@@ -790,6 +790,68 @@ static ebuf make_laced_mkv(int64_t* total)
     return f;
 }
 
+/* Encrypted tracks are refused as protected content, not as an unknown format:
+ * MP4 Common Encryption ('enca'), iTunes FairPlay ('drms') and Matroska
+ * ContentEncryption. */
+static void test_protected_content(void)
+{
+    static const char* fourccs[] = { "enca", "drms" };
+    size_t size = 0, i, j;
+    uint8_t* d = load_file("aac.m4a", &size);
+    fa_open_options o;
+    fa_stream* s = NULL;
+    CHECK(d != NULL);
+    fa_open_options_init(&o);
+    for (i = 0; i < 2; i++) {
+        uint8_t* p = (uint8_t*)malloc(size);
+        int done = 0;
+        memcpy(p, d, size);
+        for (j = 4; j + 12 < size && !done; j++)
+            if (memcmp(p + j, "stsd", 4) == 0 && memcmp(p + j + 16, "mp4a", 4) == 0) {
+                memcpy(p + j + 16, fourccs[i], 4);
+                done = 1;
+            }
+        CHECK(done);
+        CHECK_EQ(fa_stream_open_memory(g_engine, p, size, &o, &s), FA_ERROR_PROTECTED_CONTENT);
+        free(p);
+    }
+    free(d);
+    {
+        ebuf f = { 0 }, hdr = { 0 }, info = { 0 }, tracks = { 0 }, te = { 0 }, audio = { 0 };
+        ebuf encs = { 0 }, enc = { 0 }, crypt = { 0 };
+        union { double d; uint64_t u; } rate;
+        static const int one[1] = { 96 };
+        int64_t k = 0;
+        put_el(&hdr, 0x4282, "matroska", 8);
+        put_el(&f, 0x1A45DFA3, hdr.p, (int64_t)hdr.n);
+        put_el(&f, 0x18538067, NULL, -1);
+        put_uint(&info, 0x2AD7B1, 1000000);
+        put_el(&f, 0x1549A966, info.p, (int64_t)info.n);
+        rate.d = 8000.0;
+        put_uint(&audio, 0xB5, rate.u);
+        put_uint(&audio, 0x9F, 1);
+        put_uint(&audio, 0x6264, 16);
+        put_uint(&crypt, 0x47E1, 5);                          /* ContentEncAlgo: AES */
+        put_uint(&enc, 0x5033, 1);                            /* ContentEncodingType: encryption */
+        put_el(&enc, 0x5035, crypt.p, (int64_t)crypt.n);
+        put_el(&encs, 0x6240, enc.p, (int64_t)enc.n);
+        put_uint(&te, 0xD7, 1);
+        put_uint(&te, 0x83, 2);
+        put_el(&te, 0x86, "A_PCM/INT/LIT", 13);
+        put_el(&te, 0xE1, audio.p, (int64_t)audio.n);
+        put_el(&te, 0x6D80, encs.p, (int64_t)encs.n);
+        put_el(&tracks, 0xAE, te.p, (int64_t)te.n);
+        put_el(&f, 0x1654AE6B, tracks.p, (int64_t)tracks.n);
+        put_el(&f, 0x1F43B675, NULL, -1);
+        put_uint(&f, 0xE7, 0);
+        put_block(&f, 0xA3, 1, 0, 0, one, 1, &k);
+        CHECK_EQ(fa_stream_open_memory(g_engine, f.p, f.n, &o, &s), FA_ERROR_PROTECTED_CONTENT);
+        free(f.p); free(hdr.p); free(info.p); free(tracks.p); free(te.p); free(audio.p);
+        free(encs.p); free(enc.p); free(crypt.p);
+    }
+    CHECK(strcmp(fa_result_string(FA_ERROR_PROTECTED_CONTENT), "protected content") == 0);
+}
+
 static void test_mkv_lacing_and_live_layout(void)
 {
     static const int64_t targets[] = { 0, 96, 100, 256, 600, 1300, 2000, 5 };
@@ -1108,6 +1170,7 @@ int main(void)
     RUN(test_adts_junk_and_tags);
     RUN(test_adts_junk_and_format_change);
     RUN(test_mkv_lacing_and_live_layout);
+    RUN(test_protected_content);
     RUN(test_damaged_files_do_not_crash);
     RUN(test_scan_video_file);
     RUN(test_mp3_cbr);

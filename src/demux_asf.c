@@ -18,7 +18,7 @@
  * send times (interpolation, then halving) narrows it; reading on from there finds
  * the media object. Forward-only sources and broadcast streams play straight
  * through. DRM-protected content (Content Encryption objects, encrypted streams)
- * is refused with FA_ERROR_UNSUPPORTED_FORMAT: it cannot be decoded without the
+ * is refused with FA_ERROR_PROTECTED_CONTENT: it cannot be decoded without the
  * license, which only Windows' own DRM components hold. */
 #include "demux.h"
 #include <math.h>
@@ -904,7 +904,8 @@ static fa_result asf_open(fa_decoder* dec)
     if (dec->audio_track >= h->count) { r = FA_ERROR_NOT_FOUND; goto fail; }
     s = &h->streams[dec->audio_track < 0 ? 0 : dec->audio_track];
     /* Protected content: there is no way to decode it here (see the top). */
-    if (h->protected_content || s->encrypted || !s->codec) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
+    if (h->protected_content || s->encrypted) { r = FA_ERROR_PROTECTED_CONTENT; goto fail; }
+    if (!s->codec) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
     if (h->min_packet != h->max_packet || h->min_packet == 0 || h->min_packet > ASF_MAX_PACKET) {
         r = FA_ERROR_UNSUPPORTED_FORMAT;
         goto fail;
