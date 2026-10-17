@@ -2,9 +2,7 @@
  * when that is full, a stream's spill slots); API threads add to the engine's
  * pending list under list_lock. Decode workers and the event thread both move
  * queued events into the pending list every few milliseconds, so a slow user
- * callback does not let the queues fill up. If they fill anyway, the audio thread
- * holds back whatever would raise an event and retries on its next callback, so
- * no event is ever dropped. The event thread then calls the
+ * callback does not let the queues fill up. The event thread then calls the
  * user's callbacks in sequence order, so user code never runs on the audio
  * thread. It also frees closed streams, after their last event. */
 #include "fa_internal.h"
@@ -32,22 +30,10 @@ int fa_event_queue_pop(fa_event_queue* q, fa_qevent* out)
     return 1;
 }
 
-int fa_audio_event_room(struct fa_device* d, struct fa_stream* s)
-{
-    int i;
-    /* Only the audio thread fills the queue and the spill slots; other threads only
-     * empty them. So room seen here is still there when the event is posted. */
-    if ((uint32_t)fa_load32(&d->events.head) - (uint32_t)fa_load32(&d->events.tail) < FA_EVENT_QUEUE_SIZE) return 1;
-    for (i = 0; i < FA_EVENT_SPILL; i++)
-        if (!fa_load32(&s->spill_full[i])) return 1;
-    return 0;
-}
-
-int fa_audio_post_event(struct fa_device* d, struct fa_stream* s, fa_event_type type, int64_t frame, int64_t value)
+void fa_audio_post_event(struct fa_device* d, struct fa_stream* s, fa_event_type type, int64_t frame, int64_t value)
 {
     fa_qevent q;
-    int i, posted = 0;
-    if (!fa_audio_event_room(d, s)) return 0;
+    int i;
     q.ev.type = type;
     q.ev.stream = s;
     q.ev.frame = frame;
@@ -56,16 +42,18 @@ int fa_audio_post_event(struct fa_device* d, struct fa_stream* s, fa_event_type 
      * event visible; the event thread waits it out before delivering (see below). */
     fa_fetch_add32(&d->publishing, 1);
     q.seq = fa_fetch_add32(&d->engine->event_seq, 1);
-    if (fa_event_queue_push(&d->events, &q)) posted = 1;
-    for (i = 0; !posted && i < FA_EVENT_SPILL; i++) {
-        if (fa_load32(&s->spill_full[i])) continue;
-        s->spill[i] = q;
-        fa_store32(&s->spill_full[i], 1);
-        fa_store32(&d->spilled, 1);
-        posted = 1;
+    if (!fa_event_queue_push(&d->events, &q)) {
+        for (i = 0; i < FA_EVENT_SPILL; i++) {
+            if (fa_load32(&s->spill_full[i])) continue;
+            s->spill[i] = q;
+            fa_store32(&s->spill_full[i], 1);
+            fa_store32(&d->spilled, 1);
+            break;
+        }
+        /* Not reached: FA_EVENT_SPILL covers everything one stream can raise
+         * between two collections. */
     }
     fa_fetch_add32(&d->publishing, -1);
-    return posted;
 }
 
 /* Caller holds list_lock. */

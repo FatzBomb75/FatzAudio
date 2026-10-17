@@ -445,6 +445,11 @@ FA_API fa_result FA_CALL fa_stream_play(fa_stream* stream)
     if (!is_attached(stream)) r = FA_ERROR_INVALID_ARG;
     else {
         if (fa_load32(&stream->state) == FA_STATE_ENDED) seek_locked(stream, 0);
+        /* Empty the event queues before playback can raise another ENDED, which keeps
+         * this stream's spill slots from overflowing (see FA_EVENT_SPILL). */
+        fa_mutex_lock(&stream->engine->list_lock);
+        fa_event_collect_locked(stream->engine);
+        fa_mutex_unlock(&stream->engine->list_lock);
         fa_store32(&stream->state, FA_STATE_PLAYING);
     }
     fa_mutex_unlock(&stream->api_lock);
@@ -555,7 +560,9 @@ static fa_result post_param(struct fa_stream* s, fa_param param, float target, f
     /* Publish. If the audio thread never claimed the previous command, it never
      * started, so its RAMP_DONE is ours to raise (the audio thread will not). Its
      * sequence number is taken before the new command becomes visible, so it is
-     * delivered before anything the new command raises. */
+     * delivered before anything the new command raises. The event queues are
+     * then emptied: that bounds what the mixer can raise for this stream before the
+     * next collection, so its spill slots never overflow (see FA_EVENT_SPILL). */
     {
         int32_t prev, done_seq;
         fa_mutex_lock(&s->engine->list_lock);
@@ -564,6 +571,7 @@ static fa_result post_param(struct fa_stream* s, fa_param param, float target, f
             prev = fa_load32(&m->word);
             if (fa_cas32(&m->word, prev, seq)) break;
         }
+        fa_event_collect_locked(s->engine);
         if (!(prev & FA_CMD_CLAIMED) && m->last_notify) {
             fa_event ev;
             ev.type = FA_EVENT_RAMP_DONE;
@@ -693,19 +701,17 @@ FA_API fa_result FA_CALL fa_stream_read(fa_stream* stream, void* buffer, fa_fram
 
 /* ---- mixing (audio thread) ----------------------------------------------- */
 
-static int push_event(fa_device* dev, struct fa_stream* s, fa_event_type type, int64_t value)
+static void push_event(fa_device* dev, struct fa_stream* s, fa_event_type type, int64_t value)
 {
-    return fa_audio_post_event(dev, s, type, attached_position(s), value);
+    fa_audio_post_event(dev, s, type, attached_position(s), value);
 }
 
-/* Ends a ramp that has run its course (or had zero length) at its target. With no
- * room for its RAMP_DONE the ramp stays active, holding its target, and the next
- * callback tries again. */
+/* Ends a ramp that has run its course (or had zero length) at its target. */
 static void finish_ramp(struct fa_stream* s, fa_device* dev, fa_param_voice* v)
 {
-    v->value = v->target;
-    if (v->notify && !push_event(dev, s, FA_EVENT_RAMP_DONE, v->tag)) return;
     v->active = 0;
+    v->value = v->target;
+    if (v->notify) push_event(dev, s, FA_EVENT_RAMP_DONE, v->tag);
 }
 
 /* Takes a new parameter command if one is waiting (see fa_param_mailbox). */
@@ -719,8 +725,6 @@ static void take_command(struct fa_stream* s, fa_device* dev, int p, int playing
     int64_t ns, tag;
     int curve, notify, has_start, i;
     if (w & FA_CMD_CLAIMED) return;
-    /* Replacing a ramp raises its RAMP_DONE: wait for room before taking the command. */
-    if (v->active && v->notify && !fa_audio_event_room(dev, s)) return;
     slot = &m->slot[w & 1];
     target = fa_load_float(&slot->target);
     ns = fa_load64(&slot->frames_ns);
@@ -839,9 +843,7 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
 
     if (n < (int64_t)frames) {
         if (fa_load32(&s->eof) && fa_ring_readable(&s->ring) == 0) {
-            /* Without room for ENDED the stream stays playing (silent) and ends next callback. */
-            if (fa_audio_event_room(dev, s) && fa_cas32(&s->state, FA_STATE_PLAYING, FA_STATE_ENDED))
-                push_event(dev, s, FA_EVENT_ENDED, 0);
+            if (fa_cas32(&s->state, FA_STATE_PLAYING, FA_STATE_ENDED)) push_event(dev, s, FA_EVENT_ENDED, 0);
         } else {
             fa_fetch_add32(&s->underruns, 1);
         }
