@@ -447,6 +447,8 @@ FA_API fa_result FA_CALL fa_stream_get_clock(fa_stream* stream, fa_time* out_pts
  * format reported by fa_stream_get_info. `buffer` must hold frames * channels floats.
  * Returns FA_OK with 1..frames frames read (short reads happen; keep calling), and
  * FA_ERROR_END_OF_STREAM with *out_frames_read == 0 once the end is reached.
+ * Push and packet streams return FA_OK with 0 frames while nothing is queued, and
+ * FA_ERROR_END_OF_STREAM after fa_stream_push_end once everything was read.
  * Returns FA_ERROR_BUSY for streams attached to a device (the device pulls them). */
 FA_API fa_result FA_CALL fa_stream_read(fa_stream* stream, void* buffer, fa_frames frames, fa_frames* out_frames_read);
 
@@ -715,7 +717,8 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
  * FA_EVENT_RAMP_DONE       position               fa_ramp.tag of the finished ramp
  * FA_EVENT_STARTED         position               0
  *
- * Delivered today: ENDED, MARKER, LOUDNESS_FINAL, RAMP_DONE and STARTED. The others are raised by the features
+ * Delivered today: ENDED, MARKER, LOUDNESS_FINAL, RAMP_DONE, STARTED, and STALLED, RESUMED and
+ * DECODE_ERROR from push and packet streams. The others are raised by the features
  * that produce them as those land (see docs/features). */
 typedef enum fa_event_type {
     FA_EVENT_ENDED = 0,

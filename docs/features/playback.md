@@ -55,7 +55,7 @@ using var s = engine.OpenFile("track.flac", new StreamOptions { BufferLength = T
 ## Position and clock
 
 - `fa_stream_get_position`: source frames handed to the device. Frames decoded ahead into the buffer don't count.
-- `fa_stream_get_clock`: the position in nanoseconds minus the device latency, which is what's leaving the speaker now. Sync video and lyrics to this.
+- `fa_stream_get_clock`: the presentation clock, the time of the audio leaving the speaker now, device latency included. It moves smoothly between audio callbacks, holds while paused, buffering or ended, and jumps on a seek. Sync video, CD+G and lyrics to it. Push and packet streams report your own timestamps ([FFmpeg hand-off](ffmpeg.md#following-the-clock-with-the-video)).
 - `fa_device_get_time` (.NET `OutputDevice.Time`): the device clock, the audio the device has mixed since it opened. Scheduled starts and ramps use it ([crossfade](crossfade.md#the-device-clock)).
 
 ```c

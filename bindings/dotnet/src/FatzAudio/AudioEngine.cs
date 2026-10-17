@@ -291,7 +291,61 @@ public sealed class AudioEngine : IDisposable
         FatzAudioException.ThrowIfFailed(rc);
         var sh = new StreamHandle();
         sh.Initialize(s, h);
-        return new PushAudioStream(this, sh, null, null, format);
+        return new PushAudioStream(this, sh, format);
+    }
+
+    /// <summary>
+    /// Opens a stream for the compressed packets of one audio track, for apps that demux the file themselves
+    /// (typically with FFmpeg, for the video). Push packets straight from <c>av_read_frame</c>; FatzAudio decodes
+    /// them on its worker threads (PCM and MP3 built in, other codecs through the FFmpeg your app loaded) and
+    /// <see cref="AudioStream.Clock"/> reports their timestamps as they leave the speaker.
+    /// </summary>
+    /// <param name="parameters">The track: codec name, rate, channels, codec configuration and time base.</param>
+    /// <param name="options">Optional open options (<see cref="StreamOptions.Loop"/> is not allowed).</param>
+    /// <returns>A packet stream; dispose it when done.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="parameters"/> is null.</exception>
+    /// <exception cref="FatzAudioException">The codec needs FFmpeg and none was found (<see cref="ErrorCode.ProviderMissing"/>),
+    /// FFmpeg has no decoder for it (<see cref="ErrorCode.UnsupportedFormat"/>), or a parameter is invalid.</exception>
+    /// <example>
+    /// <code>
+    /// using var audio = engine.OpenPackets(new CodecParameters("ac3", 48000, 6) { TimeBase = new Rational(1, 90000) });
+    /// audio.PlayOn(output);
+    /// audio.PushPacket(packetBytes, pts);
+    /// </code>
+    /// </example>
+    public unsafe PacketAudioStream OpenPackets(CodecParameters parameters, StreamOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(parameters);
+        ArgumentNullException.ThrowIfNull(parameters.Codec);
+        var h = Handle;
+        using var opts = NativeOptions.Create(options);
+        byte* codec = (byte*)Marshal.StringToCoTaskMemUTF8(parameters.Codec);
+        try
+        {
+            fixed (byte* extra = parameters.ExtraData)
+            {
+                FaCodecParams p;
+                NativeMethods.fa_codec_params_init(&p);
+                p.Codec = codec;
+                p.SampleRate = (uint)Math.Max(0, parameters.SampleRate);
+                p.Channels = (uint)Math.Max(0, parameters.Channels);
+                p.Extradata = extra;
+                p.ExtradataSize = (nuint)(parameters.ExtraData?.Length ?? 0);
+                p.BitRate = parameters.BitRate;
+                p.BlockAlign = (uint)Math.Max(0, parameters.BlockAlign);
+                p.BitsPerCodedSample = (uint)Math.Max(0, parameters.BitsPerCodedSample);
+                p.TimeBase = parameters.TimeBase.ToNative();
+                int rc = NativeMethods.fa_stream_open_packets(h, &p, opts.Pointer, out nint s);
+                FatzAudioException.ThrowIfFailed(rc);
+                var sh = new StreamHandle();
+                sh.Initialize(s, h);
+                return new PacketAudioStream(this, sh, parameters);
+            }
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem((nint)codec);
+        }
     }
 
     /// <summary>

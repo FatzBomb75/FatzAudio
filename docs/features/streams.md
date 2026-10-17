@@ -12,6 +12,8 @@ A stream is anything that produces audio. You open it from a file, a memory bloc
 
 More formats are added to the same registry (Ogg Vorbis, Opus, AAC, AC-3/E-AC-3 and others follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
 
+Apps that demux files themselves (for example with FFmpeg, for the video) can push compressed packets or decoded frames instead of opening a file: see [FFmpeg hand-off and A/V sync](ffmpeg.md).
+
 ### How detection works
 
 1. The first 8 KB of the source are read once and kept, so detection works even on sources that can't seek.

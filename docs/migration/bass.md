@@ -19,7 +19,7 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | Fades via `BASS_ChannelSlideAttribute` (linear or log only) | `fa_stream_ramp_param` with linear, equal-power, log, exp, S-curve, bezier or your own points, optionally starting at an exact time | |
 | Crossfades built by hand from two slides and a `BASS_SYNC_POS` | `fa_crossfade`, or `fa_stream_set_next` to crossfade (or go gapless) automatically at the mix point | No sync juggling; both sides start on the same frame |
 | Tempo/pitch need bass_fx and a separate "tempo stream" wrapping the source | `FA_PARAM_TEMPO` and `FA_PARAM_PITCH` on any stream | No wrapper streams to create and free |
-| Sync with external video means pushing PCM and correcting drift by hand | `fa_stream_get_clock` gives the presentation time leaving the speaker | Video follows the audio clock; no manual resync |
+| Audio of a video played with FFmpeg means decoding it to PCM yourself, pushing it, and correcting drift by hand | Push FFmpeg's packets as they are (`fa_stream_push_packet`) or its frames in their own format (`fa_stream_push_frame`); `fa_stream_get_clock` reports their pts as it leaves the speaker ([FFmpeg hand-off](../features/ffmpeg.md)) | No audio decoding or resampling in the app, and the video follows one clock: no manual resync |
 
 ## 2. Function map: bass.dll
 
@@ -54,7 +54,12 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS_StreamCreateFile (memory) | `fa_stream_open_memory` | `engine.OpenMemory(bytes)` | ✅ |
 | BASS_StreamCreateFileUser | `fa_stream_open_io`; `close` is called once by `fa_stream_close`, never on a failed open ([custom I/O](../features/streams.md#custom-io-your-own-reader)) | `engine.OpenStream(System.IO.Stream)` | ✅ |
 | BASS_StreamCreateURL | `fa_stream_open_url` | `engine.OpenUrl(url)` | 🧩 |
-| BASS_StreamCreate (STREAMPROC_PUSH) + BASS_StreamPutData | `fa_stream_open_push` + `fa_stream_push_pcm` | `engine.CreatePushStream(format)` | 🧩 |
+| BASS_StreamCreate (STREAMPROC_PUSH) + BASS_StreamPutData | `fa_stream_open_push` + `fa_stream_push_pcm`, with an optional pts per push ([FFmpeg hand-off](../features/ffmpeg.md)) | `engine.CreatePushStream(format)`, `Push(samples, pts)` | ✅ |
+| BASS_StreamPutData of PCM converted from another format (swresample first) | `fa_stream_push_frame`: any sample format, planar or interleaved, any rate; converted on a worker thread | `PushFrame(format, (nint)frame->extended_data, ...)` | ✅ |
+| BASS_StreamPutData(h, NULL, 0) to read the queued amount | `fa_stream_get_buffered` (queued + decoded ahead + device buffer, as a duration) | `Buffered` | ✅ |
+| BASS_StreamPutData with BASS_STREAMPROC_END | `fa_stream_push_end` | `End()` | ✅ |
+| BASS_ChannelSetPosition(h, 0, ...) to clear a push stream after the app seeks | `fa_stream_push_flush`: drops everything queued at once; the clock holds until the new audio plays | `Flush()` | ✅ |
+| Decode compressed audio yourself (FFmpeg) and push PCM | `fa_stream_open_packets` + `fa_stream_push_packet`: packets straight from `av_read_frame`; PCM and MP3 built in, other codecs through the app's own FFmpeg, loaded at runtime | `engine.OpenPackets(params)`, `PushPacket(...)` | ✅ |
 | BASS_StreamCreate (STREAMPROC callback) | Planned pull-callback source | | 🗓️ |
 | BASS_StreamPutFileData | `fa_stream_open_io` with `seek = NULL` (forward-only source fed from your own buffer) | `engine.OpenStream(stream)` with a non-seekable stream | ✅ |
 | BASS_StreamGetFilePosition | Planned buffering/download progress query | | 🗓️ |
@@ -104,6 +109,16 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
 | BASS_ChannelGetPosition on a playing channel used as a timeline | `fa_device_get_time`: frames the device mixed since it opened, in ns; never jumps on seek or track change | `output.Time` | ✅ |
+
+### Video sync
+
+| BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| BASS_ChannelGetPosition minus the latency from BASS_GetInfo, converted with Bytes2Seconds, to find which video frame to show | `fa_stream_get_clock`: the time leaving the speaker, latency included, interpolated between callbacks; holds while paused, stalled or ended ([FFmpeg hand-off](../features/ffmpeg.md#following-the-clock-with-the-video)) | `stream.Clock` | ✅ |
+| Keeping your own offset from the first pushed pts | Not needed: push streams report the pts you pushed, timestamp jumps included | `Clock` | ➖ (by design) |
+| BASS_SYNC_STALL (stalled / resumed) | `FA_EVENT_STALLED` / `FA_EVENT_RESUMED` on push and packet streams | `Stalled` / `Resumed` | ✅ (web streams 🗓️) |
+| BASS_ChannelIsActive == BASS_ACTIVE_STALLED | `FA_STATE_BUFFERING`; resumes by itself at about 100 ms queued | `StreamState.Buffering` | ✅ |
+| BASS_FFMPEG / BASS_DSHOW add-ons (third-party) to play the audio of video files | `fa_stream_open_packets` fed from the FFmpeg demuxer your app already has | `OpenPackets` | ✅ |
 
 ### Effects
 
@@ -179,8 +194,8 @@ The legacy app doesn't ship bassmix.dll, but mixer-style code built on `BASS_Cha
 
 | Legacy DLL | Replaced by | Status |
 |---|---|---|
-| bass_aac.dll | Built-in `fa_stream_open_*` (OS AAC codec) | 🗓️ |
-| bass_ac3.dll | Built-in (OS AC-3/E-AC-3 codec, passthrough, FFmpeg bridge) | 🗓️ |
+| bass_aac.dll | AAC packets through the app's FFmpeg (`fa_stream_open_packets`); AAC files through the OS codec | ✅ packets, 🗓️ files |
+| bass_ac3.dll | AC-3 and E-AC-3 packets through the app's FFmpeg (`fa_stream_open_packets`); files through the OS codec, and passthrough | ✅ packets, 🗓️ files and passthrough |
 | bassflac.dll | Built-in | ✅ |
 | bassopus.dll | Built-in (incl. raw packet push) | 🗓️ |
 | basswebm.dll | Built-in Matroska/WebM demuxer | 🗓️ |
@@ -376,4 +391,40 @@ BASS: two channels and two `BASS_ChannelSetAttribute(h, BASS_ATTRIB_VOL, ...)` c
 
 FatzAudio: one bus per deck, and the slider sets or ramps the bus volumes ([buses](../features/buses.md)). In .NET: `deckA.Volume = MathF.Cos(x * MathF.PI / 2); deckB.Volume = MathF.Sin(x * MathF.PI / 2);`.
 
-*More patterns (tempo, FFmpeg hand-off, CD+G) are added here as each feature lands.*
+### Audio of a video played with FFmpeg
+
+BASS: decode every audio packet with libavcodec, convert it with swresample to the push stream's format, `BASS_StreamPutData` it, and on every video frame compute the audio time from `BASS_ChannelGetPosition`, the device latency and the first pts, then nudge the video when it drifts. After a seek you clear the push stream and recompute the offset.
+
+FatzAudio: push the packets and show the video frame for the clock ([FFmpeg hand-off](../features/ffmpeg.md)).
+
+```c
+fa_codec_params params;
+fa_codec_params_from_av(&params, st->codecpar, st->time_base);   /* fatzaudio_ffmpeg.h */
+fa_stream_open_packets(engine, &params, NULL, &audio);
+fa_stream_attach(audio, device, NULL);
+fa_stream_play(audio);
+
+/* demux loop */
+fa_packet p;
+fa_packet_from_av(&p, pkt);
+fa_stream_push_packet(audio, &p);
+
+/* render loop */
+fa_time now;
+fa_stream_get_clock(audio, &now);   /* the pts being heard, in ns */
+
+/* seek */
+av_seek_frame(fmt, -1, target, AVSEEK_FLAG_BACKWARD);
+fa_stream_push_flush(audio);
+```
+
+.NET:
+```csharp
+using var audio = engine.OpenPackets(parameters);
+audio.PlayOn(output);
+audio.PushPacket((nint)pkt->data, pkt->size, pkt->pts, pkt->duration);   // demux loop
+TimeSpan now = audio.Clock;                                               // render loop
+audio.Flush();                                                            // after seeking the demuxer
+```
+
+*More patterns (tempo, CD+G) are added here as each feature lands.*

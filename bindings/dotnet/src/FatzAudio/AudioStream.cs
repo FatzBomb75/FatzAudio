@@ -33,8 +33,8 @@ public delegate void DspProcessor(Span<float> samples, int channels);
 
 /// <summary>
 /// A playable or decodable audio source. Create one with <see cref="AudioEngine.OpenFile"/>,
-/// <see cref="AudioEngine.OpenMemory"/>, <see cref="AudioEngine.OpenStream"/>, <see cref="AudioEngine.OpenUrl(string, StreamOptions?)"/>
-/// or <see cref="AudioEngine.CreatePushStream"/>.
+/// <see cref="AudioEngine.OpenMemory"/>, <see cref="AudioEngine.OpenStream"/>, <see cref="AudioEngine.OpenUrl(string, StreamOptions?)"/>,
+/// <see cref="AudioEngine.CreatePushStream"/> or <see cref="AudioEngine.OpenPackets"/>.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -341,9 +341,15 @@ public unsafe class AudioStream : IDisposable
     }
 
     /// <summary>
-    /// Presentation time of the audio currently leaving the speaker: the position minus the device
-    /// latency. Video and lyric renderers should follow this clock.
+    /// The presentation clock: the timestamp of the audio leaving the speaker right now. Follow it with your video,
+    /// CD+G or lyric renderer (show the frame whose timestamp is closest) and the picture stays in sync by itself.
     /// </summary>
+    /// <remarks>
+    /// It includes the device latency, moves smoothly between audio callbacks (so it can be read every video frame),
+    /// stops while the stream is paused, stalled or ended, and jumps to the target on a seek. File streams report the
+    /// position in the file; <see cref="FeedAudioStream"/>s report the timestamps you pushed, converted to time.
+    /// Streams that are not playing report the time of their next frame.
+    /// </remarks>
     /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
     public TimeSpan Clock
     {
@@ -638,7 +644,8 @@ public unsafe class AudioStream : IDisposable
 
     /// <summary>Pulls decoded PCM from a decode-only stream (<see cref="StreamOptions.DecodeOnly"/>).</summary>
     /// <param name="buffer">Receives interleaved 32-bit float samples; its length should be a multiple of the channel count.</param>
-    /// <returns>The number of <b>frames</b> written (samples / channels); 0 at the end of the stream.</returns>
+    /// <returns>The number of <b>frames</b> written (samples / channels); 0 at the end of the stream. For a
+    /// <see cref="FeedAudioStream"/>, 0 before <see cref="FeedAudioStream.End"/> means nothing is queued yet: push more.</returns>
     /// <exception cref="FatzAudioException">The stream is not decode-only or decoding failed.</exception>
     /// <example>
     /// <code>
@@ -879,62 +886,5 @@ public unsafe class AudioStream : IDisposable
             _ramps.Clear();
         }
         foreach (var t in pending) t.TrySetCanceled();
-    }
-}
-
-/// <summary>
-/// A stream fed by the application with PCM data (<see cref="AudioEngine.CreatePushStream"/>).
-/// </summary>
-/// <example>
-/// <code>
-/// using var push = engine.CreatePushStream(AudioFormat.Float32(48000, 2));
-/// push.PlayOn(output);
-/// push.Push(interleavedSamples);
-/// </code>
-/// </example>
-public sealed unsafe class PushAudioStream : AudioStream
-{
-    private readonly AudioFormat _format;
-
-    internal PushAudioStream(AudioEngine engine, StreamHandle handle, GCHandle? io, IoState? state, AudioFormat format)
-        : base(engine, handle, io, state, format) => _format = format;
-
-    /// <summary>The PCM format this stream accepts.</summary>
-    public AudioFormat Format => _format;
-
-    /// <summary>Pushes interleaved 32-bit float frames. The stream must have been created with <see cref="SampleFormat.Float32"/>.</summary>
-    /// <param name="samples">Interleaved samples; the length must be a multiple of the channel count.</param>
-    /// <param name="presentationTime">Optional presentation timestamp of the first frame.</param>
-    /// <exception cref="InvalidOperationException">The stream format is not <see cref="SampleFormat.Float32"/>.</exception>
-    /// <exception cref="ArgumentException">The sample count is not a multiple of the channel count.</exception>
-    /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
-    public void Push(ReadOnlySpan<float> samples, TimeSpan? presentationTime = null)
-    {
-        if (_format.SampleFormat != SampleFormat.Float32)
-            throw new InvalidOperationException("This push stream was not created with SampleFormat.Float32.");
-        fixed (float* p = samples) PushCore(p, samples.Length, presentationTime);
-    }
-
-    /// <summary>Pushes interleaved signed 16-bit frames. The stream must have been created with <see cref="SampleFormat.Int16"/>.</summary>
-    /// <param name="samples">Interleaved samples; the length must be a multiple of the channel count.</param>
-    /// <param name="presentationTime">Optional presentation timestamp of the first frame.</param>
-    /// <exception cref="InvalidOperationException">The stream format is not <see cref="SampleFormat.Int16"/>.</exception>
-    /// <exception cref="ArgumentException">The sample count is not a multiple of the channel count.</exception>
-    /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
-    public void Push(ReadOnlySpan<short> samples, TimeSpan? presentationTime = null)
-    {
-        if (_format.SampleFormat != SampleFormat.Int16)
-            throw new InvalidOperationException("This push stream was not created with SampleFormat.Int16.");
-        fixed (short* p = samples) PushCore(p, samples.Length, presentationTime);
-    }
-
-    private void PushCore(void* data, int sampleCount, TimeSpan? pts)
-    {
-        if (_format.Channels <= 0 || sampleCount % _format.Channels != 0)
-            throw new ArgumentException("Sample count must be a multiple of the channel count.");
-        void* plane = data;
-        long frames = sampleCount / _format.Channels;
-        long ns = pts is { } t ? TimeConvert.ToNanoseconds(t) : 0;
-        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_push_pcm(Handle, &plane, frames, ns));
     }
 }

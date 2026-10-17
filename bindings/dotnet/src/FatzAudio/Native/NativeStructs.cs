@@ -103,3 +103,53 @@ internal unsafe struct FaEvent
     public long Frame;
     public long Value;
 }
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaRational
+{
+    public int Num;
+    public int Den;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaCodecParams
+{
+    public uint StructSize;
+    public byte* Codec;
+    public uint SampleRate;
+    public uint Channels;
+    public void* Extradata;
+    public nuint ExtradataSize;
+    public long BitRate;
+    public uint BlockAlign;
+    public uint BitsPerCodedSample;
+    public FaRational TimeBase;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaPacket
+{
+    public void* Data;
+    public nuint Size;
+    public long Pts;
+    public long Duration;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaAudioFrame
+{
+    public FaAudioFormat Format;
+    public void** Data;
+    public long Frames;
+    public long Pts;
+    public FaRational TimeBase;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaFfmpegInfo
+{
+    public int Loaded;
+    public uint AvcodecVersion;
+    public uint AvutilVersion;
+    public fixed byte AvcodecPath[512];
+}
