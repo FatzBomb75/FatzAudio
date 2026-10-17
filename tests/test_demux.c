@@ -1,8 +1,8 @@
 /* White-box tests of the MP4 / MOV and Matroska / WebM demuxers, on the small
  * files in tests/data (make_demux_data.sh). Every audio track is a sine of its own
- * frequency and level, so the tests can tell which track came out. Tracks that
- * need FFmpeg (AAC, Opus) are skipped when it is not installed; MP3 and PCM
- * tracks always run. */
+ * frequency and level, so the tests can tell which track came out. AAC tracks
+ * need FFmpeg outside Windows, macOS, iOS and Android and are skipped when it is
+ * not installed; the rest always run. */
 #if !defined(_WIN32)
 #  define _POSIX_C_SOURCE 200809L
 #endif
@@ -27,6 +27,18 @@ static int g_failures = 0;
 #define SKIP_NO_FFMPEG(r) do { if ((r) == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); return; } } while (0)
 
 static fa_engine* g_engine;
+
+/* AAC goes to the system's decoders on Windows, macOS, iOS and Android
+ * (codec_mf.c, codec_at.c, codec_mediacodec.c), to FFmpeg elsewhere. Checks of
+ * AAC audio hold for any decoder (tones, levels, lengths, positions); a seek
+ * matches the full decode to the bit only where FFmpeg is known to be the one. */
+#if defined(_WIN32) || defined(__APPLE__) || defined(__ANDROID__)
+#  define AAC_SEEK_TOL 1e-2
+#  define AAC_START_TOL 5e-2
+#else
+#  define AAC_SEEK_TOL 1e-3
+#  define AAC_START_TOL 5e-3
+#endif
 
 static void data_path(char* out, size_t cap, const char* name)
 {
@@ -266,7 +278,7 @@ static void test_m4a_aac(void)
     CHECK_NEAR(rms(full, 4800, 43200, 2), 0.3536, 0.05);
     /* The first frames are the start of the sine, not priming silence. */
     CHECK(fabs(full[2 * 12]) > 0.05);
-    CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), 1e-3, &worst));
+    CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), AAC_SEEK_TOL, &worst));
     printf("  AAC seek vs sequential: max difference %.2g\n", worst);
     free(full);
     fa_stream_close(s);
@@ -511,12 +523,12 @@ static void test_adts_file(void)
     CHECK_EQ(n, (ADTS_FRAMES - 1) * 1024);
     CHECK_NEAR(freq(full, 4410, 128000, 2, 44100), 440.0, 2.0);
     CHECK_NEAR(rms(full, 4410, 128000, 2), 0.0625, 0.01);
-    CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), 1e-3, &worst));
+    CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), AAC_SEEK_TOL, &worst));
     printf("  ADTS seek vs sequential: max difference %.2g\n", worst);
     /* Back to the very start there is no earlier frame to decode first, and FFmpeg's
      * flush keeps the last frame's window shape: the first frame differs a little
      * (an MP4 edit list hides this in the priming frames). */
-    CHECK(seek_matches(s, full, n, 2, start, 1, 5e-3, &worst));
+    CHECK(seek_matches(s, full, n, 2, start, 1, AAC_START_TOL, &worst));
     free(full);
     fa_stream_close(s);
     compare_forward_only("net/tone.aac", -1, 2);
@@ -926,7 +938,8 @@ static void exercise_memory(const uint8_t* data, size_t size, int32_t track)
 
 static void test_damaged_files_do_not_crash(void)
 {
-    static const char* names[] = { "av_tracks.mp4", "aac.m4a", "pcm.mov", "frag.mp4", "av_tracks.mkv", "opus.webm", "net/tone.aac" };
+    static const char* names[] = { "av_tracks.mp4", "aac.m4a", "pcm.mov", "frag.mp4", "av_tracks.mkv", "opus.webm", "net/tone.aac",
+                                   "alac/alac16.mkv", "alac/alac51_24.m4a" };
     size_t f;
     uint32_t seed = 12345;
     for (f = 0; f < sizeof(names) / sizeof(names[0]); f++) {
@@ -1004,6 +1017,270 @@ static void test_aac_config_explicit_rates(void)
     CHECK(((asc[1] >> 3) & 15) == 7);
     fa_aac_build_asc(asc, 2, 48000, 7, 0);
     CHECK(((asc[1] >> 3) & 15) == 0);
+}
+
+/* ---- what the systems' AAC and ALAC decoders are given (codec_os.c) --------------- */
+
+static void test_os_codec_helpers(void)
+{
+    static const uint8_t lc[2] = { 0x12, 0x10 };   /* LC, 44.1 kHz, stereo */
+    /* LC 22.05 kHz stereo, then the sync extension: SBR at 44.1 kHz and PS. */
+    static const uint8_t ext[7] = { 0x13, 0x90, 0x56, 0xE5, 0xA5, 0x48, 0x80 };
+    static const uint8_t ext_off[5] = { 0x13, 0x90, 0x56, 0xE5, 0x00 };   /* SBR signalled absent */
+    uint8_t asc[FA_AAC_ASC_MAX + 8], esds[64], adts[64], alac[48];
+    fa_aac_asc_info info;
+    fa_codec_params p;
+    fa_alac_info a;
+    const uint8_t* d;
+    size_t n, m;
+    uint32_t map[8];
+
+    CHECK(fa_aac_parse_asc(lc, 2, &info));
+    CHECK_EQ(info.object_type, 2);
+    CHECK_EQ(info.rate, 44100);
+    CHECK_EQ(info.channel_config, 2);
+    CHECK_EQ(info.sbr, -1);
+    CHECK_EQ(info.ext_rate, 0);
+    n = fa_aac_build_asc(asc, 2, 22050, 2, 44100);
+    CHECK(fa_aac_parse_asc(asc, n, &info));
+    CHECK_EQ(info.object_type, 2);
+    CHECK_EQ(info.rate, 22050);
+    CHECK_EQ(info.ext_rate, 44100);
+    CHECK_EQ(info.sbr, 1);
+    CHECK_EQ(info.ps, 0);
+    CHECK(fa_aac_parse_asc(ext, sizeof(ext), &info));
+    CHECK_EQ(info.object_type, 2);
+    CHECK_EQ(info.rate, 22050);
+    CHECK_EQ(info.sbr, 1);
+    CHECK_EQ(info.ext_rate, 44100);
+    CHECK_EQ(info.ps, 1);
+    CHECK(fa_aac_parse_asc(ext_off, sizeof(ext_off), &info));
+    CHECK_EQ(info.sbr, 0);
+    CHECK(!fa_aac_parse_asc(lc, 1, &info));
+    asc[0] = 0x16; asc[1] = 0x90;                    /* rate index 13: reserved */
+    CHECK(!fa_aac_parse_asc(asc, 2, &info));
+    CHECK_EQ(fa_aac_config_channels(6), 6);
+    CHECK_EQ(fa_aac_config_channels(7), 8);
+
+    /* ADTS frames (no extradata): LC from the header's rate and channels, or at low
+     * rates HE-AAC (HE-AAC v2 for mono) for decoders that do not find SBR alone. */
+    fa_codec_params_init(&p);
+    p.codec = "aac";
+    p.sample_rate = 44100;
+    p.channels = 2;
+    n = fa_aac_os_asc(&p, 1, asc, sizeof(asc));
+    CHECK(n == 2 && memcmp(asc, lc, 2) == 0);
+    p.sample_rate = 24000;
+    p.channels = 1;
+    n = fa_aac_os_asc(&p, 1, asc, sizeof(asc));
+    CHECK(n > 0 && fa_aac_parse_asc(asc, n, &info));
+    CHECK_EQ(info.sbr, 1);
+    CHECK_EQ(info.ps, 1);
+    CHECK_EQ(info.rate, 24000);
+    CHECK_EQ(info.ext_rate, 48000);
+    CHECK_EQ(info.channel_config, 1);
+    n = fa_aac_os_asc(&p, 0, asc, sizeof(asc));
+    CHECK(n > 0 && fa_aac_parse_asc(asc, n, &info));
+    CHECK_EQ(info.sbr, -1);
+    p.extradata = ext;                               /* the stream's own config wins */
+    p.extradata_size = sizeof(ext);
+    n = fa_aac_os_asc(&p, 1, asc, sizeof(asc));
+    CHECK(n == sizeof(ext) && memcmp(asc, ext, n) == 0);
+    {
+        /* LC at 22.05 kHz stereo, SBR left implicit: signalled when guessing. */
+        static const uint8_t lc22[2] = { 0x13, 0x90 };
+        p.extradata = lc22;
+        p.extradata_size = 2;
+        n = fa_aac_os_asc(&p, 1, asc, sizeof(asc));
+        CHECK(n > 0 && fa_aac_parse_asc(asc, n, &info));
+        CHECK_EQ(info.sbr, 1);
+        CHECK_EQ(info.rate, 22050);
+        CHECK_EQ(info.ext_rate, 44100);
+        CHECK_EQ(info.channel_config, 2);
+        n = fa_aac_os_asc(&p, 0, asc, sizeof(asc));
+        CHECK(n == 2 && memcmp(asc, lc22, 2) == 0);
+    }
+    p.extradata = lc;
+    p.extradata_size = 1;                            /* broken */
+    CHECK_EQ(fa_aac_os_asc(&p, 1, asc, sizeof(asc)), 0);
+
+    /* The ES descriptor around it: tags 3, 4 (MPEG-4 audio), 5 (the config), 6. */
+    m = fa_aac_esds(lc, 2, esds, sizeof(esds));
+    CHECK_EQ(m, 39);
+    CHECK(esds[0] == 0x03 && esds[4] == 34);
+    CHECK(esds[8] == 0x04 && esds[12] == 20 && esds[13] == 0x40 && esds[14] == 0x15);
+    CHECK(esds[26] == 0x05 && esds[30] == 2 && esds[31] == 0x12 && esds[32] == 0x10);
+    CHECK(esds[33] == 0x06 && esds[37] == 1 && esds[38] == 0x02);
+    CHECK_EQ(fa_aac_esds(lc, 2, esds, 38), 0);
+
+    /* ADTS headers: 7 bytes, 9 with a CRC; several raw blocks are refused. */
+    memset(adts, 0x55, sizeof(adts));
+    adts[0] = 0xFF; adts[1] = 0xF1; adts[2] = 0x50; adts[3] = 0x80;
+    adts[4] = (uint8_t)(20 >> 3); adts[5] = (uint8_t)((20 & 7) << 5) | 0x1F; adts[6] = 0xFC;
+    d = adts; m = 20;
+    CHECK_EQ(fa_adts_strip(&d, &m), 1);
+    CHECK(d == adts + 7 && m == 13);
+    adts[1] = 0xF0;
+    d = adts; m = 20;
+    CHECK_EQ(fa_adts_strip(&d, &m), 1);
+    CHECK(d == adts + 9 && m == 11);
+    adts[1] = 0xF1;
+    adts[6] = 0xFD;
+    d = adts; m = 20;
+    CHECK_EQ(fa_adts_strip(&d, &m), -1);
+    adts[6] = 0xFC;
+    d = adts; m = 21;                                /* the length does not match */
+    CHECK_EQ(fa_adts_strip(&d, &m), 0);
+    CHECK(d == adts && m == 21);
+    d = lc; m = 2;
+    CHECK_EQ(fa_adts_strip(&d, &m), 0);
+
+    /* ALAC: the bare config, the 'alac' box, and Core Audio's cookie with 'frma'. */
+    memset(alac, 0, sizeof(alac));
+    alac[24 + 2] = 0x10;                             /* frameLength 4096 */
+    alac[24 + 5] = 16;                               /* bitDepth */
+    alac[24 + 9] = 2;                                /* numChannels */
+    alac[24 + 22] = 0xAC; alac[24 + 23] = 0x44;      /* sampleRate 44100 */
+    CHECK(fa_alac_parse_config(alac + 24, 24, &a));
+    CHECK(a.config == alac + 24 && a.frame_length == 4096 && a.bit_depth == 16 && a.channels == 2 && a.rate == 44100);
+    alac[12 + 3] = 36;
+    memcpy(alac + 12 + 4, "alac", 4);
+    CHECK(fa_alac_parse_config(alac + 12, 36, &a));
+    CHECK(a.config == alac + 24);
+    alac[3] = 12;
+    memcpy(alac + 4, "frma", 4);
+    memcpy(alac + 8, "alac", 4);
+    CHECK(fa_alac_parse_config(alac, 48, &a));
+    CHECK(a.config == alac + 24);
+    alac[24 + 5] = 15;
+    CHECK(!fa_alac_parse_config(alac + 24, 24, &a));
+    CHECK(!fa_alac_parse_config(alac + 24, 23, &a));
+
+    /* Core Audio's channel labels to the library's order (WAVE's). */
+    {
+        static const uint32_t aac51[6] = { 3, 1, 2, 5, 6, 4 };            /* C L R Ls Rs LFE */
+        static const uint32_t aac71[8] = { 3, 7, 8, 1, 2, 5, 6, 4 };      /* C Lc Rc L R Ls Rs LFE */
+        static const uint32_t mpeg71[8] = { 1, 2, 3, 4, 5, 6, 33, 34 };   /* L R C LFE Ls Rs Rls Rrs */
+        static const uint32_t aac61[7] = { 3, 1, 2, 5, 6, 9, 4 };         /* C L R Ls Rs Cs LFE */
+        static const uint32_t wave51[6] = { 1, 2, 3, 4, 5, 6 };
+        static const uint32_t dup[3] = { 1, 1, 2 };
+        static const uint32_t want51[6] = { 1, 2, 0, 5, 3, 4 };
+        static const uint32_t want71[8] = { 3, 4, 0, 7, 5, 6, 1, 2 };
+        static const uint32_t want_m71[8] = { 0, 1, 2, 3, 6, 7, 4, 5 };
+        static const uint32_t want61[7] = { 1, 2, 0, 6, 5, 3, 4 };
+        CHECK(fa_os_channel_map(aac51, 6, map) == 1 && memcmp(map, want51, sizeof(want51)) == 0);
+        CHECK(fa_os_channel_map(aac71, 8, map) == 1 && memcmp(map, want71, sizeof(want71)) == 0);
+        CHECK(fa_os_channel_map(mpeg71, 8, map) == 1 && memcmp(map, want_m71, sizeof(want_m71)) == 0);
+        CHECK(fa_os_channel_map(aac61, 7, map) == 1 && memcmp(map, want61, sizeof(want61)) == 0);
+        CHECK_EQ(fa_os_channel_map(wave51, 6, map), 0);
+        CHECK_EQ(fa_os_channel_map(aac51, 2, map), 0);
+        CHECK_EQ(fa_os_channel_map(dup, 3, map), 0);
+        CHECK(map[0] == 0 && map[1] == 1 && map[2] == 2);
+    }
+}
+
+/* ALAC is lossless: the 16-bit sines come back exactly. */
+static void test_m4a_alac(void)
+{
+    static const int64_t targets[] = { 0, 1, 4095, 4096, 4097, 9000, 3 };
+    fa_stream* s;
+    fa_stream_info info;
+    float* full;
+    int64_t n, i;
+    double worst = 0;
+    fa_result r = open_file("alac.m4a", -1, &s);
+    SKIP_NO_FFMPEG(r);
+    CHECK_EQ(r, FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.codec, "alac") == 0);
+    CHECK_EQ(info.format.sample_rate, 44100);
+    CHECK_EQ(info.format.channels, 2);
+    CHECK_EQ(info.length_frames, 11025);
+    full = read_all(s, 2, &n);
+    CHECK_EQ(n, 11025);
+    for (i = 0; i < n; i++) {
+        double l = 0.5 * sin(2 * 3.14159265358979 * 440.0 * (double)i / 44100.0);
+        double rr = 0.25 * sin(2 * 3.14159265358979 * 660.0 * (double)i / 44100.0);
+        double d = fabs(full[2 * i] - l);
+        if (fabs(full[2 * i + 1] - rr) > d) d = fabs(full[2 * i + 1] - rr);
+        if (d > worst) worst = d;
+    }
+    printf("  largest difference from the sines: %.3g (a 16-bit step is %.3g)\n", worst, 1.0 / 32768);
+    CHECK(worst <= 1.01 / 32768);
+    CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), 0.0, &worst));
+    free(full);
+    fa_stream_close(s);
+}
+
+/* The built-in ALAC decoder against FLAC copies of the same samples (lossless
+ * both, so equal to the bit): 5.1 at 24 bits (ALAC's centre-first order put in
+ * the library's, noise, silence, a sweep) in MP4, and 16-bit stereo in Matroska;
+ * the last frame of each is a partial one. */
+static void check_alac(const char* alac, const char* flac, uint32_t channels, uint32_t rate)
+{
+    static const int64_t targets[] = { 0, 1, 4095, 4096, 4097, 9000, 3, 15000 };
+    fa_stream *s, *f;
+    fa_stream_info info;
+    float *a, *b;
+    int64_t na, nb, i;
+    double worst = 0;
+    CHECK_EQ(open_file(alac, -1, &s), FA_OK);
+    CHECK_EQ(open_file(flac, -1, &f), FA_OK);
+    if (!s || !f) { fa_stream_close(s); fa_stream_close(f); return; }
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.codec, "alac") == 0);
+    CHECK_EQ(info.format.sample_rate, rate);
+    CHECK_EQ(info.format.channels, channels);
+    a = read_all(s, channels, &na);
+    b = read_all(f, channels, &nb);
+    CHECK_EQ(na, nb);
+    CHECK_EQ(info.length_frames, nb);
+    for (i = 0; i < na * (int64_t)channels && i < nb * (int64_t)channels; i++) {
+        double d = fabs((double)a[i] - (double)b[i]);
+        if (d > worst) worst = d;
+    }
+    printf("  %s: %lld frames, largest difference from FLAC %.3g\n", alac, (long long)na, worst);
+    CHECK(worst == 0.0);
+    CHECK(seek_matches(s, a, na, channels, targets, (int)(sizeof(targets) / sizeof(targets[0])), 0.0, &worst));
+    free(a);
+    free(b);
+    fa_stream_close(s);
+    fa_stream_close(f);
+}
+
+static void test_alac_against_flac(void)
+{
+    check_alac("alac/alac51_24.m4a", "alac/alac51_24.flac", 6, 48000);
+    check_alac("alac/alac16.mkv", "alac/alac16.flac", 2, 44100);
+}
+
+/* AAC 5.1: each channel's own frequency where the library's order puts it
+ * (L R C LFE Ls Rs), whichever decoder and whatever order it decodes in. */
+static void test_aac_51_channel_order(void)
+{
+    static const double hz[6] = { 500, 700, 900, 80, 1300, 1700 };
+    fa_stream* s;
+    fa_stream_info info;
+    float* full;
+    int64_t n;
+    uint32_t k;
+    fa_result r = open_file("aac51.m4a", -1, &s);
+    SKIP_NO_FFMPEG(r);
+    CHECK_EQ(r, FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.codec, "aac") == 0);
+    CHECK_EQ(info.format.sample_rate, 48000);
+    CHECK_EQ(info.format.channels, 6);
+    full = read_all(s, 6, &n);
+    CHECK_EQ(n, 24000);
+    for (k = 0; k < 6; k++) {
+        double f = freq(full + k, 4800, 19200, 6, 48000);
+        printf("  channel %u: %.1f Hz (want %.0f), RMS %.3f\n", k, f, hz[k], rms(full + k, 4800, 19200, 6));
+        CHECK_NEAR(f, hz[k], hz[k] * 0.02);
+        CHECK_NEAR(rms(full + k, 4800, 19200, 6), 0.2121, 0.05);
+    }
+    free(full);
+    fa_stream_close(s);
 }
 
 /* ---- MP3 files (dec_mp3.c) ---------------------------------------------------------- */
@@ -1156,10 +1433,14 @@ int main(void)
     printf("FFmpeg %s\n", fa_ffmpeg_load(NULL) == FA_OK ? "found" : "not found: AAC and Opus tracks are skipped");
 
     RUN(test_aac_config_explicit_rates);
+    RUN(test_os_codec_helpers);
     RUN(test_registry_lists_containers);
     RUN(test_mp4_info_and_tracks);
     RUN(test_mp4_mp3_seek_is_exact);
     RUN(test_m4a_aac);
+    RUN(test_m4a_alac);
+    RUN(test_alac_against_flac);
+    RUN(test_aac_51_channel_order);
     RUN(test_mov_pcm);
     RUN(test_fragmented_mp4);
     RUN(test_mkv_tracks_and_seek);

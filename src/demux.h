@@ -136,6 +136,9 @@ void fa_track_close(fa_track* t);
 int64_t fa_demux_packet_samples(const char* codec, uint32_t channels, uint32_t rate,
                                 const uint8_t* d, size_t n, uint32_t* out_rate);
 
+/* AAC's sampling frequency table (ISO/IEC 14496-3 1.6.3.4), by index. */
+extern const uint32_t fa_aac_rates[13];
+
 /* AudioSpecificConfig for AAC from the container's rate and channels, for files
  * that do not carry one. `sbr_rate` > rate signals HE-AAC. Returns its size. */
 /* At most 5 + 28 + 4 + 28 + 5 + 3 = 73 bits: two explicit 24-bit rates with SBR. */

@@ -1151,6 +1151,26 @@ static void test_icy_radio_decode_only(void)
 
 #define AAC_FRAMES (130 * 1024)   /* 131 frames less the priming */
 
+/* Two decodes of the same AAC: the same audio, as a signal to noise ratio in dB
+ * over the first `n` samples (any decoder: the system's on Windows, macOS, iOS and
+ * Android, FFmpeg elsewhere). Where FFmpeg decodes, they are the same to the bit. */
+static double snr_db(const float* got, const float* ref, size_t n)
+{
+    double sig = 0, err = 0;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        sig += (double)ref[i] * ref[i];
+        err += ((double)got[i] - ref[i]) * ((double)got[i] - ref[i]);
+    }
+    if (err == 0) return 200.0;
+    return 10.0 * log10(sig / err);
+}
+#if defined(_WIN32) || defined(__APPLE__) || defined(__ANDROID__)
+#  define AAC_BIT_EXACT 0
+#else
+#  define AAC_BIT_EXACT 1
+#endif
+
 /* An .aac file on a web server: length and seeks estimated from the frame sizes,
  * every frame decoded. */
 static void test_aac_over_http(void)
@@ -1176,8 +1196,9 @@ static void test_aac_over_http(void)
     ref = read_all_memory(g_aac, g_aac_n, &ref_n);
     CHECK_EQ(n, AAC_FRAMES);
     CHECK_EQ(ref_n, AAC_FRAMES);
+    CHECK(snr_db(got, ref, AAC_FRAMES * 2) > 60.0);
     for (i = 0; i < AAC_FRAMES * 2 && i < n * 2; i++) err += fabs(got[i] - ref[i]);
-    CHECK(err < 1e-3);
+    if (AAC_BIT_EXACT) CHECK(err < 1e-3);
     /* A seek by estimated byte position: lands on a frame boundary near the target. */
     CHECK_EQ(fa_stream_seek(s, 88200), FA_OK);
     CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
@@ -1322,8 +1343,9 @@ static void test_hls_aac(void)
     ref = read_all_memory(g_aac, g_aac_n, &ref_n);
     printf("  hls %lld frames, file %lld\n", (long long)n, (long long)ref_n);
     CHECK_EQ(n, ref_n);
+    CHECK(n >= 44100 && snr_db(got, ref, 44100 * 2) > 60.0);
     for (i = 0; i < 44100 * 2 && i < n * 2; i++) err += fabs(got[i] - ref[i]);
-    CHECK(err < 1e-3);
+    if (AAC_BIT_EXACT) CHECK(err < 1e-3);
     /* Into the last segment: the position is exact, the audio settles within a frame. */
     {
         fa_frames target = (fa_frames)((g_aseg_dur[0] + g_aseg_dur[1]) * 44100) + 3000;

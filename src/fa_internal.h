@@ -930,6 +930,9 @@ struct fa_codec {
     /* fa_dynamic_range of the stream, read on every packet (NULL = full range).
      * Set by the owner after fa_codec_open. */
     fa_atomic32* dynamic_range;
+    /* Its audio can come out a packet or more after the packet that holds it (the
+     * systems' decoders): the track decoder anchors the audio on the first packet. */
+    int trails;
 };
 
 /* Opens a decoder for `p` (validated). FA_ERROR_PROVIDER_MISSING: needs FFmpeg,
@@ -968,11 +971,44 @@ int fa_sample_kind(fa_sample_format f, int* out_planar);
 /* ffmpeg.c */
 fa_result fa_ffmpeg_open_codec(fa_codec* c, const fa_codec_params* p);
 #ifdef _WIN32
-/* codec_mf.c: Windows Media Audio (wmav1, wmav2, wmapro, wmalossless, wmavoice)
- * through Media Foundation's decoders. FA_ERROR_UNSUPPORTED_FORMAT for any other
- * codec or when Media Foundation is not there (Windows N): FFmpeg is tried next. */
+/* codec_mf.c: Windows Media Audio (wmav1, wmav2, wmapro, wmalossless, wmavoice),
+ * and AAC (LC, HE, HE v2) through Media Foundation's
+ * decoders. FA_ERROR_UNSUPPORTED_FORMAT for any other codec, or when Media
+ * Foundation or the decoder is not there (Windows N): FFmpeg is tried next. */
 fa_result fa_mf_codec_open(fa_codec* c, const fa_codec_params* p);
 #endif
+#ifdef __APPLE__
+/* codec_at.c: AAC (LC, HE, HE v2, xHE where the system has it) through
+ * AudioToolbox's AudioConverter. FA_ERROR_UNSUPPORTED_FORMAT: FFmpeg next. */
+fa_result fa_at_codec_open(fa_codec* c, const fa_codec_params* p);
+#endif
+#ifdef __ANDROID__
+/* codec_mediacodec.c: AAC through the NDK's AMediaCodec (libmediandk.so,
+ * loaded at run time). FA_ERROR_UNSUPPORTED_FORMAT: FFmpeg next. */
+fa_result fa_mc_codec_open(fa_codec* c, const fa_codec_params* p);
+#endif
+
+/* codec_os.c: stream details for the operating systems' AAC decoders. */
+typedef struct fa_aac_asc_info {
+    int object_type;            /* of the core: 2 = LC (after explicit SBR/PS signalling) */
+    uint32_t rate;              /* core sampling rate */
+    uint32_t ext_rate;          /* SBR output rate, 0 if not signalled */
+    uint32_t channel_config;    /* 0: a program config element says */
+    int sbr, ps;                /* 1 signalled, 0 signalled absent, -1 not said (implicit) */
+} fa_aac_asc_info;
+int fa_aac_parse_asc(const uint8_t* p, size_t n, fa_aac_asc_info* out);   /* 1 if valid */
+uint32_t fa_aac_config_channels(uint32_t config);
+/* The AudioSpecificConfig to hand an OS decoder (the extradata, else built for ADTS
+ * frames); 0 if none can be had. */
+size_t fa_aac_os_asc(const fa_codec_params* p, int he_guess, uint8_t* out, size_t cap);
+/* Takes the header off a packet that is one whole ADTS frame: 1; not ADTS: 0;
+ * several raw data blocks in the frame: -1. */
+int fa_adts_strip(const uint8_t** data, size_t* size);
+/* An MPEG-4 ES descriptor holding the AudioSpecificConfig (an 'esds' box's contents). */
+size_t fa_aac_esds(const uint8_t* asc, size_t n, uint8_t* out, size_t cap);
+/* From Core Audio channel labels to the library's channel order: src_of_dst[i] is the
+ * decoder's channel for the library's channel i; 1 if it is not the identity. */
+int fa_os_channel_map(const uint32_t* labels, uint32_t n, uint32_t* src_of_dst);
 /* Sets a decoder option (AVOption, searched in the decoder's own options too) on
  * a codec fa_ffmpeg_open_codec opened. */
 void fa_ffmpeg_codec_option(fa_codec* c, const char* name, const char* value);
@@ -980,6 +1016,14 @@ void fa_ffmpeg_codec_option(fa_codec* c, const char* name, const char* value);
 /* codec_flac.c: the built-in FLAC codec (dr_flac), one frame per packet.
  * FA_ERROR_UNSUPPORTED_FORMAT without STREAMINFO or usable parameters. */
 fa_result fa_flac_codec_open(fa_codec* c, const fa_codec_params* p);
+/* codec_alac.c: the built-in ALAC decoder, from the ALACSpecificConfig (bare, in
+ * its 'alac' box, or after a 'frma' box) in the extradata. */
+fa_result fa_alac_codec_open(fa_codec* c, const fa_codec_params* p);
+typedef struct fa_alac_info {
+    const uint8_t* config;      /* the 24-byte ALACSpecificConfig, within the extradata */
+    uint32_t frame_length, rate, channels, bit_depth;
+} fa_alac_info;
+int fa_alac_parse_config(const uint8_t* p, size_t n, fa_alac_info* out);   /* 1 if valid */
 /* Rate, channels and bit depth from a 34-byte FLAC STREAMINFO. */
 void fa_flac_streaminfo_format(const uint8_t* si, uint32_t* rate, uint32_t* channels, uint32_t* bits);
 
