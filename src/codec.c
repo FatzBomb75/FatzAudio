@@ -388,7 +388,7 @@ static fa_result mp3_decode(fa_codec* c, const uint8_t* data, size_t size)
         c->out_frames += frames;
         pos += flen > 0 ? (size_t)flen : (size_t)used;
     }
-    memmove(st->buf, st->buf + pos, st->len - pos);
+    if (pos > 0) memmove(st->buf, st->buf + pos, st->len - pos);
     st->len -= pos;
     if (st->len > 65536) st->len = 0;           /* garbage that never syncs: drop it */
     return FA_OK;
@@ -452,15 +452,17 @@ static fa_result os_codec_open(fa_codec* c, const fa_codec_params* p)
 /* AAC in ADTS frames (no AudioSpecificConfig: .aac files, radio, HLS). The system's
  * decoders are set up once from a configuration, while every ADTS header carries its
  * own, so each header is read here: when the rate, channels or profile change (an
- * HLS variant switch) the system's decoder is set up again, and frames it cannot
- * take (a layout in a program config element, several raw data blocks per frame,
- * profiles other than LC) go to FFmpeg from then on. */
+ * HLS variant switch) the system's decoder hands out what it still holds and is set
+ * up again, and frames it cannot take (a layout in a program config element, several
+ * raw data blocks per frame, profiles other than LC) go to FFmpeg from then on. */
 typedef struct adts_state {
     fa_codec inner;
     fa_codec_params p;
     char name[32];
     uint32_t key;           /* the frames `inner` is set up for; 0 = from the parameters */
     int ffmpeg;             /* `inner` is FFmpeg's */
+    uint8_t* held;          /* the first packet of a new format, fed after the old audio */
+    size_t held_size, held_cap;
 } adts_state;
 
 /* Profile, rate index and channel configuration of one whole ADTS frame (0 if the
@@ -479,25 +481,38 @@ static uint32_t adts_key(const uint8_t* d, size_t n, int* os)
     return 0x1000u | (profile << 8) | (rate_i << 4) | config;
 }
 
-static void adts_sync(fa_codec* c, adts_state* st)
+/* Adds what `inner` just gave to c->out (all of one format within a call). */
+static fa_result adts_take(fa_codec* c, adts_state* st)
 {
-    c->out = st->inner.out;
-    c->out_frames = st->inner.out_frames;
-    c->out_cap = st->inner.out_cap;
-    if (st->inner.rate) c->rate = st->inner.rate;
-    if (st->inner.channels) c->channels = st->inner.channels;
+    fa_codec* in = &st->inner;
+    fa_result r;
+    if (in->out_frames <= 0 || in->rate == 0 || in->channels == 0) return FA_OK;
+    if (c->out_frames > 0 && (c->rate != in->rate || c->channels != in->channels)) return FA_OK;   /* cannot happen */
+    r = fa_codec_reserve(c, in->out_frames, in->channels);
+    if (r != FA_OK) return r;
+    memcpy(c->out + (size_t)c->out_frames * in->channels, in->out, (size_t)in->out_frames * in->channels * sizeof(float));
+    c->out_frames += in->out_frames;
+    c->rate = in->rate;
+    c->channels = in->channels;
+    return FA_OK;
 }
 
-/* Sets `inner` up again for frames of `key`. */
-static fa_result adts_reopen(adts_state* st, uint32_t key, int os)
+/* Sets `inner` up again for frames of `key`, after taking what the old one held. */
+static fa_result adts_reopen(fa_codec* c, adts_state* st, uint32_t key, int os)
 {
     fa_codec_params p = st->p;
     fa_result r = FA_ERROR_UNSUPPORTED_FORMAT;
+    int i;
+    for (i = 0; i < 16 && st->inner.vt; i++) {
+        if (st->inner.vt->decode(&st->inner, NULL, 0) != FA_OK || st->inner.out_frames <= 0) break;
+        r = adts_take(c, st);
+        if (r != FA_OK) return r;
+    }
     fa_codec_close(&st->inner);
     p.sample_rate = fa_aac_rates[(key >> 4) & 15];
     p.channels = fa_aac_config_channels(key & 15);
     if (p.channels == 0) p.channels = st->p.channels;
-    if (os) r = os_codec_open(&st->inner, &p);
+    r = os ? os_codec_open(&st->inner, &p) : FA_ERROR_UNSUPPORTED_FORMAT;
     if (r != FA_OK) {
         fa_codec_close(&st->inner);
         r = fa_ffmpeg_open_codec(&st->inner, &p);
@@ -512,11 +527,12 @@ static fa_result adts_reopen(adts_state* st, uint32_t key, int os)
     return FA_OK;
 }
 
-static fa_result adts_decode(fa_codec* c, const uint8_t* data, size_t size)
+/* One packet into `inner`, its audio added to c->out. A packet that starts a new
+ * format while c->out holds the old one's waits for the next call. */
+static fa_result adts_feed(fa_codec* c, adts_state* st, const uint8_t* data, size_t size)
 {
-    adts_state* st = (adts_state*)c->impl;
     fa_result r;
-    if (data && size > 0 && !st->ffmpeg) {
+    if (!st->ffmpeg) {
         int os = 1;
         uint32_t key = adts_key(data, size, &os);
         if (key && key != st->key) {
@@ -526,12 +542,18 @@ static fa_result adts_decode(fa_codec* c, const uint8_t* data, size_t size)
             if (same) {
                 st->key = key;
             } else {
-                r = adts_reopen(st, key, os);
-                if (r != FA_OK) {
-                    c->out = NULL;
-                    c->out_frames = 0;
-                    c->out_cap = 0;
-                    return r;
+                r = adts_reopen(c, st, key, os);
+                if (r != FA_OK) return r;
+                if (c->out_frames > 0) {
+                    if (size > st->held_cap) {
+                        uint8_t* h = (uint8_t*)realloc(st->held, size);
+                        if (!h) return FA_ERROR_OUT_OF_MEMORY;
+                        st->held = h;
+                        st->held_cap = size;
+                    }
+                    memcpy(st->held, data, size);
+                    st->held_size = size;
+                    return FA_OK;
                 }
             }
         }
@@ -539,13 +561,34 @@ static fa_result adts_decode(fa_codec* c, const uint8_t* data, size_t size)
     if (!st->inner.vt) return FA_ERROR_UNSUPPORTED_FORMAT;
     st->inner.dynamic_range = c->dynamic_range;
     r = st->inner.vt->decode(&st->inner, data, size);
-    adts_sync(c, st);
-    return r;
+    if (r != FA_OK) return r;
+    return adts_take(c, st);
+}
+
+static fa_result adts_decode(fa_codec* c, const uint8_t* data, size_t size)
+{
+    adts_state* st = (adts_state*)c->impl;
+    fa_result r;
+    c->out_frames = 0;
+    if (st->held_size > 0) {
+        size_t n = st->held_size;
+        st->held_size = 0;
+        r = adts_feed(c, st, st->held, n);
+        if (r != FA_OK && r != FA_ERROR_UNSUPPORTED_FORMAT) return r;
+    }
+    if (data && size > 0) return adts_feed(c, st, data, size);
+    if (c->out_frames > 0 || !st->inner.vt) return FA_OK;
+    /* The end: what the decoder still holds. */
+    st->inner.dynamic_range = c->dynamic_range;
+    r = st->inner.vt->decode(&st->inner, NULL, 0);
+    if (r != FA_OK) return r;
+    return adts_take(c, st);
 }
 
 static void adts_flush(fa_codec* c)
 {
     adts_state* st = (adts_state*)c->impl;
+    st->held_size = 0;
     if (st->inner.vt && st->inner.vt->flush) st->inner.vt->flush(&st->inner);
 }
 
@@ -554,10 +597,10 @@ static void adts_close(fa_codec* c)
     adts_state* st = (adts_state*)c->impl;
     if (st) {
         fa_codec_close(&st->inner);
+        free(st->held);
         free(st);
     }
     c->impl = NULL;
-    c->out = NULL;          /* was the inner codec's */
 }
 
 static const fa_codec_vtable adts_vtable = { "aac", adts_decode, adts_flush, adts_close };
@@ -580,7 +623,8 @@ static fa_result adts_open(fa_codec* c, const fa_codec_params* p)
     c->vt = &adts_vtable;
     c->impl = st;
     c->trails = st->inner.trails;
-    adts_sync(c, st);
+    c->rate = st->inner.rate;
+    c->channels = st->inner.channels;
     return FA_OK;
 }
 

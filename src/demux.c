@@ -296,6 +296,8 @@ static fa_result emit(fa_track* t, const fa_demux_packet* pk)
     dc = pk->duration >= 0 ? (fa_frames)llround((double)pk->duration * t->fpt) : -1;
     d = packet_frames(t, pk->data, pk->size);
     if (d < 0 && t->p.precision == 0) d = dc;
+    /* A system decoder's output may be an earlier packet's: the count is its own. */
+    if (t->codec.trails) d = dc = -1;
 
     if (placing) {
         fa_frames gap_from = t->next_pos;
@@ -399,8 +401,12 @@ static fa_result fill(fa_track* t)
             /* The codec gives back what it still holds (decoders with delayed
              * output), one block per call until it has nothing left. */
             t->draining = 1;
-            if (t->format_known && t->codec.vt->decode(&t->codec, NULL, 0) == FA_OK && t->codec.out_frames > 0 &&
+            if (t->codec_ready && t->codec.vt->decode(&t->codec, NULL, 0) == FA_OK && t->codec.out_frames > 0 &&
                 t->codec.rate != 0 && t->codec.channels != 0) {
+                /* A trailing decoder may give a short file's first audio only now. */
+                if (!t->format_known) learn_format(t);
+                if (t->quiet && t->place) pk.pts = t->quiet_pts;
+                t->quiet = 0;
                 r = emit(t, &pk);
                 if (r != FA_OK) return r;
                 continue;
