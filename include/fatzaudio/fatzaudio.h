@@ -378,7 +378,9 @@ FA_API fa_result FA_CALL fa_stream_get_buffered(fa_stream* stream, fa_time* out_
 
 /* ---- FFmpeg at runtime ------------------------------------------------------
  * FatzAudio never links or bundles FFmpeg. When a packet stream needs a codec it
- * has no decoder of its own for, it uses the libavcodec and libavutil of your app:
+ * has no decoder of its own for, and the system has none either (the system
+ * decodes AAC and ALAC on Windows, macOS, iOS and Android, and WMA on Windows),
+ * it uses the libavcodec and libavutil of your app:
  *   1. the ones already loaded in the process (your app's FFmpeg), else
  *   2. the ones the system loader finds (next to your executable, PATH, ...).
  * fa_ffmpeg_load(directory) loads them from a folder instead (call it first).
