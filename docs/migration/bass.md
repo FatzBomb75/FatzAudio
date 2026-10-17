@@ -4,6 +4,8 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 
 **Goal:** after migration the app ships one native library per platform (`fatzaudio.dll`/`.dylib`/`.so`) and none of the BASS DLLs.
 
+On Android and iOS BASS also comes as the core library plus one library per add-on (`libbass.so`, `libbass_fx.so` and so on in each Android ABI folder). FatzAudio replaces them all with one `libfatzaudio.so` per ABI and one `fatzaudio.xcframework` ([Building](../building.md)). Delete the add-on libraries and their `BASS_PluginLoad` calls there too.
+
 ## 1. What changes conceptually
 
 | BASS | FatzAudio | Why it matters when porting |
