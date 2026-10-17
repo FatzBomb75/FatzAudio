@@ -10,15 +10,16 @@ A stream is anything that produces audio. You open it from a file, a memory bloc
 | FLAC | Native FLAC, with or without a leading ID3v2 tag | `flac` |
 | MP3 | MPEG-1, 2 and 2.5 Layer III, with or without ID3v2 tags | `mp3` |
 | AAC (ADTS) | `.aac` files, AAC internet radio and AAC in HLS segments: AAC-LC, HE-AAC and HE-AAC v2 in ADTS frames, with or without ID3v2 tags | `aac` (container `adts`) |
+| Ogg Opus, Ogg Vorbis | `.opus`, `.ogg`, `.oga`, including chained files (one song after another) and Ogg files with several streams ([Ogg](#ogg-opus-and-ogg-vorbis)) | `opus` or `vorbis` (container `ogg`) |
 | MP4, M4A, MOV | ISO MP4 and QuickTime, including fragmented MP4. Audio tracks only: video is never read | the track's codec: `aac`, `mp3`, `ac3`, `eac3`, `opus`, `flac`, `alac`, `pcm_*`, ... (container `mp4` or `mov`) |
 | Matroska, WebM | MKV, MKA, WebM, including live layouts (unknown sizes, no Cues). Audio tracks only | `aac`, `mp3`, `ac3`, `eac3`, `opus`, `vorbis`, `flac`, `pcm_*`, ... (container `matroska` or `webm`) |
 | Dolby Digital, Dolby Digital Plus | Raw `.ac3` and `.ec3` streams, up to 7.1 ([Dolby Digital](dolby.md)) | `ac3` or `eac3` (container `ac3` or `ec3`) |
 
-Inside MP4 and Matroska, PCM, MP3, AC-3 and E-AC-3 tracks decode built in; every other codec (AAC, Opus, Vorbis, FLAC, ALAC, DTS, TrueHD) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`. The same goes for `.aac` files and AAC streams.
+Inside MP4 and Matroska, PCM, MP3, AC-3, E-AC-3, Opus and Vorbis tracks decode built in; every other codec (AAC, FLAC, ALAC, DTS, TrueHD) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`. The same goes for `.aac` files and AAC streams.
 
 An `.aac` file on disk or in memory is indexed when it opens (a quick pass over the frame headers, without decoding), so its length and seeks are exact. Over the network, and from your own read callbacks when they can seek, the length and seek positions are estimated from the frame sizes at the start, as for MP3 without a seek table. Junk between frames, such as a radio stream joined in the middle of a frame or ID3 tags between HLS segments, is skipped.
 
-More formats are added to the same registry (Ogg Vorbis and Opus, and built-in or OS decoders for the codecs above follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
+More formats are added to the same registry (WMA, MIDI, and built-in or OS decoders for the codecs above follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
 
 Apps that demux files themselves (for example with FFmpeg, for the video) can push compressed packets or decoded frames instead of opening a file: see [FFmpeg hand-off and A/V sync](ffmpeg.md).
 
@@ -26,7 +27,7 @@ Apps that demux files themselves (for example with FFmpeg, for the video) can pu
 
 1. The first 8 KB of the source are read once and kept, so detection works even on sources that can't seek.
 2. A leading ID3v2 tag is skipped. If the tag is bigger than the 8 KB window (cover art often is), detection reads the 8 KB right after it instead. A forward-only source can't do that, so there the file name or `mime_hint` picks the decoder.
-3. Every decoder in the registry scores the data from 0 to 100: magic bytes for WAV/AIFF/FLAC, two chained valid frame headers for MP3.
+3. Every decoder in the registry scores the data from 0 to 100: magic bytes for WAV/AIFF/FLAC/Ogg, two chained valid frame headers for MP3.
 4. The best-scoring decoder opens the stream. If it rejects the data, the next candidate gets a turn.
 5. The file extension and `mime_hint` only break ties. A FLAC file named `song.mp3` still opens as FLAC.
 
@@ -173,6 +174,27 @@ In .NET, `stream.PlayOn(device)` attaches (or moves) and plays, and `stream.Deta
 - `fa_stream_open_memory` copies the data, so you can free your buffer right after the call.
 - Paths are UTF-8. On Windows FatzAudio converts them to UTF-16 internally, so non-ASCII file names work.
 - `audio_track` greater than 0 returns `FA_ERROR_NOT_FOUND` for single-track formats.
+
+## Ogg Opus and Ogg Vorbis
+
+Opus and Vorbis decode with libopus and libvorbis, compiled into the library: no FFmpeg, no extra DLL. The same decoders play Opus and Vorbis tracks in WebM, Matroska and MP4, and raw Opus packets pushed by your app ([FFmpeg hand-off](ffmpeg.md)), which replaces bassopus's `BASS_OPUS_StreamCreate` + `BASS_StreamPutData`.
+
+```c
+fa_stream* s;
+fa_stream_open_path(engine, "song.opus", NULL, &s);     /* or .ogg, .oga */
+```
+
+```csharp
+using var s = engine.OpenFile("song.opus");
+```
+
+- **Length and seeking** are sample exact. The length comes from the last page's granule position, Opus pre-skip is dropped, and the end is trimmed where the encoder padded it. Opus restarts 80 ms before a seek target, as the format asks.
+- **Output gain** in the Opus header is applied, and ReplayGain / R128 tags in the comment header (`R128_TRACK_GAIN` in OpusTags, `REPLAYGAIN_*` in Vorbis comments) feed normalization like any other tags ([normalization](normalization.md)).
+- **Channels:** up to 8 channels come out in the standard speaker order (see [Dolby Digital](dolby.md#channels)), not Ogg's own order. Quadraphonic sound plays as 5 channels with a silent centre. Opus ambisonics (mapping family 2) plays its channels as they are; family 3 needs FFmpeg.
+- **Chained files** (songs joined one after another, each with its own headers) play straight through. The first song sets the stream's rate and channels; later songs with a different format are converted. On a seekable local file the length and seeking cover every song (the file's page headers are read once at open). A chained file over HTTP plays through but can't seek.
+- **Several streams in one file** (for example Ogg with video, or two audio languages): `audio_track` picks among the audio streams that start the file, as for MP4 and Matroska.
+- **Web radio:** Ogg Opus and Ogg Vorbis stations work, and each song's title comes from its comment header ([web streams](web-streams.md#song-titles-icy-metadata)).
+- Not supported: Ogg FLAC and Speex (FLAC follows with the FLAC work), and Ogg streams that start without their headers.
 
 ## Video files and audio tracks
 

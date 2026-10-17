@@ -1,6 +1,6 @@
 /* Loudness tags: ReplayGain 2 (REPLAYGAIN_TRACK_GAIN etc., reference -18 LUFS)
  * and R128 (R128_TRACK_GAIN, Q7.8 dB relative to -23 LUFS), read from ID3v2 TXXX
- * frames, FLAC Vorbis comments and APEv2 tags. Only the frames that can hold them
+ * frames, FLAC and Ogg Vorbis comments (OpusTags too) and APEv2 tags. Only the frames that can hold them
  * are read; pictures and other large frames are skipped with a seek. */
 #include "fa_internal.h"
 #include <math.h>
@@ -246,5 +246,6 @@ void fa_tags_read_loudness(fa_source* src, fa_tag_loudness* out)
     if (!src->seekable) return;
     id3 = read_id3v2(src, out);
     read_flac(src, id3, out);
+    fa_ogg_read_loudness(src, out);
     read_ape(src, out);
 }

@@ -59,10 +59,10 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 
 | BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
-| BASS_StreamCreateFile (path) | `fa_stream_open_path`; format detected from content ([streams](../features/streams.md)) | `engine.OpenFile(path)` | ✅ WAV/AIFF/MP3/FLAC so far |
+| BASS_StreamCreateFile (path) | `fa_stream_open_path`; format detected from content ([streams](../features/streams.md)) | `engine.OpenFile(path)` | ✅ WAV/AIFF/MP3/FLAC/OGG/Opus so far |
 | BASS_StreamCreateFile (memory) | `fa_stream_open_memory` | `engine.OpenMemory(bytes)` | ✅ |
 | BASS_StreamCreateFileUser | `fa_stream_open_io`; `close` is called once by `fa_stream_close`, never on a failed open ([custom I/O](../features/streams.md#custom-io-your-own-reader)) | `engine.OpenStream(System.IO.Stream)` | ✅ |
-| BASS_StreamCreateURL | `fa_stream_open_url`: HTTP/HTTPS files with range seeking, Icecast/Shoutcast radio, HLS, `.pls`/`.m3u`; reconnects by itself ([web streams](../features/web-streams.md)) | `engine.OpenUrl(url)` | ✅ (AAC through the app's FFmpeg) |
+| BASS_StreamCreateURL | `fa_stream_open_url`: HTTP/HTTPS files with range seeking, Icecast/Shoutcast radio, HLS, `.pls`/`.m3u`; reconnects by itself ([web streams](../features/web-streams.md)) | `engine.OpenUrl(url)` | ✅ WAV/FLAC/MP3/OGG/Opus/AC-3 built in (AAC through the app's FFmpeg) |
 | BASS_StreamCreateURL `DOWNLOADPROC` (raw bytes to save a station) | Planned | | 🗓️ |
 | BASS_StreamCreateURL `BASS_STREAM_BLOCK` | Not needed: memory per web stream is bounded (4 MB) and seeking still works | — | ➖ (by design) |
 | BASS_StreamCreateURL `BASS_STREAM_STATUS` (+ `BASS_TAG_HTTP` during connect) | `fa_stream_get_http_header` and `fa_stream_get_net_status` after the open | `GetHttpHeader`, `NetworkStatus` | ✅ |
@@ -156,7 +156,7 @@ BASS has no normalization: apps measure each file themselves with a decode pass 
 | Storing your analysis result and reapplying it next time | `fa_stream_set_loudness` (wins over everything); results cached automatically in `fa_engine_config.cache_directory` | `stream.SetLoudness(lufs)`, `AudioEngineOptions.CacheDirectory` | ✅ |
 | Analysing files ahead of playback (library import) | `fa_scan_loudness_path`: audio only, all cores, cached | `engine.ScanLoudness(path)` | ✅ |
 | `BASS_ATTRIB_VOLDSP` to boost above 1.0 | Normalization gain is separate from `FA_PARAM_VOLUME` and boosts up to +12 dB; volume stays free for fades | automatic | ✅ |
-| Reading ReplayGain tags yourself (`BASS_ChannelGetTags` + parsing) | Read automatically: ID3v2 `TXXX`, FLAC Vorbis comments, APEv2; RG2 and R128 | automatic | ✅ |
+| Reading ReplayGain tags yourself (`BASS_ChannelGetTags` + parsing) | Read automatically: ID3v2 `TXXX`, FLAC and Ogg Vorbis comments, OpusTags, APEv2; RG2 and R128 | automatic | ✅ |
 | BASSloud: `BASS_Loudness_Start` / `GetLevel` (integrated, range, true peak) | `fa_stream_get_loudness`, `fa_scan_loudness_path` (BS.1770-4 / R128) | `GetLoudness()`, `ScanLoudness()` | ✅ integrated, range, true peak; momentary/short-term meters 🗓️ |
 | bass_fx `BASS_FX_BFX_DAMP` (dynamic amplification) on live streams | Running loudness estimate drives the gain for streams that can't be scanned | automatic | ✅ |
 | bass_fx `BASS_FX_BFX_COMPRESSOR2` used to stop clipping | `fa_engine_set_limiter`: true-peak, look-ahead, on every device | `engine.SetLimiter(...)` | ✅ |
@@ -238,6 +238,23 @@ AC-3 and E-AC-3 are built-in formats: the ordinary open calls play them, in raw 
 | AC-3 packets from your own FFmpeg demuxer | `fa_stream_open_packets` with codec `ac3` / `eac3`, decoded natively | `engine.OpenPackets` | ✅ |
 | Passthrough to an AV receiver (S/PDIF, HDMI) | Not provided | — | 🗓️ |
 
+### bassopus and OGG Vorbis
+
+Opus and Vorbis are built-in formats: `.opus` and `.ogg` files, chained files, Ogg web radio, and Opus or Vorbis tracks in WebM, Matroska and MP4 all open with the ordinary calls, with no plugin and no FFmpeg ([Ogg Opus and Ogg Vorbis](../features/streams.md#ogg-opus-and-ogg-vorbis)).
+
+| BASS / bassopus | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| BASS_StreamCreateFile on `.ogg` (built into bass.dll) | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ |
+| BASS_OPUS_StreamCreateFile | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ |
+| BASS_OPUS_StreamCreateURL | `fa_stream_open_url`; Ogg radio song titles come from each song's comments | `engine.OpenUrl` | ✅ |
+| BASS_OPUS_StreamCreateFileUser | `fa_stream_open_io` | `engine.OpenStream` | ✅ |
+| BASS_OPUS_StreamCreate (`BASS_OPUS_HEAD`) + BASS_OPUS_StreamPutData (raw packets) | `fa_stream_open_packets` with codec `opus`, the `OpusHead` as extradata (or none for plain mono/stereo), then `fa_stream_push_packet` ([FFmpeg hand-off](../features/ffmpeg.md)) | `engine.OpenPackets`, `PushPacket` | ✅ |
+| BASS_PluginLoad("bassopus.dll") | Not needed: built in | — | ➖ (by design) |
+| BASS_CONFIG_OGG_PRESCAN (exact length and seeking of chained/VBR files) | Always exact: the length comes from the last page, chained files are read once at open | automatic | ✅ |
+| BASS_ATTRIB_OPUS_GAIN / the header's output gain | The header gain is applied; add your own with the stream volume | `stream.Volume` | ✅ |
+| BASS_ATTRIB_OPUS_ORIGFREQ (the encoder's input rate) | Not exposed: Opus always decodes at 48 kHz | — | ➖ |
+| BASS_ChannelGetTags(BASS_TAG_OGG) | ReplayGain / R128 comments are used for normalization automatically, and radio titles come through `fa_stream_get_metadata`; a general tag reader is planned | | 🗓️ |
+
 ### bass_fx tempo, pitch and rate
 
 bass_fx needs a decode stream wrapped in a separate tempo stream; FatzAudio puts three parameters on every stream ([tempo and pitch](../features/tempo-pitch.md)).
@@ -317,8 +334,9 @@ basscd is an add-on DLL; FatzAudio reads CDs and `.cue` images itself, with one 
 | bass_ac3.dll | Built-in AC-3 and E-AC-3 decoder: raw `.ac3`/`.ec3` files, MP4/MKV tracks, web streams and HLS, and pushed packets, with dynamic range modes ([Dolby Digital](../features/dolby.md)) | ✅ (passthrough 🗓️) |
 | bassflac.dll | Built-in | ✅ |
 | basshls.dll (if used) | Built-in: `fa_stream_open_url` plays `.m3u8` (MPEG-TS, fMP4, AES-128) | ✅ (AAC segments through the app's FFmpeg) |
-| bassopus.dll | Built-in (incl. raw packet push) | 🗓️ |
-| basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM and MP3 tracks built in, Opus, Vorbis, AAC and others through the app's FFmpeg ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ (built-in Opus/Vorbis decoders 🗓️) |
+| bassopus.dll | Built-in: `.opus` files, Opus web radio, Opus in WebM/MKV/MP4, and raw packets through `fa_stream_open_packets` ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
+| basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM, MP3, AC-3, Opus and Vorbis tracks built in, AAC and others through the app's FFmpeg ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ |
+| OGG Vorbis in bass.dll | Built-in: `.ogg` files, chained files, Ogg radio with song titles ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
 | basswma.dll | Decode via Media Foundation on Windows / FFmpeg bridge; encoding not provided | 🗓️ / ➖ |
 | bassmidi.dll | Built-in MIDI synth (SF2, later SFZ/SF3); soundfont via stream options | 🗓️ |
 | bass_fx.dll | Tempo/pitch/rate params on every stream ([tempo and pitch](../features/tempo-pitch.md)); reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | ✅ tempo/pitch/rate and level control, 🗓️ reverse and BPM |

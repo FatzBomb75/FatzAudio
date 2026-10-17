@@ -159,11 +159,10 @@ static void meta_free_entry(fa_net_meta_entry* e)
     memset(e, 0, sizeof(*e));
 }
 
-/* Caller holds the lock. A block that repeats the current title is not a change. */
-static void meta_add(fa_net* n, const char* block)
+/* Caller holds the lock. Takes ownership of title and url. A title that repeats
+ * the current one is not a change. */
+static void meta_push(fa_net* n, char* title, char* url, int64_t byte, int64_t frame)
 {
-    char* title = icy_value(block, "StreamTitle");
-    char* url = icy_value(block, "StreamUrl");
     fa_net_meta_entry* last = n->meta_count > 0 ? &n->meta[n->meta_count - 1] : NULL;
     if (!title && !url) return;
     if (last && strcmp(last->title ? last->title : "", title ? title : "") == 0 &&
@@ -179,11 +178,28 @@ static void meta_add(fa_net* n, const char* block)
         n->meta_count--;
     }
     last = &n->meta[n->meta_count++];
-    last->byte = n->win_end;
-    last->frame = -1;
+    last->byte = byte;
+    last->frame = frame;
     last->seq = ++n->meta_seq;
     last->title = title;
     last->url = url;
+}
+
+/* Caller holds the lock. */
+static void meta_add(fa_net* n, const char* block)
+{
+    meta_push(n, icy_value(block, "StreamTitle"), icy_value(block, "StreamUrl"), n->win_end, -1);
+}
+
+void fa_net_meta_add_frame(fa_net* n, int64_t frame, const char* title)
+{
+    size_t len = strlen(title);
+    char* t = (char*)malloc(len + 1);
+    if (!t) return;
+    memcpy(t, title, len + 1);
+    fa_mutex_lock(&n->lock);
+    meta_push(n, t, NULL, -1, frame);
+    fa_mutex_unlock(&n->lock);
 }
 
 /* Splits ICY metadata out of the body; the audio goes to the window. */
