@@ -7,6 +7,7 @@
  * and these where the system cannot, goes to the app's FFmpeg, loaded at runtime
  * (ffmpeg.c). */
 #include "fa_internal.h"
+#include "demux.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -427,6 +428,164 @@ static fa_result mp3_open(fa_codec* c, const fa_codec_params* p)
 
 /* ---- dispatch ------------------------------------------------------------------- */
 
+#if defined(_WIN32) || defined(__APPLE__) || defined(__ANDROID__)
+#define FA_OS_CODECS 1
+#else
+#define FA_OS_CODECS 0
+#endif
+
+#if FA_OS_CODECS
+
+/* ---- The system's decoders ------------------------------------------------------- */
+
+static fa_result os_codec_open(fa_codec* c, const fa_codec_params* p)
+{
+#if defined(_WIN32)
+    return fa_mf_codec_open(c, p);
+#elif defined(__APPLE__)
+    return fa_at_codec_open(c, p);
+#else
+    return fa_mc_codec_open(c, p);
+#endif
+}
+
+/* AAC in ADTS frames (no AudioSpecificConfig: .aac files, radio, HLS). The system's
+ * decoders are set up once from a configuration, while every ADTS header carries its
+ * own, so each header is read here: when the rate, channels or profile change (an
+ * HLS variant switch) the system's decoder is set up again, and frames it cannot
+ * take (a layout in a program config element, several raw data blocks per frame,
+ * profiles other than LC) go to FFmpeg from then on. */
+typedef struct adts_state {
+    fa_codec inner;
+    fa_codec_params p;
+    char name[32];
+    uint32_t key;           /* the frames `inner` is set up for; 0 = from the parameters */
+    int ffmpeg;             /* `inner` is FFmpeg's */
+} adts_state;
+
+/* Profile, rate index and channel configuration of one whole ADTS frame (0 if the
+ * packet is not one); *os = 0 if the system's decoders cannot take it. */
+static uint32_t adts_key(const uint8_t* d, size_t n, int* os)
+{
+    size_t len;
+    uint32_t profile, rate_i, config;
+    if (n < 7 || d[0] != 0xFF || (d[1] & 0xF6) != 0xF0) return 0;
+    len = ((size_t)(d[3] & 3) << 11) | ((size_t)d[4] << 3) | (d[5] >> 5);
+    profile = d[2] >> 6;
+    rate_i = (d[2] >> 2) & 15;
+    config = ((uint32_t)(d[2] & 1) << 2) | (d[3] >> 6);
+    if (len != n || rate_i >= 13) return 0;
+    *os = profile == 1 && config != 0 && (d[6] & 3) == 0;
+    return 0x1000u | (profile << 8) | (rate_i << 4) | config;
+}
+
+static void adts_sync(fa_codec* c, adts_state* st)
+{
+    c->out = st->inner.out;
+    c->out_frames = st->inner.out_frames;
+    c->out_cap = st->inner.out_cap;
+    if (st->inner.rate) c->rate = st->inner.rate;
+    if (st->inner.channels) c->channels = st->inner.channels;
+}
+
+/* Sets `inner` up again for frames of `key`. */
+static fa_result adts_reopen(adts_state* st, uint32_t key, int os)
+{
+    fa_codec_params p = st->p;
+    fa_result r = FA_ERROR_UNSUPPORTED_FORMAT;
+    fa_codec_close(&st->inner);
+    p.sample_rate = fa_aac_rates[(key >> 4) & 15];
+    p.channels = fa_aac_config_channels(key & 15);
+    if (p.channels == 0) p.channels = st->p.channels;
+    if (os) r = os_codec_open(&st->inner, &p);
+    if (r != FA_OK) {
+        fa_codec_close(&st->inner);
+        r = fa_ffmpeg_open_codec(&st->inner, &p);
+        if (r != FA_OK) {
+            free(st->inner.out);
+            memset(&st->inner, 0, sizeof(st->inner));
+            return r == FA_ERROR_PROVIDER_MISSING ? FA_ERROR_UNSUPPORTED_FORMAT : r;
+        }
+        st->ffmpeg = 1;
+    }
+    st->key = key;
+    return FA_OK;
+}
+
+static fa_result adts_decode(fa_codec* c, const uint8_t* data, size_t size)
+{
+    adts_state* st = (adts_state*)c->impl;
+    fa_result r;
+    if (data && size > 0 && !st->ffmpeg) {
+        int os = 1;
+        uint32_t key = adts_key(data, size, &os);
+        if (key && key != st->key) {
+            /* The first frame only confirms what the parameters said. */
+            int same = st->key == 0 && os && fa_aac_rates[(key >> 4) & 15] == st->p.sample_rate &&
+                       fa_aac_config_channels(key & 15) == st->p.channels;
+            if (same) {
+                st->key = key;
+            } else {
+                r = adts_reopen(st, key, os);
+                if (r != FA_OK) {
+                    c->out = NULL;
+                    c->out_frames = 0;
+                    c->out_cap = 0;
+                    return r;
+                }
+            }
+        }
+    }
+    if (!st->inner.vt) return FA_ERROR_UNSUPPORTED_FORMAT;
+    st->inner.dynamic_range = c->dynamic_range;
+    r = st->inner.vt->decode(&st->inner, data, size);
+    adts_sync(c, st);
+    return r;
+}
+
+static void adts_flush(fa_codec* c)
+{
+    adts_state* st = (adts_state*)c->impl;
+    if (st->inner.vt && st->inner.vt->flush) st->inner.vt->flush(&st->inner);
+}
+
+static void adts_close(fa_codec* c)
+{
+    adts_state* st = (adts_state*)c->impl;
+    if (st) {
+        fa_codec_close(&st->inner);
+        free(st);
+    }
+    c->impl = NULL;
+    c->out = NULL;          /* was the inner codec's */
+}
+
+static const fa_codec_vtable adts_vtable = { "aac", adts_decode, adts_flush, adts_close };
+
+static fa_result adts_open(fa_codec* c, const fa_codec_params* p)
+{
+    adts_state* st = (adts_state*)calloc(1, sizeof(*st));
+    fa_result r;
+    if (!st) return FA_ERROR_OUT_OF_MEMORY;
+    r = os_codec_open(&st->inner, p);
+    if (r != FA_OK) {
+        fa_codec_close(&st->inner);
+        free(st);
+        return r;
+    }
+    st->p = *p;
+    snprintf(st->name, sizeof(st->name), "%s", p->codec);
+    st->p.codec = st->name;
+    st->p.extradata = NULL;
+    c->vt = &adts_vtable;
+    c->impl = st;
+    c->trails = st->inner.trails;
+    adts_sync(c, st);
+    return FA_OK;
+}
+
+#endif /* FA_OS_CODECS */
+
 fa_result fa_codec_open(fa_codec* c, const fa_codec_params* p)
 {
     size_t i;
@@ -458,12 +617,9 @@ fa_result fa_codec_open(fa_codec* c, const fa_codec_params* p)
     }
     /* The system's own decoders first: Windows Media Audio, AAC and ALAC. What
      * they do not take (or a system without them) goes to FFmpeg. */
-#if defined(_WIN32)
-    r = fa_mf_codec_open(c, p);
-#elif defined(__APPLE__)
-    r = fa_at_codec_open(c, p);
-#elif defined(__ANDROID__)
-    r = fa_mc_codec_open(c, p);
+#if FA_OS_CODECS
+    if (strcmp(p->codec, "aac") == 0 && p->extradata_size == 0) r = adts_open(c, p);
+    else r = os_codec_open(c, p);
 #else
     r = FA_ERROR_UNSUPPORTED_FORMAT;
 #endif

@@ -367,9 +367,7 @@ static void codec_settings(fa_track* t, const fa_codec_params* p)
     if (strcmp(p->codec, "opus") == 0 && t->p.seek_preroll_s <= 0) t->p.seek_preroll_s = 0.08;
     /* FFmpeg's WMA 1 and 2 give their first audio a packet or two late; so may the
      * systems' decoders (MediaCodec decodes asynchronously). */
-    t->trails = strcmp(p->codec, "wmav1") == 0 || strcmp(p->codec, "wmav2") == 0 ||
-                (t->codec.vt && (strcmp(t->codec.vt->name, "mf") == 0 || strcmp(t->codec.vt->name, "at") == 0 ||
-                                 strcmp(t->codec.vt->name, "mediacodec") == 0));
+    t->trails = strcmp(p->codec, "wmav1") == 0 || strcmp(p->codec, "wmav2") == 0 || t->codec.trails;
 }
 
 /* A chained stream's next song: its own codec, set up from its own headers. */
@@ -545,7 +543,7 @@ void fa_track_close(fa_track* t)
 
 /* ---- AAC ---------------------------------------------------------------------------- */
 
-static const uint32_t aac_rates[13] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000,
+const uint32_t fa_aac_rates[13] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000,
                                         22050, 16000, 12000, 11025, 8000, 7350 };
 
 typedef struct bitw { uint8_t* p; size_t bit; } bitw;
@@ -562,7 +560,7 @@ static void put_rate(bitw* w, uint32_t rate)
 {
     int i;
     for (i = 0; i < 13; i++)
-        if (aac_rates[i] == rate) { put_bits(w, (uint32_t)i, 4); return; }
+        if (fa_aac_rates[i] == rate) { put_bits(w, (uint32_t)i, 4); return; }
     put_bits(w, 15, 4);
     put_bits(w, rate, 24);
 }

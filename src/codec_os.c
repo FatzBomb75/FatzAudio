@@ -9,9 +9,6 @@
 #include "demux.h"
 #include <string.h>
 
-static const uint32_t asc_rates[13] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000,
-                                        22050, 16000, 12000, 11025, 8000, 7350 };
-
 typedef struct bitr {
     const uint8_t* p;
     size_t n, bit;          /* n in bits */
@@ -45,7 +42,7 @@ static uint32_t get_rate(bitr* r)
 {
     uint32_t i = get_bits(r, 4);
     if (i == 15) return get_bits(r, 24);
-    return i < 13 ? asc_rates[i] : 0;
+    return i < 13 ? fa_aac_rates[i] : 0;
 }
 
 /* ISO/IEC 14496-3 1.6.2.1 AudioSpecificConfig, as far as the decoders' setup needs:
@@ -124,9 +121,10 @@ uint32_t fa_aac_config_channels(uint32_t config)
 
 /* The AudioSpecificConfig the OS decoders get: the stream's own (MP4, Matroska),
  * or, for ADTS frames (no extradata), LC from the stream's rate and channels. ADTS
- * cannot say HE-AAC (SBR and PS are only found in the audio), so `he_guess` asks
- * for SBR to be signalled at low rates (and PS for mono), for a decoder that does
- * not find it by itself; an HE decoder plays plain LC too. */
+ * cannot say HE-AAC, nor can an MP4 config that leaves SBR implicit (SBR and PS are
+ * then only found in the audio), so `he_guess` asks for SBR to be signalled at low
+ * rates (and PS for mono), for a decoder that does not find it by itself; an HE
+ * decoder plays plain LC too. */
 size_t fa_aac_os_asc(const fa_codec_params* p, int he_guess, uint8_t* out, size_t cap)
 {
     fa_aac_asc_info info;
@@ -135,8 +133,18 @@ size_t fa_aac_os_asc(const fa_codec_params* p, int he_guess, uint8_t* out, size_
     if (p->extradata_size > 0) {
         if (!p->extradata || p->extradata_size > cap || !fa_aac_parse_asc((const uint8_t*)p->extradata, p->extradata_size, &info))
             return 0;
-        memcpy(out, p->extradata, p->extradata_size);
-        return p->extradata_size;
+        /* LC at a low rate with SBR not said either way (implicit signalling): the
+         * same guess as for ADTS, for a decoder whose output rate is fixed at open. */
+        if (!(he_guess && info.object_type == 2 && info.sbr == -1 && info.rate <= 24000 &&
+              (info.channel_config == 1 || info.channel_config == 2))) {
+            memcpy(out, p->extradata, p->extradata_size);
+            return p->extradata_size;
+        }
+        n = fa_aac_build_asc(asc, 2, info.rate, info.channel_config, info.rate * 2);
+        if (info.channel_config == 1) asc[0] = (uint8_t)((asc[0] & 0x07) | (29 << 3));
+        if (n == 0 || n > cap) return 0;
+        memcpy(out, asc, n);
+        return n;
     }
     if (p->sample_rate == 0 || p->channels == 0) return 0;
     if (he_guess && p->sample_rate <= 24000 && p->channels <= 2) {

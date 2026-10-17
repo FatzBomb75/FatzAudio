@@ -835,6 +835,55 @@ static void test_ffmpeg_aac(void)
     decode_file("tone.aac", "aac", 48000, 2, adts_len, 24000, 2200);
 }
 
+/* ADTS whose headers change mid-stream (an HLS variant switch): 48 kHz stereo,
+ * then 32 kHz mono. The system's decoders are set up again for the second part. */
+static void test_aac_switch(void)
+{
+    fa_codec_params p;
+    fa_stream* s = NULL;
+    fa_open_options o;
+    fa_stream_info info;
+    size_t size = 0, at = 0;
+    uint8_t* data = load_file("aac_switch.aac", &size);
+    float* out;
+    int64_t n;
+    fa_result r;
+    CHECK(data != NULL);
+    fa_codec_params_init(&p);
+    p.codec = "aac";
+    p.sample_rate = 48000;
+    p.channels = 2;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    r = fa_stream_open_packets(g_engine, &p, &o, &s);
+    if (r == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); free(data); return; }
+    CHECK_EQ(r, FA_OK);
+    while (at < size) {
+        fa_packet pk;
+        size_t l = adts_len(data + at, size - at);
+        if (l == 0 || l > size - at) break;
+        memset(&pk, 0, sizeof(pk));
+        pk.data = data + at;
+        pk.size = l;
+        pk.pts = FA_PTS_NONE;
+        CHECK_EQ(fa_stream_push_packet(s, &pk), FA_OK);
+        at += l;
+    }
+    free(data);
+    CHECK(at == size);
+    CHECK_EQ(fa_stream_push_end(s), FA_OK);
+    out = read_all(s, 2, &n);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    printf("  %lld frames at %u Hz\n", (long long)n, info.format.sample_rate);
+    CHECK_EQ(info.format.sample_rate, 48000);
+    /* 0.53 s, then 0.5 s (and priming) at 48 kHz. */
+    CHECK_NEAR((double)n, 49600.0, 3500.0);
+    CHECK_NEAR(rms(out, 6000, 18000, 2), 0.3536, 0.05);
+    CHECK_NEAR(rms(out, 33000, 45000, 2), 0.3536, 0.05);
+    free(out);
+    fa_stream_close(s);
+}
+
 static void test_packets_play_on_device(void)
 {
     fa_codec_params p;
@@ -930,6 +979,7 @@ int main(void)
     RUN(test_ac3_eac3_packets);
     RUN(test_ac3_packets_cut_anywhere);
     RUN(test_ffmpeg_aac);
+    RUN(test_aac_switch);
     RUN(test_packets_play_on_device);
     RUN(test_bad_arguments);
 

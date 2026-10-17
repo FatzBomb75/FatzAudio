@@ -217,7 +217,7 @@ fa_result fa_at_codec_open(fa_codec* c, const fa_codec_params* p)
     memset(&in, 0, sizeof(in));
     if (aac) {
         fa_aac_asc_info info;
-        size_t n = fa_aac_os_asc(p, p->extradata_size == 0, asc, sizeof(asc));
+        size_t n = fa_aac_os_asc(p, 1, asc, sizeof(asc));
         size_t m;
         if (n == 0 || !fa_aac_parse_asc(asc, n, &info)) return FA_ERROR_UNSUPPORTED_FORMAT;
         m = fa_aac_esds(asc, n, cookie, sizeof(cookie));
@@ -285,6 +285,7 @@ fa_result fa_at_codec_open(fa_codec* c, const fa_codec_params* p)
     if (!st->buf) { at_free(st); return FA_ERROR_OUT_OF_MEMORY; }
     c->impl = st;
     c->vt = &at_vtable;
+    c->trails = 1;
     c->rate = (uint32_t)st->out.mSampleRate;
     c->channels = st->out.mChannelsPerFrame;
     return FA_OK;

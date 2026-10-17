@@ -913,6 +913,9 @@ struct fa_codec {
     /* fa_dynamic_range of the stream, read on every packet (NULL = full range).
      * Set by the owner after fa_codec_open. */
     fa_atomic32* dynamic_range;
+    /* Its audio can come out a packet or more after the packet that holds it (the
+     * systems' decoders): the track decoder anchors the audio on the first packet. */
+    int trails;
 };
 
 /* Opens a decoder for `p` (validated). FA_ERROR_PROVIDER_MISSING: needs FFmpeg,

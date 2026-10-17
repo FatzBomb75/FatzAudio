@@ -1022,6 +1022,20 @@ static void test_os_codec_helpers(void)
     p.extradata_size = sizeof(ext);
     n = fa_aac_os_asc(&p, 1, asc, sizeof(asc));
     CHECK(n == sizeof(ext) && memcmp(asc, ext, n) == 0);
+    {
+        /* LC at 22.05 kHz stereo, SBR left implicit: signalled when guessing. */
+        static const uint8_t lc22[2] = { 0x13, 0x90 };
+        p.extradata = lc22;
+        p.extradata_size = 2;
+        n = fa_aac_os_asc(&p, 1, asc, sizeof(asc));
+        CHECK(n > 0 && fa_aac_parse_asc(asc, n, &info));
+        CHECK_EQ(info.sbr, 1);
+        CHECK_EQ(info.rate, 22050);
+        CHECK_EQ(info.ext_rate, 44100);
+        CHECK_EQ(info.channel_config, 2);
+        n = fa_aac_os_asc(&p, 0, asc, sizeof(asc));
+        CHECK(n == 2 && memcmp(asc, lc22, 2) == 0);
+    }
     p.extradata = lc;
     p.extradata_size = 1;                            /* broken */
     CHECK_EQ(fa_aac_os_asc(&p, 1, asc, sizeof(asc)), 0);

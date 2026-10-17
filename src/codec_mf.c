@@ -353,6 +353,7 @@ static fa_result mf_finish(fa_codec* c, mf_state* st, HRESULT hr)
     }
     c->impl = st;
     c->vt = &mf_vtable;
+    c->trails = 1;
     c->rate = st->rate;
     c->channels = st->channels;
     return FA_OK;
@@ -516,6 +517,9 @@ static fa_result open_alac(fa_codec* c, const fa_codec_params* p)
     if (!fa_alac_parse_config((const uint8_t*)p->extradata, p->extradata_size, &a)) return FA_ERROR_UNSUPPORTED_FORMAT;
     rate = a.rate;
     ch = a.channels;
+    /* ALAC's own channel order (centre first) is not WAVE's, and what Media
+     * Foundation gives is not documented: FFmpeg reorders. */
+    if (ch > 2) return FA_ERROR_UNSUPPORTED_FORMAT;
     /* The bare ALACSpecificConfig first, else inside its 'alac' box. */
     atom[0] = 0; atom[1] = 0; atom[2] = 0; atom[3] = 36;
     memcpy(atom + 4, "alac", 4);

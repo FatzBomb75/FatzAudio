@@ -11,7 +11,8 @@
  *  - ALAC: "audio/alac" (Android 13 and later decode it) with the 24-byte
  *    ALACSpecificConfig as "csd-0".
  * Float output is asked for (Android 7.0 and later honour "pcm-encoding"); 16-bit
- * output is converted. MediaCodec's channel order is WAVE's, the library's.
+ * output is converted. MediaCodec's channel order is WAVE's, the library's, for
+ * AAC; ALAC of more than two channels goes to FFmpeg (see fa_mc_codec_open).
  * MediaCodec works asynchronously: output can trail input by a packet or more,
  * which the track decoder allows for (it anchors the audio on the first packet). */
 #if defined(__ANDROID__)
@@ -96,7 +97,8 @@ typedef struct mc_state {
     int eos_sent, drained;
     int encoding;           /* MC_PCM_* of the output */
     uint32_t rate, channels;
-    int64_t time_us;        /* input timestamps */
+    uint32_t pkt_frames, pkt_rate;   /* one packet's frames at its coded rate */
+    int64_t pkt_count;               /* packets queued: their timestamps */
 } mc_state;
 
 /* The output format after a change (or at the start). */
@@ -117,7 +119,7 @@ static fa_result pull(fa_codec* c, mc_state* st, int64_t wait_us)
     int rounds = 0;
     for (;;) {
         mc_buffer_info info;
-        ssize_t idx = mc.dequeue_output(st->codec, &info, wait_us);
+        ssize_t idx = mc.dequeue_output(st->codec, &info, rounds == 0 ? wait_us : 0);
         if (idx == MC_INFO_TRY_AGAIN_LATER) return FA_OK;
         if (idx == MC_INFO_OUTPUT_FORMAT_CHANGED) {
             /* Audio already out is in the old format: hand it out first. */
@@ -155,6 +157,12 @@ static fa_result pull(fa_codec* c, mc_state* st, int64_t wait_us)
     }
 }
 
+/* The next input's timestamp. */
+static int64_t time_us(const mc_state* st)
+{
+    return st->pkt_rate ? st->pkt_count * st->pkt_frames * 1000000 / st->pkt_rate : 0;
+}
+
 static fa_result mc_decode(fa_codec* c, const uint8_t* data, size_t size)
 {
     mc_state* st = (mc_state*)c->impl;
@@ -165,9 +173,15 @@ static fa_result mc_decode(fa_codec* c, const uint8_t* data, size_t size)
         /* The end: an empty buffer marked end of stream, then what the decoder holds. */
         if (st->drained) return FA_OK;
         if (!st->eos_sent) {
+            /* Output first while every input buffer is busy: it is handed out now,
+             * and the end of stream goes in on a later call. */
             idx = mc.dequeue_input(st->codec, 100000);
-            if (idx < 0) { st->drained = 1; return FA_OK; }
-            mc.queue_input(st->codec, (size_t)idx, 0, 0, (uint64_t)st->time_us, MC_FLAG_END_OF_STREAM);
+            if (idx < 0) {
+                fa_result r = pull(c, st, 0);
+                if (c->out_frames == 0) st->drained = 1;   /* stuck: give up */
+                return r;
+            }
+            mc.queue_input(st->codec, (size_t)idx, 0, 0, (uint64_t)time_us(st), MC_FLAG_END_OF_STREAM);
             st->eos_sent = 1;
         }
         {
@@ -189,12 +203,12 @@ static fa_result mc_decode(fa_codec* c, const uint8_t* data, size_t size)
         size_t cap = 0;
         uint8_t* in = mc.input_buffer(st->codec, (size_t)idx, &cap);
         if (!in || cap < size) {
-            mc.queue_input(st->codec, (size_t)idx, 0, 0, (uint64_t)st->time_us, 0);
+            mc.queue_input(st->codec, (size_t)idx, 0, 0, (uint64_t)time_us(st), 0);
             return c->out_frames > 0 ? FA_OK : FA_ERROR_UNSUPPORTED_FORMAT;
         }
         memcpy(in, data, size);
-        mc.queue_input(st->codec, (size_t)idx, 0, size, (uint64_t)st->time_us, 0);
-        if (st->rate) st->time_us += (int64_t)1024 * 1000000 / st->rate;
+        mc.queue_input(st->codec, (size_t)idx, 0, size, (uint64_t)time_us(st), 0);
+        st->pkt_count++;
     }
     {
         fa_result r = pull(c, st, 0);
@@ -235,7 +249,7 @@ fa_result fa_mc_codec_open(fa_codec* c, const fa_codec_params* p)
     uint8_t csd[256];
     size_t csd_n;
     const char* mime;
-    uint32_t rate, ch;
+    uint32_t rate, ch, frames;
     mc_state* st;
     AMediaFormat* f;
     int aac = strcmp(p->codec, "aac") == 0;
@@ -246,6 +260,7 @@ fa_result fa_mc_codec_open(fa_codec* c, const fa_codec_params* p)
         csd_n = fa_aac_os_asc(p, 0, csd, sizeof(csd));
         if (csd_n == 0 || !fa_aac_parse_asc(csd, csd_n, &info)) return FA_ERROR_UNSUPPORTED_FORMAT;
         rate = info.rate;
+        frames = 1024;
         ch = fa_aac_config_channels(info.channel_config);
         if (ch == 0) ch = p->channels;
     } else if (strcmp(p->codec, "alac") == 0) {
@@ -256,6 +271,10 @@ fa_result fa_mc_codec_open(fa_codec* c, const fa_codec_params* p)
         csd_n = 24;
         rate = a.rate;
         ch = a.channels;
+        frames = a.frame_length;
+        /* ALAC's own channel order (centre first) is not WAVE's, and what the
+         * system's decoder gives is not documented: FFmpeg reorders. */
+        if (ch > 2) return FA_ERROR_UNSUPPORTED_FORMAT;
     } else {
         return FA_ERROR_UNSUPPORTED_FORMAT;
     }
@@ -268,6 +287,8 @@ fa_result fa_mc_codec_open(fa_codec* c, const fa_codec_params* p)
     st->adts = aac;
     st->rate = rate;
     st->channels = ch;
+    st->pkt_frames = frames;
+    st->pkt_rate = rate;
     st->encoding = MC_PCM_16BIT;
     st->codec = mc.create_decoder(mime);
     f = st->codec ? mc.format_new() : NULL;
@@ -288,6 +309,7 @@ fa_result fa_mc_codec_open(fa_codec* c, const fa_codec_params* p)
     read_format(st);
     c->impl = st;
     c->vt = &mc_vtable;
+    c->trails = 1;
     c->rate = st->rate;
     c->channels = st->channels;
     return FA_OK;
