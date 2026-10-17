@@ -34,6 +34,8 @@ public enum ErrorCode
     NotImplemented = -12,
     /// <summary>An optional provider (for example FFmpeg or LAME) could not be found at runtime.</summary>
     ProviderMissing = -13,
+    /// <summary>The CD drive has no disc, its tray is open, or the disc was changed under an open stream.</summary>
+    NoDisc = -14,
 }
 
 /// <summary>

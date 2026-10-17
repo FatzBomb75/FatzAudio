@@ -224,7 +224,41 @@ BASS has no CD+G decoder: apps read the `.cdg` themselves, time it from `BASS_Ch
 | Your own sync offset | `fa_stream_set_cdg_offset` | `song.CdgOffset` | ✅ |
 | Converting the 300x216 index buffer to a bitmap, scaling, borders | `fa_cdg_surface_config`: BGRA/RGBA/indexed, any size, sharp or smooth, with or without border, transparent background, premultiplied | `CdgSurfaceOptions` | ✅ |
 | Redrawing the whole bitmap each tick | Upload only `frame.dirty_*`, only when `frame.changed` | `frame.Changed`, `frame.Dirty` | ✅ |
-| CD+G from a disc via `BASS_CD_StreamCreate(..., BASS_CD_SUBCHANNEL)` | Disc playback | | 🗓️ |
+| CD+G from a disc via `BASS_CD_StreamCreate(..., BASS_CD_SUBCHANNEL)` | CD+G from disc playback (next step of [disc playback](../features/disc.md)) | | 🗓️ |
+
+### basscd (audio CDs)
+
+basscd is an add-on DLL; FatzAudio reads CDs and `.cue` images itself, with one API on Windows, macOS and Linux ([disc playback](../features/disc.md)). Drives are opened by id (`"D:"`, `"/dev/sr0"`, `"disk2"`) instead of a drive number, and a `fa_disc*` handle carries the drive.
+
+| BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| BASS_CD_GetInfo (per drive number) | `fa_disc_drive_count` + `fa_disc_drive_get_info` (id, name, vendor, product, revision) | `Disc.Drives` | ✅ |
+| Drive number argument on every call | `fa_disc_open(id, options, &disc)` once, then the `fa_disc*` | `Disc.Open("D:")` | ✅ |
+| BASS_CD_SetInterface (SPTI/ASPI/WinMM) | Not needed: the OS pass-through is always used, without administrator rights | — | ➖ |
+| BASS_CD_Door (open / close / lock / unlock) | `fa_disc_eject`, `fa_disc_load`, `fa_disc_set_locked` | `Eject()`, `Load()`, `Locked` | ✅ |
+| BASS_CD_DoorIsOpen / DoorIsLocked / IsReady | `fa_disc_get_status`: state, locked, change counter (notices swaps between polls) | `disc.Status` | ✅ |
+| BASS_CD_GetTracks / GetTrackLength | `fa_disc_get_toc`: tracks with sectors, frames, duration and flags | `disc.Toc` | ✅ |
+| BASS_CD_GetTrackPregap | Not provided yet (track starts are INDEX 01) | | 🗓️ |
+| BASS_CD_GetID(BASS_CDID_CDDB) | `toc.freedb_query` | `toc.FreedbQuery` | ✅ |
+| BASS_CD_GetID(BASS_CDID_CDDB2) | `toc.freedb_id` | `toc.FreedbId` | ✅ |
+| BASS_CD_GetID(BASS_CDID_MUSICBRAINZ) | `toc.musicbrainz_id` (Enhanced CDs handled) | `toc.MusicBrainzId` | ✅ |
+| BASS_CD_GetID(BASS_CDID_TEXT) (parse the null-separated list yourself) | `fa_disc_get_text(disc, track, FA_DISC_TEXT_TITLE, ...)`: one field, UTF-8 | `disc.GetText(track, DiscTextField.Title)` | ✅ |
+| BASS_CD_GetID(BASS_CDID_UPC / BASS_CDID_ISRC + track) | `fa_disc_get_text(..., FA_DISC_TEXT_CODE, ...)` (track 0 = UPC/EAN) | `DiscTextField.Code` | ✅ |
+| BASS_CD_GetID(BASS_CDID_CDPLAYER), BASS_CD_GetID(BASS_CDID_TOC...) raw TOC | Not provided; the parsed TOC has everything | | ➖ |
+| BASS_CD_GetID(BASS_CDID_CDDB_QUERY / CDDB_READ) online lookups | Not provided: no network access from the library; look the ids up where you like | | ➖ |
+| BASS_CD_GetSpeed / SetSpeed (kB/s, 176.4 = 1x) | `fa_disc_get_speed` / `fa_disc_set_speed` in x (0 = maximum) | `disc.Speed` | ✅ |
+| BASS_CD_SetOffset | `fa_disc_options.read_offset` (samples) | `DiscOptions.ReadOffset` | ✅ |
+| BASS_CD_StreamCreate | `fa_stream_open_disc(engine, disc, track, options, &stream)` (track numbers as on the disc, not 0-based) | `engine.OpenDisc(disc, track)` | ✅ |
+| BASS_CD_StreamCreateFile (`.cda`) | `fa_stream_open_path` (Windows) | `engine.OpenFile` | ✅ |
+| BASS_CD_StreamCreateEx / BASS_CD_SUBCHANNEL, BASS_CD_SUBCHANNEL_NOHW (subchannel callback) | CD+G from the disc, decoded and drawn by FatzAudio | | 🗓️ |
+| BASS_CD_StreamGetTrack | Not needed: you opened the track, so you know its number | | ➖ |
+| BASS_CD_StreamSetTrack (switch track on the same stream) | Open the next track and `fa_stream_set_next` (gapless) or crossfade | `SetNext` | ✅ |
+| BASS_CD_Analog_* (drive's own DAC) | Not provided: modern drives have no analog output | | ➖ |
+| BASS_CONFIG_CD_RETRY | `fa_disc_options.retries` (default 5) | `DiscOptions.Retries` | ✅ |
+| BASS_CONFIG_CD_SKIPERROR | Always on: unreadable sectors play as silence and raise `FA_EVENT_DECODE_ERROR` | automatic | ✅ |
+| BASS_CD_C2ERRORS / BASS_CONFIG_CD_... C2 handling | Automatic when the drive supports it; `FA_DISC_NO_C2` turns it off | `DiscOptions.UseC2` | ✅ |
+| BASS_CONFIG_CD_AUTOSPEED, BASS_CONFIG_CD_FREEOLD, BASS_CONFIG_CD_CDDB_SERVER, BASS_CD_READ | Not needed (reads are buffered per stream; no server access) | | ➖ |
+| De-emphasis of pre-emphasized tracks (your own filter) | Automatic for tracks with the PRE flag; `FA_DISC_NO_DEEMPHASIS` turns it off | `DiscOptions.DeEmphasis` | ✅ |
 
 ## 3. Add-on map
 
@@ -239,7 +273,7 @@ BASS has no CD+G decoder: apps read the `.cdg` themselves, time it from `BASS_Ch
 | basswma.dll | Decode via Media Foundation on Windows / FFmpeg bridge; encoding not provided | 🗓️ / ➖ |
 | bassmidi.dll | Built-in MIDI synth (SF2, later SFZ/SF3); soundfont via stream options | 🗓️ |
 | bass_fx.dll | Tempo/pitch/rate params on every stream; reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | 🗓️ tempo/pitch, ✅ level control |
-| basscd.dll | Disc source + CD+G; analog playback not provided | 🗓️ disc; ✅ CD+G from files |
+| basscd.dll | Built-in disc source: drives on Windows, macOS and Linux, `.cue` images, CD-Text, freedb and MusicBrainz ids ([disc playback](../features/disc.md)); analog playback not provided | ✅ disc; 🗓️ CD+G from disc; ✅ CD+G from files |
 | Your own CD+G decoder and renderer (MP3+G, ZIP) | Built in: `fa_cdg_surface_*` draws the graphics in sync with the audio ([CD+G](../features/cdg.md)) | ✅ |
 
 ## 4. Common patterns
@@ -515,5 +549,29 @@ CompositionTarget.Rendering += (_, _) =>
 ```
 
 Pausing, seeking, crossfading to the next singer and tempo changes need no extra code: delete the timer, the position maths and the pack decoder.
+
+### Play an audio CD (BASS_CD_StreamCreate)
+
+BASS: pick a drive number, check `BASS_CD_IsReady`, loop `BASS_CD_GetTracks`/`GetTrackLength`, split the `BASS_CDID_TEXT` list yourself, then `BASS_CD_StreamCreate(drive, track, 0)` and `BASS_ChannelPlay`.
+
+```c
+fa_disc* disc;
+fa_disc_open(NULL, NULL, &disc);                  /* first drive; or "D:", "/dev/sr0", "album.cue" */
+fa_disc_toc toc;
+if (fa_disc_get_toc(disc, &toc) == FA_ERROR_NO_DISC) { /* ask for a disc */ }
+fa_stream* s;
+fa_stream_open_disc(engine, disc, toc.first_track, NULL, &s);
+fa_stream_attach(s, device, NULL);
+fa_stream_play(s);
+fa_disc_close(disc);                               /* the stream keeps the drive open */
+```
+
+```csharp
+using var disc = Disc.Open();
+using var track = engine.OpenDisc(disc, disc.Toc.FirstTrack);
+track.PlayOn(output);
+```
+
+Poll `fa_disc_get_status` (`disc.Status`) to notice a new disc; a stream of a removed disc ends with `FA_ERROR_NO_DISC`.
 
 *More patterns (tempo) are added here as each feature lands.*

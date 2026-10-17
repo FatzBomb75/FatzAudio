@@ -16,5 +16,5 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | FFmpeg hand-off and A/V sync (packets, frames, presentation clock) | [ffmpeg.md](ffmpeg.md) | ✅ |
 | Web streams and HLS (HTTP/HTTPS, radio titles, reconnects, HLS) | [web-streams.md](web-streams.md) | ✅ WAV/FLAC/MP3; AAC with the AAC decoder 🗓️ |
 | CD+G karaoke graphics (MP3+G, ZIP, surfaces for any renderer) | [cdg.md](cdg.md) | ✅ files; disc 🗓️ |
-| Disc playback | disc.md | 🗓️ |
+| Disc playback (audio CDs and `.cue` images) | [disc.md](disc.md) | ✅ (CD+G from disc 🗓️) |
 | Recording and encoding | recording-encoding.md | 🗓️ |

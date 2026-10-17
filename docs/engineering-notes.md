@@ -9,6 +9,9 @@ was found (a PR, a review, or a thread).
 
 | Date | Area | Issue | Found in |
 |---|---|---|---|
+| 2026-10-17 | Disc | Real drives have not been tested yet: the MMC layer, CD-Text, C2 retries and the Linux and Windows backends are covered by a simulated drive and `.cue` images in `tests/test_disc.c`. Worth a check with a real drive (and an Enhanced CD and a scratched disc) on Windows and Linux. | Disc playback thread |
+| 2026-10-17 | Disc | The macOS backend (`src/disc_mac.c`, DKIOCCD ioctls) only compiles in CI and has never run against a drive. It lists only drives with a disc in them, and cannot close the tray or lock it. | Disc playback thread |
+| 2026-10-17 | Disc | No jitter correction (cdparanoia-style overlap matching) for old drives without accurate stream; reads rely on C2 retries and the drive's own correction. Track pregaps (`BASS_CD_GetTrackPregap`) are not reported. | Disc playback thread |
 | 2026-10-17 | CD+G | While a song uses the smooth-scroll offsets, every changed tile redraws the whole surface (the dirty rectangle is not shifted with the offsets). Rare in practice; map the shifted rectangle if a renderer ever needs it. | CD+G thread (/code-review) |
 | 2026-10-17 | CD+G | CD+EG (extended graphics) packs are ignored, and the design's optional renderer helpers (D3D11 texture updater, CVPixelBuffer) are not built; apps upload the pixel buffer themselves. | CD+G thread |
 | 2026-10-17 | CD+G | ZIP64, encrypted and multi-part archives are refused (`FA_ERROR_UNSUPPORTED_FORMAT`); karaoke downloads do not use them. | CD+G thread |

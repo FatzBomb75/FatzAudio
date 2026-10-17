@@ -70,7 +70,9 @@ enum {
     FA_ERROR_BUSY = -10,
     FA_ERROR_END_OF_STREAM = -11,
     FA_ERROR_NOT_IMPLEMENTED = -12,
-    FA_ERROR_PROVIDER_MISSING = -13 /* e.g. FFmpeg or LAME not found at runtime */
+    FA_ERROR_PROVIDER_MISSING = -13, /* e.g. FFmpeg or LAME not found at runtime */
+    FA_ERROR_NO_DISC = -14           /* the CD drive has no disc, its tray is open, or the
+                                        disc was changed under an open stream */
 };
 
 typedef struct fa_engine fa_engine;   /* one per process is typical */
@@ -474,6 +476,163 @@ FA_API fa_result FA_CALL fa_stream_get_net_status(fa_stream* stream, fa_net_stat
 /* A header of the last HTTP response, e.g. "Content-Type" or "icy-name" (any case).
  * FA_ERROR_NOT_FOUND when the response had no such header; truncated to fit. */
 FA_API fa_result FA_CALL fa_stream_get_http_header(fa_stream* stream, const char* name, char* out_value, size_t value_size);
+
+/* ---- Audio CDs ------------------------------------------------------------
+ *
+ * Audio CDs play like any other source: open the drive with fa_disc_open, read
+ * its table of contents, and open a track with fa_stream_open_disc. The stream
+ * is an ordinary seekable stream, so crossfades, queues (gapless track to track),
+ * markers, normalization and buses all work on it unchanged.
+ *
+ * Supported on Windows, macOS and Linux. iOS and Android have no optical drives
+ * (fa_disc_drive_count reports 0 there), but disc images still open everywhere.
+ *
+ * A disc image (a .cue sheet with its .bin files) opens exactly like a drive:
+ * pass the path of the .cue file to fa_disc_open.
+ *
+ * Reading is error tolerant: sectors the drive flags as damaged (C2 error
+ * pointers, when the drive reports them) are read again up to `retries` times;
+ * a sector that stays unreadable plays as silence and raises FA_EVENT_DECODE_ERROR
+ * (value FA_ERROR_IO) instead of stopping playback. Tracks recorded with
+ * pre-emphasis are de-emphasized automatically.
+ *
+ * Drive access: on Linux the user needs read and write access to the drive's
+ * device node (usually membership of the "cdrom" group); on Windows no
+ * administrator rights are needed. */
+
+typedef struct fa_disc fa_disc;   /* an opened CD drive or disc image */
+
+typedef struct fa_disc_drive_info {
+    char id[256];        /* pass to fa_disc_open: "D:" on Windows, "/dev/sr0" on Linux,
+                            "disk2" on macOS */
+    char name[128];      /* "vendor product", e.g. "ASUS DRW-24D5MT" */
+    char vendor[16];
+    char product[32];
+    char revision[8];
+} fa_disc_drive_info;
+
+/* The optical drives of this computer. On macOS only drives with an audio CD in
+ * them are listed. The list is built when fa_disc_drive_count is called. */
+FA_API fa_result FA_CALL fa_disc_drive_count(uint32_t* out_count);
+FA_API fa_result FA_CALL fa_disc_drive_get_info(uint32_t index, fa_disc_drive_info* out_info);
+
+typedef enum fa_disc_flags {
+    FA_DISC_NO_DEEMPHASIS = 1 << 0,  /* play pre-emphasized tracks as recorded */
+    FA_DISC_NO_C2         = 1 << 1   /* do not ask the drive for C2 error pointers
+                                        (for drives that report them wrongly) */
+} fa_disc_flags;
+
+typedef struct fa_disc_options {
+    uint32_t struct_size;  /* sizeof(fa_disc_options) */
+    int32_t read_offset;   /* the drive's read offset correction in samples, as listed in
+                              the AccurateRip drive database (e.g. +6); 0 = none */
+    uint32_t retries;      /* re-reads of a damaged sector before it plays as silence;
+                              fa_disc_options_init sets 5 */
+    uint32_t flags;        /* fa_disc_flags */
+} fa_disc_options;
+
+FA_API void FA_CALL fa_disc_options_init(fa_disc_options* options);
+
+/* drive_id: an id from fa_disc_drive_get_info, the path of a .cue disc image, or
+ * NULL for the first drive. options may be NULL (defaults). A drive opens with or
+ * without a disc in it. FA_ERROR_NOT_FOUND when there is no such drive,
+ * FA_ERROR_DEVICE when it cannot be opened (no permission). */
+FA_API fa_result FA_CALL fa_disc_open(const char* drive_id, const fa_disc_options* options, fa_disc** out_disc);
+/* Streams opened from the disc keep working until they are closed. */
+FA_API void FA_CALL fa_disc_close(fa_disc* disc);
+
+typedef enum fa_disc_state {
+    FA_DISC_READY = 0,       /* a disc is in and readable */
+    FA_DISC_NO_DISC,         /* tray closed, no disc */
+    FA_DISC_TRAY_OPEN,
+    FA_DISC_SPINNING_UP      /* a disc was just inserted; ready in a moment */
+} fa_disc_state;
+
+typedef struct fa_disc_status {
+    fa_disc_state state;
+    int32_t locked;          /* 1 = the eject button is disabled by fa_disc_set_locked */
+    uint32_t change_count;   /* goes up by one each time a disc is removed or inserted,
+                                as seen by fa_disc_get_status: poll it (every second or
+                                so) to notice a new disc */
+} fa_disc_status;
+
+/* Asks the drive now; takes a few milliseconds. */
+FA_API fa_result FA_CALL fa_disc_get_status(fa_disc* disc, fa_disc_status* out_status);
+
+#define FA_DISC_MAX_TRACKS 99
+#define FA_DISC_SECTOR_FRAMES 588   /* frames per sector; 75 sectors per second */
+
+typedef struct fa_disc_track {
+    int32_t number;          /* 1..99, as printed on the cover */
+    int32_t is_audio;        /* 0 = a data track (CD-ROM part of an Enhanced CD): not playable */
+    int32_t preemphasis;     /* 1 = recorded with pre-emphasis (de-emphasized on playback) */
+    int32_t copy_permitted;
+    int32_t four_channel;    /* 1 = a four-channel audio track (very rare; not playable) */
+    int64_t start_sector;    /* where the track starts (its index 1), in sectors from the
+                                start of the disc's program area */
+    int64_t sectors;         /* length; the pregap of the next track is not included */
+    fa_frames frames;        /* sectors * 588, the length of its stream */
+    fa_time duration;
+} fa_disc_track;
+
+typedef struct fa_disc_toc {
+    int32_t first_track;     /* number of the first track, usually 1 */
+    int32_t last_track;
+    int32_t track_count;     /* entries used in tracks[] */
+    int32_t audio_track_count;
+    int64_t leadout_sector;  /* end of the last session's program area */
+    fa_time duration;        /* of all audio tracks */
+    uint32_t freedb_id;      /* the freedb/CDDB disc id, e.g. 0x8a09ec0c */
+    char freedb_query[1024]; /* "8a09ec0c 12 150 22767 ... 3631", the arguments of a CDDB
+                                "cddb query" command */
+    char musicbrainz_id[32]; /* the MusicBrainz disc id (28 characters) for
+                                https://musicbrainz.org/cdtoc/<id> */
+    int32_t has_cd_text;     /* 1 = fa_disc_get_text has titles from the disc */
+    fa_disc_track tracks[FA_DISC_MAX_TRACKS]; /* tracks[i] is track first_track + i */
+} fa_disc_toc;
+
+/* The disc's table of contents. FA_ERROR_NO_DISC when no readable disc is in the
+ * drive. Read once per disc and kept, so calling it again is free. */
+FA_API fa_result FA_CALL fa_disc_get_toc(fa_disc* disc, fa_disc_toc* out_toc);
+
+typedef enum fa_disc_text {
+    FA_DISC_TEXT_TITLE = 0,
+    FA_DISC_TEXT_PERFORMER,
+    FA_DISC_TEXT_SONGWRITER,
+    FA_DISC_TEXT_COMPOSER,
+    FA_DISC_TEXT_ARRANGER,
+    FA_DISC_TEXT_MESSAGE,
+    FA_DISC_TEXT_GENRE,      /* album only */
+    FA_DISC_TEXT_CODE        /* album: UPC/EAN (media catalog number); track: ISRC. Read from
+                                the subcode when CD-Text has none (a short disc access) */
+} fa_disc_text;
+
+/* CD-Text of the album (track 0) or a track (its number), as UTF-8.
+ * FA_ERROR_NOT_FOUND when the disc has no such text; truncated to fit. */
+FA_API fa_result FA_CALL fa_disc_get_text(fa_disc* disc, int32_t track, fa_disc_text field, char* out_text, size_t text_size);
+
+/* Opens the tray (unlocking it first) and closes it. Closing is not possible on
+ * slot-loading and laptop drives (FA_ERROR_NOT_IMPLEMENTED or FA_ERROR_DEVICE). */
+FA_API fa_result FA_CALL fa_disc_eject(fa_disc* disc);
+FA_API fa_result FA_CALL fa_disc_load(fa_disc* disc);
+/* 1 disables the drive's eject button until 0 or fa_disc_close. */
+FA_API fa_result FA_CALL fa_disc_set_locked(fa_disc* disc, int32_t locked);
+/* Read speed as a multiple of normal playback speed (1 = 176.4 kB/s); 0 = the
+ * fastest. Slower is quieter and often reads damaged discs better. The drive
+ * picks the nearest speed it supports; fa_disc_get_speed reports it. */
+FA_API fa_result FA_CALL fa_disc_set_speed(fa_disc* disc, float speed);
+FA_API fa_result FA_CALL fa_disc_get_speed(fa_disc* disc, float* out_speed);
+
+/* A stream of one audio track (its number, as in fa_disc_toc). FA_ERROR_NOT_FOUND
+ * when the disc has no such track, FA_ERROR_UNSUPPORTED_FORMAT for a data or
+ * four-channel track, FA_ERROR_NO_DISC without a disc. The stream is 44.1 kHz
+ * stereo, seekable, codec "cdda", container "cd". If the disc is taken out while
+ * it plays, the stream ends (its last read fails with FA_ERROR_NO_DISC).
+ * Normalization uses the running estimate: a disc is not read twice for a scan.
+ *
+ * fa_stream_open_path also opens Windows' TrackNN.cda files (D:\Track01.cda)
+ * as the track they stand for. */
+FA_API fa_result FA_CALL fa_stream_open_disc(fa_engine* engine, fa_disc* disc, int32_t track, const fa_open_options* options, fa_stream** out_stream);
 
 /* ---- Stream info -------------------------------------------------------- */
 
@@ -936,7 +1095,7 @@ FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_ti
  *
  * Delivered today: ENDED, MARKER, LOUDNESS_FINAL, RAMP_DONE and STARTED; METADATA from web
  * streams; STALLED and RESUMED from push, packet and web streams; DECODE_ERROR from packet
- * streams. The others are raised by the features that produce them as those land (see docs/features). */
+ * and disc streams. The others are raised by the features that produce them as those land (see docs/features). */
 typedef enum fa_event_type {
     FA_EVENT_ENDED = 0,
     FA_EVENT_POSITION,        /* reached a requested frame */

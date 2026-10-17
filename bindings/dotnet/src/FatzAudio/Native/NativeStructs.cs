@@ -225,3 +225,62 @@ internal unsafe struct FaCdgFrame
     public fixed byte Palette[64];
     public long Time;
 }
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaDiscDriveInfo
+{
+    public fixed byte Id[256];
+    public fixed byte Name[128];
+    public fixed byte Vendor[16];
+    public fixed byte Product[32];
+    public fixed byte Revision[8];
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaDiscOptions
+{
+    public uint StructSize;
+    public int ReadOffset;
+    public uint Retries;
+    public uint Flags;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaDiscStatus
+{
+    public int State;
+    public int Locked;
+    public uint ChangeCount;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaDiscTrack
+{
+    public int Number;
+    public int IsAudio;
+    public int Preemphasis;
+    public int CopyPermitted;
+    public int FourChannel;
+    public long StartSector;
+    public long Sectors;
+    public long Frames;
+    public long Duration;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaDiscToc
+{
+    public const int MaxTracks = 99;
+    public int FirstTrack;
+    public int LastTrack;
+    public int TrackCount;
+    public int AudioTrackCount;
+    public long LeadoutSector;
+    public long Duration;
+    public uint FreedbId;
+    public fixed byte FreedbQuery[1024];
+    public fixed byte MusicBrainzId[32];
+    public int HasCdText;
+    // fa_disc_track tracks[99]; 56 bytes each, 8-byte aligned at offset 1096.
+    public fixed byte Tracks[MaxTracks * 56];
+}

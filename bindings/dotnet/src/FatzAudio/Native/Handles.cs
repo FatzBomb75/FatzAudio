@@ -154,6 +154,21 @@ internal sealed class BusHandle : SafeHandle
     }
 }
 
+/// <summary>Owns an <c>fa_disc*</c>. Streams opened from the disc hold their own native reference.</summary>
+internal sealed class DiscHandle : SafeHandle
+{
+    public DiscHandle() : base(0, true) { }
+    public override bool IsInvalid => handle == 0;
+
+    public void Initialize(nint native) => SetHandle(native);
+
+    protected override bool ReleaseHandle()
+    {
+        NativeMethods.fa_disc_close(handle);
+        return true;
+    }
+}
+
 internal static class HandleRef
 {
     public static T AddRef<T>(T handle) where T : SafeHandle
