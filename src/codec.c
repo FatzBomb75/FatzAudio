@@ -1,6 +1,6 @@
 /* Packet codecs: one compressed packet in, interleaved F32 out. The built-in ones
- * (PCM in all its byte layouts, MP3) need nothing else; every other codec goes
- * to the app's FFmpeg, loaded at runtime (ffmpeg.c). */
+ * (PCM in all its byte layouts, MP3, AC-3 and E-AC-3 in dec_ac3.c) need nothing
+ * else; every other codec goes to the app's FFmpeg, loaded at runtime (ffmpeg.c). */
 #include "fa_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -436,6 +436,7 @@ fa_result fa_codec_open(fa_codec* c, const fa_codec_params* p)
         }
     }
     if (strcmp(p->codec, "mp3") == 0) return mp3_open(c, p);
+    if (strcmp(p->codec, "ac3") == 0 || strcmp(p->codec, "eac3") == 0) return fa_ac3_codec_open(c, p);
     r = fa_ffmpeg_open_codec(c, p);
     if (r != FA_OK) {
         free(c->out);

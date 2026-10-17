@@ -101,6 +101,7 @@ typedef struct fa_track {
     fa_frames drop_before;    /* frames before this position are not handed out */
     int place;                /* the next packet with audio fixes the position (open, seek) */
     int eof;
+    int draining;             /* the packets ended; the codec gives back what it holds */
     int format_known;
     /* Container timestamps that are rounded (Matroska) are snapped to the grid of
      * a codec with a constant packet duration, which makes seeks exact there. */
@@ -120,7 +121,7 @@ fa_result fa_track_read(fa_track* t, float* out, fa_frames frames, fa_frames* go
 fa_result fa_track_seek(fa_track* t, fa_frames frame);
 void fa_track_close(fa_track* t);
 
-/* Samples in packet `d` from its own bytes (PCM, Opus, MPEG audio), at *out_rate;
+/* Samples in packet `d` from its own bytes (PCM, Opus, MPEG audio, AC-3), at *out_rate;
  * -1 if the codec does not tell. */
 int64_t fa_demux_packet_samples(const char* codec, uint32_t channels, uint32_t rate,
                                 const uint8_t* d, size_t n, uint32_t* out_rate);

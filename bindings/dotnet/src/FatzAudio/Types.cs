@@ -251,6 +251,26 @@ public sealed record StreamOptions
     public TimeSpan? BufferLength { get; init; }
     /// <summary>Connection settings for <see cref="AudioEngine.OpenUrl(string, StreamOptions?)"/>; null uses the defaults. Ignored by the other open calls.</summary>
     public NetworkOptions? Network { get; init; }
+    /// <summary>
+    /// Dynamic range of Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3) audio (default
+    /// <see cref="FatzAudio.DynamicRange.Full"/>). Other formats ignore it. Can be changed later with
+    /// <see cref="AudioStream.DynamicRange"/>.
+    /// </summary>
+    public DynamicRange DynamicRange { get; init; } = DynamicRange.Full;
+}
+
+/// <summary>
+/// Dynamic range of Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3) audio. These streams carry the
+/// broadcaster's compression gains; the decoder can apply them or play the mix as it was mastered.
+/// </summary>
+public enum DynamicRange
+{
+    /// <summary>The full mix, no compression (the default).</summary>
+    Full = 0,
+    /// <summary>The stream's own compression ("line mode"): quiet parts lifted and loud ones tamed, as a home AV receiver does.</summary>
+    Normal = 1,
+    /// <summary>Heavy compression for listening at low volume ("RF mode"); streams without heavy gains use <see cref="Normal"/>'s.</summary>
+    Night = 2,
 }
 
 /// <summary>Connection settings for web streams (<see cref="AudioEngine.OpenUrl(string, StreamOptions?)"/>). All properties are optional.</summary>

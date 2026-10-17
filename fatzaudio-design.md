@@ -61,13 +61,13 @@ Rules:
 | WAV/AIFF/W64/RF64, MP3, FLAC | dr_wav, dr_mp3, dr_flac (PD/MIT-0), hardened (see below) |
 | Ogg Vorbis, Opus | libvorbis/stb_vorbis, libopus + opusfile (BSD) |
 | AAC-LC/HE-AAC/xHE, ALAC | OS codec (Media Foundation, AudioToolbox, MediaCodec); FFmpeg bridge on Linux |
-| **AC-3, E-AC-3 (DD+), incl. Atmos-in-DD+ core** | OS codec where present (Windows 10/11 and Apple include DD+; many Android devices do); FFmpeg bridge elsewhere; **passthrough** (IEC 61937 bitstream over HDMI/S/PDIF) on every platform that exposes it |
+| **AC-3, E-AC-3 (DD+), incl. Atmos-in-DD+ core** | Built-in decoder written from the public specs (src/ac3.c), up to 7.1; FFmpeg only for the rare AHT/enhanced-coupling frames; **passthrough** (IEC 61937 bitstream over HDMI/S/PDIF) planned |
 | **TrueHD, DTS / DTS-HD** | Passthrough + FFmpeg bridge. No OS decodes these reliably |
 | WMA | Media Foundation on Windows, FFmpeg bridge elsewhere |
 | MIDI | TinySoundFont + TinyMidiLoader (SF2) |
 | Tracker modules | libopenmpt (build option) |
 
-Open option: writing our own AC-3/E-AC-3 decoder from the public ETSI TS 102 366 spec would make Dolby Digital work everywhere without FFmpeg. It's a large job and needs a patent check first (AC-3 patents have expired; E-AC-3 needs confirming). Atmos object rendering and TrueHD stay passthrough/FFmpeg either way, since they're proprietary.
+Done: the built-in AC-3/E-AC-3 decoder makes Dolby Digital work everywhere without FFmpeg ([dolby.md](docs/features/dolby.md)). The patent check for E-AC-3 is still open (AC-3 patents have expired). Atmos object rendering and TrueHD stay passthrough/FFmpeg, since they're proprietary.
 
 Robustness means:
 - Every decoder is fuzzed (libFuzzer/AFL corpora per format) in CI.

@@ -210,6 +210,23 @@ The legacy app doesn't ship bassmix.dll, but mixer-style code built on `BASS_Cha
 | BASS_MIXER_CHAN_NORAMPIN | Not needed: starts are exact and fades are explicit | — | ➖ (by design) |
 | BASS_Split_* (one source to several outputs) | Not provided yet | | 🗓️ |
 
+### bass_ac3 (Dolby Digital and Dolby Digital Plus)
+
+AC-3 and E-AC-3 are built-in formats: the ordinary open calls play them, in raw files, video files, web streams and HLS, with no plugin and no FFmpeg ([Dolby Digital](../features/dolby.md)).
+
+| bass_ac3 | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| BASS_AC3_StreamCreateFile | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ |
+| BASS_AC3_StreamCreateURL | `fa_stream_open_url` (raw AC-3/E-AC-3 over HTTP, and AC-3 in HLS) | `engine.OpenUrl` | ✅ |
+| BASS_AC3_StreamCreateFileUser | `fa_stream_open_io` | `engine.OpenStream` | ✅ |
+| BASS_PluginLoad("bass_ac3.dll") | Not needed: built in | — | ➖ (by design) |
+| BASS_CONFIG_AC3_DYNRNG / BASS_AC3_DYNAMIC_RANGE | `fa_open_options.dynamic_range` per stream (`FA_DYNAMIC_RANGE_FULL`, `NORMAL` or `NIGHT`), changeable while playing with `fa_stream_set_dynamic_range` | `StreamOptions.DynamicRange`, `stream.DynamicRange` | ✅ |
+| BASS_AC3_DOWNMIX_2 / BASS_AC3_DOWNMIX_4 | The engine downmixes to the device automatically; for a custom downmix, `fa_stream_set_matrix` | `stream.SetMatrix` | ✅ |
+| BASS_AC3_DOWNMIX_DOLBY (Pro Logic Lt/Rt) | Not provided: the plain stereo downmix, or your own matrix | — | ➖ (rarely needed today) |
+| E-AC-3 (Dolby Digital Plus), 7.1 | Built in, including dependent substreams; Atmos streams play their bed | Built in | ✅ |
+| AC-3 packets from your own FFmpeg demuxer | `fa_stream_open_packets` with codec `ac3` / `eac3`, decoded natively | `engine.OpenPackets` | ✅ |
+| Passthrough to an AV receiver (S/PDIF, HDMI) | Not provided | — | 🗓️ |
+
 ### bass_fx tempo, pitch and rate
 
 bass_fx needs a decode stream wrapped in a separate tempo stream; FatzAudio puts three parameters on every stream ([tempo and pitch](../features/tempo-pitch.md)).
@@ -252,9 +269,9 @@ BASS has no CD+G decoder: apps read the `.cdg` themselves, time it from `BASS_Ch
 | Legacy DLL | Replaced by | Status |
 |---|---|---|
 | bass_aac.dll | MP4/M4A/MOV files (built-in demuxer, any audio track) and AAC packets (`fa_stream_open_packets`), decoded through the app's FFmpeg; a built-in or OS AAC decoder and raw ADTS files | ✅ MP4 and packets via FFmpeg, 🗓️ built-in decoder |
-| bass_ac3.dll | AC-3 and E-AC-3 packets through the app's FFmpeg (`fa_stream_open_packets`); files through the OS codec, and passthrough | ✅ packets, 🗓️ files and passthrough |
+| bass_ac3.dll | Built-in AC-3 and E-AC-3 decoder: raw `.ac3`/`.ec3` files, MP4/MKV tracks, web streams and HLS, and pushed packets, with dynamic range modes ([Dolby Digital](../features/dolby.md)) | ✅ (passthrough 🗓️) |
 | bassflac.dll | Built-in | ✅ |
-| basshls.dll (if used) | Built-in: `fa_stream_open_url` plays `.m3u8` (MPEG-TS, fMP4, AES-128) | ✅ MP3 segments; AAC 🗓️ |
+| basshls.dll (if used) | Built-in: `fa_stream_open_url` plays `.m3u8` (MPEG-TS, fMP4, AES-128) | ✅ MP3 and AC-3/E-AC-3 segments; AAC 🗓️ |
 | bassopus.dll | Built-in (incl. raw packet push) | 🗓️ |
 | basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM and MP3 tracks built in, Opus, Vorbis, AAC and others through the app's FFmpeg ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ (built-in Opus/Vorbis decoders 🗓️) |
 | basswma.dll | Decode via Media Foundation on Windows / FFmpeg bridge; encoding not provided | 🗓️ / ➖ |

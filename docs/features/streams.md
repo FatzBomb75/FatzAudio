@@ -11,10 +11,11 @@ A stream is anything that produces audio. You open it from a file, a memory bloc
 | MP3 | MPEG-1, 2 and 2.5 Layer III, with or without ID3v2 tags | `mp3` |
 | MP4, M4A, MOV | ISO MP4 and QuickTime, including fragmented MP4. Audio tracks only: video is never read | the track's codec: `aac`, `mp3`, `ac3`, `eac3`, `opus`, `flac`, `alac`, `pcm_*`, ... (container `mp4` or `mov`) |
 | Matroska, WebM | MKV, MKA, WebM, including live layouts (unknown sizes, no Cues). Audio tracks only | `aac`, `mp3`, `ac3`, `eac3`, `opus`, `vorbis`, `flac`, `pcm_*`, ... (container `matroska` or `webm`) |
+| Dolby Digital, Dolby Digital Plus | Raw `.ac3` and `.ec3` streams, up to 7.1 ([Dolby Digital](dolby.md)) | `ac3` or `eac3` (container `ac3` or `ec3`) |
 
-Inside MP4 and Matroska, PCM and MP3 tracks decode built in; every other codec (AAC, AC-3, E-AC-3, Opus, Vorbis, FLAC, ALAC, DTS, TrueHD) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`.
+Inside MP4 and Matroska, PCM, MP3, AC-3 and E-AC-3 tracks decode built in; every other codec (AAC, Opus, Vorbis, FLAC, ALAC, DTS, TrueHD) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`.
 
-More formats are added to the same registry (Ogg Vorbis and Opus, raw AAC and AC-3 files, and built-in decoders for the codecs above follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
+More formats are added to the same registry (Ogg Vorbis and Opus, raw AAC files, and built-in decoders for the codecs above follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
 
 Apps that demux files themselves (for example with FFmpeg, for the video) can push compressed packets or decoded frames instead of opening a file: see [FFmpeg hand-off and A/V sync](ffmpeg.md).
 

@@ -9,7 +9,7 @@
 | An HLS playlist (`.m3u8`), on demand or live | The best audio variant, MPEG-TS, fMP4 or plain audio segments, AES-128 encryption. On-demand HLS is seekable to the frame |
 | A `.pls` or `.m3u` playlist (what radio sites usually link to) | Its first entry is played |
 
-The format is detected from the content, as for files ([streams](streams.md#how-detection-works)). Today that means WAV, FLAC and MP3, including MP3 in MPEG-TS for HLS. AAC streams, which most HLS and many radio stations use, follow with the AAC decoder.
+The format is detected from the content, as for files ([streams](streams.md#how-detection-works)). Today that means WAV, FLAC, MP3, AC-3 and E-AC-3, including MP3 and AC-3/E-AC-3 in MPEG-TS for HLS. AAC streams, which most HLS and many radio stations use, follow with the AAC decoder.
 
 ## C
 
