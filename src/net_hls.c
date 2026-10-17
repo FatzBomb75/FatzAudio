@@ -973,5 +973,5 @@ static int hls_probe(const uint8_t* data, size_t size, size_t id3) { (void)data;
 /* Not in the registry: URL streams that turn out to be HLS use it directly. */
 const fa_decoder_vtable fa_decoder_hls = {
     "hls", "HTTP Live Streaming", "m3u8", "application/vnd.apple.mpegurl;application/x-mpegurl",
-    hls_probe, hls_open, hls_read, hls_seek, hls_close, 0, NULL
+    hls_probe, hls_open, hls_read, hls_seek, hls_close, 0, NULL, NULL
 };

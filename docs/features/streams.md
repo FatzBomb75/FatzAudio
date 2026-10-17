@@ -177,6 +177,17 @@ In .NET, `stream.PlayOn(device)` attaches (or moves) and plays, and `stream.Deta
 - Paths are UTF-8. On Windows FatzAudio converts them to UTF-16 internally, so non-ASCII file names work.
 - `audio_track` greater than 0 returns `FA_ERROR_NOT_FOUND` for single-track formats.
 
+## MP3
+
+MP3 files decode built in (minimp3, inside miniaudio), in 32-bit float: nothing is rounded to 16 bits, so the output matches a reference float decoder to about 124 dB.
+
+- **Start and length:** a LAME/Xing header's encoder delay and padding are removed, so the audio starts on the first sample the encoder was given and the length is exact. Without that header the decoder's own 529-frame delay is still removed (the encoder's delay is not recorded anywhere, so a LAME-encoded file then starts 576 frames late, as in BASS).
+- **Seeking is exact and fast**, on files and memory: a seek lands on the frame asked for, with exactly the samples a straight decode gives there. The decoder finds frames by hopping from header to header (no decoding) and keeps the position of every 16th; after a seek it decodes only the few frames before the target that the bit reservoir and the filter bank need, so a seek takes about 0.3 ms. A file with a Xing/LAME header is hopped lazily, up to where you seek, so the first seek far into a long file reads the headers on the way (about 6 ms for 10 minutes; later seeks don't); a file without one is hopped once at open to learn its length.
+- **`FA_OPEN_PRESCAN`** hops the whole file at open: the length then comes from the frames themselves rather than the header's frame count, and no later seek has to read ahead. It is never needed for exact seeks.
+- **Damaged files:** junk between frames is skipped, the same way when playing and when seeking; a frame that can't be decoded plays as silence so the timeline never shifts. A file cut off mid-frame plays up to its last whole frame.
+- **Over the network** the length comes from the Xing header (or the bitrate) and seeks jump to the estimated byte, as nothing past the playing position has been downloaded. Free-format files (no bitrate in the header) also use that decoder.
+- **Loudness scans** cut MP3 files into chunks on all cores like other formats ([normalization](normalization.md#why-the-scan-is-fast-even-on-large-video-files)).
+
 ## Ogg Opus and Ogg Vorbis
 
 Opus and Vorbis decode with libopus and libvorbis, compiled into the library: no FFmpeg, no extra DLL. Ogg FLAC (`.oga`) uses the same FLAC decoder as `.flac` files and gives exactly the same samples. The same decoders play Opus and Vorbis tracks in WebM, Matroska and MP4, and raw Opus packets pushed by your app ([FFmpeg hand-off](ffmpeg.md)), which replaces bassopus's `BASS_OPUS_StreamCreate` + `BASS_StreamPutData`.

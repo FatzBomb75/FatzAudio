@@ -443,5 +443,5 @@ static void adts_lag(fa_decoder* dec, int64_t* out_bytes, int64_t* out_frames)
 const fa_decoder_vtable fa_decoder_adts = {
     "aac", "AAC in ADTS frames (.aac, AAC radio, AAC in HLS)", "aac;adts",
     "audio/aac;audio/aacp;audio/x-aac;audio/vnd.dlna.adts;audio/x-hx-aac-adts",
-    adts_probe, adts_open, adts_read, adts_seek, adts_close, 1, adts_lag
+    adts_probe, adts_open, adts_read, adts_seek, adts_close, 1, adts_lag, NULL
 };

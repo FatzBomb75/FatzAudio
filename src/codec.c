@@ -269,14 +269,6 @@ static fa_result pcm_open(fa_codec* c, const fa_codec_params* p, const pcm_layou
 
 /* ---- MP3 (minimp3 inside miniaudio) -------------------------------------------- */
 
-/* dr_mp3's frame decoder lives in miniaudio_impl.c, where its API is visible. */
-void* fa_mp3dec_create(void);
-/* Decodes the first frame in data[0..size); returns the bytes used (0 = needs more
- * data) and writes up to 1152 interleaved frames to pcm. */
-int fa_mp3dec_decode(void* dec, const uint8_t* data, int size, float* pcm, int* out_frames,
-                     int* out_channels, int* out_rate);
-void fa_mp3dec_reset(void* dec);
-
 typedef struct mp3_state {
     void* dec;
     uint8_t* buf;        /* bytes not decoded yet (a frame can span packets) */

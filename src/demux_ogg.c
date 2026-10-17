@@ -942,7 +942,7 @@ static int ogg_probe(const uint8_t* d, size_t n, size_t id3)
 const fa_decoder_vtable fa_decoder_ogg = {
     "ogg", "Ogg Opus, Ogg Vorbis and Ogg FLAC", "ogg;oga;opus;ogv;ogx",
     "audio/ogg;application/ogg;audio/opus;audio/vorbis;audio/x-vorbis+ogg;video/ogg",
-    ogg_probe, ogg_open, ogg_read, ogg_dec_seek, ogg_close, 1, NULL
+    ogg_probe, ogg_open, ogg_read, ogg_dec_seek, ogg_close, 1, NULL, NULL
 };
 
 /* ---- loudness tags --------------------------------------------------------------------------- */
