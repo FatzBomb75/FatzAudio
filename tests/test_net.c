@@ -228,6 +228,7 @@ static fa_thread g_conn_threads[MAX_CONNS];
 static int g_conn_count;
 static fa_atomic32 g_requests;     /* requests served */
 static fa_atomic32 g_drop_served;  /* /drop.wav requests */
+static fa_atomic32 g_stall_served; /* /stall.wav requests */
 static fa_atomic32 g_seg_drop;     /* /hls/flaky*.ts: the next request of segment 1 breaks off */
 static char g_last_agent[4096];    /* User-Agent of the last request */
 
@@ -420,13 +421,16 @@ static void handle_request(sock_t s)
         serve_bytes(s, req, g_wav, g_wav_n, "audio/wav", 1, first ? 100000 : 0);
     }
     else if (strcmp(path, "/stall.wav") == 0) {
-        /* 1 s of audio, then the server goes quiet for 1.5 s, then the rest. */
+        /* 1 s of audio, then the server goes quiet for 1.5 s, then the rest. The pause
+         * is timed by the clock (sleeps overshoot a lot on busy CI machines) and only
+         * the first connection pauses, so a reconnect can't stall again. */
         char head[256];
         size_t first = 44 + 44100 * 4;
+        int pause = fa_fetch_add32(&g_stall_served, 1) == 0;
         snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", g_wav_n);
         if (!send_str(s, head) && !send_all(s, g_wav, first)) {
-            int i;
-            for (i = 0; i < 150 && !fa_load32(&g_stop); i++) fa_sleep_ms(10);
+            int64_t until = fa_monotonic_ns() + 1500000000LL;
+            while (pause && fa_monotonic_ns() < until && !fa_load32(&g_stop)) fa_sleep_ms(10);
             send_all(s, g_wav + first, g_wav_n - first);
         }
     }
