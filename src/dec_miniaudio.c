@@ -1,4 +1,5 @@
-/* WAV/AIFF, FLAC and MP3 decoders. Each one drives miniaudio's embedded
+/* WAV/AIFF and FLAC decoders, and MP3 over the network or in free format (local
+ * MP3 files are dec_mp3.c). Each one drives miniaudio's embedded
  * dr_wav / dr_flac / dr_mp3 for exactly one format (no trial-and-error across
  * backends): the registry has already decided what the data is. */
 #include "fa_internal.h"
@@ -194,32 +195,39 @@ static void mp3_remote_lag(fa_decoder* dec, int64_t* out_bytes, int64_t* out_fra
 }
 
 static fa_result flac_open(fa_decoder* dec) { return open_with(dec, ma_encoding_format_flac); }
-static fa_result mp3_open(fa_decoder* dec)
+/* dec_mp3.c decodes local files itself; network sources and free-format files
+ * (no bitrate in the header) come here. */
+extern const fa_decoder_vtable fa_decoder_mp3_ma;
+fa_result fa_mp3_open_fallback(fa_decoder* dec)
 {
-    return dec->src->remote ? mp3_remote_open(dec) : open_with(dec, ma_encoding_format_mp3);
+    fa_result r;
+    if (dec->src->remote) return mp3_remote_open(dec);
+    r = open_with(dec, ma_encoding_format_mp3);
+    if (r == FA_OK) dec->vt = &fa_decoder_mp3_ma;
+    return r;
 }
 
 const fa_decoder_vtable fa_decoder_wav = {
     "wav", "WAV, RF64, Wave64 and AIFF (PCM, float, ADPCM)", "wav;wave;rf64;w64;bwf;aif;aiff;aifc",
     "audio/wav;audio/x-wav;audio/wave;audio/vnd.wave;audio/aiff;audio/x-aiff",
-    fa_probe_wav, wav_open, wav_read, wav_seek, wav_close, 1, NULL
+    fa_probe_wav, wav_open, wav_read, wav_seek, wav_close, 1, NULL, NULL
 };
 
 const fa_decoder_vtable fa_decoder_flac = {
     "flac", "Free Lossless Audio Codec", "flac;fla",
     "audio/flac;audio/x-flac",
-    fa_probe_flac, flac_open, ma_read, ma_seek, ma_close, 1, NULL
+    fa_probe_flac, flac_open, ma_read, ma_seek, ma_close, 1, NULL, NULL
 };
 
-const fa_decoder_vtable fa_decoder_mp3 = {
+/* Not in the registry: fa_mp3_open_fallback switches to these. */
+const fa_decoder_vtable fa_decoder_mp3_ma = {
     "mp3", "MPEG-1/2/2.5 Layer III", "mp3",
     "audio/mpeg;audio/mp3;audio/x-mp3",
-    fa_probe_mp3, mp3_open, ma_read, ma_seek, ma_close, 0, NULL
+    fa_probe_mp3, fa_mp3_open_fallback, ma_read, ma_seek, ma_close, 0, NULL, NULL
 };
 
-/* Not in the registry: mp3_open switches to it for network sources. */
 const fa_decoder_vtable fa_decoder_mp3_remote = {
     "mp3", "MPEG-1/2/2.5 Layer III", "mp3",
     "audio/mpeg;audio/mp3;audio/x-mp3",
-    fa_probe_mp3, mp3_remote_open, mp3_remote_read, mp3_remote_seek, mp3_remote_close, 0, mp3_remote_lag
+    fa_probe_mp3, mp3_remote_open, mp3_remote_read, mp3_remote_seek, mp3_remote_close, 0, mp3_remote_lag, NULL
 };

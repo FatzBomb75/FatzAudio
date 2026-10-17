@@ -60,6 +60,7 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
 | BASS_StreamCreateFile (path) | `fa_stream_open_path`; format detected from content ([streams](../features/streams.md)) | `engine.OpenFile(path)` | ✅ WAV/AIFF/MP3/FLAC/OGG/Opus so far (and the add-on formats below: MP4, MKV, AAC, AC-3, WMA) |
+| BASS_STREAM_PRESCAN | `FA_OPEN_PRESCAN` in `fa_open_options.flags`: MP3 reads every frame header at open. Seeks are exact and fast without it; other formats are always exact ([MP3](../features/streams.md#mp3)) | `new StreamOptions { Prescan = true }` | ✅ |
 | BASS_StreamCreateFile (memory) | `fa_stream_open_memory` | `engine.OpenMemory(bytes)` | ✅ |
 | BASS_StreamCreateFileUser | `fa_stream_open_io`; `close` is called once by `fa_stream_close`, never on a failed open ([custom I/O](../features/streams.md#custom-io-your-own-reader)) | `engine.OpenStream(System.IO.Stream)` | ✅ |
 | BASS_StreamCreateURL | `fa_stream_open_url`: HTTP/HTTPS files with range seeking, Icecast/Shoutcast radio, HLS, `.pls`/`.m3u`; reconnects by itself ([web streams](../features/web-streams.md)) | `engine.OpenUrl(url)` | ✅ WAV/FLAC/MP3/OGG/Opus/AC-3 built in (AAC through the app's FFmpeg) |
@@ -850,10 +851,9 @@ Stored positions (cue points, mix points, lyrics or CD+G offsets saved by your a
 |---|---|---|---|
 | AAC in MP4/M4A (and video files) | Plays the encoder's priming (1024 frames) and ignores the edit list, so it is 1024 frames long too | Starts on the first real sample, exact length | −1024 frames (about −23 ms at 44.1 kHz) |
 | AAC in `.aac` (ADTS) files and AAC radio | Drops the first 1024 frames | Keeps them, as FFmpeg does (ADTS has no delay field) | +1024 frames |
-| MP3 without a Xing/LAME header | Drops the decoder's 529-frame delay | Keeps it, as FFmpeg does | +529 frames |
-| WAV, FLAC, MP3 with a LAME header, AC-3 | Same frame | Same frame | none |
+| WAV, FLAC, MP3 (with or without a LAME header), AC-3 | Same frame | Same frame | none |
 
 ### Where BASS is still ahead
 
-The comparison report opens with every measurement where BASS won; the ones to fix are in the [engineering notes](../engineering-notes.md) (area "bass-compare"). In short: MP3 forward seeks are off and slow, the AC-3 decoder is about 2.5 times slower and uses more memory per stream, the loudness scan of MP3 is slower than BASS decoding it, and WMA is not built yet. Ogg Opus and Ogg Vorbis match bassopus and BASS's Vorbis decoder.
+The comparison report opens with every measurement where BASS won; the ones to fix are in the [engineering notes](../engineering-notes.md) (area "bass-compare"). In short: the AC-3 decoder is about 2.5 times slower and uses more memory per stream, and WMA has not been compared yet (basswma does not run under Wine). MP3 now seeks exactly in about 0.3 ms (BASS lands off target unless it prescans), decodes as accurately as BASS, and its loudness scan runs faster than BASS decodes the file. Ogg Opus and Ogg Vorbis match bassopus and BASS's Vorbis decoder.
 

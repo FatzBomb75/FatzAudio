@@ -172,6 +172,7 @@ static fa_result stream_open_decoder(struct fa_stream* s, const char* name_hint,
     r = fa_decoder_open(&s->decoder, &s->source, name_hint, options ? options->mime_hint : NULL,
                         options ? options->audio_track : -1, &env);
     if (r != FA_OK) return r;
+    if ((s->flags & FA_OPEN_PRESCAN) && s->decoder.vt->prescan) s->decoder.vt->prescan(&s->decoder);
     s->decoder_ready = 1;
     s->midi = fa_midi_of(&s->decoder);
     if (!s->midi) {

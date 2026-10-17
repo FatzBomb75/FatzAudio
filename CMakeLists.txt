@@ -34,6 +34,7 @@ set(FA_SOURCES
     src/probe.c
     src/decoder.c
     src/dec_miniaudio.c
+    src/dec_mp3.c
     src/fa_platform.c
     src/ring.c
     src/curve.c
