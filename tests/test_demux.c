@@ -483,6 +483,169 @@ static void test_forward_only_sources(void)
     CHECK_EQ(r, FA_ERROR_NOT_SEEKABLE);
 }
 
+/* ---- AAC in ADTS frames ------------------------------------------------------------- */
+
+/* net/tone.aac: 3 s of a 440 Hz sine, 44.1 kHz stereo, 131 frames. RMS 0.0625 per
+ * channel (amplitude 1/8, less 3 dB from FFmpeg's mono to stereo upmix). */
+#define ADTS_FRAMES 131
+static void test_adts_file(void)
+{
+    static const int64_t targets[] = { 1023, 1024, 1025, 50000, 120000, 7 };
+    static const int64_t start[] = { 0 };
+    fa_stream* s;
+    fa_stream_info info;
+    float* full;
+    int64_t n;
+    double worst;
+    fa_result r = open_file("net/tone.aac", -1, &s);
+    SKIP_NO_FFMPEG(r);
+    CHECK_EQ(r, FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.codec, "aac") == 0);
+    CHECK(strcmp(info.container, "adts") == 0);
+    CHECK_EQ(info.format.sample_rate, 44100);
+    CHECK_EQ(info.format.channels, 2);
+    CHECK_EQ(info.length_frames, ADTS_FRAMES * 1024);   /* every frame, from the index */
+    CHECK_EQ(info.seekable, 1);
+    full = read_all(s, 2, &n);
+    CHECK_EQ(n, ADTS_FRAMES * 1024);
+    CHECK_NEAR(freq(full, 4410, 128000, 2, 44100), 440.0, 2.0);
+    CHECK_NEAR(rms(full, 4410, 128000, 2), 0.0625, 0.01);
+    CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), 1e-3, &worst));
+    printf("  ADTS seek vs sequential: max difference %.2g\n", worst);
+    /* Back to the very start there is no earlier frame to decode first, and FFmpeg's
+     * flush keeps the last frame's window shape: the first frame differs a little
+     * (an MP4 edit list hides this in the priming frames). */
+    CHECK(seek_matches(s, full, n, 2, start, 1, 5e-3, &worst));
+    free(full);
+    fa_stream_close(s);
+    compare_forward_only("net/tone.aac", -1, 2);
+}
+
+/* Builds net/tone.aac with an ID3 tag in front, half a frame of junk (a stream
+ * joined mid-frame), and an ID3 tag between frames 40 and 41. */
+static uint8_t* adts_with_junk(size_t* out_n)
+{
+    static const uint8_t tag[20] = { 'I', 'D', '3', 4, 0, 0, 0, 0, 0, 10, 'T', 'I', 'T', '2', 0, 0, 0, 0, 0, 0 };
+    size_t size = 0, i = 0, n = 0, f = 0, len;
+    uint8_t* data = load_file("net/tone.aac", &size);
+    uint8_t* out;
+    if (!data) return NULL;
+    out = (uint8_t*)malloc(size + 2 * sizeof(tag) + 200);
+    memcpy(out, tag, sizeof(tag)); n = sizeof(tag);
+    len = ((size_t)(data[3] & 3) << 11) | ((size_t)data[4] << 3) | (data[5] >> 5);
+    memcpy(out + n, data + len / 2, len - len / 2); n += len - len / 2;   /* the end of frame 0 */
+    for (i = 0; i < size; i += len, f++) {
+        len = ((size_t)(data[i + 3] & 3) << 11) | ((size_t)data[i + 4] << 3) | (data[i + 5] >> 5);
+        if (f == 41) { memcpy(out + n, tag, sizeof(tag)); n += sizeof(tag); }
+        memcpy(out + n, data + i, len);
+        n += len;
+    }
+    free(data);
+    *out_n = n;
+    return out;
+}
+
+static void test_adts_junk_and_tags(void)
+{
+    size_t size = 0;
+    uint8_t* data = adts_with_junk(&size);
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_stream_info info;
+    float *a, *b;
+    int64_t na, nb;
+    mem_io m;
+    fa_io_callbacks io = { io_read, NULL, NULL, io_close };
+    fa_result r;
+    CHECK(data != NULL);
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    r = fa_stream_open_memory(g_engine, data, size, &o, &s);
+    SKIP_NO_FFMPEG(r);
+    CHECK_EQ(r, FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.container, "adts") == 0);
+    CHECK_EQ(info.length_frames, ADTS_FRAMES * 1024);   /* the tag between frames is skipped */
+    a = read_all(s, 2, &na);
+    CHECK_EQ(na, ADTS_FRAMES * 1024);
+    fa_stream_close(s);
+    /* The same from a forward-only source: found by sliding to the next header. */
+    m.p = data;
+    m.n = size;
+    m.pos = 0;
+    CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK_EQ(info.seekable, 0);
+    b = read_all(s, 2, &nb);
+    CHECK_EQ(nb, na);
+    CHECK(nb == na && memcmp(a, b, (size_t)na * 2 * sizeof(float)) == 0);
+    fa_stream_close(s);
+    free(a);
+    free(b);
+    free(data);
+}
+
+/* Junk between frames of a local file, then a change of configuration (net/tone.aac
+ * at 44.1 kHz followed by tone.aac at 48 kHz, as at an HLS discontinuity): nothing
+ * is lost, and the 48 kHz part is converted to the stream's rate. */
+static void test_adts_junk_and_format_change(void)
+{
+    size_t na_ = 0, nb_ = 0, n = 0, i = 0, f = 0, len;
+    uint8_t* a = load_file("net/tone.aac", &na_);
+    uint8_t* b = load_file("tone.aac", &nb_);
+    uint8_t* buf;
+    uint32_t seed = 777;
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_stream_info info;
+    float *x, *y;
+    int64_t nx, ny, expect = ADTS_FRAMES * 1024 + 25 * 940;   /* 1024 frames at 48 kHz last 940 at 44.1 */
+    mem_io m;
+    fa_io_callbacks io = { io_read, NULL, NULL, io_close };
+    fa_result r;
+    CHECK(a && b);
+    if (!a || !b) { free(a); free(b); return; }
+    buf = (uint8_t*)malloc(na_ + nb_ + 300);
+    for (i = 0; i < na_; i += len, f++) {
+        len = ((size_t)(a[i + 3] & 3) << 11) | ((size_t)a[i + 4] << 3) | (a[i + 5] >> 5);
+        if (f == 60) {
+            size_t k;
+            for (k = 0; k < 300; k++) { seed = seed * 1103515245u + 12345u; buf[n++] = (uint8_t)((seed >> 16) % 255); }
+        }
+        memcpy(buf + n, a + i, len);
+        n += len;
+    }
+    memcpy(buf + n, b, nb_);
+    n += nb_;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    r = fa_stream_open_memory(g_engine, buf, n, &o, &s);
+    if (r == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); free(a); free(b); free(buf); return; }
+    CHECK_EQ(r, FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK_EQ(info.format.sample_rate, 44100);
+    CHECK_EQ(info.length_frames, expect);
+    x = read_all(s, 2, &nx);
+    printf("  %lld frames decoded, length %lld\n", (long long)nx, (long long)info.length_frames);
+    CHECK(llabs((long long)(nx - expect)) < 64);
+    /* The 48 kHz part is the 1 kHz tone of tone.aac. */
+    CHECK_NEAR(freq(x, expect - 15000, expect - 2000, 2, 44100), 1000.0, 5.0);
+    fa_stream_close(s);
+    m.p = buf;
+    m.n = n;
+    m.pos = 0;
+    CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_OK);
+    y = read_all(s, 2, &ny);
+    CHECK(llabs((long long)(ny - nx)) < 64);
+    fa_stream_close(s);
+    free(x);
+    free(y);
+    free(a);
+    free(b);
+    free(buf);
+}
+
 /* ---- a hand-made Matroska file: lacing, unknown sizes, block groups ----------------- */
 
 typedef struct ebuf { uint8_t* p; size_t n, cap; } ebuf;
@@ -700,7 +863,7 @@ static void exercise_memory(const uint8_t* data, size_t size, int32_t track)
 
 static void test_damaged_files_do_not_crash(void)
 {
-    static const char* names[] = { "av_tracks.mp4", "aac.m4a", "pcm.mov", "frag.mp4", "av_tracks.mkv", "opus.webm" };
+    static const char* names[] = { "av_tracks.mp4", "aac.m4a", "pcm.mov", "frag.mp4", "av_tracks.mkv", "opus.webm", "net/tone.aac" };
     size_t f;
     uint32_t seed = 12345;
     for (f = 0; f < sizeof(names) / sizeof(names[0]); f++) {
@@ -716,7 +879,8 @@ static void test_damaged_files_do_not_crash(void)
         }
         /* Random bytes changed (only where the built-in codecs decode: FFmpeg would
          * log every corrupt packet). */
-        for (i = 0; i < 40 && strcmp(names[f], "aac.m4a") != 0 && strcmp(names[f], "opus.webm") != 0; i++) {
+        for (i = 0; i < 40 && strcmp(names[f], "aac.m4a") != 0 && strcmp(names[f], "opus.webm") != 0 &&
+                         strcmp(names[f], "net/tone.aac") != 0; i++) {
             size_t j, flips = 1 + i % 8;
             memcpy(bad, data, size);
             for (j = 0; j < flips; j++) {
@@ -754,9 +918,9 @@ static void test_registry_lists_containers(void)
     uint32_t i, found = 0;
     for (i = 0; i < fa_format_count(); i++) {
         CHECK_EQ(fa_format_get_info(i, &fi), FA_OK);
-        if (strcmp(fi.name, "mp4") == 0 || strcmp(fi.name, "matroska") == 0) found++;
+        if (strcmp(fi.name, "mp4") == 0 || strcmp(fi.name, "matroska") == 0 || strcmp(fi.name, "aac") == 0) found++;
     }
-    CHECK_EQ(found, 2);
+    CHECK_EQ(found, 3);
 }
 
 /* AAC configs with explicit (non-table) rates, which a Matroska track without
@@ -798,6 +962,9 @@ int main(void)
     RUN(test_mkv_tracks_and_seek);
     RUN(test_webm_opus);
     RUN(test_forward_only_sources);
+    RUN(test_adts_file);
+    RUN(test_adts_junk_and_tags);
+    RUN(test_adts_junk_and_format_change);
     RUN(test_mkv_lacing_and_live_layout);
     RUN(test_damaged_files_do_not_crash);
     RUN(test_scan_video_file);

@@ -1081,5 +1081,5 @@ static int mkv_probe(const uint8_t* d, size_t n, size_t id3)
 const fa_decoder_vtable fa_decoder_mkv = {
     "matroska", "Matroska and WebM (audio tracks)", "mkv;mka;webm;weba",
     "video/x-matroska;audio/x-matroska;video/webm;audio/webm",
-    mkv_probe, mkv_open, mkv_read, mkv_seek, mkv_close, 1
+    mkv_probe, mkv_open, mkv_read, mkv_seek, mkv_close, 1, NULL
 };

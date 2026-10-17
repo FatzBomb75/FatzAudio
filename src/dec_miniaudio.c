@@ -188,11 +188,9 @@ static void mp3_remote_close(fa_decoder* dec)
     dec->impl = NULL;
 }
 
-void fa_decoder_lag(fa_decoder* dec, int64_t* out_bytes, int64_t* out_frames)
+static void mp3_remote_lag(fa_decoder* dec, int64_t* out_bytes, int64_t* out_frames)
 {
-    *out_bytes = 0;
-    *out_frames = 0;
-    if (dec->vt == &fa_decoder_mp3_remote && dec->impl) fa_drmp3_lag(((mp3_remote*)dec->impl)->dr, out_bytes, out_frames);
+    fa_drmp3_lag(((mp3_remote*)dec->impl)->dr, out_bytes, out_frames);
 }
 
 static fa_result flac_open(fa_decoder* dec) { return open_with(dec, ma_encoding_format_flac); }
@@ -204,24 +202,24 @@ static fa_result mp3_open(fa_decoder* dec)
 const fa_decoder_vtable fa_decoder_wav = {
     "wav", "WAV, RF64, Wave64 and AIFF (PCM, float, ADPCM)", "wav;wave;rf64;w64;bwf;aif;aiff;aifc",
     "audio/wav;audio/x-wav;audio/wave;audio/vnd.wave;audio/aiff;audio/x-aiff",
-    fa_probe_wav, wav_open, wav_read, wav_seek, wav_close, 1
+    fa_probe_wav, wav_open, wav_read, wav_seek, wav_close, 1, NULL
 };
 
 const fa_decoder_vtable fa_decoder_flac = {
     "flac", "Free Lossless Audio Codec", "flac;fla",
     "audio/flac;audio/x-flac",
-    fa_probe_flac, flac_open, ma_read, ma_seek, ma_close, 1
+    fa_probe_flac, flac_open, ma_read, ma_seek, ma_close, 1, NULL
 };
 
 const fa_decoder_vtable fa_decoder_mp3 = {
     "mp3", "MPEG-1/2/2.5 Layer III", "mp3",
     "audio/mpeg;audio/mp3;audio/x-mp3",
-    fa_probe_mp3, mp3_open, ma_read, ma_seek, ma_close, 0
+    fa_probe_mp3, mp3_open, ma_read, ma_seek, ma_close, 0, NULL
 };
 
 /* Not in the registry: mp3_open switches to it for network sources. */
 const fa_decoder_vtable fa_decoder_mp3_remote = {
     "mp3", "MPEG-1/2/2.5 Layer III", "mp3",
     "audio/mpeg;audio/mp3;audio/x-mp3",
-    fa_probe_mp3, mp3_remote_open, mp3_remote_read, mp3_remote_seek, mp3_remote_close, 0
+    fa_probe_mp3, mp3_remote_open, mp3_remote_read, mp3_remote_seek, mp3_remote_close, 0, mp3_remote_lag
 };
