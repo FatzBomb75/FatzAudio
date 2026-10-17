@@ -94,17 +94,39 @@ typedef struct fa_audio_format {
 FA_API uint32_t FA_CALL fa_version(void); /* (major << 16) | (minor << 8) | patch */
 FA_API const char* FA_CALL fa_result_string(fa_result result);
 
+typedef enum fa_engine_flags {
+    /* Devices play into a silent "null" output that runs in real time on its own
+     * thread. For automated tests, CI machines without audio hardware, and servers. */
+    FA_ENGINE_NULL_OUTPUT = 1 << 0
+} fa_engine_flags;
+
 typedef struct fa_engine_config {
     uint32_t struct_size;         /* sizeof(fa_engine_config) */
     uint32_t mix_sample_rate;     /* 0 = device native */
     uint32_t period_ms;           /* 0 = backend default */
     uint32_t worker_threads;      /* for scanning/decoding, 0 = number of cores */
     const char* cache_directory;  /* loudness/seek-index cache, NULL = disabled */
+    uint32_t flags;               /* fa_engine_flags */
 } fa_engine_config;
 
 FA_API void FA_CALL fa_engine_config_init(fa_engine_config* config);
 FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_engine** out_engine);
+/* Close every stream and device of the engine before destroying it. */
 FA_API void FA_CALL fa_engine_destroy(fa_engine* engine);
+
+/* ---- Supported formats -------------------------------------------------- */
+
+/* Everything the built-in decoder registry can open. Replaces BASS_PluginGetInfo:
+ * there are no plugins, every format is compiled in. */
+typedef struct fa_format_info {
+    char name[32];          /* registry name, e.g. "flac" */
+    char description[64];   /* e.g. "Free Lossless Audio Codec" */
+    char extensions[64];    /* typical file extensions, ';'-separated, e.g. "flac;fla" */
+    char mime_types[128];   /* ';'-separated */
+} fa_format_info;
+
+FA_API uint32_t FA_CALL fa_format_count(void);
+FA_API fa_result FA_CALL fa_format_get_info(uint32_t index, fa_format_info* out_info);
 
 /* ---- Devices ------------------------------------------------------------ */
 
@@ -124,21 +146,42 @@ FA_API fa_result FA_CALL fa_device_get_info(fa_engine* engine, fa_device_type ty
 
 /* device_id NULL = system default; follows default-device changes automatically. */
 FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id, fa_device** out_device);
+/* Detaches every stream still attached (they keep their position) and closes the device. */
 FA_API void FA_CALL fa_device_close(fa_device* device);
+/* Start and stop are idempotent: starting a running device or stopping a stopped
+ * one returns FA_OK and does nothing. Attached streams keep their position. */
 FA_API fa_result FA_CALL fa_device_start(fa_device* device);
 FA_API fa_result FA_CALL fa_device_stop(fa_device* device);
+/* *out_started = 1 while the device is running, else 0. */
+FA_API fa_result FA_CALL fa_device_is_started(fa_device* device, int32_t* out_started);
 FA_API fa_result FA_CALL fa_device_set_volume(fa_device* device, float volume);
 FA_API fa_result FA_CALL fa_device_get_volume(fa_device* device, float* out_volume);
 FA_API fa_result FA_CALL fa_device_get_latency(fa_device* device, fa_time* out_latency);
 
 /* ---- Opening streams ---------------------------------------------------- */
 
-/* Custom I/O. Return bytes read, 0 at end, negative on error. */
+/* Custom I/O for fa_stream_open_io.
+ *
+ * read   Required. Copy up to `bytes` bytes into `buffer` and return how many were
+ *        copied; 0 means end of data, a negative fa_result means an I/O error.
+ *        Short reads are fine.
+ * seek   Optional. Move to the absolute byte `offset` and return FA_OK, or an error.
+ *        NULL means the source can only be read forwards: the stream still opens
+ *        (the first few KB are buffered for format detection) but cannot seek.
+ * length Optional. Total size in bytes, or a negative value / NULL if unknown.
+ * close  Optional. Called exactly once, when the stream is closed with
+ *        fa_stream_close, after the last read/seek/length call. Release `user` here.
+ *
+ * Lifetime of `user`: the stream takes ownership only when fa_stream_open_io
+ * returns FA_OK. If it fails, `close` is NOT called and the caller still owns
+ * `user`. The callbacks are never called concurrently for one stream, but they
+ * may be called from engine worker threads, not only the thread that opened it.
+ * The fa_io_callbacks struct itself is copied, so it may live on the stack. */
 typedef struct fa_io_callbacks {
     int64_t (FA_CALL *read)(void* user, void* buffer, size_t bytes);
-    fa_result (FA_CALL *seek)(void* user, int64_t offset); /* absolute; NULL = not seekable */
-    int64_t (FA_CALL *length)(void* user);                 /* NULL or <0 = unknown */
-    void (FA_CALL *close)(void* user);                     /* may be NULL */
+    fa_result (FA_CALL *seek)(void* user, int64_t offset);
+    int64_t (FA_CALL *length)(void* user);
+    void (FA_CALL *close)(void* user);
 } fa_io_callbacks;
 
 typedef enum fa_open_flags {
@@ -151,13 +194,20 @@ typedef enum fa_open_flags {
 typedef struct fa_open_options {
     uint32_t struct_size;
     uint32_t flags;          /* fa_open_flags */
-    int32_t audio_track;     /* for containers with several audio tracks, -1 = default */
-    const char* mime_hint;   /* optional, content sniffing still wins */
+    int32_t audio_track;     /* for containers with several audio tracks, -1 = default;
+                                FA_ERROR_NOT_FOUND if the track does not exist */
+    const char* mime_hint;   /* optional, e.g. "audio/flac"; only used when the content
+                                itself is ambiguous. Content sniffing always wins */
 } fa_open_options;
 
 FA_API void FA_CALL fa_open_options_init(fa_open_options* options);
 
-/* One entry point per source kind; format is detected from content. */
+/* One entry point per source kind. The format is detected from the content
+ * (magic bytes and frame sync, ID3v2 tags skipped), never from the file name;
+ * the extension and mime_hint are only tie-breakers when the content is
+ * ambiguous. There are no per-format open calls and no plugins.
+ * Returns FA_ERROR_UNSUPPORTED_FORMAT when no built-in decoder recognises the data.
+ * options may be NULL (defaults). fa_stream_open_memory copies the data. */
 FA_API fa_result FA_CALL fa_stream_open_path(fa_engine* engine, const char* path, const fa_open_options* options, fa_stream** out_stream);
 FA_API fa_result FA_CALL fa_stream_open_memory(fa_engine* engine, const void* data, size_t size, const fa_open_options* options, fa_stream** out_stream);
 FA_API fa_result FA_CALL fa_stream_open_io(fa_engine* engine, const fa_io_callbacks* io, void* user, const fa_open_options* options, fa_stream** out_stream);
@@ -172,20 +222,30 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream);
 /* ---- Stream info -------------------------------------------------------- */
 
 typedef struct fa_stream_info {
-    fa_audio_format format;      /* decoded output format */
+    fa_audio_format format;      /* the source's own decoded format (always F32 interleaved,
+                                    at the source's rate and channel count). It does not
+                                    change when the stream is attached to a device; the
+                                    voice chain converts to the device format */
     char codec[32];              /* "mp3", "flac", "eac3", ... */
     char container[32];          /* "mp4", "matroska", "ogg", "raw", ... */
     fa_frames length_frames;     /* -1 if unknown (live) */
     int32_t seekable;
     int32_t audio_track_count;
     int32_t has_cdg;             /* CD+G side stream present */
+    fa_time duration;            /* length in nanoseconds, -1 if unknown */
 } fa_stream_info;
 
 FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* out_info);
 
 /* ---- Transport and position -------------------------------------------- */
 
-FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, fa_bus* bus); /* bus may be NULL = master */
+/* Routes a stream to a device (bus NULL = the device's master mix). The decoder
+ * is not reopened: position, format and parameters are kept. Attaching to the
+ * device it is already on is a no-op; attaching to another device moves it there
+ * (still keeping its position). Decode-only streams cannot be attached. */
+FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, fa_bus* bus);
+/* Removes the stream from its device; it keeps its position. FA_OK if not attached. */
+FA_API fa_result FA_CALL fa_stream_detach(fa_stream* stream);
 FA_API fa_result FA_CALL fa_stream_play(fa_stream* stream);
 FA_API fa_result FA_CALL fa_stream_play_at(fa_stream* stream, fa_time engine_time); /* sample-accurate scheduled start */
 FA_API fa_result FA_CALL fa_stream_pause(fa_stream* stream);
@@ -204,7 +264,11 @@ FA_API fa_result FA_CALL fa_stream_get_position(fa_stream* stream, fa_frames* ou
 FA_API fa_result FA_CALL fa_stream_get_clock(fa_stream* stream, fa_time* out_pts);
 FA_API fa_result FA_CALL fa_engine_get_time(fa_engine* engine, fa_time* out_time);
 
-/* Decode-only streams: pull PCM in the stream's output format. */
+/* Decode-only streams (FA_OPEN_DECODE_ONLY): pull interleaved F32 PCM in the
+ * format reported by fa_stream_get_info. `buffer` must hold frames * channels floats.
+ * Returns FA_OK with 1..frames frames read (short reads happen; keep calling), and
+ * FA_ERROR_END_OF_STREAM with *out_frames_read == 0 once the end is reached.
+ * Returns FA_ERROR_BUSY for streams attached to a device (the device pulls them). */
 FA_API fa_result FA_CALL fa_stream_read(fa_stream* stream, void* buffer, fa_frames frames, fa_frames* out_frames_read);
 
 /* ---- Parameters and envelopes ----------------------------------------- */
@@ -245,6 +309,10 @@ typedef enum fa_marker {
     FA_MARKER_FADE_OUT_START,
     FA_MARKER_MIX_POINT /* where the next queued stream starts */
 } fa_marker;
+
+/* "No marker": set a marker to FA_FRAMES_UNSET to clear it; get returns it for
+ * markers that were never set. Any other negative frame is FA_ERROR_INVALID_ARG. */
+#define FA_FRAMES_UNSET ((fa_frames)-1)
 
 FA_API fa_result FA_CALL fa_stream_set_marker(fa_stream* stream, fa_marker marker, fa_frames frame);
 FA_API fa_result FA_CALL fa_stream_get_marker(fa_stream* stream, fa_marker marker, fa_frames* out_frame);

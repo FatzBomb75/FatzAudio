@@ -122,7 +122,7 @@ public unsafe class AudioStream : IDisposable
     {
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_info(Handle, out FaStreamInfo n));
         var format = AudioFormat.FromNative(n.Format);
-        TimeSpan? duration = n.LengthFrames >= 0 ? TimeConvert.FromFrames(n.LengthFrames, format.SampleRate) : null;
+        TimeSpan? duration = n.Duration >= 0 ? TimeConvert.FromNanoseconds(n.Duration) : null;
         return new StreamInfo(
             format,
             Marshal.PtrToStringUTF8((nint)n.Codec) ?? "",
@@ -131,8 +131,9 @@ public unsafe class AudioStream : IDisposable
     }
 
     /// <summary>
-    /// Information about the decoded stream. The values are re-read on every access: after
-    /// <see cref="PlayOn"/> the format reflects the device's rate and channel layout.
+    /// Information about the decoded stream: the source's own format, codec, container and duration.
+    /// The format stays the same when the stream is attached to a device; conversion to the device
+    /// format happens inside the engine.
     /// </summary>
     /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
     public StreamInfo Info => ReadInfo();
@@ -145,13 +146,17 @@ public unsafe class AudioStream : IDisposable
     /// <summary>The output device this stream is attached to, or null.</summary>
     public OutputDevice? Device => _device;
 
-    /// <summary>Attaches the stream to <paramref name="device"/>, starts the device if necessary and starts playback.</summary>
+    /// <summary>
+    /// Attaches the stream to <paramref name="device"/>, starts the device if necessary and starts playback.
+    /// If the stream is already on another device it moves there and continues from the same position.
+    /// </summary>
     /// <param name="device">The output device.</param>
     /// <exception cref="ArgumentNullException"><paramref name="device"/> is null.</exception>
-    /// <exception cref="FatzAudioException">The stream is decode-only (<see cref="ErrorCode.InvalidArgument"/>), already attached to another device (<see cref="ErrorCode.Busy"/>) or the device failed.</exception>
+    /// <exception cref="FatzAudioException">The stream is decode-only (<see cref="ErrorCode.InvalidArgument"/>) or the device failed.</exception>
     /// <example>
     /// <code>
     /// song.PlayOn(output);
+    /// song.PlayOn(headphones); // moves to the other device, same position
     /// </code>
     /// </example>
     public void PlayOn(OutputDevice device)
@@ -159,19 +164,31 @@ public unsafe class AudioStream : IDisposable
         ArgumentNullException.ThrowIfNull(device);
         var h = Handle;
         var dh = device.Handle;
-        if (_device is null)
+        if (!ReferenceEquals(_device, device))
         {
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_attach(h, dh, 0));
             h.AttachDevice(dh);
             _device = device;
-            RefreshFormat(); // native re-opens the decoder in the device format
-        }
-        else if (!ReferenceEquals(_device, device))
-        {
-            throw new FatzAudioException(ErrorCode.Busy, "The stream is already attached to another device.");
         }
         device.Start();
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_play(h));
+    }
+
+    /// <summary>
+    /// Removes the stream from its output device. It keeps its position, so a later
+    /// <see cref="PlayOn"/> continues where it left off. Does nothing if the stream is not attached.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    /// <example>
+    /// <code>
+    /// song.Detach();
+    /// Console.WriteLine(song.Position); // unchanged
+    /// </code>
+    /// </example>
+    public void Detach()
+    {
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_detach(Handle));
+        _device = null;
     }
 
     /// <summary>Starts or resumes playback. The stream must have been attached with <see cref="PlayOn"/> before.</summary>

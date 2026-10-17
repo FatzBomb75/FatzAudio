@@ -187,11 +187,13 @@ Decode null-test, seek accuracy, length/end accuracy, gapless/crossfade timing, 
 
 ## 7. API fixes found while writing the .NET binding (to do in the core-engine phase)
 
-1. Document that `fa_stream_read` returns `FA_ERROR_END_OF_STREAM` with 0 frames at the end.
-2. `fa_stream_attach` must not reopen the decoder or reset position/format (resampling belongs in the voice chain).
-3. Add a duration field to `fa_stream_info`.
-4. Make `fa_device_start`/`stop` idempotent.
-5. Define an "unset" value for markers.
+Status: ✅ = done in the core-engine phase.
+
+1. ✅ Document that `fa_stream_read` returns `FA_ERROR_END_OF_STREAM` with 0 frames at the end.
+2. ✅ `fa_stream_attach` must not reopen the decoder or reset position/format (resampling belongs in the voice chain). Attaching to another device now moves the stream; `fa_stream_detach` added.
+3. ✅ Add a duration field to `fa_stream_info` (`duration`, nanoseconds, -1 unknown).
+4. ✅ Make `fa_device_start`/`stop` idempotent (`fa_device_is_started` added).
+5. ✅ Define an "unset" value for markers (`FA_FRAMES_UNSET`).
 6. Add a ramp-finished event so `RampAsync` can complete on the real end.
-7. Specify `fa_io_callbacks.close` and the lifetime of `user`.
+7. ✅ Specify `fa_io_callbacks.close` and the lifetime of `user` (owned by the stream only after a successful open; `close` called exactly once by `fa_stream_close`).
 8. Document `fa_event.frame`/`value` per event type.

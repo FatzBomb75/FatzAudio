@@ -172,7 +172,19 @@ public sealed record AudioEngineOptions
     public int WorkerThreads { get; init; }
     /// <summary>Directory for the loudness and seek-index cache; null disables the cache.</summary>
     public string? CacheDirectory { get; init; }
+    /// <summary>
+    /// Output devices play into a silent output that still runs in real time. Use it for automated
+    /// tests, build servers without audio hardware, and headless services.
+    /// </summary>
+    public bool NullOutput { get; init; }
 }
+
+/// <summary>A format the built-in decoder registry can open (see <see cref="AudioEngine.SupportedFormats"/>).</summary>
+/// <param name="Name">Registry name, for example <c>flac</c>.</param>
+/// <param name="Description">Human-readable description.</param>
+/// <param name="Extensions">Typical file extensions, without dots.</param>
+/// <param name="MimeTypes">MIME types of the format.</param>
+public sealed record AudioFormatInfo(string Name, string Description, IReadOnlyList<string> Extensions, IReadOnlyList<string> MimeTypes);
 
 internal static class TimeConvert
 {

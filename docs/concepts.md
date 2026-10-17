@@ -6,7 +6,7 @@
 |---|---|---|---|
 | `fa_engine` | The library instance: thread pool, caches, normalization settings. Usually one per app. | `fa_engine_create` | `fa_engine_destroy` |
 | `fa_device` | An opened output device. `NULL` id = the system's primary device, and it follows the primary device when that changes. | `fa_device_open` | `fa_device_close` |
-| `fa_stream` | Anything that produces audio: file, memory, custom I/O, URL, pushed PCM/packets, CD track. | `fa_stream_open_*` | `fa_stream_close` |
+| `fa_stream` | Anything that produces audio: file, memory, custom I/O, URL, pushed PCM/packets, CD track. The format is detected from the content by the decoder registry ([streams](features/streams.md)). | `fa_stream_open_*` | `fa_stream_close` |
 | `fa_bus` | A mix group (deck, cue bus). Streams attach to a bus or straight to the device. | (planned) | (planned) |
 
 There is **no hidden state**: every call names the object it acts on. Unlike BASS there is no "current device" per thread and no "last error" to poll.

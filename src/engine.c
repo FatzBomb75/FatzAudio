@@ -38,15 +38,30 @@ FA_API void FA_CALL fa_engine_config_init(fa_engine_config* config)
 FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_engine** out_engine)
 {
     fa_engine* e;
+    ma_result r;
     if (!out_engine) return FA_ERROR_INVALID_ARG;
     *out_engine = NULL;
 
     e = (fa_engine*)calloc(1, sizeof(*e));
     if (!e) return FA_ERROR_OUT_OF_MEMORY;
-    if (config) e->config = *config; else fa_engine_config_init(&e->config);
+    /* Copy only the part of the config the caller's struct_size covers, so callers
+     * compiled against an older, shorter struct keep working. */
+    fa_engine_config_init(&e->config);
+    if (config) {
+        size_t n = config->struct_size;
+        if (n == 0 || n > sizeof(e->config)) n = sizeof(e->config);
+        memcpy(&e->config, config, n);
+        e->config.struct_size = (uint32_t)sizeof(e->config);
+    }
 
     if (ma_mutex_init(&e->lock) != MA_SUCCESS) { free(e); return FA_ERROR_GENERIC; }
-    if (ma_context_init(NULL, 0, NULL, &e->context) != MA_SUCCESS) {
+    if (e->config.flags & FA_ENGINE_NULL_OUTPUT) {
+        ma_backend null_backend = ma_backend_null;
+        r = ma_context_init(&null_backend, 1, NULL, &e->context);
+    } else {
+        r = ma_context_init(NULL, 0, NULL, &e->context);
+    }
+    if (r != MA_SUCCESS) {
         ma_mutex_uninit(&e->lock);
         free(e);
         return FA_ERROR_DEVICE;

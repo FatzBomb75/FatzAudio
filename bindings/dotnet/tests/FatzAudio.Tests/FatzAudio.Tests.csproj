@@ -21,6 +21,8 @@
     <ProjectReference Include="..\..\src\FatzAudio\FatzAudio.csproj" />
     <!-- Native library next to the test assembly -->
     <None Include="$(FatzAudioNativeDir)\fatzaudio.dll" Link="fatzaudio.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(FatzAudioNativeDir)\fatzaudio.dll')" />
+    <None Include="$(FatzAudioNativeDir)/libfatzaudio.so" Link="libfatzaudio.so" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(FatzAudioNativeDir)/libfatzaudio.so')" />
+    <None Include="$(FatzAudioNativeDir)/libfatzaudio.dylib" Link="libfatzaudio.dylib" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(FatzAudioNativeDir)/libfatzaudio.dylib')" />
   </ItemGroup>
 
 </Project>

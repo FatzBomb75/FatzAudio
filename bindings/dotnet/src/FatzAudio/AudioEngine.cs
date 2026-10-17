@@ -54,6 +54,7 @@ public sealed class AudioEngine : IDisposable
                 config.MixSampleRate = (uint)Math.Max(0, options.MixSampleRate);
                 config.PeriodMs = options.Period is { } p ? (uint)Math.Max(0, p.TotalMilliseconds) : 0;
                 config.WorkerThreads = (uint)Math.Max(0, options.WorkerThreads);
+                if (options.NullOutput) config.Flags |= 1; // FA_ENGINE_NULL_OUTPUT
                 if (options.CacheDirectory is { } dir)
                 {
                     cachePtr = Marshal.StringToCoTaskMemUTF8(dir);
@@ -80,6 +81,38 @@ public sealed class AudioEngine : IDisposable
             NativeLoader.EnsureInitialized();
             uint v = NativeMethods.fa_version();
             return new Version((int)(v >> 16), (int)((v >> 8) & 0xFF), (int)(v & 0xFF));
+        }
+    }
+
+    /// <summary>
+    /// Every format the native library can open. All formats are built in and detected from the
+    /// content, so there is nothing to load or register (unlike BASS plugins).
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// foreach (var f in AudioEngine.SupportedFormats)
+    ///     Console.WriteLine($"{f.Name}: {f.Description} ({string.Join(", ", f.Extensions)})");
+    /// </code>
+    /// </example>
+    public static unsafe IReadOnlyList<AudioFormatInfo> SupportedFormats
+    {
+        get
+        {
+            NativeLoader.EnsureInitialized();
+            uint count = NativeMethods.fa_format_count();
+            var list = new List<AudioFormatInfo>((int)count);
+            for (uint i = 0; i < count; i++)
+            {
+                FatzAudioException.ThrowIfFailed(NativeMethods.fa_format_get_info(i, out FaFormatInfo f));
+                list.Add(new AudioFormatInfo(
+                    Marshal.PtrToStringUTF8((nint)f.Name) ?? "",
+                    Marshal.PtrToStringUTF8((nint)f.Description) ?? "",
+                    Split(Marshal.PtrToStringUTF8((nint)f.Extensions)),
+                    Split(Marshal.PtrToStringUTF8((nint)f.MimeTypes))));
+            }
+            return list;
+
+            static string[] Split(string? s) => string.IsNullOrEmpty(s) ? [] : s.Split(';');
         }
     }
 

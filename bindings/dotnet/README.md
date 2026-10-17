@@ -54,5 +54,16 @@ Binaries for other platforms placed in `src/FatzAudio/runtimes/<rid>/native/` ar
 
 ## Status
 
-The native library is an early scaffold. Functions it does not implement yet throw
-`FatzAudioException` with `ErrorCode.NotImplemented`.
+Functions the native library does not implement yet throw `FatzAudioException` with
+`ErrorCode.NotImplemented`. See the [feature guides](../../docs/features/README.md) for what is available.
+
+## Tests
+
+The tests run without audio hardware (they use `AudioEngineOptions.NullOutput`). Build the native
+library first, then point the tests at it:
+
+```
+dotnet test bindings/dotnet/tests/FatzAudio.Tests -p:FatzAudioNativeDir=<repo>/build/bin/Release
+```
+
+On Linux and macOS the CMake output folder is `build/bin` (no `Release` subfolder).
