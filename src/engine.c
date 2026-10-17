@@ -24,6 +24,7 @@ FA_API const char* FA_CALL fa_result_string(fa_result result)
     case FA_ERROR_END_OF_STREAM: return "end of stream";
     case FA_ERROR_NOT_IMPLEMENTED: return "not implemented";
     case FA_ERROR_PROVIDER_MISSING: return "provider missing";
+    case FA_ERROR_NO_DISC: return "no disc";
     default: return "unknown result";
     }
 }

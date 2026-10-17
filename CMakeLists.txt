@@ -67,20 +67,25 @@ set(FA_SOURCES
     src/resample.c
     src/stretch.cpp
     src/cdg.h
+    src/disc.c
+    src/disc_mmc.c
+    src/disc_image.c
     src/tempo.h
     src/ac3.h
     src/mdct.h
     src/fa_internal.h
     src/net.h
+    src/disc.h
 )
-# HTTPS through the platform's own stack: nothing is bundled.
+# HTTPS through the platform's own stack, CD drives through its drive interface:
+# nothing is bundled.
 if(WIN32)
-    list(APPEND FA_SOURCES src/net_https_winhttp.c)
+    list(APPEND FA_SOURCES src/net_https_winhttp.c src/disc_win.c)
 elseif(APPLE)
     enable_language(OBJC)
-    list(APPEND FA_SOURCES src/net_https_apple.m)
+    list(APPEND FA_SOURCES src/net_https_apple.m src/disc_mac.c)
 else()
-    list(APPEND FA_SOURCES src/net_https_curl.c)
+    list(APPEND FA_SOURCES src/net_https_curl.c src/disc_linux.c)
 endif()
 
 add_library(fatzaudio SHARED ${FA_SOURCES})
@@ -110,6 +115,9 @@ if(WIN32)
     set(FA_NET_LIBS ws2_32 winhttp)
 elseif(APPLE)
     set(FA_NET_LIBS "-framework Foundation" "-framework CFNetwork")
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        list(APPEND FA_NET_LIBS "-framework IOKit" "-framework CoreFoundation")
+    endif()
     set_source_files_properties(src/net_https_apple.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 else()
     set(FA_NET_LIBS "")

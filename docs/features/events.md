@@ -13,7 +13,7 @@ Each stream has one event callback. The audio thread queues events without locki
 | `FA_EVENT_STARTED` | position at the start | 0 | ✅ after `play_at`, a crossfade or a queue ([crossfade](crossfade.md)) |
 | `FA_EVENT_METADATA` | position where the new title starts | `fa_metadata.seq` of the title | ✅ radio song titles ([web streams](web-streams.md#song-titles-icy-metadata)) |
 | `FA_EVENT_STALLED` / `RESUMED` | position | 0 | ✅ push and packet streams ([FFmpeg hand-off](ffmpeg.md#buffering-the-end-and-seeking)), web streams ([buffering](web-streams.md#buffering-stalls-and-reconnects)) |
-| `FA_EVENT_DECODE_ERROR` | position | the `fa_result` | ✅ packet streams (the packet is skipped) |
+| `FA_EVENT_DECODE_ERROR` | position | the `fa_result` | ✅ packet streams (the packet is skipped); disc streams (`FA_ERROR_IO` for a sector that stays unreadable, which plays as silence) |
 | `FA_EVENT_DEVICE_CHANGED` | position | 0 | 🗓️ R14 |
 | `FA_EVENT_LOUDNESS_FINAL` | position | 0 | ✅ ([normalization](normalization.md)) |
 

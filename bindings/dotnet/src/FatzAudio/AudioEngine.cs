@@ -182,6 +182,31 @@ public sealed class AudioEngine : IDisposable
         return AudioStream.Wrap(this, NativeMethods.fa_stream_open_path(h, path, opts.Pointer, out nint s), s, null);
     }
 
+    /// <summary>
+    /// Opens one audio track of a CD (or disc image). The stream is 44.1 kHz stereo and seekable, and works
+    /// like any other: crossfades, queues (gapless track to track), normalization and buses.
+    /// </summary>
+    /// <param name="disc">The drive, from <see cref="Disc.Open(string?, DiscOptions?)"/>.</param>
+    /// <param name="track">The track number, as in <see cref="DiscToc.Tracks"/>.</param>
+    /// <param name="options">Optional open options.</param>
+    /// <returns>The stream; dispose it when done. If the disc is taken out while it plays, the stream ends.</returns>
+    /// <exception cref="FatzAudioException">The disc has no such track (<see cref="ErrorCode.NotFound"/>), it is a data track
+    /// (<see cref="ErrorCode.UnsupportedFormat"/>), or there is no disc (<see cref="ErrorCode.NoDisc"/>).</exception>
+    /// <example>
+    /// <code>
+    /// using var disc = Disc.Open();
+    /// using var track = engine.OpenDisc(disc, 3);
+    /// track.PlayOn(output);
+    /// </code>
+    /// </example>
+    public unsafe AudioStream OpenDisc(Disc disc, int track, StreamOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(disc);
+        var h = Handle;
+        using var opts = NativeOptions.Create(options);
+        return AudioStream.Wrap(this, NativeMethods.fa_stream_open_disc(h, disc.Handle, track, opts.Pointer, out nint s), s, null);
+    }
+
     /// <summary>Opens audio held in memory. The native library copies the data, so the buffer may be reused afterwards.</summary>
     /// <param name="data">Encoded audio file contents.</param>
     /// <param name="options">Optional open options.</param>
