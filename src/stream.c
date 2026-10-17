@@ -335,6 +335,7 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
     if (!stream || !device) return FA_ERROR_INVALID_ARG;
     if (bus) return FA_ERROR_NOT_IMPLEMENTED;
     if (stream->flags & FA_OPEN_DECODE_ONLY) return FA_ERROR_INVALID_ARG;
+    if (device->engine != stream->engine) return FA_ERROR_INVALID_ARG; /* events and cleanup are per engine */
 
     fa_mutex_lock(&stream->api_lock);
     if (stream->device == device) { fa_mutex_unlock(&stream->api_lock); return FA_OK; }
@@ -344,6 +345,18 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
     r = build_chain_locked(stream, device);
     if (r == FA_OK) {
         fa_frames pos = fa_load64(&stream->position);
+        int p;
+        /* Ramp counters are in device frames: keep a running ramp's remaining time
+         * when moving to a device with another rate. Nothing mixes this stream now. */
+        for (p = 0; p < FA_MIX_PARAMS; p++) {
+            fa_param_voice* v = &stream->voice[p];
+            if (v->active && stream->voice_rate && stream->voice_rate != device->rate) {
+                double k = (double)device->rate / (double)stream->voice_rate;
+                v->total = (int64_t)((double)v->total * k + 0.5);
+                v->done = (int64_t)((double)v->done * k + 0.5);
+            }
+        }
+        stream->voice_rate = device->rate;
         stream->dev_rate = device->rate;
         fa_store64(&stream->seek_base, pos);
         fa_store64(&stream->played, 0);
@@ -648,12 +661,15 @@ FA_API fa_result FA_CALL fa_stream_read(fa_stream* stream, void* buffer, fa_fram
 
 static void push_event(fa_device* dev, struct fa_stream* s, fa_event_type type, int64_t value)
 {
-    fa_event ev;
-    ev.type = type;
-    ev.stream = s;
-    ev.frame = attached_position(s);
-    ev.value = value;
-    fa_event_queue_push(&dev->events, &ev);
+    fa_audio_post_event(dev, s, type, attached_position(s), value);
+}
+
+/* Ends a ramp that has run its course (or had zero length) at its target. */
+static void finish_ramp(struct fa_stream* s, fa_device* dev, fa_param_voice* v)
+{
+    v->active = 0;
+    v->value = v->target;
+    if (v->notify) push_event(dev, s, FA_EVENT_RAMP_DONE, v->tag);
 }
 
 /* Takes a new parameter command if one is waiting (see fa_param_mailbox). */
@@ -732,7 +748,11 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
     int p, playing;
     if (fa_load32(&s->flushing)) return;
     playing = fa_load32(&s->state) == FA_STATE_PLAYING;
-    for (p = 0; p < FA_MIX_PARAMS; p++) take_command(s, dev, p, playing);
+    for (p = 0; p < FA_MIX_PARAMS; p++) {
+        take_command(s, dev, p, playing);
+        /* A zero-length ramp is a jump: the first sample already uses the target. */
+        if (s->voice[p].active && s->voice[p].done >= s->voice[p].total) finish_ramp(s, dev, &s->voice[p]);
+    }
     if (!playing) {
         for (p = 0; p < FA_MIX_PARAMS; p++) fa_store_float(&s->current[p], s->voice[p].value);
         s->was_audible = 0;
@@ -774,23 +794,10 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
             v->value = v1[p];
             if (!v->active) continue;
             v->done += blk;
-            if (v->done >= v->total) {
-                v->active = 0;
-                v->value = v->target;
-                if (v->notify) push_event(dev, s, FA_EVENT_RAMP_DONE, v->tag);
-            }
+            if (v->done >= v->total) finish_ramp(s, dev, v);
         }
     }
-    /* Zero-length ramps finish even when no audio was mixed. */
-    for (p = 0; p < FA_MIX_PARAMS; p++) {
-        fa_param_voice* v = &s->voice[p];
-        if (v->active && v->done >= v->total) {
-            v->active = 0;
-            v->value = v->target;
-            if (v->notify) push_event(dev, s, FA_EVENT_RAMP_DONE, v->tag);
-        }
-        fa_store_float(&s->current[p], v->value);
-    }
+    for (p = 0; p < FA_MIX_PARAMS; p++) fa_store_float(&s->current[p], s->voice[p].value);
 
     if (n < (int64_t)frames) {
         if (fa_load32(&s->eof) && fa_ring_readable(&s->ring) == 0) {

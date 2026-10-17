@@ -124,21 +124,39 @@ float fa_curve_eval(int curve, const float bezier[4], float t, int rising);
 
 /* ---- Events (event.c) ----------------------------------------------------- */
 
-#define FA_EVENT_QUEUE_SIZE 256 /* power of two */
+#define FA_EVENT_QUEUE_SIZE 1024 /* power of two */
+#define FA_EVENT_SPILL 6          /* per stream: 2 params x (replaced + done) + ENDED, plus slack */
+
+/* An event plus its engine-wide sequence number. Events from the audio thread and
+ * from API threads travel different paths; the event thread sorts each round by
+ * `seq`, so callbacks for a stream arrive in the order the events happened. */
+typedef struct fa_qevent {
+    fa_event ev;
+    int32_t seq;
+} fa_qevent;
 
 /* Single producer (audio thread), single consumer (event thread). */
 typedef struct fa_event_queue {
-    fa_event items[FA_EVENT_QUEUE_SIZE];
+    fa_qevent items[FA_EVENT_QUEUE_SIZE];
     fa_atomic32 head;
     fa_atomic32 tail;
-    fa_atomic32 dropped;
 } fa_event_queue;
 
-int fa_event_queue_push(fa_event_queue* q, const fa_event* ev); /* 0 if full (dropped) */
-int fa_event_queue_pop(fa_event_queue* q, fa_event* out);
+int fa_event_queue_push(fa_event_queue* q, const fa_qevent* ev); /* 0 if full */
+int fa_event_queue_pop(fa_event_queue* q, fa_qevent* out);
+
+/* From the audio thread: never blocks or allocates. If the device queue is full the
+ * event goes to the stream's spill slots, which the event thread also drains, so
+ * ENDED and RAMP_DONE are not lost (a RampAsync waits on them). */
+void fa_audio_post_event(struct fa_device* d, struct fa_stream* s, fa_event_type type, int64_t frame, int64_t value);
 
 /* From any non-audio thread. */
 void fa_engine_post_event(fa_engine* engine, const fa_event* ev);
+
+/* Moves a device's queued events (and a stream's spilled ones) to the engine's
+ * pending list. Caller holds list_lock and the audio thread must not be using them. */
+void fa_event_rescue_device(fa_engine* e, struct fa_device* d);
+void fa_event_rescue_stream(fa_engine* e, struct fa_stream* s);
 
 /* ---- Engine, devices, streams ------------------------------------------- */
 
@@ -156,14 +174,17 @@ struct fa_engine {
     struct fa_stream* streams;   /* attached streams the workers keep filled */
     struct fa_device* devices;
     struct fa_stream* graveyard; /* closed streams, freed by the event thread */
-    fa_event* pending;           /* events posted by API/worker threads */
+    fa_qevent* pending;          /* events posted by API/worker threads */
     uint32_t pending_count, pending_cap;
 
     fa_thread workers[FA_MAX_WORKERS];
     uint32_t worker_count;
     fa_thread event_thread;
     fa_atomic64 event_thread_id;
+    fa_atomic32 event_seq;       /* next fa_qevent.seq */
     fa_atomic32 quit;
+    int destroy_on_event_thread; /* fa_engine_destroy ran inside a callback: the event
+                                    thread finishes the teardown when it exits */
 };
 
 typedef struct fa_voice_list {
@@ -179,6 +200,7 @@ struct fa_device {
     fa_atomic_ptr voices;        /* fa_voice_list*, read by the audio callback */
     fa_atomic64 epoch;           /* odd while the audio callback runs */
     fa_event_queue events;       /* audio callback -> event thread */
+    fa_atomic32 spilled;         /* 1 = some stream on this device used its spill slots */
     struct fa_device* next;      /* engine->devices */
 };
 
@@ -257,6 +279,7 @@ struct fa_stream {
     /* Parameters */
     fa_param_mailbox mailbox[FA_MIX_PARAMS];
     fa_param_voice voice[FA_MIX_PARAMS]; /* audio thread only */
+    uint32_t voice_rate;                 /* device rate the ramp counters are in */
     int was_audible;                     /* audio thread only: mixed in the previous callback */
     fa_atomic32 current[FA_MIX_PARAMS];  /* float bits, published by the audio thread */
 
@@ -265,6 +288,8 @@ struct fa_stream {
     void* callback_user;
     fa_atomic32 in_callback;
     fa_atomic32 closed;
+    fa_qevent spill[FA_EVENT_SPILL];     /* written by the audio thread when the queue is full */
+    fa_atomic32 spill_full[FA_EVENT_SPILL];
 
     struct fa_stream* next;      /* engine->streams or engine->graveyard */
 };

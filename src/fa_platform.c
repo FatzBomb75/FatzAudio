@@ -71,6 +71,12 @@ void fa_thread_join(fa_thread* t)
     CloseHandle((HANDLE)t->impl);
     t->impl = NULL;
 }
+void fa_thread_detach(fa_thread* t)
+{
+    if (!t->impl) return;
+    CloseHandle((HANDLE)t->impl);
+    t->impl = NULL;
+}
 uintptr_t fa_thread_current_id(void) { return (uintptr_t)GetCurrentThreadId(); }
 
 void fa_sleep_ms(uint32_t ms) { Sleep(ms); }
@@ -167,6 +173,13 @@ void fa_thread_join(fa_thread* t)
 {
     if (!t->impl) return;
     pthread_join(*(pthread_t*)t->impl, NULL);
+    free(t->impl);
+    t->impl = NULL;
+}
+void fa_thread_detach(fa_thread* t)
+{
+    if (!t->impl) return;
+    pthread_detach(*(pthread_t*)t->impl);
     free(t->impl);
     t->impl = NULL;
 }

@@ -22,6 +22,7 @@ typedef struct { void* volatile v; } fa_atomic_ptr;
 static __inline int32_t fa_load32(fa_atomic32* a) { return (int32_t)_InterlockedCompareExchange((volatile long*)&a->v, 0, 0); }
 static __inline void fa_store32(fa_atomic32* a, int32_t x) { _InterlockedExchange((volatile long*)&a->v, (long)x); }
 static __inline int32_t fa_fetch_add32(fa_atomic32* a, int32_t d) { return (int32_t)_InterlockedExchangeAdd((volatile long*)&a->v, (long)d); }
+static __inline int32_t fa_exchange32(fa_atomic32* a, int32_t x) { return (int32_t)_InterlockedExchange((volatile long*)&a->v, (long)x); }
 static __inline int fa_cas32(fa_atomic32* a, int32_t expected, int32_t desired)
 { return _InterlockedCompareExchange((volatile long*)&a->v, (long)desired, (long)expected) == (long)expected; }
 static __inline int64_t fa_load64(fa_atomic64* a) { return _InterlockedCompareExchange64((volatile __int64*)&a->v, 0, 0); }
@@ -41,6 +42,7 @@ static __inline void* fa_exchange_ptr(fa_atomic_ptr* a, void* x) { return _Inter
 static inline int32_t fa_load32(fa_atomic32* a) { return __atomic_load_n(&a->v, __ATOMIC_SEQ_CST); }
 static inline void fa_store32(fa_atomic32* a, int32_t x) { __atomic_store_n(&a->v, x, __ATOMIC_SEQ_CST); }
 static inline int32_t fa_fetch_add32(fa_atomic32* a, int32_t d) { return __atomic_fetch_add(&a->v, d, __ATOMIC_SEQ_CST); }
+static inline int32_t fa_exchange32(fa_atomic32* a, int32_t x) { return __atomic_exchange_n(&a->v, x, __ATOMIC_SEQ_CST); }
 static inline int fa_cas32(fa_atomic32* a, int32_t expected, int32_t desired)
 { return __atomic_compare_exchange_n(&a->v, &expected, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
 static inline int64_t fa_load64(fa_atomic64* a) { return __atomic_load_n(&a->v, __ATOMIC_SEQ_CST); }
@@ -84,6 +86,8 @@ void fa_cond_broadcast(fa_cond* c);
 
 int fa_thread_create(fa_thread* t, fa_thread_proc proc, void* arg);
 void fa_thread_join(fa_thread* t);
+/* Lets the thread clean up after itself when it exits; `t` can no longer be joined. */
+void fa_thread_detach(fa_thread* t);
 /* Opaque id of the calling thread, comparable with fa_thread_id_of. */
 uintptr_t fa_thread_current_id(void);
 

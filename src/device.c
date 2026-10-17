@@ -205,11 +205,13 @@ FA_API void FA_CALL fa_device_close(fa_device* device)
         if (!list || list->count == 0) break;
         fa_stream_detach(list->items[0]);
     }
+    ma_device_uninit(&device->device);       /* no more audio callbacks */
+    /* Hand events still queued (ENDED, RAMP_DONE) to the engine before the queue goes. */
     fa_mutex_lock(&device->engine->list_lock);
     for (pp = &device->engine->devices; *pp; pp = &(*pp)->next)
         if (*pp == device) { *pp = device->next; break; }
+    fa_event_rescue_device(device->engine, device);
     fa_mutex_unlock(&device->engine->list_lock);
-    ma_device_uninit(&device->device);
     free(fa_load_ptr(&device->voices));
     fa_mutex_destroy(&device->lock);
     free(device);

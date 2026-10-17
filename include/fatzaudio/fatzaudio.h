@@ -253,7 +253,9 @@ FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* o
 /* Routes a stream to a device (bus NULL = the device's master mix). The decoder
  * is not reopened: position, format and parameters are kept. Attaching to the
  * device it is already on is a no-op; attaching to another device moves it there
- * (still keeping its position). Decode-only streams cannot be attached. */
+ * (still keeping its position), and a running ramp keeps its remaining time.
+ * Decode-only streams, and devices of another engine, cannot be attached
+ * (FA_ERROR_INVALID_ARG). */
 FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, fa_bus* bus);
 /* Removes the stream from its device; it keeps its position. FA_OK if not attached. */
 FA_API fa_result FA_CALL fa_stream_detach(fa_stream* stream);
@@ -415,7 +417,9 @@ typedef void (FA_CALL *fa_event_callback)(const fa_event* event, void* user);
 /* One callback per stream (NULL removes it). Callbacks run on the engine's event
  * thread, in order, shortly after the event (within a few milliseconds); never on
  * the audio thread. A callback may call any FatzAudio function, including
- * fa_stream_close on its own stream.
+ * fa_stream_close on its own stream, or fa_engine_destroy once the engine's
+ * streams are closed (the event thread then finishes the teardown after the
+ * callback returns). ENDED and RAMP_DONE are never dropped.
  * When this function or fa_stream_close returns, the previous callback is no
  * longer running (unless you call them from inside that callback), so its `user`
  * data can be freed. */

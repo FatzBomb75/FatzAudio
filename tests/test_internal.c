@@ -79,6 +79,7 @@ static void render(fa_stream* s, float* out, uint32_t frames)
 typedef struct recorder {
     fa_mutex lock;
     int count;
+    int by_type[32];
     fa_event ev[64];
 } recorder;
 
@@ -87,17 +88,17 @@ static void FA_CALL record(const fa_event* ev, void* user)
     recorder* r = (recorder*)user;
     fa_mutex_lock(&r->lock);
     if (r->count < 64) r->ev[r->count] = *ev;
+    if ((int)ev->type >= 0 && (int)ev->type < 32) r->by_type[ev->type]++;
     r->count++;
     fa_mutex_unlock(&r->lock);
 }
 
 static int count_events(recorder* r, fa_event_type type, int wait_for)
 {
-    int i, n = 0, tries;
+    int n = 0, tries;
     for (tries = 0; tries < 200; tries++) {
-        n = 0;
         fa_mutex_lock(&r->lock);
-        for (i = 0; i < r->count && i < 64; i++) if (r->ev[i].type == type) n++;
+        n = r->by_type[type];
         fa_mutex_unlock(&r->lock);
         if (n >= wait_for) break;
         fa_sleep_ms(5);
@@ -382,6 +383,179 @@ static void test_close_inside_callback(void)
     fa_sleep_ms(50);                                 /* no crash, no double free (ASan) */
 }
 
+static void test_zero_length_ramp_jumps(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    recorder rec;
+    fa_ramp r;
+    float out[2 * 64];
+    rec_init(&rec);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(s, out, 64);
+    CHECK_NEAR(out[0], 0.5, 1e-6);
+    memset(&r, 0, sizeof(r)); r.tag = 7;
+    CHECK_EQ(fa_stream_ramp_param(s, FA_PARAM_VOLUME, 0.0f, 0, 0, &r), FA_OK);
+    render(s, out, 64);
+    CHECK_NEAR(out[0], 0.0, 1e-9);                   /* the very first sample is silent */
+    CHECK_EQ(count_events(&rec, FA_EVENT_RAMP_DONE, 1), 1);
+    CHECK_EQ(rec.ev[0].frame, 64);                   /* finished before this callback mixed */
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
+static fa_atomic32 g_hold;
+
+/* Records like `record`, but a STALLED event parks the event thread until released. */
+static void FA_CALL record_and_hold(const fa_event* ev, void* user)
+{
+    record(ev, user);
+    if (ev->type == FA_EVENT_STALLED) while (fa_load32(&g_hold)) fa_sleep_ms(1);
+}
+
+static void test_events_arrive_in_order(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    recorder rec;
+    fa_ramp a, b;
+    fa_event park;
+    float out[2 * 512];
+    rec_init(&rec);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(s, record_and_hold, &rec), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    /* Park the event thread so the next two events wait in different queues. */
+    fa_store32(&g_hold, 1);
+    memset(&park, 0, sizeof(park));
+    park.type = FA_EVENT_STALLED;
+    park.stream = s;
+    fa_engine_post_event(g_engine, &park);
+    CHECK_EQ(count_events(&rec, FA_EVENT_STALLED, 1), 1);
+    memset(&a, 0, sizeof(a)); a.tag = 1;
+    memset(&b, 0, sizeof(b)); b.tag = 2;
+    CHECK_EQ(fa_stream_ramp_param(s, FA_PARAM_VOLUME, 0.5f, 0, 0, &a), FA_OK);
+    render(s, out, 512);                             /* a ends: audio thread -> device queue */
+    CHECK_EQ(fa_stream_ramp_param(s, FA_PARAM_VOLUME, 0.2f, 1000000000, 0, &b), FA_OK);
+    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_VOLUME, 1.0f), FA_OK); /* replaces unstarted b: API thread posts */
+    fa_store32(&g_hold, 0);
+    CHECK_EQ(count_events(&rec, FA_EVENT_RAMP_DONE, 2), 2);
+    CHECK_EQ(rec.ev[1].value, 1);
+    CHECK_EQ(rec.ev[2].value, 2);
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
+static void test_full_queue_keeps_ramp_done(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    recorder rec;
+    fa_ramp r;
+    fa_qevent filler;
+    float out[2 * 64];
+    int i;
+    rec_init(&rec);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    memset(&r, 0, sizeof(r)); r.tag = 99;
+    CHECK_EQ(fa_stream_ramp_param(s, FA_PARAM_VOLUME, 0.0f, 0, 0, &r), FA_OK);
+    memset(&filler, 0, sizeof(filler));
+    filler.ev.type = FA_EVENT_STALLED;
+    filler.ev.stream = s;
+    fa_mutex_lock(&g_engine->list_lock);             /* the event thread cannot drain meanwhile */
+    for (i = 0; i < FA_EVENT_QUEUE_SIZE; i++) {
+        filler.seq = fa_fetch_add32(&g_engine->event_seq, 1);
+        CHECK(fa_event_queue_push(&g_dev->events, &filler));
+    }
+    render(s, out, 64);                              /* RAMP_DONE finds the queue full */
+    fa_mutex_unlock(&g_engine->list_lock);
+    CHECK_EQ(count_events(&rec, FA_EVENT_RAMP_DONE, 1), 1);
+    CHECK_EQ(count_events(&rec, FA_EVENT_STALLED, FA_EVENT_QUEUE_SIZE), FA_EVENT_QUEUE_SIZE);
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
+static void test_ramp_keeps_time_across_rates(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    recorder rec;
+    float out[2 * 4800];
+    rec_init(&rec);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    CHECK_EQ(fa_stream_ramp_param(s, FA_PARAM_VOLUME, 0.0f, (fa_time)(4800.0 * 1e9 / g_dev->rate), 0, NULL), FA_OK);
+    render(s, out, 2400);                            /* half way */
+    CHECK_EQ(fa_stream_detach(s), FA_OK);
+    s->voice_rate = g_dev->rate * 2;                 /* pretend it ran on a device twice as fast */
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(s->voice[FA_PARAM_VOLUME].total, 2400); /* same remaining time at this rate */
+    CHECK_EQ(s->voice[FA_PARAM_VOLUME].done, 1200);
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
+static void test_attach_rejects_other_engine(void)
+{
+    fa_engine_config cfg;
+    fa_engine* other;
+    fa_device* dev;
+    fa_stream* s = open_attached(1000, 0, 0);
+    CHECK(s != NULL);
+    fa_engine_config_init(&cfg);
+    cfg.flags = FA_ENGINE_NULL_OUTPUT;
+    CHECK_EQ(fa_engine_create(&cfg, &other), FA_OK);
+    CHECK_EQ(fa_device_open(other, NULL, &dev), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, dev, NULL), FA_ERROR_INVALID_ARG);
+    CHECK(s->device == g_dev);                       /* left where it was */
+    fa_stream_close(s);
+    fa_device_close(dev);
+    fa_engine_destroy(other);
+}
+
+static fa_atomic32 g_destroyed;
+
+static void FA_CALL destroy_from_callback(const fa_event* ev, void* user)
+{
+    if (ev->type != FA_EVENT_ENDED) return;
+    fa_stream_close(ev->stream);
+    fa_engine_destroy((fa_engine*)user);
+    fa_store32(&g_destroyed, 1);
+}
+
+static void test_destroy_engine_inside_callback(void)
+{
+    fa_engine_config cfg;
+    fa_engine* e;
+    fa_device* dev;
+    fa_stream* s = NULL;
+    fa_open_options o;
+    size_t n;
+    uint8_t* wav;
+    float out[2 * 1024];
+    int i;
+    fa_engine_config_init(&cfg);
+    cfg.flags = FA_ENGINE_NULL_OUTPUT;
+    CHECK_EQ(fa_engine_create(&cfg, &e), FA_OK);
+    CHECK_EQ(fa_device_open(e, NULL, &dev), FA_OK);
+    wav = make_wav(dev->rate, 300, 0, &n);
+    fa_open_options_init(&o);
+    CHECK_EQ(fa_stream_open_memory(e, wav, n, &o, &s), FA_OK);
+    free(wav);
+    CHECK_EQ(fa_stream_attach(s, dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_set_event_callback(s, destroy_from_callback, e), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    for (i = 0; i < 2000 && !fa_load32(&s->eof); i++) fa_sleep_ms(1);
+    memset(out, 0, sizeof(out));
+    fa_fetch_add64(&dev->epoch, 1);
+    fa_stream_mix(s, dev, out, 1024);                /* ends -> callback closes and destroys */
+    fa_fetch_add64(&dev->epoch, 1);
+    for (i = 0; i < 400 && !fa_load32(&g_destroyed); i++) fa_sleep_ms(5);
+    CHECK(fa_load32(&g_destroyed));                  /* returned, no deadlock; ASan checks the rest */
+    fa_sleep_ms(50);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -404,6 +578,12 @@ int main(void)
     RUN(test_ended_event_and_state);
     RUN(test_loop_is_seamless);
     RUN(test_close_inside_callback);
+    RUN(test_zero_length_ramp_jumps);
+    RUN(test_events_arrive_in_order);
+    RUN(test_full_queue_keeps_ramp_done);
+    RUN(test_ramp_keeps_time_across_rates);
+    RUN(test_attach_rejects_other_engine);
+    RUN(test_destroy_engine_inside_callback);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);
