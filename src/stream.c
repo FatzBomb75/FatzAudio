@@ -39,6 +39,7 @@ static fa_frames marker(struct fa_stream* s, int m) { return fa_load64(&s->marke
 
 void fa_stream_free_memory(struct fa_stream* s)
 {
+    free(s->carry);
     fa_mutex_destroy(&s->norm_lock);
     fa_mutex_destroy(&s->cb_lock);
     fa_mutex_destroy(&s->decode_lock);
@@ -53,6 +54,8 @@ static void release_chain(struct fa_stream* s)
     free(s->in_buf); s->in_buf = NULL;
     free(s->out_buf); s->out_buf = NULL;
     free(s->mat_buf); s->mat_buf = NULL;
+    free(s->hist); s->hist = NULL;
+    s->hist_cap = 0;
     s->in_cap = s->out_cap = s->in_count = s->in_offset = 0;
     s->decoded = 0;
     s->draining = 0;
@@ -273,6 +276,9 @@ static void update_estimate(struct fa_stream* s, const float* frames, fa_frames 
     }
 }
 
+/* Only a seekable source loops (looping seeks back); a forward-only one ends. */
+static int loops(struct fa_stream* s) { return (s->flags & FA_OPEN_LOOP) && s->decoder.seekable; }
+
 /* Where the stream ends (CUE_OUT, else the length; -1 = unknown) and where it loops back to. */
 static fa_frames end_frame(struct fa_stream* s)
 {
@@ -301,6 +307,44 @@ static void apply_matrix(struct fa_stream* s, const float* in, fa_frames n)
     }
 }
 
+/* Appends source frames to the history of a forward-only stream (see `hist`). */
+static void hist_write(struct fa_stream* s, const float* in, fa_frames n)
+{
+    uint32_t ch = s->decoder.format.channels;
+    fa_frames at, first;
+    if (n > s->hist_cap) { in += (size_t)(n - s->hist_cap) * ch; n = s->hist_cap; }
+    at = s->decoded % s->hist_cap;
+    first = s->hist_cap - at < n ? s->hist_cap - at : n;
+    memcpy(s->hist + (size_t)at * ch, in, (size_t)first * ch * sizeof(float));
+    memcpy(s->hist, in + (size_t)first * ch, (size_t)(n - first) * ch * sizeof(float));
+}
+
+/* Detaching a forward-only stream: moves the `unheard` most recent source frames from
+ * the history to the front of `carry`, so they play on the next attach. Caller holds
+ * decode_lock. Returns 0 if it could not (out of memory), and nothing changes. */
+static int keep_unheard(struct fa_stream* s, fa_frames unheard)
+{
+    uint32_t ch = s->decoder.format.channels;
+    fa_frames left = s->carry_count, total, start, first;
+    float* buf;
+    if (unheard > s->decoded) unheard = s->decoded;
+    if (unheard > s->hist_cap) unheard = s->hist_cap;
+    if (unheard <= 0) return 1;
+    total = unheard + left;
+    buf = (float*)malloc((size_t)total * ch * sizeof(float));
+    if (!buf) return 0;
+    start = (s->decoded - unheard) % s->hist_cap;
+    first = s->hist_cap - start < unheard ? s->hist_cap - start : unheard;
+    memcpy(buf, s->hist + (size_t)start * ch, (size_t)first * ch * sizeof(float));
+    memcpy(buf + (size_t)first * ch, s->hist, (size_t)(unheard - first) * ch * sizeof(float));
+    if (left > 0) memcpy(buf + (size_t)unheard * ch, s->carry + (size_t)s->carry_offset * ch, (size_t)left * ch * sizeof(float));
+    free(s->carry);
+    s->carry = buf;
+    s->carry_count = total;
+    s->carry_offset = 0;
+    return 1;
+}
+
 /* Decodes, converts to the device format and appends to the ring until it is
  * full, `max_frames` were produced, or the source ended (at CUE_OUT, if set).
  * Caller holds decode_lock. */
@@ -319,12 +363,22 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
         if (room <= 0) break;
         if (s->in_count == 0) {
             fa_frames got = 0, want = s->in_cap, end = end_frame(s);
+            int from_carry;
             if (s->draining) {                    /* the resampler has given back everything */
                 fa_store32(&s->eof, 1);
                 break;
             }
             if (end >= 0 && s->src_pos + want > end) want = end - s->src_pos;
-            if (want > 0) fa_decoder_read(&s->decoder, s->in_buf, want, &got);
+            from_carry = s->carry_count > 0;
+            if (from_carry) {                     /* audio decoded ahead before a detach */
+                got = s->carry_count < want ? s->carry_count : want;
+                memcpy(s->in_buf, s->carry + (size_t)s->carry_offset * ch, (size_t)got * ch * sizeof(float));
+                s->carry_offset += got;
+                s->carry_count -= got;
+            } else if (want > 0) {
+                fa_decoder_read(&s->decoder, s->in_buf, want, &got);
+            }
+            if (s->hist) hist_write(s, s->in_buf, got);
             s->in_offset = 0;
             s->in_count = got;
             s->decoded += got;
@@ -352,7 +406,7 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 break;
             }
             just_looped = 0;
-            update_estimate(s, s->in_buf, got);
+            if (!from_carry) update_estimate(s, s->in_buf, got); /* carried audio was measured */
             if (s->matrix) apply_matrix(s, s->in_buf, got);
         }
         conv_in = s->matrix ? s->mat_buf : s->in_buf;
@@ -379,7 +433,7 @@ static double linear_position(struct fa_stream* s, int64_t played)
 static fa_frames wrap_position(struct fa_stream* s, fa_frames pos)
 {
     fa_frames end = end_frame(s);
-    if ((s->flags & FA_OPEN_LOOP) && end > 0 && pos >= end) {
+    if (loops(s) && end > 0 && pos >= end) {
         fa_frames back = loop_start(s), len = end - back;
         return len > 0 ? back + (pos - end) % len : back;
     }
@@ -443,7 +497,13 @@ static fa_result build_chain_locked(struct fa_stream* s, fa_device* dev)
     s->in_buf = (float*)malloc((size_t)s->in_cap * ch * sizeof(float));
     s->out_buf = (float*)malloc((size_t)s->out_cap * FA_DEVICE_CHANNELS * sizeof(float));
     if (s->matrix) s->mat_buf = (float*)malloc((size_t)s->in_cap * FA_DEVICE_CHANNELS * sizeof(float));
-    if (!s->in_buf || !s->out_buf || (s->matrix && !s->mat_buf) || fa_ring_init(&s->ring, FA_DEVICE_CHANNELS, capacity) != FA_OK) {
+    if (!s->decoder.seekable) {
+        /* Everything not yet heard: the ring, the input chunk and the resampler's delay. */
+        s->hist_cap = (fa_frames)((double)capacity * s->decoder.format.sample_rate / dev->rate) + 2 * s->in_cap + 256;
+        s->hist = (float*)malloc((size_t)s->hist_cap * ch * sizeof(float));
+    }
+    if (!s->in_buf || !s->out_buf || (s->matrix && !s->mat_buf) || (!s->decoder.seekable && !s->hist) ||
+        fa_ring_init(&s->ring, FA_DEVICE_CHANNELS, capacity) != FA_OK) {
         release_chain(s);
         return FA_ERROR_OUT_OF_MEMORY;
     }
@@ -493,10 +553,12 @@ static void detach_locked(struct fa_stream* s)
     s->device = NULL;
     fa_exchange_ptr(&s->bus, NULL);
     /* Continue later from what was actually heard, not from what was decoded ahead.
-     * A forward-only source cannot go back: the audio buffered ahead is skipped, and
-     * the position says where decoding really continues. */
-    if (fa_decoder_seek(&s->decoder, pos) != FA_OK && !s->decoder.seekable)
-        pos = fa_load64(&s->seek_base) + s->decoded;
+     * A forward-only source cannot go back, so it keeps the audio decoded ahead and
+     * plays it first on the next attach. */
+    if (s->decoder.seekable) fa_decoder_seek(&s->decoder, pos);
+    else if (!keep_unheard(s, fa_load64(&s->seek_base) + s->decoded - pos)) {
+        pos = fa_load64(&s->seek_base) + s->decoded; /* out of memory: skip it as before */
+    }
     fa_store64(&s->position, pos);
     s->src_pos = pos;
     release_chain(s);
@@ -1238,7 +1300,7 @@ static double fade_position(struct fa_stream* s, int64_t played)
 {
     double lin = linear_position(s, played);
     fa_frames end = end_frame(s);
-    if ((s->flags & FA_OPEN_LOOP) && end > 0 && lin >= (double)end) {
+    if (loops(s) && end > 0 && lin >= (double)end) {
         fa_frames back = loop_start(s), len = end - back;
         if (len > 0) return (double)back + fmod(lin - (double)end, (double)len);
     }
@@ -1251,7 +1313,7 @@ static void marker_events(struct fa_stream* s, fa_device* dev, const mix_markers
     fa_frames p0 = (fa_frames)(linear_position(s, played0) + 0.5);
     fa_frames p1 = (fa_frames)(linear_position(s, played1) + 0.5);
     fa_frames end = end_frame(s), back = loop_start(s), w0, w1;
-    int looping = (s->flags & FA_OPEN_LOOP) && end > 0 && end > back;
+    int looping = loops(s) && end > 0 && end > back;
     int i;
     if (p1 <= p0 && !ended) return;
     w0 = wrap_position(s, p0);
@@ -1305,7 +1367,7 @@ static int64_t frames_to_cue_out(struct fa_stream* s, int64_t played)
 {
     fa_frames out = marker(s, FA_MARKER_CUE_OUT);
     double d;
-    if (out == FA_FRAMES_UNSET || (s->flags & FA_OPEN_LOOP)) return -1;
+    if (out == FA_FRAMES_UNSET || loops(s)) return -1;
     d = ((double)out - linear_position(s, played)) * (double)s->dev_rate / (double)s->decoder.format.sample_rate;
     return d <= 0.0 ? 0 : (int64_t)ceil(d - 1e-9);
 }
@@ -1317,7 +1379,7 @@ static int64_t frames_to_mix_point(struct fa_stream* s, int64_t frames)
     int64_t xf_ns = fa_load64(&s->xfade_ns);
     double sr = (double)s->decoder.format.sample_rate, dr = (double)s->dev_rate;
     /* A loop has no end to count back from: it hands over at its MIX_POINT only. */
-    if (mix == FA_FRAMES_UNSET && xf_ns > 0 && !(s->flags & FA_OPEN_LOOP)) {
+    if (mix == FA_FRAMES_UNSET && xf_ns > 0 && !loops(s)) {
         fa_frames end = end_frame(s);
         if (end >= 0) {
             mix = end - (fa_frames)((double)xf_ns * sr / 1e9 + 0.5);
@@ -1327,7 +1389,7 @@ static int64_t frames_to_mix_point(struct fa_stream* s, int64_t frames)
     if (mix != FA_FRAMES_UNSET) {
         double dist = (double)mix - fade_position(s, fa_load64(&s->played));
         int64_t k;
-        if (dist < 0.0 && (s->flags & FA_OPEN_LOOP)) {
+        if (dist < 0.0 && loops(s)) {
             fa_frames end = end_frame(s), back = loop_start(s);
             if (end > back) dist += (double)(end - back);
         }
@@ -1335,7 +1397,7 @@ static int64_t frames_to_mix_point(struct fa_stream* s, int64_t frames)
         if (k < frames) return k;
     }
     /* At the end: gapless (or the fallback when the end was not known in advance). */
-    if (!(s->flags & FA_OPEN_LOOP)) {
+    if (!loops(s)) {
         int64_t avail = fa_ring_readable(&s->ring), left = -1;
         int64_t cut = frames_to_cue_out(s, fa_load64(&s->played));
         if (fa_load32(&s->eof)) left = avail;
@@ -1449,7 +1511,7 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
     }
     loop_end = end_frame(s);
     loop_back = loop_start(s);
-    looping = (s->flags & FA_OPEN_LOOP) && loop_end > 0 && loop_end > loop_back;
+    looping = loops(s) && loop_end > 0 && loop_end > loop_back;
 
     while (done < n && !ended) {
         /* Blocks of FA_RAMP_BLOCK frames: gains are exact at block edges and

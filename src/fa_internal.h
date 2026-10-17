@@ -508,7 +508,15 @@ struct fa_stream {
     int converter_ready;
     float* in_buf;
     fa_frames in_cap, in_count, in_offset;
-    fa_frames decoded;           /* source frames read from the decoder since seek_base */
+    fa_frames decoded;           /* source frames fed to the converter since seek_base */
+    /* Forward-only sources only: a copy of the last source frames fed in (`hist`, a
+     * circular buffer covering everything that can still be unheard), so a detach can
+     * keep the audio decoded ahead in `carry`, which is fed in again before the
+     * decoder on the next attach. `carry` lives across attaches; `hist` with the chain. */
+    float* hist;
+    fa_frames hist_cap;
+    float* carry;
+    fa_frames carry_count, carry_offset;
     int draining;                /* the source ended; in_buf holds silence that flushes the resampler */
     float* out_buf;
     fa_frames out_cap;

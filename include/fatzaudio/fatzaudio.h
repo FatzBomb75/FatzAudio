@@ -270,7 +270,9 @@ FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* o
  * Decode-only streams, devices of another engine, and a bus of another device
  * cannot be attached (FA_ERROR_INVALID_ARG). */
 FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, fa_bus* bus);
-/* Removes the stream from its device; it keeps its position. FA_OK if not attached. */
+/* Removes the stream from its device; it keeps the position heard so far. A
+ * forward-only stream keeps the audio it had decoded ahead and plays it first on its
+ * next attach, so nothing is skipped. FA_OK if not attached. */
 FA_API fa_result FA_CALL fa_stream_detach(fa_stream* stream);
 /* Starts or resumes an attached stream. A stopped or ended stream starts at its
  * FA_MARKER_CUE_IN (0 when unset); a paused one continues where it was. */
