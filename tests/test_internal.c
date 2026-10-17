@@ -611,7 +611,8 @@ static int64_t FA_CALL fwd_read(void* u, void* dst, size_t bytes)
 }
 
 /* A forward-only stream can't seek back, so detaching keeps the audio it decoded
- * ahead and plays it first after the next attach: nothing is skipped, twice over. */
+ * ahead and plays it first after the next attach. The second attach uses a smaller
+ * buffer, so part of the kept audio is still waiting when it is detached again. */
 static void test_forward_only_detach_position(void)
 {
     size_t n;
@@ -619,11 +620,12 @@ static void test_forward_only_detach_position(void)
     fwd_io io_state = { 0 };
     fa_io_callbacks io = { fwd_read, NULL, NULL, NULL };
     fa_stream* s = NULL;
-    fa_frames pos = 0;
+    fa_frames pos = 0, waiting;
     float out[2 * 256];
-    uint32_t i, heard = 0, round;
+    uint32_t i, heard = 0, round, default_ms;
     io_state.p = wav; io_state.n = n;
     CHECK_EQ(fa_stream_open_io(g_engine, &io, &io_state, NULL, &s), FA_OK);
+    default_ms = s->buffer_ms;
     CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
     CHECK_EQ(fa_stream_play(s), FA_OK);
     for (round = 0; round < 3; round++) {
@@ -631,15 +633,96 @@ static void test_forward_only_detach_position(void)
         render(s, out, frames);
         for (i = 0; i < frames; i++) CHECK(out[i * 2] == expected(1, heard + i));
         heard += frames;
-        fa_sleep_ms(30);                              /* decoded well past what was heard */
+        fa_sleep_ms(50);                              /* decoded well past what was heard */
+        if (round == 1) {
+            fa_mutex_lock(&s->decode_lock);
+            waiting = s->carry_count;                 /* kept audio not yet back in the ring */
+            fa_mutex_unlock(&s->decode_lock);
+            CHECK(waiting > 0);
+        }
         CHECK_EQ(fa_stream_detach(s), FA_OK);
         CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
         CHECK_EQ(pos, heard);                         /* where it was heard up to */
+        s->buffer_ms = round == 0 ? 50 : default_ms;
         CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
         CHECK_EQ(fa_stream_play(s), FA_OK);
     }
     render(s, out, 256);
     for (i = 0; i < 256; i++) CHECK(out[i * 2] == expected(1, heard + i));
+    fa_stream_close(s);
+    free(wav);
+}
+
+/* Plays a forward-only stream at another rate than the device's to the end, 16
+ * frames per callback, optionally detaching and reattaching after `detach_at`.
+ * Returns how many frames it produced. */
+static int64_t forward_only_resampled_length(int64_t detach_at)
+{
+    size_t n;
+    uint32_t rate = g_dev->rate * 3 / 4;
+    uint8_t* wav = make_wav(rate, rate, 0, &n);
+    fwd_io io_state = { 0 };
+    fa_io_callbacks io = { fwd_read, NULL, NULL, NULL };
+    fa_stream* s = NULL;
+    float out[2 * 16];
+    int64_t produced = 0;
+    io_state.p = wav; io_state.n = n;
+    if (fa_stream_open_io(g_engine, &io, &io_state, NULL, &s) != FA_OK) { free(wav); return -1; }
+    fa_stream_attach(s, g_dev, NULL);
+    fa_stream_play(s);
+    while (fa_load32(&s->state) == FA_STATE_PLAYING && produced < (int64_t)g_dev->rate * 4) {
+        if (produced == detach_at) {
+            fa_sleep_ms(50);
+            fa_stream_detach(s);
+            fa_stream_attach(s, g_dev, NULL);
+            fa_stream_play(s);
+        }
+        render(s, out, 16);
+        produced += 16;
+    }
+    fa_stream_close(s);
+    free(wav);
+    return produced;
+}
+
+/* Across a detach at another rate, only the resampler's few frames of delay may
+ * differ; before, everything decoded ahead was lost. */
+static void test_forward_only_detach_resampled(void)
+{
+    int64_t straight = forward_only_resampled_length(-1);
+    int64_t moved = forward_only_resampled_length(16 * 600);
+    CHECK(straight > 0);
+    CHECK_NEAR((double)moved, (double)straight, 32.0);
+}
+
+/* FA_OPEN_LOOP can't loop a forward-only source: it ends, and its position stays at
+ * the end instead of wrapping to 0 (which would replay heard audio on reattach). */
+static void test_forward_only_loop_flag_ends(void)
+{
+    size_t n;
+    uint8_t* wav = make_wav(g_dev->rate, 3000, 1, &n);
+    fwd_io io_state = { 0 };
+    fa_io_callbacks io = { fwd_read, NULL, NULL, NULL };
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_frames pos = 0, waiting;
+    float out[2 * 1024];
+    int i;
+    io_state.p = wav; io_state.n = n;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_LOOP;
+    CHECK_EQ(fa_stream_open_io(g_engine, &io, &io_state, &o, &s), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    for (i = 0; i < 4; i++) render(s, out, 1024);
+    CHECK_EQ(fa_load32(&s->state), FA_STATE_ENDED);
+    CHECK_EQ(fa_stream_detach(s), FA_OK);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_EQ(pos, 3000);
+    fa_mutex_lock(&s->decode_lock);
+    waiting = s->carry_count;
+    fa_mutex_unlock(&s->decode_lock);
+    CHECK_EQ(waiting, 0);                             /* nothing heard comes back */
     fa_stream_close(s);
     free(wav);
 }
@@ -875,6 +958,8 @@ int main(void)
     RUN(test_move_keeps_playing);
     RUN(test_resampled_end_is_complete);
     RUN(test_forward_only_detach_position);
+    RUN(test_forward_only_detach_resampled);
+    RUN(test_forward_only_loop_flag_ends);
     RUN(test_consecutive_sets_glide_from_heard);
     RUN(test_slow_callback_loses_nothing);
     RUN(test_publishing_audio_event_holds_later_ones);

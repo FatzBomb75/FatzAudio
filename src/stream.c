@@ -379,7 +379,8 @@ static fa_frames attached_position(struct fa_stream* s)
     fa_frames base = fa_load64(&s->seek_base);
     int64_t played = fa_load64(&s->played);
     fa_frames pos = base + (fa_frames)((double)played * (double)s->decoder.format.sample_rate / (double)s->dev_rate + 0.5);
-    if ((s->flags & FA_OPEN_LOOP) && s->decoder.length > 0) pos %= s->decoder.length;
+    /* Only a seekable source loops (looping seeks back to 0); a forward-only one ends. */
+    if ((s->flags & FA_OPEN_LOOP) && s->decoder.seekable && s->decoder.length > 0) pos %= s->decoder.length;
     else if (s->decoder.length >= 0 && pos > s->decoder.length) pos = s->decoder.length;
     return pos;
 }
