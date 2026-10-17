@@ -1,4 +1,4 @@
-/* Inverse MDCT (mdct.c). */
+/* The DCT-IV behind the inverse MDCT (mdct.c). */
 #ifndef FA_MDCT_H
 #define FA_MDCT_H
 
@@ -8,19 +8,19 @@ typedef struct fa_mdct {
     int m;           /* coefficients in, 2m samples out */
     float* twiddle;  /* m/2 complex rotations before the FFT */
     float* post;     /* and after it */
-    float* fft_tw;   /* m/4 complex FFT roots */
+    float* fft_tw;   /* FFT roots, per radix-4 pass */
     int* rev;        /* bit reversal of m/2 */
     float* work;     /* m/2 complex */
-    float* u;        /* m: the DCT-IV */
 } fa_mdct;
 
 fa_result fa_imdct_init(fa_mdct* t, int m);
 void fa_imdct_free(fa_mdct* t);
-/* out[n] = sum_k in[k] cos(pi/m (n + m/2 + 1/2)(k + 1/2)), n = 0..2m-1 (no scaling,
- * no window). Not reentrant for one fa_mdct (it has a work buffer). */
-void fa_imdct(const fa_mdct* t, const float* in, float* out);
-/* u[j] = sum_k in[k] cos(pi/m (j + 1/2)(k + 1/2)), j = 0..m-1 (DCT-IV, which the
- * IMDCT unfolds; codecs with other transform phases unfold it themselves). */
+/* u[j] = sum_k in[k] cos(pi/m (j + 1/2)(k + 1/2)), j = 0..m-1 (DCT-IV, no scaling).
+ * The IMDCT out[n] = sum_k in[k] cos(pi/m (n + m/2 + 1/2)(k + 1/2)), n = 0..2m-1,
+ * unfolds from it by its symmetries u[2m-1-j] = -u[j] and u[j+2m] = -u[j]:
+ * out[n] = u[n + m/2], -u[3m/2 - 1 - n], -u[n - 3m/2] for n below m/2, 3m/2, 2m.
+ * Codecs unfold it into their window themselves. Not reentrant for one fa_mdct
+ * (it has a work buffer). */
 void fa_mdct_dct4(const fa_mdct* t, const float* in, float* u);
 
 #endif

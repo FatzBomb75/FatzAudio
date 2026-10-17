@@ -14,16 +14,23 @@
 
 /* ---- buffered reader ----------------------------------------------------------- */
 
-#define BR_CAP (256u * 1024u)
+/* Read-ahead: up to 256 KB over the network and from the app's callbacks (which
+ * may be the network too), 16 KB from files and memory, where reads are cheap and
+ * the OS caches. The buffer grows with the read-ahead, so a stream that only
+ * reads headers, or one jumping around, stays small. */
+#define BR_CAP_SLOW (256u * 1024u)
+#define BR_CAP_FAST (16u * 1024u)
 #define BR_MIN 512u     /* after a jump: enough for the next headers */
+#define BR_HOP 8192     /* a forward hop up to this far keeps the read-ahead */
 
 fa_result fa_br_init(fa_br* b, fa_source* src)
 {
     memset(b, 0, sizeof(*b));
-    b->buf = (uint8_t*)malloc(BR_CAP);
+    b->buf = (uint8_t*)malloc(BR_MIN);
     if (!b->buf) return FA_ERROR_OUT_OF_MEMORY;
     b->src = src;
-    b->cap = BR_CAP;
+    b->cap = BR_MIN;
+    b->max = src->remote || src->kind == FA_SOURCE_IO ? BR_CAP_SLOW : BR_CAP_FAST;
     b->chunk = BR_MIN;
     b->base = fa_source_tell(src);
     return FA_OK;
@@ -48,9 +55,11 @@ fa_result fa_br_seek(fa_br* b, int64_t pos)
     if (!b->src->seekable && pos < b->base + (int64_t)b->len) return FA_ERROR_NOT_SEEKABLE;
     r = fa_source_seek(b->src, pos);
     if (r != FA_OK) return r;
+    /* A hop of a frame or so forward (from header to header) keeps reading
+     * ahead; a jump starts small again. */
+    if (pos < b->base + (int64_t)b->len || pos - (b->base + (int64_t)b->len) > (int64_t)BR_HOP) b->chunk = BR_MIN;
     b->base = pos;
     b->len = b->off = 0;
-    b->chunk = BR_MIN;
     return FA_OK;
 }
 
@@ -78,10 +87,16 @@ size_t fa_br_read(fa_br* b, void* out, size_t n)
             done += (size_t)got;
             continue;
         }
+        if (b->chunk > b->cap) {
+            /* Short of memory, it reads ahead less. */
+            uint8_t* p = (uint8_t*)realloc(b->buf, b->chunk);
+            if (p) { b->buf = p; b->cap = b->chunk; }
+            else b->chunk = b->max = b->cap;
+        }
         got = fa_source_read(b->src, b->buf, b->chunk);
         if (got <= 0) break;
         b->len = (size_t)got;
-        if (b->chunk < b->cap) b->chunk *= 2;  /* reading on in sequence: read further ahead */
+        if (b->chunk < b->max) b->chunk *= 2;  /* reading on in sequence: read further ahead */
     }
     return done;
 }
@@ -359,11 +374,17 @@ static fa_result emit(fa_track* t, const fa_demux_packet* pk)
     hi = pos + m;
     if (t->p.clip_to_end && t->length >= 0 && hi > t->length) hi = t->length;
     if (hi < lo) hi = lo;
-    r = fa_float_reserve(&t->buf, &t->buf_cap, (zhi - zlo) + (hi - lo), ch);
-    if (r != FA_OK) return r;
-    if (zhi > zlo) memset(t->buf, 0, (size_t)(zhi - zlo) * ch * sizeof(float));
-    if (hi > lo)
-        memcpy(t->buf + (size_t)(zhi - zlo) * ch, data + (size_t)(lo - pos) * ch, (size_t)(hi - lo) * ch * sizeof(float));
+    if (zhi > zlo) {
+        r = fa_float_reserve(&t->buf, &t->buf_cap, (zhi - zlo) + (hi - lo), ch);
+        if (r != FA_OK) return r;
+        memset(t->buf, 0, (size_t)(zhi - zlo) * ch * sizeof(float));
+        if (hi > lo)
+            memcpy(t->buf + (size_t)(zhi - zlo) * ch, data + (size_t)(lo - pos) * ch, (size_t)(hi - lo) * ch * sizeof(float));
+        t->view = t->buf;
+    } else {
+        /* Handed out from the codec's own buffer, which stays until the next packet. */
+        t->view = hi > lo ? data + (size_t)(lo - pos) * ch : NULL;
+    }
     t->count = (zhi - zlo) + (hi - lo);
     t->off = 0;
     return FA_OK;
@@ -512,7 +533,7 @@ fa_result fa_track_read(fa_track* t, float* out, fa_frames frames, fa_frames* go
         if (t->off < t->count) {
             fa_frames n = t->count - t->off;
             if (n > frames - produced) n = frames - produced;
-            memcpy(out + (size_t)produced * ch, t->buf + (size_t)t->off * ch, (size_t)n * ch * sizeof(float));
+            memcpy(out + (size_t)produced * ch, t->view + (size_t)t->off * ch, (size_t)n * ch * sizeof(float));
             t->off += n;
             produced += n;
             continue;

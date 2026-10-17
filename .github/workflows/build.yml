@@ -23,12 +23,29 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Linux audio headers and FFmpeg (runtime codecs and the helper test)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libavformat-dev libavcodec-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libavformat-dev libavcodec-dev libmp3lame0
+      # LAME is loaded at runtime like an app would ship it, so the MP3 tests run
+      # (FA_TEST_REQUIRE_LAME makes a missing LAME fail them instead of skipping).
+      - name: Install LAME (macOS)
+        if: runner.os == 'macOS'
+        run: brew install lame
+      - name: Install LAME (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          "$VCPKG_INSTALLATION_ROOT/vcpkg" install mp3lame:x64-windows
+          dll=$(find "$VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin" -iname '*mp3lame*.dll' | head -1)
+          test -n "$dll"
+          mkdir -p "$RUNNER_TEMP/lame"
+          cp "$dll" "$RUNNER_TEMP/lame/libmp3lame.dll"
+          cygpath -w "$RUNNER_TEMP/lame" >> "$GITHUB_PATH"
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
         run: cmake --build build --config Release
       - name: Test
+        env:
+          FA_TEST_REQUIRE_LAME: '1'
         run: ctest --test-dir build -C Release --output-on-failure
 
       - uses: actions/setup-dotnet@v4
@@ -38,6 +55,8 @@ jobs:
             10.0.x
       - name: .NET build (docs enforced) and test
         shell: bash
+        env:
+          FA_TEST_REQUIRE_LAME: '1'
         run: |
           native="$GITHUB_WORKSPACE/build/bin"
           if [ "$RUNNER_OS" = "Windows" ]; then native="$native/Release"; fi
@@ -56,5 +75,58 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-  # TODO: Android job (NDK toolchain, arm64-v8a / x86_64, build only).
-  # TODO: iOS job (CMAKE_SYSTEM_NAME=iOS, build only; miniaudio needs Objective-C there).
+  # Library only, every Android ABI: checks the .so needs nothing but libc, libm
+  # and libdl and exports only fa_*.
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build for every Android ABI
+        run: |
+          for abi in arm64-v8a x86_64 armeabi-v7a x86; do
+            cmake -S . -B build-android-$abi -G Ninja \
+              -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+              -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release \
+              -DFA_BUILD_TESTS=OFF -DFA_BUILD_TOOLS=OFF
+            cmake --build build-android-$abi
+          done
+      - name: Check dependencies and exports
+        run: |
+          readelf=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf
+          bad=0
+          for so in build-android-*/bin/libfatzaudio.so; do
+            if $readelf -d $so | grep NEEDED | grep -vE '\[lib(c|m|dl)\.so\]'; then bad=1; fi
+            if $readelf --dyn-syms -W $so | awk '($5=="GLOBAL"||$5=="WEAK") && $7!="UND" {print $8}' | grep -v '^fa_'; then bad=1; fi
+          done
+          exit $bad
+
+  # Every test suite inside an Android 14 user space (tools/android-test/run.sh):
+  # x86_64 natively, arm64 under qemu-user.
+  android-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [x86_64, arm64-v8a]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install qemu-user
+        if: matrix.abi == 'arm64-v8a'
+        run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - name: Build for Android ${{ matrix.abi }} with tests
+        run: |
+          cmake -S . -B build-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.abi }} -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release \
+            -DFA_BUILD_TOOLS=OFF
+          cmake --build build-android
+      - name: Test in Android 14
+        run: sudo tools/android-test/run.sh build-android
+
+  # fatzaudio.xcframework for iOS devices and the simulator.
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build fatzaudio.xcframework
+        run: tools/build-xcframework.sh build-ios
