@@ -26,6 +26,24 @@ public sealed class StreamEventArgs : EventArgs
     public long Value { get; }
 }
 
+/// <summary>Event data for <see cref="AudioStream.MetadataChanged"/>.</summary>
+public sealed class MetadataChangedEventArgs : EventArgs
+{
+    internal MetadataChangedEventArgs(StreamMetadata metadata, TimeSpan position, long frame)
+    {
+        Metadata = metadata;
+        Position = position;
+        Frame = frame;
+    }
+
+    /// <summary>The metadata now in effect (the new title).</summary>
+    public StreamMetadata Metadata { get; }
+    /// <summary>Stream position where the new title starts.</summary>
+    public TimeSpan Position { get; }
+    /// <summary>Stream position where the new title starts, in frames.</summary>
+    public long Frame { get; }
+}
+
 /// <summary>Callback for in-place DSP on interleaved float frames.</summary>
 /// <param name="samples">Interleaved samples (frames x channels); modify in place.</param>
 /// <param name="channels">Channel count.</param>
@@ -141,6 +159,59 @@ public unsafe class AudioStream : IDisposable
     /// </summary>
     /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
     public StreamInfo Info => ReadInfo();
+
+    // ---- Web streams ----------------------------------------------------------
+
+    /// <summary>
+    /// What a web stream is playing right now: the station and the song heard now. A title that is
+    /// downloaded but still in the buffer is not returned until playback reaches it.
+    /// <see cref="StreamMetadata.Empty"/> for streams that are not web streams.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public unsafe StreamMetadata Metadata
+    {
+        get
+        {
+            FaMetadata m;
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_metadata(Handle, &m));
+            return new StreamMetadata(
+                Str(m.StreamTitle), Str(m.Artist), Str(m.Title), Str(m.Url), Str(m.Station), Str(m.Genre),
+                Str(m.Description), Str(m.StationUrl), Str(m.ContentType), (int)m.BitrateKbps, m.Seq);
+        }
+    }
+
+    /// <summary>The connection of a web stream (buffering, reconnects, the URL after redirects); null for other streams.</summary>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public unsafe NetworkStatus? NetworkStatus
+    {
+        get
+        {
+            FaNetStatus n;
+            int rc = NativeMethods.fa_stream_get_net_status(Handle, &n);
+            if (rc == (int)ErrorCode.InvalidArgument) return null;
+            FatzAudioException.ThrowIfFailed(rc);
+            return new NetworkStatus(
+                n.Connected != 0, n.HttpStatus, n.IsLive != 0, n.IsHls != 0, n.Seekable != 0, n.Finished != 0,
+                n.ContentLength, n.Downloaded, n.BufferedBytes, TimeConvert.FromNanoseconds(n.Buffered),
+                (int)n.Reconnects, (ErrorCode)n.LastError, Str(n.Url));
+        }
+    }
+
+    /// <summary>A header of the web server's last response, for example "Content-Type" or "icy-name" (any case).</summary>
+    /// <param name="name">The header name.</param>
+    /// <returns>The value, or null when the response had no such header or this is not a web stream.</returns>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public unsafe string? GetHttpHeader(string name)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        byte* buf = stackalloc byte[4096];
+        int rc = NativeMethods.fa_stream_get_http_header(Handle, name, buf, 4096);
+        if (rc == (int)ErrorCode.NotFound) return null;
+        FatzAudioException.ThrowIfFailed(rc);
+        return Marshal.PtrToStringUTF8((nint)buf);
+    }
+
+    private static unsafe string Str(byte* p) => Marshal.PtrToStringUTF8((nint)p) ?? "";
 
     internal TimeSpan FramesToTime(long frames) => TimeConvert.FromFrames(frames, _sampleRate);
     internal long TimeToFrames(TimeSpan time) => TimeConvert.ToFrames(time, _sampleRate);
@@ -766,8 +837,8 @@ public unsafe class AudioStream : IDisposable
 
     /// <summary>Raised when playback reaches the end of the source. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? Ended;
-    /// <summary>Raised when tags or stream metadata (for example an ICY title) changed. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
-    public event EventHandler? MetadataChanged;
+    /// <summary>Raised when a web radio station's song title changes, at the moment the new song is heard (not when it was downloaded). When titles change faster than events are delivered (decode-only streams read faster than real time), only the latest title is raised. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
+    public event EventHandler<MetadataChangedEventArgs>? MetadataChanged;
     /// <summary>Raised when playback stalls waiting for data. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? Stalled;
     /// <summary>Raised when playback resumes after a stall. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
@@ -838,7 +909,15 @@ public unsafe class AudioStream : IDisposable
                 case 0: Ended?.Invoke(this, EventArgs.Empty); break;
                 case 1: PositionReached?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
                 case 2: MarkerReached?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value, (MarkerKind)value)); break;
-                case 3: MetadataChanged?.Invoke(this, EventArgs.Empty); break;
+                case 3:
+                    if (MetadataChanged is { } onMeta)
+                    {
+                        // A newer title was heard before this event was delivered (a fast
+                        // decode-only reader): its own event follows, so skip this stale one.
+                        var md = Metadata;
+                        if (md.Sequence <= value) onMeta(this, new MetadataChangedEventArgs(md, FramesToTime(frame), frame));
+                    }
+                    break;
                 case 4: Stalled?.Invoke(this, EventArgs.Empty); break;
                 case 5: Resumed?.Invoke(this, EventArgs.Empty); break;
                 case 6: DecodeError?.Invoke(this, EventArgs.Empty); break;

@@ -82,14 +82,15 @@ static void ma_close(fa_decoder* dec)
 }
 
 /* WAV/AIFF use dr_wav directly (see miniaudio_impl.c) so a forward-only source
- * can be opened in sequential mode. */
+ * can be opened in sequential mode. Web streams open sequentially too: otherwise
+ * dr_wav seeks past the audio for trailing chunks, a download restart each way. */
 static fa_result wav_open(fa_decoder* dec)
 {
     const uint8_t* head;
     size_t n = fa_source_peek(dec->src, &head);
     uint32_t rate = 0, channels = 0;
     uint64_t frames = 0;
-    fa_result r = fa_drwav_open(dec->src, !dec->src->seekable, &dec->impl, &rate, &channels, &frames);
+    fa_result r = fa_drwav_open(dec->src, !dec->src->seekable || dec->src->remote, &dec->impl, &rate, &channels, &frames);
     if (r != FA_OK) return r;
     dec->format.sample_rate = rate;
     dec->format.channels = channels;
@@ -118,8 +119,87 @@ static void wav_close(fa_decoder* dec)
     dec->impl = NULL;
 }
 
+/* ---- MP3 over the network ----------------------------------------------------
+ * The length comes from the Xing/Info header, else from the file size and the
+ * bitrate (counting frames would download the whole file). Seeks jump to the
+ * estimated byte and restart the decoder there: within a frame or so for CBR
+ * files, approximate for VBR files without a Xing header. */
+
+typedef struct mp3_remote {
+    void* dr;
+    int64_t data_start;      /* first audio byte (after ID3v2 and the Xing frame) */
+    int64_t data_bytes;      /* audio bytes, -1 = unknown */
+    uint32_t kbps;           /* of the first frame, 0 = unknown */
+} mp3_remote;
+
+extern const fa_decoder_vtable fa_decoder_mp3_remote;
+
+static fa_result mp3_remote_open(fa_decoder* dec)
+{
+    mp3_remote* m = (mp3_remote*)calloc(1, sizeof(mp3_remote));
+    uint32_t rate = 0, channels = 0, probe_rate = 0;
+    uint64_t frames = 0;
+    const uint8_t* head;
+    size_t n;
+    fa_result r;
+    if (!m) return FA_ERROR_OUT_OF_MEMORY;
+    n = fa_source_peek(dec->src, &head);
+    r = fa_drmp3_open(dec->src, &m->dr, &rate, &channels, &frames, &m->data_start);
+    if (r != FA_OK) { free(m); return r; }
+    if (n > 0) fa_probe_mp3_header(head, n, fa_probe_id3v2_size(head, n), &m->kbps, &probe_rate);
+    m->data_bytes = dec->src->length > m->data_start ? dec->src->length - m->data_start : -1;
+    dec->impl = m;
+    dec->vt = &fa_decoder_mp3_remote;
+    dec->format.sample_rate = rate;
+    dec->format.channels = channels;
+    dec->seekable = dec->src->seekable;
+    if (frames > 0) dec->length = (fa_frames)frames;
+    else if (m->data_bytes > 0 && m->kbps > 0)
+        dec->length = (fa_frames)((double)m->data_bytes * 8.0 / (m->kbps * 1000.0) * rate);
+    return FA_OK;
+}
+
+static fa_result mp3_remote_read(fa_decoder* dec, float* out, fa_frames frames, fa_frames* got)
+{
+    uint64_t k = fa_drmp3_read(((mp3_remote*)dec->impl)->dr, out, (uint64_t)frames);
+    *got = (fa_frames)k;
+    return k > 0 ? FA_OK : FA_ERROR_END_OF_STREAM;
+}
+
+static fa_result mp3_remote_seek(fa_decoder* dec, fa_frames frame)
+{
+    mp3_remote* m = (mp3_remote*)dec->impl;
+    int64_t byte = 0;
+    fa_result r;
+    if (frame > 0) {
+        if (dec->length > 0 && m->data_bytes > 0) byte = m->data_start + (int64_t)((double)frame / dec->length * m->data_bytes);
+        else if (m->kbps > 0) byte = m->data_start + (int64_t)((double)frame * m->kbps * 125.0 / dec->format.sample_rate);
+        else return FA_ERROR_NOT_SEEKABLE;
+    }
+    r = fa_source_seek(dec->src, byte);
+    if (r != FA_OK) return r;
+    return fa_drmp3_restart(m->dr);
+}
+
+static void mp3_remote_close(fa_decoder* dec)
+{
+    mp3_remote* m = (mp3_remote*)dec->impl;
+    if (m) { fa_drmp3_close(m->dr); free(m); }
+    dec->impl = NULL;
+}
+
+void fa_decoder_lag(fa_decoder* dec, int64_t* out_bytes, int64_t* out_frames)
+{
+    *out_bytes = 0;
+    *out_frames = 0;
+    if (dec->vt == &fa_decoder_mp3_remote && dec->impl) fa_drmp3_lag(((mp3_remote*)dec->impl)->dr, out_bytes, out_frames);
+}
+
 static fa_result flac_open(fa_decoder* dec) { return open_with(dec, ma_encoding_format_flac); }
-static fa_result mp3_open(fa_decoder* dec) { return open_with(dec, ma_encoding_format_mp3); }
+static fa_result mp3_open(fa_decoder* dec)
+{
+    return dec->src->remote ? mp3_remote_open(dec) : open_with(dec, ma_encoding_format_mp3);
+}
 
 const fa_decoder_vtable fa_decoder_wav = {
     "wav", "WAV, RF64, Wave64 and AIFF (PCM, float, ADPCM)", "wav;wave;rf64;w64;bwf;aif;aiff;aifc",
@@ -137,4 +217,11 @@ const fa_decoder_vtable fa_decoder_mp3 = {
     "mp3", "MPEG-1/2/2.5 Layer III", "mp3",
     "audio/mpeg;audio/mp3;audio/x-mp3",
     fa_probe_mp3, mp3_open, ma_read, ma_seek, ma_close, 0
+};
+
+/* Not in the registry: mp3_open switches to it for network sources. */
+const fa_decoder_vtable fa_decoder_mp3_remote = {
+    "mp3", "MPEG-1/2/2.5 Layer III", "mp3",
+    "audio/mpeg;audio/mp3;audio/x-mp3",
+    fa_probe_mp3, mp3_remote_open, mp3_remote_read, mp3_remote_seek, mp3_remote_close, 0
 };

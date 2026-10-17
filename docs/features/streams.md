@@ -1,6 +1,6 @@
 # Opening and decoding streams
 
-A stream is anything that produces audio. You open it from a file, a memory block, or your own read callbacks, and FatzAudio works out the format from the data itself. There's one open call per kind of source and none per format: no plugins to load, no `BASS_FLAC_StreamCreateFile`.
+A stream is anything that produces audio. You open it from a file, a memory block, your own read callbacks, or a URL ([web streams](web-streams.md)), and FatzAudio works out the format from the data itself. There's one open call per kind of source and none per format: no plugins to load, no `BASS_FLAC_StreamCreateFile`.
 
 ## Supported formats
 

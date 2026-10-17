@@ -35,8 +35,22 @@ set(FA_SOURCES
     src/limiter.c
     src/stubs.c
     src/miniaudio_impl.c
+    src/net_url.c
+    src/net_http.c
+    src/net_source.c
+    src/net_hls.c
     src/fa_internal.h
+    src/net.h
 )
+# HTTPS through the platform's own stack: nothing is bundled.
+if(WIN32)
+    list(APPEND FA_SOURCES src/net_https_winhttp.c)
+elseif(APPLE)
+    enable_language(OBJC)
+    list(APPEND FA_SOURCES src/net_https_apple.m)
+else()
+    list(APPEND FA_SOURCES src/net_https_curl.c)
+endif()
 
 add_library(fatzaudio SHARED ${FA_SOURCES})
 
@@ -52,6 +66,15 @@ set_target_properties(fatzaudio PROPERTIES
 
 find_package(Threads REQUIRED)
 target_link_libraries(fatzaudio PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+if(WIN32)
+    set(FA_NET_LIBS ws2_32 winhttp)
+elseif(APPLE)
+    set(FA_NET_LIBS "-framework Foundation" "-framework CFNetwork")
+    set_source_files_properties(src/net_https_apple.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+else()
+    set(FA_NET_LIBS "")
+endif()
+target_link_libraries(fatzaudio PRIVATE ${FA_NET_LIBS})
 if(UNIX)
     target_link_libraries(fatzaudio PRIVATE m)
 endif()

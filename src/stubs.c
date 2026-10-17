@@ -4,9 +4,6 @@
 
 #define FA_UNUSED(x) (void)(x)
 
-FA_API fa_result FA_CALL fa_stream_open_url(fa_engine* engine, const char* url, const fa_open_options* options, fa_stream** out_stream)
-{ FA_UNUSED(engine); FA_UNUSED(url); FA_UNUSED(options); if (out_stream) *out_stream = NULL; return FA_ERROR_NOT_IMPLEMENTED; }
-
 FA_API fa_result FA_CALL fa_stream_open_push(fa_engine* engine, const fa_audio_format* format, const fa_open_options* options, fa_stream** out_stream)
 { FA_UNUSED(engine); FA_UNUSED(format); FA_UNUSED(options); if (out_stream) *out_stream = NULL; return FA_ERROR_NOT_IMPLEMENTED; }
 

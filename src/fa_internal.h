@@ -27,6 +27,8 @@ typedef struct fa_source {
     int64_t length;    /* bytes, -1 = unknown */
     int seekable;
     fa_result error;   /* first read failure of the app's callbacks or the file, else FA_OK */
+    int remote;        /* bytes come over the network (fa_stream_open_url): decoders avoid
+                          reading far ahead or scanning the whole file */
     int prefix_filled;
     size_t prefix_len;
     uint8_t prefix[FA_PROBE_BYTES];
@@ -95,6 +97,18 @@ uint64_t fa_drwav_read(void* impl, float* out, uint64_t frames);
 int fa_drwav_seek(void* impl, uint64_t frame);
 void fa_drwav_close(void* impl);
 
+/* dr_mp3 glue for MP3 over the network: never scans the file, restarts at any byte. */
+fa_result fa_drmp3_open(fa_source* src, void** out_impl, uint32_t* out_rate, uint32_t* out_channels,
+                        uint64_t* out_frames, int64_t* out_data_start);
+uint64_t fa_drmp3_read(void* impl, float* out, uint64_t frames);
+fa_result fa_drmp3_restart(void* impl);
+void fa_drmp3_lag(void* impl, int64_t* out_bytes, int64_t* out_frames);
+void fa_drmp3_close(void* impl);
+
+/* Bytes the decoder has read from its source but not decoded yet, and frames it has
+ * decoded but not returned yet (0 when it does not know). Places ICY titles exactly. */
+void fa_decoder_lag(fa_decoder* dec, int64_t* out_bytes, int64_t* out_frames);
+
 /* Registry contents, defined in decoder.c. */
 extern const fa_decoder_vtable* const fa_decoder_registry[];
 extern const uint32_t fa_decoder_registry_count;
@@ -109,6 +123,9 @@ size_t fa_probe_id3v2_size(const uint8_t* data, size_t size);
 int fa_probe_wav(const uint8_t* data, size_t size, size_t id3_size);
 int fa_probe_flac(const uint8_t* data, size_t size, size_t id3_size);
 int fa_probe_mp3(const uint8_t* data, size_t size, size_t id3_size);
+/* First MPEG audio Layer III frame at or after `start`: bitrate (kbps), sample rate.
+ * 0 if none is found in the window. */
+int fa_probe_mp3_header(const uint8_t* data, size_t size, size_t start, uint32_t* out_kbps, uint32_t* out_rate);
 
 /* ---- Ring buffer (ring.c): single producer (worker), single consumer (audio) */
 
@@ -562,6 +579,17 @@ struct fa_stream {
     fa_atomic32 closed;
     fa_qevent spill[FA_EVENT_SPILL];     /* written by the audio thread when the queue is full */
     fa_atomic32 spill_full[FA_EVENT_SPILL];
+
+    /* Web streams (fa_stream_open_url): the download buffer, NULL for other streams.
+     * ICY titles are announced when heard: a worker arms the source frame where the
+     * next title starts, the audio thread posts FA_EVENT_METADATA when playback gets
+     * there. `meta_announced` (the last seq posted) keeps workers and the audio
+     * thread from posting a title twice. */
+    struct fa_net* net;
+    fa_atomic64 meta_frame;      /* INT64_MAX = nothing armed */
+    fa_atomic64 meta_seq_armed;
+    fa_atomic64 meta_announced;
+    int stalled;                 /* audio thread: FA_EVENT_STALLED sent, RESUMED owed */
 
     struct fa_stream* next;      /* engine->streams or engine->graveyard */
 };

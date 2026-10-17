@@ -221,7 +221,89 @@ public sealed record StreamOptions
     /// allowed 50 ms to 10 s). Larger values ride out slow disks and networks; smaller values use less memory.
     /// </summary>
     public TimeSpan? BufferLength { get; init; }
+    /// <summary>Connection settings for <see cref="AudioEngine.OpenUrl(string, StreamOptions?)"/>; null uses the defaults. Ignored by the other open calls.</summary>
+    public NetworkOptions? Network { get; init; }
 }
+
+/// <summary>Connection settings for web streams (<see cref="AudioEngine.OpenUrl(string, StreamOptions?)"/>). All properties are optional.</summary>
+/// <example>
+/// <code>
+/// var opts = new StreamOptions
+/// {
+///     Network = new NetworkOptions
+///     {
+///         Headers = new Dictionary&lt;string, string&gt; { ["Authorization"] = "Bearer abc" },
+///         Prebuffer = TimeSpan.FromSeconds(3),
+///     },
+/// };
+/// using var s = engine.OpenUrl("https://example.com/live.m3u8", opts);
+/// </code>
+/// </example>
+public sealed record NetworkOptions
+{
+    /// <summary>The User-Agent header; null sends <c>FatzAudio/&lt;version&gt;</c>.</summary>
+    public string? UserAgent { get; init; }
+    /// <summary>Extra request headers (cookies, authorization, ...), sent with every request including HLS segments.</summary>
+    public IReadOnlyDictionary<string, string>? Headers { get; init; }
+    /// <summary>
+    /// Null uses the system's proxy setting (the http_proxy / https_proxy environment variables, and the
+    /// Windows and macOS proxy settings); "" connects directly; otherwise "host:port" or
+    /// "http://user:password@host:port".
+    /// </summary>
+    public string? Proxy { get; init; }
+    /// <summary>How long connecting may take, and the longest the server may stay silent; null = 10 s.</summary>
+    public TimeSpan? Timeout { get; init; }
+    /// <summary>Audio buffered before playback starts, and before it resumes after a stall; null = 1 s.</summary>
+    public TimeSpan? Prebuffer { get; init; }
+    /// <summary>How long to keep reconnecting after the connection drops; null = 30 s.</summary>
+    public TimeSpan? ReconnectFor { get; init; }
+    /// <summary>Reconnect when the connection drops (default true). False ends the stream instead.</summary>
+    public bool Reconnect { get; init; } = true;
+    /// <summary>Ask radio servers for song titles (ICY metadata; default true).</summary>
+    public bool SongTitles { get; init; } = true;
+    /// <summary>HLS: play the best variant up to this many bits per second; 0 = the best one.</summary>
+    public int HlsMaxBandwidth { get; init; }
+}
+
+/// <summary>What a web stream is playing (<see cref="AudioStream.Metadata"/>). Strings are empty when unknown.</summary>
+/// <param name="StreamTitle">The song heard now as the station sends it (ICY StreamTitle), usually "Artist - Title".</param>
+/// <param name="Artist"><paramref name="StreamTitle"/> up to its first " - ".</param>
+/// <param name="Title">The rest; all of <paramref name="StreamTitle"/> when there is no " - ".</param>
+/// <param name="Url">ICY StreamUrl (often album art or the station's page).</param>
+/// <param name="Station">The station's name (icy-name).</param>
+/// <param name="Genre">icy-genre.</param>
+/// <param name="Description">icy-description.</param>
+/// <param name="StationUrl">icy-url.</param>
+/// <param name="ContentType">Content type of the audio, for example audio/mpeg.</param>
+/// <param name="BitrateKbps">icy-br; 0 = unknown.</param>
+/// <param name="Sequence">1, 2, ... for each title heard; 0 = none yet.</param>
+public sealed record StreamMetadata(
+    string StreamTitle, string Artist, string Title, string Url,
+    string Station, string Genre, string Description, string StationUrl,
+    string ContentType, int BitrateKbps, long Sequence)
+{
+    /// <summary>No metadata (streams that are not web streams).</summary>
+    public static StreamMetadata Empty { get; } = new("", "", "", "", "", "", "", "", "", 0, 0);
+}
+
+/// <summary>The connection of a web stream (<see cref="AudioStream.NetworkStatus"/>).</summary>
+/// <param name="Connected">True while a connection is open.</param>
+/// <param name="HttpStatus">Status code of the last response; 0 before one.</param>
+/// <param name="IsLive">No known end (radio, live HLS).</param>
+/// <param name="IsHls">An HLS playlist.</param>
+/// <param name="Seekable">Seeking works.</param>
+/// <param name="Finished">Everything is downloaded, or reconnecting gave up.</param>
+/// <param name="ContentLength">Bytes of the file; -1 = unknown or live.</param>
+/// <param name="Downloaded">Bytes received over all connections.</param>
+/// <param name="BufferedBytes">Downloaded and not decoded yet.</param>
+/// <param name="Buffered">Audio ready ahead of playback, estimated from the bitrate.</param>
+/// <param name="Reconnects">Connections re-established after a drop.</param>
+/// <param name="LastError">Why the last connection failed; <see cref="ErrorCode.Ok"/> if none did.</param>
+/// <param name="Url">The URL in use after redirects (HLS: the media playlist).</param>
+public sealed record NetworkStatus(
+    bool Connected, int HttpStatus, bool IsLive, bool IsHls, bool Seekable, bool Finished,
+    long ContentLength, long Downloaded, long BufferedBytes, TimeSpan Buffered,
+    int Reconnects, ErrorCode LastError, string Url);
 
 /// <summary>Configuration for <see cref="AudioEngine.Create"/>. All properties are optional.</summary>
 public sealed record AudioEngineOptions
