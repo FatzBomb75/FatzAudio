@@ -112,6 +112,21 @@ int64_t fa_clock_at(fa_clock* c, double frame)
     }
 }
 
+int64_t fa_clock_mixed_end(fa_clock* c)
+{
+    for (;;) {
+        int32_t e1 = fa_load32(&c->epoch);
+        int64_t cnt, dev = 0, n = 0, p0, p1, end = -1;
+        if (e1 & 1) { fa_sleep_ms(0); continue; }
+        cnt = fa_load64(&c->count);
+        if (cnt > 0) {
+            if (!read_rec(c, cnt - 1, &dev, &n, &p0, &p1)) { fa_sleep_ms(0); continue; }   /* mid-write: again */
+            end = dev + n;
+        }
+        if (fa_load32(&c->epoch) == e1) return end;
+    }
+}
+
 /* ---- pts map ------------------------------------------------------------------ */
 
 void fa_ptsmap_reset(fa_ptsmap* m)

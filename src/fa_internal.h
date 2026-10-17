@@ -173,6 +173,8 @@ void fa_clock_set_hold(fa_clock* c, int64_t hold_pts);  /* before the first reco
 void fa_clock_record(fa_clock* c, int64_t dev, int64_t n, int64_t pts0, int64_t pts1);
 /* Presentation time at device frame `frame` (fractional). */
 int64_t fa_clock_at(fa_clock* c, double frame);
+/* The device frame right after the last one recorded, -1 = none since the reset. */
+int64_t fa_clock_mixed_end(fa_clock* c);
 
 /* Where the timeline restarts inside a push stream's ring: at ring frame `idx`
  * (frames written since the ring was reset) the pts is `pts`. Single producer (the
@@ -662,6 +664,8 @@ void fa_device_remove_voice(fa_device* device, struct fa_stream* stream);
 /* Presentation clock of `s` at monotonic time `now_ns` (fa_stream_get_clock uses the
  * current time; tests pass their own). Caller holds api_lock. */
 int64_t fa_stream_clock_at(struct fa_stream* s, int64_t now_ns);
+/* fa_stream_get_buffered at monotonic time `now_ns` (push streams). Caller holds api_lock. */
+int64_t fa_stream_buffered_at(struct fa_stream* s, int64_t now_ns);
 void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames); /* audio thread */
 /* Audio thread, before any voice is mixed: starts queued streams whose
  * predecessor reaches its mix point within this callback. */

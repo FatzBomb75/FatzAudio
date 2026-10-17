@@ -232,7 +232,11 @@ FA_API fa_result FA_CALL fa_stream_push_packet(fa_stream* stream, const fa_packe
 FA_API fa_result FA_CALL fa_stream_push_end(fa_stream* stream)
 {
     if (!stream || !stream->push) return FA_ERROR_INVALID_ARG;
+    /* Under the queue lock: a push that got past enqueue's check is queued before
+     * anyone can see the end. */
+    fa_mutex_lock(&stream->push->lock);
     fa_store32(&stream->push->ended, 1);
+    fa_mutex_unlock(&stream->push->lock);
     fa_engine_wake_workers(stream->engine);
     return FA_OK;
 }

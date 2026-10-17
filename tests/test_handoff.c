@@ -478,6 +478,63 @@ static void test_buffered_ignores_timestamp_jumps(void)
     fa_stream_close(s);
 }
 
+/* A push stream at half the device rate: the resampler's start-up frames come out
+ * first, and the clock must not show 0 for them before the app's first pts. */
+static void test_clock_starts_at_first_pts_when_resampled(void)
+{
+    fa_audio_format f;
+    fa_stream* s = NULL;
+    int64_t lat = latency_ns(), base = 10000000000LL, t0, t, lowest = INT64_MAX;
+    memset(&f, 0, sizeof(f));
+    f.sample_format = FA_FORMAT_S16_PLANAR;
+    f.sample_rate = g_dev->rate / 2;
+    f.channels = 2;
+    CHECK_EQ(fa_stream_open_push(g_engine, &f, NULL, &s), FA_OK);
+    CHECK_EQ(push_level(s, f.sample_rate, 0.25f, base), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    wait_decoded(s, PERIOD * 4);
+    t0 = g_now;
+    render(PERIOD * 20);
+    for (t = t0; t < g_now; t += 100000) {          /* every 0.1 ms from the start */
+        int64_t c = clock_at(s, t);
+        if (c < lowest) lowest = c;
+    }
+    CHECK(lowest > base - 1000000);                /* never far before 10 s */
+    /* The resampler's start-up frames take the first pts too: the clock leads the
+     * audio by those few frames (well under a millisecond). */
+    CHECK_NEAR((double)clock_at(s, t0 + lat + 100000000), (double)(base + 100000000), 200000.0);
+    fa_stream_close(s);
+}
+
+/* After the last audio is mixed (the stream is buffering again), what the device
+ * has not played yet still counts, and drains to zero as it plays. */
+static void test_buffered_counts_the_device_while_draining(void)
+{
+    fa_stream* s = open_push_s16p();
+    fa_stream_state st;
+    int64_t lat = latency_ns(), mixed_end, b0, b1, b2;
+    CHECK(s != NULL);
+    CHECK_EQ(push_level(s, g_dev->rate / 10, 0.25f, 0), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    wait_decoded(s, g_dev->rate / 10);
+    render(g_dev->rate / 10 + PERIOD * 2);       /* all of it mixed, then runs dry */
+    CHECK_EQ(fa_stream_get_state(s, &st), FA_OK);
+    CHECK_EQ(st, FA_STATE_BUFFERING);
+    /* When the callback that would play the frame after the last one mixed starts. */
+    mixed_end = fa_load64(&g_dev->cb_time) + frames_to_ns(fa_clock_mixed_end(&s->clock) - fa_load64(&g_dev->cb_frame));
+    fa_mutex_lock(&s->api_lock);
+    b0 = fa_stream_buffered_at(s, mixed_end);
+    b1 = fa_stream_buffered_at(s, mixed_end + lat / 2);
+    b2 = fa_stream_buffered_at(s, mixed_end + lat + 1000000);
+    fa_mutex_unlock(&s->api_lock);
+    CHECK_NEAR((double)b0, (double)lat, 1e5);
+    CHECK_NEAR((double)b1, (double)(lat / 2), 1e5);
+    CHECK_EQ(b2, 0);
+    fa_stream_close(s);
+}
+
 /* The audio thread extends clock records while other threads read them: a reader
  * never sees a record half-extended (the old length with the new end). */
 static fa_clock g_race_clock;
@@ -848,6 +905,8 @@ int main(void)
     RUN(test_clock_across_detach_with_jump);
     RUN(test_flush_after_detach_and_hold);
     RUN(test_buffered_ignores_timestamp_jumps);
+    RUN(test_buffered_counts_the_device_while_draining);
+    RUN(test_clock_starts_at_first_pts_when_resampled);
     RUN(test_file_clock_and_seek);
     RUN(test_buffering_stall_resume_end);
     RUN(test_flush_and_buffered);

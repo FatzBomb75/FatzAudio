@@ -441,8 +441,11 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 /* The app's timeline restarts at this chunk: note at which ring frame
                  * (what the resampler still holds comes out first), and at which
                  * source frame for a later attach. */
-                fa_ptsmap_add(&s->ptsmap, fa_load64(&s->ring.write) + (int64_t)ma_data_converter_get_output_latency(&s->converter),
-                              s->decoder.anchor_pts);
+                int64_t at = fa_load64(&s->ring.write), lat = (int64_t)ma_data_converter_get_output_latency(&s->converter);
+                /* The ring's very first frames are the resampler's start-up, ahead of
+                 * this chunk: they start the timeline too (at its pts, never at 0 or
+                 * before the clock's hold). */
+                fa_ptsmap_add(&s->ptsmap, at == 0 && fa_load64(&s->ptsmap.write) == 0 ? 0 : at + lat, s->decoder.anchor_pts);
                 s->anchor_pos[s->anchors % FA_SRC_ANCHORS] = s->src_pos;
                 s->anchor_pts[s->anchors % FA_SRC_ANCHORS] = s->decoder.anchor_pts;
                 s->anchors++;
@@ -1023,32 +1026,38 @@ FA_API fa_result FA_CALL fa_stream_push_flush(fa_stream* stream)
 
 /* Counted by durations, never by timestamps, so jumps in the app's timeline don't
  * count as audio: the push queue and what its decoder holds, what the stream read
- * but hasn't put in its ring, the ring, and the device buffer while playing. */
+ * but hasn't put in its ring, the ring, and what the device has yet to play. */
 FA_API fa_result FA_CALL fa_stream_get_buffered(fa_stream* stream, fa_time* out_duration)
 {
-    int64_t total;
-    double sr;
     if (!stream || !out_duration) return FA_ERROR_INVALID_ARG;
     *out_duration = 0;
     if (!stream->push) return FA_ERROR_INVALID_ARG;
-    sr = (double)stream->decoder.format.sample_rate;
     fa_mutex_lock(&stream->api_lock);
+    *out_duration = fa_stream_buffered_at(stream, fa_monotonic_ns());
+    fa_mutex_unlock(&stream->api_lock);
+    return FA_OK;
+}
+
+int64_t fa_stream_buffered_at(struct fa_stream* stream, int64_t now_ns)
+{
+    int64_t total;
+    double sr = (double)stream->decoder.format.sample_rate;
     total = fa_push_buffered_ns(stream->push);
     fa_mutex_lock(&stream->decode_lock);
     total += (int64_t)((double)(stream->in_count + stream->carry_count) * 1e9 / sr + 0.5);
     if (stream->ring.data && stream->dev_rate > 0)
         total += (int64_t)((double)fa_ring_readable(&stream->ring) * 1e9 / (double)stream->dev_rate + 0.5);
     fa_mutex_unlock(&stream->decode_lock);
-    if (stream->device && stream->dev_rate > 0 && fa_load32(&stream->state) == FA_STATE_PLAYING) {
-        /* In the device buffer: up to its latency, of what was mixed since the last flush. */
-        fa_time lat = 0;
-        int64_t mixed = (int64_t)((double)fa_load64(&stream->played_audible) * 1e9 / (double)stream->dev_rate + 0.5);
-        fa_device_get_latency(stream->device, &lat);
-        total += lat < mixed ? lat : mixed;
+    if (stream->device && stream->dev_rate > 0) {
+        /* In the device buffer: what was mixed and hasn't reached the speaker yet,
+         * whatever the state now (the last frames before a stall or the end too). */
+        int64_t end = fa_clock_mixed_end(&stream->clock);
+        if (end >= 0) {
+            double ahead = (double)end - fa_device_speaker_frame(stream->device, now_ns);
+            if (ahead > 0.0) total += (int64_t)(ahead * 1e9 / (double)stream->dev_rate + 0.5);
+        }
     }
-    fa_mutex_unlock(&stream->api_lock);
-    *out_duration = total;
-    return FA_OK;
+    return total;
 }
 
 /* ---- parameters ---------------------------------------------------------- */
