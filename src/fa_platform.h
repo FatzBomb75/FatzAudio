@@ -42,6 +42,8 @@ static __inline int64_t fa_exchange64(fa_atomic64* a, int64_t x)
     __int64 old = a->v;
     for (;;) { __int64 seen = _InterlockedCompareExchange64((volatile __int64*)&a->v, x, old); if (seen == old) return old; old = seen; }
 }
+static __inline int fa_cas64(fa_atomic64* a, int64_t expected, int64_t desired)
+{ return _InterlockedCompareExchange64((volatile __int64*)&a->v, desired, expected) == expected; }
 static __inline void* fa_load_ptr(fa_atomic_ptr* a) { return _InterlockedCompareExchangePointer((void* volatile*)&a->v, NULL, NULL); }
 static __inline void* fa_exchange_ptr(fa_atomic_ptr* a, void* x) { return _InterlockedExchangePointer((void* volatile*)&a->v, x); }
 static __inline int fa_cas_ptr(fa_atomic_ptr* a, void* expected, void* desired)
@@ -57,6 +59,8 @@ static inline int64_t fa_load64(fa_atomic64* a) { return __atomic_load_n(&a->v, 
 static inline void fa_store64(fa_atomic64* a, int64_t x) { __atomic_store_n(&a->v, x, __ATOMIC_SEQ_CST); }
 static inline int64_t fa_fetch_add64(fa_atomic64* a, int64_t d) { return __atomic_fetch_add(&a->v, d, __ATOMIC_SEQ_CST); }
 static inline int64_t fa_exchange64(fa_atomic64* a, int64_t x) { return __atomic_exchange_n(&a->v, x, __ATOMIC_SEQ_CST); }
+static inline int fa_cas64(fa_atomic64* a, int64_t expected, int64_t desired)
+{ return __atomic_compare_exchange_n(&a->v, &expected, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
 static inline void* fa_load_ptr(fa_atomic_ptr* a) { return __atomic_load_n(&a->v, __ATOMIC_SEQ_CST); }
 static inline void* fa_exchange_ptr(fa_atomic_ptr* a, void* x) { return __atomic_exchange_n(&a->v, x, __ATOMIC_SEQ_CST); }
 static inline int fa_cas_ptr(fa_atomic_ptr* a, void* expected, void* desired)

@@ -26,7 +26,7 @@ song.Ramp(AudioParameter.Volume, 0f, TimeSpan.FromSeconds(3), Curve.EqualPower);
 | `AudioEngine` | Entry point. `OutputDevices`, `InputDevices`, `OpenOutput`, `OpenFile`, `OpenMemory`, `OpenStream`, `OpenUrl`, `CreatePushStream`, `OpenPackets`. |
 | `OutputDevice` | Opened playback device: `Volume`, `Latency`, `Time` (the device clock), `CreateBus()`, `Start()`, `Stop()`. |
 | `MixBus` | A group of streams with its own `Volume`, `Pan` and `Ramp`: decks, a DJ crossfader. |
-| `AudioStream` | Any playable / decodable source: `PlayOn`, `Pause`, `Stop`, `Position`, `Volume`, `Pan`, `Rate`, `Tempo`, `Pitch`, `Ramp`, `PlayAt`, `Markers`, `CrossfadeTo`, `QueueNext`, `SetMatrix`, `Read`, `GetLevels`, `Clock`, events. |
+| `AudioStream` | Any playable / decodable source: `PlayOn`, `Pause`, `Stop`, `Position`, `Volume`, `Pan`, `Rate`, `Tempo`, `Pitch`, `Ramp`, `PlayAt`, `Markers`, `CrossfadeTo`, `QueueNext`, `SetMatrix`, `Read`, `GetLevels`, `Clock`, events. Web streams add `Metadata`, `NetworkStatus` and `GetHttpHeader`. |
 | `PushAudioStream` | Stream you feed with PCM via `Push(...)`, or with decoded frames in any format via `PushFrame(...)`. `End`, `Flush`, `Buffered`. |
 | `PacketAudioStream` | Stream you feed with compressed packets from your demuxer (FFmpeg): `PushPacket(...)`. Decoded on worker threads; `Clock` follows your timestamps. |
 | `FFmpeg` | `Load(folder)`, `Info`, `ToSampleFormat(...)`: the FFmpeg your app already uses, loaded at runtime (never bundled). |

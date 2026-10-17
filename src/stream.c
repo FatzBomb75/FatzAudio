@@ -9,8 +9,9 @@
  * To change what the audio thread reads (seek, detach), an API thread sets
  * `flushing` or removes the voice, waits until the audio callback has passed
  * (fa_device_wait_quiescent), then takes decode_lock so no worker runs either. */
-#include "fa_internal.h"
+#include "net.h"
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,6 +23,9 @@
 #define FA_RAMP_BLOCK 16         /* ramp curves are evaluated every 16 frames */
 #define FA_NORM_GLIDE_DOWN_DB_S 12.0f
 #define FA_NORM_GLIDE_UP_DB_S 6.0f
+#define FA_STR_(x) #x
+#define FA_STR(x) FA_STR_(x)
+#define FA_NET_USER_AGENT "FatzAudio/" FA_STR(FA_VERSION_MAJOR) "." FA_STR(FA_VERSION_MINOR) "." FA_STR(FA_VERSION_PATCH)
 
 FA_API void FA_CALL fa_open_options_init(fa_open_options* options)
 {
@@ -70,6 +74,7 @@ static void stream_discard(struct fa_stream* s)
     if (s->decoder_ready) fa_decoder_close(&s->decoder);
     fa_push_free(s->push);
     fa_source_close(&s->source);
+    fa_net_close(s->net);
     fa_stream_free_memory(s);
 }
 
@@ -91,7 +96,8 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
     s->engine = engine;
     s->flags = options ? options->flags : 0;
     s->buffer_ms = FA_DEFAULT_BUFFER_MS;
-    if (options && options->struct_size >= sizeof(fa_open_options) && options->buffer_ms) {
+    if (options && options->struct_size >= offsetof(fa_open_options, buffer_ms) + sizeof(options->buffer_ms) &&
+        options->buffer_ms) {
         s->buffer_ms = options->buffer_ms;
         if (s->buffer_ms < 50) s->buffer_ms = 50;
         if (s->buffer_ms > 10000) s->buffer_ms = 10000;
@@ -102,6 +108,7 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
     fa_store_float(&s->norm_album, NAN);
     fa_store_float(&s->norm_est, NAN);
     fa_store32(&s->state, FA_STATE_STOPPED);
+    fa_store64(&s->meta_frame, INT64_MAX);
     for (i = 0; i < FA_MARKER_COUNT; i++) fa_store64(&s->markers[i], FA_FRAMES_UNSET);
     for (i = 0; i < FA_STREAM_LANES; i++) fa_lane_init(&s->lanes[i], i == FA_PARAM_PAN ? 0.0f : 1.0f);
     {
@@ -245,6 +252,109 @@ FA_API fa_result FA_CALL fa_stream_open_packets(fa_engine* engine, const fa_code
     return FA_OK;
 }
 
+static char* copy_str(const char* text, fa_result* r)
+{
+    char* c;
+    size_t n;
+    if (!text) return NULL;
+    n = strlen(text) + 1;
+    c = (char*)malloc(n);
+    if (c) memcpy(c, text, n);
+    else *r = FA_ERROR_OUT_OF_MEMORY;
+    return c;
+}
+
+FA_API void FA_CALL fa_net_options_init(fa_net_options* options)
+{
+    if (!options) return;
+    memset(options, 0, sizeof(*options));
+    options->struct_size = (uint32_t)sizeof(*options);
+}
+
+/* The settings of fa_open_options.net, with defaults, into a config the download
+ * buffer owns. Older callers' shorter structs are read only as far as they go. */
+static fa_result net_config(const char* url, const fa_open_options* options, fa_net_config* cfg)
+{
+    fa_net_options o;
+    fa_result r = FA_OK;
+    fa_net_options_init(&o);
+    if (options && options->struct_size >= offsetof(fa_open_options, net) + sizeof(options->net) && options->net) {
+        size_t sz = options->net->struct_size;
+        if (sz < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+        if (sz > sizeof(o)) sz = sizeof(o);
+        memcpy(&o, options->net, sz);
+    }
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->url = copy_str(url, &r);
+    cfg->user_agent = copy_str(o.user_agent ? o.user_agent : FA_NET_USER_AGENT, &r);
+    cfg->headers = copy_str(o.headers, &r);
+    cfg->proxy = copy_str(o.proxy, &r);
+    cfg->timeout_ms = o.timeout_ms ? o.timeout_ms : FA_NET_DEFAULT_TIMEOUT_MS;
+    cfg->prebuffer_ms = o.prebuffer_ms ? o.prebuffer_ms : FA_NET_DEFAULT_PREBUFFER_MS;
+    cfg->reconnect_ms = (o.flags & FA_NET_NO_RECONNECT) ? 0 : (o.reconnect_ms ? o.reconnect_ms : FA_NET_DEFAULT_RECONNECT_MS);
+    cfg->flags = o.flags;
+    cfg->hls_max_bandwidth = o.hls_max_bandwidth;
+    if (cfg->prebuffer_ms > 30000) cfg->prebuffer_ms = 30000;
+    if (r != FA_OK) { free(cfg->url); free(cfg->user_agent); free(cfg->headers); free(cfg->proxy); }
+    return r;
+}
+
+FA_API fa_result FA_CALL fa_stream_open_url(fa_engine* engine, const char* url, const fa_open_options* options, fa_stream** out_stream)
+{
+    struct fa_stream* s;
+    fa_net_config cfg;
+    fa_io_callbacks io;
+    fa_url parsed;
+    fa_result r;
+    if (out_stream) *out_stream = NULL;
+    if (!engine || !url || !out_stream) return FA_ERROR_INVALID_ARG;
+    if (fa_url_parse(url, &parsed) != FA_OK) return FA_ERROR_INVALID_ARG;
+    r = net_config(url, options, &cfg);
+    if (r != FA_OK) return r;
+    r = stream_create(engine, options, &s);
+    if (r != FA_OK) { free(cfg.url); free(cfg.user_agent); free(cfg.headers); free(cfg.proxy); return r; }
+    r = fa_net_open(&cfg, &s->net);           /* takes the config's strings */
+    if (r == FA_OK) {
+        fa_net_io(s->net, &io);
+        io.close = NULL;                      /* the stream closes the net itself */
+        fa_source_open_io(&s->source, &io, s->net);
+        s->source.remote = 1;
+        if (fa_net_is_hls(s->net)) {
+            s->decoder.vt = &fa_decoder_hls;
+            s->decoder.src = &s->source;
+            s->decoder.length = -1;
+            r = fa_decoder_hls.open(&s->decoder);
+            if (r == FA_OK) {
+                s->decoder.format.sample_format = FA_FORMAT_F32;
+                s->decoder_ready = 1;
+                if (options && options->audio_track > 0) r = FA_ERROR_NOT_FOUND;
+                else if (!(s->flags & FA_OPEN_DECODE_ONLY) &&
+                         fa_meter_init(&s->run_meter, s->decoder.format.sample_rate, s->decoder.format.channels, 0,
+                                       FA_RUNNING_SUBS) == FA_OK)
+                    s->run_meter_ready = 1;
+            } else {
+                memset(&s->decoder, 0, sizeof(s->decoder));
+            }
+        } else {
+            char mime[128];
+            fa_open_options o;
+            fa_open_options_init(&o);
+            if (options) memcpy(&o, options, options->struct_size < sizeof(o) ? options->struct_size : sizeof(o));
+            /* The server's Content-Type is a tie-breaker when the app gave none. */
+            if (!o.mime_hint && fa_net_get_header(s->net, "Content-Type", mime, sizeof(mime)) == FA_OK) {
+                mime[strcspn(mime, "; ")] = 0;
+                o.mime_hint = mime;
+            }
+            r = stream_open_decoder(s, parsed.path, &o);
+        }
+    }
+    if (r == FA_OK) fa_net_set_sample_rate(s->net, s->decoder.format.sample_rate);
+    if (r != FA_OK) { stream_discard(s); return r; }
+    stream_opened(s);
+    *out_stream = s;
+    return FA_OK;
+}
+
 FA_API void FA_CALL fa_stream_close(fa_stream* stream)
 {
     fa_scan_job* job;
@@ -252,6 +362,9 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
     uintptr_t self;
     if (!stream) return;
     e = stream->engine;
+    /* A worker may be waiting in a network read while holding decode_lock: end
+     * the download first so the read returns. */
+    fa_net_interrupt(stream->net);
     fa_stream_detach(stream);
 
     /* A scan of this stream reads its file or memory: stop it before they go. */
@@ -274,6 +387,8 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
     fa_push_free(stream->push);
     stream->push = NULL;
     fa_source_close(&stream->source); /* the app's io close, exactly once */
+    fa_net_close(stream->net);
+    stream->net = NULL;
     if (stream->run_meter_ready) { fa_meter_free(&stream->run_meter); stream->run_meter_ready = 0; }
     free(stream->path);
     stream->path = NULL;
@@ -310,13 +425,93 @@ FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* o
     return FA_OK;
 }
 
+/* ---- web stream info ----------------------------------------------------- */
+
+FA_API fa_result FA_CALL fa_stream_get_metadata(fa_stream* stream, fa_metadata* out_metadata)
+{
+    fa_net_meta m;
+    const char* dash;
+    if (!stream || !out_metadata) return FA_ERROR_INVALID_ARG;
+    memset(out_metadata, 0, sizeof(*out_metadata));
+    if (!stream->net) return FA_OK;
+    fa_net_get_station(stream->net, out_metadata);
+    fa_net_meta_at(stream->net, fa_stream_position_now(stream), &m);
+    if (m.seq == 0) return FA_OK;
+    snprintf(out_metadata->stream_title, sizeof(out_metadata->stream_title), "%s", m.title);
+    snprintf(out_metadata->url, sizeof(out_metadata->url), "%s", m.url);
+    out_metadata->seq = m.seq;
+    dash = strstr(m.title, " - ");
+    if (dash) {
+        int len = (int)(dash - m.title);
+        snprintf(out_metadata->artist, sizeof(out_metadata->artist), "%.*s", len, m.title);
+        snprintf(out_metadata->title, sizeof(out_metadata->title), "%.767s", dash + 3);
+    } else {
+        snprintf(out_metadata->title, sizeof(out_metadata->title), "%.767s", m.title);
+    }
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_net_status(fa_stream* stream, fa_net_status* out_status)
+{
+    double bpf, secs = 0.0;
+    if (out_status) memset(out_status, 0, sizeof(*out_status));
+    if (!stream || !out_status || !stream->net) return FA_ERROR_INVALID_ARG;
+    fa_net_get_status(stream->net, out_status);
+    bpf = fa_net_bytes_per_frame(stream->net);
+    if (bpf > 0 && stream->decoder.format.sample_rate)
+        secs = (double)out_status->buffered_bytes / bpf / (double)stream->decoder.format.sample_rate;
+    if (stream->dev_rate && stream->ring.data && !fa_load32(&stream->flushing))
+        secs += (double)fa_ring_readable(&stream->ring) / (double)stream->dev_rate;
+    out_status->buffered = (fa_time)(secs * 1e9);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_http_header(fa_stream* stream, const char* name, char* out_value, size_t value_size)
+{
+    if (out_value && value_size) out_value[0] = 0;
+    if (!stream || !name || !out_value || value_size == 0) return FA_ERROR_INVALID_ARG;
+    if (!stream->net) return FA_ERROR_NOT_FOUND;
+    return fa_net_get_header(stream->net, name, out_value, value_size);
+}
+
 /* ---- decode-ahead (worker threads) -------------------------------------- */
 
 int fa_stream_needs_work(struct fa_stream* s)
 {
     if (!s->ring.data || fa_load32(&s->eof) || fa_load32(&s->flushing)) return 0;
     if (s->push && !fa_push_has_input(s->push) && !fa_load32(&s->staged)) return 0;   /* nothing pushed yet */
-    return fa_ring_writable(&s->ring) >= s->ring.capacity / 4;
+    if (fa_ring_writable(&s->ring) < s->ring.capacity / 4) return 0;
+    /* Web streams: only once the bytes are downloaded, so a worker never waits. */
+    return !s->net || fa_net_can_decode(s->net, NULL);
+}
+
+/* Posts FA_EVENT_METADATA for the title in effect at `heard` if nobody has yet. */
+static void announce_title(struct fa_stream* s, int64_t heard)
+{
+    int64_t seq = fa_net_meta_seq_at(s->net, heard), was = fa_load64(&s->meta_announced);
+    if (seq > was && fa_cas64(&s->meta_announced, was, seq)) {
+        fa_event ev;
+        ev.type = FA_EVENT_METADATA;
+        ev.stream = s;
+        ev.frame = heard;
+        ev.value = seq;
+        fa_engine_post_event(s->engine, &ev);
+    }
+}
+
+/* Web streams, after `got` frames were decoded, ending at source frame `cursor`:
+ * places new ICY titles on the timeline and arms the next one for the audio thread. */
+static void net_decoded(struct fa_stream* s, fa_frames got, fa_frames cursor, fa_frames heard)
+{
+    int64_t lag_bytes = 0, lag_frames = 0, seq = 0, next;
+    fa_net_note_decoded(s->net, got);
+    fa_decoder_lag(&s->decoder, &lag_bytes, &lag_frames);
+    next = fa_net_meta_update(s->net, cursor + lag_frames, lag_bytes, heard, &seq);
+    announce_title(s, heard);
+    if (next != INT64_MAX) {
+        fa_store64(&s->meta_seq_armed, seq);  /* seq first: the audio thread reads the frame first */
+        fa_store64(&s->meta_frame, next);
+    }
 }
 
 /* Feeds the running loudness estimate until the final value is known. */
@@ -434,6 +629,7 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 s->carry_offset += got;
                 s->carry_count -= got;
             } else if (want > 0) {
+                if (s->net && !fa_net_can_decode(s->net, NULL)) break;  /* not downloaded yet */
                 rr = fa_decoder_read(&s->decoder, s->in_buf, want, &got);
             }
             if (got == 0 && rr == FA_ERROR_BUSY) break;   /* push stream: nothing queued yet */
@@ -455,6 +651,7 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
             s->in_count = got;
             s->decoded += got;
             s->src_pos += got;
+            if (s->net && !from_carry && got > 0) net_decoded(s, got, s->src_pos, fa_stream_position_now(s));
             if (got == 0) {
                 fa_frames back = loop_start(s);
                 ma_uint64 latency;
@@ -549,6 +746,10 @@ static fa_result restart_at_locked(struct fa_stream* s, fa_frames frame)
     s->src_pos = frame;
     fa_ptsmap_reset(&s->ptsmap);
     fa_clock_reset(&s->clock, hold);
+    if (s->net) {
+        fa_net_meta_reset_frames(s->net, frame);
+        fa_store64(&s->meta_frame, INT64_MAX);
+    }
     if (s->ring.data) {
         fa_ring_reset(&s->ring);
         s->in_count = s->in_offset = 0;
@@ -717,7 +918,8 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
         fa_mutex_unlock(&stream->api_lock);
         return FA_OK;
     }
-    was_playing = stream->device && fa_load32(&stream->state) == FA_STATE_PLAYING;
+    was_playing = stream->device && (fa_load32(&stream->state) == FA_STATE_PLAYING ||
+                                     fa_load32(&stream->state) == FA_STATE_BUFFERING);
     if (stream->device) detach_locked(stream);  /* pauses it */
 
     fa_mutex_lock(&stream->decode_lock);
@@ -903,8 +1105,8 @@ FA_API fa_result FA_CALL fa_stream_pause(fa_stream* stream)
     fa_mutex_lock(&stream->api_lock);
     if (!is_attached(stream)) r = FA_ERROR_INVALID_ARG;
     else {
-        /* The mixer may start a scheduled stream or a push stream may start or stop
-         * buffering meanwhile: retry until the state we saw is the one we replaced. */
+        /* The mixer may start a scheduled stream, or a push or web stream may start or
+         * stop buffering, meanwhile: retry until the state we saw is the one we replaced. */
         for (;;) {
             int32_t st = fa_load32(&stream->state);
             if (st != FA_STATE_PLAYING && st != FA_STATE_SCHEDULED && st != FA_STATE_BUFFERING) break;
@@ -1276,14 +1478,14 @@ FA_API fa_result FA_CALL fa_stream_set_next(fa_stream* stream, fa_stream* next, 
     if (next->engine != stream->engine || (next->flags & FA_OPEN_DECODE_ONLY)) return FA_ERROR_INVALID_ARG;
     r = fa_shape_from_ramp(shape, FA_CURVE_EQUAL_POWER, &sh);
     if (r != FA_OK) return r;
-    if (fa_load32(&next->state) == FA_STATE_PLAYING) return FA_ERROR_BUSY;
+    if (fa_load32(&next->state) == FA_STATE_PLAYING || fa_load32(&next->state) == FA_STATE_BUFFERING) return FA_ERROR_BUSY;
     r = join_device(stream, next, &dev);
     if (r != FA_OK) return r;
 
     /* Ready to go: positioned at its cue-in and buffered, waiting for the trigger. */
     fa_mutex_lock(&next->api_lock);
     if (next->device != dev) r = FA_ERROR_INVALID_ARG;
-    else if (fa_load32(&next->state) == FA_STATE_PLAYING) r = FA_ERROR_BUSY;
+    else if (fa_load32(&next->state) == FA_STATE_PLAYING || fa_load32(&next->state) == FA_STATE_BUFFERING) r = FA_ERROR_BUSY;
     else {
         int32_t st = fa_load32(&next->state);
         if (st == FA_STATE_ENDED || st == FA_STATE_STOPPED) rewind_locked(next);
@@ -1404,6 +1606,11 @@ FA_API fa_result FA_CALL fa_stream_read(fa_stream* stream, void* buffer, fa_fram
     fa_mutex_lock(&stream->decode_lock);
     r = fa_decoder_read(&stream->decoder, (float*)buffer, frames, &got);
     fa_fetch_add64(&stream->position, got);
+    if (stream->net && got > 0) {
+        /* Decode-only: what is read now is what the app "hears". */
+        fa_frames pos = fa_load64(&stream->position);
+        net_decoded(stream, got, pos, pos);
+    }
     fa_mutex_unlock(&stream->decode_lock);
     *out_frames_read = got;
     if (r == FA_ERROR_BUSY) r = FA_OK;   /* push stream with nothing queued: 0 frames, not the end */
@@ -1723,11 +1930,22 @@ static void record_clock(struct fa_stream* s, int64_t dev0, int64_t played0, int
     }
 }
 
-/* Push streams wait in FA_STATE_BUFFERING until this much is decoded ahead. */
+/* A buffering push or web stream plays on once this much is decoded ahead. */
 static int64_t prebuffer_frames(struct fa_stream* s)
 {
     int64_t want = (int64_t)s->dev_rate * FA_PREFILL_MS / 1000;
     return want < s->ring.capacity / 2 ? want : s->ring.capacity / 2;
+}
+
+/* Web streams: FA_EVENT_METADATA when playback reaches the armed title. */
+static void net_title_heard(struct fa_stream* s, fa_device* dev)
+{
+    int64_t at = fa_load64(&s->meta_frame), seq, was;
+    if (at == INT64_MAX || attached_position(s) < at) return;
+    seq = fa_load64(&s->meta_seq_armed);
+    fa_cas64(&s->meta_frame, at, INT64_MAX);
+    was = fa_load64(&s->meta_announced);
+    if (seq > was && fa_cas64(&s->meta_announced, was, seq)) push_event(dev, s, FA_EVENT_METADATA, seq);
 }
 
 void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames)
@@ -1872,6 +2090,7 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
         record_clock(s, clock + off, played0, done);
         fa_fetch_add64(&s->played_audible, done);
     }
+    if (s->net && done > 0) net_title_heard(s, dev);
 
     if (ended) {
         marker_events(s, dev, &mk, played0, played0 + done, 0);
@@ -1890,9 +2109,11 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
             return;
         }
         fa_fetch_add32(&s->underruns, 1);
-        /* A push stream that ran dry waits for the app's next data. */
-        if (s->push && fa_cas32(&s->state, FA_STATE_PLAYING, FA_STATE_BUFFERING) &&
-            fa_load64(&s->played_audible) > 0 && !s->stalled) {
+        /* A push or web stream that ran dry waits for more: the app's next data, or
+         * the network (whose download buffer only hands data on once prebuffer_ms are
+         * in, so the ring then refills at once). */
+        if ((s->push || s->net) && fa_cas32(&s->state, FA_STATE_PLAYING, FA_STATE_BUFFERING) &&
+            fa_load64(s->push ? &s->played_audible : &s->played) > 0 && !s->stalled) {
             s->stalled = 1;
             push_event(dev, s, FA_EVENT_STALLED, 0);
         }

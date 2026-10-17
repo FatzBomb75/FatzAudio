@@ -240,14 +240,25 @@ public sealed class AudioEngine : IDisposable
         return AudioStream.Wrap(this, rc, s, gc, state);
     }
 
-    /// <summary>Opens a network URL (http/https; availability depends on the native build).</summary>
+    /// <summary>
+    /// Opens what is behind an http:// or https:// URL: an audio file on a web server (seekable when the
+    /// server supports byte ranges), an Icecast/Shoutcast radio station (song titles arrive as
+    /// <see cref="AudioStream.MetadataChanged"/> when the song is heard), or an HLS playlist (.m3u8).
+    /// The call connects and waits for the first few KB to detect the format; everything after that is
+    /// downloaded on a thread of the stream, so playback never waits for the network.
+    /// </summary>
     /// <param name="url">The URL.</param>
-    /// <param name="options">Optional open options.</param>
+    /// <param name="options">Optional open options; <see cref="StreamOptions.Network"/> holds the connection settings.</param>
     /// <returns>The stream; dispose it when done.</returns>
-    /// <exception cref="FatzAudioException">The URL could not be opened (<see cref="ErrorCode.NotImplemented"/> if the native library has no network support yet).</exception>
+    /// <exception cref="ArgumentException">Not an absolute http or https URL (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <exception cref="FatzAudioException">The server could not be reached (<see cref="ErrorCode.Network"/>), answered with an
+    /// error (<see cref="ErrorCode.NotFound"/>), sent something that is not audio (<see cref="ErrorCode.UnsupportedFormat"/>),
+    /// or HTTPS has no TLS stack on this system (<see cref="ErrorCode.ProviderMissing"/>).</exception>
     /// <example>
     /// <code>
     /// using var radio = engine.OpenUrl("https://example.com/stream.mp3");
+    /// radio.MetadataChanged += (_, e) => Console.WriteLine($"Now playing: {e.Metadata.StreamTitle}");
+    /// radio.PlayOn(output);
     /// </code>
     /// </example>
     public unsafe AudioStream OpenUrl(string url, StreamOptions? options = null)
@@ -255,7 +266,9 @@ public sealed class AudioEngine : IDisposable
         ArgumentNullException.ThrowIfNull(url);
         var h = Handle;
         using var opts = NativeOptions.Create(options);
-        return AudioStream.Wrap(this, NativeMethods.fa_stream_open_url(h, url, opts.Pointer, out nint s), s, null);
+        int rc = NativeMethods.fa_stream_open_url(h, url, opts.Pointer, out nint s);
+        if (rc == (int)ErrorCode.InvalidArgument) throw new ArgumentException("Not an absolute http or https URL.", nameof(url));
+        return AudioStream.Wrap(this, rc, s, null);
     }
 
     /// <summary>Opens a network URL.</summary>
@@ -406,6 +419,8 @@ internal unsafe ref struct NativeOptions
 {
     private FaOpenOptions* _ptr;
     private byte* _mime;
+    private FaNetOptions* _net;
+    private byte* _userAgent, _headers, _proxy;
 
     public readonly FaOpenOptions* Pointer => _ptr;
 
@@ -429,14 +444,45 @@ internal unsafe ref struct NativeOptions
             o._mime = (byte*)Marshal.StringToCoTaskMemUTF8(mime);
             o._ptr->MimeHint = o._mime;
         }
+        if (options.Network is { } net)
+        {
+            o._net = (FaNetOptions*)NativeMemory.AllocZeroed((nuint)sizeof(FaNetOptions));
+            NativeMethods.fa_net_options_init(o._net);
+            o._userAgent = Utf8(net.UserAgent);
+            o._proxy = net.Proxy is null ? null : Utf8(net.Proxy);
+            if (net.Headers is { Count: > 0 } headers)
+                o._headers = Utf8(string.Join("\r\n", headers.Select(kv => $"{kv.Key}: {kv.Value}")));
+            o._net->UserAgent = o._userAgent;
+            o._net->Headers = o._headers;
+            o._net->Proxy = o._proxy;
+            o._net->TimeoutMs = Millis(net.Timeout);
+            o._net->PrebufferMs = Millis(net.Prebuffer);
+            o._net->ReconnectMs = Millis(net.ReconnectFor);
+            uint netFlags = 0;
+            if (!net.Reconnect) netFlags |= 1u << 0;
+            if (!net.SongTitles) netFlags |= 1u << 1;
+            o._net->Flags = netFlags;
+            o._net->HlsMaxBandwidth = (uint)Math.Clamp(net.HlsMaxBandwidth, 0, int.MaxValue);
+            o._ptr->Net = o._net;
+        }
         return o;
     }
+
+    private static byte* Utf8(string? s) => s is null ? null : (byte*)Marshal.StringToCoTaskMemUTF8(s);
+
+    private static uint Millis(TimeSpan? t) =>
+        t is { } v ? (uint)Math.Clamp(Math.Ceiling(v.TotalMilliseconds), 1, uint.MaxValue) : 0;
 
     public void Dispose()
     {
         if (_mime != null) Marshal.FreeCoTaskMem((nint)_mime);
+        if (_userAgent != null) Marshal.FreeCoTaskMem((nint)_userAgent);
+        if (_headers != null) Marshal.FreeCoTaskMem((nint)_headers);
+        if (_proxy != null) Marshal.FreeCoTaskMem((nint)_proxy);
+        if (_net != null) NativeMemory.Free(_net);
         if (_ptr != null) NativeMemory.Free(_ptr);
-        _mime = null;
+        _mime = _userAgent = _headers = _proxy = null;
+        _net = null;
         _ptr = null;
     }
 }

@@ -8,13 +8,13 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Opening and decoding streams (format detection, custom I/O, MP4 and MKV audio tracks) | [streams.md](streams.md) | ✅ |
 | Playback, buffering and threads (decode-ahead, transport, device clock) | [playback.md](playback.md) | ✅ |
 | Volume, pan and ramps (7 curves, scheduled starts, ramp-done) | [ramps.md](ramps.md) | ✅ volume and pan |
-| Events | [events.md](events.md) | ✅ ended, ramp done, marker, started, loudness final, stalled, resumed, decode error |
+| Events | [events.md](events.md) | ✅ ended, ramp done, marker, started, loudness final, metadata, stalled/resumed, decode error |
 | Loudness normalization (R128 scans, tags, cache, limiter) | [normalization.md](normalization.md) | ✅ |
 | Crossfades, markers, queues and gapless, scheduled starts | [crossfade.md](crossfade.md) | ✅ |
 | Buses (decks, groups) and the channel matrix | [buses.md](buses.md) | ✅ |
 | Tempo and pitch | tempo-pitch.md | 🗓️ |
 | FFmpeg hand-off and A/V sync (packets, frames, presentation clock) | [ffmpeg.md](ffmpeg.md) | ✅ |
-| Web streams and HLS | web-streams.md | 🗓️ |
+| Web streams and HLS (HTTP/HTTPS, radio titles, reconnects, HLS) | [web-streams.md](web-streams.md) | ✅ WAV/FLAC/MP3; AAC with the AAC decoder 🗓️ |
 | CD+G | cdg.md | 🗓️ |
 | Disc playback | disc.md | 🗓️ |
 | Recording and encoding | recording-encoding.md | 🗓️ |

@@ -50,6 +50,55 @@ internal unsafe struct FaOpenOptions
     public int AudioTrack;
     public byte* MimeHint;
     public uint BufferMs;
+    public FaNetOptions* Net;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaNetOptions
+{
+    public uint StructSize;
+    public byte* UserAgent;
+    public byte* Headers;
+    public byte* Proxy;
+    public uint TimeoutMs;
+    public uint PrebufferMs;
+    public uint ReconnectMs;
+    public uint Flags;
+    public uint HlsMaxBandwidth;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaMetadata
+{
+    public fixed byte StreamTitle[1024];
+    public fixed byte Artist[256];
+    public fixed byte Title[768];
+    public fixed byte Url[512];
+    public fixed byte Station[256];
+    public fixed byte Genre[128];
+    public fixed byte Description[256];
+    public fixed byte StationUrl[512];
+    public fixed byte ContentType[128];
+    public uint BitrateKbps;
+    public long Seq;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaNetStatus
+{
+    public int Connected;
+    public int HttpStatus;
+    public int IsLive;
+    public int IsHls;
+    public int Seekable;
+    public int Finished;
+    public long ContentLength;
+    public long Downloaded;
+    public long BufferedBytes;
+    public long Buffered;
+    public uint Reconnects;
+    public int LastError;
+    public fixed byte Url[2048];
 }
 
 [StructLayout(LayoutKind.Sequential)]

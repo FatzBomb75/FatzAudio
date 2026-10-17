@@ -211,6 +211,8 @@ typedef enum fa_open_flags {
                                       (jingles, sound effects, already-mastered mixes) */
 } fa_open_flags;
 
+typedef struct fa_net_options fa_net_options;
+
 typedef struct fa_open_options {
     uint32_t struct_size;
     uint32_t flags;          /* fa_open_flags */
@@ -220,6 +222,8 @@ typedef struct fa_open_options {
                                 itself is ambiguous. Content sniffing always wins */
     uint32_t buffer_ms;      /* decode-ahead buffer while attached to a device,
                                 0 = default (500 ms), clamped to 50..10000 */
+    const fa_net_options* net; /* fa_stream_open_url only: connection settings,
+                                NULL = defaults. Copied by the call */
 } fa_open_options;
 
 FA_API void FA_CALL fa_open_options_init(fa_open_options* options);
@@ -233,6 +237,7 @@ FA_API void FA_CALL fa_open_options_init(fa_open_options* options);
 FA_API fa_result FA_CALL fa_stream_open_path(fa_engine* engine, const char* path, const fa_open_options* options, fa_stream** out_stream);
 FA_API fa_result FA_CALL fa_stream_open_memory(fa_engine* engine, const void* data, size_t size, const fa_open_options* options, fa_stream** out_stream);
 FA_API fa_result FA_CALL fa_stream_open_io(fa_engine* engine, const fa_io_callbacks* io, void* user, const fa_open_options* options, fa_stream** out_stream);
+/* Web streams: see "Web streams" below. */
 FA_API fa_result FA_CALL fa_stream_open_url(fa_engine* engine, const char* url, const fa_open_options* options, fa_stream** out_stream);
 
 /* ---- Push streams and the FFmpeg hand-off --------------------------------
@@ -367,6 +372,105 @@ FA_API fa_result FA_CALL fa_ffmpeg_load(const char* directory);
 FA_API fa_result FA_CALL fa_ffmpeg_get_info(fa_ffmpeg_info* out_info);
 
 FA_API void FA_CALL fa_stream_close(fa_stream* stream);
+
+/* ---- Web streams --------------------------------------------------------
+ *
+ * fa_stream_open_url plays what is behind an http:// or https:// URL:
+ *   - audio files on a web server: seekable when the server supports byte ranges
+ *     (almost all do); only what is played is downloaded;
+ *   - Icecast / Shoutcast radio: the song titles arrive as FA_EVENT_METADATA at
+ *     the moment the new song is heard, not when it was downloaded;
+ *   - HLS playlists (.m3u8), live or on demand, with MPEG-TS, fMP4 or plain audio
+ *     segments and AES-128 encryption. On-demand HLS is seekable.
+ * The format of the audio is detected from the content, as for files.
+ *
+ * Opening connects and waits for the first few KB (format detection), at most
+ * timeout_ms. All further network I/O runs on a download thread of the stream:
+ * decoding only starts on data that is already downloaded, so the audio thread
+ * and the decode workers never wait for the network.
+ *
+ * Playback starts once prebuffer_ms of audio are buffered. When the network
+ * cannot keep up, the stream goes to FA_STATE_BUFFERING (FA_EVENT_STALLED), and
+ * back to playing (FA_EVENT_RESUMED) once prebuffer_ms are buffered again.
+ * A dropped connection is re-established by itself for reconnect_ms: a file
+ * continues at the byte where it stopped, radio picks up the live stream.
+ * When reconnecting fails for that long, the stream plays what it has and ends.
+ *
+ * HTTPS uses the system's TLS stack (WinHTTP on Windows, URLSession on Apple
+ * platforms, libcurl on Linux, loaded at runtime; FA_ERROR_PROVIDER_MISSING if
+ * the system has none). Plain http:// uses FatzAudio's own HTTP/1.1 client. */
+
+typedef enum fa_net_flags {
+    FA_NET_NO_RECONNECT = 1 << 0,  /* end the stream when the connection drops */
+    FA_NET_NO_ICY       = 1 << 1   /* do not ask radio servers for song titles */
+} fa_net_flags;
+
+struct fa_net_options {
+    uint32_t struct_size;          /* sizeof(fa_net_options) */
+    const char* user_agent;        /* NULL = "FatzAudio/<version>" */
+    const char* headers;           /* extra request headers, "Name: value" lines separated
+                                      by "\r\n" or "\n" (cookies, authorization, ...); NULL = none */
+    const char* proxy;             /* NULL = the system's setting (environment http_proxy /
+                                      https_proxy, Windows and macOS proxy settings);
+                                      "" = connect directly; "host:port" or
+                                      "http://user:password@host:port" */
+    uint32_t timeout_ms;           /* connecting, and the longest the server may stay
+                                      silent; 0 = 10000 */
+    uint32_t prebuffer_ms;         /* audio buffered before playback starts, and before it
+                                      resumes after a stall; 0 = 1000 */
+    uint32_t reconnect_ms;         /* how long to keep reconnecting after the connection
+                                      drops; 0 = 30000 (FA_NET_NO_RECONNECT: never) */
+    uint32_t flags;                /* fa_net_flags */
+    uint32_t hls_max_bandwidth;    /* HLS: plays the best variant up to this many bits per
+                                      second; 0 = the best one */
+};
+
+FA_API void FA_CALL fa_net_options_init(fa_net_options* options);
+
+/* What a web stream is playing. Every string is UTF-8 and "" when unknown. Streams
+ * that are not web streams return FA_OK with everything empty. */
+typedef struct fa_metadata {
+    char stream_title[1024];       /* the song heard now, as the station sends it
+                                      (ICY StreamTitle), usually "Artist - Title" */
+    char artist[256];              /* stream_title split at its first " - " */
+    char title[768];               /* the rest; all of stream_title when there is no " - " */
+    char url[512];                 /* ICY StreamUrl (often album art or the station's page) */
+    char station[256];             /* icy-name */
+    char genre[128];               /* icy-genre */
+    char description[256];         /* icy-description */
+    char station_url[512];         /* icy-url */
+    char content_type[128];        /* of the audio, e.g. "audio/mpeg" */
+    uint32_t bitrate_kbps;         /* icy-br, 0 = unknown */
+    int64_t seq;                   /* 1, 2, ... for each title heard; 0 = none yet. The value
+                                      of the matching FA_EVENT_METADATA */
+} fa_metadata;
+
+/* The metadata of what is heard right now: a title that is downloaded but still
+ * in the buffer is not returned until playback reaches it. */
+FA_API fa_result FA_CALL fa_stream_get_metadata(fa_stream* stream, fa_metadata* out_metadata);
+
+typedef struct fa_net_status {
+    int32_t connected;             /* 1 while a connection is open */
+    int32_t http_status;           /* status code of the last response, 0 before one */
+    int32_t is_live;               /* 1 = no known end (radio, live HLS) */
+    int32_t is_hls;                /* 1 = an HLS playlist */
+    int32_t seekable;              /* 1 = fa_stream_seek works */
+    int32_t finished;              /* 1 = everything is downloaded, or reconnecting gave up */
+    int64_t content_length;        /* bytes of the file, -1 = unknown or live */
+    int64_t downloaded;            /* bytes received, over all connections */
+    int64_t buffered_bytes;        /* downloaded and not decoded yet */
+    fa_time buffered;              /* audio ready ahead of playback (download buffer and
+                                      decode-ahead), estimated from the bitrate */
+    uint32_t reconnects;           /* connections re-established after a drop */
+    fa_result last_error;          /* why the last connection failed, FA_OK if none did */
+    char url[2048];                /* the URL in use after redirects (HLS: the media playlist) */
+} fa_net_status;
+
+/* FA_ERROR_INVALID_ARG for streams that are not web streams. */
+FA_API fa_result FA_CALL fa_stream_get_net_status(fa_stream* stream, fa_net_status* out_status);
+/* A header of the last HTTP response, e.g. "Content-Type" or "icy-name" (any case).
+ * FA_ERROR_NOT_FOUND when the response had no such header; truncated to fit. */
+FA_API fa_result FA_CALL fa_stream_get_http_header(fa_stream* stream, const char* name, char* out_value, size_t value_size);
 
 /* ---- Stream info -------------------------------------------------------- */
 
@@ -709,7 +813,7 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
  * FA_EVENT_ENDED           position at the end    0
  * FA_EVENT_POSITION        the requested frame    0
  * FA_EVENT_MARKER          the marker's frame     the fa_marker
- * FA_EVENT_METADATA        position               0
+ * FA_EVENT_METADATA        position               fa_metadata.seq of the new title
  * FA_EVENT_STALLED         position               0
  * FA_EVENT_RESUMED         position               0
  * FA_EVENT_DECODE_ERROR    position               the fa_result of the error
@@ -718,9 +822,9 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
  * FA_EVENT_RAMP_DONE       position               fa_ramp.tag of the finished ramp
  * FA_EVENT_STARTED         position               0
  *
- * Delivered today: ENDED, MARKER, LOUDNESS_FINAL, RAMP_DONE, STARTED, and STALLED, RESUMED and
- * DECODE_ERROR from push and packet streams. The others are raised by the features
- * that produce them as those land (see docs/features). */
+ * Delivered today: ENDED, MARKER, LOUDNESS_FINAL, RAMP_DONE and STARTED; METADATA from web
+ * streams; STALLED and RESUMED from push, packet and web streams; DECODE_ERROR from packet
+ * streams. The others are raised by the features that produce them as those land (see docs/features). */
 typedef enum fa_event_type {
     FA_EVENT_ENDED = 0,
     FA_EVENT_POSITION,        /* reached a requested frame */

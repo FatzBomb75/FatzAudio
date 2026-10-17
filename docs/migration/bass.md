@@ -41,6 +41,15 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS_SetVolume / BASS_GetVolume | `fa_device_set_volume` / `get_volume` | `device.Volume` | ✅ |
 | BASS_SetConfig / GetConfig (+Ptr) | `fa_engine_config` fields at creation; per-stream options | `AudioEngineOptions` | ✅ partially (rate, period, threads, cache dir) |
 | BASS_CONFIG_BUFFER | `fa_open_options.buffer_ms` per stream, default 500 ms ([playback](../features/playback.md#buffer-length)) | `StreamOptions.BufferLength` | ✅ |
+| BASS_CONFIG_NET_TIMEOUT / NET_READTIMEOUT | `fa_net_options.timeout_ms` per stream: connecting, and the longest the server may stay silent ([web streams](../features/web-streams.md#connection-settings)) | `NetworkOptions.Timeout` | ✅ |
+| BASS_CONFIG_NET_BUFFER | Not needed: each web stream keeps up to 4 MB, at most 2 MB ahead of playback | — | ➖ (by design) |
+| BASS_CONFIG_NET_PREBUF / NET_PREBUF_WAIT | `fa_net_options.prebuffer_ms` (default 1 s), used at the start and after every stall; opening never waits for it | `NetworkOptions.Prebuffer` | ✅ |
+| BASS_CONFIG_NET_AGENT | `fa_net_options.user_agent` | `NetworkOptions.UserAgent` | ✅ |
+| BASS_CONFIG_NET_PROXY | `fa_net_options.proxy`: `NULL` = system settings and environment, `""` = direct, or `"user:pass@host:port"` | `NetworkOptions.Proxy` | ✅ |
+| BASS_CONFIG_NET_PLAYLIST | Always on: `.pls` and `.m3u` are followed to their first entry, `.m3u8` plays as HLS | automatic | ✅ |
+| BASS_CONFIG_NET_META | Always asks for ICY titles; `FA_NET_NO_ICY` turns it off | `NetworkOptions.SongTitles = false` | ✅ |
+| BASS_CONFIG_NET_RESTRATE | Not needed: the download only runs 2 MB ahead of playback, so it's paced by playback anyway | — | ➖ (by design) |
+| BASS_CONFIG_NET_PASSIVE (FTP) | FTP isn't supported | — | ➖ |
 | BASS_CONFIG_UPDATETHREADS / UPDATEPERIOD | `fa_engine_config.worker_threads`; workers refill the emptiest buffer first, nothing to tune | `AudioEngineOptions.WorkerThreads` | ✅ |
 | BASS_Update / BASS_ChannelUpdate | Not needed: worker threads keep buffers full | — | ➖ (by design) |
 | BASS_GetCPU | Planned `fa_engine_get_stats` | | 🗓️ |
@@ -53,7 +62,10 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS_StreamCreateFile (path) | `fa_stream_open_path`; format detected from content ([streams](../features/streams.md)) | `engine.OpenFile(path)` | ✅ WAV/AIFF/MP3/FLAC so far |
 | BASS_StreamCreateFile (memory) | `fa_stream_open_memory` | `engine.OpenMemory(bytes)` | ✅ |
 | BASS_StreamCreateFileUser | `fa_stream_open_io`; `close` is called once by `fa_stream_close`, never on a failed open ([custom I/O](../features/streams.md#custom-io-your-own-reader)) | `engine.OpenStream(System.IO.Stream)` | ✅ |
-| BASS_StreamCreateURL | `fa_stream_open_url` | `engine.OpenUrl(url)` | 🧩 |
+| BASS_StreamCreateURL | `fa_stream_open_url`: HTTP/HTTPS files with range seeking, Icecast/Shoutcast radio, HLS, `.pls`/`.m3u`; reconnects by itself ([web streams](../features/web-streams.md)) | `engine.OpenUrl(url)` | ✅ WAV/FLAC/MP3; AAC 🗓️ |
+| BASS_StreamCreateURL `DOWNLOADPROC` (raw bytes to save a station) | Planned | | 🗓️ |
+| BASS_StreamCreateURL `BASS_STREAM_BLOCK` | Not needed: memory per web stream is bounded (4 MB) and seeking still works | — | ➖ (by design) |
+| BASS_StreamCreateURL `BASS_STREAM_STATUS` (+ `BASS_TAG_HTTP` during connect) | `fa_stream_get_http_header` and `fa_stream_get_net_status` after the open | `GetHttpHeader`, `NetworkStatus` | ✅ |
 | BASS_StreamCreate (STREAMPROC_PUSH) + BASS_StreamPutData | `fa_stream_open_push` + `fa_stream_push_pcm`, with an optional pts per push ([FFmpeg hand-off](../features/ffmpeg.md)) | `engine.CreatePushStream(format)`, `Push(samples, pts)` | ✅ |
 | BASS_StreamPutData of PCM converted from another format (swresample first) | `fa_stream_push_frame`: any sample format, planar or interleaved, any rate; converted on a worker thread | `PushFrame(format, (nint)frame->extended_data, ...)` | ✅ |
 | BASS_StreamPutData(h, NULL, 0) to read the queued amount | `fa_stream_get_buffered` (queued + decoded ahead + device buffer, as a duration) | `Buffered` | ✅ |
@@ -62,7 +74,8 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | Decode compressed audio yourself (FFmpeg) and push PCM | `fa_stream_open_packets` + `fa_stream_push_packet`: packets straight from `av_read_frame`; PCM and MP3 built in, other codecs through the app's own FFmpeg, loaded at runtime | `engine.OpenPackets(params)`, `PushPacket(...)` | ✅ |
 | BASS_StreamCreate (STREAMPROC callback) | Planned pull-callback source | | 🗓️ |
 | BASS_StreamPutFileData | `fa_stream_open_io` with `seek = NULL` (forward-only source fed from your own buffer) | `engine.OpenStream(stream)` with a non-seekable stream | ✅ |
-| BASS_StreamGetFilePosition | Planned buffering/download progress query | | 🗓️ |
+| BASS_StreamGetFilePosition (web streams) | `fa_stream_get_net_status`: `BASS_FILEPOS_DOWNLOAD` → `downloaded`, `BUFFER` → `buffered_bytes` (and `buffered` as time), `END`/`SIZE` → `content_length`, `CONNECTED` → `connected`, `BUFFERING` → `FA_STATE_BUFFERING` ([web streams](../features/web-streams.md#status-and-headers)) | `NetworkStatus` | ✅ |
+| BASS_StreamGetFilePosition (files) | Not needed: positions are in frames; use `fa_stream_get_position` | — | ➖ (by design) |
 | BASS_StreamCancel | Async open with cancellation | | 🗓️ |
 | BASS_StreamFree / BASS_ChannelFree | `fa_stream_close` | `Dispose()` | ✅ |
 | `BASS_STREAM_DECODE` flag + BASS_ChannelGetData (PCM) | `FA_OPEN_DECODE_ONLY` + `fa_stream_read`; returns `FA_ERROR_END_OF_STREAM` with 0 frames at the end ([decoding](../features/streams.md#decoding-without-playback)) | `Read(Span<float>)`, 0 at the end | ✅ |
@@ -88,6 +101,10 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS_ChannelSetSync / RemoveSync | `fa_stream_set_event_callback`; one callback receives every event type ([events](../features/events.md)) | `Ended`, `RampCompleted`, … events | ✅ |
 | BASS_SYNC_END | `FA_EVENT_ENDED` | `Ended` | ✅ |
 | BASS_SYNC_SLIDE | `FA_EVENT_RAMP_DONE` | `RampCompleted` / `RampAsync` | ✅ |
+| BASS_SYNC_META | `FA_EVENT_METADATA`, raised when the new song is heard rather than when it is downloaded ([song titles](../features/web-streams.md#song-titles-icy-metadata)) | `MetadataChanged` (carries the new `Metadata`) | ✅ |
+| BASS_SYNC_STALL | `FA_EVENT_STALLED` and `FA_EVENT_RESUMED` (two events instead of one with a flag) | `Stalled`, `Resumed` | ✅ |
+| BASS_SYNC_DOWNLOAD | `fa_net_status.finished` | `NetworkStatus.Finished` | ✅ (polled, no event) |
+| BASS_SYNC_HLS_SEGMENT | Not provided | — | ➖ |
 | BASS_SYNC_POS | `fa_stream_add_position_event` + `FA_EVENT_POSITION` | `AddPositionEvent`, `PositionReached` | 🧩 |
 | BASS_SYNC_POS used to start a crossfade or the next track | Markers (`FA_MARKER_MIX_POINT`, fades) and `fa_stream_set_next` ([crossfade](../features/crossfade.md)) | `stream.Markers`, `QueueNext` | ✅ |
 | BASS_SYNC_POS used to end playback early (trim) | `FA_MARKER_CUE_OUT` (exact end) and `FA_MARKER_CUE_IN` | `Markers.CueOut`, `Markers.CueIn` | ✅ |
@@ -97,6 +114,9 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS_ChannelGetLevel (+Ex) | `fa_stream_get_levels` | `GetLevels()` | 🧩 |
 | BASS_ChannelGetData (FFT) | Planned `fa_stream_get_spectrum` | | 🗓️ |
 | BASS_ChannelGetTags | Planned `fa_stream_get_tags` (one reader for all formats) | | 🗓️ |
+| BASS_ChannelGetTags `BASS_TAG_META` (ICY StreamTitle) | `fa_stream_get_metadata`: the title heard now, split into artist and title ([song titles](../features/web-streams.md#song-titles-icy-metadata)) | `stream.Metadata` | ✅ |
+| BASS_ChannelGetTags `BASS_TAG_ICY` / `BASS_TAG_HTTP` | `fa_stream_get_metadata` (station, genre, bitrate, ...) or any header by name with `fa_stream_get_http_header` | `stream.Metadata`, `GetHttpHeader(name)` | ✅ |
+| BASS_ChannelGetTags `BASS_TAG_HLS_*` | `fa_stream_get_info` (container `hls`, codec) and `fa_stream_get_net_status` (`is_hls`, media playlist URL) | `Info`, `NetworkStatus` | ✅ |
 | BASS_ChannelFlags (loop) | `FA_OPEN_LOOP`, looping between the cue-in and cue-out markers; runtime toggle planned | | ✅ open-time only |
 | BASS_POS_LOOP / BASS_POS_END (loop start, end position) | `FA_MARKER_CUE_IN` / `FA_MARKER_CUE_OUT` | `Markers.CueIn` / `Markers.CueOut` | ✅ |
 | BASS_ChannelSetLink / RemoveLink | `fa_stream_play_at` with the same time starts streams on the same frame; a bus ([buses](../features/buses.md)) groups their volume and pan | `PlayAt`, `MixBus` | ✅ |
@@ -197,6 +217,7 @@ The legacy app doesn't ship bassmix.dll, but mixer-style code built on `BASS_Cha
 | bass_aac.dll | MP4/M4A/MOV files (built-in demuxer, any audio track) and AAC packets (`fa_stream_open_packets`), decoded through the app's FFmpeg; a built-in or OS AAC decoder and raw ADTS files | ✅ MP4 and packets via FFmpeg, 🗓️ built-in decoder |
 | bass_ac3.dll | AC-3 and E-AC-3 packets through the app's FFmpeg (`fa_stream_open_packets`); files through the OS codec, and passthrough | ✅ packets, 🗓️ files and passthrough |
 | bassflac.dll | Built-in | ✅ |
+| basshls.dll (if used) | Built-in: `fa_stream_open_url` plays `.m3u8` (MPEG-TS, fMP4, AES-128) | ✅ MP3 segments; AAC 🗓️ |
 | bassopus.dll | Built-in (incl. raw packet push) | 🗓️ |
 | basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM and MP3 tracks built in, Opus, Vorbis, AAC and others through the app's FFmpeg ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ (built-in Opus/Vorbis decoders 🗓️) |
 | basswma.dll | Decode via Media Foundation on Windows / FFmpeg bridge; encoding not provided | 🗓️ / ➖ |
@@ -303,6 +324,36 @@ song.Stop();
 BASS: `BASS_ChannelSetSync(h, BASS_SYNC_END, 0, EndProc, user);`. The SYNCPROC runs on BASS's update thread, and `BASS_SYNC_MIXTIME` variants run inside the mixer, where most BASS calls aren't allowed.
 
 FatzAudio: `fa_stream_set_event_callback(s, on_event, user);` and handle `FA_EVENT_ENDED`. The callback runs on the event thread, so it can start the next track, close the stream, or update state directly. .NET: `song.Ended += ...`.
+
+### Internet radio with song titles (BASS_StreamCreateURL + BASS_SYNC_META)
+
+BASS:
+```c
+HSTREAM h = BASS_StreamCreateURL(url, 0, BASS_STREAM_AUTOFREE, NULL, NULL);
+BASS_ChannelSetSync(h, BASS_SYNC_META, 0, MetaSync, NULL);
+/* in MetaSync: parse "StreamTitle='...';" out of BASS_ChannelGetTags(h, BASS_TAG_META) */
+BASS_ChannelSetSync(h, BASS_SYNC_STALL, 0, StallSync, NULL);
+BASS_ChannelPlay(h, FALSE);
+```
+
+FatzAudio ([web streams](../features/web-streams.md)):
+```c
+fa_stream* radio;
+fa_stream_open_url(engine, url, NULL, &radio);
+fa_stream_set_event_callback(radio, on_event, NULL);  /* FA_EVENT_METADATA, STALLED, RESUMED */
+fa_stream_attach(radio, device, NULL);
+fa_stream_play(radio);
+/* in on_event: fa_metadata md; fa_stream_get_metadata(ev->stream, &md); md.artist, md.title */
+```
+
+.NET:
+```csharp
+using var radio = engine.OpenUrl(url);
+radio.MetadataChanged += (_, e) => nowPlaying.Text = $"{e.Metadata.Artist} - {e.Metadata.Title}";
+radio.PlayOn(output);
+```
+
+No title parsing, no Latin-1 guessing, and the title changes when the listener hears the new song. Reconnecting after a dropped connection is built in (`reconnect_ms`), where BASS apps usually restart the stream themselves.
 
 ### Normalize loudness (replaces your own analysis pass)
 

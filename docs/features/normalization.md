@@ -51,7 +51,7 @@ Playback starts with the best value known at that moment. When the exact value a
 
 ### Live streams and app I/O
 
-Streams that can't be read a second time (`fa_stream_open_io`, and later web streams) are never scanned. They use the running estimate, which adapts as the program changes. You can still give them a value with `fa_stream_set_loudness`.
+Streams that can't be read a second time (`fa_stream_open_io` and [web streams](web-streams.md)) are never scanned. They use the running estimate, which adapts as the program changes. You can still give them a value with `fa_stream_set_loudness`.
 
 ## Gain
 
