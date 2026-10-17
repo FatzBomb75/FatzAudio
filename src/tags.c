@@ -1,7 +1,8 @@
 /* Loudness tags: ReplayGain 2 (REPLAYGAIN_TRACK_GAIN etc., reference -18 LUFS)
  * and R128 (R128_TRACK_GAIN, Q7.8 dB relative to -23 LUFS), read from ID3v2 TXXX
- * frames, FLAC and Ogg Vorbis comments (OpusTags too) and APEv2 tags. Only the frames that can hold them
- * are read; pictures and other large frames are skipped with a seek. */
+ * frames, FLAC and Ogg Vorbis comments (OpusTags too), APEv2 tags and ASF (.wma)
+ * attributes (demux_asf.c). Only the frames that can hold them are read; pictures
+ * and other large frames are skipped with a seek. */
 #include "fa_internal.h"
 #include <math.h>
 #include <stdlib.h>
@@ -35,7 +36,9 @@ static double parse_number(const char* s)
     return neg ? -v : v;
 }
 
-static void handle(const char* key, const char* value, fa_tag_loudness* out)
+int fa_tags_key_is(const char* key, const char* name) { return ieq(key, name); }
+
+void fa_tags_handle(const char* key, const char* value, fa_tag_loudness* out)
 {
     double v = parse_number(value);
     if (v != v) return;
@@ -126,7 +129,7 @@ static int64_t read_id3v2(fa_source* src, fa_tag_loudness* out)
                 n = id3_text(raw, (size_t)fsize, text, sizeof(text));
                 if (n > 0) {
                     size_t klen = strlen(text);
-                    if (klen < n) handle(text, text + klen + 1, out);
+                    if (klen < n) fa_tags_handle(text, text + klen + 1, out);
                 }
             }
         }
@@ -156,7 +159,7 @@ void fa_tags_parse_vorbis_comments(const uint8_t* p, size_t n, fa_tag_loudness* 
             memcpy(text, p + pos, len);
             text[len] = '\0';
             eq = strchr(text, '=');
-            if (eq) { *eq = '\0'; handle(text, eq + 1, out); }
+            if (eq) { *eq = '\0'; fa_tags_handle(text, eq + 1, out); }
         }
         pos += len;
     }
@@ -220,7 +223,7 @@ static int read_ape_at(fa_source* src, int64_t footer_pos, fa_tag_loudness* out)
             char val[FA_TAG_TEXT_MAX];
             if (!read_exact(src, val, vlen)) return 1;
             val[vlen] = '\0';
-            handle(key, val, out);
+            fa_tags_handle(key, val, out);
         }
         pos += vlen;
     }
@@ -244,6 +247,11 @@ void fa_tags_read_loudness(fa_source* src, fa_tag_loudness* out)
     out->track_lufs = out->album_lufs = NAN;
     out->track_peak_db = out->album_peak_db = NAN;
     if (!src->seekable) return;
+    {
+        /* ASF (.wma): Content Description and Extended Content Description / Metadata items. */
+        fa_asf_tags asf;
+        if (fa_asf_read_tags(src, &asf)) { *out = asf.loudness; return; }
+    }
     id3 = read_id3v2(src, out);
     read_flac(src, id3, out);
     fa_ogg_read_loudness(src, out);

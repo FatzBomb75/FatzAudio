@@ -61,6 +61,7 @@ set(FA_SOURCES
     src/demux_ogg.c
     src/codec_xiph.c
     src/codec_flac.c
+    src/demux_asf.c
     src/stubs.c
     src/miniaudio_impl.c
     src/net_url.c
@@ -93,7 +94,9 @@ set(FA_SOURCES
 # HTTPS through the platform's own stack, CD drives through its drive interface:
 # nothing is bundled.
 if(WIN32)
-    list(APPEND FA_SOURCES src/net_https_winhttp.c src/disc_win.c)
+    # codec_mf.c: Windows Media Audio through Media Foundation (mfplat.dll is loaded
+    # at run time, so the library still loads on Windows N without it).
+    list(APPEND FA_SOURCES src/net_https_winhttp.c src/disc_win.c src/codec_mf.c)
 elseif(APPLE)
     enable_language(OBJC)
     list(APPEND FA_SOURCES src/net_https_apple.m src/disc_mac.c)
@@ -128,7 +131,8 @@ set_target_properties(fatzaudio PROPERTIES
 find_package(Threads REQUIRED)
 target_link_libraries(fatzaudio PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 if(WIN32)
-    set(FA_NET_LIBS ws2_32 winhttp)
+    # Also the system libraries of codec_mf.c: mfuuid (GUIDs, static) and ole32.
+    set(FA_NET_LIBS ws2_32 winhttp mfuuid ole32)
 elseif(APPLE)
     set(FA_NET_LIBS "-framework Foundation" "-framework CFNetwork")
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
