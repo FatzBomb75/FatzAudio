@@ -1,12 +1,13 @@
 # Volume, pan and ramps
 
-Volume and pan are applied in the mixer, per sample, with no zipper noise. A plain change glides over 5 ms when the stream is audible. A **ramp** moves a parameter to a target over a set time with a chosen curve, and tells you when it's done.
+Volume and pan are applied in the mixer, per sample, with no zipper noise. Tempo, pitch and rate take the same ramps ([tempo and pitch](tempo-pitch.md)). A plain change glides over 5 ms when the stream is audible. A **ramp** moves a parameter to a target over a set time with a chosen curve, and tells you when it's done.
 
 | Parameter | Range | Notes |
 |---|---|---|
 | `FA_PARAM_VOLUME` | ≥ 0 (1 = unity) | Linear gain |
 | `FA_PARAM_PAN` | -1 (left) … 1 (right) | Stereo balance; clamped |
-| `FA_PARAM_RATE`, `TEMPO`, `PITCH` | — | `FA_ERROR_NOT_IMPLEMENTED` until the tempo/pitch phase |
+| `FA_PARAM_TEMPO`, `RATE` | 0.1 … 10 (1 = normal) | Applied where the stream is decoded; see [tempo and pitch](tempo-pitch.md) |
+| `FA_PARAM_PITCH` | -36 … 36 semitones | Same |
 
 ## Curves
 

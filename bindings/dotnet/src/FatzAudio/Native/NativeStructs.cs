@@ -202,3 +202,35 @@ internal unsafe struct FaFfmpegInfo
     public uint AvutilVersion;
     public fixed byte AvcodecPath[512];
 }
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaTempoOptions
+{
+    public uint StructSize;
+    public int Quality;
+    public int KeepFormants;
+    public uint LatencyMs;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaCdgSurfaceConfig
+{
+    public uint StructSize;
+    public int PixelFormat;
+    public uint Width, Height;
+    public uint Flags;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaCdgFrame
+{
+    public void* Pixels;
+    public uint Width, Height;
+    public int Stride;
+    public int PixelFormat;
+    public int Changed;
+    public int PaletteChanged;
+    public uint DirtyX, DirtyY, DirtyWidth, DirtyHeight;
+    public fixed byte Palette[64];
+    public long Time;
+}

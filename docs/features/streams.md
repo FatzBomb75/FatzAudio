@@ -31,6 +31,8 @@ Apps that demux files themselves (for example with FFmpeg, for the video) can pu
 
 If nothing matches, the open returns `FA_ERROR_UNSUPPORTED_FORMAT`.
 
+Karaoke files: a ZIP archive opened with `fa_stream_open_path` or `fa_stream_open_memory` plays the audio file inside it, and `fa_stream_open_path` on an audio file also loads a `.cdg` of the same name next to it (turn that off with `FA_OPEN_NO_CDG`). See [CD+G](cdg.md).
+
 ## C
 
 ```c

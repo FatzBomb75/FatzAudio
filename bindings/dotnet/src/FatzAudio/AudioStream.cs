@@ -431,6 +431,66 @@ public unsafe class AudioStream : IDisposable
         }
     }
 
+    // ---- CD+G -------------------------------------------------------------------
+
+    /// <summary>
+    /// True when the stream has CD+G karaoke graphics: a matching <c>.cdg</c> file found next to the audio
+    /// file, a <c>.cdg</c> inside a ZIP archive, or graphics loaded with <see cref="LoadCdg(string)"/>.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public bool HasCdg => Info.HasCdg;
+
+    /// <summary>Attaches CD+G graphics from a <c>.cdg</c> file to this stream, replacing any it had.</summary>
+    /// <param name="path">The <c>.cdg</c> file; it is read in full.</param>
+    /// <exception cref="FatzAudioException"><see cref="ErrorCode.NotFound"/> if the file is missing,
+    /// <see cref="ErrorCode.UnsupportedFormat"/> if it holds no whole CD+G pack.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public void LoadCdg(string path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_load_cdg_path(Handle, path));
+    }
+
+    /// <summary>Attaches CD+G graphics held in memory (the bytes of a <c>.cdg</c> file); they are copied.</summary>
+    /// <param name="cdg">The contents of a <c>.cdg</c> file.</param>
+    /// <exception cref="FatzAudioException"><see cref="ErrorCode.UnsupportedFormat"/> if it holds no whole CD+G pack.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public void LoadCdg(ReadOnlySpan<byte> cdg)
+    {
+        if (cdg.IsEmpty) throw new FatzAudioException(ErrorCode.UnsupportedFormat);
+        fixed (byte* p = cdg)
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_load_cdg_memory(Handle, p, (nuint)cdg.Length));
+    }
+
+    /// <summary>Removes the stream's CD+G graphics; surfaces show a blank picture afterwards.</summary>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public void RemoveCdg() => FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_load_cdg_path(Handle, null));
+
+    /// <summary>
+    /// Shifts the CD+G graphics against the audio, for files that are out of sync: positive shows them later,
+    /// negative earlier. Default zero.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public TimeSpan CdgOffset
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_cdg_offset(Handle, out long ns));
+            return TimeConvert.FromNanoseconds(ns);
+        }
+        set => FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_cdg_offset(Handle, TimeConvert.ToNanoseconds(value)));
+    }
+
+    /// <summary>
+    /// Creates a surface that draws this stream's CD+G graphics, in sync with the audio, into a pixel buffer you
+    /// copy to your renderer (a WPF <c>WriteableBitmap</c>, a Direct3D or OpenGL texture, a SkiaSharp bitmap).
+    /// Call <see cref="CdgSurface.Update"/> from your render loop. Several surfaces may show one stream.
+    /// </summary>
+    /// <param name="options">Pixel format, size and drawing options; null = BGRA, 300x216.</param>
+    /// <exception cref="ArgumentException">An option is out of range (size above 8192, unknown pixel format).</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public CdgSurface CreateCdgSurface(CdgSurfaceOptions? options = null) => new CdgSurface(this, options ?? new CdgSurfaceOptions());
+
     // ---- Parameters -----------------------------------------------------------
 
     private float GetParam(AudioParameter p)
@@ -448,14 +508,57 @@ public unsafe class AudioStream : IDisposable
     /// <summary>Stereo pan from -1 (left) to 1 (right).</summary>
     public float Pan { get => GetParam(AudioParameter.Pan); set => SetParam(AudioParameter.Pan, value); }
 
-    /// <summary>Playback rate multiplier; pitch follows.</summary>
+    /// <summary>Playback speed multiplier (0.1..10, clamped); pitch follows, like a turntable.</summary>
+    /// <exception cref="FatzAudioException">On a push or packet stream, which takes <see cref="Pitch"/> only (<see cref="ErrorCode.NotImplemented"/>).</exception>
     public float Rate { get => GetParam(AudioParameter.Rate); set => SetParam(AudioParameter.Rate, value); }
 
-    /// <summary>Tempo multiplier with pitch preserved.</summary>
+    /// <summary>Tempo multiplier (0.1..10, clamped) with pitch preserved.</summary>
+    /// <exception cref="FatzAudioException">On a push or packet stream, which takes <see cref="Pitch"/> only (<see cref="ErrorCode.NotImplemented"/>).</exception>
     public float Tempo { get => GetParam(AudioParameter.Tempo); set => SetParam(AudioParameter.Tempo, value); }
 
-    /// <summary>Pitch shift in semitones with tempo preserved.</summary>
+    /// <summary>Pitch shift in semitones (-36..36, clamped) with tempo preserved.</summary>
     public float Pitch { get => GetParam(AudioParameter.Pitch); set => SetParam(AudioParameter.Pitch, value); }
+
+    /// <summary>
+    /// How tempo, pitch and rate are processed. Setting it takes effect at once; a new quality restarts the
+    /// processing from the position being heard (on a stream that can't seek, after the next stop, seek or
+    /// attach). Null restores the defaults.
+    /// </summary>
+    /// <remarks>The latency is clamped to 50 ms .. the engine's buffer.</remarks>
+    /// <exception cref="ArgumentException">An unknown <see cref="StretchQuality"/>.</exception>
+    [System.Diagnostics.CodeAnalysis.AllowNull]
+    public TempoOptions TempoOptions
+    {
+        get
+        {
+            FaTempoOptions o;
+            NativeMethods.fa_tempo_options_init(&o);
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_tempo_options(Handle, &o));
+            return new TempoOptions
+            {
+                Quality = (StretchQuality)o.Quality,
+                KeepFormants = o.KeepFormants != 0,
+                Latency = TimeSpan.FromMilliseconds(o.LatencyMs),
+            };
+        }
+        set
+        {
+            if (value is null)
+            {
+                FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_tempo_options(Handle, null));
+                return;
+            }
+            FaTempoOptions o;
+            NativeMethods.fa_tempo_options_init(&o);
+            o.Quality = (int)value.Quality;
+            o.KeepFormants = value.KeepFormants ? 1 : 0;
+            o.LatencyMs = (uint)Math.Clamp(Math.Round(value.Latency.TotalMilliseconds), 1, 60000);
+            int rc = NativeMethods.fa_stream_set_tempo_options(Handle, &o);
+            if (rc == (int)ErrorCode.InvalidArgument)
+                throw new ArgumentException("Unknown stretch quality.", nameof(value));
+            FatzAudioException.ThrowIfFailed(rc);
+        }
+    }
 
     /// <summary>Gets any parameter by name.</summary>
     /// <param name="parameter">The parameter.</param>

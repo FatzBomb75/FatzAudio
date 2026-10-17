@@ -218,6 +218,27 @@ fa_result fa_source_seek(fa_source* src, int64_t offset)
 
 int64_t fa_source_tell(const fa_source* src) { return src->pos; }
 
+fa_result fa_source_read_all(fa_source* src, size_t max_size, uint8_t** out_data, size_t* out_size)
+{
+    int64_t len = src->length;
+    uint8_t* buf;
+    size_t done = 0;
+    *out_data = NULL;
+    *out_size = 0;
+    if (len <= 0 || (uint64_t)len > (uint64_t)max_size) return FA_ERROR_UNSUPPORTED_FORMAT;
+    buf = (uint8_t*)malloc((size_t)len);
+    if (!buf) return FA_ERROR_OUT_OF_MEMORY;
+    if (fa_source_seek(src, 0) != FA_OK) { free(buf); return FA_ERROR_IO; }
+    while (done < (size_t)len) {
+        int64_t got = fa_source_read(src, buf + done, (size_t)len - done);
+        if (got <= 0) { free(buf); return FA_ERROR_IO; }
+        done += (size_t)got;
+    }
+    *out_data = buf;
+    *out_size = done;
+    return FA_OK;
+}
+
 void fa_source_close(fa_source* src)
 {
     if (src->kind == FA_SOURCE_FILE && src->file) fclose(src->file);
