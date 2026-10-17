@@ -1,0 +1,94 @@
+/* Minimal portable threading layer: sequentially consistent atomics, mutexes,
+ * condition variables with timeouts, threads, and a monotonic clock.
+ * Everything the audio thread touches is in the atomics section: those never
+ * block and never make system calls. */
+#ifndef FA_PLATFORM_H
+#define FA_PLATFORM_H
+
+#include <stdint.h>
+
+#if defined(_MSC_VER) && !defined(__clang__)
+#  include <intrin.h>
+#  define FA_MSVC_ATOMICS 1
+#endif
+
+/* ---- Atomics (seq_cst; lock-free on every supported target) ---------------- */
+
+typedef struct { volatile int32_t v; } fa_atomic32;
+typedef struct { volatile int64_t v; } fa_atomic64;
+typedef struct { void* volatile v; } fa_atomic_ptr;
+
+#if defined(FA_MSVC_ATOMICS)
+static __inline int32_t fa_load32(fa_atomic32* a) { return (int32_t)_InterlockedCompareExchange((volatile long*)&a->v, 0, 0); }
+static __inline void fa_store32(fa_atomic32* a, int32_t x) { _InterlockedExchange((volatile long*)&a->v, (long)x); }
+static __inline int32_t fa_fetch_add32(fa_atomic32* a, int32_t d) { return (int32_t)_InterlockedExchangeAdd((volatile long*)&a->v, (long)d); }
+static __inline int fa_cas32(fa_atomic32* a, int32_t expected, int32_t desired)
+{ return _InterlockedCompareExchange((volatile long*)&a->v, (long)desired, (long)expected) == (long)expected; }
+static __inline int64_t fa_load64(fa_atomic64* a) { return _InterlockedCompareExchange64((volatile __int64*)&a->v, 0, 0); }
+static __inline void fa_store64(fa_atomic64* a, int64_t x)
+{
+    __int64 old = a->v;
+    for (;;) { __int64 seen = _InterlockedCompareExchange64((volatile __int64*)&a->v, x, old); if (seen == old) break; old = seen; }
+}
+static __inline int64_t fa_fetch_add64(fa_atomic64* a, int64_t d)
+{
+    __int64 old = a->v;
+    for (;;) { __int64 seen = _InterlockedCompareExchange64((volatile __int64*)&a->v, old + d, old); if (seen == old) return old; old = seen; }
+}
+static __inline void* fa_load_ptr(fa_atomic_ptr* a) { return _InterlockedCompareExchangePointer((void* volatile*)&a->v, NULL, NULL); }
+static __inline void* fa_exchange_ptr(fa_atomic_ptr* a, void* x) { return _InterlockedExchangePointer((void* volatile*)&a->v, x); }
+#else
+static inline int32_t fa_load32(fa_atomic32* a) { return __atomic_load_n(&a->v, __ATOMIC_SEQ_CST); }
+static inline void fa_store32(fa_atomic32* a, int32_t x) { __atomic_store_n(&a->v, x, __ATOMIC_SEQ_CST); }
+static inline int32_t fa_fetch_add32(fa_atomic32* a, int32_t d) { return __atomic_fetch_add(&a->v, d, __ATOMIC_SEQ_CST); }
+static inline int fa_cas32(fa_atomic32* a, int32_t expected, int32_t desired)
+{ return __atomic_compare_exchange_n(&a->v, &expected, desired, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
+static inline int64_t fa_load64(fa_atomic64* a) { return __atomic_load_n(&a->v, __ATOMIC_SEQ_CST); }
+static inline void fa_store64(fa_atomic64* a, int64_t x) { __atomic_store_n(&a->v, x, __ATOMIC_SEQ_CST); }
+static inline int64_t fa_fetch_add64(fa_atomic64* a, int64_t d) { return __atomic_fetch_add(&a->v, d, __ATOMIC_SEQ_CST); }
+static inline void* fa_load_ptr(fa_atomic_ptr* a) { return __atomic_load_n(&a->v, __ATOMIC_SEQ_CST); }
+static inline void* fa_exchange_ptr(fa_atomic_ptr* a, void* x) { return __atomic_exchange_n(&a->v, x, __ATOMIC_SEQ_CST); }
+#endif
+
+static inline float fa_load_float(fa_atomic32* a)
+{
+    union { int32_t i; float f; } u;
+    u.i = fa_load32(a);
+    return u.f;
+}
+static inline void fa_store_float(fa_atomic32* a, float f)
+{
+    union { int32_t i; float f; } u;
+    u.f = f;
+    fa_store32(a, u.i);
+}
+
+/* ---- Blocking primitives (never used on the audio thread) ------------------ */
+
+typedef struct fa_mutex { void* impl; } fa_mutex;
+typedef struct fa_cond { void* impl; } fa_cond;
+typedef struct fa_thread { void* impl; } fa_thread;
+typedef void (*fa_thread_proc)(void* arg);
+
+int fa_mutex_init(fa_mutex* m);   /* 0 on success */
+void fa_mutex_destroy(fa_mutex* m);
+void fa_mutex_lock(fa_mutex* m);
+int fa_mutex_trylock(fa_mutex* m); /* 1 if acquired */
+void fa_mutex_unlock(fa_mutex* m);
+
+int fa_cond_init(fa_cond* c);
+void fa_cond_destroy(fa_cond* c);
+/* Waits until signalled or `timeout_ms` passed; spurious wakeups are possible. */
+void fa_cond_wait_ms(fa_cond* c, fa_mutex* m, uint32_t timeout_ms);
+void fa_cond_broadcast(fa_cond* c);
+
+int fa_thread_create(fa_thread* t, fa_thread_proc proc, void* arg);
+void fa_thread_join(fa_thread* t);
+/* Opaque id of the calling thread, comparable with fa_thread_id_of. */
+uintptr_t fa_thread_current_id(void);
+
+void fa_sleep_ms(uint32_t ms);
+uint32_t fa_cpu_count(void);
+int64_t fa_monotonic_ns(void);
+
+#endif

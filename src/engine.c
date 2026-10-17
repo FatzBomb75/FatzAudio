@@ -35,10 +35,69 @@ FA_API void FA_CALL fa_engine_config_init(fa_engine_config* config)
     config->struct_size = (uint32_t)sizeof(*config);
 }
 
+/* ---- Decode workers ------------------------------------------------------- */
+
+void fa_engine_wake_workers(fa_engine* e)
+{
+    fa_mutex_lock(&e->list_lock);
+    fa_cond_broadcast(&e->work_cond);
+    fa_mutex_unlock(&e->list_lock);
+}
+
+void fa_engine_track_stream(fa_engine* e, struct fa_stream* s, int add)
+{
+    struct fa_stream** pp;
+    fa_mutex_lock(&e->list_lock);
+    for (pp = &e->streams; *pp; pp = &(*pp)->next)
+        if (*pp == s) { *pp = s->next; break; }
+    s->next = NULL;
+    if (add) {
+        s->next = e->streams;
+        e->streams = s;
+        fa_cond_broadcast(&e->work_cond);
+    }
+    fa_mutex_unlock(&e->list_lock);
+}
+
+/* Each worker repeatedly takes the attached stream with the emptiest buffer that
+ * nobody else is decoding (try-lock on its decode lock) and tops it up. With
+ * nothing to do it sleeps until woken or 5 ms pass; the audio thread never has
+ * to signal anything. */
+static void worker_main(void* arg)
+{
+    fa_engine* e = (fa_engine*)arg;
+    fa_mutex_lock(&e->list_lock);
+    while (!fa_load32(&e->quit)) {
+        struct fa_stream* s;
+        struct fa_stream* pick = NULL;
+        double best = 2.0;
+        for (s = e->streams; s; s = s->next) {
+            double fill;
+            if (!fa_stream_needs_work(s)) continue;
+            fill = (double)fa_ring_readable(&s->ring) / (double)s->ring.capacity;
+            if (fill < best) { best = fill; pick = s; }
+        }
+        if (pick && fa_mutex_trylock(&pick->decode_lock)) {
+            fa_mutex_unlock(&e->list_lock);
+            /* Top up to full, in turns of at most half a buffer so one stream
+             * cannot starve the others. */
+            fa_stream_fill(pick, pick->ring.capacity / 2);
+            fa_mutex_unlock(&pick->decode_lock);
+            fa_mutex_lock(&e->list_lock);
+            continue;
+        }
+        fa_cond_wait_ms(&e->work_cond, &e->list_lock, pick ? 1 : 5);
+    }
+    fa_mutex_unlock(&e->list_lock);
+}
+
+void fa_event_thread_main(void* arg);
+
 FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_engine** out_engine)
 {
     fa_engine* e;
     ma_result r;
+    uint32_t i, n;
     if (!out_engine) return FA_ERROR_INVALID_ARG;
     *out_engine = NULL;
 
@@ -48,13 +107,19 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
      * compiled against an older, shorter struct keep working. */
     fa_engine_config_init(&e->config);
     if (config) {
-        size_t n = config->struct_size;
-        if (n == 0 || n > sizeof(e->config)) n = sizeof(e->config);
-        memcpy(&e->config, config, n);
+        size_t sz = config->struct_size;
+        if (sz == 0 || sz > sizeof(e->config)) sz = sizeof(e->config);
+        memcpy(&e->config, config, sz);
         e->config.struct_size = (uint32_t)sizeof(e->config);
     }
 
     if (ma_mutex_init(&e->lock) != MA_SUCCESS) { free(e); return FA_ERROR_GENERIC; }
+    if (fa_mutex_init(&e->list_lock) != 0 || fa_cond_init(&e->work_cond) != 0 || fa_cond_init(&e->event_cond) != 0) {
+        fa_cond_destroy(&e->event_cond); fa_cond_destroy(&e->work_cond); fa_mutex_destroy(&e->list_lock);
+        ma_mutex_uninit(&e->lock);
+        free(e);
+        return FA_ERROR_GENERIC;
+    }
     if (e->config.flags & FA_ENGINE_NULL_OUTPUT) {
         ma_backend null_backend = ma_backend_null;
         r = ma_context_init(&null_backend, 1, NULL, &e->context);
@@ -62,9 +127,22 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
         r = ma_context_init(NULL, 0, NULL, &e->context);
     }
     if (r != MA_SUCCESS) {
+        fa_cond_destroy(&e->event_cond); fa_cond_destroy(&e->work_cond); fa_mutex_destroy(&e->list_lock);
         ma_mutex_uninit(&e->lock);
         free(e);
         return FA_ERROR_DEVICE;
+    }
+
+    n = e->config.worker_threads;
+    if (n == 0) n = fa_cpu_count();
+    if (n > FA_MAX_WORKERS) n = FA_MAX_WORKERS;
+    for (i = 0; i < n; i++) {
+        if (fa_thread_create(&e->workers[i], worker_main, e) != 0) break;
+        e->worker_count++;
+    }
+    if (e->worker_count == 0 || fa_thread_create(&e->event_thread, fa_event_thread_main, e) != 0) {
+        fa_engine_destroy(e);
+        return FA_ERROR_GENERIC;
     }
     *out_engine = e;
     return FA_OK;
@@ -72,8 +150,24 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
 
 FA_API void FA_CALL fa_engine_destroy(fa_engine* engine)
 {
+    uint32_t i;
     if (!engine) return;
+    /* Devices left open would keep calling into freed streams: close them first. */
+    while (engine->devices) fa_device_close(engine->devices);
+
+    fa_store32(&engine->quit, 1);
+    fa_mutex_lock(&engine->list_lock);
+    fa_cond_broadcast(&engine->work_cond);
+    fa_cond_broadcast(&engine->event_cond);
+    fa_mutex_unlock(&engine->list_lock);
+    for (i = 0; i < engine->worker_count; i++) fa_thread_join(&engine->workers[i]);
+    fa_thread_join(&engine->event_thread); /* delivers what is queued and frees closed streams */
+
     ma_context_uninit(&engine->context);
     ma_mutex_uninit(&engine->lock);
+    fa_cond_destroy(&engine->event_cond);
+    fa_cond_destroy(&engine->work_cond);
+    fa_mutex_destroy(&engine->list_lock);
+    free(engine->pending);
     free(engine);
 }

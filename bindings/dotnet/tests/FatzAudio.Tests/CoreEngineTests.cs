@@ -118,3 +118,93 @@ public class CoreEngineTests
         Assert.Equal(StreamState.Ended, s.State);
     }
 }
+
+/// <summary>Decode-ahead playback, ramps and events on the silent null output.</summary>
+public class PlaybackTests
+{
+    private static AudioEngine CreateHeadless() => AudioEngine.Create(new AudioEngineOptions { NullOutput = true });
+
+    [Fact]
+    public async Task Ended_EventIsRaised()
+    {
+        using var engine = CreateHeadless();
+        using var output = engine.OpenOutput();
+        using var s = engine.OpenMemory(TestAudio.SineWav(seconds: 0.1));
+        var ended = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        s.Ended += (_, _) => ended.TrySetResult();
+        Assert.True(s.EventsSupported);
+        s.PlayOn(output);
+        await ended.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(StreamState.Ended, s.State);
+    }
+
+    [Fact]
+    public async Task RampAsync_CompletesWhenTheRampEnds()
+    {
+        using var engine = CreateHeadless();
+        using var output = engine.OpenOutput();
+        using var s = engine.OpenMemory(TestAudio.SineWav(seconds: 5));
+        s.PlayOn(output);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await s.RampAsync(AudioParameter.Volume, 0f, TimeSpan.FromMilliseconds(200), Curve.EqualPower)
+               .WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(sw.Elapsed >= TimeSpan.FromMilliseconds(150), $"completed after {sw.Elapsed}");
+        Assert.Equal(0f, s.Volume, 3);
+    }
+
+    [Fact]
+    public async Task RampAsync_CompletesWhenReplaced()
+    {
+        using var engine = CreateHeadless();
+        using var output = engine.OpenOutput();
+        using var s = engine.OpenMemory(TestAudio.SineWav(seconds: 5));
+        s.PlayOn(output);
+        var slow = s.RampAsync(AudioParameter.Volume, 0f, TimeSpan.FromSeconds(30));
+        await Task.Delay(50);
+        s.Volume = 0.5f;                       // replaces the running ramp
+        await slow.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(50);
+        Assert.Equal(0.5f, s.Volume, 3);
+    }
+
+    [Fact]
+    public async Task Ramp_WaitsForPlayback()
+    {
+        using var engine = CreateHeadless();
+        using var output = engine.OpenOutput();
+        using var s = engine.OpenMemory(TestAudio.SineWav(seconds: 5));
+        s.Volume = 0f;
+        var fadeIn = s.RampAsync(AudioParameter.Volume, 1f, TimeSpan.FromMilliseconds(100));
+        await Task.Delay(200);
+        Assert.False(fadeIn.IsCompleted);      // not playing yet: the fade has not started
+        s.PlayOn(output);
+        await fadeIn.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1f, s.Volume, 3);
+    }
+
+    [Fact]
+    public async Task Pause_FreezesPositionAndClock()
+    {
+        using var engine = CreateHeadless();
+        using var output = engine.OpenOutput();
+        using var s = engine.OpenMemory(TestAudio.SineWav(seconds: 5), new StreamOptions { BufferLength = TimeSpan.FromMilliseconds(200) });
+        s.PlayOn(output);
+        await Task.Delay(150);
+        s.Pause();
+        var pos = s.Position;
+        Assert.True(pos > TimeSpan.Zero);
+        await Task.Delay(100);
+        Assert.Equal(pos, s.Position);
+        Assert.True(s.Clock <= pos);           // clock = position minus device latency
+    }
+
+    [Fact]
+    public async Task Dispose_CancelsPendingRamp()
+    {
+        using var engine = CreateHeadless();
+        var s = engine.OpenMemory(TestAudio.SineWav(seconds: 5));
+        var ramp = s.RampAsync(AudioParameter.Volume, 0f, TimeSpan.FromSeconds(1));
+        s.Dispose();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => ramp);
+    }
+}

@@ -11,3 +11,22 @@ if(UNIX)
     target_link_libraries(fa_test_core PRIVATE m)
 endif()
 add_test(NAME core COMMAND fa_test_core WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
+# White-box tests: the library sources compiled straight into the test, so it can
+# drive the mixer by hand and check exact sample values.
+list(TRANSFORM FA_SOURCES PREPEND ${PROJECT_SOURCE_DIR}/)
+add_executable(fa_test_internal test_internal.c ${FA_SOURCES})
+target_include_directories(fa_test_internal PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+target_compile_definitions(fa_test_internal PRIVATE FA_STATIC)
+target_compile_options(fa_test_internal PRIVATE ${FA_WARNINGS})
+if(MSVC)
+    set_source_files_properties(${PROJECT_SOURCE_DIR}/src/miniaudio_impl.c PROPERTIES COMPILE_OPTIONS "/W0")
+else()
+    set_source_files_properties(${PROJECT_SOURCE_DIR}/src/miniaudio_impl.c PROPERTIES COMPILE_OPTIONS "-w")
+endif()
+target_link_libraries(fa_test_internal PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+if(UNIX)
+    target_link_libraries(fa_test_internal PRIVATE m)
+endif()
+add_test(NAME internal COMMAND fa_test_internal)

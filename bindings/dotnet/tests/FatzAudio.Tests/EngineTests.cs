@@ -181,7 +181,7 @@ public class EngineTests
     {
         using var engine = AudioEngine.Create();
         using var s = engine.OpenMemory(TestAudio.SineWav(), DecodeOnly);
-        var ex = Assert.Throws<FatzAudioException>(() => s.Ramp(AudioParameter.Volume, 0f, TimeSpan.FromSeconds(1), Curve.EqualPower));
+        var ex = Assert.Throws<FatzAudioException>(() => s.Ramp(AudioParameter.Tempo, 1.2f, TimeSpan.FromSeconds(1), Curve.EqualPower));
         Assert.Equal(ErrorCode.NotImplemented, ex.ErrorCode);
         Assert.Contains("mplemented", ex.Message, StringComparison.OrdinalIgnoreCase);
         Assert.Equal(ErrorCode.NotImplemented, Assert.Throws<FatzAudioException>(() => _ = engine.Time).ErrorCode);

@@ -39,6 +39,8 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS_IsStarted | `fa_device_is_started` | `device.IsStarted` | ✅ |
 | BASS_SetVolume / BASS_GetVolume | `fa_device_set_volume` / `get_volume` | `device.Volume` | ✅ |
 | BASS_SetConfig / GetConfig (+Ptr) | `fa_engine_config` fields at creation; per-stream options | `AudioEngineOptions` | ✅ partially (rate, period, threads, cache dir) |
+| BASS_CONFIG_BUFFER | `fa_open_options.buffer_ms` per stream, default 500 ms ([playback](../features/playback.md#buffer-length)) | `StreamOptions.BufferLength` | ✅ |
+| BASS_CONFIG_UPDATETHREADS / UPDATEPERIOD | `fa_engine_config.worker_threads`; workers refill the emptiest buffer first, nothing to tune | `AudioEngineOptions.WorkerThreads` | ✅ |
 | BASS_Update / BASS_ChannelUpdate | Not needed: worker threads keep buffers full | — | ➖ (by design) |
 | BASS_GetCPU | Planned `fa_engine_get_stats` | | 🗓️ |
 | BASS_GetDSoundObject | Not provided (Windows-only escape hatch) | — | ➖ |
@@ -64,18 +66,24 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
 | BASS_ChannelPlay / BASS_ChannelStart | `fa_stream_attach` + `fa_stream_play` | `stream.PlayOn(device)` | ✅ |
-| BASS_ChannelPlay at a precise time | `fa_stream_play_at` | | 🧩 |
+| BASS_ChannelPlay at a precise time | `fa_stream_play_at` | | 🧩 (crossfade phase) |
 | BASS_ChannelPause / BASS_ChannelStop | `fa_stream_pause` / `fa_stream_stop` | `Pause()` / `Stop()` | ✅ |
 | BASS_ChannelIsActive | `fa_stream_get_state` | `stream.State` | ✅ |
 | BASS_ChannelGetInfo | `fa_stream_get_info` (the source's own format; unchanged by attaching) | `stream.Info` | ✅ |
 | BASS_ChannelGetLength | `fa_stream_info.length_frames` or `.duration` (ns) | `stream.Info.Duration` | ✅ |
-| BASS_ChannelGetPosition / SetPosition | `fa_stream_get_position` / `fa_stream_seek` (frames) | `stream.Position` (TimeSpan) | ✅ |
+| BASS_ChannelGetPosition / SetPosition | `fa_stream_get_position` / `fa_stream_seek` (frames); seek refills 100 ms before returning | `stream.Position` (TimeSpan) | ✅ |
+| BASS_ChannelGetPosition with BASS_POS_DECODE | Not needed: the position always counts what was played, never what was decoded ahead | — | ➖ (by design) |
 | BASS_ChannelBytes2Seconds / Seconds2Bytes | Not needed: frames ÷ sample rate, or use TimeSpan in .NET | — | ➖ (by design) |
-| BASS_ChannelSetAttribute VOL / PAN | `fa_stream_set_param` VOLUME / PAN | `Volume` / `Pan` | ✅ |
+| BASS_ChannelSetAttribute VOL / PAN | `fa_stream_set_param` VOLUME / PAN, de-zippered over 5 ms ([ramps](../features/ramps.md)) | `Volume` / `Pan` | ✅ |
 | BASS_ChannelSetAttribute FREQ | `FA_PARAM_RATE` | `Rate` | 🧩 |
 | BASS_ChannelSetAttributeEx / GetAttributeEx | Typed functions per feature instead | | ➖ (by design) |
-| BASS_ChannelSlideAttribute / IsSliding | `fa_stream_ramp_param` | `Ramp(...)` | 🧩 |
-| BASS_ChannelSetSync / RemoveSync | `fa_stream_set_event_callback`, `fa_stream_add_position_event` | `Ended`, `MetadataChanged`, … events | 🧩 |
+| BASS_ChannelSlideAttribute | `fa_stream_ramp_param` with 6 curves ([ramps](../features/ramps.md)) | `Ramp(...)` / `await RampAsync(...)` | ✅ volume, pan |
+| BASS_ChannelIsSliding | `FA_EVENT_RAMP_DONE` (one per ramp, tagged) instead of polling | `RampAsync` task, `RampCompleted` event | ✅ |
+| BASS_ChannelSetSync / RemoveSync | `fa_stream_set_event_callback`; one callback receives every event type ([events](../features/events.md)) | `Ended`, `RampCompleted`, … events | ✅ |
+| BASS_SYNC_END | `FA_EVENT_ENDED` | `Ended` | ✅ |
+| BASS_SYNC_SLIDE | `FA_EVENT_RAMP_DONE` | `RampCompleted` / `RampAsync` | ✅ |
+| BASS_SYNC_POS | `fa_stream_add_position_event` + `FA_EVENT_POSITION` | `AddPositionEvent`, `PositionReached` | 🧩 |
+| BASS_SYNC_MIXTIME | Not needed: callbacks never run on the audio thread, so any call is safe in them; sample-accurate actions use ramps and (later) `play_at` | — | ➖ (by design) |
 | BASS_ChannelSetDSP (+Ex) / RemoveDSP | `fa_stream_add_dsp` / `fa_stream_remove_dsp` | | 🧩 |
 | BASS_ChannelGetLevel (+Ex) | `fa_stream_get_levels` | `GetLevels()` | 🧩 |
 | BASS_ChannelGetData (FFT) | Planned `fa_stream_get_spectrum` | | 🗓️ |
@@ -212,4 +220,32 @@ BASS: `BASS_ChannelSetDevice(h, newDevice);` (both devices must be initialised, 
 
 FatzAudio: `fa_stream_attach(s, other_device, NULL);` keeps the position, and play/pause state carries on. In .NET: `song.PlayOn(otherDevice);`.
 
-*More patterns (fades, crossfades, syncs/events, tempo, FFmpeg hand-off, normalization, CD+G) are added here as each feature lands.*
+### Fade out, then stop
+
+BASS:
+```c
+BASS_ChannelSlideAttribute(h, BASS_ATTRIB_VOL, 0, 3000);         /* linear or log only */
+BASS_ChannelSetSync(h, BASS_SYNC_SLIDE | BASS_SYNC_ONETIME, 0, SlideDone, 0);
+/* SlideDone fires for any finished slide on the channel; check which attribute... */
+```
+
+FatzAudio:
+```c
+fa_ramp r = { FA_CURVE_EQUAL_POWER }; r.tag = 7;
+fa_stream_ramp_param(s, FA_PARAM_VOLUME, 0.0f, 3000000000LL, 0, &r);
+/* FA_EVENT_RAMP_DONE with value == 7 tells you exactly which ramp finished */
+```
+
+.NET:
+```csharp
+await song.RampAsync(AudioParameter.Volume, 0f, TimeSpan.FromSeconds(3), Curve.EqualPower);
+song.Stop();
+```
+
+### React to the end of a track (BASS_SYNC_END)
+
+BASS: `BASS_ChannelSetSync(h, BASS_SYNC_END, 0, EndProc, user);`. The SYNCPROC runs on BASS's update thread, and `BASS_SYNC_MIXTIME` variants run inside the mixer, where most BASS calls aren't allowed.
+
+FatzAudio: `fa_stream_set_event_callback(s, on_event, user);` and handle `FA_EVENT_ENDED`. The callback runs on the event thread, so it can start the next track, close the stream, or update state directly. .NET: `song.Ended += ...`.
+
+*More patterns (crossfades, tempo, FFmpeg hand-off, normalization, CD+G) are added here as each feature lands.*

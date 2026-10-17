@@ -194,6 +194,6 @@ Status: ✅ = done in the core-engine phase.
 3. ✅ Add a duration field to `fa_stream_info` (`duration`, nanoseconds, -1 unknown).
 4. ✅ Make `fa_device_start`/`stop` idempotent (`fa_device_is_started` added).
 5. ✅ Define an "unset" value for markers (`FA_FRAMES_UNSET`).
-6. Add a ramp-finished event so `RampAsync` can complete on the real end.
+6. ✅ Add a ramp-finished event so `RampAsync` can complete on the real end (`FA_EVENT_RAMP_DONE`, value = `fa_ramp.tag`, exactly once per ramp).
 7. ✅ Specify `fa_io_callbacks.close` and the lifetime of `user` (owned by the stream only after a successful open; `close` called exactly once by `fa_stream_close`).
-8. Document `fa_event.frame`/`value` per event type.
+8. ✅ Document `fa_event.frame`/`value` per event type (table above `fa_event_type` in the header, and docs/features/events.md).

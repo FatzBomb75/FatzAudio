@@ -14,7 +14,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 option(FA_BUILD_TESTS "Build FatzAudio tests" ON)
 
-add_library(fatzaudio SHARED
+set(FA_SOURCES
     src/engine.c
     src/device.c
     src/stream.c
@@ -22,9 +22,16 @@ add_library(fatzaudio SHARED
     src/probe.c
     src/decoder.c
     src/dec_miniaudio.c
+    src/fa_platform.c
+    src/ring.c
+    src/curve.c
+    src/event.c
     src/stubs.c
     src/miniaudio_impl.c
-    src/fa_internal.h)
+    src/fa_internal.h
+)
+
+add_library(fatzaudio SHARED ${FA_SOURCES})
 
 target_include_directories(fatzaudio
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -45,9 +52,11 @@ endif()
 if(MSVC)
     target_compile_options(fatzaudio PRIVATE /W3)
     set_source_files_properties(src/miniaudio_impl.c PROPERTIES COMPILE_OPTIONS "/W0")
+    set(FA_WARNINGS /W3)
 else()
     target_compile_options(fatzaudio PRIVATE -Wall -Wextra)
     set_source_files_properties(src/miniaudio_impl.c PROPERTIES COMPILE_OPTIONS "-w")
+    set(FA_WARNINGS -Wall -Wextra)
 endif()
 
 if(FA_BUILD_TESTS)

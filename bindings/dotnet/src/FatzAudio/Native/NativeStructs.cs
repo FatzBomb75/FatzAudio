@@ -49,6 +49,7 @@ internal unsafe struct FaOpenOptions
     public uint Flags;
     public int AudioTrack;
     public byte* MimeHint;
+    public uint BufferMs;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -78,6 +79,7 @@ internal struct FaRamp
 {
     public int Curve;
     public float BezierX1, BezierY1, BezierX2, BezierY2;
+    public long Tag;
 }
 
 [StructLayout(LayoutKind.Sequential)]

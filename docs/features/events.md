@@ -1,0 +1,49 @@
+# Events
+
+Each stream has one event callback. The audio thread queues events without locking. The engine's **event thread** delivers them in order, a few milliseconds later, so your callback never runs on the audio thread and can call any FatzAudio function, including closing the stream.
+
+## Event fields
+
+| Type | `frame` | `value` | Delivered |
+|---|---|---|---|
+| `FA_EVENT_ENDED` | position at the end | 0 | ✅ |
+| `FA_EVENT_RAMP_DONE` | position | the ramp's `tag` | ✅ |
+| `FA_EVENT_POSITION` | the requested frame | 0 | 🧩 |
+| `FA_EVENT_MARKER` | the marker's frame | the `fa_marker` | 🗓️ crossfade phase |
+| `FA_EVENT_METADATA` | position | 0 | 🗓️ web streams |
+| `FA_EVENT_STALLED` / `RESUMED` | position | 0 | 🗓️ web streams |
+| `FA_EVENT_DECODE_ERROR` | position | the `fa_result` | 🗓️ |
+| `FA_EVENT_DEVICE_CHANGED` | position | 0 | 🗓️ R14 |
+| `FA_EVENT_LOUDNESS_FINAL` | position | 0 | 🗓️ normalization |
+
+## C
+
+```c
+static void FA_CALL on_event(const fa_event* ev, void* user)
+{
+    switch (ev->type) {
+    case FA_EVENT_ENDED:
+        printf("ended at frame %lld\n", (long long)ev->frame);
+        break;
+    case FA_EVENT_RAMP_DONE:
+        printf("ramp %lld done\n", (long long)ev->value);
+        break;
+    default: break;
+    }
+}
+
+fa_stream_set_event_callback(s, on_event, my_state);
+```
+
+## C#
+
+```csharp
+song.Ended += (_, _) => Console.WriteLine("done");
+song.RampCompleted += (_, e) => Console.WriteLine($"ramp {e.Value} done at {e.Position}");
+```
+
+## Lifetime guarantees
+
+- When `fa_stream_set_event_callback` (replacing a callback) or `fa_stream_close` returns, the previous callback isn't running and won't be called again, so you can free its `user` data. The one exception is calling them from inside that callback itself.
+- Events queued for a stream that has since been closed are dropped, not delivered.
+- If more than 256 events pile up on one device before the event thread runs, the extra ones are dropped. In practice it drains every few milliseconds.

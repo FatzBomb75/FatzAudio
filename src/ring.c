@@ -1,0 +1,58 @@
+/* Lock-free single-producer/single-consumer ring of interleaved float frames.
+ * The counters only grow, so "readable = write - read" needs no wrap handling. */
+#include "fa_internal.h"
+#include <stdlib.h>
+#include <string.h>
+
+fa_result fa_ring_init(fa_ring* r, uint32_t channels, int64_t capacity)
+{
+    memset(r, 0, sizeof(*r));
+    r->data = (float*)calloc((size_t)capacity * channels, sizeof(float));
+    if (!r->data) return FA_ERROR_OUT_OF_MEMORY;
+    r->channels = channels;
+    r->capacity = capacity;
+    return FA_OK;
+}
+
+void fa_ring_free(fa_ring* r)
+{
+    free(r->data);
+    memset(r, 0, sizeof(*r));
+}
+
+int64_t fa_ring_readable(fa_ring* r) { return fa_load64(&r->write) - fa_load64(&r->read); }
+int64_t fa_ring_writable(fa_ring* r) { return r->capacity - fa_ring_readable(r); }
+
+void fa_ring_write(fa_ring* r, const float* src, int64_t frames)
+{
+    int64_t w = fa_load64(&r->write);
+    int64_t at = w % r->capacity;
+    int64_t first = r->capacity - at < frames ? r->capacity - at : frames;
+    size_t ch = r->channels;
+    memcpy(r->data + (size_t)at * ch, src, (size_t)first * ch * sizeof(float));
+    if (frames > first)
+        memcpy(r->data, src + (size_t)first * ch, (size_t)(frames - first) * ch * sizeof(float));
+    fa_store64(&r->write, w + frames); /* publishes the samples to the consumer */
+}
+
+void fa_ring_regions(fa_ring* r, int64_t frames, const float** p1, int64_t* n1, const float** p2, int64_t* n2)
+{
+    int64_t rd = fa_load64(&r->read);
+    int64_t at = rd % r->capacity;
+    int64_t first = r->capacity - at < frames ? r->capacity - at : frames;
+    *p1 = r->data + (size_t)at * r->channels;
+    *n1 = first;
+    *p2 = r->data;
+    *n2 = frames - first;
+}
+
+void fa_ring_advance_read(fa_ring* r, int64_t frames)
+{
+    fa_store64(&r->read, fa_load64(&r->read) + frames);
+}
+
+void fa_ring_reset(fa_ring* r)
+{
+    fa_store64(&r->read, 0);
+    fa_store64(&r->write, 0);
+}
