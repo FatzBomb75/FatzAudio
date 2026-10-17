@@ -47,6 +47,9 @@ set(FA_SOURCES
     src/limiter.c
     src/clock.c
     src/codec.c
+    src/ac3.c
+    src/dec_ac3.c
+    src/mdct.c
     src/ffmpeg.c
     src/push.c
     src/demux.c
@@ -68,6 +71,8 @@ set(FA_SOURCES
     src/disc_mmc.c
     src/disc_image.c
     src/tempo.h
+    src/ac3.h
+    src/mdct.h
     src/fa_internal.h
     src/net.h
     src/disc.h

@@ -51,6 +51,7 @@ internal unsafe struct FaOpenOptions
     public byte* MimeHint;
     public uint BufferMs;
     public FaNetOptions* Net;
+    public int DynamicRange;
 }
 
 [StructLayout(LayoutKind.Sequential)]

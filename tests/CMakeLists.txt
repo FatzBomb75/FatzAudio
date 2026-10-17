@@ -88,6 +88,17 @@ if(UNIX)
 endif()
 add_test(NAME demux COMMAND fa_test_demux)
 
+add_executable(fa_test_dolby test_dolby.c ${FA_SOURCES})
+target_include_directories(fa_test_dolby PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+target_compile_definitions(fa_test_dolby PRIVATE FA_STATIC FA_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_compile_options(fa_test_dolby PRIVATE ${FA_WARNINGS})
+target_link_libraries(fa_test_dolby PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
+if(UNIX)
+    target_link_libraries(fa_test_dolby PRIVATE m)
+endif()
+add_test(NAME dolby COMMAND fa_test_dolby)
+
 # fatzaudio_ffmpeg.h against a real FFmpeg, the way an app uses it. Only built when
 # FFmpeg's development files are found (the library itself never needs them).
 find_package(PkgConfig QUIET)

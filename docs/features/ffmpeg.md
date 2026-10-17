@@ -9,7 +9,7 @@ For apps that already read the file themselves, usually with FFmpeg because of t
 | Interleaved PCM | `fa_stream_push_pcm` (.NET `Push`) | Plays it |
 | A video renderer to keep in sync | `fa_stream_get_clock` (.NET `Clock`) | Reports the pts of the audio leaving the speaker right now, in your own timeline |
 
-FatzAudio never links or ships FFmpeg. Packet streams decode PCM and MP3 themselves and use the FFmpeg your app already loaded for everything else: AAC, AC-3, E-AC-3 (Dolby Digital Plus), Opus, Vorbis, FLAC, DTS, TrueHD, WMA and so on.
+FatzAudio never links or ships FFmpeg. Packet streams decode PCM, MP3, AC-3 and E-AC-3 (Dolby Digital and Dolby Digital Plus, see [Dolby Digital](dolby.md)) themselves and use the FFmpeg your app already loaded for everything else: AAC, Opus, Vorbis, FLAC, DTS, TrueHD, WMA and so on.
 
 ## Packets straight from the demuxer (C)
 

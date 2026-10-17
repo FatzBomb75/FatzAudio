@@ -218,6 +218,18 @@ typedef enum fa_open_flags {
 
 typedef struct fa_net_options fa_net_options;
 
+/* Dynamic range of Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3) audio.
+ * These streams carry the broadcaster's compression gains for every block; the
+ * decoder can apply them or play the mix as it was mastered. Other formats are
+ * not affected. */
+typedef enum fa_dynamic_range {
+    FA_DYNAMIC_RANGE_FULL = 0,  /* default: the full mix, no compression */
+    FA_DYNAMIC_RANGE_NORMAL,    /* the stream's compression ("line mode"): quiet parts
+                                   lifted and loud ones tamed, as a home AV receiver does */
+    FA_DYNAMIC_RANGE_NIGHT      /* heavy compression for listening at low volume ("RF
+                                   mode"); streams without heavy gains use NORMAL's */
+} fa_dynamic_range;
+
 typedef struct fa_open_options {
     uint32_t struct_size;
     uint32_t flags;          /* fa_open_flags */
@@ -229,6 +241,8 @@ typedef struct fa_open_options {
                                 0 = default (500 ms), clamped to 50..10000 */
     const fa_net_options* net; /* fa_stream_open_url only: connection settings,
                                 NULL = defaults. Copied by the call */
+    int32_t dynamic_range;   /* fa_dynamic_range for Dolby audio (default FULL); can be
+                                changed later with fa_stream_set_dynamic_range */
 } fa_open_options;
 
 FA_API void FA_CALL fa_open_options_init(fa_open_options* options);
@@ -253,8 +267,8 @@ FA_API fa_result FA_CALL fa_stream_open_url(fa_engine* engine, const char* url, 
  *
  *   compressed packets   fa_stream_open_packets + fa_stream_push_packet: straight
  *                        from av_read_frame, no audio decoding in the app at all.
- *                        FatzAudio decodes them on its worker threads: PCM and MP3
- *                        built in, everything else (AAC, AC-3, E-AC-3, Opus, ...)
+ *                        FatzAudio decodes them on its worker threads: PCM, MP3,
+ *                        AC-3 and E-AC-3 built in, everything else (AAC, Opus, ...)
  *                        through the FFmpeg your app already loaded (never bundled).
  *   decoded frames       fa_stream_open_push + fa_stream_push_frame: AVFrame data
  *                        as it is (planar or interleaved, any sample format, any
@@ -651,6 +665,12 @@ typedef struct fa_stream_info {
 } fa_stream_info;
 
 FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* out_info);
+
+/* Dolby dynamic range (see fa_dynamic_range): applies to audio decoded from now on,
+ * so a playing stream changes after its decode-ahead buffer (buffer_ms, 500 ms by
+ * default). Streams of other formats accept and ignore it. */
+FA_API fa_result FA_CALL fa_stream_set_dynamic_range(fa_stream* stream, fa_dynamic_range mode);
+FA_API fa_result FA_CALL fa_stream_get_dynamic_range(fa_stream* stream, fa_dynamic_range* out_mode);
 
 /* ---- Transport and position -------------------------------------------- */
 
