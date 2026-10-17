@@ -6,6 +6,9 @@ One page per feature, each with: what it does, C example, C# example, options, t
 |---|---|---|
 | Devices (output, start/stop, silent output) | [devices.md](devices.md) | ✅ output; input and default following 🗓️ |
 | Opening and decoding streams (format detection, custom I/O) | [streams.md](streams.md) | ✅ |
+| Playback, buffering and threads (decode-ahead, transport, clock) | [playback.md](playback.md) | ✅ |
+| Volume, pan and ramps (curves, ramp-done) | [ramps.md](ramps.md) | ✅ volume and pan |
+| Events | [events.md](events.md) | ✅ ended, ramp done |
 | Normalization | normalization.md | 🗓️ |
 | Crossfade, markers and curves | crossfade.md | 🗓️ |
 | Tempo and pitch | tempo-pitch.md | 🗓️ |

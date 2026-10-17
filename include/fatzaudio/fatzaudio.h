@@ -12,6 +12,15 @@
  * - Strings are UTF-8.
  * - The API is thread-safe unless a function says otherwise. Callbacks run on
  *   engine threads and must not block.
+ *
+ * Threads
+ * - Each engine runs decode worker threads (fa_engine_config.worker_threads) and
+ *   one event thread. Workers decode, resample and channel-convert every attached
+ *   stream ahead of time into a lock-free ring buffer (fa_open_options.buffer_ms).
+ * - The device's audio callback only mixes those buffers: it takes no locks,
+ *   allocates nothing, does no I/O and calls no user code.
+ * - Event callbacks (fa_stream_set_event_callback) run on the engine's event
+ *   thread, never on the audio thread, so they may call any FatzAudio function.
  */
 #ifndef FATZAUDIO_H
 #define FATZAUDIO_H
@@ -104,7 +113,7 @@ typedef struct fa_engine_config {
     uint32_t struct_size;         /* sizeof(fa_engine_config) */
     uint32_t mix_sample_rate;     /* 0 = device native */
     uint32_t period_ms;           /* 0 = backend default */
-    uint32_t worker_threads;      /* for scanning/decoding, 0 = number of cores */
+    uint32_t worker_threads;      /* decode worker threads, 0 = number of cores (max 8) */
     const char* cache_directory;  /* loudness/seek-index cache, NULL = disabled */
     uint32_t flags;               /* fa_engine_flags */
 } fa_engine_config;
@@ -198,6 +207,8 @@ typedef struct fa_open_options {
                                 FA_ERROR_NOT_FOUND if the track does not exist */
     const char* mime_hint;   /* optional, e.g. "audio/flac"; only used when the content
                                 itself is ambiguous. Content sniffing always wins */
+    uint32_t buffer_ms;      /* decode-ahead buffer while attached to a device,
+                                0 = default (500 ms), clamped to 50..10000 */
 } fa_open_options;
 
 FA_API void FA_CALL fa_open_options_init(fa_open_options* options);
@@ -248,6 +259,8 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
 FA_API fa_result FA_CALL fa_stream_detach(fa_stream* stream);
 FA_API fa_result FA_CALL fa_stream_play(fa_stream* stream);
 FA_API fa_result FA_CALL fa_stream_play_at(fa_stream* stream, fa_time engine_time); /* sample-accurate scheduled start */
+/* Pause and stop take effect before they return: no further audio of the stream
+ * is mixed after that, so the position read right after is final. */
 FA_API fa_result FA_CALL fa_stream_pause(fa_stream* stream);
 FA_API fa_result FA_CALL fa_stream_stop(fa_stream* stream);
 
@@ -256,11 +269,17 @@ typedef enum fa_stream_state {
 } fa_stream_state;
 
 FA_API fa_result FA_CALL fa_stream_get_state(fa_stream* stream, fa_stream_state* out_state);
+/* Seeking an attached stream drops the decode-ahead buffer and refills the first
+ * ~100 ms on the calling thread before returning, so playback resumes at once. */
 FA_API fa_result FA_CALL fa_stream_seek(fa_stream* stream, fa_frames frame);
+/* Source frames already handed to the device (or read, for decode-only streams).
+ * Frames decoded ahead into the buffer are not counted. */
 FA_API fa_result FA_CALL fa_stream_get_position(fa_stream* stream, fa_frames* out_frame);
 
-/* Presentation time of the audio currently leaving the speaker (device latency
- * included). Video and CD+G renderers should follow this clock. */
+/* Presentation time of the audio currently leaving the speaker: the stream
+ * position converted to nanoseconds, minus the device latency (never below 0).
+ * Video and CD+G renderers should follow this clock. Streams that are not
+ * attached report their position. */
 FA_API fa_result FA_CALL fa_stream_get_clock(fa_stream* stream, fa_time* out_pts);
 FA_API fa_result FA_CALL fa_engine_get_time(fa_engine* engine, fa_time* out_time);
 
@@ -293,11 +312,24 @@ typedef enum fa_curve {
 typedef struct fa_ramp {
     fa_curve curve;
     float bezier_x1, bezier_y1, bezier_x2, bezier_y2;
+    int64_t tag;   /* any value; returned in the FA_EVENT_RAMP_DONE event of this ramp */
 } fa_ramp;
 
+/* Volume (linear gain >= 0) and pan (-1..1) are applied in the mixer, sample-accurately
+ * and without zipper noise (changes are smoothed over 5 ms). RATE, TEMPO and PITCH
+ * return FA_ERROR_NOT_IMPLEMENTED until the tempo/pitch phase.
+ * fa_stream_get_param returns the value being applied right now (mid-ramp values
+ * included); a value just set with fa_stream_set_param is returned immediately. */
 FA_API fa_result FA_CALL fa_stream_set_param(fa_stream* stream, fa_param param, float value);
 FA_API fa_result FA_CALL fa_stream_get_param(fa_stream* stream, fa_param param, float* out_value);
-/* Ramp a parameter to target over duration, starting at engine_time (0 = now). */
+/* Ramps a parameter from its current value to `target` over `duration` with the
+ * curve in `ramp` (NULL = linear, tag 0). Ramps advance with playback: they run
+ * while the stream is playing on a running device and wait while it is paused,
+ * stopped or not attached, so "ramp to 1, then play" gives a fade-in.
+ * A new ramp or fa_stream_set_param on the same parameter replaces a running ramp.
+ * Every ramp raises exactly one FA_EVENT_RAMP_DONE (value = ramp->tag): when it
+ * reaches the target, or when it is replaced.
+ * engine_time must be 0 (start now); scheduled starts come with the crossfade phase. */
 FA_API fa_result FA_CALL fa_stream_ramp_param(fa_stream* stream, fa_param param, float target, fa_time duration, fa_time engine_time, const fa_ramp* ramp);
 
 /* ---- Markers and crossfade -------------------------------------------- */
@@ -341,6 +373,23 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
 
 /* ---- Events ----------------------------------------------------------- */
 
+/* Meaning of fa_event.frame and fa_event.value per type. "Position" is the stream
+ * position (fa_stream_get_position) when the event happened.
+ *
+ * type                     frame                  value
+ * FA_EVENT_ENDED           position at the end    0
+ * FA_EVENT_POSITION        the requested frame    0
+ * FA_EVENT_MARKER          the marker's frame     the fa_marker
+ * FA_EVENT_METADATA        position               0
+ * FA_EVENT_STALLED         position               0
+ * FA_EVENT_RESUMED         position               0
+ * FA_EVENT_DECODE_ERROR    position               the fa_result of the error
+ * FA_EVENT_DEVICE_CHANGED  position               0
+ * FA_EVENT_LOUDNESS_FINAL  position               0
+ * FA_EVENT_RAMP_DONE       position               fa_ramp.tag of the finished ramp
+ *
+ * Delivered today: ENDED and RAMP_DONE. The others are raised by the features
+ * that produce them as those land (see docs/features). */
 typedef enum fa_event_type {
     FA_EVENT_ENDED = 0,
     FA_EVENT_POSITION,        /* reached a requested frame */
@@ -350,7 +399,8 @@ typedef enum fa_event_type {
     FA_EVENT_RESUMED,
     FA_EVENT_DECODE_ERROR,    /* recovered: data skipped, playback continues */
     FA_EVENT_DEVICE_CHANGED,
-    FA_EVENT_LOUDNESS_FINAL
+    FA_EVENT_LOUDNESS_FINAL,
+    FA_EVENT_RAMP_DONE        /* a ramp reached its target or was replaced */
 } fa_event_type;
 
 typedef struct fa_event {
@@ -362,6 +412,13 @@ typedef struct fa_event {
 
 typedef void (FA_CALL *fa_event_callback)(const fa_event* event, void* user);
 
+/* One callback per stream (NULL removes it). Callbacks run on the engine's event
+ * thread, in order, shortly after the event (within a few milliseconds); never on
+ * the audio thread. A callback may call any FatzAudio function, including
+ * fa_stream_close on its own stream.
+ * When this function or fa_stream_close returns, the previous callback is no
+ * longer running (unless you call them from inside that callback), so its `user`
+ * data can be freed. */
 FA_API fa_result FA_CALL fa_stream_set_event_callback(fa_stream* stream, fa_event_callback callback, void* user);
 FA_API fa_result FA_CALL fa_stream_add_position_event(fa_stream* stream, fa_frames frame);
 

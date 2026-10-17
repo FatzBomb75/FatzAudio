@@ -159,6 +159,11 @@ public sealed record StreamOptions
     public int AudioTrack { get; init; } = -1;
     /// <summary>Optional MIME type hint; content sniffing still wins.</summary>
     public string? MimeHint { get; init; }
+    /// <summary>
+    /// How much audio is decoded ahead on worker threads while the stream plays (default 500 ms,
+    /// allowed 50 ms to 10 s). Larger values ride out slow disks and networks; smaller values use less memory.
+    /// </summary>
+    public TimeSpan? BufferLength { get; init; }
 }
 
 /// <summary>Configuration for <see cref="AudioEngine.Create"/>. All properties are optional.</summary>
@@ -168,7 +173,7 @@ public sealed record AudioEngineOptions
     public int MixSampleRate { get; init; }
     /// <summary>Device period length; null uses the backend default.</summary>
     public TimeSpan? Period { get; init; }
-    /// <summary>Worker threads for scanning and decoding; 0 uses the number of cores.</summary>
+    /// <summary>Decode worker threads; 0 uses the number of cores (at most 8).</summary>
     public int WorkerThreads { get; init; }
     /// <summary>Directory for the loudness and seek-index cache; null disables the cache.</summary>
     public string? CacheDirectory { get; init; }

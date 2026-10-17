@@ -71,22 +71,63 @@ FA_API fa_result FA_CALL fa_device_get_info(fa_engine* engine, fa_device_type ty
     return FA_OK;
 }
 
+/* ---- The audio callback ------------------------------------------------------
+ * Lock-free: it reads an immutable voice list published through an atomic
+ * pointer and mixes each stream's pre-decoded ring buffer. `epoch` is odd while
+ * it runs, which lets API threads wait until it no longer sees an old list
+ * (fa_device_wait_quiescent) before freeing anything it might touch. */
 static void data_callback(ma_device* d, void* output, const void* input, ma_uint32 frames)
 {
     fa_device* dev = (fa_device*)d->pUserData;
+    fa_voice_list* list;
+    uint32_t i;
     (void)input;
+    fa_fetch_add64(&dev->epoch, 1);
     memset(output, 0, (size_t)frames * FA_DEVICE_CHANNELS * sizeof(float));
-    fa_device_mix(dev, (float*)output, frames);
+    list = (fa_voice_list*)fa_load_ptr(&dev->voices);
+    if (list)
+        for (i = 0; i < list->count; i++) fa_stream_mix(list->items[i], dev, (float*)output, frames);
+    fa_fetch_add64(&dev->epoch, 1);
 }
 
-/* TODO: replace the mutex around the stream list with a lock-free/RCU style list
- * so the audio thread never blocks on API calls. */
-void fa_device_mix(fa_device* device, float* out, ma_uint32 frames)
+void fa_device_wait_quiescent(fa_device* dev)
 {
-    struct fa_stream* s;
-    ma_mutex_lock(&device->lock);
-    for (s = device->streams; s; s = s->next) fa_stream_mix_into(s, out, frames);
-    ma_mutex_unlock(&device->lock);
+    int64_t e = fa_load64(&dev->epoch);
+    if (!(e & 1)) return;                 /* not inside the callback: nothing to wait for */
+    while (fa_load64(&dev->epoch) == e) fa_sleep_ms(1);
+}
+
+/* Publishes a new voice list; the old one is freed once the callback is done with it. */
+static fa_result publish_voices(fa_device* dev, fa_stream* add, fa_stream* remove)
+{
+    fa_voice_list* old = (fa_voice_list*)fa_load_ptr(&dev->voices);
+    uint32_t n = old ? old->count : 0, i, k = 0;
+    fa_voice_list* list = (fa_voice_list*)malloc(sizeof(fa_voice_list) + (size_t)(n + 1) * sizeof(fa_stream*));
+    if (!list) return FA_ERROR_OUT_OF_MEMORY;
+    for (i = 0; i < n; i++)
+        if (old->items[i] != remove && old->items[i] != add) list->items[k++] = old->items[i];
+    if (add) list->items[k++] = add;
+    list->count = k;
+    fa_exchange_ptr(&dev->voices, list);
+    fa_device_wait_quiescent(dev);
+    free(old);
+    return FA_OK;
+}
+
+fa_result fa_device_add_voice(fa_device* dev, fa_stream* s)
+{
+    fa_result r;
+    fa_mutex_lock(&dev->lock);
+    r = publish_voices(dev, s, NULL);
+    fa_mutex_unlock(&dev->lock);
+    return r;
+}
+
+void fa_device_remove_voice(fa_device* dev, fa_stream* s)
+{
+    fa_mutex_lock(&dev->lock);
+    while (publish_voices(dev, NULL, s) != FA_OK) fa_sleep_ms(1); /* must not fail: retry on OOM */
+    fa_mutex_unlock(&dev->lock);
 }
 
 FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id, fa_device** out_device)
@@ -125,7 +166,7 @@ FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id
     d = (fa_device*)calloc(1, sizeof(*d));
     if (!d) return FA_ERROR_OUT_OF_MEMORY;
     d->engine = engine;
-    if (ma_mutex_init(&d->lock) != MA_SUCCESS) { free(d); return FA_ERROR_GENERIC; }
+    if (fa_mutex_init(&d->lock) != 0) { free(d); return FA_ERROR_GENERIC; }
 
     cfg = ma_device_config_init(ma_device_type_playback);
     cfg.playback.pDeviceID = pid;
@@ -135,22 +176,42 @@ FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id
     cfg.periodSizeInMilliseconds = engine->config.period_ms;
     cfg.dataCallback = data_callback;
     cfg.pUserData = d;
+    cfg.noPreSilencedOutputBuffer = MA_TRUE;  /* the callback clears the buffer itself */
+    cfg.wasapi.usage = ma_wasapi_usage_pro_audio; /* MMCSS "Pro Audio" scheduling on Windows */
 
     if (ma_device_init(&engine->context, &cfg, &d->device) != MA_SUCCESS) {
-        ma_mutex_uninit(&d->lock);
+        fa_mutex_destroy(&d->lock);
         free(d);
         return FA_ERROR_DEVICE;
     }
+    d->rate = d->device.sampleRate;
+
+    fa_mutex_lock(&engine->list_lock);
+    d->next = engine->devices;
+    engine->devices = d;
+    fa_mutex_unlock(&engine->list_lock);
     *out_device = d;
     return FA_OK;
 }
 
 FA_API void FA_CALL fa_device_close(fa_device* device)
 {
+    fa_device** pp;
+    fa_voice_list* list;
     if (!device) return;
-    ma_device_uninit(&device->device); /* stops the callback thread */
-    while (device->streams) fa_stream_detach(device->streams);
-    ma_mutex_uninit(&device->lock);
+    ma_device_stop(&device->device);
+    for (;;) {
+        list = (fa_voice_list*)fa_load_ptr(&device->voices);
+        if (!list || list->count == 0) break;
+        fa_stream_detach(list->items[0]);
+    }
+    fa_mutex_lock(&device->engine->list_lock);
+    for (pp = &device->engine->devices; *pp; pp = &(*pp)->next)
+        if (*pp == device) { *pp = device->next; break; }
+    fa_mutex_unlock(&device->engine->list_lock);
+    ma_device_uninit(&device->device);
+    free(fa_load_ptr(&device->voices));
+    fa_mutex_destroy(&device->lock);
     free(device);
 }
 

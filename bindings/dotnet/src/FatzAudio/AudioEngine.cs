@@ -351,6 +351,8 @@ internal unsafe ref struct NativeOptions
         if (options.NoNormalize) flags |= 1u << 3;
         o._ptr->Flags = flags;
         o._ptr->AudioTrack = options.AudioTrack;
+        if (options.BufferLength is { } buffer)
+            o._ptr->BufferMs = (uint)Math.Clamp(buffer.TotalMilliseconds, 1, uint.MaxValue);
         if (options.MimeHint is { } mime)
         {
             o._mime = (byte*)Marshal.StringToCoTaskMemUTF8(mime);
