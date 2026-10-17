@@ -73,8 +73,10 @@ enum {
     FA_ERROR_PROVIDER_MISSING = -13, /* e.g. FFmpeg or LAME not found at runtime */
     FA_ERROR_NO_DISC = -14,          /* the CD drive has no disc, its tray is open, or the
                                         disc was changed under an open stream */
-    FA_ERROR_NO_SOUNDFONT = -15      /* a MIDI file needs a soundfont: fa_engine_set_soundfont
+    FA_ERROR_NO_SOUNDFONT = -15,     /* a MIDI file needs a soundfont: fa_engine_set_soundfont
                                         or fa_open_options.soundfont */
+    FA_ERROR_PROTECTED_CONTENT = -16 /* DRM-protected or encrypted content (WMA DRM,
+                                        FairPlay, encrypted MP4/MKV, SAMPLE-AES HLS) */
 };
 
 typedef struct fa_engine fa_engine;   /* one per process is typical */

@@ -31,6 +31,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 |---|---|---|---|
 | BASS_GetVersion | `fa_version` | `AudioEngine.NativeVersion` | ✅ |
 | BASS_ErrorGetCode | Return value of every call; `fa_result_string` | `FatzAudioException.ErrorCode` | ✅ |
+| BASS_ERROR_WMA_LICENSE (protected WMA) | `FA_ERROR_PROTECTED_CONTENT`, also for encrypted MP4/MKV and SAMPLE-AES HLS | `ErrorCode.ProtectedContent` | ✅ |
 | BASS_Init | `fa_engine_create` + `fa_device_open` | `AudioEngine.Create()` + `engine.OpenOutput()` | ✅ |
 | BASS_Init with device 0 ("no sound") | `FA_ENGINE_NULL_OUTPUT` in `fa_engine_config.flags`: a silent output that still runs in real time ([devices](../features/devices.md#silent-output-for-tests-and-servers)) | `new AudioEngineOptions { NullOutput = true }` | ✅ |
 | BASS_Free | `fa_device_close` + `fa_engine_destroy` | `Dispose()` | ✅ |
@@ -311,7 +312,7 @@ WMA plays through the ordinary open calls: a built-in ASF demuxer, decoded by Wi
 | BASS_WMA_StreamCreateFile (file or memory) | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ (FFmpeg outside Windows) |
 | BASS_WMA_StreamCreateFileUser | `fa_stream_open_io` (forward-only when `seek` is NULL) | `engine.OpenStream` | ✅ |
 | BASS_StreamCreateURL / BASS_WMA_StreamCreateFile on an `http://` WMA/ASF file | `fa_stream_open_url` | `engine.OpenUrl` | ✅ |
-| BASS_WMA_StreamCreateFileAuth (DRM licence) | Protected files return `FA_ERROR_UNSUPPORTED_FORMAT` | — | ➖ (only Windows' DRM components can decrypt them) |
+| BASS_WMA_StreamCreateFileAuth (DRM licence) | Protected files return `FA_ERROR_PROTECTED_CONTENT` | `ErrorCode.ProtectedContent` | ➖ (only Windows' DRM components can decrypt them) |
 | `mms://` URLs, Windows Media Server HTTP streaming (WMSP), BASS_CONFIG_WMA_PREBUF, BASS_CONFIG_WMA_NETSEEK | Not supported | — | ➖ (the protocol and its servers are retired) |
 | `audio_track`-style stream choice in multi-stream / multiple-bitrate files | `fa_open_options.audio_track`, `fa_stream_info.audio_track_count` | `StreamOptions.AudioTrack`, `Info.AudioTrackCount` | ✅ |
 | BASS_TAG_WMA_CODEC (via BASS_ChannelGetTags) | `fa_stream_info.codec` (`wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`) | `Info.Codec` | ✅ |
@@ -854,7 +855,15 @@ Stored positions (cue points, mix points, lyrics or CD+G offsets saved by your a
 | AAC in MP4/M4A (and video files) | Plays the encoder's priming (1024 frames) and ignores the edit list, so it is 1024 frames long too | Starts on the first real sample, exact length | −1024 frames (about −23 ms at 44.1 kHz) |
 | WAV, FLAC, MP3 (with or without a LAME header), AC-3, AAC in `.aac` (ADTS) files and AAC radio | Same frame | Same frame | none |
 
+### Playback timing
+
+With `--rec`, the harness also plays both libraries through the output device and records what comes out (tools/bass-compare README, "Playback on a real device"). Measured so far on a virtual sound card under Wine; a run on Windows hardware is still to come:
+
+- **Gapless:** `fa_stream_set_next` joins two files with no gap and no overlap. With plain BASS, starting the next stream from a `BASS_SYNC_END` sync leaves a gap of about 30 ms, and with `BASS_SYNC_MIXTIME` the next stream starts about half a second early, while the end of the first is still in BASS's playback buffer. Replace either with `fa_stream_set_next(current, next, 0, NULL)`.
+- **Crossfades:** both libraries follow the curve closely and start both fades together (within 1 ms). `fa_crossfade` also offers equal power (no dip in loudness); BASS slides are linear, which dips 3 dB in the middle.
+- **Latency:** FatzAudio started sounds and crossfades 10 to 35 ms later than BASS (see below).
+
 ### Where BASS is still ahead
 
-The comparison report opens with every measurement where BASS won; the ones to fix are in the [engineering notes](../engineering-notes.md) (area "bass-compare"). In short: WMA has not been compared yet (basswma does not run under Wine), and 16 AC-3 5.1 streams at once take more memory each than in bass_ac3. The AC-3 decoder now runs faster than bass_ac3 (5.1 about 400× real time against 350×, stereo 900× against 820×) and opens a file in about 0.5 ms. MP3 now seeks exactly in about 0.3 ms (BASS lands off target unless it prescans), decodes as accurately as BASS, and its loudness scan runs faster than BASS decodes the file. `.aac` files and AAC radio start on the same frame as in bass_aac. Ogg Opus and Ogg Vorbis match bassopus and BASS's Vorbis decoder.
+The comparison report opens with every measurement where BASS won; the ones to fix are in the [engineering notes](../engineering-notes.md) (area "bass-compare"). In short: on the virtual device FatzAudio's start latency was 10 to 35 ms higher than BASS's and its crossfades started about 30 ms later after the call (to be confirmed on Windows hardware); WMA has not been compared yet (basswma does not run under Wine), and 16 AC-3 5.1 streams at once take more memory each than in bass_ac3. The AC-3 decoder now runs faster than bass_ac3 (5.1 about 400× real time against 350×, stereo 900× against 820×) and opens a file in about 0.5 ms. MP3 now seeks exactly in about 0.3 ms (BASS lands off target unless it prescans), decodes as accurately as BASS, and its loudness scan runs faster than BASS decodes the file. `.aac` files and AAC radio start on the same frame as in bass_aac. Ogg Opus and Ogg Vorbis match bassopus and BASS's Vorbis decoder.
 

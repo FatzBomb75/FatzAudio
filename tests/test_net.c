@@ -758,6 +758,13 @@ static void test_hls_parse(void)
     CHECK_EQ(p.segments[2].key_method, 0);
     CHECK(fabs(p.segments[1].duration - 5.5) < 1e-9);
     fa_hls_playlist_free(&p);
+    /* SAMPLE-AES and DRM key formats are protected content. */
+    {
+        const char* drm = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n"
+                          "#EXT-X-KEY:METHOD=SAMPLE-AES,URI=\"skd://key\",KEYFORMAT=\"com.apple.streamingkeydelivery\"\n"
+                          "#EXTINF:6.0,\nseg.ts\n#EXT-X-ENDLIST\n";
+        CHECK_EQ(fa_hls_parse(drm, strlen(drm), "http://h.com/m/a.m3u8", &p), FA_ERROR_PROTECTED_CONTENT);
+    }
 }
 
 static void test_aes_vectors(void)

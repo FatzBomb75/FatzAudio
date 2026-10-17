@@ -1,12 +1,13 @@
 /* fa_bench: FatzAudio's side of the BASS comparison (tools/bass-compare/README.md).
  * Uses only the public API, on decode-only streams, and prints one JSON line.
+ * Without --ffmpeg it uses no FFmpeg at all; `--ffmpeg system` loads the system's.
  *
- *   fa_bench [--ffmpeg <dir>] decode <in> <out.f32|-> [--prescan]
- *   fa_bench [--ffmpeg <dir>] info <in> [--prescan]
- *   fa_bench [--ffmpeg <dir>] seek <in> <out.f32> [--prescan] <frames> <frame> ...
- *   fa_bench [--ffmpeg <dir>] multi <in> <streams>
- *   fa_bench [--ffmpeg <dir>] loudness <in>
- *   fa_bench [--ffmpeg <dir>] disc <image.cue> <track> <out.f32|->
+ *   fa_bench [--ffmpeg <dir>|system] decode <in> <out.f32|-> [--prescan]
+ *   fa_bench [--ffmpeg <dir>|system] info <in> [--prescan]
+ *   fa_bench [--ffmpeg <dir>|system] seek <in> <out.f32> [--prescan] <frames> <frame> ...
+ *   fa_bench [--ffmpeg <dir>|system] multi <in> <streams>
+ *   fa_bench [--ffmpeg <dir>|system] loudness <in>
+ *   fa_bench [--ffmpeg <dir>|system] disc <image.cue> <track> <out.f32|->
  *
  * decode   the whole file: reported length, decoded frames, time to open, time to
  *          the first audio, total time, memory.
@@ -15,7 +16,17 @@
  * multi    opens <streams> streams of the same file and decodes them all, in turn,
  *          to the end: throughput and memory with many streams.
  * loudness fa_scan_loudness_path (integrated loudness, range, true peak).
- * disc     decodes one track of a disc image, like decode. */
+ * disc     decodes one track of a disc image, like decode.
+ *
+ * The play commands play through the default output device instead, while
+ * loop_rec records it (README.md, "Playback on a real device"). They print the
+ * time of each call on loop_rec's clock, so run.py can line the calls up with what
+ * was recorded:
+ * play-latency    plays <click.wav> <trials> times, <gap ms> apart (start to start).
+ * play-crossfade  plays <a.wav>, then after <start after ms> crossfades to <b.wav>
+ *                 over <fade ms> with fa_crossfade (linear, or equal power).
+ * play-gapless    queues <b.wav> after <a.wav> with fa_stream_set_next (no
+ *                 crossfade), as a player does for gapless albums. */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #  define _POSIX_C_SOURCE 200809L  /* clock_gettime */
 #endif
@@ -23,8 +34,8 @@
 #include "bench_common.h"
 
 #define CHUNK 4096
-#define FA_USAGE "       fa_bench [--ffmpeg <dir>] loudness <in>\n" \
-                 "       fa_bench [--ffmpeg <dir>] disc <image.cue> <track> <out.f32|->\n"
+#define FA_USAGE "       fa_bench [--ffmpeg <dir>|system] loudness <in>\n" \
+                 "       fa_bench [--ffmpeg <dir>|system] disc <image.cue> <track> <out.f32|->\n"
 
 static fa_engine* engine;
 
@@ -241,18 +252,151 @@ static int cmd_loudness(const char* in)
     return 0;
 }
 
+/* ---- Playback on the default device (the play commands) ----------------- */
+
+static fa_device* device;
+
+static fa_stream* open_playing(const char* path)
+{
+    fa_open_options opts;
+    fa_stream* s = NULL;
+    fa_result r;
+    fa_open_options_init(&opts);
+    opts.flags = FA_OPEN_NO_CDG;
+    r = fa_stream_open_path(engine, path, &opts, &s);
+    if (r == FA_OK) r = fa_stream_attach(s, device, NULL);
+    if (r != FA_OK) {
+        printf("{\"lib\":\"fatzaudio\",\"error\":\"%s: %s\"}\n", path, fa_result_string(r));
+        exit(1);
+    }
+    return s;
+}
+
+static void open_device(void)
+{
+    fa_result r = fa_device_open(engine, NULL, &device);
+    if (r == FA_OK) r = fa_device_start(device);
+    if (r != FA_OK) {
+        printf("{\"lib\":\"fatzaudio\",\"error\":\"device: %s\"}\n", fa_result_string(r));
+        exit(1);
+    }
+}
+
+static void print_device(void)
+{
+    fa_time lat = 0;
+    fa_device_get_latency(device, &lat);
+    printf("\"lib\":\"fatzaudio\",\"reported_latency_ms\":%.3f,", (double)lat / 1e6);
+}
+
+static double length_ms(fa_stream* s)
+{
+    fa_stream_info info;
+    fa_stream_get_info(s, &info);
+    return info.length_frames > 0 ? (double)info.length_frames * 1000.0 / info.format.sample_rate : 0;
+}
+
+/* Waits until the stream has ended, or at most `max_ms`. */
+static void wait_ended(fa_stream* s, double max_ms)
+{
+    double t_end = bench_now_ms() + max_ms;
+    fa_stream_state st = FA_STATE_PLAYING;
+    while (bench_now_ms() < t_end && fa_stream_get_state(s, &st) == FA_OK && st != FA_STATE_ENDED)
+        bench_sleep_ms(5);
+}
+
+static int cmd_play_latency(const char* click, int trials, double gap_ms)
+{
+    double* t = (double*)calloc((size_t)trials, sizeof(double));
+    fa_stream* s;
+    int i;
+    open_device();
+    s = open_playing(click);
+    bench_sleep_ms(300);  /* let the device settle */
+    for (i = 0; i < trials; i++) {
+        double t0 = bench_now_ms();
+        t[i] = t0;
+        fa_stream_play(s);
+        bench_sleep_ms(gap_ms - (bench_now_ms() - t0) - 20);
+        fa_stream_stop(s);  /* rewinds for the next trial */
+        bench_sleep_ms(gap_ms - (bench_now_ms() - t0));
+    }
+    printf("{");
+    print_device();
+    bench_print_times("calls", t, trials);
+    printf("}\n");
+    fa_stream_close(s);
+    fa_device_close(device);
+    free(t);
+    return 0;
+}
+
+static int cmd_play_crossfade(const char* a, const char* b, double fade_ms, double after_ms, int equal)
+{
+    fa_ramp ramp;
+    fa_stream* sa;
+    fa_stream* sb;
+    double t_play, t_fade;
+    fa_result r;
+    open_device();
+    sa = open_playing(a);
+    sb = open_playing(b);
+    memset(&ramp, 0, sizeof(ramp));
+    ramp.curve = equal ? FA_CURVE_EQUAL_POWER : FA_CURVE_LINEAR;
+    bench_sleep_ms(300);
+    t_play = bench_now_ms();
+    fa_stream_play(sa);
+    bench_sleep_ms(after_ms);
+    t_fade = bench_now_ms();
+    r = fa_crossfade(sa, sb, (fa_time)(fade_ms * 1e6), &ramp);
+    bench_sleep_ms(fade_ms + 1000);
+    printf("{");
+    print_device();
+    printf("\"curve\":\"%s\",\"play\":%.3f,\"fade\":%.3f,\"result\":\"%s\"}\n", equal ? "equal" : "linear",
+           t_play, t_fade, fa_result_string(r));
+    fa_stream_close(sa);
+    fa_stream_close(sb);
+    fa_device_close(device);
+    return 0;
+}
+
+static int cmd_play_gapless(const char* a, const char* b)
+{
+    fa_stream* sa;
+    fa_stream* sb;
+    double t_play;
+    fa_result r;
+    open_device();
+    sa = open_playing(a);
+    sb = open_playing(b);
+    r = fa_stream_set_next(sa, sb, 0, NULL);
+    bench_sleep_ms(300);
+    t_play = bench_now_ms();
+    fa_stream_play(sa);
+    wait_ended(sb, length_ms(sa) + length_ms(sb) + 3000);
+    bench_sleep_ms(300);
+    printf("{");
+    print_device();
+    printf("\"play\":%.3f,\"result\":\"%s\"}\n", t_play, fa_result_string(r));
+    fa_stream_close(sa);
+    fa_stream_close(sb);
+    fa_device_close(device);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     fa_engine_config cfg;
     int a = 1, prescan = 0, rc, i;
     const char* cmd;
+    /* FatzAudio needs no FFmpeg. --ffmpeg loads one anyway, for the rows the report
+     * marks "FFmpeg-assisted": formats FatzAudio cannot decode natively yet. */
     if (a + 1 < argc && !strcmp(argv[a], "--ffmpeg")) {
-        if (fa_ffmpeg_load(argv[a + 1]) != FA_OK) fprintf(stderr, "no FFmpeg in %s\n", argv[a + 1]);
+        const char* dir = strcmp(argv[a + 1], "system") ? argv[a + 1] : NULL;
+        if (fa_ffmpeg_load(dir) != FA_OK) fprintf(stderr, "no FFmpeg in %s\n", argv[a + 1]);
         a += 2;
-    } else {
-        fa_ffmpeg_load(NULL);  /* the system's, when there is one; native formats need none */
     }
-    if (a + 1 >= argc) { bench_usage(argv[0], "[--ffmpeg <dir>] ", FA_USAGE); return 2; }
+    if (a + 1 >= argc) { bench_usage(argv[0], "[--ffmpeg <dir>|system] ", FA_USAGE); return 2; }
     cmd = argv[a];
     for (i = a; i < argc; i++)
         if (!strcmp(argv[i], "--prescan")) {
@@ -262,7 +406,7 @@ int main(int argc, char** argv)
             i--;
         }
     fa_engine_config_init(&cfg);
-    cfg.flags = FA_ENGINE_NULL_OUTPUT;
+    if (strncmp(cmd, "play-", 5)) cfg.flags = FA_ENGINE_NULL_OUTPUT;
     if (fa_engine_create(&cfg, &engine) != FA_OK) { fprintf(stderr, "engine failed\n"); return 1; }
     if (!strcmp(cmd, "info")) rc = cmd_info(argv[a + 1], prescan);
     else if (!strcmp(cmd, "decode") && a + 2 < argc) rc = cmd_decode(argv[a + 1], argv[a + 2], prescan);
@@ -270,7 +414,11 @@ int main(int argc, char** argv)
     else if (!strcmp(cmd, "multi") && a + 2 < argc) rc = cmd_multi(argv[a + 1], atoi(argv[a + 2]));
     else if (!strcmp(cmd, "disc") && a + 3 < argc) rc = cmd_disc(argv[a + 1], atoi(argv[a + 2]), argv[a + 3]);
     else if (!strcmp(cmd, "loudness")) rc = cmd_loudness(argv[a + 1]);
-    else { bench_usage(argv[0], "[--ffmpeg <dir>] ", FA_USAGE); rc = 2; }
+    else if (!strcmp(cmd, "play-latency") && a + 3 < argc) rc = cmd_play_latency(argv[a + 1], atoi(argv[a + 2]), atof(argv[a + 3]));
+    else if (!strcmp(cmd, "play-crossfade") && a + 4 < argc)
+        rc = cmd_play_crossfade(argv[a + 1], argv[a + 2], atof(argv[a + 3]), atof(argv[a + 4]), a + 5 < argc && !strcmp(argv[a + 5], "equal"));
+    else if (!strcmp(cmd, "play-gapless") && a + 2 < argc) rc = cmd_play_gapless(argv[a + 1], argv[a + 2]);
+    else { bench_usage(argv[0], "[--ffmpeg <dir>|system] ", FA_USAGE); rc = 2; }
     fa_engine_destroy(engine);
     return rc;
 }
