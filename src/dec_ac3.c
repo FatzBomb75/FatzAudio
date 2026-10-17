@@ -182,7 +182,7 @@ static fa_result ac3c_decode(fa_codec* c, const uint8_t* data, size_t size)
         st->pend_frames = 0;
     }
     if (st->len + size > st->cap) {
-        size_t cap = st->cap ? st->cap : 16384;
+        size_t cap = st->cap ? st->cap : 4096;
         uint8_t* b;
         while (cap < st->len + size) cap *= 2;
         b = (uint8_t*)realloc(st->buf, cap);
@@ -208,17 +208,32 @@ static fa_result ac3c_decode(fa_codec* c, const uint8_t* data, size_t size)
             pos += n;
             continue;
         }
-        r = fa_ac3_decode(st->dec, st->buf + pos, n, c->dynamic_range ? fa_load32(c->dynamic_range) : FA_AC3_DRC_OFF,
-                          &st->pcm, &st->pcm_cap, &frames, &channels, &rate);
-        if (r == FA_ERROR_UNSUPPORTED_FORMAT && st->ff_state == 0 && ffmpeg_unit(c, st->buf + pos, n) != 0) {
+        {
+            /* The usual case, one unit per packet: straight into the output. */
+            int direct = c->out_frames == 0;
+            size_t cap = direct ? (size_t)c->out_cap : st->pcm_cap;
+            float** dst = direct ? &c->out : &st->pcm;
+            r = fa_ac3_decode(st->dec, st->buf + pos, n, c->dynamic_range ? fa_load32(c->dynamic_range) : FA_AC3_DRC_OFF,
+                              dst, &cap, &frames, &channels, &rate);
+            if (direct) c->out_cap = (fa_frames)cap;
+            else st->pcm_cap = cap;
+            if (r == FA_ERROR_UNSUPPORTED_FORMAT && st->ff_state == 0 && ffmpeg_unit(c, st->buf + pos, n) != 0) {
+                pos += n;
+                continue;
+            }
+            if (r == FA_ERROR_OUT_OF_MEMORY) return r;
             pos += n;
-            continue;
+            if (frames <= 0) continue;
+            if (direct) {
+                c->out_frames = frames;
+                c->channels = (uint32_t)channels;
+                c->rate = rate;
+                r = FA_OK;
+            } else {
+                r = format_change(c, (uint32_t)channels, rate) ? hold(st, st->pcm, frames, (uint32_t)channels, rate)
+                                                                : append_out(c, st->pcm, frames, (uint32_t)channels, rate);
+            }
         }
-        if (r == FA_ERROR_OUT_OF_MEMORY) return r;
-        pos += n;
-        if (frames <= 0) continue;
-        r = format_change(c, (uint32_t)channels, rate) ? hold(st, st->pcm, frames, (uint32_t)channels, rate)
-                                                        : append_out(c, st->pcm, frames, (uint32_t)channels, rate);
         if (r != FA_OK) return r;
     }
     if (pos > st->len) pos = st->len;
@@ -308,6 +323,9 @@ typedef struct ac3_raw {
     int may_seek;
     ac3_unit* index;
     size_t nindex;
+    int64_t cbr;            /* every unit one frame of this size (no index needed) */
+    int64_t cbr_units;
+    int cbr_samples;
     double bytes_per_sample;
     int64_t est_samples;
 } ac3_raw;
@@ -481,6 +499,12 @@ static fa_result raw_seek_packets(void* ctx, int64_t t, int packets_back, size_t
         lo = lo >= (size_t)packets_back ? lo - (size_t)packets_back : 0;
         off = a->index[lo].off;
         pts = a->index[lo].pts;
+    } else if (a->cbr) {
+        int64_t u = t > 0 ? t / a->cbr_samples : 0;
+        if (u >= a->cbr_units) u = a->cbr_units - 1;
+        u = u >= packets_back ? u - packets_back : 0;
+        off = a->data_start + u * a->cbr;
+        pts = u * a->cbr_samples;
     } else {
         if (!a->br.src->seekable || a->bytes_per_sample <= 0) return FA_ERROR_NOT_SEEKABLE;
         pts = t - (int64_t)packets_back * 1536;
@@ -492,12 +516,43 @@ static fa_result raw_seek_packets(void* ctx, int64_t t, int packets_back, size_t
     if (r != FA_OK) return r;
     a->h_n = 0;
     a->pts = pts;
-    a->in_flow = a->index != NULL;
+    a->in_flow = a->index != NULL || a->cbr;
     a->may_seek = 1;
     return FA_OK;
 }
 
 static const fa_demux_ops raw_ops = { raw_next, raw_seek_packets };
+
+/* Local files where every frame is a unit of one size (constant bit rate, one
+ * substream: nearly every AC-3 file): the data is a whole number of frames, and
+ * the second, the last and 32 frames spread in between have the first one's
+ * size and rate. Then unit k is at data_start + k * size, with no index to
+ * build. (A stretch of other frames that happens to keep every checked frame in
+ * place goes unnoticed: seeks into it land on the next frame, a little off.) */
+#define AC3_CBR_CHECKS 32
+static int check_cbr(ac3_raw* a, const fa_ac3_header* first, int64_t* out_end)
+{
+    int64_t len = a->br.src->length, size = (int64_t)first->frame_size, n;
+    int i;
+    if (len <= a->data_start || size <= 0 || (len - a->data_start) % size != 0) return 0;
+    n = (len - a->data_start) / size;
+    for (i = 0; i <= AC3_CBR_CHECKS + 1; i++) {
+        uint8_t hb[8];
+        fa_ac3_header h;
+        int64_t at = i == 0 ? 1 : i == AC3_CBR_CHECKS + 1 ? n - 1 : n * i / (AC3_CBR_CHECKS + 1);
+        if (at >= n) at = n - 1;
+        if (fa_br_seek(&a->br, a->data_start + at * size) != FA_OK || fa_br_read(&a->br, hb, 8) != 8 ||
+            !fa_ac3_parse_header(hb, 8, &h) || !starts_unit(&h) || h.frame_size != first->frame_size ||
+            h.rate != first->rate || h.blocks != first->blocks || h.eac3 != first->eac3)
+            return 0;
+    }
+    a->cbr = size;
+    a->cbr_units = n;
+    a->cbr_samples = first->blocks * 256;
+    a->bytes_per_sample = (double)size / (double)a->cbr_samples;
+    *out_end = n * a->cbr_samples;
+    return 1;
+}
 
 /* Local files: every unit's offset and time, hopping from header to header (junk
  * between frames is slid over). Very long files fall back to estimates. */
@@ -612,10 +667,12 @@ static fa_result raw_open(fa_decoder* dec)
     a->eac3 = h.eac3;
 
     if (src->seekable) {
-        if (src->kind != FA_SOURCE_IO && !src->remote) r = build_index(a, &end);
+        if (src->kind != FA_SOURCE_IO && !src->remote) {
+            if (!check_cbr(a, &h, &end)) r = build_index(a, &end);
+        }
         else estimate_rate(a);
         if (r != FA_OK) goto fail;
-        if (!a->index && a->bytes_per_sample > 0 && src->length > a->data_start)
+        if (!a->index && !a->cbr && a->bytes_per_sample > 0 && src->length > a->data_start)
             a->est_samples = (int64_t)((double)(src->length - a->data_start) / a->bytes_per_sample);
         r = fa_br_seek(&a->br, a->data_start);
         if (r != FA_OK) goto fail;
@@ -631,14 +688,14 @@ static fa_result raw_open(fa_decoder* dec)
     tp.time_base = 1.0 / h.rate;
     tp.start = 0;
     tp.end = end != FA_DEMUX_NO_PTS ? end : a->est_samples > 0 ? a->est_samples : FA_DEMUX_NO_PTS;
-    tp.clip_to_end = a->index != NULL;
+    tp.clip_to_end = a->index != NULL || a->cbr;
     tp.exact_durations = 1;
     tp.last_pts = FA_DEMUX_NO_PTS;
 
     r = fa_track_open(&a->track, dec, &raw_ops, a, &tp);
     if (r != FA_OK) goto fail;
     dec->impl = a;
-    dec->seekable = a->index != NULL || (src->seekable && a->bytes_per_sample > 0);
+    dec->seekable = a->index != NULL || a->cbr || (src->seekable && a->bytes_per_sample > 0);
     snprintf(dec->container, sizeof(dec->container), "%s", h.eac3 ? "ec3" : "ac3");
     return FA_OK;
 fail:
