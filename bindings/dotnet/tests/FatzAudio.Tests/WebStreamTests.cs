@@ -150,6 +150,9 @@ public sealed class WebStreamTests : IDisposable
         radio.MetadataChanged += (_, e) => { lock (titles) titles.Add(e.Metadata); };
         var buf = new float[4096 * 2];
         long frames = 0;
+        // Song 2 starts 2 s in: read 1 s and let song 1's event arrive before going on.
+        while (frames < 44100) frames += radio.Read(buf) / 2;
+        for (int i = 0; i < 200; i++) { lock (titles) if (titles.Count >= 1) break; Thread.Sleep(10); }
         while (frames < 3 * 44100) frames += radio.Read(buf) / 2;
 
         var md = radio.Metadata;
@@ -165,6 +168,7 @@ public sealed class WebStreamTests : IDisposable
         {
             Assert.Equal(2, titles.Count);
             Assert.Equal("Song 1", titles[0].Title);
+            Assert.Equal("Song 2", titles[1].Title);
         }
     }
 

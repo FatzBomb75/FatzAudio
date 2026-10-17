@@ -837,7 +837,7 @@ public unsafe class AudioStream : IDisposable
 
     /// <summary>Raised when playback reaches the end of the source. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? Ended;
-    /// <summary>Raised when a web radio station's song title changes, at the moment the new song is heard (not when it was downloaded). Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
+    /// <summary>Raised when a web radio station's song title changes, at the moment the new song is heard (not when it was downloaded). When titles change faster than events are delivered (decode-only streams read faster than real time), only the latest title is raised. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler<MetadataChangedEventArgs>? MetadataChanged;
     /// <summary>Raised when playback stalls waiting for data. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? Stalled;
@@ -912,8 +912,10 @@ public unsafe class AudioStream : IDisposable
                 case 3:
                     if (MetadataChanged is { } onMeta)
                     {
+                        // A newer title was heard before this event was delivered (a fast
+                        // decode-only reader): its own event follows, so skip this stale one.
                         var md = Metadata;
-                        onMeta(this, new MetadataChangedEventArgs(md, FramesToTime(frame), frame));
+                        if (md.Sequence <= value) onMeta(this, new MetadataChangedEventArgs(md, FramesToTime(frame), frame));
                     }
                     break;
                 case 4: Stalled?.Invoke(this, EventArgs.Empty); break;

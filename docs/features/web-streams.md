@@ -158,7 +158,7 @@ MP3 over the network seeks by estimated byte position, like most players do for 
 
 ## Song titles (ICY metadata)
 
-Radio servers send the title of the song inside the audio data, every few KB. The title is downloaded seconds before you hear it (the buffer), so FatzAudio keeps it until playback reaches the byte where it was sent, then raises `FA_EVENT_METADATA`. `value` is the title's `seq` (1, 2, ...), and `fa_stream_get_metadata` returns the title heard now, never one that is still in the buffer.
+Radio servers send the title of the song inside the audio data, every few KB. The title is downloaded seconds before you hear it (the buffer), so FatzAudio keeps it until playback reaches the byte where it was sent, then raises `FA_EVENT_METADATA`. `value` is the title's `seq` (1, 2, ...), and `fa_stream_get_metadata` returns the title heard now, never one that is still in the buffer. Events are delivered on the event thread, so when titles change faster than that (a decode-only stream read faster than real time), `fa_stream_get_metadata` in the handler can already return a newer title: compare its `seq` with the event's `value`. The .NET `MetadataChanged` skips such stale events and raises only the latest title.
 
 `stream_title` is the title exactly as the station sends it; `artist` and `title` split it at the first `" - "`. Titles in Latin-1, which older servers send, are converted to UTF-8. Station details (`station`, `genre`, `description`, `station_url`, `bitrate_kbps`) come from the `icy-*` response headers.
 
