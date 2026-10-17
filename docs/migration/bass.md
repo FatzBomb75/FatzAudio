@@ -749,3 +749,23 @@ AudioEncoder.ConvertFile(engine, "in.mp3", "out.flac", new EncoderOptions { Form
 ```
 
 *More patterns are added here as each feature lands.*
+
+## 5. Measured against BASS
+
+[tools/bass-compare](../../tools/bass-compare/README.md) decodes the same generated files through both libraries (BASS as a black box, through its public API) and scores them. The legacy `bass.dll` reports itself as 2.4.17.0 through `BASS_GetVersion`. Lossless formats (WAV, FLAC) are bit exact in both and AC-3 scores the same; FatzAudio's AAC follows the file's encoder delay where bass_aac does not, and it seeks AC-3 exactly where BASS lands about 20 ms off.
+
+### Positions that move when you port
+
+Stored positions (cue points, mix points, lyrics or CD+G offsets saved by your app) were measured on BASS's timeline. These formats start at a different frame, so shift stored positions by the amount below:
+
+| Format | BASS | FatzAudio | Shift a stored BASS position by |
+|---|---|---|---|
+| AAC in MP4/M4A (and video files) | Plays the encoder's priming (1024 frames) and ignores the edit list, so it is 1024 frames long too | Starts on the first real sample, exact length | −1024 frames (about −23 ms at 44.1 kHz) |
+| AAC in `.aac` (ADTS) files and AAC radio | Drops the first 1024 frames | Keeps them, as FFmpeg does (ADTS has no delay field) | +1024 frames |
+| MP3 without a Xing/LAME header | Drops the decoder's 529-frame delay | Keeps it, as FFmpeg does | +529 frames |
+| WAV, FLAC, MP3 with a LAME header, AC-3 | Same frame | Same frame | none |
+
+### Where BASS is still ahead
+
+The comparison report opens with every measurement where BASS won; the ones to fix are in the [engineering notes](../engineering-notes.md) (area "bass-compare"). In short: MP3 forward seeks are off and slow, the AC-3 decoder is about 2.5 times slower and uses more memory per stream, the loudness scan of MP3 is slower than BASS decoding it, and WMA is not built yet. Ogg Opus and Ogg Vorbis match bassopus and BASS's Vorbis decoder.
+
