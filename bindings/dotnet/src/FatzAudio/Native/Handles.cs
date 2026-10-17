@@ -96,8 +96,27 @@ internal sealed class StreamHandle : SafeHandle
         previous?.DangerousRelease();
     }
 
+    private readonly List<CdgSurface> _surfaces = new();
+
+    /// <summary>Registers a CD+G surface: native surfaces are freed with the stream.</summary>
+    public void TrackSurface(CdgSurface surface)
+    {
+        lock (_surfaces) _surfaces.Add(surface);
+    }
+
+    public void UntrackSurface(CdgSurface surface)
+    {
+        lock (_surfaces) _surfaces.Remove(surface);
+    }
+
     protected override bool ReleaseHandle()
     {
+        // Surfaces the app did not dispose are destroyed with the stream.
+        lock (_surfaces)
+        {
+            foreach (var s in _surfaces) s.Orphan();
+            _surfaces.Clear();
+        }
         NativeMethods.fa_stream_close(handle);
         lock (_pins)
         {

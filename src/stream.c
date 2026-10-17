@@ -10,6 +10,7 @@
  * `flushing` or removes the voice, waits until the audio callback has passed
  * (fa_device_wait_quiescent), then takes decode_lock so no worker runs either. */
 #include "net.h"
+#include "cdg.h"
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -44,6 +45,7 @@ static fa_frames marker(struct fa_stream* s, int m) { return fa_load64(&s->marke
 void fa_stream_free_memory(struct fa_stream* s)
 {
     free(s->carry);
+    fa_mutex_destroy(&s->cdg_lock);
     fa_mutex_destroy(&s->norm_lock);
     fa_mutex_destroy(&s->cb_lock);
     fa_mutex_destroy(&s->decode_lock);
@@ -69,6 +71,7 @@ static void release_chain(struct fa_stream* s)
 static void stream_discard(struct fa_stream* s)
 {
     if (s->run_meter_ready) fa_meter_free(&s->run_meter);
+    fa_stream_cdg_close(s);
     free(s->path);
     free(s->matrix);
     if (s->decoder_ready) fa_decoder_close(&s->decoder);
@@ -91,6 +94,11 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
     }
     if (fa_mutex_init(&s->norm_lock) != 0) {
         fa_mutex_destroy(&s->cb_lock); fa_mutex_destroy(&s->decode_lock); fa_mutex_destroy(&s->api_lock); free(s);
+        return FA_ERROR_GENERIC;
+    }
+    if (fa_mutex_init(&s->cdg_lock) != 0) {
+        fa_mutex_destroy(&s->norm_lock); fa_mutex_destroy(&s->cb_lock); fa_mutex_destroy(&s->decode_lock);
+        fa_mutex_destroy(&s->api_lock); free(s);
         return FA_ERROR_GENERIC;
     }
     s->engine = engine;
@@ -144,22 +152,98 @@ static void stream_opened(struct fa_stream* s)
         fa_stream_start_analysis(s);
 }
 
+#define FA_ZIP_MAX_BYTES ((size_t)1 << 30)
+
+static int source_is_zip(fa_source* src)
+{
+    const uint8_t* p;
+    size_t n = fa_source_peek(src, &p);
+    return fa_zip_probe(p, n);
+}
+
+/* Prefers entries named like the .cdg ("song.mp3" for "song.cdg"). */
+static int same_stem(const char* a, const char* cdg_name)
+{
+    size_t n = strlen(cdg_name) - 4; /* without ".cdg" */
+    return strncmp(a, cdg_name, n) == 0 && a[n] == '.';
+}
+
+/* A ZIP archive (karaoke downloads: song.mp3 + song.cdg). The audio entry becomes
+ * the stream's memory source, the .cdg entry its graphics. Takes `zip` (malloc'ed).
+ * Expects s->source closed. */
+static fa_result open_zip(struct fa_stream* s, uint8_t* zip, size_t size, const fa_open_options* options)
+{
+    fa_zip_entry* entries;
+    uint32_t count, i, pass;
+    int cdg = -1;
+    fa_result r = fa_zip_list(zip, size, &entries, &count);
+    if (r != FA_OK) { free(zip); return r; }
+    for (i = 0; i < count && cdg < 0; i++)
+        if (fa_cdg_is_cdg_name(entries[i].name)) cdg = (int)i;
+    r = FA_ERROR_UNSUPPORTED_FORMAT;
+    for (pass = 0; pass < 2 && r != FA_OK && r != FA_ERROR_NOT_FOUND; pass++) {
+        for (i = 0; i < count && r != FA_OK; i++) {
+            uint8_t* audio;
+            int preferred = cdg >= 0 && same_stem(entries[i].name, entries[cdg].name);
+            if ((int)i == cdg || fa_cdg_is_cdg_name(entries[i].name) || preferred != (pass == 0)) continue;
+            if (fa_zip_extract(zip, size, &entries[i], &audio) != FA_OK) continue;
+            fa_source_open_memory_ref(&s->source, audio, (size_t)entries[i].size);
+            s->source.owned = audio;
+            r = stream_open_decoder(s, entries[i].name, options);
+            /* The audio_track asked for is missing: no other entry is tried. The
+             * source stays open for stream_discard. */
+            if (r == FA_ERROR_NOT_FOUND) break;
+            if (r != FA_OK) {
+                if (s->decoder_ready) { fa_decoder_close(&s->decoder); s->decoder_ready = 0; }
+                fa_source_close(&s->source);
+            }
+        }
+    }
+    if (r == FA_OK && cdg >= 0 && !(s->flags & FA_OPEN_NO_CDG)) {
+        uint8_t* bytes;
+        fa_cdg_data* data;
+        /* Damaged graphics leave a playable song: the stream simply has none. */
+        if (fa_zip_extract(zip, size, &entries[cdg], &bytes) == FA_OK &&
+            fa_cdg_data_adopt(bytes, (size_t)entries[cdg].size, &data) == FA_OK)
+            fa_stream_cdg_attach(s, data);
+    }
+    free(entries);
+    free(zip);
+    return r;
+}
+
 FA_API fa_result FA_CALL fa_stream_open_path(fa_engine* engine, const char* path, const fa_open_options* options, fa_stream** out_stream)
 {
     struct fa_stream* s; fa_result r;
+    int zip = 0;
     if (!engine || !path || !out_stream) return FA_ERROR_INVALID_ARG;
     *out_stream = NULL;
     r = stream_create(engine, options, &s);
     if (r != FA_OK) return r;
     r = fa_source_open_path(&s->source, path);
-    if (r == FA_OK) r = stream_open_decoder(s, path, options);
-    if (r == FA_OK) {
+    if (r == FA_OK && source_is_zip(&s->source)) {
+        uint8_t* bytes; size_t size = 0;
+        zip = 1;
+        r = fa_source_read_all(&s->source, FA_ZIP_MAX_BYTES, &bytes, &size);
+        if (r == FA_OK) {
+            fa_source_close(&s->source);
+            r = open_zip(s, bytes, size, options);
+        }
+    } else if (r == FA_OK) {
+        r = stream_open_decoder(s, path, options);
+    }
+    /* Loudness scans reopen path streams by name; a ZIP is scanned from memory. */
+    if (r == FA_OK && !zip) {
         size_t n = strlen(path) + 1;
         s->path = (char*)malloc(n);
         if (s->path) memcpy(s->path, path, n);
         else r = FA_ERROR_OUT_OF_MEMORY;
     }
     if (r != FA_OK) { stream_discard(s); return r; }
+    if (!zip && !(s->flags & FA_OPEN_NO_CDG)) {
+        fa_cdg_data* graphics = fa_cdg_find_sibling(path);
+        if (graphics) fa_stream_cdg_attach(s, graphics);
+    }
     stream_opened(s);
     *out_stream = s;
     return FA_OK;
@@ -173,7 +257,14 @@ FA_API fa_result FA_CALL fa_stream_open_memory(fa_engine* engine, const void* da
     r = stream_create(engine, options, &s);
     if (r != FA_OK) return r;
     r = fa_source_open_memory(&s->source, data, size);
-    if (r == FA_OK) r = stream_open_decoder(s, NULL, options);
+    if (r == FA_OK && source_is_zip(&s->source)) {
+        uint8_t* bytes = s->source.owned; /* the copy becomes the archive */
+        s->source.owned = NULL;
+        fa_source_close(&s->source);
+        r = open_zip(s, bytes, size, options);
+    } else if (r == FA_OK) {
+        r = stream_open_decoder(s, NULL, options);
+    }
     if (r != FA_OK) { stream_discard(s); return r; }
     stream_opened(s);
     *out_stream = s;
@@ -395,6 +486,7 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
     free(stream->matrix);
     stream->matrix = NULL;
     fa_mutex_unlock(&stream->decode_lock);
+    fa_stream_cdg_close(stream); /* its surfaces stay until the app destroys them */
 
     /* The memory goes to the event thread, which frees it after delivering (and
      * skipping) every event already queued for this stream. */
@@ -421,7 +513,7 @@ FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* o
         ? (fa_time)((double)d->length * 1e9 / (double)d->format.sample_rate + 0.5) : -1;
     out_info->seekable = d->seekable;
     out_info->audio_track_count = d->track_count > 0 ? d->track_count : 1;
-    out_info->has_cdg = 0;
+    out_info->has_cdg = fa_stream_cdg_present(stream);
     return FA_OK;
 }
 

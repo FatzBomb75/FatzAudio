@@ -22,7 +22,7 @@ In .NET, errors become a `FatzAudioException` with an `ErrorCode`.
 - **Frames** (`fa_frames`, int64) are sample-exact positions: one frame is one sample on every channel.
 - **Time** (`fa_time`, int64 nanoseconds) is used for durations, markers and clocks.
 - `fa_device_get_time()` is the **device clock**: the audio the device has mixed since it opened. Scheduled starts, ramps, crossfades and queues are timed on it, exact to the frame ([crossfade](features/crossfade.md)).
-- `fa_stream_get_clock()` returns the presentation time of the audio *currently leaving the speaker*, with device latency included. Sync video or CD+G graphics to this value and it stays in sync through pauses, seeks and tempo changes.
+- `fa_stream_get_clock()` returns the presentation time of the audio *currently leaving the speaker*, with device latency included. Sync video to this value and it stays in sync through pauses, seeks and tempo changes. CD+G surfaces follow it by themselves ([CD+G](features/cdg.md)).
 
 ## Threads
 

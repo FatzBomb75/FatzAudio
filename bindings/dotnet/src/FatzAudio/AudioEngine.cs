@@ -435,6 +435,7 @@ internal unsafe ref struct NativeOptions
         if (options.Loop) flags |= 1u << 1;
         if (options.Prescan) flags |= 1u << 2;
         if (options.NoNormalize) flags |= 1u << 3;
+        if (options.NoCdg) flags |= 1u << 4;
         o._ptr->Flags = flags;
         o._ptr->AudioTrack = options.AudioTrack;
         if (options.BufferLength is { } buffer)

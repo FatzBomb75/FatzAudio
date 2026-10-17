@@ -44,6 +44,9 @@ size_t fa_source_peek(fa_source* src, const uint8_t** out_data);
 int64_t fa_source_read(fa_source* src, void* buf, size_t n); /* bytes read, 0 at end, <0 fa_result */
 fa_result fa_source_seek(fa_source* src, int64_t offset);
 int64_t fa_source_tell(const fa_source* src);
+/* The whole source in one malloc'ed block (archives, .cdg files); needs a known
+ * length of at most `max_size`, else FA_ERROR_UNSUPPORTED_FORMAT. */
+fa_result fa_source_read_all(fa_source* src, size_t max_size, uint8_t** out_data, size_t* out_size);
 void fa_source_close(fa_source* src);
 
 /* ---- Decoder registry (decoder.c) --------------------------------------- */
@@ -671,6 +674,15 @@ struct fa_stream {
     fa_atomic64 meta_frame;      /* INT64_MAX = nothing armed */
     fa_atomic64 meta_seq_armed;
     fa_atomic64 meta_announced;
+
+    /* CD+G graphics (cdg.c): the packs, the surfaces drawing them, and a generation
+     * count that tells surfaces the graphics were replaced. Never touched by the
+     * audio thread or the workers. */
+    fa_mutex cdg_lock;
+    struct fa_cdg_data* cdg;     /* NULL = no graphics */
+    struct fa_cdg_surface* cdg_surfaces;
+    uint32_t cdg_gen;
+    fa_atomic64 cdg_offset;      /* fa_time */
 
     struct fa_stream* next;      /* engine->streams or engine->graveyard */
 };

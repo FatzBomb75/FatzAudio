@@ -207,8 +207,11 @@ typedef enum fa_open_flags {
     FA_OPEN_DECODE_ONLY = 1 << 0,  /* not attached to a device; pull with fa_stream_read */
     FA_OPEN_LOOP        = 1 << 1,
     FA_OPEN_PRESCAN     = 1 << 2,  /* build exact seek index / length before returning */
-    FA_OPEN_NO_NORMALIZE = 1 << 3  /* opt this stream out of engine normalization
+    FA_OPEN_NO_NORMALIZE = 1 << 3, /* opt this stream out of engine normalization
                                       (jingles, sound effects, already-mastered mixes) */
+    FA_OPEN_NO_CDG       = 1 << 4  /* no CD+G graphics: fa_stream_open_path does not look
+                                      for a matching .cdg next to the audio, and ZIP
+                                      archives play without theirs (see "CD+G") */
 } fa_open_flags;
 
 typedef struct fa_net_options fa_net_options;
@@ -803,6 +806,115 @@ FA_API fa_result FA_CALL fa_stream_set_loudness(fa_stream* stream, const fa_loud
 /* Standalone scan, no playback: decodes only the audio, in chunks on all cores,
  * and blocks until done. Uses and fills the cache. Tags are ignored (this measures). */
 FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* path, fa_loudness* out_loudness);
+
+/* ---- CD+G karaoke graphics ---------------------------------------------
+ *
+ * A CD+G track is a song plus a stream of graphics packs (300 per second) that
+ * draw the lyrics. FatzAudio treats the graphics as a side stream of the audio:
+ *   - fa_stream_open_path("song.mp3") also loads "song.cdg" from the same folder
+ *     (MP3+G pairs; any audio format works, the .cdg extension may be in any case);
+ *   - fa_stream_open_path / fa_stream_open_memory of a ZIP archive plays the audio
+ *     file inside it and loads the .cdg next to it in the archive;
+ *   - fa_stream_load_cdg_path / fa_stream_load_cdg_memory attach graphics to any
+ *     other stream (web streams, FFmpeg hand-off, other file names).
+ * fa_stream_info.has_cdg is 1 when a stream has graphics.
+ *
+ * To show them, create a surface (fa_cdg_surface_create) and call
+ * fa_cdg_surface_update from your render loop (each vsync, or a timer). It draws the
+ * picture at the time the stream is heard at right now (fa_stream_get_clock), into
+ * a pixel buffer in the format and size you chose, and tells you whether and where
+ * it changed. You copy that to whatever you draw with: a Direct3D/OpenGL/Metal/
+ * Vulkan texture, a WPF WriteableBitmap, a SkiaSharp or Android bitmap, a GDI DIB.
+ * Pausing, seeking, looping, crossfades and tempo changes need no extra work: the
+ * graphics always follow the audio clock. Several surfaces (a preview window and a
+ * TV output, at different sizes) can show one stream.
+ *
+ * The CD+G instruction set is complete: memory and border preset, normal and XOR
+ * tile blocks, scroll preset and copy with smooth-scroll offsets, transparent colour,
+ * and both colour-table loads. CD+EG (extended graphics) packs are ignored. */
+
+typedef struct fa_cdg_surface fa_cdg_surface;
+
+/* Byte order in memory. BGRA32 matches Direct3D/DXGI B8G8R8A8, WPF Bgra32/Pbgra32,
+ * SkiaSharp Bgra8888 and GDI DIBs; RGBA32 matches OpenGL/Vulkan/Metal RGBA8 and
+ * Android ARGB_8888 bitmaps. INDEXED8 is one byte per pixel, a colour index 0..15
+ * into fa_cdg_frame.palette. */
+typedef enum fa_cdg_pixel_format {
+    FA_CDG_PIXELS_BGRA32 = 0,
+    FA_CDG_PIXELS_RGBA32,
+    FA_CDG_PIXELS_INDEXED8
+} fa_cdg_pixel_format;
+
+/* The CD+G screen is 300x216 pixels; the picture area inside the border is 288x192
+ * (6 pixels left and right, 12 top and bottom). */
+#define FA_CDG_WIDTH 300
+#define FA_CDG_HEIGHT 216
+#define FA_CDG_PICTURE_WIDTH 288
+#define FA_CDG_PICTURE_HEIGHT 192
+
+typedef enum fa_cdg_flags {
+    FA_CDG_NO_BORDER     = 1 << 0,  /* only the 288x192 picture area, without the border */
+    FA_CDG_TRANSPARENT   = 1 << 1,  /* the background colour (that of the last screen clear)
+                                       is fully transparent, and colours the disc marks as
+                                       transparent are too: for lyrics over video */
+    FA_CDG_PREMULTIPLIED = 1 << 2,  /* colour multiplied by alpha (WPF Pbgra32, Direct2D,
+                                       most compositors). Without it alpha is straight */
+    FA_CDG_SMOOTH        = 1 << 3   /* bilinear scaling instead of sharp (nearest) pixels;
+                                       ignored for INDEXED8 */
+} fa_cdg_flags;
+
+typedef struct fa_cdg_surface_config {
+    uint32_t struct_size;              /* sizeof(fa_cdg_surface_config) */
+    fa_cdg_pixel_format pixel_format;  /* default BGRA32 */
+    uint32_t width, height;            /* output size in pixels; 0 = native (300x216, or
+                                          288x192 with FA_CDG_NO_BORDER); max 8192 */
+    uint32_t flags;                    /* fa_cdg_flags */
+} fa_cdg_surface_config;
+
+FA_API void FA_CALL fa_cdg_surface_config_init(fa_cdg_surface_config* config);
+
+/* One rendered picture. `pixels` belongs to the surface: it stays valid and unchanged
+ * until the next update of that surface or fa_cdg_surface_destroy. */
+typedef struct fa_cdg_frame {
+    const void* pixels;
+    uint32_t width, height;
+    int32_t stride;                    /* bytes from one row to the next */
+    fa_cdg_pixel_format pixel_format;
+    int32_t changed;                   /* 1 = the pixels or the palette differ from the
+                                          previous update (always 1 on the first update) */
+    int32_t palette_changed;           /* 1 = `palette` differs from the previous update. For
+                                          INDEXED8 this alone changes the colours on screen,
+                                          with an empty dirty rectangle */
+    uint32_t dirty_x, dirty_y;         /* the pixels that changed, in output pixels; upload just
+                                          this rectangle. All 0 when no pixel changed */
+    uint32_t dirty_width, dirty_height;
+    uint8_t palette[16][4];            /* R, G, B, A of colours 0..15 (straight alpha) */
+    fa_time time;                      /* position on the graphics timeline that is shown */
+} fa_cdg_frame;
+
+/* Attaches graphics to any stream, replacing what it had. The file or block is read
+ * in full (memory is copied); path NULL removes the graphics. FA_ERROR_NOT_FOUND if
+ * the file is missing, FA_ERROR_UNSUPPORTED_FORMAT if it holds no whole pack. */
+FA_API fa_result FA_CALL fa_stream_load_cdg_path(fa_stream* stream, const char* path);
+FA_API fa_result FA_CALL fa_stream_load_cdg_memory(fa_stream* stream, const void* data, size_t size);
+/* Shifts the graphics against the audio: positive shows them later, negative earlier.
+ * For files that are out of sync; default 0. */
+FA_API fa_result FA_CALL fa_stream_set_cdg_offset(fa_stream* stream, fa_time offset);
+FA_API fa_result FA_CALL fa_stream_get_cdg_offset(fa_stream* stream, fa_time* out_offset);
+
+/* config NULL = BGRA32, native size. A stream without graphics gives a blank
+ * (black) picture until graphics are loaded. Destroy every surface you create, before
+ * or after closing its stream (not while fa_stream_close runs): once the stream is
+ * closed, updates return FA_ERROR_INVALID_ARG. One surface is updated from one
+ * thread at a time; different surfaces may be updated from different threads. */
+FA_API fa_result FA_CALL fa_cdg_surface_create(fa_stream* stream, const fa_cdg_surface_config* config, fa_cdg_surface** out_surface);
+FA_API void FA_CALL fa_cdg_surface_destroy(fa_cdg_surface* surface);
+/* Draws the picture for the audio heard right now. Cheap when nothing changed: call
+ * it every frame and upload only when out_frame->changed. */
+FA_API fa_result FA_CALL fa_cdg_surface_update(fa_cdg_surface* surface, fa_cdg_frame* out_frame);
+/* Same, at a position you choose on the stream's timeline (ns from its start, the
+ * offset still applies): for your own clock, previews, or rendering to a video file. */
+FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_time time, fa_cdg_frame* out_frame);
 
 /* ---- Events ----------------------------------------------------------- */
 

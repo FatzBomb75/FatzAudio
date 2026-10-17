@@ -210,6 +210,22 @@ The legacy app doesn't ship bassmix.dll, but mixer-style code built on `BASS_Cha
 | BASS_MIXER_CHAN_NORAMPIN | Not needed: starts are exact and fades are explicit | — | ➖ (by design) |
 | BASS_Split_* (one source to several outputs) | Not provided yet | | 🗓️ |
 
+### CD+G karaoke graphics
+
+BASS has no CD+G decoder: apps read the `.cdg` themselves, time it from `BASS_ChannelGetPosition` and draw it. basscd only gives raw subchannel data from discs (`BASS_CD_SUBCHANNEL`). FatzAudio decodes, times and draws CD+G itself ([CD+G](../features/cdg.md)).
+
+| BASS / your app | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| Open the `.mp3` and the `.cdg` separately | `fa_stream_open_path` on the audio loads the `.cdg` with the same name | `engine.OpenFile("song.mp3")`, then `song.HasCdg` | ✅ |
+| Unzip a karaoke `.zip` to a temp folder first | `fa_stream_open_path` / `fa_stream_open_memory` on the `.zip` | `engine.OpenFile("song.zip")` | ✅ |
+| Read a `.cdg` from elsewhere into your decoder | `fa_stream_load_cdg_path` / `fa_stream_load_cdg_memory` | `song.LoadCdg(path)` / `song.LoadCdg(bytes)` | ✅ |
+| Your pack decoder (memory/border preset, tiles, scroll, colour tables) | Built in | Built in | ✅ (CD+EG ❌) |
+| Timer: `BASS_ChannelGetPosition` → `Bytes2Seconds` → pack index → decode up to it | `fa_cdg_surface_update` (follows `fa_stream_get_clock`, device latency included) | `surface.Update()` | ✅ |
+| Your own sync offset | `fa_stream_set_cdg_offset` | `song.CdgOffset` | ✅ |
+| Converting the 300x216 index buffer to a bitmap, scaling, borders | `fa_cdg_surface_config`: BGRA/RGBA/indexed, any size, sharp or smooth, with or without border, transparent background, premultiplied | `CdgSurfaceOptions` | ✅ |
+| Redrawing the whole bitmap each tick | Upload only `frame.dirty_*`, only when `frame.changed` | `frame.Changed`, `frame.Dirty` | ✅ |
+| CD+G from a disc via `BASS_CD_StreamCreate(..., BASS_CD_SUBCHANNEL)` | Disc playback | | 🗓️ |
+
 ## 3. Add-on map
 
 | Legacy DLL | Replaced by | Status |
@@ -223,7 +239,8 @@ The legacy app doesn't ship bassmix.dll, but mixer-style code built on `BASS_Cha
 | basswma.dll | Decode via Media Foundation on Windows / FFmpeg bridge; encoding not provided | 🗓️ / ➖ |
 | bassmidi.dll | Built-in MIDI synth (SF2, later SFZ/SF3); soundfont via stream options | 🗓️ |
 | bass_fx.dll | Tempo/pitch/rate params on every stream; reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | 🗓️ tempo/pitch, ✅ level control |
-| basscd.dll | Disc source + CD+G; analog playback not provided | 🗓️ |
+| basscd.dll | Disc source + CD+G; analog playback not provided | 🗓️ disc; ✅ CD+G from files |
+| Your own CD+G decoder and renderer (MP3+G, ZIP) | Built in: `fa_cdg_surface_*` draws the graphics in sync with the audio ([CD+G](../features/cdg.md)) | ✅ |
 
 ## 4. Common patterns
 
@@ -478,4 +495,25 @@ TimeSpan now = audio.Clock;                                               // ren
 audio.Flush();                                                            // after seeking the demuxer
 ```
 
-*More patterns (tempo, CD+G) are added here as each feature lands.*
+
+### Karaoke (MP3+G or ZIP) with lyrics on screen
+
+BASS: open the audio with `BASS_StreamCreateFile`, read the `.cdg` (unzipping first if needed), and on a timer convert `BASS_ChannelGetPosition` to a pack index, decode up to it and repaint a bitmap.
+
+FatzAudio: open the audio (or the `.zip`); the graphics come with it. Create a surface once and call it from the render loop ([CD+G](../features/cdg.md)):
+
+```csharp
+using var song = engine.OpenFile(path);                   // song.mp3 (+ song.cdg) or song.zip
+using var cdg = song.CreateCdgSurface(new CdgSurfaceOptions { Premultiplied = true });
+song.PlayOn(output);
+
+CompositionTarget.Rendering += (_, _) =>
+{
+    var frame = cdg.Update();                             // the picture for what is heard now
+    if (frame.Changed) CopyToBitmap(frame);               // only frame.Dirty changed
+};
+```
+
+Pausing, seeking, crossfading to the next singer and tempo changes need no extra code: delete the timer, the position maths and the pack decoder.
+
+*More patterns (tempo) are added here as each feature lands.*
