@@ -341,8 +341,9 @@ FA_API fa_result FA_CALL fa_stream_push_end(fa_stream* stream);
  * playing stream goes on with whatever is pushed next. */
 FA_API fa_result FA_CALL fa_stream_push_flush(fa_stream* stream);
 /* How much pushed audio has not been heard yet (queued, decoded ahead, and in the
- * device buffer), as a duration. Packets count by their duration, or by the gap
- * to the next packet's pts. */
+ * device buffer), as a duration. Counted from durations, never timestamps, so a
+ * jump in the timeline adds nothing. A queued packet without a duration counts
+ * like the one before it until it is decoded. */
 FA_API fa_result FA_CALL fa_stream_get_buffered(fa_stream* stream, fa_time* out_duration);
 
 /* ---- FFmpeg at runtime ------------------------------------------------------

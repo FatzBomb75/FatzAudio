@@ -15,7 +15,7 @@ void fa_clock_reset(fa_clock* c, int64_t hold_pts)
     int i;
     fa_fetch_add32(&c->epoch, 1);         /* odd: readers retry */
     fa_store64(&c->count, 0);
-    for (i = 0; i < FA_CLOCK_HISTORY; i++) fa_store64(&c->rec[i].seq, 0);
+    for (i = 0; i < FA_CLOCK_HISTORY; i++) fa_store64(&c->rec[i].idx, -1);
     fa_store64(&c->hold, hold_pts);
     fa_fetch_add32(&c->epoch, 1);
 }
@@ -38,36 +38,41 @@ void fa_clock_record(fa_clock* c, int64_t dev, int64_t n, int64_t pts0, int64_t 
         if (pd + pn == dev && p1 - pts0 <= 2 && pts0 - p1 <= 2 && pn > 0) {
             double slope_prev = (double)(p1 - p0) / (double)pn, slope = (double)(pts1 - pts0) / (double)n;
             if (slope_prev - slope < 0.05 && slope - slope_prev < 0.05 && pn < ((int64_t)1 << 20)) {
-                fa_store64(&p->seq, 2 * (k - 1) + 1);
+                int64_t s = fa_load64(&p->seq);
+                fa_store64(&p->seq, s + 1);       /* odd: readers retry */
                 fa_store64(&p->n, pn + n);
                 fa_store64(&p->pts1, pts1);
-                fa_store64(&p->seq, 2 * (k - 1) + 2);
+                fa_store64(&p->seq, s + 2);       /* a new even value: a reader that saw the old one retries */
                 return;
             }
         }
     }
     r = &c->rec[k % FA_CLOCK_HISTORY];
-    fa_store64(&r->seq, 2 * k + 1);
-    fa_store64(&r->dev, dev);
-    fa_store64(&r->n, n);
-    fa_store64(&r->pts0, pts0);
-    fa_store64(&r->pts1, pts1);
-    fa_store64(&r->seq, 2 * k + 2);
+    {
+        int64_t s = fa_load64(&r->seq);
+        fa_store64(&r->seq, s + 1);
+        fa_store64(&r->idx, k);
+        fa_store64(&r->dev, dev);
+        fa_store64(&r->n, n);
+        fa_store64(&r->pts0, pts0);
+        fa_store64(&r->pts1, pts1);
+        fa_store64(&r->seq, s + 2);
+    }
     fa_store64(&c->count, k + 1);
 }
 
-/* Reads record k; 0 if it was overwritten (or is being written) meanwhile. */
+/* Reads record k; 0 if it was overwritten, or written meanwhile. */
 static int read_rec(fa_clock* c, int64_t k, int64_t* dev, int64_t* n, int64_t* p0, int64_t* p1)
 {
     fa_clock_rec* r = &c->rec[k % FA_CLOCK_HISTORY];
     int64_t s1 = fa_load64(&r->seq), s2;
-    if (s1 != 2 * k + 2) return 0;
+    if ((s1 & 1) || fa_load64(&r->idx) != k) return 0;
     *dev = fa_load64(&r->dev);
     *n = fa_load64(&r->n);
     *p0 = fa_load64(&r->pts0);
     *p1 = fa_load64(&r->pts1);
     s2 = fa_load64(&r->seq);
-    return s1 == s2;
+    return s1 == s2 && fa_load64(&r->idx) == k;
 }
 
 int64_t fa_clock_at(fa_clock* c, double frame)
@@ -99,7 +104,10 @@ int64_t fa_clock_at(fa_clock* c, double frame)
             oldest_pts = p0;
         }
         if (torn) continue;
-        if (!found && have_oldest) result = oldest_pts; /* not heard yet: holds at its start */
+        /* Before the first record is heard the clock holds (the seek target, the
+         * last time heard before a flush); only when the records before the oldest
+         * one kept were overwritten is the oldest one's start the best answer. */
+        if (!found && have_oldest && cnt > FA_CLOCK_HISTORY) result = oldest_pts;
         if (fa_load32(&c->epoch) == e1) return result;
     }
 }

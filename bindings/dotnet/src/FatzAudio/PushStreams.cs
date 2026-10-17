@@ -102,8 +102,9 @@ public abstract class FeedAudioStream : AudioStream
     public void Flush() => FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_push_flush(Handle));
 
     /// <summary>
-    /// How much pushed audio has not been heard yet: queued, decoded ahead and in the device buffer. Packets
-    /// count by their duration, or by the gap to the next packet's timestamp.
+    /// How much pushed audio has not been heard yet: queued, decoded ahead and in the device buffer. It is
+    /// counted from durations, never timestamps, so a jump in the timeline adds nothing; a queued packet without
+    /// a duration counts like the one before it until it is decoded.
     /// </summary>
     /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
     public TimeSpan Buffered

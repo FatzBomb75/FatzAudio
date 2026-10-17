@@ -315,7 +315,7 @@ FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* o
 int fa_stream_needs_work(struct fa_stream* s)
 {
     if (!s->ring.data || fa_load32(&s->eof) || fa_load32(&s->flushing)) return 0;
-    if (s->push && !fa_push_has_input(s->push)) return 0;   /* nothing pushed yet */
+    if (s->push && !fa_push_has_input(s->push) && !fa_load32(&s->staged)) return 0;   /* nothing pushed yet */
     return fa_ring_writable(&s->ring) >= s->ring.capacity / 4;
 }
 
@@ -437,11 +437,16 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 rr = fa_decoder_read(&s->decoder, s->in_buf, want, &got);
             }
             if (got == 0 && rr == FA_ERROR_BUSY) break;   /* push stream: nothing queued yet */
-            if (got > 0 && !from_carry && s->push && s->decoder.anchor_pts != FA_PTS_NONE)
+            if (got > 0 && !from_carry && s->push && s->decoder.anchor_pts != FA_PTS_NONE) {
                 /* The app's timeline restarts at this chunk: note at which ring frame
-                 * (what the resampler still holds comes out first). */
+                 * (what the resampler still holds comes out first), and at which
+                 * source frame for a later attach. */
                 fa_ptsmap_add(&s->ptsmap, fa_load64(&s->ring.write) + (int64_t)ma_data_converter_get_output_latency(&s->converter),
                               s->decoder.anchor_pts);
+                s->anchor_pos[s->anchors % FA_SRC_ANCHORS] = s->src_pos;
+                s->anchor_pts[s->anchors % FA_SRC_ANCHORS] = s->decoder.anchor_pts;
+                s->anchors++;
+            }
             if (s->hist) hist_write(s, s->in_buf, got);
             s->in_offset = 0;
             s->in_count = got;
@@ -484,6 +489,9 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
         produced += (int64_t)out_n;
         if (in_n == 0 && out_n == 0) break; /* converter stalled; try again later */
     }
+    /* Frames read but not in the ring yet still need a worker, even with nothing
+     * more pushed (fa_stream_needs_work runs without decode_lock). */
+    fa_store32(&s->staged, s->in_count > 0 || s->carry_count > 0);
 }
 
 /* Source position (not wrapped) after `played` device frames since seek_base. */
@@ -645,6 +653,45 @@ static void detach_locked(struct fa_stream* s)
     else fa_cas32(&s->state, FA_STATE_SCHEDULED, FA_STATE_PAUSED);
 }
 
+/* The pts of source frame `pos` of a push stream, from the timeline restarts noted
+ * by fa_stream_fill; *ok = 0 when the restart before it is no longer known. */
+static int64_t source_pts(struct fa_stream* s, int64_t pos, int* ok)
+{
+    int64_t k, lo = s->anchors > FA_SRC_ANCHORS ? s->anchors - FA_SRC_ANCHORS : 0;
+    double sr = (double)s->decoder.format.sample_rate;
+    for (k = s->anchors - 1; k >= lo; k--) {
+        int64_t ap = s->anchor_pos[k % FA_SRC_ANCHORS];
+        if (ap <= pos) {
+            *ok = 1;
+            return s->anchor_pts[k % FA_SRC_ANCHORS] + (int64_t)((double)(pos - ap) * 1e9 / sr + 0.5);
+        }
+    }
+    *ok = 0;
+    return 0;
+}
+
+/* Attaching a push stream: the audio kept from before a detach (carry) plays first,
+ * with the timestamps it had, timeline jumps inside it included; the decoder's own
+ * output follows. Returns the pts of the first frame. Caller holds decode_lock,
+ * with the pts map just reset and the ring empty. */
+static int64_t carry_timeline(struct fa_stream* s, uint32_t dev_rate)
+{
+    double ratio = (double)dev_rate / (double)s->decoder.format.sample_rate;
+    int64_t pos = s->src_pos, end = pos + s->carry_count, k, lo, first;
+    int ok = 0;
+    if (s->carry_count <= 0) return fa_push_next_pts(s->push);
+    first = source_pts(s, pos, &ok);
+    if (!ok) first = fa_push_next_pts(s->push) - (int64_t)((double)s->carry_count * 1e9 / (double)s->decoder.format.sample_rate + 0.5);
+    fa_ptsmap_add(&s->ptsmap, 0, first);
+    lo = s->anchors > FA_SRC_ANCHORS ? s->anchors - FA_SRC_ANCHORS : 0;
+    for (k = lo; k < s->anchors; k++) {
+        int64_t ap = s->anchor_pos[k % FA_SRC_ANCHORS];
+        if (ap > pos && ap < end)
+            fa_ptsmap_add(&s->ptsmap, (int64_t)((double)(ap - pos) * ratio + 0.5), s->anchor_pts[k % FA_SRC_ANCHORS]);
+    }
+    return first;
+}
+
 FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, fa_bus* bus)
 {
     fa_result r;
@@ -688,12 +735,8 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
         fa_store32(&stream->flushing, 0);
         fa_ptsmap_reset(&stream->ptsmap);
         if (stream->push) {
-            /* Audio kept from before a detach (carry) plays first and ends where the
-             * push decoder's output continues. */
-            int64_t first = fa_push_next_pts(stream->push) -
-                            (int64_t)((double)stream->carry_count * 1e9 / (double)stream->decoder.format.sample_rate + 0.5);
+            int64_t first = carry_timeline(stream, device->rate);
             fa_push_restart_timeline(stream->push);
-            if (stream->carry_count > 0) fa_ptsmap_add(&stream->ptsmap, 0, first);
             fa_clock_reset(&stream->clock, first);
         } else {
             fa_clock_reset(&stream->clock, (int64_t)((double)pos * 1e9 / (double)stream->decoder.format.sample_rate + 0.5));
@@ -940,7 +983,11 @@ FA_API fa_result FA_CALL fa_stream_push_flush(fa_stream* stream)
         fa_device_wait_quiescent(stream->device);   /* the mixer now skips this stream */
     }
     fa_mutex_lock(&stream->decode_lock);
-    fa_push_flush_locked(stream->push);
+    fa_push_flush_locked(stream->push, fa_load64(&stream->clock.count) > 0);
+    /* Audio kept from a detach is decoded-ahead audio too. */
+    stream->carry_count = stream->carry_offset = 0;
+    stream->anchors = 0;
+    fa_store32(&stream->staged, 0);
     if (stream->ring.data) {
         fa_frames pos = fa_stream_position_now(stream);
         fa_ring_reset(&stream->ring);
@@ -952,6 +999,7 @@ FA_API fa_result FA_CALL fa_stream_push_flush(fa_stream* stream)
         fa_store64(&stream->seek_base, pos);
         fa_store64(&stream->position, pos);
         fa_store64(&stream->played, 0);
+        stream->src_pos = pos;
     }
     fa_store64(&stream->played_audible, 0);
     fa_ptsmap_reset(&stream->ptsmap);
@@ -962,18 +1010,33 @@ FA_API fa_result FA_CALL fa_stream_push_flush(fa_stream* stream)
     return FA_OK;
 }
 
+/* Counted by durations, never by timestamps, so jumps in the app's timeline don't
+ * count as audio: the push queue and what its decoder holds, what the stream read
+ * but hasn't put in its ring, the ring, and the device buffer while playing. */
 FA_API fa_result FA_CALL fa_stream_get_buffered(fa_stream* stream, fa_time* out_duration)
 {
-    int64_t end, now;
+    int64_t total;
+    double sr;
     if (!stream || !out_duration) return FA_ERROR_INVALID_ARG;
     *out_duration = 0;
     if (!stream->push) return FA_ERROR_INVALID_ARG;
-    end = fa_push_end_pts(stream->push);
-    if (end == FA_PTS_NONE) return FA_OK;
+    sr = (double)stream->decoder.format.sample_rate;
     fa_mutex_lock(&stream->api_lock);
-    now = fa_stream_clock_at(stream, fa_monotonic_ns());
+    total = fa_push_buffered_ns(stream->push);
+    fa_mutex_lock(&stream->decode_lock);
+    total += (int64_t)((double)(stream->in_count + stream->carry_count) * 1e9 / sr + 0.5);
+    if (stream->ring.data && stream->dev_rate > 0)
+        total += (int64_t)((double)fa_ring_readable(&stream->ring) * 1e9 / (double)stream->dev_rate + 0.5);
+    fa_mutex_unlock(&stream->decode_lock);
+    if (stream->device && stream->dev_rate > 0 && fa_load32(&stream->state) == FA_STATE_PLAYING) {
+        /* In the device buffer: up to its latency, of what was mixed since the last flush. */
+        fa_time lat = 0;
+        int64_t mixed = (int64_t)((double)fa_load64(&stream->played_audible) * 1e9 / (double)stream->dev_rate + 0.5);
+        fa_device_get_latency(stream->device, &lat);
+        total += lat < mixed ? lat : mixed;
+    }
     fa_mutex_unlock(&stream->api_lock);
-    *out_duration = end > now ? end - now : 0;
+    *out_duration = total;
     return FA_OK;
 }
 

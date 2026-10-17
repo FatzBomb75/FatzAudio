@@ -482,7 +482,7 @@ static fa_result parse_stsd(mp4* m, const box* stbl, fa_codec_params* cp)
         }
         if (dsi && dsi_len > 0 && !set_extra(m, dsi, dsi_len)) return FA_ERROR_OUT_OF_MEMORY;
         if (strcmp(name, "aac") == 0 && !m->extra) {
-            uint8_t asc[8];
+            uint8_t asc[FA_AAC_ASC_MAX];
             if (!set_extra(m, asc, fa_aac_build_asc(asc, 2, rate, channels, 0))) return FA_ERROR_OUT_OF_MEMORY;
         }
         break;

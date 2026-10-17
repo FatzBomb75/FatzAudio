@@ -410,7 +410,7 @@ static fa_result map_codec(mkv* m, const mkv_entry* t, fa_codec_params* cp)
             if (!set_extra(m, t->priv.p, t->priv.len)) return FA_ERROR_OUT_OF_MEMORY;
         } else {
             /* Legacy IDs carry the profile in the name: build the config. */
-            uint8_t asc[8];
+            uint8_t asc[FA_AAC_ASC_MAX];
             int aot = 2;
             uint32_t sbr = t->out_rate > t->rate ? (uint32_t)(t->out_rate + 0.5) : 0;
             if (el_starts(id, "A_AAC/MPEG2/MAIN") || el_starts(id, "A_AAC/MPEG4/MAIN")) aot = 1;

@@ -27,6 +27,8 @@ typedef struct fa_push_item {
     int64_t pts;                 /* ns, FA_PTS_NONE */
     uint32_t rate, channels;     /* PCM items: F32 interleaved */
     fa_frames frames;
+    int64_t dur_ns;              /* counted in queued_ns: the packet's duration or a guess */
+    int dur_known;               /* dur_ns was given, not guessed */
     size_t size;                 /* bytes of data */
     /* data follows */
 } fa_push_item;
@@ -42,8 +44,8 @@ struct fa_push {
     int packets;                 /* packet stream (else PCM) */
     fa_audio_format pcm_format;  /* fa_stream_push_pcm's format */
     fa_rational tb;              /* packets: the track's time base */
-    int64_t end_pts;             /* pts after everything pushed so far, FA_PTS_NONE */
-    int64_t last_pts, last_dur;  /* previous packet (ns), to guess missing durations */
+    int64_t queued_ns;           /* audio in the queue (fa_stream_get_buffered) */
+    int64_t last_dur;            /* duration of the latest packet (ns), the guess for one without */
 
     /* Worker side, under the stream's decode_lock. */
     fa_codec codec;
@@ -59,6 +61,8 @@ struct fa_push {
     int need_anchor;             /* the next chunk starts the timeline (first one, after a flush) */
     int hold_pending;            /* ... and sets the clock's hold value */
     fa_atomic64 out_pts;         /* next_pts, readable by any thread */
+    fa_atomic64 out_buffered;    /* frames in buf, readable by any thread */
+    int drained;                 /* the codec was told the input ended and gave back the rest */
 };
 
 static int64_t to_ns(int64_t v, fa_rational tb)
@@ -75,8 +79,6 @@ static fa_result push_new(struct fa_stream* s, struct fa_push** out)
     if (!p) return FA_ERROR_OUT_OF_MEMORY;
     if (fa_mutex_init(&p->lock) != 0) { free(p); return FA_ERROR_GENERIC; }
     p->stream = s;
-    p->end_pts = FA_PTS_NONE;
-    p->last_pts = FA_PTS_NONE;
     p->pending_anchor = FA_PTS_NONE;
     p->need_anchor = 1;
     p->hold_pending = 1;
@@ -156,20 +158,13 @@ static fa_result enqueue(struct fa_push* p, fa_push_item* it, int64_t dur_ns)
     if (p->tail) p->tail->next = it; else p->head = it;
     p->tail = it;
     p->bytes += it->size;
-    /* Where the pushed audio ends, for fa_stream_get_buffered. */
-    if (it->pts != FA_PTS_NONE) {
-        if (dur_ns <= 0 && p->last_pts != FA_PTS_NONE && it->pts > p->last_pts) {
-            p->last_dur = it->pts - p->last_pts;   /* a missing duration: the gap to this one */
-            if (p->end_pts == FA_PTS_NONE || p->last_pts + p->last_dur > p->end_pts) p->end_pts = p->last_pts + p->last_dur;
-        }
-        p->last_pts = it->pts;
-        if (dur_ns > 0) p->last_dur = dur_ns;
-        p->end_pts = it->pts + (dur_ns > 0 ? dur_ns : p->last_dur);
-    } else {
-        int64_t d = dur_ns > 0 ? dur_ns : p->last_dur;
-        p->end_pts = (p->end_pts == FA_PTS_NONE ? 0 : p->end_pts) + d;
-        if (dur_ns > 0) p->last_dur = dur_ns;
-    }
+    /* For fa_stream_get_buffered: durations, never timestamps, so a jump in the
+     * timeline doesn't count as audio. A packet without one counts like the
+     * previous one until it is decoded. */
+    if (dur_ns > 0) p->last_dur = dur_ns;
+    it->dur_known = dur_ns > 0;
+    it->dur_ns = dur_ns > 0 ? dur_ns : p->last_dur;
+    p->queued_ns += it->dur_ns;
     fa_fetch_add32(&p->count, 1);
     fa_mutex_unlock(&p->lock);
     fa_engine_wake_workers(p->stream->engine);
@@ -251,18 +246,19 @@ int fa_push_has_input(struct fa_push* p)
 
 int64_t fa_push_next_pts(struct fa_push* p) { return fa_load64(&p->out_pts); }
 
-int64_t fa_push_end_pts(struct fa_push* p)
+/* Pushed audio not handed to the stream yet: queued, and decoded but not read. */
+int64_t fa_push_buffered_ns(struct fa_push* p)
 {
-    int64_t e;
+    int64_t q;
     fa_mutex_lock(&p->lock);
-    e = p->end_pts;
+    q = p->queued_ns;
     fa_mutex_unlock(&p->lock);
-    return e;
+    return q + (int64_t)((double)fa_load64(&p->out_buffered) * 1e9 / (double)p->rate + 0.5);
 }
 
 /* Drops the queue and everything decoded; the next chunk starts a new timeline.
  * Caller holds the stream's decode_lock. */
-void fa_push_flush_locked(struct fa_push* p)
+void fa_push_flush_locked(struct fa_push* p, int keep_hold)
 {
     fa_push_item* it;
     fa_mutex_lock(&p->lock);
@@ -271,17 +267,20 @@ void fa_push_flush_locked(struct fa_push* p)
     p->bytes = 0;
     fa_store32(&p->count, 0);
     fa_store32(&p->ended, 0);
-    p->end_pts = FA_PTS_NONE;
-    p->last_pts = FA_PTS_NONE;
+    p->queued_ns = 0;
     fa_mutex_unlock(&p->lock);
     while (it) { fa_push_item* n = it->next; free(it); it = n; }
     if (p->codec_ready && p->codec.vt->flush) p->codec.vt->flush(&p->codec);
     if (p->conv_ready) ma_data_converter_reset(&p->conv);
     p->buf_count = p->buf_off = 0;
+    fa_store64(&p->out_buffered, 0);
     p->pending_anchor = FA_PTS_NONE;
     fa_store32(&p->has_buffered, 0);
+    p->drained = 0;
     p->need_anchor = 1;
-    p->hold_pending = 1;
+    /* Once audio has played, the clock holds at the last time heard until the
+     * new audio is heard; before that it shows the first pts pushed. */
+    p->hold_pending = !keep_hold;
 }
 
 /* A new ring starts (attach, a rebuilt chain): the next frame handed out must
@@ -363,23 +362,50 @@ static void post_decode_error(struct fa_push* p, fa_result err)
     fa_engine_post_event(p->stream->engine, &ev);
 }
 
+/* Puts a decoded block into buf and decides whether it starts a new piece of the timeline. */
+static void take_block(struct fa_push* p, const float* pcm, fa_frames n, uint32_t rate, uint32_t ch, int64_t pts)
+{
+    p->buf_count = p->buf_off = 0;
+    if (n > 0 && rate > 0 && ch > 0) {
+        if (convert_into_buf(p, pcm, n, rate, ch) != FA_OK) p->buf_count = 0;
+    }
+    if (p->buf_count > 0) {
+        /* Does this chunk continue the timeline or start a new piece of it? */
+        if (p->need_anchor) {
+            p->pending_anchor = pts != FA_PTS_NONE ? pts : p->next_pts;
+            p->need_anchor = 0;
+        } else if (pts != FA_PTS_NONE && (pts - p->next_pts > FA_PUSH_JITTER_NS || p->next_pts - pts > FA_PUSH_JITTER_NS)) {
+            p->pending_anchor = pts;
+        }
+        fa_store32(&p->has_buffered, 1);
+    }
+}
+
 /* Pops one item and decodes it into buf. 0 = the queue is empty. */
 static int refill(struct fa_push* p)
 {
     fa_push_item* it;
-    const float* pcm;
-    fa_frames n;
-    uint32_t rate, ch;
     fa_mutex_lock(&p->lock);
     it = p->head;
     if (it) {
         p->head = it->next;
         if (!p->head) p->tail = NULL;
         p->bytes -= it->size;
+        p->queued_ns -= it->dur_ns;
         fa_fetch_add32(&p->count, -1);
     }
     fa_mutex_unlock(&p->lock);
-    if (!it) return 0;
+    if (!it) {
+        /* The end: the codec gives back what it still holds (delayed output). */
+        if (p->codec_ready && !p->drained && fa_load32(&p->ended) && fa_load32(&p->count) == 0) {
+            p->drained = 1;
+            if (p->codec.vt->decode(&p->codec, NULL, 0) == FA_OK && p->codec.out_frames > 0) {
+                take_block(p, p->codec.out, p->codec.out_frames, p->codec.rate, p->codec.channels, FA_PTS_NONE);
+                return 1;
+            }
+        }
+        return 0;
+    }
 
     if (it->is_packet) {
         fa_result r = p->codec.vt->decode(&p->codec, (const uint8_t*)(it + 1), it->size);
@@ -388,29 +414,15 @@ static int refill(struct fa_push* p)
             free(it);
             return 1;
         }
-        pcm = p->codec.out;
-        n = p->codec.out_frames;
-        rate = p->codec.rate;
-        ch = p->codec.channels;
-    } else {
-        pcm = (const float*)(it + 1);
-        n = it->frames;
-        rate = it->rate;
-        ch = it->channels;
-    }
-    p->buf_count = p->buf_off = 0;
-    if (n > 0 && rate > 0 && ch > 0) {
-        if (convert_into_buf(p, pcm, n, rate, ch) != FA_OK) p->buf_count = 0;
-    }
-    if (p->buf_count > 0) {
-        /* Does this chunk continue the timeline or start a new piece of it? */
-        if (p->need_anchor) {
-            p->pending_anchor = it->pts != FA_PTS_NONE ? it->pts : p->next_pts;
-            p->need_anchor = 0;
-        } else if (it->pts != FA_PTS_NONE && (it->pts - p->next_pts > FA_PUSH_JITTER_NS || p->next_pts - it->pts > FA_PUSH_JITTER_NS)) {
-            p->pending_anchor = it->pts;
+        if (p->codec.out_frames > 0 && p->codec.rate > 0 && !it->dur_known) {
+            /* No duration given: the next packet without one is guessed from this one. */
+            fa_mutex_lock(&p->lock);
+            p->last_dur = (int64_t)((double)p->codec.out_frames * 1e9 / (double)p->codec.rate + 0.5);
+            fa_mutex_unlock(&p->lock);
         }
-        fa_store32(&p->has_buffered, 1);
+        take_block(p, p->codec.out, p->codec.out_frames, p->codec.rate, p->codec.channels, it->pts);
+    } else {
+        take_block(p, (const float*)(it + 1), it->frames, it->rate, it->channels, it->pts);
     }
     free(it);
     return 1;
@@ -447,6 +459,7 @@ static fa_result push_read(fa_decoder* dec, float* out, fa_frames frames, fa_fra
         if (!refill(p)) break;
     }
     fa_store64(&p->out_pts, p->next_pts);
+    fa_store64(&p->out_buffered, p->buf_count - p->buf_off);
     *got = produced;
     if (produced > 0) return FA_OK;
     if (fa_load32(&p->ended) && fa_load32(&p->count) == 0) return FA_ERROR_END_OF_STREAM;

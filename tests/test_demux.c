@@ -7,6 +7,7 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include "fa_internal.h"
+#include "demux.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -758,6 +759,19 @@ static void test_registry_lists_containers(void)
     CHECK_EQ(found, 2);
 }
 
+/* AAC configs with explicit (non-table) rates, which a Matroska track without
+ * CodecPrivate can ask for: 73 bits with SBR, no write past the buffer. */
+static void test_aac_config_explicit_rates(void)
+{
+    uint8_t asc[FA_AAC_ASC_MAX + 4];
+    memset(asc, 0xAB, sizeof(asc));
+    CHECK(fa_aac_build_asc(asc, 2, 12345, 2, 24690) == 10);
+    CHECK(asc[FA_AAC_ASC_MAX] == 0xAB);                 /* nothing written past the limit */
+    CHECK((asc[0] >> 3) == 5);                          /* explicit SBR */
+    CHECK(fa_aac_build_asc(asc, 2, 12345, 2, 0) == 5);  /* 5 + 28 + 4 + 3 = 40 bits */
+    CHECK(fa_aac_build_asc(asc, 2, 44100, 2, 0) == 2);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -767,6 +781,7 @@ int main(void)
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) { fprintf(stderr, "engine create failed\n"); return 1; }
     printf("FFmpeg %s\n", fa_ffmpeg_load(NULL) == FA_OK ? "found" : "not found: AAC and Opus tracks are skipped");
 
+    RUN(test_aac_config_explicit_rates);
     RUN(test_registry_lists_containers);
     RUN(test_mp4_info_and_tracks);
     RUN(test_mp4_mp3_seek_is_exact);

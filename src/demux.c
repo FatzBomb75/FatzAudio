@@ -379,7 +379,19 @@ static fa_result fill(fa_track* t)
         pk.pts = FA_DEMUX_NO_PTS;
         pk.duration = -1;
         r = t->ops->next(t->ctx, &pk);
-        if (r == FA_ERROR_END_OF_STREAM) { t->eof = 1; break; }
+        if (r == FA_ERROR_END_OF_STREAM) {
+            t->eof = 1;
+            /* The codec gives back what it still holds (decoders with delayed output). */
+            if (t->format_known && t->codec.vt->decode(&t->codec, NULL, 0) == FA_OK && t->codec.out_frames > 0 &&
+                t->codec.rate != 0 && t->codec.channels != 0) {
+                memset(&pk, 0, sizeof(pk));
+                pk.pts = FA_DEMUX_NO_PTS;
+                pk.duration = -1;
+                r = emit(t, &pk);
+                if (r != FA_OK) return r;
+            }
+            break;
+        }
         if (r != FA_OK) return r;
         r = t->codec.vt->decode(&t->codec, pk.data, pk.size);
         if (r == FA_ERROR_OUT_OF_MEMORY) return r;
@@ -526,11 +538,11 @@ static void put_rate(bitw* w, uint32_t rate)
 }
 
 /* ISO/IEC 14496-3 1.6.2.1 AudioSpecificConfig with a GASpecificConfig. */
-size_t fa_aac_build_asc(uint8_t out[8], int object_type, uint32_t rate, uint32_t channels, uint32_t sbr_rate)
+size_t fa_aac_build_asc(uint8_t out[FA_AAC_ASC_MAX], int object_type, uint32_t rate, uint32_t channels, uint32_t sbr_rate)
 {
     bitw w;
     uint32_t cfg = channels <= 6 ? channels : channels == 8 ? 7 : 2;
-    memset(out, 0, 8);
+    memset(out, 0, FA_AAC_ASC_MAX);
     w.p = out;
     w.bit = 0;
     if (sbr_rate > rate) {

@@ -131,10 +131,10 @@ audio.PushFrame(fmt, (nint)frame->extended_data, frame->nb_samples, frame->best_
 
 | Call | What happens |
 |---|---|
-| `fa_stream_get_buffered` / `Buffered` | Pushed audio not heard yet: queued, decoded ahead and in the device buffer. Packets count by their duration, or by the gap to the next packet's pts. Keep about a second queued |
+| `fa_stream_get_buffered` / `Buffered` | Pushed audio not heard yet: queued, decoded ahead and in the device buffer. Counted from durations, never timestamps, so a jump in the timeline adds nothing; a queued packet without a duration counts like the one before it until it is decoded. Keep about a second queued |
 | The queue runs dry | The stream is `FA_STATE_BUFFERING`, the clock holds, and `FA_EVENT_STALLED` (`Stalled`) is raised once audio had played. It resumes by itself when about 100 ms are queued (`FA_EVENT_RESUMED`, `Resumed`) |
-| `fa_stream_push_end` / `End` | Plays what is queued, then ends (`FA_EVENT_ENDED`). Pushing after it returns `FA_ERROR_END_OF_STREAM` |
-| `fa_stream_push_flush` / `Flush` | Drops everything queued and decoded ahead, at once. The clock holds where it was until audio from the new position plays. A playing stream keeps playing whatever comes next. Also makes an ended stream pushable again |
+| `fa_stream_push_end` / `End` | Plays what is queued, including what the decoder still holds (codecs with delayed output), then ends (`FA_EVENT_ENDED`). Pushing after it returns `FA_ERROR_END_OF_STREAM` |
+| `fa_stream_push_flush` / `Flush` | Drops everything queued and decoded ahead, at once, including audio kept by a detach. The clock holds where it was until audio from the new position is heard, also while paused. A playing stream keeps playing whatever comes next. Also makes an ended stream pushable again |
 
 Push streams can't be seeked with `fa_stream_seek` (`FA_ERROR_NOT_SEEKABLE`): seek your demuxer, flush, and push from the new position.
 

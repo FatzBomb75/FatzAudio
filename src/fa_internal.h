@@ -154,7 +154,8 @@ void fa_ring_reset(fa_ring* r);
 #define FA_CLOCK_HISTORY 128
 
 typedef struct fa_clock_rec {
-    fa_atomic64 seq;              /* 2k+1 while record k is written, 2k+2 when done */
+    fa_atomic64 seq;              /* odd while being written; changes on every write */
+    fa_atomic64 idx;              /* which record (k) this slot holds, -1 = none */
     fa_atomic64 dev, n, pts0, pts1;
 } fa_clock_rec;
 
@@ -177,6 +178,8 @@ int64_t fa_clock_at(fa_clock* c, double frame);
  * (frames written since the ring was reset) the pts is `pts`. Single producer (the
  * decode worker, under decode_lock), single consumer (the audio thread). */
 #define FA_PTSMAP_SIZE 64
+
+#define FA_SRC_ANCHORS 64
 
 typedef struct fa_ptsmap {
     int64_t idx[FA_PTSMAP_SIZE];
@@ -601,6 +604,11 @@ struct fa_stream {
     struct fa_push* push;        /* NULL for file, memory and I/O streams */
     fa_atomic64 played_audible;  /* frames played since the last flush (stall events) */
     int stalled;                 /* audio thread: FA_EVENT_STALLED raised, RESUMED owed */
+    /* Push streams, under decode_lock: the source frames at which the app's timeline
+     * restarted, so audio kept across a detach (carry) keeps its timestamps. */
+    int64_t anchor_pos[FA_SRC_ANCHORS], anchor_pts[FA_SRC_ANCHORS];
+    int64_t anchors;             /* written since the last flush */
+    fa_atomic32 staged;          /* in_buf or carry hold frames not in the ring yet */
 
     /* Parameters */
     fa_lane lanes[FA_STREAM_LANES];      /* VOLUME, PAN, crossfade gain */
@@ -735,12 +743,12 @@ fa_result fa_push_init_pcm(struct fa_stream* s, const fa_audio_format* f);
 fa_result fa_push_init_packets(struct fa_stream* s, const fa_codec_params* params);
 /* Under decode_lock: drop everything queued and decoded (fa_stream_push_flush), or
  * re-anchor the timeline at the next frame (a new ring). */
-void fa_push_flush_locked(struct fa_push* p);
+void fa_push_flush_locked(struct fa_push* p, int keep_hold);
 void fa_push_restart_timeline(struct fa_push* p);
 /* pts of the next frame the push decoder will hand out (ns). */
 int64_t fa_push_next_pts(struct fa_push* p);
 /* Total duration of everything pushed so far, as a pts end (ns); FA_PTS_NONE if nothing. */
-int64_t fa_push_end_pts(struct fa_push* p);
+int64_t fa_push_buffered_ns(struct fa_push* p);
 
 /* engine.c */
 void fa_engine_wake_workers(fa_engine* engine);

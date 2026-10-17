@@ -336,6 +336,7 @@ typedef struct ff_codec {
     void* ctx;
     void* pkt;
     void* frame;
+    int drained;   /* the end-of-input packet was sent */
 } ff_codec;
 
 static int ctx_channels(void* ctx)
@@ -396,7 +397,17 @@ static fa_result ff_decode(fa_codec* c, const uint8_t* data, size_t size)
     fa_result r = FA_OK;
     int ret;
     c->out_frames = 0;
+    if (!data && size == 0) {
+        /* The input ended: an empty packet makes the decoder give back what it
+         * still holds. Once drained it stays so until ff_flush. */
+        if (f->drained) return FA_OK;
+        f->drained = 1;
+        ret = ff.avcodec_send_packet(f->ctx, NULL);
+        if (ret < 0 && ret != FF_ERROR_EOF) return FA_OK;
+        return drain(c, f);
+    }
     if (size == 0 || size > 0x7FFFFFF0) return FA_OK;
+    if (f->drained) return FA_OK;  /* nothing more after the end until a flush */
     /* Decoders read past the end in blocks: the data needs zeroed padding. */
     copy = (uint8_t*)malloc(size + FF_INPUT_PADDING);
     if (!copy) return FA_ERROR_OUT_OF_MEMORY;
@@ -428,6 +439,7 @@ static void ff_flush(fa_codec* c)
 {
     ff_codec* f = (ff_codec*)c->impl;
     ff.avcodec_flush_buffers(f->ctx);
+    f->drained = 0;
 }
 
 static void ff_close(fa_codec* c)

@@ -129,6 +129,8 @@ int64_t fa_demux_packet_samples(const char* codec, uint32_t channels, uint32_t r
 
 /* AudioSpecificConfig for AAC from the container's rate and channels, for files
  * that do not carry one. `sbr_rate` > rate signals HE-AAC. Returns its size. */
-size_t fa_aac_build_asc(uint8_t out[8], int object_type, uint32_t rate, uint32_t channels, uint32_t sbr_rate);
+/* At most 5 + 28 + 4 + 28 + 5 + 3 = 73 bits: two explicit 24-bit rates with SBR. */
+#define FA_AAC_ASC_MAX 16
+size_t fa_aac_build_asc(uint8_t out[FA_AAC_ASC_MAX], int object_type, uint32_t rate, uint32_t channels, uint32_t sbr_rate);
 
 #endif

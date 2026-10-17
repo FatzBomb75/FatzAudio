@@ -351,6 +351,141 @@ static void test_clock_across_detach(void)
     fa_stream_close(s);
 }
 
+/* Detaching while the decoded-ahead audio holds a timestamp jump: after attaching
+ * again, the jump is still heard where it was. */
+static void test_clock_across_detach_with_jump(void)
+{
+    fa_stream* s = open_push_s16p();
+    int64_t lat = latency_ns(), t1, heard_ns, half = g_dev->rate / 4;   /* 250 ms pieces */
+    fa_frames pos = 0;
+    CHECK(s != NULL);
+    CHECK_EQ(push_level(s, half, 0.25f, 0), FA_OK);
+    CHECK_EQ(push_level(s, half, 0.25f, 10000000000LL), FA_OK);          /* jump to 10 s */
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    wait_decoded(s, half * 2 - PERIOD);
+    render(PERIOD * 10);                                                 /* 100 ms: before the jump */
+    CHECK_EQ(fa_stream_detach(s), FA_OK);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK(pos > 0 && pos < half);
+    heard_ns = (int64_t)((double)pos * 1e9 / g_dev->rate + 0.5);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_NEAR((double)clock_at(s, g_now), (double)heard_ns, 2000.0);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    wait_decoded(s, PERIOD * 4);
+    t1 = g_now;
+    render(half * 2 - pos);
+    CHECK_NEAR((double)clock_at(s, t1 + lat + 50000000), (double)(heard_ns + 50000000), 2000.0);
+    /* 250 ms - heard after attaching, the 10 s piece is heard. */
+    CHECK_NEAR((double)clock_at(s, t1 + lat + (250000000 - heard_ns) + 20000000), 10020000000.0, 2000.0);
+    fa_stream_close(s);
+}
+
+/* Flush drops the audio kept by a detach too, and the clock holds at the last time
+ * heard until audio of the new position is heard. */
+static void test_flush_after_detach_and_hold(void)
+{
+    fa_stream* s = open_push_s16p();
+    int64_t lat = latency_ns(), t1, held;
+    int64_t i, wrong = 0;
+    CHECK(s != NULL);
+    CHECK_EQ(push_level(s, g_dev->rate, 0.25f, 1000000000LL), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    wait_decoded(s, PERIOD * 4);
+    render(PERIOD * 10);
+    CHECK_EQ(fa_stream_pause(s), FA_OK);
+    render(PERIOD * 10);                             /* the device buffer plays out */
+    held = clock_at(s, g_now);
+    CHECK_NEAR((double)held, 1000000000.0 + 100000000.0, 2000.0);
+    /* Paused: the app seeks to 30 s. The new audio decodes at once, but the clock
+     * holds until it is heard. */
+    CHECK_EQ(fa_stream_push_flush(s), FA_OK);
+    CHECK_EQ(push_level(s, g_dev->rate / 2, 0.5f, 30000000000LL), FA_OK);
+    wait_decoded(s, PERIOD * 4);
+    CHECK_NEAR((double)clock_at(s, g_now), (double)held, 2000.0);
+    /* Detach, flush again and push another position: nothing kept from before plays. */
+    CHECK_EQ(fa_stream_detach(s), FA_OK);
+    CHECK_EQ(fa_stream_push_flush(s), FA_OK);
+    CHECK_EQ(push_level(s, g_dev->rate / 2, 0.125f, 40000000000LL), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    wait_decoded(s, PERIOD * 4);
+    t1 = g_now;
+    rec_reset();
+    render(PERIOD * 20);
+    for (i = (int64_t)(lat * (double)g_dev->rate / 1e9) + PERIOD; i < g_rec_frames; i++)
+        if (fabsf(g_rec[i * 2] - 0.125f) > 0.01f) wrong++;
+    CHECK_EQ(wrong, 0);
+    CHECK_NEAR((double)clock_at(s, t1 + lat + 20000000), 40020000000.0, 2000.0);
+    fa_stream_close(s);
+}
+
+/* Buffered counts audio, not timestamps: a jump in the timeline adds nothing. */
+static void test_buffered_ignores_timestamp_jumps(void)
+{
+    fa_stream* s = open_push_s16p();
+    fa_time buffered = 0;
+    int64_t i, heard = 0;
+    CHECK(s != NULL);
+    CHECK_EQ(push_level(s, g_dev->rate / 50, 0.25f, 1000000000LL), FA_OK);    /* 20 ms at 1 s */
+    CHECK_EQ(push_level(s, g_dev->rate / 50, 0.25f, 10000000000LL), FA_OK);   /* 20 ms at 10 s */
+    CHECK_EQ(push_level(s, g_dev->rate / 50, 0.25f, 5000000000LL), FA_OK);    /* 20 ms back at 5 s */
+    CHECK_EQ(fa_stream_get_buffered(s, &buffered), FA_OK);
+    CHECK_NEAR((double)buffered, 60000000.0, 1e3);
+    /* Everything pushed plays, without waiting for more (the last piece read from
+     * the queue has nothing behind it). */
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    wait_decoded(s, g_dev->rate * 3 / 50);
+    rec_reset();
+    render(PERIOD * 30);
+    for (i = 0; i < g_rec_frames; i++) if (g_rec[i * 2] > 0.2f) heard++;
+    CHECK_NEAR((double)heard, (double)(g_dev->rate * 3 / 50), 2.0);
+    CHECK_EQ(fa_stream_get_buffered(s, &buffered), FA_OK);
+    CHECK_EQ(buffered, 0);
+    fa_stream_close(s);
+}
+
+/* The audio thread extends clock records while other threads read them: a reader
+ * never sees a record half-extended (the old length with the new end). */
+static fa_clock g_race_clock;
+static fa_atomic64 g_race_written;
+static fa_atomic32 g_race_stop;
+
+static void race_writer(void* arg)
+{
+    int64_t k;
+    (void)arg;
+    for (k = 0; k < 400000 && !fa_load32(&g_race_stop); k++) {
+        /* 480 frames, 10 ms each: one rate throughout, so every record extends the last. */
+        fa_clock_record(&g_race_clock, k * 480, 480, k * 10000000, (k + 1) * 10000000);
+        fa_store64(&g_race_written, (k + 1) * 480);
+    }
+    fa_store32(&g_race_stop, 1);
+}
+
+static void test_clock_records_extend_atomically(void)
+{
+    fa_thread t;
+    int64_t bad = 0, reads = 0;
+    fa_clock_reset(&g_race_clock, 0);
+    fa_store64(&g_race_written, 0);
+    fa_store32(&g_race_stop, 0);
+    CHECK_EQ(fa_thread_create(&t, race_writer, NULL), 0);
+    while (!fa_load32(&g_race_stop)) {
+        int64_t w = fa_load64(&g_race_written), f;
+        if (w < 960) continue;
+        f = w - 240 - (reads % 200);              /* inside what is written */
+        if (f < 0) f = 0;
+        if (llabs(fa_clock_at(&g_race_clock, (double)f) - (int64_t)((double)f * 1e9 / 48000.0)) > 1) bad++;
+        reads++;
+    }
+    fa_thread_join(&t);
+    CHECK(reads > 1000);
+    CHECK_EQ(bad, 0);
+}
+
 static void test_file_clock_and_seek(void)
 {
     /* 1 s of 16-bit mono WAV at the device rate. */
@@ -574,6 +709,16 @@ static void decode_file(const char* file, const char* codec, uint32_t rate, uint
 
 static void test_mp3_packets(void) { decode_file("tone.mp3", "mp3", 44100, 1, mp3_len, 22050, 2400); }
 
+/* Packets that cut frames anywhere: a frame split across packets waits for the
+ * rest (419 bytes = one 417/418-byte frame plus the first bytes of the next). */
+static size_t cut_419(const uint8_t* h, size_t left) { (void)h; return left < 419 ? left : 419; }
+static size_t cut_1000(const uint8_t* h, size_t left) { (void)h; return left < 1000 ? left : 1000; }
+static void test_mp3_packets_cut_anywhere(void)
+{
+    decode_file("tone.mp3", "mp3", 44100, 1, cut_419, 22050, 2400);
+    decode_file("tone.mp3", "mp3", 44100, 1, cut_1000, 22050, 2400);
+}
+
 static void test_ffmpeg_aac_ac3_eac3(void)
 {
     fa_ffmpeg_info fi;
@@ -666,12 +811,17 @@ int main(void)
     RUN(test_push_frame_converts_any_format);
     RUN(test_clock_follows_the_speaker);
     RUN(test_clock_follows_timestamp_jumps);
+    RUN(test_clock_records_extend_atomically);
     RUN(test_clock_across_detach);
+    RUN(test_clock_across_detach_with_jump);
+    RUN(test_flush_after_detach_and_hold);
+    RUN(test_buffered_ignores_timestamp_jumps);
     RUN(test_file_clock_and_seek);
     RUN(test_buffering_stall_resume_end);
     RUN(test_flush_and_buffered);
     RUN(test_pcm_packets_split_anywhere);
     RUN(test_mp3_packets);
+    RUN(test_mp3_packets_cut_anywhere);
     RUN(test_ffmpeg_aac_ac3_eac3);
     RUN(test_ffmpeg_packets_play_on_device);
     RUN(test_bad_arguments);
