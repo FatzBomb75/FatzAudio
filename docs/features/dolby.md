@@ -7,7 +7,7 @@ FatzAudio decodes Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3) itself, i
 | AC-3 (Dolby Digital) | Every mode: mono to 5.1, 32, 44.1 and 48 kHz, all bit rates |
 | E-AC-3 (Dolby Digital Plus) | Every coding tool: independent and dependent substreams (7.1), 1 to 6 blocks per frame, spectral extension, enhanced coupling, the adaptive hybrid transform, all bit allocation options. Transient pre-noise processing data is read and not applied, as in most decoders |
 | Atmos (Dolby Digital Plus with JOC) | The 5.1 or 7.1 bed plays; the height objects are not rendered |
-| Dolby TrueHD | Through the app's FFmpeg (MP4/MKV tracks and packets) |
+| Dolby TrueHD | Not supported. If you need it, we recommend decoding it with FFmpeg in your app and handing FatzAudio the audio ([FFmpeg hand-off](ffmpeg.md)) |
 
 `fa_stream_get_info` reports codec `ac3` or `eac3`. The container is `ac3` or `ec3` for raw files, or the video file's (`mp4`, `matroska`, `hls`, ...).
 
