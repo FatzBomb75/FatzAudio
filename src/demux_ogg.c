@@ -51,7 +51,7 @@ typedef struct oggs_link {
     uint32_t serial;
     int kind;
     uint32_t rate, channels, preskip;
-    int bs[2];              /* Vorbis block sizes */
+    int long_block;         /* Vorbis: the long block size */
     int64_t first_gran;     /* granule where its first packet starts; OGG_NO_GRAN = not seen yet */
     int64_t last_gran;      /* granule of its last page, OGG_NO_GRAN = unknown */
     int64_t base;           /* pts of its first audible frame */
@@ -66,18 +66,17 @@ typedef struct oggs_link {
 typedef struct oggs_pkt {
     size_t off, len;
     int64_t pts, dur, trim;
-    const fa_codec_params* reopen;
 } oggs_pkt;
 
 typedef struct ogg {
     fa_br br;
     fa_track track;
-    fa_decoder* dec;
     uint32_t crc[256];
     oggs_link** links;       /* each one allocated alone: pointers to them stay valid */
     int nlinks, cap_links;
     uint32_t group[16];     /* serials of the first link's logical streams */
     int ngroup;
+    int want;               /* the audio stream picked in every link (audio_track) */
     int cur;                /* link being read */
     int codec_link;         /* link the codec is set up for */
     int enumerated;         /* every link is known (a seekable file) */
@@ -375,7 +374,8 @@ static int kind_of(const uint8_t* p, size_t n)
     return OGG_NONE;
 }
 
-/* "ARTIST - TITLE" from a comment packet (after its magic), for web radio. */
+/* "ARTIST - TITLE" from a comment packet (after its magic), for web radio.
+ * Field names are case-insensitive. */
 static void comment_title(const uint8_t* p, size_t n, char* out, size_t cap)
 {
     char artist[256] = "", title[512] = "";
@@ -389,13 +389,13 @@ static void comment_title(const uint8_t* p, size_t n, char* out, size_t cap)
     pos += 4;
     for (i = 0; i < count && pos + 4 <= n; i++) {
         uint32_t len = le32(p + pos);
-        const char* s = (const char*)p + pos + 4;
+        const char* f = (const char*)p + pos + 4;
         pos += 4;
         if (len > n - pos) return;
-        if (len > 7 && strncmp(s, "ARTIST=", 7) == 0 && !artist[0]) snprintf(artist, sizeof(artist), "%.*s", (int)(len - 7), s + 7);
-        else if (len > 7 && (strncmp(s, "TITLE=", 6) == 0 || strncmp(s, "title=", 6) == 0) && !title[0])
-            snprintf(title, sizeof(title), "%.*s", (int)(len - 6), s + 6);
-        else if (len > 7 && strncmp(s, "artist=", 7) == 0 && !artist[0]) snprintf(artist, sizeof(artist), "%.*s", (int)(len - 7), s + 7);
+        if (len > 7 && !artist[0] && fa_strncasecmp_ascii(f, "ARTIST=", 7) == 0)
+            snprintf(artist, sizeof(artist), "%.*s", (int)(len - 7), f + 7);
+        else if (len > 6 && !title[0] && fa_strncasecmp_ascii(f, "TITLE=", 6) == 0)
+            snprintf(title, sizeof(title), "%.*s", (int)(len - 6), f + 6);
         pos += len;
     }
     if (artist[0] && title[0]) snprintf(out, cap, "%s - %s", artist, title);
@@ -404,7 +404,9 @@ static void comment_title(const uint8_t* p, size_t n, char* out, size_t cap)
 
 /* Reads a link's headers, starting at its BOS page group at the reader's
  * position: picks audio stream `want` (0-based) among the group's audio streams,
- * then collects its header packets. *out_audio = the group's audio stream count. */
+ * then collects its header packets. *out_audio = the group's audio stream count.
+ * A later link with fewer audio streams plays its first one; the first link
+ * returns FA_ERROR_NOT_FOUND then. */
 static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_tag_loudness* tags)
 {
     oggs_page pg;
@@ -416,7 +418,7 @@ static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_ta
     memset(l, 0, sizeof(*l));
     l->first_gran = l->last_gran = OGG_NO_GRAN;
     l->end = -1;
-    l->start = fa_br_tell(&o->br);
+    l->start = -1;
     title[0] = '\0';
     /* The BOS pages: one per logical stream, each with exactly one packet. */
     for (;;) {
@@ -427,11 +429,12 @@ static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_ta
             o->has_held = 1;
             break;
         }
-        if (o->ngroup < 16) o->group[o->ngroup++] = pg.serial;
+        if (l->start < 0) l->start = pg.pos;          /* the group's first page */
+        if (o->nlinks == 1 && o->ngroup < 16) o->group[o->ngroup++] = pg.serial;
         if (pg.nseg == 0 || pg.lace[pg.nseg - 1] == 255) continue;
         if (kind_of(o->body, pg.body_len) != OGG_NONE) {
-            if (audio++ == want) {
-                l->start = pg.pos;
+            if (audio++ == want || (picked == 0 && o->nlinks > 1 && audio == 1)) {
+                free(hdr[0]);
                 l->serial = pg.serial;
                 l->kind = kind_of(o->body, pg.body_len);
                 hdr[0] = (uint8_t*)malloc(pg.body_len);
@@ -439,7 +442,7 @@ static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_ta
                 memcpy(hdr[0], o->body, pg.body_len);
                 hlen[0] = pg.body_len;
                 nh = 1;
-                picked = 1;
+                picked = audio - 1 == want ? 2 : 1;   /* 1 = the fallback for now */
             }
         }
     }
@@ -499,8 +502,9 @@ static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_ta
         if (l->vi.rate <= 0 || l->vi.channels <= 0) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
         l->rate = (uint32_t)l->vi.rate;
         l->channels = (uint32_t)l->vi.channels;
-        l->bs[0] = vorbis_info_blocksize(&l->vi, 0);
-        l->bs[1] = vorbis_info_blocksize(&l->vi, 1);
+        l->long_block = vorbis_info_blocksize(&l->vi, 1);
+        vorbis_comment_clear(&l->vc);              /* read below from the packet itself */
+        vorbis_comment_init(&l->vc);
         if (hlen[1] > 7) {
             comment_title(hdr[1] + 7, hlen[1] - 7, title, sizeof(title));
             if (tags) fa_tags_parse_vorbis_comments(hdr[1] + 7, hlen[1] - 7, tags);
@@ -596,7 +600,7 @@ static fa_result fill_queue(ogg* o)
                 o->has_held = 1;
                 r = add_link(o, &nl);
                 if (r != FA_OK) return r;
-                r = read_link(o, nl, 0, NULL, NULL);
+                r = read_link(o, nl, o->want, NULL, NULL);
                 if (r == FA_ERROR_OUT_OF_MEMORY) return r;
                 if (r != FA_OK) {
                     /* Not audio we know: its pages are skipped. */
@@ -649,18 +653,17 @@ static fa_result ogg_next(void* ctx, fa_demux_packet* out)
 
 /* The last page of `serial` that starts before `hi`, with a granule below `g`
  * (from a binary search over pages); -1 = none after `lo`. */
-static int64_t find_page_before(ogg* o, uint32_t serial, int64_t lo, int64_t hi, int64_t g, int64_t* out_gran)
+static int64_t find_page_before(ogg* o, uint32_t serial, int64_t lo, int64_t hi, int64_t g)
 {
     int64_t best = -1, a = lo, b = hi;
     oggs_page pg;
-    *out_gran = -1;
     while (b - a > 65536) {
         int64_t mid = a + (b - a) / 2, got = -1;
         if (seek_to(o, mid) != FA_OK) return best;
         while (next_page(o, &pg, b - mid) == FA_OK && pg.pos < b) {
             if (pg.serial == serial && pg.granule >= 0) { got = pg.granule; break; }
         }
-        if (got >= 0 && got < g) { best = pg.pos; *out_gran = got; a = pg.pos + pg.size; }
+        if (got >= 0 && got < g) { best = pg.pos; a = pg.pos + pg.size; }
         else b = mid;
     }
     /* The rest page by page. */
@@ -669,7 +672,6 @@ static int64_t find_page_before(ogg* o, uint32_t serial, int64_t lo, int64_t hi,
         if (pg.serial != serial || pg.granule < 0) continue;
         if (pg.granule >= g) break;
         best = pg.pos;
-        *out_gran = pg.granule;
     }
     return best;
 }
@@ -679,7 +681,7 @@ static fa_result ogg_seek(void* ctx, int64_t t, int packets_back, size_t bytes_b
     ogg* o = (ogg*)ctx;
     oggs_link* l;
     int k = 0, i;
-    int64_t g, at, gran, end;
+    int64_t g, at, end;
     (void)packets_back;
     (void)bytes_back;
     for (i = 1; i < o->nlinks; i++)
@@ -687,9 +689,9 @@ static fa_result ogg_seek(void* ctx, int64_t t, int packets_back, size_t bytes_b
     l = o->links[k];
     g = (int64_t)llround((double)(t - l->base) * (double)l->rate / o->rate0) + l->first_gran + (int64_t)l->preskip;
     /* Vorbis needs the packet before the one holding the target: a long block back. */
-    if (l->kind == OGG_VORBIS) g -= l->bs[1] > 0 ? l->bs[1] : 8192;
+    if (l->kind == OGG_VORBIS) g -= l->long_block > 0 ? l->long_block : 8192;
     end = l->end >= 0 ? l->end : o->br.src->length >= 0 ? o->br.src->length : INT64_MAX;
-    at = g > l->first_gran ? find_page_before(o, l->serial, l->data, end, g, &gran) : -1;
+    at = g > l->first_gran ? find_page_before(o, l->serial, l->data, end, g) : -1;
     if (at < 0) at = l->data;
     o->cur = k;
     o->nq = o->iq = 0;
@@ -745,7 +747,8 @@ static int64_t last_granule(ogg* o, uint32_t serial, int* out_chained)
         int ended = 0;
         while (next_page(o, &pg, from - at) == FA_OK && pg.pos < from) {
             /* Another stream, a stream starting, or pages after the end. */
-            if (!in_group(o, pg.serial) || (pg.pos > 0 && (pg.flags & 2)) || (ended && pg.serial == serial)) *out_chained = 1;
+            if (!in_group(o, pg.serial) || (pg.pos >= o->links[0]->data && (pg.flags & 2)) || (ended && pg.serial == serial))
+                *out_chained = 1;
             if (pg.serial == serial && pg.granule >= 0) gran = pg.granule;
             if (pg.serial == serial && (pg.flags & 4)) ended = 1;
         }
@@ -780,13 +783,13 @@ static fa_result ogg_open(fa_decoder* dec)
     int audio = 0, want = dec->audio_track < 0 ? 0 : dec->audio_track, chained = 0, i;
     fa_result r;
     if (!o) return FA_ERROR_OUT_OF_MEMORY;
-    o->dec = dec;
     crc_init(o->crc);
     r = fa_br_init(&o->br, dec->src);
     if (r != FA_OK) { free(o); return r; }
     /* A web stream's source reads from its fa_net (stream.c, net_hls.c). */
     if (dec->src->remote && dec->src->kind == FA_SOURCE_IO) o->net = (fa_net*)dec->src->io_user;
     r = add_link(o, &l);
+    o->want = want;
     if (r == FA_OK) r = read_link(o, l, want, &audio, NULL);
     if (r != FA_OK) goto fail;
     dec->track_count = audio;

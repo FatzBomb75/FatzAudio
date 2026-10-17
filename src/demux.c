@@ -325,6 +325,33 @@ static fa_result emit(fa_track* t, const fa_demux_packet* pk)
     return FA_OK;
 }
 
+/* The codec's settings, from its parameters (open, and a chained stream's next song). */
+static void codec_settings(fa_track* t, const fa_codec_params* p)
+{
+    const codec_info* ci = find_codec(p->codec);
+    t->p.codec = *p;
+    /* The codec name is a static string; the extradata was only needed to open it. */
+    t->p.codec.extradata = NULL;
+    t->p.codec.extradata_size = 0;
+    t->packets_back = ci ? ci->packets_back : pcm_bytes(p->codec) > 0 ? 0 : 1;
+    t->bytes_back = ci ? ci->bytes_back : 0;
+    if (strcmp(p->codec, "opus") == 0 && t->p.seek_preroll_s <= 0) t->p.seek_preroll_s = 0.08;
+}
+
+/* A chained stream's next song: its own codec, set up from its own headers. */
+static fa_result reopen_codec(fa_track* t, const fa_codec_params* p)
+{
+    fa_result r;
+    if (t->codec_ready) fa_codec_close(&t->codec);
+    t->codec_ready = 0;
+    r = fa_codec_open(&t->codec, p);
+    if (r != FA_OK) return r;
+    t->codec_ready = 1;
+    t->codec.dynamic_range = t->dec->dynamic_range;
+    codec_settings(t, p);
+    return FA_OK;
+}
+
 /* Decodes packets until there are frames to hand out or the track ends. */
 static fa_result fill(fa_track* t)
 {
@@ -351,13 +378,10 @@ static fa_result fill(fa_track* t)
         }
         if (r != FA_OK) return r;
         if (pk.reopen) {
-            fa_codec_close(&t->codec);
-            t->codec_ready = 0;
-            r = fa_codec_open(&t->codec, pk.reopen);
+            r = reopen_codec(t, pk.reopen);
             if (r != FA_OK) { t->eof = 1; return r; }    /* the next song cannot be decoded */
-            t->codec_ready = 1;
-            t->codec.dynamic_range = t->dec->dynamic_range;
         }
+        if (!t->codec_ready) return FA_ERROR_UNSUPPORTED_FORMAT;
         r = t->codec.vt->decode(&t->codec, pk.data, pk.size);
         if (r == FA_ERROR_OUT_OF_MEMORY) return r;
         if (r != FA_OK || t->codec.out_frames <= 0 || t->codec.rate == 0 || t->codec.channels == 0) {
@@ -375,7 +399,6 @@ static fa_result fill(fa_track* t)
 
 fa_result fa_track_open(fa_track* t, fa_decoder* dec, const fa_demux_ops* ops, void* ctx, const fa_track_params* p)
 {
-    const codec_info* ci;
     fa_result r;
     memset(t, 0, sizeof(*t));
     t->dec = dec;
@@ -387,13 +410,7 @@ fa_result fa_track_open(fa_track* t, fa_decoder* dec, const fa_demux_ops* ops, v
     if (r != FA_OK) return r;
     t->codec_ready = 1;
     t->codec.dynamic_range = dec->dynamic_range;
-    /* The codec name is a static string; the extradata was only needed to open it. */
-    t->p.codec.extradata = NULL;
-    t->p.codec.extradata_size = 0;
-    ci = find_codec(p->codec.codec);
-    t->packets_back = ci ? ci->packets_back : pcm_bytes(p->codec.codec) > 0 ? 0 : 1;
-    t->bytes_back = ci ? ci->bytes_back : 0;
-    if (strcmp(p->codec.codec, "opus") == 0 && t->p.seek_preroll_s <= 0) t->p.seek_preroll_s = 0.08;
+    codec_settings(t, &p->codec);
     t->place = 1;
 
     r = fill(t);
@@ -458,8 +475,9 @@ fa_result fa_track_seek(fa_track* t, fa_frames frame)
     fa_frames want = frame - (fa_frames)llround(t->p.seek_preroll_s * t->dec->format.sample_rate);
     double at = (double)t->p.start + (double)(want - t->lead) / t->fpt;
     fa_result r;
-    if (!t->codec_ready) return FA_ERROR_UNSUPPORTED_FORMAT;
-    if (t->codec.vt->flush) t->codec.vt->flush(&t->codec);
+    /* Without a codec (a chained song that could not be opened) the demuxer
+     * reopens the right one for the target. */
+    if (t->codec_ready && t->codec.vt->flush) t->codec.vt->flush(&t->codec);
     fa_pcm_conv_reset(&t->conv);
     t->count = t->off = 0;
     t->eof = t->draining = 0;
