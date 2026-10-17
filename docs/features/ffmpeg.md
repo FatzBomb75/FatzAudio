@@ -14,7 +14,7 @@ FatzAudio never links or ships FFmpeg. Packet streams decode PCM, MP3, AC-3 and 
 | Codec | Windows | macOS, iOS | Android | Linux |
 |---|---|---|---|---|
 | AAC (`aac`: LC, HE-AAC, HE-AAC v2) | Media Foundation | AudioToolbox (also xHE-AAC where the system has it) | MediaCodec | FFmpeg |
-| ALAC (`alac`) | Media Foundation (Windows 10 and later) | AudioToolbox | MediaCodec (Android 13 and later) | FFmpeg |
+| ALAC (`alac`) | FFmpeg | AudioToolbox | MediaCodec (Android 13 and later) | FFmpeg |
 | WMA (`wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`) | Media Foundation | FFmpeg | FFmpeg | FFmpeg |
 
 Give AAC its AudioSpecificConfig as `extradata` (`codecpar->extradata` from MP4 or Matroska); ADTS packets (from MPEG-TS) need none, their headers are taken off. ALAC needs its 24-byte configuration or the `alac` box that holds it. WMA needs `extradata` (the bytes after the WAVEFORMATEX) and `block_align`. A system decoder's audio matches FFmpeg's to within a decoder's rounding, not to the bit; HE-AAC can come out at twice the rate the stream states, which the stream's format reports.

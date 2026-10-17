@@ -242,7 +242,7 @@ The legacy app doesn't ship bassmix.dll, but mixer-style code built on `BASS_Cha
 
 ### bass_aac (AAC)
 
-AAC plays through the ordinary open calls, in MP4/M4A files, video files, `.aac` (ADTS) files, AAC radio and HLS. It is decoded by the operating system's own AAC decoder (Media Foundation on Windows, AudioToolbox on macOS and iOS, MediaCodec on Android): AAC-LC, HE-AAC and HE-AAC v2, and xHE-AAC where the system has it. On Linux, and where the system turns a stream down, the FFmpeg your app already has decodes it ([streams](../features/streams.md#supported-formats)); only then does a missing FFmpeg return `FA_ERROR_PROVIDER_MISSING`. ALAC in M4A goes the same way.
+AAC plays through the ordinary open calls, in MP4/M4A files, video files, `.aac` (ADTS) files, AAC radio and HLS. It is decoded by the operating system's own AAC decoder (Media Foundation on Windows, AudioToolbox on macOS and iOS, MediaCodec on Android): AAC-LC, HE-AAC and HE-AAC v2, and xHE-AAC where the system has it. On Linux, and where the system turns a stream down, the FFmpeg your app already has decodes it ([streams](../features/streams.md#supported-formats)); only then does a missing FFmpeg return `FA_ERROR_PROVIDER_MISSING`. ALAC in M4A goes the same way, except on Windows, where FFmpeg decodes it.
 
 | bass_aac | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|

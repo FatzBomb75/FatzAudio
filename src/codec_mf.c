@@ -7,8 +7,8 @@
  *    raw access units (payload type 0) with the AudioSpecificConfig after an
  *    HEAACWAVEINFO's fields as MF_MT_USER_DATA. ADTS frames lose their header
  *    first (codec_os.c). SBR doubles the rate: the output type says the rate.
- *  - ALAC (Windows 10 and later): the system's ALAC decoder, the 'alac' box
- *    holding the ALACSpecificConfig as MF_MT_USER_DATA.
+ *  - ALAC is not taken: Windows' ALAC decoder accepts the stream's configuration
+ *    (bare or in its 'alac' box) and then decodes nothing, so FFmpeg does it.
  * Their output is in WAVE channel order, which is the library's.
  *
  * mfplat.dll is loaded at run time, never imported: Windows N and KN editions
@@ -41,11 +41,10 @@
 /* The decoders' class IDs (wmcodecdsp.h), written out so no GUID library is needed. */
 static const GUID fa_clsid_wma_dec = { 0x2eeb4adf, 0x4578, 0x4d10, { 0xbc, 0xa7, 0xbb, 0x95, 0x5f, 0x56, 0x32, 0x0a } };
 static const GUID fa_clsid_wmsp_dec = { 0x874131cb, 0x4ecc, 0x443b, { 0x89, 0x48, 0x74, 0x6b, 0x89, 0x59, 0x5d, 0x20 } };
-/* And what older SDKs lack (mfapi.h): the decoder category, the AAC and ALAC
- * subtypes (WAVE_FORMAT_MPEG_HEAAC, WAVE_FORMAT_ALAC) and the AAC attributes. */
+/* And what older SDKs lack (mfapi.h): the decoder category, the AAC subtype
+ * (WAVE_FORMAT_MPEG_HEAAC) and the AAC attributes. */
 static const GUID fa_mft_audio_decoder = { 0x9ea73fb4, 0xef7a, 0x4559, { 0x8d, 0x5d, 0x71, 0x9d, 0x8f, 0x04, 0x26, 0xc7 } };
 static const GUID fa_mf_aac = { 0x00001610, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
-static const GUID fa_mf_alac = { 0x00006c61, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
 static const GUID fa_mt_aac_payload_type = { 0xbfbabe79, 0x7434, 0x4d1c, { 0x94, 0xf0, 0x72, 0xa3, 0xb9, 0xe1, 0x71, 0x88 } };
 static const GUID fa_mt_aac_profile_level = { 0x7632f0e6, 0x9538, 0x4d61, { 0xac, 0xda, 0xea, 0x29, 0xc8, 0xc1, 0x44, 0x56 } };
 static const GUID fa_mt_user_data = { 0xb6bc765f, 0x4c3b, 0x40a4, { 0xbd, 0x51, 0x25, 0x35, 0xb6, 0x6f, 0xe0, 0x9d } };
@@ -397,7 +396,7 @@ static fa_result open_wma(fa_codec* c, const fa_codec_params* p, uint16_t tag, c
     return mf_finish(c, st, hr);
 }
 
-/* One input type for the AAC or ALAC decoder. */
+/* One input type for the AAC decoder. */
 static HRESULT make_type(const GUID* subtype, uint32_t rate, uint32_t channels, uint32_t bits,
                          const uint8_t* user, size_t user_n, int aac, IMFMediaType** out)
 {
@@ -507,30 +506,6 @@ static fa_result open_aac(fa_codec* c, const fa_codec_params* p)
     return open_enum(c, &fa_mf_aac, rates, chans, tries, 16, users, user_n, 1, 1);
 }
 
-static fa_result open_alac(fa_codec* c, const fa_codec_params* p)
-{
-    fa_alac_info a;
-    uint8_t atom[36];
-    const uint8_t* users[2];
-    size_t user_n[2];
-    uint32_t rate, ch;
-    if (!fa_alac_parse_config((const uint8_t*)p->extradata, p->extradata_size, &a)) return FA_ERROR_UNSUPPORTED_FORMAT;
-    rate = a.rate;
-    ch = a.channels;
-    /* ALAC's own channel order (centre first) is not WAVE's, and what Media
-     * Foundation gives is not documented: FFmpeg reorders. */
-    if (ch > 2) return FA_ERROR_UNSUPPORTED_FORMAT;
-    /* The 'alac' box first (as Windows' own MP4 source passes it: the bare config
-     * is taken at open but then decodes nothing), else the bare ALACSpecificConfig. */
-    atom[0] = 0; atom[1] = 0; atom[2] = 0; atom[3] = 36;
-    memcpy(atom + 4, "alac", 4);
-    memset(atom + 8, 0, 4);
-    memcpy(atom + 12, a.config, 24);
-    users[0] = atom; user_n[0] = 36;
-    users[1] = a.config; user_n[1] = 24;
-    return open_enum(c, &fa_mf_alac, &rate, &ch, 1, a.bit_depth, users, user_n, 2, 0);
-}
-
 fa_result fa_mf_codec_open(fa_codec* c, const fa_codec_params* p)
 {
     const GUID* clsid = &fa_clsid_wma_dec;
@@ -543,13 +518,11 @@ fa_result fa_mf_codec_open(fa_codec* c, const fa_codec_params* p)
     else if (strcmp(p->codec, "wmalossless") == 0) tag = 0x0163;
     else if (strcmp(p->codec, "wmavoice") == 0) { tag = 0x000A; clsid = &fa_clsid_wmsp_dec; }
     else if (strcmp(p->codec, "aac") == 0) { tag = 0; kind = 1; }
-    else if (strcmp(p->codec, "alac") == 0) { tag = 0; kind = 2; }
     else return FA_ERROR_UNSUPPORTED_FORMAT;
     if (p->extradata_size > 0 && !p->extradata) return FA_ERROR_UNSUPPORTED_FORMAT;
     InitOnceExecuteOnce(&mf_once, mf_load, NULL, NULL);
     if (!mf.ok) return FA_ERROR_UNSUPPORTED_FORMAT;
     if (kind == 1) return open_aac(c, p);
-    if (kind == 2) return open_alac(c, p);
     return open_wma(c, p, tag, clsid);
 }
 

@@ -972,7 +972,7 @@ int fa_sample_kind(fa_sample_format f, int* out_planar);
 fa_result fa_ffmpeg_open_codec(fa_codec* c, const fa_codec_params* p);
 #ifdef _WIN32
 /* codec_mf.c: Windows Media Audio (wmav1, wmav2, wmapro, wmalossless, wmavoice),
- * AAC (LC, HE, HE v2) and ALAC (Windows 10 and later) through Media Foundation's
+ * and AAC (LC, HE, HE v2) through Media Foundation's
  * decoders. FA_ERROR_UNSUPPORTED_FORMAT for any other codec, or when Media
  * Foundation or the decoder is not there (Windows N): FFmpeg is tried next. */
 fa_result fa_mf_codec_open(fa_codec* c, const fa_codec_params* p);
