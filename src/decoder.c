@@ -9,6 +9,7 @@ const fa_decoder_vtable* const fa_decoder_registry[] = {
     &fa_decoder_mp3,
     &fa_decoder_mp4,
     &fa_decoder_mkv,
+    &fa_decoder_ac3,
     &fa_decoder_adts,
 };
 const uint32_t fa_decoder_registry_count = (uint32_t)(sizeof(fa_decoder_registry) / sizeof(fa_decoder_registry[0]));
@@ -47,7 +48,7 @@ static const char* extension_of(const char* path)
 }
 
 fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint, const char* mime_hint,
-                          int32_t audio_track)
+                          int32_t audio_track, fa_atomic32* dynamic_range)
 {
     uint8_t after[FA_PROBE_BYTES];
     const uint8_t* head;
@@ -97,6 +98,7 @@ fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint
         tried[best] = 1;
 
         memset(dec, 0, sizeof(*dec));
+        dec->dynamic_range = dynamic_range;
         dec->vt = fa_decoder_registry[best];
         dec->src = src;
         dec->length = -1;

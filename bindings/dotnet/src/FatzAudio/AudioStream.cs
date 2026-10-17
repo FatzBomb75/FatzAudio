@@ -482,6 +482,29 @@ public unsafe class AudioStream : IDisposable
     }
 
     /// <summary>
+    /// Dynamic range of Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3) audio: the full mix, or the
+    /// stream's own compression for normal or night listening. Applies to audio decoded from now on (what is
+    /// already buffered plays out first; seek to hear it at once). Other formats ignore it.
+    /// </summary>
+    /// <exception cref="ArgumentException">An unknown <see cref="FatzAudio.DynamicRange"/>.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public DynamicRange DynamicRange
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_dynamic_range(Handle, out int mode));
+            return (DynamicRange)mode;
+        }
+        set
+        {
+            int rc = NativeMethods.fa_stream_set_dynamic_range(Handle, (int)value);
+            if (rc == (int)ErrorCode.InvalidArgument)
+                throw new ArgumentException("Unknown dynamic range.", nameof(value));
+            FatzAudioException.ThrowIfFailed(rc);
+        }
+    }
+
+    /// <summary>
     /// Creates a surface that draws this stream's CD+G graphics, in sync with the audio, into a pixel buffer you
     /// copy to your renderer (a WPF <c>WriteableBitmap</c>, a Direct3D or OpenGL texture, a SkiaSharp bitmap).
     /// Call <see cref="CdgSurface.Update"/> from your render loop. Several surfaces may show one stream.

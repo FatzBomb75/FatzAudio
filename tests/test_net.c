@@ -161,9 +161,9 @@ static void ts_section(tsbuf* t, int pid, const uint8_t* sec, size_t n)
     ts_packet(t, pid, 1, buf, 184);
 }
 
-/* A TS file with PAT, PMT (one audio stream of `stream_type` on PID 0x101: 0x03
- * MPEG audio, 0x0F AAC in ADTS) and the audio in PES packets of up to 2000 bytes. */
-static void ts_mux(tsbuf* t, const uint8_t* es, size_t n, uint8_t stream_type)
+/* A TS file with PAT, PMT (one audio stream of the given type on PID 0x101) and
+ * the audio in PES packets of up to 2000 bytes with the given stream id. */
+static void ts_mux_as(tsbuf* t, const uint8_t* es, size_t n, uint8_t stream_type, uint8_t pes_id)
 {
     static const uint8_t pat[] = { 0x00, 0xB0, 13, 0x00, 0x01, 0xC1, 0x00, 0x00, 0x00, 0x01, 0xF0, 0x00 };
     uint8_t pmt[] = { 0x02, 0xB0, 18, 0x00, 0x01, 0xC1, 0x00, 0x00, 0xE1, 0x01, 0xF0, 0x00,
@@ -174,7 +174,7 @@ static void ts_mux(tsbuf* t, const uint8_t* es, size_t n, uint8_t stream_type)
     while (n > 0) {
         uint8_t pes[2009];
         size_t chunk = n < 2000 ? n : 2000, len = 9 + chunk, off = 0;
-        pes[0] = 0; pes[1] = 0; pes[2] = 1; pes[3] = 0xC0;
+        pes[0] = 0; pes[1] = 0; pes[2] = 1; pes[3] = pes_id;
         pes[4] = (uint8_t)((chunk + 3) >> 8); pes[5] = (uint8_t)(chunk + 3);
         pes[6] = 0x80; pes[7] = 0; pes[8] = 0;
         memcpy(pes + 9, es, chunk);
@@ -187,6 +187,8 @@ static void ts_mux(tsbuf* t, const uint8_t* es, size_t n, uint8_t stream_type)
         n -= chunk;
     }
 }
+
+static void ts_mux(tsbuf* t, const uint8_t* es, size_t n) { ts_mux_as(t, es, n, 0x03, 0xC0); }
 
 /* HLS: g_mp3 cut at frame boundaries into HLS_SEGS segments. */
 #define HLS_SEGS 3
@@ -215,7 +217,7 @@ static void make_hls(void)
         while (q + 4 <= cut[s + 1]) { size_t fs = mp3_frame_size(g_mp3 + q); if (!fs) break; q += fs; f++; }
         g_seg_dur[s] = (double)f * 1152.0 / 44100.0;
         memset(&g_seg[s], 0, sizeof(g_seg[s]));
-        ts_mux(&g_seg[s], g_mp3 + cut[s], cut[s + 1] - cut[s], 0x03);
+        ts_mux(&g_seg[s], g_mp3 + cut[s], cut[s + 1] - cut[s]);
     }
     (void)pos;
 }
@@ -240,12 +242,26 @@ static void make_hls_aac(void)
         if (!fs || f == per * (s + 1)) {
             g_aseg_dur[s] = (double)(f - per * s) * 1024.0 / 44100.0;
             memset(&g_aseg[s], 0, sizeof(g_aseg[s]));
-            ts_mux(&g_aseg[s], g_aac + start, p - start, 0x0F);
+            ts_mux_as(&g_aseg[s], g_aac + start, p - start, 0x0F, 0xC0);
             start = p;
             s++;
             if (!fs) break;
         }
     }
+}
+
+/* HLS with AC-3 (stream type 0x81, private stream 1): tone.ac3 in two segments. */
+static uint8_t* g_ac3;
+static size_t g_ac3_n;
+static tsbuf g_ac3_seg[2];
+static size_t g_ac3_cut;   /* bytes in the first segment, a whole number of 768-byte frames */
+
+static void make_hls_ac3(void)
+{
+    g_ac3_cut = g_ac3_n / 768 / 2 * 768;
+    memset(g_ac3_seg, 0, sizeof(g_ac3_seg));
+    ts_mux_as(&g_ac3_seg[0], g_ac3, g_ac3_cut, 0x81, 0xBD);
+    ts_mux_as(&g_ac3_seg[1], g_ac3 + g_ac3_cut, g_ac3_n - g_ac3_cut, 0x81, 0xBD);
 }
 
 /* ---- the HTTP server ---------------------------------------------------------- */
@@ -385,6 +401,21 @@ static void serve_hls(sock_t s, const char* req, const char* path)
             snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", len);
             if (i == 1 && fa_exchange32(&g_seg_drop, 0)) len /= 2;
             if (!send_str(s, head)) send_all(s, g_seg[i].p, len);
+            return;
+        }
+    }
+    if (strcmp(path, "/hls/ac3.m3u8") == 0) {
+        double d0 = (double)(g_ac3_cut / 768) * 1536.0 / 48000.0, d1 = (double)((g_ac3_n - g_ac3_cut) / 768) * 1536.0 / 48000.0;
+        snprintf(text, sizeof(text), "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:%.5f,\nac3_0.ts\n#EXTINF:%.5f,\nac3_1.ts\n#EXT-X-ENDLIST\n", d0, d1);
+        snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(text));
+        if (!send_str(s, head)) send_str(s, text);
+        return;
+    }
+    if (strncmp(path, "/hls/ac3_", 9) == 0) {
+        i = atoi(path + 9);
+        if (i == 0 || i == 1) {
+            snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", g_ac3_seg[i].n);
+            if (!send_str(s, head)) send_all(s, g_ac3_seg[i].p, g_ac3_seg[i].n);
             return;
         }
     }
@@ -1409,6 +1440,35 @@ static void test_hls_vod(void)
     fa_stream_close(s);
 }
 
+/* AC-3 in HLS (as broadcasters send it) decodes natively and matches the file. */
+static void test_hls_ac3(void)
+{
+    fa_result r;
+    fa_stream* s = open_url("/hls/ac3.m3u8", FA_OPEN_DECODE_ONLY, &r);
+    fa_stream_info info;
+    fa_frames n = 0, ref_n = 0;
+    float *got, *ref;
+    double err = 0;
+    int i;
+    CHECK_EQ(r, FA_OK);
+    if (r != FA_OK) return;
+    fa_stream_get_info(s, &info);
+    CHECK_STR(info.container, "hls");
+    CHECK_STR(info.codec, "ac3");
+    CHECK_EQ(info.format.sample_rate, 48000);
+    CHECK_EQ(info.format.channels, 2);
+    got = read_all(s, &n);
+    ref = read_all_memory(g_ac3, g_ac3_n, &ref_n);
+    CHECK(ref != NULL);
+    printf("  hls %lld frames, file %lld\n", (long long)n, (long long)ref_n);
+    CHECK_EQ(n, ref_n);
+    for (i = 0; i < (int)(n < ref_n ? n : ref_n) * 2; i++) err += fabs(got[i] - ref[i]);
+    CHECK(err < 1e-3);
+    free(got);
+    free(ref);
+    fa_stream_close(s);
+}
+
 /* HTTPS through the system's TLS stack, when FA_NET_HTTPS_URL names an audio file
  * (CI sets none by default: the test must not depend on the internet). */
 static void test_https_optional(void)
@@ -1546,10 +1606,12 @@ int main(void)
     g_mp3 = read_file(FA_TEST_DATA_DIR "/net/tone_cbr.mp3", &g_mp3_n);
     g_mp3x = read_file(FA_TEST_DATA_DIR "/net/tone_xing.mp3", &g_mp3x_n);
     g_aac = read_file(FA_TEST_DATA_DIR "/net/tone.aac", &g_aac_n);
-    if (!g_mp3 || !g_mp3x || !g_aac) { fprintf(stderr, "missing test data in %s\n", FA_TEST_DATA_DIR "/net"); return 1; }
+    g_ac3 = read_file(FA_TEST_DATA_DIR "/tone.ac3", &g_ac3_n);
+    if (!g_mp3 || !g_mp3x || !g_aac || !g_ac3) { fprintf(stderr, "missing test data in %s\n", FA_TEST_DATA_DIR "/net"); return 1; }
     make_wav();
     make_hls();
     make_hls_aac();
+    make_hls_ac3();
     g_aac_tagged_n = 30000 + g_aac_n;
     g_aac_tagged = (uint8_t*)calloc(1, g_aac_tagged_n);
     memcpy(g_aac_tagged, "ID3\x04\x00\x00", 6);   /* size 29990 (syncsafe), all padding */
@@ -1580,6 +1642,7 @@ int main(void)
     RUN(test_icy_radio_attached);
     RUN(test_stall_and_resume);
     RUN(test_hls_vod);
+    RUN(test_hls_ac3);
     RUN(test_hls_retry_and_byteranges);
     RUN(test_aac_over_http);
     RUN(test_aac_radio);
@@ -1592,6 +1655,9 @@ int main(void)
     fa_engine_destroy(g_engine);
     server_stop();
     for (i = 0; i < HLS_SEGS; i++) { free(g_seg[i].p); free(g_aseg[i].p); }
+    free(g_ac3_seg[0].p);
+    free(g_ac3_seg[1].p);
+    free(g_ac3);
     free(g_mp3);
     free(g_mp3x);
     free(g_aac);

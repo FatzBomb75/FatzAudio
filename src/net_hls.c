@@ -877,6 +877,7 @@ typedef struct hls_dec {
     fa_source src;
     fa_decoder inner;
     int inner_ready;
+    fa_atomic32* dynamic_range;   /* the stream's, for the inner decoder */
 } hls_dec;
 
 static fa_result hls_open_inner(hls_dec* h)
@@ -887,7 +888,7 @@ static fa_result hls_open_inner(hls_dec* h)
     io.close = NULL;                     /* the stream owns the net */
     fa_source_open_io(&h->src, &io, h->net);
     h->src.remote = 1;
-    r = fa_decoder_open(&h->inner, &h->src, NULL, NULL, -1);   /* -1: the default track */
+    r = fa_decoder_open(&h->inner, &h->src, NULL, NULL, -1, h->dynamic_range);   /* -1: the default track */
     if (r != FA_OK) return r == FA_ERROR_PROVIDER_MISSING ? r : FA_ERROR_UNSUPPORTED_FORMAT;  /* needs FFmpeg: say so */
     h->inner_ready = 1;
     return FA_OK;
@@ -900,6 +901,7 @@ static fa_result hls_open(fa_decoder* dec)
     fa_result r;
     if (!h) return FA_ERROR_OUT_OF_MEMORY;
     h->net = (fa_net*)dec->src->io_user;
+    h->dynamic_range = dec->dynamic_range;
     r = hls_open_inner(h);
     if (r != FA_OK) { fa_source_close(&h->src); free(h); return r; }
     dec->impl = h;

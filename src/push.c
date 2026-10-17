@@ -129,6 +129,7 @@ fa_result fa_push_init_packets(struct fa_stream* s, const fa_codec_params* param
     r = fa_codec_open(&p->codec, params);
     if (r != FA_OK) return r;    /* the caller frees the push with the stream */
     p->codec_ready = 1;
+    p->codec.dynamic_range = &s->dynamic_range;
     decoder_setup(s, params->sample_rate, params->channels, params->codec, "packets");
     return FA_OK;
 }
@@ -354,11 +355,12 @@ static int refill(struct fa_push* p)
     if (!it) {
         /* The end: the codec gives back what it still holds (delayed output). */
         if (p->codec_ready && !p->drained && fa_load32(&p->ended) && fa_load32(&p->count) == 0) {
-            p->drained = 1;
+            /* One block per call until the codec has nothing left. */
             if (p->codec.vt->decode(&p->codec, NULL, 0) == FA_OK && p->codec.out_frames > 0) {
                 take_block(p, p->codec.out, p->codec.out_frames, p->codec.rate, p->codec.channels, FA_PTS_NONE);
                 return 1;
             }
+            p->drained = 1;
         }
         return 0;
     }

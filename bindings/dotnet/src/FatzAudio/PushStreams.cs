@@ -299,7 +299,7 @@ public static unsafe class FFmpeg
     /// <example>
     /// <code>
     /// if (!FFmpeg.Load(@"C:\MyApp\ffmpeg"))
-    ///     Console.WriteLine("AAC/AC-3 packets need FFmpeg");
+    ///     Console.WriteLine("AAC and Opus packets need FFmpeg");
     /// </code>
     /// </example>
     public static bool Load(string? directory = null)
