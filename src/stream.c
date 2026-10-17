@@ -426,9 +426,9 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 fa_store32(&s->eof, 1);
                 break;
             }
-            if (end >= 0 && s->src_pos + want > end) want = end - s->src_pos;
+            if (end >= 0 && s->src_pos + want > end) want = end > s->src_pos ? end - s->src_pos : 0;
             from_carry = s->carry_count > 0;
-            if (from_carry) {                     /* audio decoded ahead before a detach */
+            if (from_carry && want > 0) {         /* audio decoded ahead before a detach */
                 got = s->carry_count < want ? s->carry_count : want;
                 memcpy(s->in_buf, s->carry + (size_t)s->carry_offset * ch, (size_t)got * ch * sizeof(float));
                 s->carry_offset += got;
@@ -533,7 +533,7 @@ static fa_result restart_at_locked(struct fa_stream* s, fa_frames frame)
     int64_t hold = 0;
     if (s->push) {
         /* Push streams cannot seek: only the buffers start over (a rebuilt chain). */
-        hold = s->device ? fa_stream_clock_at(s, fa_monotonic_ns()) : fa_push_next_pts(s->push);
+        hold = fa_stream_clock_at(s, fa_monotonic_ns());
         frame = fa_stream_position_now(s);
         fa_push_restart_timeline(s->push);
     } else {
@@ -670,6 +670,15 @@ static int64_t source_pts(struct fa_stream* s, int64_t pos, int* ok)
     return 0;
 }
 
+/* The pts of the first frame kept from before a detach (carry), the next one heard. */
+static int64_t carry_first_pts(struct fa_stream* s)
+{
+    int ok = 0;
+    int64_t first = source_pts(s, s->src_pos, &ok);
+    if (!ok) first = fa_push_next_pts(s->push) - (int64_t)((double)s->carry_count * 1e9 / (double)s->decoder.format.sample_rate + 0.5);
+    return first;
+}
+
 /* Attaching a push stream: the audio kept from before a detach (carry) plays first,
  * with the timestamps it had, timeline jumps inside it included; the decoder's own
  * output follows. Returns the pts of the first frame. Caller holds decode_lock,
@@ -678,10 +687,8 @@ static int64_t carry_timeline(struct fa_stream* s, uint32_t dev_rate)
 {
     double ratio = (double)dev_rate / (double)s->decoder.format.sample_rate;
     int64_t pos = s->src_pos, end = pos + s->carry_count, k, lo, first;
-    int ok = 0;
     if (s->carry_count <= 0) return fa_push_next_pts(s->push);
-    first = source_pts(s, pos, &ok);
-    if (!ok) first = fa_push_next_pts(s->push) - (int64_t)((double)s->carry_count * 1e9 / (double)s->decoder.format.sample_rate + 0.5);
+    first = carry_first_pts(s);
     fa_ptsmap_add(&s->ptsmap, 0, first);
     lo = s->anchors > FA_SRC_ANCHORS ? s->anchors - FA_SRC_ANCHORS : 0;
     for (k = lo; k < s->anchors; k++) {
@@ -957,7 +964,11 @@ FA_API fa_result FA_CALL fa_stream_get_position(fa_stream* stream, fa_frames* ou
 int64_t fa_stream_clock_at(struct fa_stream* s, int64_t now_ns)
 {
     if (s->device) return fa_clock_at(&s->clock, fa_device_speaker_frame(s->device, now_ns));
-    if (s->push) return fa_push_next_pts(s->push);
+    if (s->push) {
+        /* Detached: audio decoded but never heard waits in carry, and is heard next. */
+        if (s->carry_count > 0) return carry_first_pts(s);
+        return fa_push_next_pts(s->push);
+    }
     return (int64_t)((double)fa_load64(&s->position) * 1e9 / (double)s->decoder.format.sample_rate + 0.5);
 }
 
@@ -1675,7 +1686,7 @@ static int64_t pts_at_played(struct fa_stream* s, int64_t played, int64_t* out_n
     *out_next = INT64_MAX;
     pos = fade_position(s, played);
     end = end_frame(s);
-    if (end > 0 && (s->flags & FA_OPEN_LOOP)) {
+    if (end > 0 && loops(s)) {
         double to_end = ((double)end - pos) * dr / sr;     /* device frames until the loop wraps */
         if (to_end > 0.0) *out_next = played + (int64_t)ceil(to_end - 1e-9);
     } else if (end >= 0 && pos > (double)end) {
@@ -1690,7 +1701,7 @@ static void record_clock(struct fa_stream* s, int64_t dev0, int64_t played0, int
     double ns_per_frame = 1e9 / (double)s->dev_rate;
     int64_t p = played0, stop = played0 + n;
     fa_frames end = end_frame(s);
-    int64_t end_pts = (!s->push && end >= 0 && !(s->flags & FA_OPEN_LOOP))
+    int64_t end_pts = (!s->push && end >= 0 && !loops(s))
         ? (int64_t)((double)end * 1e9 / (double)s->decoder.format.sample_rate + 0.5) : INT64_MAX;
     while (p < stop) {
         int64_t next, seg, pts0, pts1;

@@ -330,6 +330,7 @@ static void test_clock_across_detach(void)
     fa_stream* s = open_push_s16p();
     int64_t lat = latency_ns(), base = 10000000000LL, t1, heard_ns;
     fa_frames pos = 0;
+    fa_time c = 0;
     CHECK(s != NULL);
     CHECK_EQ(push_level(s, g_dev->rate * 2, 0.25f, base), FA_OK);
     CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
@@ -340,6 +341,8 @@ static void test_clock_across_detach(void)
     CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
     CHECK(pos > 0);
     heard_ns = base + (int64_t)((double)pos * 1e9 / g_dev->rate + 0.5);
+    CHECK_EQ(fa_stream_get_clock(s, &c), FA_OK);
+    CHECK_NEAR((double)c, (double)heard_ns, 2000.0);   /* detached: what was heard, not what was decoded */
     CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
     CHECK_NEAR((double)clock_at(s, g_now), (double)heard_ns, 2000.0);   /* holds there */
     CHECK_EQ(fa_stream_play(s), FA_OK);
@@ -358,6 +361,7 @@ static void test_clock_across_detach_with_jump(void)
     fa_stream* s = open_push_s16p();
     int64_t lat = latency_ns(), t1, heard_ns, half = g_dev->rate / 4;   /* 250 ms pieces */
     fa_frames pos = 0;
+    fa_time c = 0;
     CHECK(s != NULL);
     CHECK_EQ(push_level(s, half, 0.25f, 0), FA_OK);
     CHECK_EQ(push_level(s, half, 0.25f, 10000000000LL), FA_OK);          /* jump to 10 s */
@@ -369,6 +373,8 @@ static void test_clock_across_detach_with_jump(void)
     CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
     CHECK(pos > 0 && pos < half);
     heard_ns = (int64_t)((double)pos * 1e9 / g_dev->rate + 0.5);
+    CHECK_EQ(fa_stream_get_clock(s, &c), FA_OK);
+    CHECK_NEAR((double)c, (double)heard_ns, 2000.0);   /* not 10 s: the jump was not heard yet */
     CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
     CHECK_NEAR((double)clock_at(s, g_now), (double)heard_ns, 2000.0);
     CHECK_EQ(fa_stream_play(s), FA_OK);
@@ -378,6 +384,31 @@ static void test_clock_across_detach_with_jump(void)
     CHECK_NEAR((double)clock_at(s, t1 + lat + 50000000), (double)(heard_ns + 50000000), 2000.0);
     /* 250 ms - heard after attaching, the 10 s piece is heard. */
     CHECK_NEAR((double)clock_at(s, t1 + lat + (250000000 - heard_ns) + 20000000), 10020000000.0, 2000.0);
+    fa_stream_close(s);
+}
+
+/* A cue-out set while detached, before the audio kept from the detach: the stream
+ * just ends on attach. */
+static void test_cue_out_before_kept_audio(void)
+{
+    fa_stream* s = open_push_s16p();
+    fa_stream_state st;
+    fa_frames pos = 0;
+    CHECK(s != NULL);
+    CHECK_EQ(push_level(s, g_dev->rate, 0.25f, 0), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    wait_decoded(s, PERIOD * 8);
+    render(PERIOD * 10);
+    CHECK_EQ(fa_stream_detach(s), FA_OK);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK(pos > PERIOD);
+    CHECK_EQ(fa_stream_set_marker(s, FA_MARKER_CUE_OUT, PERIOD), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(PERIOD * 20);
+    CHECK_EQ(fa_stream_get_state(s, &st), FA_OK);
+    CHECK_EQ(st, FA_STATE_ENDED);
     fa_stream_close(s);
 }
 
@@ -809,6 +840,7 @@ int main(void)
 
     RUN(test_push_pcm_plays_exactly);
     RUN(test_push_frame_converts_any_format);
+    RUN(test_cue_out_before_kept_audio);
     RUN(test_clock_follows_the_speaker);
     RUN(test_clock_follows_timestamp_jumps);
     RUN(test_clock_records_extend_atomically);

@@ -387,7 +387,7 @@ static const char* pcm_name(int is_float, int big, uint64_t bits)
 {
     if (is_float) return bits == 64 ? "pcm_f64le" : bits == 32 ? "pcm_f32le" : NULL;
     switch (bits) {
-    case 8: return big ? "pcm_s8" : "pcm_u8";
+    case 8: return "pcm_u8";             /* 8-bit Matroska PCM is unsigned in either byte order */
     case 16: return big ? "pcm_s16be" : "pcm_s16le";
     case 24: return big ? "pcm_s24be" : "pcm_s24le";
     case 32: return big ? "pcm_s32be" : "pcm_s32le";

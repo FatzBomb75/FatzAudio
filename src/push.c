@@ -51,9 +51,7 @@ struct fa_push {
     fa_codec codec;
     int codec_ready;
     uint32_t rate, channels;     /* the stream's format */
-    ma_data_converter conv;
-    int conv_ready;
-    uint32_t conv_rate, conv_channels;
+    fa_pcm_conv conv;            /* pushed audio in another format than the stream's */
     float* buf;                  /* converted frames not handed out yet */
     fa_frames buf_cap, buf_count, buf_off;
     int64_t pending_anchor;      /* the next frame handed out starts the timeline here (ns), FA_PTS_NONE = it continues */
@@ -141,7 +139,7 @@ void fa_push_free(struct fa_push* p)
     if (!p) return;
     for (it = p->head; it;) { fa_push_item* n = it->next; free(it); it = n; }
     if (p->codec_ready) fa_codec_close(&p->codec);
-    if (p->conv_ready) ma_data_converter_uninit(&p->conv, NULL);
+    fa_pcm_conv_free(&p->conv);
     free(p->buf);
     fa_mutex_destroy(&p->lock);
     free(p);
@@ -271,7 +269,7 @@ void fa_push_flush_locked(struct fa_push* p, int keep_hold)
     fa_mutex_unlock(&p->lock);
     while (it) { fa_push_item* n = it->next; free(it); it = n; }
     if (p->codec_ready && p->codec.vt->flush) p->codec.vt->flush(&p->codec);
-    if (p->conv_ready) ma_data_converter_reset(&p->conv);
+    fa_pcm_conv_reset(&p->conv);
     p->buf_count = p->buf_off = 0;
     fa_store64(&p->out_buffered, 0);
     p->pending_anchor = FA_PTS_NONE;
@@ -292,64 +290,18 @@ void fa_push_restart_timeline(struct fa_push* p)
 
 /* ---- the push decoder (worker side) ----------------------------------------------------- */
 
-static fa_result buf_reserve(struct fa_push* p, fa_frames frames)
-{
-    fa_frames need = frames * (fa_frames)p->channels;
-    if (need > p->buf_cap) {
-        fa_frames cap = p->buf_cap ? p->buf_cap : 8192;
-        float* b;
-        while (cap < need) cap *= 2;
-        b = (float*)realloc(p->buf, (size_t)cap * sizeof(float));
-        if (!b) return FA_ERROR_OUT_OF_MEMORY;
-        p->buf = b;
-        p->buf_cap = cap;
-    }
-    return FA_OK;
-}
-
 /* Puts `frames` frames of `in` (rate, channels) into buf, in the stream's format. */
 static fa_result convert_into_buf(struct fa_push* p, const float* in, fa_frames frames, uint32_t rate, uint32_t channels)
 {
     fa_result r;
     if (rate == p->rate && channels == p->channels) {
-        r = buf_reserve(p, frames);
+        r = fa_float_reserve(&p->buf, &p->buf_cap, frames, channels);
         if (r != FA_OK) return r;
         memcpy(p->buf, in, (size_t)frames * channels * sizeof(float));
         p->buf_count = frames;
         return FA_OK;
     }
-    if (!p->conv_ready || p->conv_rate != rate || p->conv_channels != channels) {
-        ma_data_converter_config cc;
-        if (p->conv_ready) { ma_data_converter_uninit(&p->conv, NULL); p->conv_ready = 0; }
-        cc = ma_data_converter_config_init(ma_format_f32, ma_format_f32, channels, p->channels, rate, p->rate);
-        if (ma_data_converter_init(&cc, NULL, &p->conv) != MA_SUCCESS) return FA_ERROR_OUT_OF_MEMORY;
-        p->conv_ready = 1;
-        p->conv_rate = rate;
-        p->conv_channels = channels;
-    }
-    {
-        ma_uint64 expect = 0;
-        fa_frames done_in = 0;
-        ma_data_converter_get_expected_output_frame_count(&p->conv, (ma_uint64)frames, &expect);
-        r = buf_reserve(p, (fa_frames)expect + 64);
-        if (r != FA_OK) return r;
-        p->buf_count = 0;
-        while (done_in < frames) {
-            ma_uint64 in_n = (ma_uint64)(frames - done_in);
-            ma_uint64 out_n = (ma_uint64)(p->buf_cap / p->channels - p->buf_count);
-            if (out_n == 0) {
-                r = buf_reserve(p, p->buf_count * 2 + 64);
-                if (r != FA_OK) return r;
-                continue;
-            }
-            ma_data_converter_process_pcm_frames(&p->conv, in + (size_t)done_in * channels, &in_n,
-                                                 p->buf + (size_t)p->buf_count * p->channels, &out_n);
-            done_in += (fa_frames)in_n;
-            p->buf_count += (fa_frames)out_n;
-            if (in_n == 0 && out_n == 0) break;
-        }
-    }
-    return FA_OK;
+    return fa_pcm_convert(&p->conv, in, frames, rate, channels, p->rate, p->channels, &p->buf, &p->buf_cap, &p->buf_count);
 }
 
 static void post_decode_error(struct fa_push* p, fa_result err)

@@ -313,7 +313,11 @@ static int load_fragment(mp4* m, fa_result* err)
         m->next_box = size < 0 ? -1 : pos + size;
         if (type != FOURCC('m', 'o', 'o', 'f')) continue;
         if (size < 0 || size - hdr > (int64_t)MP4_MAX_BOX) break;
-        if (fa_br_read_alloc(&m->br, (size_t)(size - hdr), MP4_MAX_BOX, &buf, &cap) != FA_OK) break;
+        *err = fa_br_read_alloc(&m->br, (size_t)(size - hdr), MP4_MAX_BOX, &buf, &cap);
+        if (*err != FA_OK) {
+            if (*err != FA_ERROR_OUT_OF_MEMORY) *err = FA_OK;   /* a cut file: it ends here */
+            break;
+        }
         if (m->lazy) m->npk = m->cur = before = 0;       /* forward-only: the past is gone anyway */
         *err = parse_moof(m, buf, (size_t)(size - hdr), pos);
         if (*err != FA_OK) break;
@@ -646,8 +650,8 @@ static fa_result mp4_next(void* ctx, fa_demux_packet* out)
     const mp4_pkt* p;
     fa_result r;
     if (m->cur >= m->npk) {
-        if (!m->lazy || !load_fragment(m, &r)) return FA_ERROR_END_OF_STREAM;
-        if (r != FA_OK) return r;
+        if (!m->lazy) return FA_ERROR_END_OF_STREAM;
+        if (!load_fragment(m, &r)) return r != FA_OK ? r : FA_ERROR_END_OF_STREAM;
     }
     p = &m->pk[m->cur];
     r = fa_br_seek(&m->br, p->off);

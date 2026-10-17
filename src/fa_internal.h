@@ -719,6 +719,22 @@ void fa_codec_close(fa_codec* c);
 /* Makes room for `frames` more frames in c->out (keeping what is there). */
 fa_result fa_codec_reserve(fa_codec* c, fa_frames frames, uint32_t channels);
 
+/* Float PCM from one rate and channel count to another (miniaudio's converter),
+ * set up again whenever the input format changes. */
+typedef struct fa_pcm_conv {
+    ma_data_converter conv;
+    int ready;
+    uint32_t rate, channels;      /* the input it is set up for */
+} fa_pcm_conv;
+/* Converts `frames` frames of `in` (rate, channels) to out_rate / out_channels into
+ * *buf from its start, growing it (*cap counts floats); *out_frames = frames written. */
+fa_result fa_pcm_convert(fa_pcm_conv* c, const float* in, fa_frames frames, uint32_t rate, uint32_t channels,
+                         uint32_t out_rate, uint32_t out_channels, float** buf, fa_frames* cap, fa_frames* out_frames);
+void fa_pcm_conv_reset(fa_pcm_conv* c);
+void fa_pcm_conv_free(fa_pcm_conv* c);
+/* Makes *buf hold at least `frames` frames of `channels`, keeping its contents (*cap counts floats). */
+fa_result fa_float_reserve(float** buf, fa_frames* cap, fa_frames frames, uint32_t channels);
+
 /* Sample conversion to interleaved F32. `kind`: FA_SAMPLE_* below. */
 enum { FA_SAMPLE_U8 = 0, FA_SAMPLE_S8, FA_SAMPLE_S16, FA_SAMPLE_S24, FA_SAMPLE_S32, FA_SAMPLE_S64,
        FA_SAMPLE_F32, FA_SAMPLE_F64 };

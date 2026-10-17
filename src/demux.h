@@ -107,9 +107,7 @@ typedef struct fa_track {
     fa_frames grid, grid_origin;
     int grid_state;           /* 0 = not learned yet, 1 = holds, 2 = odd packet seen, -1 = off */
     /* When the codec's output changes format mid-stream. */
-    ma_data_converter conv;
-    int conv_ready;
-    uint32_t conv_rate, conv_channels;
+    fa_pcm_conv conv;
     float* tmp;
     fa_frames tmp_cap;
 } fa_track;

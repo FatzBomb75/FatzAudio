@@ -207,58 +207,14 @@ static fa_frames packet_frames(const fa_track* t, const uint8_t* d, size_t n)
 
 /* ---- the track decoder -------------------------------------------------------------- */
 
-static fa_result reserve(float** buf, fa_frames* cap, fa_frames frames, uint32_t channels)
-{
-    fa_frames need = frames * (fa_frames)channels;
-    if (need > *cap) {
-        fa_frames c = *cap ? *cap : 8192;
-        float* p;
-        while (c < need) c *= 2;
-        p = (float*)realloc(*buf, (size_t)c * sizeof(float));
-        if (!p) return FA_ERROR_OUT_OF_MEMORY;
-        *buf = p;
-        *cap = c;
-    }
-    return FA_OK;
-}
-
 /* The codec's output in a format other than the one reported at open (a stream
  * that changes mid-way): converted with miniaudio, into t->tmp. */
 static fa_result convert(fa_track* t, const float** data, fa_frames* frames)
 {
-    uint32_t rate = t->codec.rate, ch = t->codec.channels, out_ch = t->dec->format.channels;
-    ma_uint64 expect = 0;
-    fa_frames done_in = 0, done_out = 0, n = *frames;
-    fa_result r;
-    if (!t->conv_ready || t->conv_rate != rate || t->conv_channels != ch) {
-        ma_data_converter_config cc;
-        if (t->conv_ready) { ma_data_converter_uninit(&t->conv, NULL); t->conv_ready = 0; }
-        cc = ma_data_converter_config_init(ma_format_f32, ma_format_f32, ch, out_ch, rate, t->dec->format.sample_rate);
-        if (ma_data_converter_init(&cc, NULL, &t->conv) != MA_SUCCESS) return FA_ERROR_OUT_OF_MEMORY;
-        t->conv_ready = 1;
-        t->conv_rate = rate;
-        t->conv_channels = ch;
-    }
-    ma_data_converter_get_expected_output_frame_count(&t->conv, (ma_uint64)n, &expect);
-    r = reserve(&t->tmp, &t->tmp_cap, (fa_frames)expect + 64, out_ch);
-    if (r != FA_OK) return r;
-    while (done_in < n) {
-        ma_uint64 in_n = (ma_uint64)(n - done_in);
-        ma_uint64 out_n = (ma_uint64)(t->tmp_cap / out_ch - done_out);
-        if (out_n == 0) {
-            r = reserve(&t->tmp, &t->tmp_cap, done_out * 2 + 64, out_ch);
-            if (r != FA_OK) return r;
-            continue;
-        }
-        ma_data_converter_process_pcm_frames(&t->conv, *data + (size_t)done_in * ch, &in_n,
-                                             t->tmp + (size_t)done_out * out_ch, &out_n);
-        done_in += (fa_frames)in_n;
-        done_out += (fa_frames)out_n;
-        if (in_n == 0 && out_n == 0) break;
-    }
+    fa_result r = fa_pcm_convert(&t->conv, *data, *frames, t->codec.rate, t->codec.channels,
+                                 t->dec->format.sample_rate, t->dec->format.channels, &t->tmp, &t->tmp_cap, frames);
     *data = t->tmp;
-    *frames = done_out;
-    return FA_OK;
+    return r;
 }
 
 /* Snaps an estimated packet position to the codec's packet grid, when the
@@ -358,7 +314,7 @@ static fa_result emit(fa_track* t, const fa_demux_packet* pk)
     hi = pos + m;
     if (t->p.clip_to_end && t->length >= 0 && hi > t->length) hi = t->length;
     if (hi < lo) hi = lo;
-    r = reserve(&t->buf, &t->buf_cap, (zhi - zlo) + (hi - lo), ch);
+    r = fa_float_reserve(&t->buf, &t->buf_cap, (zhi - zlo) + (hi - lo), ch);
     if (r != FA_OK) return r;
     if (zhi > zlo) memset(t->buf, 0, (size_t)(zhi - zlo) * ch * sizeof(float));
     if (hi > lo)
@@ -493,7 +449,7 @@ fa_result fa_track_seek(fa_track* t, fa_frames frame)
     double at = (double)t->p.start + (double)(want - t->lead) / t->fpt;
     fa_result r;
     if (t->codec.vt->flush) t->codec.vt->flush(&t->codec);
-    if (t->conv_ready) ma_data_converter_reset(&t->conv);
+    fa_pcm_conv_reset(&t->conv);
     t->count = t->off = 0;
     t->eof = 0;
     /* The packet holding `want`; a hair of slack keeps exact boundaries exact. */
@@ -507,7 +463,7 @@ fa_result fa_track_seek(fa_track* t, fa_frames frame)
 void fa_track_close(fa_track* t)
 {
     if (t->codec_ready) fa_codec_close(&t->codec);
-    if (t->conv_ready) ma_data_converter_uninit(&t->conv, NULL);
+    fa_pcm_conv_free(&t->conv);
     free(t->buf);
     free(t->tmp);
     memset(t, 0, sizeof(*t));
@@ -541,7 +497,9 @@ static void put_rate(bitw* w, uint32_t rate)
 size_t fa_aac_build_asc(uint8_t out[FA_AAC_ASC_MAX], int object_type, uint32_t rate, uint32_t channels, uint32_t sbr_rate)
 {
     bitw w;
-    uint32_t cfg = channels <= 6 ? channels : channels == 8 ? 7 : 2;
+    /* channelConfiguration: 1-6 as is, 7 means 7.1; any other count is 0, "the
+     * stream's own program config element says", never a guessed layout. */
+    uint32_t cfg = channels <= 6 ? channels : channels == 8 ? 7 : 0;
     memset(out, 0, FA_AAC_ASC_MAX);
     w.p = out;
     w.bit = 0;

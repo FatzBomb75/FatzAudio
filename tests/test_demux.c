@@ -770,6 +770,13 @@ static void test_aac_config_explicit_rates(void)
     CHECK((asc[0] >> 3) == 5);                          /* explicit SBR */
     CHECK(fa_aac_build_asc(asc, 2, 12345, 2, 0) == 5);  /* 5 + 28 + 4 + 3 = 40 bits */
     CHECK(fa_aac_build_asc(asc, 2, 44100, 2, 0) == 2);
+    /* channelConfiguration (bits 9-12): 7.1 is 7, counts without one are 0, never stereo. */
+    fa_aac_build_asc(asc, 2, 48000, 6, 0);
+    CHECK(((asc[1] >> 3) & 15) == 6);
+    fa_aac_build_asc(asc, 2, 48000, 8, 0);
+    CHECK(((asc[1] >> 3) & 15) == 7);
+    fa_aac_build_asc(asc, 2, 48000, 7, 0);
+    CHECK(((asc[1] >> 3) & 15) == 0);
 }
 
 int main(void)

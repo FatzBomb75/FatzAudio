@@ -110,6 +110,69 @@ fa_result fa_codec_reserve(fa_codec* c, fa_frames frames, uint32_t channels)
     return FA_OK;
 }
 
+fa_result fa_float_reserve(float** buf, fa_frames* cap, fa_frames frames, uint32_t channels)
+{
+    fa_frames need = frames * (fa_frames)channels;
+    if (need > *cap) {
+        fa_frames c = *cap ? *cap : 8192;
+        float* p;
+        while (c < need) c *= 2;
+        p = (float*)realloc(*buf, (size_t)c * sizeof(float));
+        if (!p) return FA_ERROR_OUT_OF_MEMORY;
+        *buf = p;
+        *cap = c;
+    }
+    return FA_OK;
+}
+
+fa_result fa_pcm_convert(fa_pcm_conv* c, const float* in, fa_frames frames, uint32_t rate, uint32_t channels,
+                         uint32_t out_rate, uint32_t out_channels, float** buf, fa_frames* cap, fa_frames* out_frames)
+{
+    ma_uint64 expect = 0;
+    fa_frames done_in = 0, done_out = 0;
+    fa_result r;
+    *out_frames = 0;
+    if (!c->ready || c->rate != rate || c->channels != channels) {
+        ma_data_converter_config cc;
+        if (c->ready) { ma_data_converter_uninit(&c->conv, NULL); c->ready = 0; }
+        cc = ma_data_converter_config_init(ma_format_f32, ma_format_f32, channels, out_channels, rate, out_rate);
+        if (ma_data_converter_init(&cc, NULL, &c->conv) != MA_SUCCESS) return FA_ERROR_OUT_OF_MEMORY;
+        c->ready = 1;
+        c->rate = rate;
+        c->channels = channels;
+    }
+    ma_data_converter_get_expected_output_frame_count(&c->conv, (ma_uint64)frames, &expect);
+    r = fa_float_reserve(buf, cap, (fa_frames)expect + 64, out_channels);
+    if (r != FA_OK) return r;
+    while (done_in < frames) {
+        ma_uint64 in_n = (ma_uint64)(frames - done_in);
+        ma_uint64 out_n = (ma_uint64)(*cap / out_channels - done_out);
+        if (out_n == 0) {
+            r = fa_float_reserve(buf, cap, done_out * 2 + 64, out_channels);
+            if (r != FA_OK) return r;
+            continue;
+        }
+        ma_data_converter_process_pcm_frames(&c->conv, in + (size_t)done_in * channels, &in_n,
+                                             *buf + (size_t)done_out * out_channels, &out_n);
+        done_in += (fa_frames)in_n;
+        done_out += (fa_frames)out_n;
+        if (in_n == 0 && out_n == 0) break;
+    }
+    *out_frames = done_out;
+    return FA_OK;
+}
+
+void fa_pcm_conv_reset(fa_pcm_conv* c)
+{
+    if (c->ready) ma_data_converter_reset(&c->conv);
+}
+
+void fa_pcm_conv_free(fa_pcm_conv* c)
+{
+    if (c->ready) ma_data_converter_uninit(&c->conv, NULL);
+    c->ready = 0;
+}
+
 void fa_codec_close(fa_codec* c)
 {
     if (c->vt && c->vt->close) c->vt->close(c);
@@ -136,7 +199,7 @@ static const pcm_layout pcm_layouts[] = {
 
 typedef struct pcm_state {
     const pcm_layout* layout;
-    uint8_t carry[64];   /* the bytes of a frame split across two packets */
+    uint8_t carry[32 * 8];  /* the bytes of a frame split across two packets (32 channels of 64 bits) */
     size_t carry_len;
 } pcm_state;
 
@@ -191,7 +254,7 @@ static const fa_codec_vtable pcm_vtable = { "pcm", pcm_decode, pcm_flush, free_i
 static fa_result pcm_open(fa_codec* c, const fa_codec_params* p, const pcm_layout* layout)
 {
     pcm_state* st;
-    if (p->sample_rate == 0 || p->channels == 0 || p->channels > 8) return FA_ERROR_UNSUPPORTED_FORMAT;
+    if (p->sample_rate == 0 || p->channels == 0 || p->channels > 32) return FA_ERROR_UNSUPPORTED_FORMAT;
     st = (pcm_state*)calloc(1, sizeof(*st));
     if (!st) return FA_ERROR_OUT_OF_MEMORY;
     st->layout = layout;
@@ -365,8 +428,13 @@ fa_result fa_codec_open(fa_codec* c, const fa_codec_params* p)
     fa_result r;
     memset(c, 0, sizeof(*c));
     snprintf(c->name, sizeof(c->name), "%s", p->codec);
-    for (i = 0; i < sizeof(pcm_layouts) / sizeof(pcm_layouts[0]); i++)
-        if (strcmp(p->codec, pcm_layouts[i].name) == 0) return pcm_open(c, p, &pcm_layouts[i]);
+    for (i = 0; i < sizeof(pcm_layouts) / sizeof(pcm_layouts[0]); i++) {
+        if (strcmp(p->codec, pcm_layouts[i].name) == 0) {
+            r = pcm_open(c, p, &pcm_layouts[i]);
+            if (r != FA_ERROR_UNSUPPORTED_FORMAT) return r;
+            break;                         /* more channels than ours: FFmpeg may take it */
+        }
+    }
     if (strcmp(p->codec, "mp3") == 0) return mp3_open(c, p);
     r = fa_ffmpeg_open_codec(c, p);
     if (r != FA_OK) {
