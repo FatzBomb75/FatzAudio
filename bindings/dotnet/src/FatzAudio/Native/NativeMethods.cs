@@ -94,6 +94,19 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_info(StreamHandle stream, out FaStreamInfo info);
 
+    // ---- Web streams -------------------------------------------------------
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_net_options_init(FaNetOptions* options);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_metadata(StreamHandle stream, FaMetadata* metadata);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_net_status(StreamHandle stream, FaNetStatus* status);
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_http_header(StreamHandle stream, string name, byte* value, nuint valueSize);
+
     // ---- Transport and position -------------------------------------------
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_attach(StreamHandle stream, DeviceHandle device, nint bus);

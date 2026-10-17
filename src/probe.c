@@ -82,3 +82,20 @@ int fa_probe_mp3(const uint8_t* d, size_t n, size_t id3)
     }
     return id3 > 0 ? 30 : 0;
 }
+
+int fa_probe_mp3_header(const uint8_t* d, size_t n, size_t start, uint32_t* out_kbps, uint32_t* out_rate)
+{
+    size_t i;
+    for (i = start; i + 4 <= n; i++) {
+        uint32_t rate = 0, version, br;
+        size_t len = mp3_frame_len(d + i, &rate);
+        if (len == 0) continue;
+        if (i + len + 4 <= n && mp3_frame_len(d + i + len, NULL) == 0) continue;  /* not a chain of frames */
+        version = (d[i + 1] >> 3) & 3;
+        br = (d[i + 2] >> 4) & 15;
+        *out_kbps = version == 3 ? mp3_kbps_v1[br] : mp3_kbps_v2[br];
+        *out_rate = rate;
+        return 1;
+    }
+    return 0;
+}
