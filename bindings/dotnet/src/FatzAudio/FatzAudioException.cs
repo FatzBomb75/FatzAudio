@@ -36,6 +36,8 @@ public enum ErrorCode
     ProviderMissing = -13,
     /// <summary>The CD drive has no disc, its tray is open, or the disc was changed under an open stream.</summary>
     NoDisc = -14,
+    /// <summary>A MIDI file was opened with no soundfont: set <see cref="AudioEngine.DefaultSoundFont"/> or <see cref="StreamOptions.SoundFont"/>.</summary>
+    NoSoundFont = -15,
 }
 
 /// <summary>

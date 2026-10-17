@@ -99,3 +99,13 @@ int fa_probe_mp3_header(const uint8_t* d, size_t n, size_t start, uint32_t* out_
     }
     return 0;
 }
+
+/* Standard MIDI File: an "MThd" chunk of at least 6 bytes. RIFF MIDI (.rmi): a
+ * RIFF form of type "RMID" around one. */
+int fa_probe_midi(const uint8_t* d, size_t n, size_t id3)
+{
+    (void)id3;
+    if (n >= 8 && memcmp(d, "MThd", 4) == 0 && d[4] == 0 && d[5] == 0 && d[6] == 0 && d[7] >= 6) return 100;
+    if (n >= 12 && memcmp(d, "RIFF", 4) == 0 && memcmp(d + 8, "RMID", 4) == 0) return 100;
+    return 0;
+}

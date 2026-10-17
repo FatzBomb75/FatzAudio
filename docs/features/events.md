@@ -16,6 +16,7 @@ Each stream has one event callback. The audio thread queues events without locki
 | `FA_EVENT_DECODE_ERROR` | position | the `fa_result` | ✅ packet streams (the packet is skipped); disc streams (`FA_ERROR_IO` for a sector that stays unreadable, which plays as silence) |
 | `FA_EVENT_DEVICE_CHANGED` | position | 0 | 🗓️ R14 |
 | `FA_EVENT_LOUDNESS_FINAL` | position | 0 | ✅ ([normalization](normalization.md)) |
+| `FA_EVENT_MIDI_TEXT` | the text's frame | its index for `fa_stream_get_midi_text` | ✅ MIDI lyrics and text, streams on a device ([MIDI](midi.md#lyrics-and-text-events)) |
 
 ## C
 
@@ -43,6 +44,7 @@ song.Ended += (_, _) => Console.WriteLine("done");
 song.RampCompleted += (_, e) => Console.WriteLine($"ramp {e.Value} done at {e.Position}");
 song.Started += (_, _) => Console.WriteLine("started");
 song.MarkerReached += (_, e) => Console.WriteLine($"{e.Marker} reached");
+song.MidiTextReached += (_, e) => Console.WriteLine($"lyric: {e.Text.Text}");
 ```
 
 ## Lifetime guarantees
@@ -50,5 +52,5 @@ song.MarkerReached += (_, e) => Console.WriteLine($"{e.Marker} reached");
 - When `fa_stream_set_event_callback` (replacing a callback) or `fa_stream_close` returns, the previous callback isn't running and won't be called again, so you can free its `user` data. The one exception is calling them from inside that callback itself.
 - Events queued for a stream that has since been closed are dropped, not delivered.
 - Events for a stream arrive in the order they happened, whether the audio thread raised them (a ramp finishing) or an API call did (a ramp replaced before it started).
-- `ENDED`, `RAMP_DONE` and `STARTED` aren't lost, so a `RampAsync` or `CrossfadeTo` always completes. `MARKER` is best effort: it can be dropped in the rare case that the device's event queue (1024 events) fills before the engine empties it. A slow callback only delays later events: the decode workers keep moving events off the audio thread's queue every few milliseconds while your callback runs.
+- `ENDED`, `RAMP_DONE` and `STARTED` aren't lost, so a `RampAsync` or `CrossfadeTo` always completes. `MARKER` and `MIDI_TEXT` are best effort: they can be dropped in the rare case that the device's event queue (1024 events) fills before the engine empties it. A slow callback only delays later events: the decode workers keep moving events off the audio thread's queue every few milliseconds while your callback runs.
 - Closing a device delivers what it had queued. A callback may also call `fa_engine_destroy` after closing the engine's streams; the teardown finishes once the callback returns.

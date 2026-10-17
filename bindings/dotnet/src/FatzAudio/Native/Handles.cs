@@ -169,6 +169,19 @@ internal sealed class DiscHandle : SafeHandle
     }
 }
 
+/// <summary>Owns one reference to an <c>fa_soundfont*</c>. Engines and streams using it hold their own native references.</summary>
+internal sealed class SoundFontHandle : SafeHandle
+{
+    public SoundFontHandle() : base(0, true) { }
+    public override bool IsInvalid => handle == 0;
+
+    protected override bool ReleaseHandle()
+    {
+        NativeMethods.fa_soundfont_close(handle);
+        return true;
+    }
+}
+
 internal static class HandleRef
 {
     public static T AddRef<T>(T handle) where T : SafeHandle

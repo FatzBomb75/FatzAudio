@@ -355,6 +355,43 @@ basscd is an add-on DLL; FatzAudio reads CDs and `.cue` images itself, with one 
 | BASS_CONFIG_CD_AUTOSPEED, BASS_CONFIG_CD_FREEOLD, BASS_CONFIG_CD_CDDB_SERVER, BASS_CD_READ | Not needed (reads are buffered per stream; no server access) | | ➖ |
 | De-emphasis of pre-emphasized tracks (your own filter) | Automatic for tracks with the PRE flag; `FA_DISC_NO_DEEMPHASIS` turns it off | `DiscOptions.DeEmphasis` | ✅ |
 
+### bassmidi (MIDI files and soundfonts)
+
+MIDI files are a built-in format: the ordinary open calls play them with a SoundFont 2 you load once ([MIDI](../features/midi.md)). There are no per-stream font arrays, font handles per preset or sample loading on demand.
+
+| BASSMIDI | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| BASS_MIDI_StreamCreateFile / BASS_MIDI_StreamCreateFileUser | `fa_stream_open_path` / `fa_stream_open_memory` / `fa_stream_open_io` (`.mid`, `.kar`, `.rmi` detected from content) | `engine.OpenFile` / `engine.OpenMemory` / `engine.OpenStream` | ✅ |
+| BASS_MIDI_StreamCreateURL | `fa_stream_open_url` | `engine.OpenUrl` | ✅ |
+| BASS_PluginLoad("bassmidi.dll") | Not needed: built in | — | ➖ (by design) |
+| BASS_MIDI_FontInit (file or BASS_MIDI_FONT_MEM) | `fa_soundfont_open_path` / `fa_soundfont_open_memory` | `SoundFont.FromFile` / `SoundFont.FromMemory` | ✅ SF2; SF3 and SFZ 🗓️ |
+| BASS_MIDI_FontInitUser | Read the file yourself and use `fa_soundfont_open_memory` | `SoundFont.FromMemory` | ✅ |
+| BASS_MIDI_FontFree | `fa_soundfont_close` (reference-counted: streams using it keep it) | `soundFont.Dispose()` | ✅ |
+| BASS_MIDI_FontGetInfo | `fa_soundfont_get_info` (name, presets, sample memory) | `soundFont.Info` | ✅ |
+| BASS_MIDI_FontLoad / BASS_MIDI_FontCompact / BASS_MIDI_FontUnload | Not needed: the whole bank loads at open | — | ➖ (by design) |
+| BASS_MIDI_FontPack / BASS_MIDI_FontUnpack (SF2PACK) | Not provided: SF3 support is planned instead | — | ➖ |
+| BASS_CONFIG_MIDI_DEFFONT, BASS_MIDI_StreamSetFonts(0, ...) | `fa_engine_set_soundfont` | `engine.DefaultSoundFont` | ✅ |
+| BASS_MIDI_StreamSetFonts(stream, ...) | `fa_open_options.soundfont` when opening | `StreamOptions.SoundFont` | ✅ (one font per stream; no stacks or per-preset mapping) |
+| BASS_MIDI_FontSetVolume | Stream volume (`FA_PARAM_VOLUME`) | `Volume` | ✅ |
+| BASS_MIDI_StreamGetMark (LYRIC, TEXT, MARKER, CUE, COPY, TRACK, INST) | `fa_stream_get_midi_text` (cleaned-up lyrics with line and paragraph flags, UTF-8) and `fa_stream_get_midi_info` | `stream.MidiTexts`, `stream.MidiInfo` | ✅ |
+| BASS_MIDI_MARK_KEYSIG / TIMESIG / TEMPO / TICK | Not provided | — | 🗓️ |
+| BASS_SYNC_MIDI_LYRIC / BASS_SYNC_MIDI_TEXT / BASS_SYNC_MIDI_MARK | `FA_EVENT_MIDI_TEXT` (`value` = text index) | `stream.MidiTextReached` | ✅ |
+| BASS_MIDI_StreamEvent MIDI_EVENT_TRANSPOSE | `fa_stream_set_midi_transpose` | `stream.MidiTranspose` | ✅ |
+| BASS_MIDI_StreamEvent MIDI_EVENT_MUTE | `fa_stream_set_midi_channel_mute` | `stream.SetMidiChannelMuted` | ✅ |
+| BASS_MIDI_StreamEvent MIDI_EVENT_MASTERVOL / BASS_ATTRIB_VOL | `FA_PARAM_VOLUME` | `Volume` | ✅ |
+| BASS_MIDI_StreamEvent MIDI_EVENT_TEMPO / BASS_ATTRIB_MIDI_SPEED | `FA_PARAM_TEMPO` (lyrics and the clock follow) | `Tempo` | ✅ |
+| BASS_MIDI_StreamEvent (other events: notes, programs, controllers), BASS_MIDI_StreamEvents | Not provided | — | 🗓️ |
+| BASS_MIDI_StreamCreate / BASS_MIDI_StreamCreateEvents (real-time synth, event lists) | Not provided | — | 🗓️ |
+| BASS_MIDI_StreamGetEvent / BASS_MIDI_StreamGetEvents | Not provided | — | 🗓️ |
+| BASS_MIDI_InInit / BASS_MIDI_InStart (MIDI input devices) | Not provided | — | 🗓️ |
+| BASS_ATTRIB_MIDI_VOICES | Fixed at 256 voices per stream | — | ✅ (fixed) |
+| BASS_ATTRIB_MIDI_PPQN, BASS_POS_MIDI_TICK | Not provided: positions are frames and time | — | ➖ |
+| BASS_ATTRIB_MIDI_TRACK_VOL, BASS_MIDI_StreamGetChannel | Not provided | — | 🗓️ |
+| BASS_MIDI_DECAYEND | Always on: one second after the last event | — | ✅ |
+| BASS_MIDI_DECAYSEEK (held notes after a seek) | Not provided: held notes sound again from their next note-on | — | ➖ |
+| BASS_MIDI_NOFX (reverb and chorus) | No reverb or chorus yet | — | 🗓️ |
+| BASS_ATTRIB_MIDI_SRC / BASS_MIDI_SINCINTER | Not configurable: the synthesizer's own interpolation | — | ➖ |
+
 ## 3. Add-on map
 
 | Legacy DLL | Replaced by | Status |
@@ -368,7 +405,7 @@ basscd is an add-on DLL; FatzAudio reads CDs and `.cue` images itself, with one 
 | OGG Vorbis in bass.dll | Built-in: `.ogg` files, chained files, Ogg radio with song titles ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
 | basswma.dll | Decode via Media Foundation on Windows / FFmpeg bridge; WMA encoding not provided (record to MP3, FLAC or WAV with `fa_encoder_*` instead) | 🗓️ / ➖ |
 | bassenc.dll, bassenc_mp3.dll, bassenc_flac.dll (if added later) | Built in: `fa_encoder_*` writes WAV and FLAC itself and MP3 through the app's LAME ([recording and encoding](../features/recording-encoding.md)) | ✅ WAV/FLAC/MP3, 🗓️ Opus/AAC/casting |
-| bassmidi.dll | Built-in MIDI synth (SF2, later SFZ/SF3); soundfont via stream options | 🗓️ |
+| bassmidi.dll | Built-in SoundFont 2 synthesizer for `.mid`, `.kar` and `.rmi`: engine-wide or per-stream soundfont, lyrics and text events, transpose and channel mute ([MIDI](../features/midi.md)) | ✅ (SF3, SFZ and MIDI input 🗓️) |
 | bass_fx.dll | Tempo/pitch/rate params on every stream ([tempo and pitch](../features/tempo-pitch.md)); reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | ✅ tempo/pitch/rate and level control, 🗓️ reverse and BPM |
 | basscd.dll | Built-in disc source: drives on Windows, macOS and Linux, `.cue` images, CD-Text, freedb and MusicBrainz ids, CD+G graphics ([disc playback](../features/disc.md)); analog playback not provided | ✅ disc and CD+G discs |
 | Your own CD+G decoder and renderer (MP3+G, ZIP) | Built in: `fa_cdg_surface_*` draws the graphics in sync with the audio ([CD+G](../features/cdg.md)) | ✅ |
@@ -670,6 +707,21 @@ track.PlayOn(output);
 ```
 
 Poll `fa_disc_get_status` (`disc.Status`) to notice a new disc; a stream of a removed disc ends with `FA_ERROR_NO_DISC`.
+
+### MIDI karaoke (.kar) with lyrics (bassmidi)
+
+BASS: `BASS_MIDI_FontInit` and `BASS_MIDI_StreamSetFonts`, `BASS_MIDI_StreamCreateFile`, then `BASS_MIDI_StreamGetMark(BASS_MIDI_MARK_LYRIC)` for the text and `BASS_SYNC_MIDI_LYRIC` to highlight it, stripping the `/` and `\` marks yourself; `MIDI_EVENT_TRANSPOSE` for the key.
+
+FatzAudio ([MIDI](../features/midi.md)):
+
+```csharp
+using (var gm = SoundFont.FromFile("GeneralUser.sf2")) engine.DefaultSoundFont = gm;   // once
+using var song = engine.OpenFile("song.kar");
+var lines = song.MidiTexts.Where(t => t.Type == MidiTextType.Lyric).ToList();         // marks already turned into Flags
+song.MidiTextReached += (_, e) => Highlight(e.Text.Index);
+song.MidiTranspose = -2;                                                               // a whole tone down, drums untouched
+song.PlayOn(output);
+```
 
 ### Tempo and key change (bass_fx)
 

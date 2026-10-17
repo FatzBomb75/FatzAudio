@@ -86,7 +86,9 @@ static void stream_discard(struct fa_stream* s)
     fa_stream_cdg_close(s);
     free(s->path);
     free(s->matrix);
+    s->midi = NULL;
     if (s->decoder_ready) fa_decoder_close(&s->decoder);
+    fa_soundfont_release(s->soundfont);
     fa_push_free(s->push);
     fa_source_close(&s->source);
     fa_net_close(s->net);
@@ -134,6 +136,12 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
     if (options && options->struct_size >= offsetof(fa_open_options, dynamic_range) + sizeof(options->dynamic_range) &&
         options->dynamic_range >= FA_DYNAMIC_RANGE_FULL && options->dynamic_range <= FA_DYNAMIC_RANGE_NIGHT)
         fa_store32(&s->dynamic_range, options->dynamic_range);
+    /* MIDI files are played with the stream's soundfont, else the engine's. */
+    if (options && options->struct_size >= offsetof(fa_open_options, soundfont) + sizeof(options->soundfont) &&
+        options->soundfont)
+        s->soundfont = fa_soundfont_retain(options->soundfont);
+    else
+        s->soundfont = fa_engine_soundfont(engine);
     s->loud.integrated_lufs = s->loud.range_lu = s->loud.true_peak_dbtp = NAN;
     fa_store_float(&s->norm_track, NAN);
     fa_store_float(&s->norm_album, NAN);
@@ -156,10 +164,27 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
 /* On failure the source is NOT closed here, so open_io can hand ownership back. */
 static fa_result stream_open_decoder(struct fa_stream* s, const char* name_hint, const fa_open_options* options)
 {
-    fa_result r = fa_decoder_open(&s->decoder, &s->source, name_hint, options ? options->mime_hint : NULL,
-                                  options ? options->audio_track : -1, &s->dynamic_range);
+    fa_decoder_env env;
+    fa_result r;
+    env.dynamic_range = &s->dynamic_range;
+    env.soundfont = s->soundfont;
+    env.midi_rate = fa_engine_midi_rate(s->engine);
+    r = fa_decoder_open(&s->decoder, &s->source, name_hint, options ? options->mime_hint : NULL,
+                        options ? options->audio_track : -1, &env);
     if (r != FA_OK) return r;
     s->decoder_ready = 1;
+    s->midi = fa_midi_of(&s->decoder);
+    if (!s->midi) {
+        /* Only MIDI streams use the soundfont: don't keep a replaced bank alive. */
+        s->decoder.soundfont = NULL;
+        fa_soundfont_release(s->soundfont);
+        s->soundfont = NULL;
+    }
+    /* MIDI's live controls are heard after the decode-ahead: keep it short unless
+     * the app chose its own. */
+    if (s->midi && !(options && options->struct_size >= offsetof(fa_open_options, buffer_ms) + sizeof(options->buffer_ms) &&
+                     options->buffer_ms))
+        s->buffer_ms = FA_MIDI_BUFFER_MS;
     /* Running loudness estimate for playback; decode-only streams are never normalized. */
     if (!(s->flags & FA_OPEN_DECODE_ONLY) &&
         fa_meter_init(&s->run_meter, s->decoder.format.sample_rate, s->decoder.format.channels, 0, FA_RUNNING_SUBS) == FA_OK)
@@ -545,7 +570,10 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
 
     fa_mutex_lock(&stream->decode_lock);
     release_chain(stream);
+    stream->midi = NULL;
     if (stream->decoder_ready) { fa_decoder_close(&stream->decoder); stream->decoder_ready = 0; }
+    fa_soundfont_release(stream->soundfont);
+    stream->soundfont = NULL;
     fa_push_free(stream->push);
     stream->push = NULL;
     fa_source_close(&stream->source); /* the app's io close, exactly once */
@@ -2322,6 +2350,43 @@ static void marker_events(struct fa_stream* s, fa_device* dev, const mix_markers
     }
 }
 
+/* MIDI streams: FA_EVENT_MIDI_TEXT (value = the text's index) for every text event
+ * whose frame playback passed between `played0` and `played1`. The frames are
+ * fixed and sorted, so a binary search finds the first one; wrapping into a loop
+ * gives two ranges. Best effort, like markers. */
+static void post_texts(struct fa_stream* s, fa_device* dev, const fa_frames* at, uint32_t n, fa_frames from, fa_frames to)
+{
+    uint32_t lo = 0, hi = n;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        if (at[mid] < from) lo = mid + 1; else hi = mid;
+    }
+    for (; lo < n && at[lo] < to; lo++) fa_audio_post_event(dev, s, FA_EVENT_MIDI_TEXT, at[lo], (int64_t)lo);
+}
+
+static void midi_text_events(struct fa_stream* s, fa_device* dev, int64_t played0, int64_t played1, int ended)
+{
+    uint32_t n;
+    const fa_frames* at = fa_midi_text_frames(s->midi, &n);
+    fa_frames p0, p1, end, back, w0, w1;
+    if (n == 0) return;
+    p0 = (fa_frames)(linear_position(s, played0) + 0.5);
+    p1 = (fa_frames)(linear_position(s, played1) + 0.5);
+    if (p1 <= p0 && !ended) return;
+    end = end_frame(s);
+    back = loop_start(s);
+    w0 = wrap_position(s, p0);
+    w1 = wrap_position(s, p1);
+    if (loops(s) && end > back && p1 - p0 >= end - back) {
+        post_texts(s, dev, at, n, back, end);
+    } else if (loops(s) && end > back && w1 < w0) {
+        post_texts(s, dev, at, n, w0, end);
+        post_texts(s, dev, at, n, back, w1);
+    } else {
+        post_texts(s, dev, at, n, w0, ended ? w1 + 1 : w1);
+    }
+}
+
 /* Ends the stream from the audio thread (its data ran out, or a crossfade-out
  * finished). A crossfade still running ends with it: it raises its RAMP_DONE (so
  * whoever waits for the crossfade is not left waiting), and a later play starts
@@ -2668,17 +2733,20 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
 
     if (ended) {
         marker_events(s, dev, &mk, played0, played0 + done, 0);
+        if (s->midi) midi_text_events(s, dev, played0, played0 + done, 0);
         end_stream(s, dev);
         return;
     }
     if (at_cue_out) {
         marker_events(s, dev, &mk, played0, played0 + done, 1);
+        if (s->midi) midi_text_events(s, dev, played0, played0 + done, 1);
         end_stream(s, dev);
         return;
     }
     if (n < (int64_t)frames - off) {
         if (fa_load32(&s->eof) && fa_ring_readable(&s->ring) == 0) {
             marker_events(s, dev, &mk, played0, played0 + done, 1);
+            if (s->midi) midi_text_events(s, dev, played0, played0 + done, 1);
             end_stream(s, dev);
             return;
         }
@@ -2693,6 +2761,7 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
         }
     }
     marker_events(s, dev, &mk, played0, played0 + done, 0);
+    if (s->midi) midi_text_events(s, dev, played0, played0 + done, 0);
 }
 
 void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames)

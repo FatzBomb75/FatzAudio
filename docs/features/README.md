@@ -8,7 +8,7 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Opening and decoding streams (format detection, custom I/O, MP4 and MKV audio tracks, Ogg Opus and Vorbis) | [streams.md](streams.md) | ✅ |
 | Playback, buffering and threads (decode-ahead, transport, device clock) | [playback.md](playback.md) | ✅ |
 | Volume, pan and ramps (7 curves, scheduled starts, ramp-done) | [ramps.md](ramps.md) | ✅ volume and pan |
-| Events | [events.md](events.md) | ✅ ended, ramp done, marker, started, loudness final, metadata, stalled/resumed, decode error |
+| Events | [events.md](events.md) | ✅ ended, ramp done, marker, started, loudness final, metadata, stalled/resumed, decode error, MIDI text |
 | Loudness normalization (R128 scans, tags, cache, limiter) | [normalization.md](normalization.md) | ✅ |
 | Crossfades, markers, queues and gapless, scheduled starts | [crossfade.md](crossfade.md) | ✅ |
 | Buses (decks, groups) and the channel matrix | [buses.md](buses.md) | ✅ |
@@ -18,4 +18,5 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | CD+G karaoke graphics (MP3+G, ZIP, CD+G discs, surfaces for any renderer) | [cdg.md](cdg.md) | ✅ |
 | Dolby Digital and Dolby Digital Plus (AC-3, E-AC-3, up to 7.1, dynamic range) | [dolby.md](dolby.md) | ✅ (passthrough 🗓️) |
 | Disc playback (audio CDs, CD+G discs and `.cue` images) | [disc.md](disc.md) | ✅ |
+| MIDI and karaoke files (SoundFont 2, lyrics, transpose, channel mute) | [midi.md](midi.md) | ✅ (SF3, SFZ and MIDI input 🗓️) |
 | Recording and encoding (WAV, FLAC, MP3 via LAME; device, stream or file sources) | [recording-encoding.md](recording-encoding.md) | ✅ WAV/FLAC/MP3; Opus, AAC and casting 🗓️ |

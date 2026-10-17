@@ -52,6 +52,7 @@ internal unsafe struct FaOpenOptions
     public uint BufferMs;
     public FaNetOptions* Net;
     public int DynamicRange;
+    public nint SoundFont;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -343,4 +344,36 @@ internal unsafe struct FaLameInfo
     public int Loaded;
     public fixed byte Version[32];
     public fixed byte Path[512];
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaSoundFontInfo
+{
+    public fixed byte Name[256];
+    public uint PresetCount;
+    public ulong SampleMemory;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaMidiText
+{
+    public long Frame;
+    public long Time;
+    public int Type;
+    public uint Flags;
+    public int Track;
+    public fixed byte Text[256];
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaMidiInfo
+{
+    public fixed byte Title[256];
+    public fixed byte Artist[256];
+    public fixed byte Copyright[256];
+    public int Format;
+    public uint Tracks;
+    public uint TextCount;
+    public uint LyricCount;
+    public int Karaoke;
 }

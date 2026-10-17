@@ -14,6 +14,7 @@ A stream is anything that produces audio. You open it from a file, a memory bloc
 | MP4, M4A, MOV | ISO MP4 and QuickTime, including fragmented MP4. Audio tracks only: video is never read | the track's codec: `aac`, `mp3`, `ac3`, `eac3`, `opus`, `flac`, `alac`, `pcm_*`, ... (container `mp4` or `mov`) |
 | Matroska, WebM | MKV, MKA, WebM, including live layouts (unknown sizes, no Cues). Audio tracks only | `aac`, `mp3`, `ac3`, `eac3`, `opus`, `vorbis`, `flac`, `pcm_*`, ... (container `matroska` or `webm`) |
 | Dolby Digital, Dolby Digital Plus | Raw `.ac3` and `.ec3` streams, up to 7.1 ([Dolby Digital](dolby.md)) | `ac3` or `eac3` (container `ac3` or `ec3`) |
+| MIDI | Standard MIDI Files (format 0, 1, 2), karaoke `.kar`, RIFF `.rmi`; played with a SoundFont 2 you load ([MIDI](midi.md)) | `midi` (container `smf` or `rmid`) |
 
 Inside MP4 and Matroska, PCM, MP3, AC-3, E-AC-3, Opus and Vorbis tracks decode built in; every other codec (AAC, FLAC, ALAC, DTS, TrueHD) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`. The same goes for `.aac` files and AAC streams.
 
