@@ -11,6 +11,7 @@ ctest --test-dir build -C Release
 ```
 
 The library is written to `build/bin/<Config>/` (`fatzaudio.dll`, `libfatzaudio.dylib` or `libfatzaudio.so`).
+For Android and iOS, see [Building](building.md).
 
 ## Play a file (C)
 
