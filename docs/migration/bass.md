@@ -29,13 +29,14 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS_GetVersion | `fa_version` | `AudioEngine.NativeVersion` | ✅ |
 | BASS_ErrorGetCode | Return value of every call; `fa_result_string` | `FatzAudioException.ErrorCode` | ✅ |
 | BASS_Init | `fa_engine_create` + `fa_device_open` | `AudioEngine.Create()` + `engine.OpenOutput()` | ✅ |
+| BASS_Init with device 0 ("no sound") | `FA_ENGINE_NULL_OUTPUT` in `fa_engine_config.flags`: a silent output that still runs in real time ([devices](../features/devices.md#silent-output-for-tests-and-servers)) | `new AudioEngineOptions { NullOutput = true }` | ✅ |
 | BASS_Free | `fa_device_close` + `fa_engine_destroy` | `Dispose()` | ✅ |
 | BASS_GetDeviceInfo | `fa_device_count` + `fa_device_get_info` | `engine.OutputDevices` | ✅ |
 | BASS_SetDevice / BASS_GetDevice | Not needed: pass the `fa_device*` | — | ➖ (by design) |
 | BASS_GetInfo | `fa_device_get_info`, `fa_device_get_latency` | `device.Latency` | ✅ (latency, rate, channels) |
-| BASS_Start / BASS_Stop | `fa_device_start` / `fa_device_stop` | `device.Start()` / `Stop()` | ✅ |
+| BASS_Start / BASS_Stop | `fa_device_start` / `fa_device_stop` (both idempotent) | `device.Start()` / `Stop()` | ✅ |
 | BASS_Pause | `fa_device_stop` (streams keep their position) | `device.Stop()` | ✅ |
-| BASS_IsStarted | Planned `fa_device_is_started` | | 🗓️ |
+| BASS_IsStarted | `fa_device_is_started` | `device.IsStarted` | ✅ |
 | BASS_SetVolume / BASS_GetVolume | `fa_device_set_volume` / `get_volume` | `device.Volume` | ✅ |
 | BASS_SetConfig / GetConfig (+Ptr) | `fa_engine_config` fields at creation; per-stream options | `AudioEngineOptions` | ✅ partially (rate, period, threads, cache dir) |
 | BASS_Update / BASS_ChannelUpdate | Not needed: worker threads keep buffers full | — | ➖ (by design) |
@@ -46,17 +47,17 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 
 | BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
-| BASS_StreamCreateFile (path) | `fa_stream_open_path` | `engine.OpenFile(path)` | ✅ WAV/MP3/FLAC so far |
+| BASS_StreamCreateFile (path) | `fa_stream_open_path`; format detected from content ([streams](../features/streams.md)) | `engine.OpenFile(path)` | ✅ WAV/AIFF/MP3/FLAC so far |
 | BASS_StreamCreateFile (memory) | `fa_stream_open_memory` | `engine.OpenMemory(bytes)` | ✅ |
-| BASS_StreamCreateFileUser | `fa_stream_open_io` | `engine.OpenStream(System.IO.Stream)` | 🧩 |
+| BASS_StreamCreateFileUser | `fa_stream_open_io`; `close` is called once by `fa_stream_close`, never on a failed open ([custom I/O](../features/streams.md#custom-io-your-own-reader)) | `engine.OpenStream(System.IO.Stream)` | ✅ |
 | BASS_StreamCreateURL | `fa_stream_open_url` | `engine.OpenUrl(url)` | 🧩 |
 | BASS_StreamCreate (STREAMPROC_PUSH) + BASS_StreamPutData | `fa_stream_open_push` + `fa_stream_push_pcm` | `engine.CreatePushStream(format)` | 🧩 |
 | BASS_StreamCreate (STREAMPROC callback) | Planned pull-callback source | | 🗓️ |
-| BASS_StreamPutFileData | Use `fa_stream_open_io` with your own buffer | | 🧩 |
+| BASS_StreamPutFileData | `fa_stream_open_io` with `seek = NULL` (forward-only source fed from your own buffer) | `engine.OpenStream(stream)` with a non-seekable stream | ✅ |
 | BASS_StreamGetFilePosition | Planned buffering/download progress query | | 🗓️ |
 | BASS_StreamCancel | Async open with cancellation | | 🗓️ |
 | BASS_StreamFree / BASS_ChannelFree | `fa_stream_close` | `Dispose()` | ✅ |
-| `BASS_STREAM_DECODE` flag + BASS_ChannelGetData (PCM) | `FA_OPEN_DECODE_ONLY` + `fa_stream_read` | `Read(Span<float>)` | ✅ |
+| `BASS_STREAM_DECODE` flag + BASS_ChannelGetData (PCM) | `FA_OPEN_DECODE_ONLY` + `fa_stream_read`; returns `FA_ERROR_END_OF_STREAM` with 0 frames at the end ([decoding](../features/streams.md#decoding-without-playback)) | `Read(Span<float>)`, 0 at the end | ✅ |
 
 ### Channel control
 
@@ -66,8 +67,8 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS_ChannelPlay at a precise time | `fa_stream_play_at` | | 🧩 |
 | BASS_ChannelPause / BASS_ChannelStop | `fa_stream_pause` / `fa_stream_stop` | `Pause()` / `Stop()` | ✅ |
 | BASS_ChannelIsActive | `fa_stream_get_state` | `stream.State` | ✅ |
-| BASS_ChannelGetInfo | `fa_stream_get_info` | `stream.Info` | ✅ |
-| BASS_ChannelGetLength | `fa_stream_info.length_frames` | `stream.Info.Duration` | ✅ |
+| BASS_ChannelGetInfo | `fa_stream_get_info` (the source's own format; unchanged by attaching) | `stream.Info` | ✅ |
+| BASS_ChannelGetLength | `fa_stream_info.length_frames` or `.duration` (ns) | `stream.Info.Duration` | ✅ |
 | BASS_ChannelGetPosition / SetPosition | `fa_stream_get_position` / `fa_stream_seek` (frames) | `stream.Position` (TimeSpan) | ✅ |
 | BASS_ChannelBytes2Seconds / Seconds2Bytes | Not needed: frames ÷ sample rate, or use TimeSpan in .NET | — | ➖ (by design) |
 | BASS_ChannelSetAttribute VOL / PAN | `fa_stream_set_param` VOLUME / PAN | `Volume` / `Pan` | ✅ |
@@ -82,7 +83,7 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS_ChannelFlags (loop) | `FA_OPEN_LOOP`; runtime toggle planned | | ✅ open-time only |
 | BASS_ChannelSetLink / RemoveLink | Buses and `fa_stream_play_at` (sample-accurate group start) | | 🗓️ |
 | BASS_ChannelLock | Not needed: parameter changes are applied atomically per buffer | — | ➖ (by design) |
-| BASS_ChannelSetDevice / GetDevice | Re-attach with `fa_stream_attach` | | ✅ (position currently resets, fix planned) |
+| BASS_ChannelSetDevice / GetDevice | `fa_stream_attach` to the new device moves the stream and keeps its position; `fa_stream_detach` removes it | `stream.PlayOn(other)`, `stream.Detach()`, `stream.Device` | ✅ |
 | BASS_ChannelRef | Not needed: handles stay valid until you close them | — | ➖ (by design) |
 
 ### Effects
@@ -122,7 +123,8 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 
 | BASS | FatzAudio | Status |
 |---|---|---|
-| BASS_PluginLoad / Free / Enable / GetInfo | Not needed: all formats built in. Planned `fa_formats_list` to query support | ➖ (by design) |
+| BASS_PluginLoad / Free / Enable | Not needed: all formats are built in and detected from content | ➖ (by design) |
+| BASS_PluginGetInfo | `fa_format_count` + `fa_format_get_info`; .NET `AudioEngine.SupportedFormats` | ✅ |
 
 ## 3. Add-on map
 
@@ -182,5 +184,32 @@ FatzAudio: open with `FA_OPEN_DECODE_ONLY`, then loop `fa_stream_read(s, buf, fr
 BASS: `BASS_ChannelSetPosition(h, BASS_ChannelSeconds2Bytes(h, 30.0), BASS_POS_BYTE);`
 
 FatzAudio: `fa_stream_seek(s, 30 * info.format.sample_rate);` or in .NET `song.Position = TimeSpan.FromSeconds(30);`
+
+### Read from your own stream (BASS_StreamCreateFileUser)
+
+BASS:
+```c
+BASS_FILEPROCS procs = { MyClose, MyLen, MyRead, MySeek };
+HSTREAM h = BASS_StreamCreateFileUser(STREAMFILE_NOBUFFER, 0, &procs, user);
+```
+
+FatzAudio:
+```c
+fa_io_callbacks io = { my_read, my_seek, my_length, my_close };
+fa_stream* s;
+if (fa_stream_open_io(engine, &io, user, NULL, &s) != FA_OK)
+    free_user(user);            /* on failure the caller still owns user */
+/* ... later: fa_stream_close(s) calls my_close(user) exactly once */
+```
+
+When porting, check your BASS error path: in FatzAudio a failed open never calls `close`, so the error path frees `user` itself.
+
+.NET: `engine.OpenStream(stream, leaveOpen: false)`.
+
+### Move playback to another device (BASS_ChannelSetDevice)
+
+BASS: `BASS_ChannelSetDevice(h, newDevice);` (both devices must be initialised, and you juggle `BASS_SetDevice` around it).
+
+FatzAudio: `fa_stream_attach(s, other_device, NULL);` keeps the position, and play/pause state carries on. In .NET: `song.PlayOn(otherDevice);`.
 
 *More patterns (fades, crossfades, syncs/events, tempo, FFmpeg hand-off, normalization, CD+G) are added here as each feature lands.*

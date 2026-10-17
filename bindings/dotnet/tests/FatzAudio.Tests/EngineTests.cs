@@ -114,21 +114,14 @@ public class EngineTests
     public void OpenStream_FromMemoryStream()
     {
         using var engine = AudioEngine.Create();
-        AudioStream s;
-        try
-        {
-            s = engine.OpenStream(new MemoryStream(TestAudio.SineWav()), DecodeOnly);
-        }
-        catch (FatzAudioException ex) when (ex.ErrorCode == ErrorCode.NotImplemented)
-        {
-            // The scaffold of the native library does not implement fa_stream_open_io yet.
-            return;
-        }
-        using (s)
+        var source = new MemoryStream(TestAudio.SineWav());
+        using (var s = engine.OpenStream(source, DecodeOnly))
         {
             Assert.InRange(s.Info.Duration!.Value.TotalSeconds, 0.99, 1.01);
             Assert.Equal(44100, TestAudio.ReadAll(s));
+            Assert.True(source.CanRead); // still open while the audio stream lives
         }
+        Assert.False(source.CanRead);    // disposed with the audio stream (leaveOpen: false)
     }
 
     [Fact]

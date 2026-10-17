@@ -19,7 +19,6 @@ namespace FatzAudio;
 public sealed class OutputDevice : IDisposable
 {
     private readonly DeviceHandle _handle;
-    private bool _started;
 
     internal OutputDevice(AudioEngine engine, DeviceHandle handle, AudioDeviceInfo? info)
     {
@@ -43,8 +42,16 @@ public sealed class OutputDevice : IDisposable
         }
     }
 
-    /// <summary>True after <see cref="Start"/> (or after a stream was started on it) and before <see cref="Stop"/>.</summary>
-    public bool IsStarted => _started;
+    /// <summary>True while the device is running: after <see cref="Start"/> (or after a stream was started on it) and before <see cref="Stop"/>.</summary>
+    /// <exception cref="ObjectDisposedException">The device was disposed.</exception>
+    public bool IsStarted
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_is_started(Handle, out int started));
+            return started != 0;
+        }
+    }
 
     /// <summary>Master volume of the device as linear gain (1 = unity, values above 1 amplify).</summary>
     /// <exception cref="ArgumentOutOfRangeException">The value is negative.</exception>
@@ -79,34 +86,18 @@ public sealed class OutputDevice : IDisposable
     /// <summary>Starts the device so that attached, playing streams become audible. Does nothing if already started.</summary>
     /// <exception cref="ObjectDisposedException">The device was disposed.</exception>
     /// <exception cref="FatzAudioException">The backend failed to start the device (<see cref="ErrorCode.Device"/>).</exception>
-    public void Start()
-    {
-        var h = Handle;
-        if (_started) return;
-        FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_start(h));
-        _started = true;
-    }
+    public void Start() => FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_start(Handle));
 
     /// <summary>Stops the device; attached streams are silenced but keep their state. Does nothing if not started.</summary>
     /// <exception cref="ObjectDisposedException">The device was disposed.</exception>
     /// <exception cref="FatzAudioException">The backend failed to stop the device.</exception>
-    public void Stop()
-    {
-        var h = Handle;
-        if (!_started) return;
-        FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_stop(h));
-        _started = false;
-    }
+    public void Stop() => FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_stop(Handle));
 
     /// <summary>Stops the device and releases this reference to it.</summary>
     public void Dispose()
     {
         if (_handle.IsClosed) return;
-        if (_started)
-        {
-            try { NativeMethods.fa_device_stop(_handle); } catch (ObjectDisposedException) { }
-            _started = false;
-        }
+        try { NativeMethods.fa_device_stop(_handle); } catch (ObjectDisposedException) { }
         _handle.Dispose();
     }
 }

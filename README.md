@@ -3,11 +3,15 @@
 FatzAudio is a cross-platform audio engine with a plain C API (`include/fatzaudio/fatzaudio.h`),
 built as a shared library (`fatzaudio.dll` / `libfatzaudio.so` / `libfatzaudio.dylib`).
 The current backend uses [miniaudio](https://github.com/mackron/miniaudio) (vendored in
-`third_party/miniaudio`) for device I/O and WAV/MP3/FLAC decoding.
+`third_party/miniaudio`) for device I/O, and its embedded dr_wav/dr_flac/dr_mp3 behind
+FatzAudio's own decoder registry.
 
-Status: early scaffold. Implemented: engine, device enumeration/open/start/stop/volume/latency,
-file and memory streams, attach/play/pause/stop/seek/position/state, volume and pan, decode-only
-reads. All other API functions are exported and return `FA_ERROR_NOT_IMPLEMENTED`.
+Status: core engine in progress. Implemented: engine (with a silent null output for tests),
+device enumeration/open/start/stop/volume/latency, streams from files, memory and custom I/O
+with format detection from content (WAV/AIFF/RF64/W64, FLAC, MP3), attach/detach/move between
+devices keeping position, play/pause/stop/seek/position/state, volume and pan, markers,
+decode-only reads. Functions not implemented yet return `FA_ERROR_NOT_IMPLEMENTED`; the
+[docs index](docs/README.md) tracks the status of each feature.
 
 ## Build
 

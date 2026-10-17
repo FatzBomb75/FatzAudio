@@ -23,5 +23,30 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Release --output-on-failure
 
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: .NET build (docs enforced) and test
+        shell: bash
+        run: |
+          native="$GITHUB_WORKSPACE/build/bin"
+          if [ "$RUNNER_OS" = "Windows" ]; then native="$native/Release"; fi
+          dotnet test bindings/dotnet/tests/FatzAudio.Tests -c Release -p:FatzAudioNativeDir="$native"
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux audio headers
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Configure (ASan + UBSan)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
   # TODO: Android job (NDK toolchain, arm64-v8a / x86_64, build only).
   # TODO: iOS job (CMAKE_SYSTEM_NAME=iOS, build only; miniaudio needs Objective-C there).

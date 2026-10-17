@@ -4,9 +4,6 @@
 
 #define FA_UNUSED(x) (void)(x)
 
-FA_API fa_result FA_CALL fa_stream_open_io(fa_engine* engine, const fa_io_callbacks* io, void* user, const fa_open_options* options, fa_stream** out_stream)
-{ FA_UNUSED(engine); FA_UNUSED(io); FA_UNUSED(user); FA_UNUSED(options); if (out_stream) *out_stream = NULL; return FA_ERROR_NOT_IMPLEMENTED; }
-
 FA_API fa_result FA_CALL fa_stream_open_url(fa_engine* engine, const char* url, const fa_open_options* options, fa_stream** out_stream)
 { FA_UNUSED(engine); FA_UNUSED(url); FA_UNUSED(options); if (out_stream) *out_stream = NULL; return FA_ERROR_NOT_IMPLEMENTED; }
 
@@ -27,12 +24,6 @@ FA_API fa_result FA_CALL fa_engine_get_time(fa_engine* engine, fa_time* out_time
 
 FA_API fa_result FA_CALL fa_stream_ramp_param(fa_stream* stream, fa_param param, float target, fa_time duration, fa_time engine_time, const fa_ramp* ramp)
 { FA_UNUSED(stream); FA_UNUSED(param); FA_UNUSED(target); FA_UNUSED(duration); FA_UNUSED(engine_time); FA_UNUSED(ramp); return FA_ERROR_NOT_IMPLEMENTED; }
-
-FA_API fa_result FA_CALL fa_stream_set_marker(fa_stream* stream, fa_marker marker, fa_frames frame)
-{ FA_UNUSED(stream); FA_UNUSED(marker); FA_UNUSED(frame); return FA_ERROR_NOT_IMPLEMENTED; }
-
-FA_API fa_result FA_CALL fa_stream_get_marker(fa_stream* stream, fa_marker marker, fa_frames* out_frame)
-{ FA_UNUSED(stream); FA_UNUSED(marker); FA_UNUSED(out_frame); return FA_ERROR_NOT_IMPLEMENTED; }
 
 FA_API fa_result FA_CALL fa_crossfade(fa_stream* from, fa_stream* to, fa_time duration, const fa_ramp* ramp)
 { FA_UNUSED(from); FA_UNUSED(to); FA_UNUSED(duration); FA_UNUSED(ramp); return FA_ERROR_NOT_IMPLEMENTED; }

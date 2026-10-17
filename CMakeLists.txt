@@ -18,6 +18,10 @@ add_library(fatzaudio SHARED
     src/engine.c
     src/device.c
     src/stream.c
+    src/source.c
+    src/probe.c
+    src/decoder.c
+    src/dec_miniaudio.c
     src/stubs.c
     src/miniaudio_impl.c
     src/fa_internal.h)

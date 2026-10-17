@@ -147,21 +147,9 @@ FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id
 
 FA_API void FA_CALL fa_device_close(fa_device* device)
 {
-    struct fa_stream* s;
     if (!device) return;
     ma_device_uninit(&device->device); /* stops the callback thread */
-    ma_mutex_lock(&device->lock);
-    for (s = device->streams; s; ) {
-        struct fa_stream* next = s->next;
-        ma_mutex_lock(&s->lock);
-        s->device = NULL;
-        s->next = NULL;
-        if (s->state == FA_STATE_PLAYING) s->state = FA_STATE_PAUSED;
-        ma_mutex_unlock(&s->lock);
-        s = next;
-    }
-    device->streams = NULL;
-    ma_mutex_unlock(&device->lock);
+    while (device->streams) fa_stream_detach(device->streams);
     ma_mutex_uninit(&device->lock);
     free(device);
 }
@@ -169,13 +157,22 @@ FA_API void FA_CALL fa_device_close(fa_device* device)
 FA_API fa_result FA_CALL fa_device_start(fa_device* device)
 {
     if (!device) return FA_ERROR_INVALID_ARG;
+    if (ma_device_is_started(&device->device)) return FA_OK;
     return ma_device_start(&device->device) == MA_SUCCESS ? FA_OK : FA_ERROR_DEVICE;
 }
 
 FA_API fa_result FA_CALL fa_device_stop(fa_device* device)
 {
     if (!device) return FA_ERROR_INVALID_ARG;
+    if (!ma_device_is_started(&device->device)) return FA_OK;
     return ma_device_stop(&device->device) == MA_SUCCESS ? FA_OK : FA_ERROR_DEVICE;
+}
+
+FA_API fa_result FA_CALL fa_device_is_started(fa_device* device, int32_t* out_started)
+{
+    if (!device || !out_started) return FA_ERROR_INVALID_ARG;
+    *out_started = ma_device_is_started(&device->device) ? 1 : 0;
+    return FA_OK;
 }
 
 FA_API fa_result FA_CALL fa_device_set_volume(fa_device* device, float volume)

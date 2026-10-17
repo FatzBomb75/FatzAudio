@@ -4,8 +4,8 @@ One page per feature, each with: what it does, C example, C# example, options, t
 
 | Feature | Page | Status |
 |---|---|---|
-| Devices (output/input, default following) | devices.md | Planned page |
-| Opening and decoding streams | streams.md | Planned page |
+| Devices (output, start/stop, silent output) | [devices.md](devices.md) | ✅ output; input and default following 🗓️ |
+| Opening and decoding streams (format detection, custom I/O) | [streams.md](streams.md) | ✅ |
 | Normalization | normalization.md | 🗓️ |
 | Crossfade, markers and curves | crossfade.md | 🗓️ |
 | Tempo and pitch | tempo-pitch.md | 🗓️ |

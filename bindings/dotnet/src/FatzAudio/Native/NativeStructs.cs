@@ -19,6 +19,7 @@ internal unsafe struct FaEngineConfig
     public uint PeriodMs;
     public uint WorkerThreads;
     public byte* CacheDirectory;
+    public uint Flags;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -60,6 +61,16 @@ internal unsafe struct FaStreamInfo
     public int Seekable;
     public int AudioTrackCount;
     public int HasCdg;
+    public long Duration;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaFormatInfo
+{
+    public fixed byte Name[32];
+    public fixed byte Description[64];
+    public fixed byte Extensions[64];
+    public fixed byte MimeTypes[128];
 }
 
 [StructLayout(LayoutKind.Sequential)]
