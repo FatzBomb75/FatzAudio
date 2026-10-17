@@ -32,6 +32,11 @@ void* fa_lib_open(const char* path, int already_loaded_only)
 
 void* fa_lib_sym(void* lib, const char* name) { return (void*)GetProcAddress((HMODULE)lib, name); }
 
+void fa_lib_close(void* lib, int already_loaded_only)
+{
+    if (lib && !already_loaded_only) FreeLibrary((HMODULE)lib);   /* the other kind is pinned */
+}
+
 void fa_lib_where(void* lib, const char* symbol, char* out, size_t cap)
 {
     wchar_t w[512];
@@ -51,6 +56,12 @@ void* fa_lib_open(const char* path, int already_loaded_only)
 }
 
 void* fa_lib_sym(void* lib, const char* name) { return dlsym(lib, name); }
+
+void fa_lib_close(void* lib, int already_loaded_only)
+{
+    (void)already_loaded_only;   /* RTLD_NOLOAD counts a reference too */
+    if (lib) dlclose(lib);
+}
 
 void fa_lib_where(void* lib, const char* symbol, char* out, size_t cap)
 {

@@ -125,6 +125,9 @@ void fa_lazy_mutex_unlock(fa_lazy_mutex* l);
  * Windows, as LoadLibrary would). A path with a folder loads from that folder. */
 void* fa_lib_open(const char* path, int already_loaded_only);
 void* fa_lib_sym(void* lib, const char* name);
+/* Gives back a library opened with fa_lib_open (same `already_loaded_only`) that
+ * turned out unusable. */
+void fa_lib_close(void* lib, int already_loaded_only);
 /* Where `lib` was loaded from (found through `symbol`, one of its functions); ""
  * when the platform cannot tell. */
 void fa_lib_where(void* lib, const char* symbol, char* out, size_t cap);

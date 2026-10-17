@@ -303,14 +303,29 @@ public sealed unsafe class AudioEncoder : IDisposable
     /// <summary>Waits until the encoder is <see cref="EncoderState.Finished"/> or <see cref="EncoderState.Failed"/>.</summary>
     /// <param name="timeout">How long to wait; <see cref="Timeout.InfiniteTimeSpan"/> for no limit.</param>
     /// <returns>True when it finished or failed, false on timeout.</returns>
+    /// <exception cref="ObjectDisposedException">The encoder was closed while waiting.</exception>
     public bool Wait(TimeSpan timeout)
     {
-        long ns = timeout == Timeout.InfiniteTimeSpan ? -1 : TimeConvert.ToNanoseconds(timeout);
-        int rc = NativeMethods.fa_encoder_wait(Handle, ns);
-        if (rc == (int)ErrorCode.Busy) return false;
-        FatzAudioException.ThrowIfFailed(rc);
-        return true;
+        bool infinite = timeout == Timeout.InfiniteTimeSpan;
+        if (!infinite && timeout < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(timeout), "Use Timeout.InfiniteTimeSpan or a positive time.");
+        // Waits in slices so that Close from another thread is not held up by this call.
+        long deadline = infinite ? long.MaxValue : Environment.TickCount64 + (long)Math.Ceiling(timeout.TotalMilliseconds);
+        while (true)
+        {
+            long left = deadline - Environment.TickCount64;
+            long ms = Math.Clamp(left, 0, WaitSliceMs);
+            int rc = NativeMethods.fa_encoder_wait(Handle, ms * 1_000_000);
+            if (rc != (int)ErrorCode.Busy)
+            {
+                FatzAudioException.ThrowIfFailed(rc);
+                return true;
+            }
+            if (left <= WaitSliceMs) return false;
+        }
     }
+
+    private const long WaitSliceMs = 50;
 
     /// <summary>
     /// Stops the source, encodes what is still queued, completes the file and closes it. Calling it again does
@@ -322,6 +337,8 @@ public sealed unsafe class AudioEncoder : IDisposable
     {
         if (Interlocked.Exchange(ref _closed, 1) != 0) return;
         _handle.Dispose();
+        // A call in progress on another thread (Write, Wait) delays the native close until it returns.
+        SpinWait.SpinUntil(() => _handle.IsReleased);
         FatzAudioException.ThrowIfFailed(_handle.CloseResult);
     }
 
@@ -403,7 +420,7 @@ public sealed unsafe class AudioEncoder : IDisposable
             {
                 var s = From(user);
                 if (s is null) return (int)ErrorCode.Io;
-                s.Out.Seek(offset, SeekOrigin.Begin);
+                s.Out.Seek(s.Start + offset, SeekOrigin.Begin);
                 return 0;
             }
             catch
@@ -430,6 +447,8 @@ public sealed unsafe class AudioEncoder : IDisposable
 
         public Stream Out { get; } = stream;
         public bool LeaveOpen { get; } = leaveOpen;
+        /// <summary>Where the encoder's first byte goes: offsets are relative to it.</summary>
+        public long Start { get; } = stream.CanSeek ? stream.Position : 0;
     }
 }
 

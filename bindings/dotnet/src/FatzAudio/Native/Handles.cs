@@ -194,6 +194,11 @@ internal sealed class EncoderHandle : SafeHandle
     /// <summary>What <c>fa_encoder_close</c> returned, once released.</summary>
     public int CloseResult { get; private set; }
 
+    private volatile bool _released;
+
+    /// <summary>True once <c>fa_encoder_close</c> has run.</summary>
+    public bool IsReleased => _released;
+
     public void Initialize(nint native, GCHandle output)
     {
         _output = output;
@@ -204,6 +209,7 @@ internal sealed class EncoderHandle : SafeHandle
     {
         CloseResult = NativeMethods.fa_encoder_close(handle);
         if (_output.IsAllocated) _output.Free();
+        _released = true;
         return true;
     }
 }

@@ -101,6 +101,29 @@ public class EncoderTests
     }
 
     [Fact]
+    public void Encode_ToAStream_StartsAtItsPosition()
+    {
+        var ms = new MemoryStream();
+        ms.Write(new byte[100]);   // the app's own preamble stays untouched
+        using (var enc = AudioEncoder.Create(ms, new EncoderOptions(), leaveOpen: true))
+            enc.Write(Sine(1000, 44100, 2), 44100, 2);
+        Assert.Equal(ms.Length, ms.Position);   // left at the end
+        var bytes = ms.ToArray();
+        Assert.All(bytes[..100], b => Assert.Equal(0, b));
+        using var engine = AudioEngine.Create();
+        using var s = engine.OpenMemory(bytes[100..], DecodeOnly);
+        Assert.Equal(1000, s.Info.LengthFrames);
+    }
+
+    [Fact]
+    public void Wait_RejectsNegativeTimeouts()
+    {
+        using var enc = AudioEncoder.Create(new MemoryStream());
+        Assert.Throws<ArgumentOutOfRangeException>(() => enc.Wait(TimeSpan.FromMilliseconds(-5)));
+        Assert.False(enc.Wait(TimeSpan.FromMilliseconds(120)));
+    }
+
+    [Fact]
     public void Record_Device_CapturesTheOutput()
     {
         var path = TempFile("wav");

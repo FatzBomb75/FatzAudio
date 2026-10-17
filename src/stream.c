@@ -523,10 +523,10 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
     uintptr_t self;
     if (!stream) return;
     e = stream->engine;
-    fa_encode_stream_closing(stream);   /* encoders recording or reading it lose their source */
-    /* A worker may be waiting in a network read while holding decode_lock: end
-     * the download first so the read returns. */
+    /* A worker or an encoder may be waiting in a network read while holding
+     * decode_lock: end the download first so the read returns. */
     fa_net_interrupt(stream->net);
+    fa_encode_stream_closing(stream);   /* encoders recording or reading it lose their source */
     fa_stream_detach(stream);
 
     /* A scan of this stream reads its file or memory: stop it before they go. */
@@ -1293,6 +1293,10 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
     if (device->engine != stream->engine) return FA_ERROR_INVALID_ARG; /* events and cleanup are per engine */
 
     fa_mutex_lock(&stream->api_lock);
+    if (stream->reader) {   /* fa_encoder_encode_stream reads it */
+        fa_mutex_unlock(&stream->api_lock);
+        return FA_ERROR_BUSY;
+    }
     if (stream->device == device) {
         fa_exchange_ptr(&stream->bus, bus);  /* the mixer picks it up on its next block */
         fa_mutex_unlock(&stream->api_lock);

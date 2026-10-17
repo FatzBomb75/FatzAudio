@@ -94,7 +94,11 @@ static int try_load(int mode, const char* dir)
             snprintf(path, sizeof(path), "%s", name);
         }
         lib = fa_lib_open(path, mode == 0);
-        if (!lib || !bind_lame(lib)) continue;
+        if (!lib) continue;
+        if (!bind_lame(lib)) {   /* not LAME's API (an old lame_enc.dll): let it go */
+            fa_lib_close(lib, mode == 0);
+            continue;
+        }
         fa_lib_where(lib, "lame_init", lm_path, sizeof(lm_path));
         if (!lm_path[0]) snprintf(lm_path, sizeof(lm_path), "%.511s", path);
         lm_state = 1;

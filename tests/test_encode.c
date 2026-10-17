@@ -399,6 +399,7 @@ static void test_encode_stream_offline(void)
     CHECK_EQ(fa_encoder_create_path("enc_conv.flac", &o, &e), FA_OK);
     CHECK_EQ(fa_encoder_encode_stream(e, s), FA_OK);
     CHECK_EQ(fa_encoder_encode_stream(e, s), FA_ERROR_BUSY);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_ERROR_BUSY);   /* the encoder reads it */
     CHECK_EQ(fa_encoder_wait(e, 10000000000ll), FA_OK);
     CHECK_EQ(fa_encoder_get_status(e, &st), FA_OK);
     CHECK_EQ(st.state, FA_ENCODER_FINISHED);
@@ -591,6 +592,56 @@ static void test_forward_only_output(void)
     free(x);
 }
 
+/* A seekable output: every format completes its header and leaves the position at
+ * the end, so the app can keep writing after the encoder closes. */
+typedef struct seek_out { uint8_t data[1 << 20]; int64_t pos, size; } seek_out;
+
+static fa_result FA_CALL seek_write(void* user, const void* data, size_t size)
+{
+    seek_out* m = (seek_out*)user;
+    if (m->pos + (int64_t)size > (int64_t)sizeof(m->data)) return FA_ERROR_IO;
+    memcpy(m->data + m->pos, data, size);
+    m->pos += (int64_t)size;
+    if (m->pos > m->size) m->size = m->pos;
+    return FA_OK;
+}
+static fa_result FA_CALL seek_seek(void* user, int64_t offset)
+{
+    ((seek_out*)user)->pos = offset;
+    return FA_OK;
+}
+
+static void test_seekable_output(void)
+{
+    const uint32_t rate = 32000, ch = 2;
+    const int64_t n = 20001;   /* odd: 24-bit stereo WAV data needs a pad byte */
+    float* x = make_signal(5, n, rate, ch);
+    seek_out* m = (seek_out*)malloc(sizeof(seek_out));
+    int f;
+    for (f = 0; f < 2; f++) {
+        fa_encoder_output out = { seek_write, seek_seek, NULL };
+        fa_encoder_options o;
+        fa_encoder* e = NULL;
+        fa_stream* s = NULL;
+        fa_stream_info info;
+        memset(m, 0, sizeof(*m));
+        fa_encoder_options_init(&o);
+        o.format = f == 0 ? FA_ENCODE_WAV : FA_ENCODE_FLAC;
+        o.bits_per_sample = 24;
+        o.channels = 1;
+        CHECK_EQ(fa_encoder_create_output(&out, m, &o, &e), FA_OK);
+        CHECK_EQ(fa_encoder_write(e, x, n, rate, ch), FA_OK);
+        CHECK_EQ(fa_encoder_close(e), FA_OK);
+        CHECK_EQ(m->pos, m->size);
+        CHECK_EQ(fa_stream_open_memory(g_engine, m->data, (size_t)m->size, NULL, &s), FA_OK);
+        fa_stream_get_info(s, &info);
+        CHECK_EQ(info.length_frames, n);   /* the completed header */
+        fa_stream_close(s);
+    }
+    free(m);
+    free(x);
+}
+
 static void test_errors(void)
 {
     fa_encoder_options o;
@@ -719,6 +770,7 @@ int main(void)
     RUN(test_record_device_and_stream);
     RUN(test_device_closed_while_recording);
     RUN(test_forward_only_output);
+    RUN(test_seekable_output);
     RUN(test_errors);
     RUN(test_mp3);
 

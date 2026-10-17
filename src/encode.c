@@ -24,6 +24,7 @@
 #define ENC_STREAM_SCRATCH 16384     /* largest audio callback a stream tap records */
 #define ENC_DEFAULT_QUEUE_MS 2000
 #define ENC_IDLE_WAIT_MS 5           /* the audio thread cannot wake the encoder: it polls */
+#define ENC_APP_WAIT_MS 1000         /* fa_encoder_write signals; this is only a safety net */
 
 enum { SRC_NONE = 0, SRC_DEVICE, SRC_STREAM, SRC_READ, SRC_APP, SRC_DEAD };
 
@@ -482,10 +483,20 @@ static void encoder_thread(void* arg)
             int stopping = fa_load32(&e->stop);   /* read before draining: nothing is queued after it */
             idle = drain_queue(e) == 0;
             if (stopping && idle) break;
+            if (!idle && e->source == SRC_APP) {   /* room again for a waiting fa_encoder_write */
+                fa_mutex_lock(&e->lock);
+                fa_cond_broadcast(&e->cond);
+                fa_mutex_unlock(&e->lock);
+            }
         }
         if (idle) {
+            /* fa_encoder_write wakes the thread (it writes, then signals under the lock,
+             * so the queue is checked again here); only the audio thread's taps and
+             * fa_stream_read's "not yet" need polling. */
+            int app = e->source == SRC_APP;
             fa_mutex_lock(&e->lock);
-            if (!fa_load32(&e->stop) && !failed(e)) fa_cond_wait_ms(&e->cond, &e->lock, ENC_IDLE_WAIT_MS);
+            if (!fa_load32(&e->stop) && !failed(e) && !(app && fa_ring_readable(&e->queue) > 0))
+                fa_cond_wait_ms(&e->cond, &e->lock, app ? ENC_APP_WAIT_MS : ENC_IDLE_WAIT_MS);
             fa_mutex_unlock(&e->lock);
         }
     }
@@ -882,7 +893,7 @@ FA_API fa_result FA_CALL fa_encoder_close(fa_encoder* encoder)
             if (r == FA_OK) r = fa_sink_flush(&e->sink);
             if (r != FA_OK) set_error(e, r);
         }
-    } else if (!e->impl && e->sink.error == FA_OK) {
+    } else if (!e->impl && e->source != SRC_DEAD && !failed(e)) {
         /* Never started: an empty file of the right format (header only). */
         fa_enc_format fmt = e->req;
         if (!fmt.rate) fmt.rate = 44100;

@@ -681,7 +681,8 @@ FA_API fa_result FA_CALL fa_stream_get_dynamic_range(fa_stream* stream, fa_dynam
  * (still keeping its position, and playing if it was), and a running ramp keeps
  * its remaining time.
  * Decode-only streams, devices of another engine, and a bus of another device
- * cannot be attached (FA_ERROR_INVALID_ARG). */
+ * cannot be attached (FA_ERROR_INVALID_ARG), nor a stream an encoder is reading
+ * (fa_encoder_encode_stream: FA_ERROR_BUSY). */
 FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, fa_bus* bus);
 /* Removes the stream from its device; it keeps the position heard so far. A
  * forward-only stream keeps the audio it had decoded ahead and plays it first on its

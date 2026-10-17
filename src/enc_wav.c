@@ -181,6 +181,7 @@ static fa_result wav_finish(void* impl, fa_enc_sink* s)
         if (r == FA_OK) r = fa_sink_write_le32(s, 0);
         /* the data chunk's size stays 0xFFFFFFFF: "see ds64" */
     }
+    if (r == FA_OK) r = fa_sink_seek(s, riff + 8);   /* back to the end, like the other formats */
     return r;
 }
 
