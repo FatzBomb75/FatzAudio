@@ -33,6 +33,10 @@ set(FA_SOURCES
     src/scan.c
     src/normalize.c
     src/limiter.c
+    src/clock.c
+    src/codec.c
+    src/ffmpeg.c
+    src/push.c
     src/stubs.c
     src/miniaudio_impl.c
     src/fa_internal.h

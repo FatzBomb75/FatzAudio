@@ -68,6 +68,7 @@ static void stream_discard(struct fa_stream* s)
     free(s->path);
     free(s->matrix);
     if (s->decoder_ready) fa_decoder_close(&s->decoder);
+    fa_push_free(s->push);
     fa_source_close(&s->source);
     fa_stream_free_memory(s);
 }
@@ -191,6 +192,59 @@ FA_API fa_result FA_CALL fa_stream_open_io(fa_engine* engine, const fa_io_callba
     return FA_OK;
 }
 
+/* Push and packet streams: no source, the push decoder instead (push.c). */
+static fa_result open_pushed(struct fa_stream* s)
+{
+    s->decoder_ready = 1;
+    if (!(s->flags & FA_OPEN_DECODE_ONLY) &&
+        fa_meter_init(&s->run_meter, s->decoder.format.sample_rate, s->decoder.format.channels, 0, FA_RUNNING_SUBS) == FA_OK)
+        s->run_meter_ready = 1;
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_open_push(fa_engine* engine, const fa_audio_format* format, const fa_open_options* options, fa_stream** out_stream)
+{
+    struct fa_stream* s; fa_result r;
+    if (out_stream) *out_stream = NULL;
+    if (!engine || !format || !out_stream) return FA_ERROR_INVALID_ARG;
+    if (options && options->flags & FA_OPEN_LOOP) return FA_ERROR_INVALID_ARG;
+    r = stream_create(engine, options, &s);
+    if (r != FA_OK) return r;
+    r = fa_push_init_pcm(s, format);
+    if (r == FA_OK) r = open_pushed(s);
+    if (r != FA_OK) { stream_discard(s); return r; }
+    stream_opened(s);
+    *out_stream = s;
+    return FA_OK;
+}
+
+FA_API void FA_CALL fa_codec_params_init(fa_codec_params* params)
+{
+    if (!params) return;
+    memset(params, 0, sizeof(*params));
+    params->struct_size = (uint32_t)sizeof(*params);
+}
+
+FA_API fa_result FA_CALL fa_stream_open_packets(fa_engine* engine, const fa_codec_params* params, const fa_open_options* options, fa_stream** out_stream)
+{
+    struct fa_stream* s; fa_result r;
+    if (out_stream) *out_stream = NULL;
+    if (!engine || !params || !out_stream || params->struct_size < sizeof(fa_codec_params)) return FA_ERROR_INVALID_ARG;
+    if (!params->codec || !params->codec[0] || strlen(params->codec) >= 32) return FA_ERROR_INVALID_ARG;
+    if (params->sample_rate < 1000 || params->sample_rate > 768000 || params->channels == 0 || params->channels > 32)
+        return FA_ERROR_INVALID_ARG;
+    if (params->extradata_size > 0 && !params->extradata) return FA_ERROR_INVALID_ARG;
+    if (options && options->flags & FA_OPEN_LOOP) return FA_ERROR_INVALID_ARG;
+    r = stream_create(engine, options, &s);
+    if (r != FA_OK) return r;
+    r = fa_push_init_packets(s, params);
+    if (r == FA_OK) r = open_pushed(s);
+    if (r != FA_OK) { stream_discard(s); return r; }
+    stream_opened(s);
+    *out_stream = s;
+    return FA_OK;
+}
+
 FA_API void FA_CALL fa_stream_close(fa_stream* stream)
 {
     fa_scan_job* job;
@@ -217,6 +271,8 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
     fa_mutex_lock(&stream->decode_lock);
     release_chain(stream);
     if (stream->decoder_ready) { fa_decoder_close(&stream->decoder); stream->decoder_ready = 0; }
+    fa_push_free(stream->push);
+    stream->push = NULL;
     fa_source_close(&stream->source); /* the app's io close, exactly once */
     if (stream->run_meter_ready) { fa_meter_free(&stream->run_meter); stream->run_meter_ready = 0; }
     free(stream->path);
@@ -259,6 +315,7 @@ FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* o
 int fa_stream_needs_work(struct fa_stream* s)
 {
     if (!s->ring.data || fa_load32(&s->eof) || fa_load32(&s->flushing)) return 0;
+    if (s->push && !fa_push_has_input(s->push)) return 0;   /* nothing pushed yet */
     return fa_ring_writable(&s->ring) >= s->ring.capacity / 4;
 }
 
@@ -363,6 +420,7 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
         if (room <= 0) break;
         if (s->in_count == 0) {
             fa_frames got = 0, want = s->in_cap, end = end_frame(s);
+            fa_result rr = FA_OK;
             int from_carry;
             if (s->draining) {                    /* the resampler has given back everything */
                 fa_store32(&s->eof, 1);
@@ -376,8 +434,14 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 s->carry_offset += got;
                 s->carry_count -= got;
             } else if (want > 0) {
-                fa_decoder_read(&s->decoder, s->in_buf, want, &got);
+                rr = fa_decoder_read(&s->decoder, s->in_buf, want, &got);
             }
+            if (got == 0 && rr == FA_ERROR_BUSY) break;   /* push stream: nothing queued yet */
+            if (got > 0 && !from_carry && s->push && s->decoder.anchor_pts != FA_PTS_NONE)
+                /* The app's timeline restarts at this chunk: note at which ring frame
+                 * (what the resampler still holds comes out first). */
+                fa_ptsmap_add(&s->ptsmap, fa_load64(&s->ring.write) + (int64_t)ma_data_converter_get_output_latency(&s->converter),
+                              s->decoder.anchor_pts);
             if (s->hist) hist_write(s, s->in_buf, got);
             s->in_offset = 0;
             s->in_count = got;
@@ -458,11 +522,22 @@ fa_frames fa_stream_position_now(struct fa_stream* s)
 static fa_result restart_at_locked(struct fa_stream* s, fa_frames frame)
 {
     fa_result r = FA_OK;
-    if (frame != fa_stream_position_now(s) || s->in_count > 0 || fa_ring_readable(&s->ring) > 0 || fa_load32(&s->eof))
-        r = fa_decoder_seek(&s->decoder, frame);
-    if (r != FA_OK) return r;
+    int64_t hold = 0;
+    if (s->push) {
+        /* Push streams cannot seek: only the buffers start over (a rebuilt chain). */
+        hold = s->device ? fa_stream_clock_at(s, fa_monotonic_ns()) : fa_push_next_pts(s->push);
+        frame = fa_stream_position_now(s);
+        fa_push_restart_timeline(s->push);
+    } else {
+        if (frame != fa_stream_position_now(s) || s->in_count > 0 || fa_ring_readable(&s->ring) > 0 || fa_load32(&s->eof))
+            r = fa_decoder_seek(&s->decoder, frame);
+        if (r != FA_OK) return r;
+        hold = (int64_t)((double)frame * 1e9 / (double)s->decoder.format.sample_rate + 0.5);
+    }
     fa_store64(&s->position, frame);
     s->src_pos = frame;
+    fa_ptsmap_reset(&s->ptsmap);
+    fa_clock_reset(&s->clock, hold);
     if (s->ring.data) {
         fa_ring_reset(&s->ring);
         s->in_count = s->in_offset = 0;
@@ -565,6 +640,7 @@ static void detach_locked(struct fa_stream* s)
     fa_store32(&s->eof, 0);
     fa_mutex_unlock(&s->decode_lock);
     fa_cas32(&s->state, FA_STATE_PLAYING, FA_STATE_PAUSED);
+    fa_cas32(&s->state, FA_STATE_BUFFERING, FA_STATE_PAUSED);
     if (fa_load64(&s->start_frame) == FA_START_QUEUED) fa_cas32(&s->state, FA_STATE_SCHEDULED, FA_STATE_STOPPED);
     else fa_cas32(&s->state, FA_STATE_SCHEDULED, FA_STATE_PAUSED);
 }
@@ -610,6 +686,18 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
         fa_store64(&stream->played, 0);
         fa_store32(&stream->eof, 0);
         fa_store32(&stream->flushing, 0);
+        fa_ptsmap_reset(&stream->ptsmap);
+        if (stream->push) {
+            /* Audio kept from before a detach (carry) plays first and ends where the
+             * push decoder's output continues. */
+            int64_t first = fa_push_next_pts(stream->push) -
+                            (int64_t)((double)stream->carry_count * 1e9 / (double)stream->decoder.format.sample_rate + 0.5);
+            fa_push_restart_timeline(stream->push);
+            if (stream->carry_count > 0) fa_ptsmap_add(&stream->ptsmap, 0, first);
+            fa_clock_reset(&stream->clock, first);
+        } else {
+            fa_clock_reset(&stream->clock, (int64_t)((double)pos * 1e9 / (double)stream->decoder.format.sample_rate + 0.5));
+        }
         fa_stream_fill(stream, (int64_t)device->rate * FA_PREFILL_MS / 1000);
     }
     fa_mutex_unlock(&stream->decode_lock);
@@ -762,11 +850,11 @@ FA_API fa_result FA_CALL fa_stream_pause(fa_stream* stream)
     fa_mutex_lock(&stream->api_lock);
     if (!is_attached(stream)) r = FA_ERROR_INVALID_ARG;
     else {
-        /* The mixer may start a scheduled stream meanwhile: retry until the state
-         * we saw is the one we replaced. */
+        /* The mixer may start a scheduled stream or a push stream may start or stop
+         * buffering meanwhile: retry until the state we saw is the one we replaced. */
         for (;;) {
             int32_t st = fa_load32(&stream->state);
-            if (st != FA_STATE_PLAYING && st != FA_STATE_SCHEDULED) break;
+            if (st != FA_STATE_PLAYING && st != FA_STATE_SCHEDULED && st != FA_STATE_BUFFERING) break;
             if (fa_cas32(&stream->state, st, FA_STATE_PAUSED)) {
                 fa_device_wait_quiescent(stream->device); /* once we return, nothing more is mixed */
                 break;
@@ -823,17 +911,69 @@ FA_API fa_result FA_CALL fa_stream_get_position(fa_stream* stream, fa_frames* ou
     return FA_OK;
 }
 
+int64_t fa_stream_clock_at(struct fa_stream* s, int64_t now_ns)
+{
+    if (s->device) return fa_clock_at(&s->clock, fa_device_speaker_frame(s->device, now_ns));
+    if (s->push) return fa_push_next_pts(s->push);
+    return (int64_t)((double)fa_load64(&s->position) * 1e9 / (double)s->decoder.format.sample_rate + 0.5);
+}
+
 FA_API fa_result FA_CALL fa_stream_get_clock(fa_stream* stream, fa_time* out_pts)
 {
-    fa_time latency = 0, pts;
-    fa_frames pos;
     if (!stream || !out_pts) return FA_ERROR_INVALID_ARG;
     fa_mutex_lock(&stream->api_lock);
-    pos = fa_stream_position_now(stream);
-    if (stream->device) fa_device_get_latency(stream->device, &latency);
+    *out_pts = fa_stream_clock_at(stream, fa_monotonic_ns());
     fa_mutex_unlock(&stream->api_lock);
-    pts = (fa_time)((double)pos * 1e9 / (double)stream->decoder.format.sample_rate) - latency;
-    *out_pts = pts > 0 ? pts : 0;
+    return FA_OK;
+}
+
+/* ---- push streams ---------------------------------------------------------- */
+
+FA_API fa_result FA_CALL fa_stream_push_flush(fa_stream* stream)
+{
+    int64_t hold;
+    if (!stream || !stream->push) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&stream->api_lock);
+    hold = fa_stream_clock_at(stream, fa_monotonic_ns());
+    if (is_attached(stream)) {
+        fa_store32(&stream->flushing, 1);
+        fa_device_wait_quiescent(stream->device);   /* the mixer now skips this stream */
+    }
+    fa_mutex_lock(&stream->decode_lock);
+    fa_push_flush_locked(stream->push);
+    if (stream->ring.data) {
+        fa_frames pos = fa_stream_position_now(stream);
+        fa_ring_reset(&stream->ring);
+        stream->in_count = stream->in_offset = 0;
+        stream->decoded = 0;
+        stream->draining = 0;
+        if (stream->converter_ready) ma_data_converter_reset(&stream->converter);
+        fa_store32(&stream->eof, 0);
+        fa_store64(&stream->seek_base, pos);
+        fa_store64(&stream->position, pos);
+        fa_store64(&stream->played, 0);
+    }
+    fa_store64(&stream->played_audible, 0);
+    fa_ptsmap_reset(&stream->ptsmap);
+    fa_clock_reset(&stream->clock, hold);
+    fa_mutex_unlock(&stream->decode_lock);
+    fa_store32(&stream->flushing, 0);
+    fa_mutex_unlock(&stream->api_lock);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_buffered(fa_stream* stream, fa_time* out_duration)
+{
+    int64_t end, now;
+    if (!stream || !out_duration) return FA_ERROR_INVALID_ARG;
+    *out_duration = 0;
+    if (!stream->push) return FA_ERROR_INVALID_ARG;
+    end = fa_push_end_pts(stream->push);
+    if (end == FA_PTS_NONE) return FA_OK;
+    fa_mutex_lock(&stream->api_lock);
+    now = fa_stream_clock_at(stream, fa_monotonic_ns());
+    fa_mutex_unlock(&stream->api_lock);
+    *out_duration = end > now ? end - now : 0;
     return FA_OK;
 }
 
@@ -1183,6 +1323,7 @@ FA_API fa_result FA_CALL fa_stream_read(fa_stream* stream, void* buffer, fa_fram
     fa_fetch_add64(&stream->position, got);
     fa_mutex_unlock(&stream->decode_lock);
     *out_frames_read = got;
+    if (r == FA_ERROR_BUSY) r = FA_OK;   /* push stream with nothing queued: 0 frames, not the end */
     return r;
 }
 
@@ -1457,6 +1598,55 @@ int fa_stream_check_queue(struct fa_stream* s, fa_device* dev, uint32_t frames)
     return 1;
 }
 
+/* ---- presentation clock (audio thread) -------------------------------------------- */
+
+/* Presentation time of the frame `played` frames into the ring, and in *out_next
+ * the next played count where that mapping stops being linear (a loop wrap, or a
+ * jump in a push stream's timestamps); INT64_MAX if none. */
+static int64_t pts_at_played(struct fa_stream* s, int64_t played, int64_t* out_next)
+{
+    double sr = (double)s->decoder.format.sample_rate, dr = (double)s->dev_rate;
+    double pos;
+    fa_frames end;
+    if (s->push) return fa_ptsmap_pts(&s->ptsmap, played, 1e9 / dr, out_next);
+    *out_next = INT64_MAX;
+    pos = fade_position(s, played);
+    end = end_frame(s);
+    if (end > 0 && (s->flags & FA_OPEN_LOOP)) {
+        double to_end = ((double)end - pos) * dr / sr;     /* device frames until the loop wraps */
+        if (to_end > 0.0) *out_next = played + (int64_t)ceil(to_end - 1e-9);
+    } else if (end >= 0 && pos > (double)end) {
+        pos = (double)end;                                 /* the resampler's tail after the end */
+    }
+    return (int64_t)(pos * 1e9 / sr + 0.5);
+}
+
+/* Notes that device frames [dev0, dev0 + n) played the stream from `played0`. */
+static void record_clock(struct fa_stream* s, int64_t dev0, int64_t played0, int64_t n)
+{
+    double ns_per_frame = 1e9 / (double)s->dev_rate;
+    int64_t p = played0, stop = played0 + n;
+    fa_frames end = end_frame(s);
+    int64_t end_pts = (!s->push && end >= 0 && !(s->flags & FA_OPEN_LOOP))
+        ? (int64_t)((double)end * 1e9 / (double)s->decoder.format.sample_rate + 0.5) : INT64_MAX;
+    while (p < stop) {
+        int64_t next, seg, pts0, pts1;
+        pts0 = pts_at_played(s, p, &next);
+        seg = next > p && next < stop ? next : stop;
+        pts1 = pts0 + (int64_t)((double)(seg - p) * ns_per_frame + 0.5);
+        if (pts1 > end_pts) pts1 = end_pts > pts0 ? end_pts : pts0;
+        fa_clock_record(&s->clock, dev0 + (p - played0), seg - p, pts0, pts1);
+        p = seg;
+    }
+}
+
+/* Push streams wait in FA_STATE_BUFFERING until this much is decoded ahead. */
+static int64_t prebuffer_frames(struct fa_stream* s)
+{
+    int64_t want = (int64_t)s->dev_rate * FA_PREFILL_MS / 1000;
+    return want < s->ring.capacity / 2 ? want : s->ring.capacity / 2;
+}
+
 void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames)
 {
     int64_t avail, n, done = 0, clock, off = 0, played0;
@@ -1479,6 +1669,12 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
             state = FA_STATE_PLAYING;
             push_event(dev, s, FA_EVENT_STARTED, 0);
         }
+    }
+    if (state == FA_STATE_BUFFERING &&
+        (fa_load32(&s->eof) || fa_ring_readable(&s->ring) >= prebuffer_frames(s)) &&
+        fa_cas32(&s->state, FA_STATE_BUFFERING, FA_STATE_PLAYING)) {
+        state = FA_STATE_PLAYING;
+        if (s->stalled) { s->stalled = 0; push_event(dev, s, FA_EVENT_RESUMED, 0); }
     }
     playing = state == FA_STATE_PLAYING;
     audible = playing && s->was_audible;
@@ -1589,6 +1785,10 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
         }
     }
     for (p = 0; p < FA_STREAM_LANES; p++) fa_store_float(&s->lanes[p].current, s->lanes[p].v.value);
+    if (done > 0) {
+        record_clock(s, clock + off, played0, done);
+        fa_fetch_add64(&s->played_audible, done);
+    }
 
     if (ended) {
         marker_events(s, dev, &mk, played0, played0 + done, 0);
@@ -1607,6 +1807,12 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
             return;
         }
         fa_fetch_add32(&s->underruns, 1);
+        /* A push stream that ran dry waits for the app's next data. */
+        if (s->push && fa_cas32(&s->state, FA_STATE_PLAYING, FA_STATE_BUFFERING) &&
+            fa_load64(&s->played_audible) > 0 && !s->stalled) {
+            s->stalled = 1;
+            push_event(dev, s, FA_EVENT_STALLED, 0);
+        }
     }
     marker_events(s, dev, &mk, played0, played0 + done, 0);
 }

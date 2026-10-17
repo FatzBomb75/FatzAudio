@@ -6,6 +6,7 @@
 /* ---- dr_wav glue for dec_miniaudio.c --------------------------------------- */
 #include "fa_internal.h"
 #include <stdlib.h>
+#include <string.h>
 
 static size_t wav_on_read(void* user, void* buf, size_t bytes)
 {
@@ -68,4 +69,33 @@ void fa_drwav_close(void* impl)
     if (!impl) return;
     ma_dr_wav_uninit((ma_dr_wav*)impl);
     free(impl);
+}
+
+/* ---- minimp3 frame decoder for packet streams (codec.c) --------------------- */
+
+void* fa_mp3dec_create(void)
+{
+    ma_dr_mp3dec* d = (ma_dr_mp3dec*)calloc(1, sizeof(ma_dr_mp3dec));
+    if (d) ma_dr_mp3dec_init(d);
+    return d;
+}
+
+void fa_mp3dec_reset(void* dec)
+{
+    ma_dr_mp3dec_init((ma_dr_mp3dec*)dec);
+}
+
+int fa_mp3dec_decode(void* dec, const uint8_t* data, int size, float* pcm, int* out_frames,
+                     int* out_channels, int* out_rate)
+{
+    ma_dr_mp3dec_frame_info info;
+    ma_int16 s16[MA_DR_MP3_MAX_SAMPLES_PER_FRAME];
+    int frames, i;
+    memset(&info, 0, sizeof(info));
+    frames = ma_dr_mp3dec_decode_frame((ma_dr_mp3dec*)dec, data, size, s16, &info);
+    *out_frames = frames;
+    *out_channels = info.channels;
+    *out_rate = info.sample_rate;
+    for (i = 0; i < frames * info.channels; i++) pcm[i] = (float)s16[i] * (1.0f / 32768.0f);
+    return info.frame_bytes;
 }
