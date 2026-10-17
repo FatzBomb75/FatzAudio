@@ -714,6 +714,96 @@ static void test_publishing_audio_event_holds_later_ones(void)
     rec_free(&rec);
 }
 
+/* Fills the device queue and the stream's spill slots; the caller holds list_lock,
+ * so nothing collects them until it lets go. Returns how many fillers it added. */
+static int fill_event_room(fa_stream* s)
+{
+    fa_qevent filler;
+    int i, n = 0;
+    memset(&filler, 0, sizeof(filler));
+    filler.ev.type = FA_EVENT_STALLED;
+    filler.ev.stream = s;
+    for (;;) {
+        filler.seq = fa_fetch_add32(&g_engine->event_seq, 1);
+        if (!fa_event_queue_push(&g_dev->events, &filler)) break;
+        n++;
+    }
+    for (i = 0; i < FA_EVENT_SPILL; i++) {
+        if (fa_load32(&s->spill_full[i])) continue;
+        s->spill[i] = filler;
+        filler.seq = fa_fetch_add32(&g_engine->event_seq, 1);
+        fa_store32(&s->spill_full[i], 1);
+        n++;
+    }
+    fa_store32(&g_dev->spilled, 1);
+    return n;
+}
+
+static int g_done_tags[8];
+static fa_atomic32 g_done_count;
+static void FA_CALL record_ramp_tags(const fa_event* ev, void* user)
+{
+    if (ev->type == FA_EVENT_RAMP_DONE) {
+        int i = fa_fetch_add32(&g_done_count, 1);
+        if (i < 8) g_done_tags[i] = (int)ev->value;
+    }
+    record(ev, user);
+}
+
+/* The device queue and the stream's spill slots are all full and nothing collects
+ * them: ramps and the end wait (audibly unchanged) instead of dropping events. */
+static void test_no_room_delays_events(void)
+{
+    fa_stream* s = open_attached(64, 0, 0);
+    recorder rec;
+    fa_ramp r;
+    float out[2 * 128];
+    float first, held;
+    int i, fillers = 0, room, owed_done, state;
+    rec_init(&rec);
+    fa_store32(&g_done_count, 0);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(s, record_ramp_tags, &rec), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    memset(&r, 0, sizeof(r));
+    r.tag = 7;
+    CHECK_EQ(fa_stream_ramp_param(s, FA_PARAM_VOLUME, 0.25f, 0, 0, &r), FA_OK);
+    fa_mutex_lock(&g_engine->list_lock);             /* checks wait until it is released */
+    fillers += fill_event_room(s);
+    room = fa_audio_event_room(g_dev, s);
+    render(s, out, 128);                             /* the ramp ends and the stream runs out */
+    first = out[0];
+    owed_done = s->voice[FA_PARAM_VOLUME].active;
+    state = fa_load32(&s->state);
+    fa_mutex_unlock(&g_engine->list_lock);
+    CHECK(!room);
+    CHECK_NEAR(first, 0.5 * 0.25, 1e-6);             /* the audio follows the ramp regardless */
+    CHECK(owed_done);                                /* its RAMP_DONE is still owed */
+    CHECK_EQ(state, FA_STATE_PLAYING);               /* and so is ENDED */
+    r.tag = 8;
+    CHECK_EQ(fa_stream_ramp_param(s, FA_PARAM_VOLUME, 1.0f, 0, 0, &r), FA_OK);
+    fa_mutex_lock(&g_engine->list_lock);
+    fillers += fill_event_room(s);                   /* collectors may have run meanwhile */
+    render(s, out, 16);
+    held = s->voice[FA_PARAM_VOLUME].value;
+    fa_mutex_unlock(&g_engine->list_lock);
+    CHECK_NEAR(held, 0.25, 1e-6);                    /* waits to replace tag 7 */
+    for (i = 0; i < 3; i++) {                        /* collection frees room; retries succeed */
+        fa_mutex_lock(&g_engine->list_lock);
+        fa_event_collect_locked(g_engine);
+        fa_mutex_unlock(&g_engine->list_lock);
+        render(s, out, 16);
+    }
+    CHECK_NEAR(s->voice[FA_PARAM_VOLUME].value, 1.0, 1e-6);
+    CHECK_EQ(count_events(&rec, FA_EVENT_RAMP_DONE, 2), 2);
+    CHECK_EQ(count_events(&rec, FA_EVENT_ENDED, 1), 1);
+    CHECK_EQ(count_events(&rec, FA_EVENT_STALLED, fillers), fillers);
+    CHECK_EQ(g_done_tags[0], 7);                     /* in order */
+    CHECK_EQ(g_done_tags[1], 8);
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
 static void test_counters_wrap(void)
 {
     fa_stream* s = open_attached(g_dev->rate, 0, 0);
@@ -777,6 +867,7 @@ int main(void)
     RUN(test_slow_callback_loses_nothing);
     RUN(test_publishing_audio_event_holds_later_ones);
     RUN(test_counters_wrap);
+    RUN(test_no_room_delays_events);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

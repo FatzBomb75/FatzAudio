@@ -693,17 +693,19 @@ FA_API fa_result FA_CALL fa_stream_read(fa_stream* stream, void* buffer, fa_fram
 
 /* ---- mixing (audio thread) ----------------------------------------------- */
 
-static void push_event(fa_device* dev, struct fa_stream* s, fa_event_type type, int64_t value)
+static int push_event(fa_device* dev, struct fa_stream* s, fa_event_type type, int64_t value)
 {
-    fa_audio_post_event(dev, s, type, attached_position(s), value);
+    return fa_audio_post_event(dev, s, type, attached_position(s), value);
 }
 
-/* Ends a ramp that has run its course (or had zero length) at its target. */
+/* Ends a ramp that has run its course (or had zero length) at its target. With no
+ * room for its RAMP_DONE the ramp stays active, holding its target, and the next
+ * callback tries again. */
 static void finish_ramp(struct fa_stream* s, fa_device* dev, fa_param_voice* v)
 {
-    v->active = 0;
     v->value = v->target;
-    if (v->notify) push_event(dev, s, FA_EVENT_RAMP_DONE, v->tag);
+    if (v->notify && !push_event(dev, s, FA_EVENT_RAMP_DONE, v->tag)) return;
+    v->active = 0;
 }
 
 /* Takes a new parameter command if one is waiting (see fa_param_mailbox). */
@@ -717,6 +719,8 @@ static void take_command(struct fa_stream* s, fa_device* dev, int p, int playing
     int64_t ns, tag;
     int curve, notify, has_start, i;
     if (w & FA_CMD_CLAIMED) return;
+    /* Replacing a ramp raises its RAMP_DONE: wait for room before taking the command. */
+    if (v->active && v->notify && !fa_audio_event_room(dev, s)) return;
     slot = &m->slot[w & 1];
     target = fa_load_float(&slot->target);
     ns = fa_load64(&slot->frames_ns);
@@ -835,7 +839,9 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
 
     if (n < (int64_t)frames) {
         if (fa_load32(&s->eof) && fa_ring_readable(&s->ring) == 0) {
-            if (fa_cas32(&s->state, FA_STATE_PLAYING, FA_STATE_ENDED)) push_event(dev, s, FA_EVENT_ENDED, 0);
+            /* Without room for ENDED the stream stays playing (silent) and ends next callback. */
+            if (fa_audio_event_room(dev, s) && fa_cas32(&s->state, FA_STATE_PLAYING, FA_STATE_ENDED))
+                push_event(dev, s, FA_EVENT_ENDED, 0);
         } else {
             fa_fetch_add32(&s->underruns, 1);
         }

@@ -155,9 +155,13 @@ int fa_event_queue_push(fa_event_queue* q, const fa_qevent* ev); /* 0 if full */
 int fa_event_queue_pop(fa_event_queue* q, fa_qevent* out);
 
 /* From the audio thread: never blocks or allocates. If the device queue is full the
- * event goes to the stream's spill slots, which the event thread also drains, so
- * ENDED and RAMP_DONE are not lost (a RampAsync waits on them). */
-void fa_audio_post_event(struct fa_device* d, struct fa_stream* s, fa_event_type type, int64_t frame, int64_t value);
+ * event goes to the stream's spill slots. If those are full too it returns 0 and
+ * posts nothing; fa_audio_event_room says beforehand whether a post will succeed.
+ * The mixer checks room before any step that raises ENDED or RAMP_DONE (a
+ * RampAsync waits on them) and retries the step on the next callback, so those
+ * events are delayed under overload, never lost. */
+int fa_audio_event_room(struct fa_device* d, struct fa_stream* s);
+int fa_audio_post_event(struct fa_device* d, struct fa_stream* s, fa_event_type type, int64_t frame, int64_t value);
 
 /* From any non-audio thread. The _locked form takes a sequence number the caller
  * got with fa_fetch_add32(&engine->event_seq, 1) while holding list_lock. */
