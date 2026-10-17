@@ -174,6 +174,6 @@ add_test(NAME ogg COMMAND fa_test_ogg)
 # The white-box tests build the library's sources themselves; the vendored codecs
 # come prebuilt.
 foreach(t fa_test_internal fa_test_loudness fa_test_crossfade fa_test_handoff fa_test_demux
-          fa_test_dolby fa_test_net fa_test_cdg fa_test_tempo fa_test_ogg)
+          fa_test_dolby fa_test_net fa_test_cdg fa_test_disc fa_test_tempo fa_test_ogg)
     target_link_libraries(${t} PRIVATE fa_opus fa_vorbis)
 endforeach()
