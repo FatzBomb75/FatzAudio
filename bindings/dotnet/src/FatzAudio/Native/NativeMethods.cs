@@ -153,7 +153,13 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_engine_set_normalization(EngineHandle engine, int mode, double targetLufs);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_engine_set_limiter(EngineHandle engine, int mode, double ceilingDbtp);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_loudness(StreamHandle stream, out FaLoudness loudness);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_loudness(StreamHandle stream, in FaLoudness loudness);
 
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_scan_loudness_path(EngineHandle engine, string path, out FaLoudness loudness);

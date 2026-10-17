@@ -8,8 +8,8 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Opening and decoding streams (format detection, custom I/O) | [streams.md](streams.md) | ✅ |
 | Playback, buffering and threads (decode-ahead, transport, clock) | [playback.md](playback.md) | ✅ |
 | Volume, pan and ramps (curves, ramp-done) | [ramps.md](ramps.md) | ✅ volume and pan |
-| Events | [events.md](events.md) | ✅ ended, ramp done |
-| Normalization | normalization.md | 🗓️ |
+| Events | [events.md](events.md) | ✅ ended, ramp done, loudness final |
+| Loudness normalization (R128 scans, tags, cache, limiter) | [normalization.md](normalization.md) | ✅ |
 | Crossfade, markers and curves | crossfade.md | 🗓️ |
 | Tempo and pitch | tempo-pitch.md | 🗓️ |
 | FFmpeg hand-off and A/V sync | ffmpeg.md | 🗓️ |

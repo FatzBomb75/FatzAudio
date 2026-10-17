@@ -114,7 +114,10 @@ typedef struct fa_engine_config {
     uint32_t mix_sample_rate;     /* 0 = device native */
     uint32_t period_ms;           /* 0 = backend default */
     uint32_t worker_threads;      /* decode worker threads, 0 = number of cores (max 8) */
-    const char* cache_directory;  /* loudness/seek-index cache, NULL = disabled */
+    const char* cache_directory;  /* loudness scan cache (one small file per scanned
+                                     file, keyed by content), NULL = disabled.
+                                     Created if missing (one level).
+                                     The string is copied */
     uint32_t flags;               /* fa_engine_flags */
 } fa_engine_config;
 
@@ -197,7 +200,8 @@ typedef enum fa_open_flags {
     FA_OPEN_DECODE_ONLY = 1 << 0,  /* not attached to a device; pull with fa_stream_read */
     FA_OPEN_LOOP        = 1 << 1,
     FA_OPEN_PRESCAN     = 1 << 2,  /* build exact seek index / length before returning */
-    FA_OPEN_NO_NORMALIZE = 1 << 3  /* opt this stream out of engine normalization */
+    FA_OPEN_NO_NORMALIZE = 1 << 3  /* opt this stream out of engine normalization
+                                      (jingles, sound effects, already-mastered mixes) */
 } fa_open_flags;
 
 typedef struct fa_open_options {
@@ -356,22 +360,81 @@ FA_API fa_result FA_CALL fa_crossfade(fa_stream* from, fa_stream* to, fa_time du
 
 /* ---- Normalization ---------------------------------------------------- */
 
+/* Loudness normalization makes every stream play at the same perceived loudness
+ * (ITU-R BS.1770-4 / EBU R128). Turn it on once for the engine; it then applies
+ * to every stream played on any device, except streams opened with
+ * FA_OPEN_NO_NORMALIZE and decode-only streams (fa_stream_read returns the
+ * source's own samples).
+ *
+ * Where a stream's loudness comes from, best first:
+ *   1. fa_stream_set_loudness (a value your app stored earlier),
+ *   2. ReplayGain 2 / R128 tags in the file (ID3v2 TXXX, FLAC Vorbis comments, APEv2),
+ *   3. the scan cache (fa_engine_config.cache_directory), keyed by file content,
+ *   4. a background scan: only the audio is decoded, the file is split into chunks
+ *      scanned on all cores at once, and the result is written to the cache,
+ *   5. while none of those is known yet, and for live or app-I/O streams that
+ *      cannot be scanned: a running estimate over the last 15 s of decoded audio.
+ * Playback never waits for any of this. It starts at the best value known at that
+ * moment and glides to the exact gain when the scan finishes (at most 12 dB/s
+ * down, 6 dB/s up), so no jump is heard. FA_EVENT_LOUDNESS_FINAL is raised then.
+ *
+ * Gain = target - loudness, limited to -30..+12 dB. A boost can push peaks over
+ * full scale, so each device also runs a true-peak limiter (fa_engine_set_limiter). */
 typedef enum fa_normalize_mode {
-    FA_NORMALIZE_OFF = 0,
-    FA_NORMALIZE_TRACK,  /* per-stream integrated loudness */
-    FA_NORMALIZE_ALBUM   /* use album gain tags when present */
+    FA_NORMALIZE_OFF = 0,  /* default */
+    FA_NORMALIZE_TRACK,    /* each stream to the target */
+    FA_NORMALIZE_ALBUM     /* album gain from tags when present (keeps an album's
+                              quiet and loud songs in proportion), else track */
 } fa_normalize_mode;
 
-typedef struct fa_loudness {
-    double integrated_lufs;
-    double range_lu;
-    double true_peak_dbtp;
-    int32_t is_final; /* 0 = estimate (scan in progress), 1 = complete */
-} fa_loudness;
+typedef enum fa_loudness_source {
+    FA_LOUDNESS_NONE = 0,  /* nothing known yet */
+    FA_LOUDNESS_ESTIMATE,  /* running estimate from the audio decoded so far */
+    FA_LOUDNESS_TAGS,      /* ReplayGain / R128 tags */
+    FA_LOUDNESS_CACHE,     /* an earlier scan of the same content */
+    FA_LOUDNESS_SCAN,      /* a full scan */
+    FA_LOUDNESS_APP        /* fa_stream_set_loudness */
+} fa_loudness_source;
 
+typedef struct fa_loudness {
+    double integrated_lufs;  /* integrated loudness; -INFINITY for digital silence */
+    double range_lu;         /* loudness range (EBU Tech 3342) */
+    double true_peak_dbtp;   /* true peak; from tags this is the sample peak */
+    int32_t is_final;        /* 1 = TAGS, CACHE, SCAN or APP; 0 = estimate or nothing yet */
+    int32_t source;          /* fa_loudness_source */
+    double gain_db;          /* gain normalization applies to this stream with the
+                                engine's current settings (0 when off or opted out) */
+} fa_loudness;
+/* Values that are not known are NAN (for example range and peak of an estimate). */
+
+/* target_lufs: -16 suits music players, -14 matches streaming services, -23 is
+ * EBU broadcast. Valid range -60..0. Takes effect on playing streams at once,
+ * with the same glide. Starts the analysis of streams that are attached. */
 FA_API fa_result FA_CALL fa_engine_set_normalization(fa_engine* engine, fa_normalize_mode mode, double target_lufs);
+
+typedef enum fa_limiter_mode {
+    FA_LIMITER_AUTO = 0,   /* default: on while normalization is on */
+    FA_LIMITER_ON,
+    FA_LIMITER_OFF
+} fa_limiter_mode;
+
+/* The output limiter of every device: true-peak detection (4x oversampled),
+ * 1.5 ms look-ahead, smooth release. It never touches audio below the ceiling.
+ * ceiling_dbtp: -1 recommended (valid -20..0). The look-ahead adds about 1.7 ms of
+ * latency, always (also while off), so turning it on or off never clicks;
+ * fa_device_get_latency includes it. */
+FA_API fa_result FA_CALL fa_engine_set_limiter(fa_engine* engine, fa_limiter_mode mode, double ceiling_dbtp);
+
+/* Best loudness known for the stream right now, and the gain it gets. Starts the
+ * analysis if it has not run yet, even with normalization off, so apps can use
+ * it for their own library. Never blocks on a scan. */
 FA_API fa_result FA_CALL fa_stream_get_loudness(fa_stream* stream, fa_loudness* out_loudness);
-/* Standalone scan (no playback): fastest path, audio track only, all cores. */
+/* Supplies a loudness your app measured or stored before (integrated_lufs is
+ * required; range and peak may be NAN). It wins over tags, cache and scans, and
+ * cancels a scan in progress. */
+FA_API fa_result FA_CALL fa_stream_set_loudness(fa_stream* stream, const fa_loudness* loudness);
+/* Standalone scan, no playback: decodes only the audio, in chunks on all cores,
+ * and blocks until done. Uses and fills the cache. Tags are ignored (this measures). */
 FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* path, fa_loudness* out_loudness);
 
 /* ---- Events ----------------------------------------------------------- */
@@ -391,7 +454,7 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
  * FA_EVENT_LOUDNESS_FINAL  position               0
  * FA_EVENT_RAMP_DONE       position               fa_ramp.tag of the finished ramp
  *
- * Delivered today: ENDED and RAMP_DONE. The others are raised by the features
+ * Delivered today: ENDED, RAMP_DONE and LOUDNESS_FINAL. The others are raised by the features
  * that produce them as those land (see docs/features). */
 typedef enum fa_event_type {
     FA_EVENT_ENDED = 0,
@@ -402,7 +465,7 @@ typedef enum fa_event_type {
     FA_EVENT_RESUMED,
     FA_EVENT_DECODE_ERROR,    /* recovered: data skipped, playback continues */
     FA_EVENT_DEVICE_CHANGED,
-    FA_EVENT_LOUDNESS_FINAL,
+    FA_EVENT_LOUDNESS_FINAL,  /* the stream's final loudness is known (fa_stream_get_loudness) */
     FA_EVENT_RAMP_DONE        /* a ramp reached its target or was replaced */
 } fa_event_type;
 

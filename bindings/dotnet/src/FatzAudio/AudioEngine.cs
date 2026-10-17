@@ -305,22 +305,50 @@ public sealed class AudioEngine : IDisposable
         }
     }
 
-    /// <summary>Configures loudness normalization for all streams.</summary>
+    /// <summary>
+    /// Turns loudness normalization on or off for every stream played on any device. Each stream's
+    /// loudness comes from <see cref="AudioStream.SetLoudness"/>, then ReplayGain/R128 tags, then the scan
+    /// cache, then a background scan that decodes only the audio, in chunks on all cores. Playback never
+    /// waits: it starts with the best value known and glides to the exact gain when the scan is done
+    /// (<see cref="AudioStream.LoudnessFinal"/>). Gain is target minus loudness, limited to -30..+12 dB.
+    /// </summary>
     /// <param name="mode">Normalization mode.</param>
-    /// <param name="targetLufs">Target loudness in LUFS (for example -14).</param>
-    /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
-    public void SetNormalization(NormalizeMode mode, double targetLufs = -14.0) =>
+    /// <param name="targetLufs">Target loudness: -16 suits music players, -14 matches streaming services, -23 is EBU broadcast. Allowed -60..0.</param>
+    /// <exception cref="FatzAudioException">The target is out of range (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <example>
+    /// <code>
+    /// engine.SetNormalization(NormalizeMode.Track, -16);
+    /// using var song = engine.OpenFile("song.flac");   // analysis starts now
+    /// song.PlayOn(output);                              // plays at once, at the right level
+    /// </code>
+    /// </example>
+    public void SetNormalization(NormalizeMode mode, double targetLufs = -16.0) =>
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_engine_set_normalization(Handle, (int)mode, targetLufs));
 
-    /// <summary>Measures the loudness of a file without playing it, using all cores.</summary>
+    /// <summary>
+    /// Configures the true-peak limiter on every output device. It catches peaks a normalization boost
+    /// or a crossfade would push over the ceiling, and never touches audio below it. Its 1.5 ms
+    /// look-ahead is always in the signal path (also while off), so switching never clicks.
+    /// </summary>
+    /// <param name="mode">When the limiter runs; <see cref="LimiterMode.Auto"/> follows normalization.</param>
+    /// <param name="ceilingDbtp">Highest true peak allowed, in dBTP (-1 recommended, allowed -20..0).</param>
+    /// <exception cref="FatzAudioException">The ceiling is out of range (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    public void SetLimiter(LimiterMode mode, double ceilingDbtp = -1.0) =>
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_engine_set_limiter(Handle, (int)mode, ceilingDbtp));
+
+    /// <summary>
+    /// Measures the loudness of a file without playing it: only the audio is decoded, in chunks on all
+    /// cores, and the result is cached when <see cref="AudioEngineOptions.CacheDirectory"/> is set. Tags are
+    /// ignored (this measures). Blocks until done; use <c>Task.Run</c> to keep a UI thread free.
+    /// </summary>
     /// <param name="path">Path of the audio file.</param>
-    /// <returns>The measured loudness.</returns>
-    /// <exception cref="FatzAudioException">The scan failed or is not supported yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
+    /// <returns>The measured loudness (<see cref="LoudnessSource.Scan"/> or <see cref="LoudnessSource.Cache"/>).</returns>
+    /// <exception cref="FatzAudioException">The file is missing (<see cref="ErrorCode.NotFound"/>) or not a supported format.</exception>
     public Loudness ScanLoudness(string path)
     {
         ArgumentNullException.ThrowIfNull(path);
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_scan_loudness_path(Handle, path, out FaLoudness l));
-        return new Loudness(l.IntegratedLufs, l.RangeLu, l.TruePeakDbtp, l.IsFinal != 0);
+        return Loudness.From(l);
     }
 
     /// <summary>

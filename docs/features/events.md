@@ -14,7 +14,7 @@ Each stream has one event callback. The audio thread queues events without locki
 | `FA_EVENT_STALLED` / `RESUMED` | position | 0 | 🗓️ web streams |
 | `FA_EVENT_DECODE_ERROR` | position | the `fa_result` | 🗓️ |
 | `FA_EVENT_DEVICE_CHANGED` | position | 0 | 🗓️ R14 |
-| `FA_EVENT_LOUDNESS_FINAL` | position | 0 | 🗓️ normalization |
+| `FA_EVENT_LOUDNESS_FINAL` | position | 0 | ✅ ([normalization](normalization.md)) |
 
 ## C
 

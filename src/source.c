@@ -34,29 +34,11 @@ static int64_t file_tell(FILE* f)
 #endif
 }
 
-static FILE* open_utf8(const char* path)
-{
-#ifdef _WIN32
-    FILE* f = NULL;
-    wchar_t* w;
-    int wn = MultiByteToWideChar(CP_UTF8, 0, path, -1, NULL, 0);
-    if (wn <= 0) return NULL;
-    w = (wchar_t*)malloc((size_t)wn * sizeof(wchar_t));
-    if (!w) return NULL;
-    MultiByteToWideChar(CP_UTF8, 0, path, -1, w, wn);
-    if (_wfopen_s(&f, w, L"rb") != 0) f = NULL;
-    free(w);
-    return f;
-#else
-    return fopen(path, "rb");
-#endif
-}
-
 fa_result fa_source_open_path(fa_source* src, const char* path)
 {
     memset(src, 0, sizeof(*src));
     src->kind = FA_SOURCE_FILE;
-    src->file = open_utf8(path);
+    src->file = fa_fopen_utf8(path, "rb");
     if (!src->file) return FA_ERROR_NOT_FOUND;
     src->seekable = 1;
     src->length = -1;
@@ -75,6 +57,17 @@ fa_result fa_source_open_memory(fa_source* src, const void* data, size_t size)
     if (!src->owned) return FA_ERROR_OUT_OF_MEMORY;
     memcpy(src->owned, data, size);
     src->mem = src->owned;
+    src->mem_size = size;
+    src->seekable = 1;
+    src->length = (int64_t)size;
+    return FA_OK;
+}
+
+fa_result fa_source_open_memory_ref(fa_source* src, const void* data, size_t size)
+{
+    memset(src, 0, sizeof(*src));
+    src->kind = FA_SOURCE_MEMORY;
+    src->mem = (const uint8_t*)data;
     src->mem_size = size;
     src->seekable = 1;
     src->length = (int64_t)size;

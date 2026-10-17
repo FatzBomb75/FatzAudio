@@ -6,6 +6,7 @@
 #define FA_PLATFORM_H
 
 #include <stdint.h>
+#include <stdio.h>
 
 #if defined(_MSC_VER) && !defined(__clang__)
 #  include <intrin.h>
@@ -92,6 +93,11 @@ void fa_thread_detach(fa_thread* t);
 uintptr_t fa_thread_current_id(void);
 
 void fa_sleep_ms(uint32_t ms);
+
+/* Files with UTF-8 paths (wide-character APIs on Windows). */
+FILE* fa_fopen_utf8(const char* path, const char* mode);
+int fa_mkdir_utf8(const char* path);                     /* 0 if created or already there */
+int fa_replace_file(const char* from, const char* to);   /* rename over an existing file; 0 on success */
 uint32_t fa_cpu_count(void);
 int64_t fa_monotonic_ns(void);
 

@@ -20,6 +20,8 @@
 #define FA_PREFILL_MS 100
 #define FA_DEZIPPER_NS 5000000   /* plain parameter changes glide over 5 ms */
 #define FA_RAMP_BLOCK 16         /* ramp curves are evaluated every 16 frames */
+#define FA_NORM_GLIDE_DOWN_DB_S 12.0f
+#define FA_NORM_GLIDE_UP_DB_S 6.0f
 
 FA_API void FA_CALL fa_open_options_init(fa_open_options* options)
 {
@@ -35,6 +37,7 @@ static int is_attached(struct fa_stream* s) { return s->device != NULL; }
 
 void fa_stream_free_memory(struct fa_stream* s)
 {
+    fa_mutex_destroy(&s->norm_lock);
     fa_mutex_destroy(&s->cb_lock);
     fa_mutex_destroy(&s->decode_lock);
     fa_mutex_destroy(&s->api_lock);
@@ -55,6 +58,8 @@ static void release_chain(struct fa_stream* s)
 /* Frees a stream that was never published to anyone (failed open). */
 static void stream_discard(struct fa_stream* s)
 {
+    if (s->run_meter_ready) fa_meter_free(&s->run_meter);
+    free(s->path);
     if (s->decoder_ready) fa_decoder_close(&s->decoder);
     fa_source_close(&s->source);
     fa_stream_free_memory(s);
@@ -71,6 +76,10 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
         fa_mutex_destroy(&s->decode_lock); fa_mutex_destroy(&s->api_lock); free(s);
         return FA_ERROR_GENERIC;
     }
+    if (fa_mutex_init(&s->norm_lock) != 0) {
+        fa_mutex_destroy(&s->cb_lock); fa_mutex_destroy(&s->decode_lock); fa_mutex_destroy(&s->api_lock); free(s);
+        return FA_ERROR_GENERIC;
+    }
     s->engine = engine;
     s->flags = options ? options->flags : 0;
     s->buffer_ms = FA_DEFAULT_BUFFER_MS;
@@ -79,6 +88,11 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
         if (s->buffer_ms < 50) s->buffer_ms = 50;
         if (s->buffer_ms > 10000) s->buffer_ms = 10000;
     }
+    s->audio_track = options ? options->audio_track : -1;
+    s->loud.integrated_lufs = s->loud.range_lu = s->loud.true_peak_dbtp = NAN;
+    fa_store_float(&s->norm_track, NAN);
+    fa_store_float(&s->norm_album, NAN);
+    fa_store_float(&s->norm_est, NAN);
     fa_store32(&s->state, FA_STATE_STOPPED);
     for (i = 0; i < FA_MARKER_COUNT; i++) s->markers[i] = FA_FRAMES_UNSET;
     for (i = 0; i < FA_MIX_PARAMS; i++) {
@@ -98,7 +112,19 @@ static fa_result stream_open_decoder(struct fa_stream* s, const char* name_hint,
     if (r != FA_OK) return r;
     s->decoder_ready = 1;
     if (options && options->audio_track > 0) return FA_ERROR_NOT_FOUND; /* single-track formats only so far */
+    /* Running loudness estimate for playback; decode-only streams are never normalized. */
+    if (!(s->flags & FA_OPEN_DECODE_ONLY) &&
+        fa_meter_init(&s->run_meter, s->decoder.format.sample_rate, s->decoder.format.channels, 0, FA_RUNNING_SUBS) == FA_OK)
+        s->run_meter_ready = 1;
     return FA_OK;
+}
+
+/* Analysis starts at open when normalization is on, so the exact gain is often
+ * known before playback even starts. */
+static void stream_opened(struct fa_stream* s)
+{
+    if (fa_load32(&s->engine->norm_mode) != FA_NORMALIZE_OFF && !(s->flags & (FA_OPEN_NO_NORMALIZE | FA_OPEN_DECODE_ONLY)))
+        fa_stream_start_analysis(s);
 }
 
 FA_API fa_result FA_CALL fa_stream_open_path(fa_engine* engine, const char* path, const fa_open_options* options, fa_stream** out_stream)
@@ -110,7 +136,14 @@ FA_API fa_result FA_CALL fa_stream_open_path(fa_engine* engine, const char* path
     if (r != FA_OK) return r;
     r = fa_source_open_path(&s->source, path);
     if (r == FA_OK) r = stream_open_decoder(s, path, options);
+    if (r == FA_OK) {
+        size_t n = strlen(path) + 1;
+        s->path = (char*)malloc(n);
+        if (s->path) memcpy(s->path, path, n);
+        else r = FA_ERROR_OUT_OF_MEMORY;
+    }
     if (r != FA_OK) { stream_discard(s); return r; }
+    stream_opened(s);
     *out_stream = s;
     return FA_OK;
 }
@@ -125,6 +158,7 @@ FA_API fa_result FA_CALL fa_stream_open_memory(fa_engine* engine, const void* da
     r = fa_source_open_memory(&s->source, data, size);
     if (r == FA_OK) r = stream_open_decoder(s, NULL, options);
     if (r != FA_OK) { stream_discard(s); return r; }
+    stream_opened(s);
     *out_stream = s;
     return FA_OK;
 }
@@ -143,17 +177,26 @@ FA_API fa_result FA_CALL fa_stream_open_io(fa_engine* engine, const fa_io_callba
         stream_discard(s);
         return r;
     }
+    stream_opened(s);
     *out_stream = s;
     return FA_OK;
 }
 
 FA_API void FA_CALL fa_stream_close(fa_stream* stream)
 {
+    fa_scan_job* job;
     fa_engine* e;
     uintptr_t self;
     if (!stream) return;
     e = stream->engine;
     fa_stream_detach(stream);
+
+    /* A scan of this stream reads its file or memory: stop it before they go. */
+    fa_mutex_lock(&stream->norm_lock);
+    job = stream->scan_job;
+    stream->scan_job = NULL;
+    fa_mutex_unlock(&stream->norm_lock);
+    fa_scan_release(job);
 
     /* Stop event delivery and wait for a callback that is running right now,
      * unless we are that callback. */
@@ -166,6 +209,9 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
     release_chain(stream);
     if (stream->decoder_ready) { fa_decoder_close(&stream->decoder); stream->decoder_ready = 0; }
     fa_source_close(&stream->source); /* the app's io close, exactly once */
+    if (stream->run_meter_ready) { fa_meter_free(&stream->run_meter); stream->run_meter_ready = 0; }
+    free(stream->path);
+    stream->path = NULL;
     fa_mutex_unlock(&stream->decode_lock);
 
     /* The memory goes to the event thread, which frees it after delivering (and
@@ -203,6 +249,20 @@ int fa_stream_needs_work(struct fa_stream* s)
 {
     if (!s->ring.data || fa_load32(&s->eof) || fa_load32(&s->flushing)) return 0;
     return fa_ring_writable(&s->ring) >= s->ring.capacity / 4;
+}
+
+/* Feeds the running loudness estimate until the final value is known. */
+static void update_estimate(struct fa_stream* s, const float* frames, fa_frames count)
+{
+    int64_t before;
+    float track = fa_load_float(&s->norm_track);
+    if (!s->run_meter_ready || track == track) return;
+    before = s->run_meter.nsubs;
+    fa_meter_process(&s->run_meter, frames, count);
+    if (s->run_meter.nsubs != before) {
+        double est = fa_meter_running_lufs(&s->run_meter);
+        if (est == est) fa_store_float(&s->norm_est, (float)est);
+    }
 }
 
 /* Decodes, converts to the device format and appends to the ring until it is
@@ -248,6 +308,7 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 break;
             }
             just_looped = 0;
+            update_estimate(s, s->in_buf, got);
         }
         in_n = (ma_uint64)s->in_count;
         out_n = (ma_uint64)(room < s->out_cap ? room : s->out_cap);
@@ -396,6 +457,7 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
         r = fa_device_add_voice(device, stream);
         if (r == FA_OK) {
             if (was_playing) fa_cas32(&stream->state, FA_STATE_PAUSED, FA_STATE_PLAYING); /* a move keeps playing */
+            stream_opened(stream);
         } else {
             fa_engine_track_stream(stream->engine, stream, 0);
             stream->device = NULL;
@@ -776,10 +838,24 @@ static void mix_region(float* out, const float* in, int64_t n, float l0, float r
     }
 }
 
+static float db_to_gain(float db) { return db == 0.0f ? 1.0f : powf(10.0f, db / 20.0f); }
+
+/* Moves the normalization gain toward its target: down at most 12 dB/s, up at
+ * most 6 dB/s, so a corrected estimate glides instead of jumping. */
+static float norm_glide(float db, float target, int64_t frames, uint32_t rate)
+{
+    float step;
+    if (db == target) return db;
+    step = (float)frames / (float)rate * (target < db ? FA_NORM_GLIDE_DOWN_DB_S : FA_NORM_GLIDE_UP_DB_S);
+    if (target < db) return db - step > target ? db - step : target;
+    return db + step < target ? db + step : target;
+}
+
 void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames)
 {
     int64_t avail, n, done = 0;
     int p, playing;
+    float norm_target, norm_lin;
     if (fa_load32(&s->flushing)) return;
     playing = fa_load32(&s->state) == FA_STATE_PLAYING;
     for (p = 0; p < FA_MIX_PARAMS; p++) {
@@ -792,7 +868,10 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
         s->was_audible = 0;
         return;
     }
+    norm_target = fa_stream_norm_target_db(s);
+    if (!s->was_audible) s->norm_db = norm_target; /* nothing heard yet: start at the right gain */
     s->was_audible = 1;
+    norm_lin = db_to_gain(s->norm_db);
 
     avail = fa_ring_readable(&s->ring);
     n = avail < (int64_t)frames ? avail : (int64_t)frames;
@@ -813,8 +892,14 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
             v0[p] = v->value;
             v1[p] = v->active ? ramp_value(v, v->done + blk) : v->value;
         }
-        stereo_gains(v0[FA_PARAM_VOLUME], v0[FA_PARAM_PAN], &l0, &r0);
-        stereo_gains(v1[FA_PARAM_VOLUME], v1[FA_PARAM_PAN], &l1, &r1);
+        {
+            float nd1 = norm_glide(s->norm_db, norm_target, blk, dev->rate);
+            float nl1 = nd1 == s->norm_db ? norm_lin : db_to_gain(nd1);
+            stereo_gains(v0[FA_PARAM_VOLUME] * norm_lin, v0[FA_PARAM_PAN], &l0, &r0);
+            stereo_gains(v1[FA_PARAM_VOLUME] * nl1, v1[FA_PARAM_PAN], &l1, &r1);
+            s->norm_db = nd1;
+            norm_lin = nl1;
+        }
         fa_ring_regions(&s->ring, blk, &p1, &n1, &p2, &n2);
         mix_region(out + done * 2, p1, n1, l0, r0, l0 + (l1 - l0) * (float)n1 / (float)blk, r0 + (r1 - r0) * (float)n1 / (float)blk);
         if (n2 > 0) mix_region(out + (done + n1) * 2, p2, n2, l0 + (l1 - l0) * (float)n1 / (float)blk,

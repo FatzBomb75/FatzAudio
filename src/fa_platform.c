@@ -86,6 +86,41 @@ uint32_t fa_cpu_count(void)
     GetSystemInfo(&si);
     return si.dwNumberOfProcessors > 0 ? (uint32_t)si.dwNumberOfProcessors : 1;
 }
+static wchar_t* widen(const char* s)
+{
+    wchar_t* w;
+    int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
+    if (n <= 0) return NULL;
+    w = (wchar_t*)malloc((size_t)n * sizeof(wchar_t));
+    if (w) MultiByteToWideChar(CP_UTF8, 0, s, -1, w, n);
+    return w;
+}
+FILE* fa_fopen_utf8(const char* path, const char* mode)
+{
+    FILE* f = NULL;
+    wchar_t* wp = widen(path);
+    wchar_t* wm = widen(mode);
+    if (wp && wm && _wfopen_s(&f, wp, wm) != 0) f = NULL;
+    free(wp); free(wm);
+    return f;
+}
+int fa_mkdir_utf8(const char* path)
+{
+    wchar_t* wp = widen(path);
+    int ok;
+    if (!wp) return -1;
+    ok = CreateDirectoryW(wp, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
+    free(wp);
+    return ok ? 0 : -1;
+}
+int fa_replace_file(const char* from, const char* to)
+{
+    wchar_t* wf = widen(from);
+    wchar_t* wt = widen(to);
+    int ok = wf && wt && MoveFileExW(wf, wt, MOVEFILE_REPLACE_EXISTING);
+    free(wf); free(wt);
+    return ok ? 0 : -1;
+}
 int64_t fa_monotonic_ns(void)
 {
     static LARGE_INTEGER freq;
@@ -100,6 +135,8 @@ int64_t fa_monotonic_ns(void)
 #  include <pthread.h>
 #  include <time.h>
 #  include <unistd.h>
+#  include <sys/stat.h>
+#  include <sys/types.h>
 
 int fa_mutex_init(fa_mutex* m)
 {
@@ -203,4 +240,10 @@ int64_t fa_monotonic_ns(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
+#endif
+
+#if !defined(_WIN32)
+FILE* fa_fopen_utf8(const char* path, const char* mode) { return fopen(path, mode); }
+int fa_mkdir_utf8(const char* path) { return (mkdir(path, 0777) == 0 || errno == EEXIST) ? 0 : -1; }
+int fa_replace_file(const char* from, const char* to) { return rename(from, to) == 0 ? 0 : -1; }
 #endif

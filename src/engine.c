@@ -119,12 +119,30 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
         memcpy(&e->config, config, sz);
         e->config.struct_size = (uint32_t)sizeof(e->config);
     }
+    /* Keep our own copy: the caller's string (a marshalled one, in .NET) may not outlive this call. */
+    if (e->config.cache_directory) {
+        size_t len = strlen(e->config.cache_directory) + 1;
+        char* dir = (char*)malloc(len);
+        if (!dir) { free(e); return FA_ERROR_OUT_OF_MEMORY; }
+        memcpy(dir, e->config.cache_directory, len);
+        e->config.cache_directory = dir;
+    }
 
-    if (ma_mutex_init(&e->lock) != MA_SUCCESS) { free(e); return FA_ERROR_GENERIC; }
+    if (ma_mutex_init(&e->lock) != MA_SUCCESS) { free((char*)e->config.cache_directory); free(e); return FA_ERROR_GENERIC; }
+    if (fa_mutex_init(&e->scan_lock) != 0) { ma_mutex_uninit(&e->lock); free((char*)e->config.cache_directory); free(e); return FA_ERROR_GENERIC; }
+    if (fa_cond_init(&e->scan_cond) != 0) {
+        fa_mutex_destroy(&e->scan_lock); ma_mutex_uninit(&e->lock); free((char*)e->config.cache_directory); free(e);
+        return FA_ERROR_GENERIC;
+    }
+    fa_store32(&e->norm_mode, FA_NORMALIZE_OFF);
+    fa_store_float(&e->norm_target, -16.0f);
+    fa_store32(&e->limiter_mode, FA_LIMITER_AUTO);
+    fa_store_float(&e->limiter_ceiling, -1.0f);
     if (fa_mutex_init(&e->list_lock) != 0 || fa_cond_init(&e->work_cond) != 0 || fa_cond_init(&e->event_cond) != 0) {
         fa_cond_destroy(&e->event_cond); fa_cond_destroy(&e->work_cond); fa_mutex_destroy(&e->list_lock);
+        fa_cond_destroy(&e->scan_cond); fa_mutex_destroy(&e->scan_lock);
         ma_mutex_uninit(&e->lock);
-        free(e);
+        free((char*)e->config.cache_directory); free(e);
         return FA_ERROR_GENERIC;
     }
     if (e->config.flags & FA_ENGINE_NULL_OUTPUT) {
@@ -135,8 +153,9 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
     }
     if (r != MA_SUCCESS) {
         fa_cond_destroy(&e->event_cond); fa_cond_destroy(&e->work_cond); fa_mutex_destroy(&e->list_lock);
+        fa_cond_destroy(&e->scan_cond); fa_mutex_destroy(&e->scan_lock);
         ma_mutex_uninit(&e->lock);
-        free(e);
+        free((char*)e->config.cache_directory); free(e);
         return FA_ERROR_DEVICE;
     }
 
@@ -159,10 +178,13 @@ void fa_engine_free(fa_engine* e)
 {
     ma_context_uninit(&e->context);
     ma_mutex_uninit(&e->lock);
+    fa_cond_destroy(&e->scan_cond);
+    fa_mutex_destroy(&e->scan_lock);
     fa_cond_destroy(&e->event_cond);
     fa_cond_destroy(&e->work_cond);
     fa_mutex_destroy(&e->list_lock);
     free(e->pending);
+    free((char*)e->config.cache_directory);
     free(e);
 }
 
@@ -183,6 +205,7 @@ FA_API void FA_CALL fa_engine_destroy(fa_engine* engine)
     fa_cond_broadcast(&engine->event_cond);
     fa_mutex_unlock(&engine->list_lock);
     for (i = 0; i < engine->worker_count; i++) fa_thread_join(&engine->workers[i]);
+    fa_scan_shutdown(engine);
     if (on_event_thread) {
         /* Called from an event callback: the event thread cannot join itself. It
          * finishes delivering, then frees the engine as it exits. */
