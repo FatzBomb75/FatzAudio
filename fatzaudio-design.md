@@ -19,6 +19,9 @@ Code location: `C:\development\nuget\fatzaudio` (not under git yet; it will be i
 | R9 | **CD+G** karaoke graphics from files and disc, synced natively, rendered to any surface | Should |
 | R10 | **Disc playback** (audio CD) | Should |
 | R11 | FFmpeg is **never bundled**; it stays its own library, FatzAudio is only compatible with it | Decided |
+| R12 | **Tempo (pitch kept) and pitch shift of clearly better quality** than NAudio/SoundTouch, at least BASS quality | Must |
+| R13 | **Native multi-threaded processing**; buffering like BASS (decode-ahead) for smooth, glitch-free output | Must |
+| R14 | Input and output device selection, always defaulting to the system's primary device | Must |
 
 Keith can point to his current implementations (FFmpeg+BASS sync, normalization analysis, CDG processing) when each part is built.
 
@@ -128,6 +131,46 @@ HTTP/HTTPS with range seeking, prebuffer, stall/resume events, auto-reconnect; I
 - Disc tracks are just another source for `fa_open()`, so everything else (normalization, crossfade, CD+G) works on them unchanged.
 - Analog CD playback (legacy basscd feature) is dropped.
 
+### R12 Tempo and pitch quality
+
+- Why NAudio/SoundTouch sound bad: they use time-domain WSOLA (overlap-add of short segments). It's cheap, but produces echo/phasing on sustained tones, smeared drums, and "warbly" vocals as soon as the ratio moves away from 1.0.
+- FatzAudio uses a **frequency-domain stretcher with phase locking and transient handling**: Signalsmith Stretch (MIT) as the first candidate, Bungee (MPL-2.0) as the second. Both are modern and permissively licensed, so they can be compiled into the single binary. Rubber Band would be excellent but is GPL/commercial, so it's out.
+- Pitch shift = stretch + **high-quality resample** (windowed-sinc polyphase, e.g. r8brain-free, MIT). The same resampler is used everywhere sample rates differ, so rate changes and device-rate conversion are clean too.
+- Formant preservation option for vocals (karaoke key change without the "chipmunk" sound).
+- Quality is measured, not assumed: the comparison suite renders the same material at ratios 0.5–2.0 and ±12 semitones through BASS (bass_fx), SoundTouch and FatzAudio, scores it with an objective metric (ViSQOL, Apache-2.0) and produces files for blind listening.
+
+### R13 Threads and buffering
+
+- **Decode-ahead per stream.** Decoding, stretching, resampling and normalization run on worker threads into a **lock-free ring buffer** per stream (default ~500 ms, configurable). That's what BASS's playback buffer does, and it's why BASS sounds smooth: the audio thread never waits on disk, network or heavy DSP. It also gives the stretcher lookahead, which improves its quality.
+- **The audio callback only mixes:** no locks, no allocation, no I/O, no decoding. It runs at real-time priority (MMCSS "Pro Audio" on Windows, audio workgroups on Apple, AAudio performance mode on Android).
+- **Work scheduler** with a thread pool sized to the CPU: decode jobs, loudness scans and seek-index builds run in parallel. Opening, scanning and seeking are **asynchronous** (completion events), so the UI thread never blocks.
+- Optional "process in my thread" mode for apps that want to drive rendering themselves (offline export, video encoders).
+
+### R14 Devices
+
+- Output and input default to the system's primary device and **follow it** when it changes (headset plugged in, Bluetooth connects). An explicit device can be chosen and is kept.
+- Unplugged device → event, and playback moves to the new default instead of stopping (configurable).
+- Windows: WASAPI shared by default, **WASAPI exclusive** and **ASIO** optional for low latency/bit-perfect output.
+
+### Features worth taking from other BASS add-ons
+
+From the official add-on list (un4seen.com/bass.html, read 2026-10-17), the ones that fit FatzAudio:
+
+| BASS add-on | Idea for FatzAudio |
+|---|---|
+| BASSmix | Matrix mixing (already in R5) and **splitters**: one source to several outputs, e.g. main speakers + a cue/headphone device for a karaoke host or DJ |
+| BASSenc (+ MP3/FLAC/OGG/OPUS) | Record/encode any stream or the master mix to file, and **broadcast to Icecast/Shoutcast** |
+| BASSloud | Loudness metering (part of R6) |
+| BASSHLS | HLS (already in R4) |
+| BASSWASAPI / BASSASIO | Exclusive-mode and ASIO output (R14) |
+| BASSWV, BASSAPE, BASSALAC, BASS_MPC, BASS_TTA, BASSDSD | Extra lossless/hi-res formats: WavPack, Monkey's Audio, ALAC, Musepack, TTA, DSD (DSF/DFF). All have permissive or small decoders; cheap to add to the registry |
+| BASSMIDI | SFZ and SF3 soundfonts besides SF2, MIDI input |
+| BASS_VST | Hosting effect plugins (VST3/CLAP) for user effects — later phase, optional |
+| Tags | Formatted tag text (e.g. "%artist - %title") as a helper |
+| BASS_FFMPEG / BASS_DSHOW | Covered by the FFmpeg compatibility bridge (R3) |
+
+Not taken: Winamp/Sonique plugin hosting, WMA encoding, ADX/AIX/OptimFROG (niche), BASS_SSL (OS TLS is used instead).
+
 ## 4. Build and packaging
 
 CMake, C11 core (C++17 only where a dependency needs it), permissive dependencies vendored and statically linked, LGPL ones (FFmpeg, LAME) only loaded at runtime. Outputs: `fatzaudio.dll` (Windows x64/arm64), `libfatzaudio.dylib` (macOS universal), `fatzaudio.xcframework` (iOS), `libfatzaudio.so` (Android ABIs, Linux x64/arm64). CI matrix builds all of them, runs fuzzers and the BASS comparison suite. One NuGet with `runtimes/<rid>/native/`.
@@ -141,3 +184,14 @@ Decode null-test, seek accuracy, length/end accuracy, gapless/crossfade timing, 
 1. Dolby Digital everywhere: rely on OS codecs + passthrough + FFmpeg (recommended to start), or also write our own AC-3/E-AC-3 decoder later?
 2. MP3 encoding via runtime-loaded LAME (recommended), same model as FFmpeg.
 3. Build order (proposed): core engine + devices + decoders → normalization → crossfade/markers → FFmpeg hand-off → web/HLS → CD+G → disc.
+
+## 7. API fixes found while writing the .NET binding (to do in the core-engine phase)
+
+1. Document that `fa_stream_read` returns `FA_ERROR_END_OF_STREAM` with 0 frames at the end.
+2. `fa_stream_attach` must not reopen the decoder or reset position/format (resampling belongs in the voice chain).
+3. Add a duration field to `fa_stream_info`.
+4. Make `fa_device_start`/`stop` idempotent.
+5. Define an "unset" value for markers.
+6. Add a ramp-finished event so `RampAsync` can complete on the real end.
+7. Specify `fa_io_callbacks.close` and the lifetime of `user`.
+8. Document `fa_event.frame`/`value` per event type.
