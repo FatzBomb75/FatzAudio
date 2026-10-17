@@ -40,10 +40,10 @@ For each stream, the first of these that is available wins:
 
 - **Only audio is decoded.** The scanner opens the file through the same decoder registry as playback, so a video container is read through its audio track alone and video packets are never decoded. (MP4 and Matroska demuxing arrives with the FFmpeg hand-off phase; their files are then scanned this way with no change to your code.)
 - **All cores at once.** The file is cut into chunks at 100 ms boundaries and each chunk is scanned by its own decoder on its own thread, starting one second early so the filters are settled. The chunks' results are joined exactly, so the answer is identical to a single pass.
-- **Once per file.** With a cache directory set, the result is stored under a fingerprint of the file's content (size plus the first, middle and last 64 KB), so renamed or moved files are still recognised and nothing is scanned twice.
+- **Once per file.** With a cache directory set, the result is stored under a fingerprint of the file's content (size plus the first, middle and last 64 KB), so renamed or moved files are still recognised and nothing is scanned twice. Entries written by an older version of the measurement are ignored and the file is scanned again.
 - **Nothing waits for it.** Analysis starts when the stream is opened, on scan threads separate from the playback workers (one per core, minus one left for playback).
 
-Measured on the CI test file (3 minutes of stereo 44.1 kHz WAV, 4-core container): about 140 ms, roughly 1,200x real time. MP3 files without a seek table are scanned in one pass, since seeking in them means decoding from the start.
+Measured on the CI test file (3 minutes of stereo 44.1 kHz WAV, 4-core container): about 0.4 s, roughly 450x real time. MP3 files without a seek table are scanned in one pass, since seeking in them means decoding from the start.
 
 ### Playback never waits
 
@@ -91,7 +91,7 @@ fa_engine_set_limiter(engine, FA_LIMITER_AUTO, -1.0);  /* the default: on while 
 | `FA_LIMITER_ON` | Always on |
 | `FA_LIMITER_OFF` | Always off |
 
-The look-ahead (about 1.7 ms in total) is always in the signal path, also while the limiter is off, so switching never clicks. `fa_device_get_latency` and `fa_stream_get_clock` include it, so video and CD+G stay in sync.
+The look-ahead (about 1.9 ms in total) is always in the signal path, also while the limiter is off, and the limiter keeps measuring while off. Switching it on or off fades over 20 ms and a new ceiling applies to audio not yet in the look-ahead, so neither ever clicks or clips. `fa_device_get_latency` and `fa_stream_get_clock` include it, so video and CD+G stay in sync.
 
 ## Reading and storing loudness
 
@@ -145,7 +145,7 @@ Values that aren't known are `NAN` (.NET: `double.NaN`), for example the range a
 
 ## Accuracy
 
-The meter is tested against the EBU compliance cases (Tech 3341 integrated loudness with gating at 44.1 and 48 kHz, Tech 3342 loudness range) to ±0.1 LU, true peak to the BS.1770 tolerance, 5.1 channel weights (surrounds +1.5 dB, LFE excluded), and a chunked scan against a single pass to 0.01 LU. See `tests/test_loudness.c`.
+The meter is tested against the EBU compliance cases (Tech 3341 integrated loudness with gating at 44.1 and 48 kHz, Tech 3342 loudness range) to ±0.1 LU, true peak to the BS.1770 tolerance (flat to 20 kHz at 48 kHz, never reading high, sample peaks and the last samples of a file included), channel weights for quad, 5.1 and 6.1 (surrounds +1.5 dB, LFE excluded), and a chunked scan against a single pass to 0.01 LU. See `tests/test_loudness.c`.
 
 ## Pitfalls
 

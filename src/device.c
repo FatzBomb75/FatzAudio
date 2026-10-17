@@ -77,12 +77,10 @@ FA_API fa_result FA_CALL fa_device_get_info(fa_engine* engine, fa_device_type ty
  * pointer and mixes each stream's pre-decoded ring buffer. `epoch` is odd while
  * it runs, which lets API threads wait until it no longer sees an old list
  * (fa_device_wait_quiescent) before freeing anything it might touch. */
-/* Linear ceiling of the output limiter, 0 = off. */
-static float limiter_ceiling(fa_engine* e)
+static int limiter_on(fa_engine* e)
 {
     int mode = fa_load32(&e->limiter_mode);
-    int on = mode == FA_LIMITER_ON || (mode == FA_LIMITER_AUTO && fa_load32(&e->norm_mode) != FA_NORMALIZE_OFF);
-    return on ? powf(10.0f, fa_load_float(&e->limiter_ceiling) / 20.0f) : 0.0f;
+    return mode == FA_LIMITER_ON || (mode == FA_LIMITER_AUTO && fa_load32(&e->norm_mode) != FA_NORMALIZE_OFF);
 }
 
 static void data_callback(ma_device* d, void* output, const void* input, ma_uint32 frames)
@@ -96,7 +94,8 @@ static void data_callback(ma_device* d, void* output, const void* input, ma_uint
     list = (fa_voice_list*)fa_load_ptr(&dev->voices);
     if (list)
         for (i = 0; i < list->count; i++) fa_stream_mix(list->items[i], dev, (float*)output, frames);
-    fa_limiter_process(&dev->limiter, (float*)output, frames, limiter_ceiling(dev->engine));
+    fa_limiter_process(&dev->limiter, (float*)output, frames,
+                       powf(10.0f, fa_load_float(&dev->engine->limiter_ceiling) / 20.0f), limiter_on(dev->engine));
     fa_fetch_add64(&dev->epoch, 1);
 }
 

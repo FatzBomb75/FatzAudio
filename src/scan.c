@@ -24,7 +24,7 @@
 #define FA_SCAN_WARMUP_S 1
 #define FA_SCAN_MAX_THREADS 16
 #define FA_KEY_BLOCK 65536
-#define FA_CACHE_MAGIC "FatzAudio-loudness 1"
+#define FA_CACHE_MAGIC "FatzAudio-loudness 2"   /* bumped whenever the measurement changes */
 
 typedef struct scan_chunk {
     double* subs;
@@ -45,6 +45,7 @@ struct fa_scan_job {
 
     /* Under engine->scan_lock. */
     int prepare_taken, plan_ready, finished;
+    int merging;                   /* a thread is merging and delivering the chunks */
     int nchunks, next_chunk, chunks_done;
     fa_scan_job* next;
 
@@ -285,6 +286,8 @@ static void run_chunk(fa_scan_job* j, int k)
         remaining -= got;
     }
     free(buf);
+    /* The file's last chunk measures the peaks between its final samples too. */
+    if (r == FA_OK && k == j->nchunks - 1 && !fa_load32(&j->cancel)) fa_truepeak_flush(&m.tp);
     if (r == FA_OK) {
         c->subs = m.subs;          /* take the list; the meter must not free it */
         c->nsubs = m.nsubs;
@@ -373,6 +376,7 @@ static int run_one_locked(fa_engine* e, fa_scan_job* only)
     run_chunk(j, task);
     fa_mutex_lock(&e->scan_lock);
     if (++j->chunks_done == j->nchunks) {
+        j->merging = 1;            /* fa_scan_release must wait for us now */
         fa_mutex_unlock(&e->scan_lock);
         if (!fa_load32(&j->cancel)) { run_merge(j); deliver(j); }
         fa_mutex_lock(&e->scan_lock);
@@ -479,10 +483,12 @@ void fa_scan_release(fa_scan_job* j)
     if (!j->finished) {
         if (!j->prepare_taken) finish_locked(e, j);
         else if (j->plan_ready) {
-            /* Chunks nobody started are dropped; running ones stop at their next read. */
+            /* Chunks nobody started are dropped; running ones stop at their next
+             * read. If none is running and nobody is merging, the job is done here;
+             * otherwise the thread that ends the last chunk (or the merge) finishes it. */
             j->chunks_done += j->nchunks - j->next_chunk;
             j->next_chunk = j->nchunks;
-            if (j->chunks_done == j->nchunks) finish_locked(e, j);
+            if (j->chunks_done == j->nchunks && !j->merging) finish_locked(e, j);
         }
     }
     while (!j->finished) fa_cond_wait_ms(&e->scan_cond, &e->scan_lock, 10);

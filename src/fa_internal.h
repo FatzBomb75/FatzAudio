@@ -140,7 +140,7 @@ float fa_curve_eval(int curve, const float bezier[4], float t, int rising);
 /* ---- Loudness (loudness.c) ------------------------------------------------ */
 
 #define FA_TP_PHASES 4
-#define FA_TP_TAPS 12
+#define FA_TP_TAPS 32
 #define FA_RUNNING_SUBS 150     /* running estimate window: 15 s of 100 ms sub-blocks */
 
 /* Polyphase true-peak detector (BS.1770 Annex 2 style). */
@@ -158,6 +158,7 @@ fa_result fa_truepeak_init(fa_truepeak* tp, uint32_t rate, uint32_t channels);
 void fa_truepeak_free(fa_truepeak* tp);
 /* One interleaved frame in; the largest |interpolated value| it completes out. */
 float fa_truepeak_push(fa_truepeak* tp, const float* frame);
+void fa_truepeak_flush(fa_truepeak* tp);
 
 /* K-weighted energy meter: one mean-square energy per 100 ms sub-block. */
 typedef struct fa_meter {
@@ -220,6 +221,9 @@ typedef struct fa_limiter {
     int window;                 /* sliding-minimum window, frames */
     int delay;                  /* audio delay, frames */
     float* audio;               /* delay line, `delay` frames */
+    float* ceil_line;           /* the ceiling each delayed frame was measured against */
+    float mix;                  /* 0 = bypassed, 1 = limiting; fades between them */
+    float mix_step;
     int apos;
     float* box;                 /* last `attack` minima */
     int bpos;
@@ -237,7 +241,7 @@ typedef struct fa_limiter {
 fa_result fa_limiter_init(fa_limiter* l, uint32_t rate, uint32_t channels);
 void fa_limiter_free(fa_limiter* l);
 /* In place. ceiling <= 0 disables limiting (the delay stays, so toggling is click-free). */
-void fa_limiter_process(fa_limiter* l, float* frames, uint32_t count, float ceiling);
+void fa_limiter_process(fa_limiter* l, float* frames, uint32_t count, float ceiling, int on);
 
 /* ---- Events (event.c) ----------------------------------------------------- */
 

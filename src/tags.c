@@ -4,6 +4,7 @@
  * are read; pictures and other large frames are skipped with a seek. */
 #include "fa_internal.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define FA_TAG_TEXT_MAX 512
@@ -173,11 +174,12 @@ static void read_flac(fa_source* src, int64_t start, fa_tag_loudness* out)
         last = h[0] & 0x80;
         type = h[0] & 0x7f;
         len = ((uint32_t)h[1] << 16) | ((uint32_t)h[2] << 8) | h[3];
-        if (type == 4 && len <= 1u << 20) {
-            uint8_t buf[1 << 14];
-            /* Comments are small; a block too big for the buffer is read in part. */
-            size_t want = len < sizeof(buf) ? len : sizeof(buf);
-            if (read_exact(src, buf, want)) fa_tags_parse_vorbis_comments(buf, want, out);
+        if (type == 4) {
+            /* The whole block, so tags after long lyrics or cue sheets are found.
+             * Blocks over 1 MB are not plausible comments and are skipped. */
+            uint8_t* buf = len <= 1u << 20 ? (uint8_t*)malloc(len ? len : 1) : NULL;
+            if (buf && read_exact(src, buf, len)) fa_tags_parse_vorbis_comments(buf, len, out);
+            free(buf);
             return;
         }
         if (last) return;

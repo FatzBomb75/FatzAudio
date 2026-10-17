@@ -9,7 +9,9 @@
  * several threads and the chunks' lists joined: the result is the same as a
  * single pass (each chunk warms its filters up on the audio before its start).
  *
- * True peak uses a polyphase 4x oversampler (2x at 88.2/96 kHz, none above). */
+ * True peak uses a polyphase 4x oversampler (2x at 88.2/96 kHz, none above).
+ * Its 128-tap filter is flat to within 0.1 dB up to 0.83x Nyquist (20 kHz at
+ * 48 kHz) and never reads high (passband ripple below 0.001 dB). */
 #include "fa_internal.h"
 #include <math.h>
 #include <stdlib.h>
@@ -40,8 +42,8 @@ fa_result fa_truepeak_init(fa_truepeak* tp, uint32_t rate, uint32_t channels)
     if (!tp->hist) return FA_ERROR_OUT_OF_MEMORY;
     if (tp->phases == 1) { tp->bound = 1.0f; return FA_OK; }
 
-    /* Kaiser-windowed sinc low-pass at 0.9x the original Nyquist, split into phases.
-     * Each phase is normalised to unity DC gain. */
+    /* Kaiser-windowed sinc low-pass (beta 9) at 0.97x the original Nyquist, split
+     * into phases. Each phase is normalised to unity DC gain. */
     n = tp->phases * FA_TP_TAPS;
     for (p = 0; p < tp->phases; p++) {
         double sum = 0.0, abs_sum = 0.0;
@@ -49,10 +51,10 @@ fa_result fa_truepeak_init(fa_truepeak* tp, uint32_t rate, uint32_t channels)
         for (t = 0; t < FA_TP_TAPS; t++) {
             int i = t * tp->phases + p;
             double x = (double)i - (double)(n - 1) / 2.0;
-            double fc = 0.9 / (2.0 * tp->phases);       /* cycles per oversampled sample */
+            double fc = 0.97 / (2.0 * tp->phases);       /* cycles per oversampled sample */
             double sinc = x == 0.0 ? 2.0 * fc : sin(2.0 * FA_PI * fc * x) / (FA_PI * x);
             double r = 2.0 * (double)i / (double)(n - 1) - 1.0;
-            double w = bessel_i0(6.0 * sqrt(1.0 - r * r)) / bessel_i0(6.0);
+            double w = bessel_i0(9.0 * sqrt(1.0 - r * r)) / bessel_i0(9.0);
             h[t] = sinc * w;
             sum += h[t];
         }
@@ -74,7 +76,7 @@ void fa_truepeak_free(fa_truepeak* tp)
 }
 
 /* Appends one sample per channel and returns the largest |value| among the
- * interpolated points it completes. History per channel is stored twice
+ * sample itself and the interpolated points it completes. History per channel is stored twice
  * (positions pos and pos + TAPS) so the newest TAPS samples are contiguous. */
 static float tp_push(fa_truepeak* tp, const float* frame)
 {
@@ -87,11 +89,11 @@ static float tp_push(fa_truepeak* tp, const float* frame)
         const float* w;
         h[tp->pos] = h[tp->pos + FA_TP_TAPS] = frame[c];
         w = h + tp->pos + 1;
-        if (tp->phases == 1) {
+        {
             float a = fabsf(frame[c]);
             if (a > m) m = a;
-            continue;
         }
+        if (tp->phases == 1) continue;
         for (p = 0; p < tp->phases; p++) {
             float acc = 0.0f;
             for (t = 0; t < FA_TP_TAPS; t++) acc += tp->coef[p][t] * w[t];
@@ -103,6 +105,20 @@ static float tp_push(fa_truepeak* tp, const float* frame)
 }
 
 float fa_truepeak_push(fa_truepeak* tp, const float* frame) { return tp_push(tp, frame); }
+
+/* Pushes TAPS frames of silence so the interpolated points between the last
+ * samples are measured too (end of the file). */
+void fa_truepeak_flush(fa_truepeak* tp)
+{
+    float* zero = (float*)calloc(tp->channels, sizeof(float));
+    int i;
+    if (!zero) return;
+    for (i = 0; i < FA_TP_TAPS; i++) {
+        float m = tp_push(tp, zero);
+        if (m > tp->peak) tp->peak = m;
+    }
+    free(zero);
+}
 
 /* Measures `frames` interleaved frames. With `measure` 0 the samples only fill
  * the history (warm-up). A block that cannot beat the peak found so far is
@@ -165,11 +181,14 @@ static void k_weighting(double rate, double b[2][3], double a[2][3])
 }
 
 /* BS.1770 channel weights: 1.0 for front channels, 1.41 for surrounds, LFE
- * excluded. Layouts follow the usual WAVE/FLAC/Vorbis orders. */
+ * excluded. Layouts follow the usual WAVE/FLAC/Vorbis orders: quad L R Ls Rs,
+ * 5.0, 5.1, 6.1 (L R C LFE Cs Ls Rs) and 7.1. */
 static double channel_weight(uint32_t channels, uint32_t c)
 {
+    if (channels == 4) { static const double w[4] = { 1, 1, 1.41, 1.41 }; return w[c]; }
     if (channels == 6) { static const double w[6] = { 1, 1, 1, 0, 1.41, 1.41 }; return w[c]; }
     if (channels == 5) { static const double w[5] = { 1, 1, 1, 1.41, 1.41 }; return w[c]; }
+    if (channels == 7) { static const double w[7] = { 1, 1, 1, 0, 1.41, 1.41, 1.41 }; return w[c]; }
     if (channels == 8) { static const double w[8] = { 1, 1, 1, 0, 1.41, 1.41, 1.41, 1.41 }; return w[c]; }
     return 1.0;
 }

@@ -92,6 +92,7 @@ static void measure(const float* x, int64_t frames, uint32_t rate, uint32_t ch, 
     fa_meter m;
     fa_meter_init(&m, rate, ch, 1, 0);
     fa_meter_process(&m, x, frames);
+    fa_truepeak_flush(&m.tp);
     *i_lufs = fa_loudness_integrated(m.subs, m.nsubs);
     if (lra) *lra = fa_loudness_range(m.subs, m.nsubs);
     if (tp) *tp = fa_meter_peak_dbtp(&m);
@@ -162,6 +163,76 @@ static void test_true_peak(void)
     CHECK_NEAR(tp, -6.02, 0.3);             /* BS.1770 tolerance is +0.2 / -0.4 dB */
 }
 
+/* Sine at `freq` and `phase` (radians), 0.5 peak: returns sample peak and true peak in dB. */
+static void sine_peaks(double freq, double phase, double* sample_db, double* tp)
+{
+    uint32_t rate = 48000;
+    int64_t n = rate, k;
+    float* x = (float*)malloc((size_t)n * 2 * sizeof(float));
+    double i, sp = 0.0;
+    for (k = 0; k < n; k++) {
+        /* 10 ms fades: an abrupt start or end overshoots for real (Gibbs). */
+        double fade = k < 480 ? k / 480.0 : n - 1 - k < 480 ? (n - 1 - k) / 480.0 : 1.0;
+        float v = (float)(0.5 * fade * sin(2.0 * PI * freq * (double)k / rate + phase));
+        x[k * 2] = x[k * 2 + 1] = v;
+        if (fabs(v) > sp) sp = fabs(v);
+    }
+    measure(x, n, rate, 2, &i, NULL, tp);
+    free(x);
+    *sample_db = 20.0 * log10(sp);
+}
+
+static void test_true_peak_high_frequencies(void)
+{
+    double sp, tp;
+    /* 16 kHz (fs/3) in phase 0: samples sit 30 degrees off the crests (-1.25 dB). */
+    sine_peaks(16000.0, 0.0, &sp, &tp);
+    CHECK_NEAR(sp, -7.27, 0.05);
+    CHECK(tp > sp + 0.8);
+    CHECK_NEAR(tp, -6.02, 0.4);             /* 4x oversampling: up to -0.3 dB here */
+    /* 20 kHz at 48 kHz, 0.83x Nyquist: the interpolator must still be flat there. */
+    sine_peaks(20000.0, 15.0 * PI / 180.0, &sp, &tp);
+    CHECK_NEAR(sp, -6.32, 0.05);
+    CHECK_NEAR(tp, -6.02, 0.15);
+    /* Never reads high, at any frequency. */
+    sine_peaks(997.0, 0.1, &sp, &tp);
+    CHECK(tp <= -6.02 + 0.01);
+    sine_peaks(21000.0, 0.7, &sp, &tp);
+    CHECK(tp <= -6.02 + 0.01);
+}
+
+static void test_true_peak_includes_samples(void)
+{
+    /* A lone impulse: no interpolated point reaches the sample, the sample counts. */
+    int64_t n = 4800;
+    float* x = (float*)calloc((size_t)n * 2, sizeof(float));
+    double i, tp;
+    x[2400 * 2] = 0.9f;
+    measure(x, n, 48000, 2, &i, NULL, &tp);
+    free(x);
+    CHECK(tp >= 20.0 * log10(0.9) - 1e-4);
+}
+
+static void test_true_peak_at_end_of_file(void)
+{
+    /* Silence ending in two samples at 0.5: the peak between them (about -3.9 dBTP)
+     * is only seen if the scan flushes the oversampler at the end. */
+    uint32_t rate = 48000;
+    int64_t n = rate, k;
+    float* x = (float*)calloc((size_t)n, sizeof(float));
+    size_t size;
+    uint8_t* wav;
+    fa_loudness l;
+    x[n - 2] = x[n - 1] = 0.5f;
+    wav = make_wav(rate, 1, x, n, NULL, 0, &size);
+    CHECK(write_file("loudness-eof.wav", wav, size));
+    free(wav);
+    free(x);
+    CHECK_EQ(fa_scan_loudness_path(g_engine, "loudness-eof.wav", &l), FA_OK);
+    CHECK(l.true_peak_dbtp > -6.02 + 1.0);
+    (void)k;
+}
+
 static void test_surround_weights(void)
 {
     /* Same sine in L only vs in Ls only: the surround channel weighs +1.5 dB. */
@@ -181,6 +252,30 @@ static void test_surround_weights(void)
     }
     free(x);
     CHECK_NEAR(surround - front, 10.0 * log10(1.41), 0.01);
+}
+
+/* Loudness of a 1 kHz sine in channel `c` only, of `channels`. */
+static double one_channel(uint32_t channels, uint32_t c)
+{
+    int64_t n = 48000 * 3, k;
+    float* x = (float*)calloc((size_t)n * channels, sizeof(float));
+    double l;
+    for (k = 0; k < n; k++) x[k * channels + c] = (float)(0.1 * sin(2.0 * PI * 1000.0 * k / 48000.0));
+    measure(x, n, 48000, channels, &l, NULL, NULL);
+    free(x);
+    return l;
+}
+
+static void test_quad_and_61_weights(void)
+{
+    double plus = 10.0 * log10(1.41);
+    double front = one_channel(4, 0);
+    CHECK_NEAR(one_channel(4, 2) - front, plus, 0.01);    /* quad: L R Ls Rs */
+    CHECK_NEAR(one_channel(4, 3) - front, plus, 0.01);
+    front = one_channel(7, 2);
+    CHECK(one_channel(7, 3) < -1000.0);                   /* 6.1: LFE excluded */
+    CHECK_NEAR(one_channel(7, 4) - front, plus, 0.01);
+    CHECK_NEAR(one_channel(7, 6) - front, plus, 0.01);
 }
 
 /* ---- scans ------------------------------------------------------------------------- */
@@ -347,6 +442,27 @@ static void test_tag_parsers(void)
         fa_tags_read_loudness(&src, &t);
         CHECK_NEAR(t.track_lufs, -15.0, 1e-9);
         CHECK_NEAR(t.track_peak_db, -6.0206, 1e-3);
+    }
+    {
+        /* Long lyrics before the gain: the whole comment block is read. */
+        size_t lyr = 40000, cap = lyr + 256, p = 0, vc;
+        uint8_t* b = (uint8_t*)malloc(cap);
+        static const char* gain = "REPLAYGAIN_TRACK_GAIN=+2.00 dB";
+        memcpy(b, "fLaC", 4); p = 4;
+        b[p++] = 0; b[p++] = 0; b[p++] = 0; b[p++] = 34;
+        memset(b + p, 0, 34); p += 34;
+        vc = p;
+        p += 4;
+        p += put_le32(b + p, 3); memcpy(b + p, "abc", 3); p += 3;
+        p += put_le32(b + p, 2);
+        p += put_le32(b + p, (uint32_t)lyr); memcpy(b + p, "LYRICS=", 7); memset(b + p + 7, 'a', lyr - 7); p += lyr;
+        p += put_le32(b + p, (uint32_t)strlen(gain)); memcpy(b + p, gain, strlen(gain)); p += strlen(gain);
+        b[vc] = 0x84;
+        b[vc + 1] = (uint8_t)((p - vc - 4) >> 16); b[vc + 2] = (uint8_t)((p - vc - 4) >> 8); b[vc + 3] = (uint8_t)(p - vc - 4);
+        fa_source_open_memory_ref(&src, b, p);
+        fa_tags_read_loudness(&src, &t);
+        CHECK_NEAR(t.track_lufs, -20.0, 1e-9);
+        free(b);
     }
 }
 
@@ -596,7 +712,7 @@ static void test_limiter(void)
 
     /* Below the ceiling: passes unchanged, only delayed. */
     for (i = 0; i < n; i++) orig[i * 2] = orig[i * 2 + 1] = x[i * 2] = x[i * 2 + 1] = (float)(0.5 * sin(2.0 * PI * 997.0 * i / rate));
-    fa_limiter_process(&lim, x, n, ceiling);
+    fa_limiter_process(&lim, x, n, ceiling, 1);
     for (i = (uint32_t)lim.delay; i < n; i++) CHECK(x[i * 2] == orig[(i - (uint32_t)lim.delay) * 2]);
 
     /* 6 dB over: true peak of the output stays at the ceiling. A burst on
@@ -605,7 +721,7 @@ static void test_limiter(void)
         float v = i < rate / 4 ? 0.0f : (float)(2.0 * sin(2.0 * PI * 3001.0 * i / rate + 0.3));
         x[i * 2] = x[i * 2 + 1] = v;
     }
-    fa_limiter_process(&lim, x, n, ceiling);
+    fa_limiter_process(&lim, x, n, ceiling, 1);
     fa_truepeak_init(&tp, rate, 2);
     for (i = 0; i < n; i++) { float m = fa_truepeak_push(&tp, x + i * 2); if (m > tp.peak) tp.peak = m; }
     out_tp = 20.0 * log10(tp.peak);
@@ -616,12 +732,12 @@ static void test_limiter(void)
     /* Turned off: the reduction releases smoothly (no click) and then the audio
      * passes unchanged, delayed. */
     for (i = 0; i < n; i++) x[i * 2] = x[i * 2 + 1] = orig[i * 2] = (float)(1.5 * sin(2.0 * PI * 440.0 * i / rate));
-    fa_limiter_process(&lim, x, n, 0.0f);
+    fa_limiter_process(&lim, x, n, ceiling, 0);
     for (i = (uint32_t)lim.delay + 1; i < rate / 100; i++) CHECK(fabs(x[i * 2] - x[(i - 1) * 2]) < 0.1);
     fa_limiter_free(&lim);
     CHECK_EQ(fa_limiter_init(&lim, rate, 2), FA_OK);
     for (i = 0; i < n; i++) x[i * 2] = x[i * 2 + 1] = orig[i * 2];
-    fa_limiter_process(&lim, x, n, 0.0f);
+    fa_limiter_process(&lim, x, n, ceiling, 0);
     for (i = (uint32_t)lim.delay; i < n; i++) CHECK(x[i * 2] == orig[(i - (uint32_t)lim.delay) * 2]);
     fa_limiter_free(&lim);
     free(x);
@@ -630,6 +746,55 @@ static void test_limiter(void)
     CHECK_EQ(fa_engine_set_limiter(g_engine, FA_LIMITER_ON, -1.0), FA_OK);
     CHECK_EQ(fa_engine_set_limiter(g_engine, FA_LIMITER_AUTO, 1.0), FA_ERROR_INVALID_ARG);
     CHECK_EQ(fa_engine_set_limiter(g_engine, FA_LIMITER_AUTO, -1.0), FA_OK);
+}
+
+/* Largest step between neighbouring output samples (channel 0). */
+static double max_step(const float* x, uint32_t from, uint32_t to)
+{
+    double m = 0.0;
+    uint32_t i;
+    for (i = from + 1; i < to; i++) if (fabs(x[i * 2] - x[(i - 1) * 2]) > m) m = fabs(x[i * 2] - x[(i - 1) * 2]);
+    return m;
+}
+
+static void test_limiter_switching_is_smooth(void)
+{
+    /* A 220 Hz sine at 1.5 (its own steepest step is 0.043): turning the limiter
+     * on, or lowering its ceiling, mid-signal must not clip or click. */
+    fa_limiter lim;
+    uint32_t rate = 48000, i, n = rate / 2, half = n / 2;
+    float* x = (float*)malloc((size_t)n * 2 * sizeof(float));
+    float c1 = (float)pow(10.0, -1.0 / 20.0), c6 = (float)pow(10.0, -6.0 / 20.0);
+    CHECK_EQ(fa_limiter_init(&lim, rate, 2), FA_OK);
+    for (i = 0; i < n; i++) x[i * 2] = x[i * 2 + 1] = (float)(1.5 * sin(2.0 * PI * 220.0 * i / rate));
+    fa_limiter_process(&lim, x, half, c1, 0);
+    fa_limiter_process(&lim, x + (size_t)half * 2, n - half, c1, 1);
+    CHECK(max_step(x, (uint32_t)lim.delay + 1, n) < 0.06);
+    CHECK(peak_of(x + (size_t)(half + rate / 20) * 2, (size_t)(n - half - rate / 20) * 2) <= c1 + 1e-6);
+
+    for (i = 0; i < n; i++) x[i * 2] = x[i * 2 + 1] = (float)(1.5 * sin(2.0 * PI * 220.0 * (i + n) / rate));
+    fa_limiter_process(&lim, x, half, c1, 1);
+    fa_limiter_process(&lim, x + (size_t)half * 2, n - half, c6, 1);
+    CHECK(max_step(x, 0, n) < 0.06);
+    CHECK(peak_of(x, (size_t)(half + lim.delay) * 2) <= c1 + 1e-6);
+    CHECK(peak_of(x + (size_t)(half + lim.delay) * 2, (size_t)(n - half - lim.delay) * 2) <= c6 + 1e-6);
+    fa_limiter_free(&lim);
+    free(x);
+}
+
+static void test_scan_release_races(void)
+{
+    /* Close streams at many points of their scan: the job must never be freed
+     * while a scan thread is still merging it (run under the sanitizers). */
+    int i;
+    CHECK_EQ(fa_engine_set_normalization(g_engine, FA_NORMALIZE_TRACK, -16.0), FA_OK);
+    for (i = 0; i < 40; i++) {
+        fa_stream* s = open_sine(45.0, -20.0, 0, NULL, 0);
+        CHECK(s != NULL);
+        if (!s) return;
+        fa_sleep_ms((uint32_t)(i % 8) * 3);
+        fa_stream_close(s);
+    }
 }
 
 static void test_latency_includes_limiter(void)
@@ -652,7 +817,11 @@ int main(void)
     RUN(test_ebu_3341_integrated);
     RUN(test_ebu_3342_range);
     RUN(test_true_peak);
+    RUN(test_true_peak_high_frequencies);
+    RUN(test_true_peak_includes_samples);
+    RUN(test_true_peak_at_end_of_file);
     RUN(test_surround_weights);
+    RUN(test_quad_and_61_weights);
     RUN(test_chunked_scan_matches_one_pass);
     RUN(test_cache);
     RUN(test_scan_errors);
@@ -664,6 +833,8 @@ int main(void)
     RUN(test_running_estimate_for_io);
     RUN(test_close_during_scan);
     RUN(test_limiter);
+    RUN(test_limiter_switching_is_smooth);
+    RUN(test_scan_release_races);
     RUN(test_latency_includes_limiter);
 
     fa_device_close(g_dev);

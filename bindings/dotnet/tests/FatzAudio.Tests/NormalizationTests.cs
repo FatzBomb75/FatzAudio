@@ -73,10 +73,12 @@ public class NormalizationTests
     public async Task Stream_GetsGainForTarget_AndRaisesLoudnessFinal()
     {
         using var engine = CreateHeadless();
-        engine.SetNormalization(NormalizeMode.Track, -23);
         var final = new TaskCompletionSource();
+        // Subscribe before analysis can start: with normalization off, opening
+        // starts nothing; the first GetLoudness starts the scan.
         using var s = engine.OpenMemory(TestAudio.SineWav(seconds: 10));
         s.LoudnessFinal += (_, _) => final.TrySetResult();
+        engine.SetNormalization(NormalizeMode.Track, -23);
         var l = await WaitFinalAsync(s);
         Assert.Equal(LoudnessSource.Scan, l.Source);
         Assert.Equal(-23 - l.IntegratedLufs, l.GainDb, 3);
