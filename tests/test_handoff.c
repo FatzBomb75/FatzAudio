@@ -789,7 +789,8 @@ static void decode_file(const char* file, const char* codec, uint32_t rate, uint
     CHECK(strcmp(info.codec, codec) == 0);
     CHECK_NEAR((double)n, (double)expect_frames, (double)slack);
     /* A 1 kHz sine of amplitude 0.5: RMS 0.354 in the middle (FFmpeg's own AAC
-     * encoder at 64 kbps makes it 0.39, as FFmpeg's decoder agrees). */
+     * encoder at 64 kbps makes it 0.39, as FFmpeg's decoder agrees; any decoder
+     * is within the tolerance). */
     CHECK_NEAR(rms(out, n / 4, n * 3 / 4, channels), 0.3536, 0.05);
     free(out);
     fa_stream_close(s);
@@ -820,14 +821,17 @@ static void test_ac3_packets_cut_anywhere(void)
     decode_file("tone.eac3", "eac3", 48000, 2, cut_1000, 24576, 1600);
 }
 
+/* AAC packets (ADTS frames): the system's decoder on Windows, macOS, iOS and
+ * Android, FFmpeg elsewhere (skipped when there is neither). */
 static void test_ffmpeg_aac(void)
 {
     fa_ffmpeg_info fi;
-    if (fa_ffmpeg_load(NULL) != FA_OK) { printf("  (skipped: FFmpeg not found)\n"); return; }
-    CHECK_EQ(fa_ffmpeg_get_info(&fi), FA_OK);
-    CHECK_EQ(fi.loaded, 1);
-    CHECK(fi.avcodec_version >> 16 >= 58);
-    printf("  libavcodec %u.%u at %s\n", fi.avcodec_version >> 16, (fi.avcodec_version >> 8) & 255, fi.avcodec_path);
+    if (fa_ffmpeg_load(NULL) == FA_OK) {
+        CHECK_EQ(fa_ffmpeg_get_info(&fi), FA_OK);
+        CHECK_EQ(fi.loaded, 1);
+        CHECK(fi.avcodec_version >> 16 >= 58);
+        printf("  libavcodec %u.%u at %s\n", fi.avcodec_version >> 16, (fi.avcodec_version >> 8) & 255, fi.avcodec_path);
+    }
     decode_file("tone.aac", "aac", 48000, 2, adts_len, 24000, 2200);
 }
 

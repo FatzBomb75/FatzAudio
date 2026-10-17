@@ -61,6 +61,7 @@ set(FA_SOURCES
     src/demux_ogg.c
     src/codec_xiph.c
     src/codec_flac.c
+    src/codec_os.c
     src/demux_asf.c
     src/stubs.c
     src/miniaudio_impl.c
@@ -94,14 +95,20 @@ set(FA_SOURCES
 # HTTPS through the platform's own stack, CD drives through its drive interface:
 # nothing is bundled.
 if(WIN32)
-    # codec_mf.c: Windows Media Audio through Media Foundation (mfplat.dll is loaded
-    # at run time, so the library still loads on Windows N without it).
+    # codec_mf.c: Windows Media Audio, AAC and ALAC through Media Foundation
+    # (mfplat.dll is loaded at run time, so the library still loads on Windows N).
     list(APPEND FA_SOURCES src/net_https_winhttp.c src/disc_win.c src/codec_mf.c)
 elseif(APPLE)
     enable_language(OBJC)
-    list(APPEND FA_SOURCES src/net_https_apple.m src/disc_mac.c)
+    # codec_at.c: AAC and ALAC through AudioToolbox.
+    list(APPEND FA_SOURCES src/net_https_apple.m src/disc_mac.c src/codec_at.c)
 else()
     list(APPEND FA_SOURCES src/net_https_curl.c src/disc_linux.c)
+    if(ANDROID)
+        # codec_mediacodec.c: AAC and ALAC through MediaCodec (libmediandk.so is
+        # loaded at run time).
+        list(APPEND FA_SOURCES src/codec_mediacodec.c)
+    endif()
 endif()
 
 include(third_party/xiph.cmake)
@@ -134,7 +141,7 @@ if(WIN32)
     # Also the system libraries of codec_mf.c: mfuuid (GUIDs, static) and ole32.
     set(FA_NET_LIBS ws2_32 winhttp mfuuid ole32)
 elseif(APPLE)
-    set(FA_NET_LIBS "-framework Foundation" "-framework CFNetwork")
+    set(FA_NET_LIBS "-framework Foundation" "-framework CFNetwork" "-framework AudioToolbox")
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         list(APPEND FA_NET_LIBS "-framework IOKit" "-framework CoreFoundation")
     endif()

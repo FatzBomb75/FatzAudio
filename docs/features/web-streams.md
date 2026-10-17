@@ -9,7 +9,7 @@
 | An HLS playlist (`.m3u8`), on demand or live | The best audio variant, MPEG-TS, fMP4 or plain audio segments, AES-128 encryption. On-demand HLS is seekable to the frame |
 | A `.pls` or `.m3u` playlist (what radio sites usually link to) | Its first entry is played |
 
-The format is detected from the content, as for files ([streams](streams.md#how-detection-works)): WAV, FLAC, MP3, Ogg Opus, Ogg Vorbis, Ogg FLAC, AAC, AC-3 and E-AC-3, also inside HLS segments (MPEG-TS, fMP4 or packed audio). AAC, which most HLS and many radio stations use, decodes through the FFmpeg your app already has ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)); without it an AAC station returns `FA_ERROR_PROVIDER_MISSING`.
+The format is detected from the content, as for files ([streams](streams.md#how-detection-works)): WAV, FLAC, MP3, Ogg Opus, Ogg Vorbis, Ogg FLAC, AAC, AC-3 and E-AC-3, also inside HLS segments (MPEG-TS, fMP4 or packed audio). AAC, which most HLS and many radio stations use, decodes through the operating system's AAC decoder on Windows, macOS, iOS and Android, and through the FFmpeg your app already has on Linux ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)); there, without it, an AAC station returns `FA_ERROR_PROVIDER_MISSING`.
 
 ## C
 
@@ -136,7 +136,7 @@ A URL that isn't an absolute http or https URL throws `ArgumentException`. Other
 | `FA_ERROR_NETWORK` | The server can't be reached, refused the connection, or timed out |
 | `FA_ERROR_NOT_FOUND` | The server answered with an error (404, 403, 500, ...) |
 | `FA_ERROR_UNSUPPORTED_FORMAT` | What came back isn't audio FatzAudio can decode (a web page, say) |
-| `FA_ERROR_PROVIDER_MISSING` | `https://` on a Linux system without libcurl, or AAC (and other codecs that need it) without FFmpeg |
+| `FA_ERROR_PROVIDER_MISSING` | `https://` on a Linux system without libcurl, or codecs that need FFmpeg (AAC on Linux) without it |
 
 ## Buffering, stalls and reconnects
 

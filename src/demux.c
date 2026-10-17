@@ -365,8 +365,11 @@ static void codec_settings(fa_track* t, const fa_codec_params* p)
     t->packets_back = ci ? ci->packets_back : pcm_bytes(p->codec) > 0 ? 0 : 1;
     t->bytes_back = ci ? ci->bytes_back : 0;
     if (strcmp(p->codec, "opus") == 0 && t->p.seek_preroll_s <= 0) t->p.seek_preroll_s = 0.08;
-    /* FFmpeg's WMA 1 and 2 give their first audio a packet or two late. */
-    t->trails = strcmp(p->codec, "wmav1") == 0 || strcmp(p->codec, "wmav2") == 0;
+    /* FFmpeg's WMA 1 and 2 give their first audio a packet or two late; so may the
+     * systems' decoders (MediaCodec decodes asynchronously). */
+    t->trails = strcmp(p->codec, "wmav1") == 0 || strcmp(p->codec, "wmav2") == 0 ||
+                (t->codec.vt && (strcmp(t->codec.vt->name, "mf") == 0 || strcmp(t->codec.vt->name, "at") == 0 ||
+                                 strcmp(t->codec.vt->name, "mediacodec") == 0));
 }
 
 /* A chained stream's next song: its own codec, set up from its own headers. */
