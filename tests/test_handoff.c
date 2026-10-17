@@ -323,6 +323,34 @@ static void test_clock_follows_timestamp_jumps(void)
     fa_stream_close(s);
 }
 
+/* Detaching keeps the audio decoded ahead (a push stream cannot go back); after
+ * attaching again the clock continues exactly where playback was. */
+static void test_clock_across_detach(void)
+{
+    fa_stream* s = open_push_s16p();
+    int64_t lat = latency_ns(), base = 10000000000LL, t1, heard_ns;
+    fa_frames pos = 0;
+    CHECK(s != NULL);
+    CHECK_EQ(push_level(s, g_dev->rate * 2, 0.25f, base), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    wait_decoded(s, PERIOD * 4);
+    render(PERIOD * 50);
+    CHECK_EQ(fa_stream_detach(s), FA_OK);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK(pos > 0);
+    heard_ns = base + (int64_t)((double)pos * 1e9 / g_dev->rate + 0.5);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_NEAR((double)clock_at(s, g_now), (double)heard_ns, 2000.0);   /* holds there */
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    wait_decoded(s, PERIOD * 4);
+    t1 = g_now;
+    render(PERIOD * 50);
+    CHECK_NEAR((double)clock_at(s, t1 + lat + 100000000), (double)(heard_ns + 100000000), 2000.0);
+    CHECK_NEAR((double)clock_at(s, t1 + lat + 300000000), (double)(heard_ns + 300000000), 2000.0);
+    fa_stream_close(s);
+}
+
 static void test_file_clock_and_seek(void)
 {
     /* 1 s of 16-bit mono WAV at the device rate. */
@@ -638,6 +666,7 @@ int main(void)
     RUN(test_push_frame_converts_any_format);
     RUN(test_clock_follows_the_speaker);
     RUN(test_clock_follows_timestamp_jumps);
+    RUN(test_clock_across_detach);
     RUN(test_file_clock_and_seek);
     RUN(test_buffering_stall_resume_end);
     RUN(test_flush_and_buffered);

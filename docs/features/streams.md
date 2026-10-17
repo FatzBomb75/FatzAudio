@@ -9,8 +9,12 @@ A stream is anything that produces audio. You open it from a file, a memory bloc
 | WAV | RIFF, RIFX, RF64, Wave64, AIFF, AIFF-C (PCM, float, ADPCM, A-law, µ-law) | `pcm` (container `wav` or `aiff`) |
 | FLAC | Native FLAC, with or without a leading ID3v2 tag | `flac` |
 | MP3 | MPEG-1, 2 and 2.5 Layer III, with or without ID3v2 tags | `mp3` |
+| MP4, M4A, MOV | ISO MP4 and QuickTime, including fragmented MP4. Audio tracks only: video is never read | the track's codec: `aac`, `mp3`, `ac3`, `eac3`, `opus`, `flac`, `alac`, `pcm_*`, ... (container `mp4` or `mov`) |
+| Matroska, WebM | MKV, MKA, WebM, including live layouts (unknown sizes, no Cues). Audio tracks only | `aac`, `mp3`, `ac3`, `eac3`, `opus`, `vorbis`, `flac`, `pcm_*`, ... (container `matroska` or `webm`) |
 
-More formats are added to the same registry (Ogg Vorbis, Opus, AAC, AC-3/E-AC-3 and others follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
+Inside MP4 and Matroska, PCM and MP3 tracks decode built in; every other codec (AAC, AC-3, E-AC-3, Opus, Vorbis, FLAC, ALAC, DTS, TrueHD) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`.
+
+More formats are added to the same registry (Ogg Vorbis and Opus, raw AAC and AC-3 files, and built-in decoders for the codecs above follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
 
 Apps that demux files themselves (for example with FFmpeg, for the video) can push compressed packets or decoded frames instead of opening a file: see [FFmpeg hand-off and A/V sync](ffmpeg.md).
 
@@ -146,7 +150,8 @@ using var fromStream = engine.OpenStream(File.OpenRead("track.wav"));
 | Field | Meaning |
 |---|---|
 | `format` | The source's own format: always 32-bit float interleaved, at the file's rate and channel count. It doesn't change when the stream is attached to a device. |
-| `codec`, `container` | For example `flac`/`flac`, `pcm`/`aiff`, `mp3`/`mp3` |
+| `codec`, `container` | For example `flac`/`flac`, `pcm`/`aiff`, `mp3`/`mp3`, `aac`/`mp4`, `opus`/`webm` |
+| `audio_track_count` | Audio tracks in the file (1 for audio-only formats) |
 | `length_frames` | Length in frames, -1 if unknown (live streams) |
 | `duration` | Length in nanoseconds, -1 if unknown. In .NET, `Info.Duration` (null if unknown) |
 | `seekable` | 0 for forward-only sources |
@@ -162,3 +167,25 @@ In .NET, `stream.PlayOn(device)` attaches (or moves) and plays, and `stream.Deta
 - `fa_stream_open_memory` copies the data, so you can free your buffer right after the call.
 - Paths are UTF-8. On Windows FatzAudio converts them to UTF-16 internally, so non-ASCII file names work.
 - `audio_track` greater than 0 returns `FA_ERROR_NOT_FOUND` for single-track formats.
+
+## Video files and audio tracks
+
+Open a video file like any other: FatzAudio reads only its audio. `fa_open_options.audio_track` (.NET `StreamOptions.AudioTrack`) picks the track, counting audio tracks only from 0; -1 is the first. `fa_stream_info.audio_track_count` (.NET `Info.AudioTrackCount`) says how many there are, and a track that doesn't exist returns `FA_ERROR_NOT_FOUND`.
+
+```c
+fa_open_options o;
+fa_open_options_init(&o);
+o.audio_track = 1;                      /* the second language */
+fa_stream_open_path(engine, "movie.mkv", &o, &s);
+```
+
+```csharp
+using var s = engine.OpenFile("movie.mp4", new StreamOptions { AudioTrack = 1 });
+Console.WriteLine(s.Info.AudioTrackCount);
+```
+
+- Seeking is sample exact: the codec is restarted a little earlier (pre-roll) and the extra audio is dropped. Encoder delay, edit lists, Matroska CodecDelay and DiscardPadding are applied, so an AAC or Opus track starts on its first real sample and has its exact length.
+- Only the audio's own bytes are read, so reading a track of a large video is fast: about 1000x real time for a 720p file, reading 3 to 7 percent of it. Normalization scans use the same path ([normalization](normalization.md)).
+- Forward-only sources work when the MP4 has its index in front (faststart or fragmented); otherwise `FA_ERROR_NOT_SEEKABLE`. Matroska always works.
+- Not supported: encrypted tracks (CENC), compressed Matroska tracks (zlib, bzip2, LZO), chained Matroska segments, and MP4 edit lists beyond a leading gap and one edit.
+- When your app demuxes the video itself with FFmpeg, you can still open the file a second time for the audio, or hand FatzAudio the packets you already read ([FFmpeg hand-off](ffmpeg.md)).

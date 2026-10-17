@@ -194,11 +194,11 @@ The legacy app doesn't ship bassmix.dll, but mixer-style code built on `BASS_Cha
 
 | Legacy DLL | Replaced by | Status |
 |---|---|---|
-| bass_aac.dll | AAC packets through the app's FFmpeg (`fa_stream_open_packets`); AAC files through the OS codec | ✅ packets, 🗓️ files |
+| bass_aac.dll | MP4/M4A/MOV files (built-in demuxer, any audio track) and AAC packets (`fa_stream_open_packets`), decoded through the app's FFmpeg; a built-in or OS AAC decoder and raw ADTS files | ✅ MP4 and packets via FFmpeg, 🗓️ built-in decoder |
 | bass_ac3.dll | AC-3 and E-AC-3 packets through the app's FFmpeg (`fa_stream_open_packets`); files through the OS codec, and passthrough | ✅ packets, 🗓️ files and passthrough |
 | bassflac.dll | Built-in | ✅ |
 | bassopus.dll | Built-in (incl. raw packet push) | 🗓️ |
-| basswebm.dll | Built-in Matroska/WebM demuxer | 🗓️ |
+| basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM and MP3 tracks built in, Opus, Vorbis, AAC and others through the app's FFmpeg ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ (built-in Opus/Vorbis decoders 🗓️) |
 | basswma.dll | Decode via Media Foundation on Windows / FFmpeg bridge; encoding not provided | 🗓️ / ➖ |
 | bassmidi.dll | Built-in MIDI synth (SF2, later SFZ/SF3); soundfont via stream options | 🗓️ |
 | bass_fx.dll | Tempo/pitch/rate params on every stream; reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | 🗓️ tempo/pitch, ✅ level control |

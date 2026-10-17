@@ -38,7 +38,7 @@ For each stream, the first of these that is available wins:
 
 ### Why the scan is fast, even on large video files
 
-- **Only audio is decoded.** The scanner opens the file through the same decoder registry as playback, so a video container is read through its audio track alone and video packets are never decoded. (MP4 and Matroska demuxing arrives with the FFmpeg hand-off phase; their files are then scanned this way with no change to your code.)
+- **Only audio is decoded.** The scanner opens the file through the same decoder registry as playback, so a video container is read through its audio track alone and video packets are never decoded. MP4, MOV, MKV and WebM files are scanned this way: only the selected audio track's bytes are read.
 - **All cores at once.** The file is cut into chunks at 100 ms boundaries and each chunk is scanned by its own decoder on its own thread, starting one second early so the filters are settled. The chunks' results are joined exactly, so the answer is identical to a single pass.
 - **Once per file.** With a cache directory set, the result is stored under a fingerprint of the file's content (size plus the first, middle and last 64 KB), so renamed or moved files are still recognised and nothing is scanned twice. Entries written by an older version of the measurement are ignored and the file is scanned again.
 - **Nothing waits for it.** Analysis starts when the stream is opened, on scan threads separate from the playback workers (one per core, minus one left for playback).

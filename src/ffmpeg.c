@@ -499,6 +499,13 @@ fa_result fa_ffmpeg_open_codec(fa_codec* c, const fa_codec_params* p)
     if (p->bits_per_coded_sample) ff.av_opt_set_int(f->ctx, "bits_per_coded_sample", p->bits_per_coded_sample, 0);
     if (p->bit_rate > 0) ff.av_opt_set_int(f->ctx, "b", p->bit_rate, 0);
     ff.av_opt_set(f->ctx, "request_sample_fmt", "flt", 0);  /* saves a conversion where offered */
+    {
+        /* Packets carry no timestamps, but a time base stops decoders that trim
+         * samples (Opus pre-skip, AAC priming) from logging a warning on each open. */
+        char tb[32];
+        snprintf(tb, sizeof(tb), "1/%u", p->sample_rate ? p->sample_rate : 48000u);
+        ff.av_opt_set(f->ctx, "pkt_timebase", tb, 0);
+    }
 
     ff_lock();                     /* avcodec_open2 was not thread-safe in old versions */
     ret = ff.avcodec_open2(f->ctx, codec, NULL);
