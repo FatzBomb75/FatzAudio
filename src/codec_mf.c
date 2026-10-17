@@ -7,8 +7,8 @@
  *    raw access units (payload type 0) with the AudioSpecificConfig after an
  *    HEAACWAVEINFO's fields as MF_MT_USER_DATA. ADTS frames lose their header
  *    first (codec_os.c). SBR doubles the rate: the output type says the rate.
- *  - ALAC (Windows 10 and later): the system's ALAC decoder, the 24-byte
- *    ALACSpecificConfig as MF_MT_USER_DATA.
+ *  - ALAC (Windows 10 and later): the system's ALAC decoder, the 'alac' box
+ *    holding the ALACSpecificConfig as MF_MT_USER_DATA.
  * Their output is in WAVE channel order, which is the library's.
  *
  * mfplat.dll is loaded at run time, never imported: Windows N and KN editions
@@ -520,13 +520,14 @@ static fa_result open_alac(fa_codec* c, const fa_codec_params* p)
     /* ALAC's own channel order (centre first) is not WAVE's, and what Media
      * Foundation gives is not documented: FFmpeg reorders. */
     if (ch > 2) return FA_ERROR_UNSUPPORTED_FORMAT;
-    /* The bare ALACSpecificConfig first, else inside its 'alac' box. */
+    /* The 'alac' box first (as Windows' own MP4 source passes it: the bare config
+     * is taken at open but then decodes nothing), else the bare ALACSpecificConfig. */
     atom[0] = 0; atom[1] = 0; atom[2] = 0; atom[3] = 36;
     memcpy(atom + 4, "alac", 4);
     memset(atom + 8, 0, 4);
     memcpy(atom + 12, a.config, 24);
-    users[0] = a.config; user_n[0] = 24;
-    users[1] = atom; user_n[1] = 36;
+    users[0] = atom; user_n[0] = 36;
+    users[1] = a.config; user_n[1] = 24;
     return open_enum(c, &fa_mf_alac, &rate, &ch, 1, a.bit_depth, users, user_n, 2, 0);
 }
 
