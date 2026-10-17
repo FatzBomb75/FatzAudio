@@ -294,17 +294,6 @@ public sealed class AudioEngine : IDisposable
         return new PushAudioStream(this, sh, null, null, format);
     }
 
-    /// <summary>The engine clock (monotonic presentation time of the mix).</summary>
-    /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
-    public TimeSpan Time
-    {
-        get
-        {
-            FatzAudioException.ThrowIfFailed(NativeMethods.fa_engine_get_time(Handle, out long ns));
-            return TimeConvert.FromNanoseconds(ns);
-        }
-    }
-
     /// <summary>
     /// Turns loudness normalization on or off for every stream played on any device. Each stream's
     /// loudness comes from <see cref="AudioStream.SetLoudness"/>, then ReplayGain/R128 tags, then the scan

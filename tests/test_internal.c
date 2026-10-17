@@ -490,8 +490,8 @@ static void test_ramp_keeps_time_across_rates(void)
     CHECK_EQ(fa_stream_detach(s), FA_OK);
     s->voice_rate = g_dev->rate * 2;                 /* pretend it ran on a device twice as fast */
     CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
-    CHECK_EQ(s->voice[FA_PARAM_VOLUME].total, 2400); /* same remaining time at this rate */
-    CHECK_EQ(s->voice[FA_PARAM_VOLUME].done, 1200);
+    CHECK_EQ(s->lanes[FA_PARAM_VOLUME].v.total, 2400); /* same remaining time at this rate */
+    CHECK_EQ(s->lanes[FA_PARAM_VOLUME].v.done, 1200);
     fa_stream_close(s);
     rec_free(&rec);
 }

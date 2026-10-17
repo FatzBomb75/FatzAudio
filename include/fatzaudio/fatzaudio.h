@@ -169,6 +169,13 @@ FA_API fa_result FA_CALL fa_device_is_started(fa_device* device, int32_t* out_st
 FA_API fa_result FA_CALL fa_device_set_volume(fa_device* device, float volume);
 FA_API fa_result FA_CALL fa_device_get_volume(fa_device* device, float* out_volume);
 FA_API fa_result FA_CALL fa_device_get_latency(fa_device* device, fa_time* out_latency);
+/* The device's sample clock: how much audio it has mixed since it was opened, in
+ * nanoseconds (frames mixed / sample rate). It starts at 0, advances only while the
+ * device runs, and never jumps. Every scheduled action on a stream or bus of this
+ * device (fa_stream_play_at, ramps with a start time, queued streams) is placed on
+ * this clock, to the exact frame. It moves in steps of one device period, so
+ * schedule at least one period ahead: "now + 50 ms" is always safe. */
+FA_API fa_result FA_CALL fa_device_get_time(fa_device* device, fa_time* out_time);
 
 /* ---- Opening streams ---------------------------------------------------- */
 
@@ -254,29 +261,39 @@ FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* o
 
 /* ---- Transport and position -------------------------------------------- */
 
-/* Routes a stream to a device (bus NULL = the device's master mix). The decoder
- * is not reopened: position, format and parameters are kept. Attaching to the
- * device it is already on is a no-op; attaching to another device moves it there
+/* Routes a stream to a device, through `bus` (fa_bus_create) or straight into the
+ * device's master mix (bus NULL). The decoder is not reopened: position, format
+ * and parameters are kept. Attaching to the device it is already on only changes
+ * the bus (instantly, without a gap); attaching to another device moves it there
  * (still keeping its position, and playing if it was), and a running ramp keeps
  * its remaining time.
- * Decode-only streams, and devices of another engine, cannot be attached
- * (FA_ERROR_INVALID_ARG). */
+ * Decode-only streams, devices of another engine, and a bus of another device
+ * cannot be attached (FA_ERROR_INVALID_ARG). */
 FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, fa_bus* bus);
 /* Removes the stream from its device; it keeps its position. FA_OK if not attached. */
 FA_API fa_result FA_CALL fa_stream_detach(fa_stream* stream);
+/* Starts or resumes an attached stream. A stopped or ended stream starts at its
+ * FA_MARKER_CUE_IN (0 when unset); a paused one continues where it was. */
 FA_API fa_result FA_CALL fa_stream_play(fa_stream* stream);
-FA_API fa_result FA_CALL fa_stream_play_at(fa_stream* stream, fa_time engine_time); /* sample-accurate scheduled start */
+/* Like fa_stream_play, but the first frame is heard exactly at `device_time` on the
+ * clock of the device the stream is attached to (fa_device_get_time). Until then
+ * the state is FA_STATE_SCHEDULED; FA_EVENT_STARTED is raised when it starts.
+ * A time already past starts it at once. Not attached: FA_ERROR_INVALID_ARG. */
+FA_API fa_result FA_CALL fa_stream_play_at(fa_stream* stream, fa_time device_time);
 /* Pause and stop take effect before they return: no further audio of the stream
- * is mixed after that, so the position read right after is final. */
+ * is mixed after that, so the position read right after is final. Both also
+ * cancel a scheduled or queued start. Stop rewinds to FA_MARKER_CUE_IN (or 0). */
 FA_API fa_result FA_CALL fa_stream_pause(fa_stream* stream);
 FA_API fa_result FA_CALL fa_stream_stop(fa_stream* stream);
 
 typedef enum fa_stream_state {
-    FA_STATE_STOPPED = 0, FA_STATE_PLAYING, FA_STATE_PAUSED, FA_STATE_BUFFERING, FA_STATE_ENDED
+    FA_STATE_STOPPED = 0, FA_STATE_PLAYING, FA_STATE_PAUSED, FA_STATE_BUFFERING, FA_STATE_ENDED,
+    FA_STATE_SCHEDULED  /* waiting for its start: fa_stream_play_at, fa_crossfade or a queue */
 } fa_stream_state;
 
 FA_API fa_result FA_CALL fa_stream_get_state(fa_stream* stream, fa_stream_state* out_state);
-/* Seeking an attached stream drops the decode-ahead buffer and refills the first
+/* Seeking a stopped stream makes it paused at the new position (stopped means "at
+ * the start"). Seeking an attached stream drops the decode-ahead buffer and refills the first
  * ~100 ms on the calling thread before returning, so playback resumes at once. */
 FA_API fa_result FA_CALL fa_stream_seek(fa_stream* stream, fa_frames frame);
 /* Source frames already handed to the device (or read, for decode-only streams).
@@ -288,7 +305,6 @@ FA_API fa_result FA_CALL fa_stream_get_position(fa_stream* stream, fa_frames* ou
  * Video and CD+G renderers should follow this clock. Streams that are not
  * attached report their position. */
 FA_API fa_result FA_CALL fa_stream_get_clock(fa_stream* stream, fa_time* out_pts);
-FA_API fa_result FA_CALL fa_engine_get_time(fa_engine* engine, fa_time* out_time);
 
 /* Decode-only streams (FA_OPEN_DECODE_ONLY): pull interleaved F32 PCM in the
  * format reported by fa_stream_get_info. `buffer` must hold frames * channels floats.
@@ -309,17 +325,28 @@ typedef enum fa_param {
 
 typedef enum fa_curve {
     FA_CURVE_LINEAR = 0,
-    FA_CURVE_EQUAL_POWER,
-    FA_CURVE_LOG,
-    FA_CURVE_EXP,
-    FA_CURVE_SCURVE,
-    FA_CURVE_BEZIER /* uses bezier_x1/y1/x2/y2 control points, CSS cubic-bezier style */
+    FA_CURVE_EQUAL_POWER, /* sin rising, cos falling: out^2 + in^2 = 1 */
+    FA_CURVE_LOG,         /* fast start, slow finish */
+    FA_CURVE_EXP,         /* slow start, fast finish */
+    FA_CURVE_SCURVE,      /* smoothstep */
+    FA_CURVE_BEZIER,      /* uses bezier_x1/y1/x2/y2 control points, CSS cubic-bezier style */
+    FA_CURVE_POINTS       /* your own shape: `points` are its values at evenly spaced
+                             times from start to end, joined by straight lines */
 } fa_curve;
 
+#define FA_CURVE_MAX_POINTS 64
+
+/* The shape of a ramp, fade or crossfade, plus a tag for its done event.
+ * Zero-initialised it is a linear ramp with tag 0.
+ * Shapes map progress 0..1 to 0..1; a ramp's value is start + (target - start) * shape.
+ * FA_CURVE_POINTS: 2..FA_CURVE_MAX_POINTS values, normally from 0 to 1 (other values
+ * are allowed, for example an overshoot). The array is copied by every call. */
 typedef struct fa_ramp {
     fa_curve curve;
     float bezier_x1, bezier_y1, bezier_x2, bezier_y2;
-    int64_t tag;   /* any value; returned in the FA_EVENT_RAMP_DONE event of this ramp */
+    int64_t tag;            /* any value; returned in the FA_EVENT_RAMP_DONE event of this ramp */
+    const float* points;    /* FA_CURVE_POINTS only */
+    uint32_t point_count;
 } fa_ramp;
 
 /* Volume (linear gain >= 0) and pan (-1..1) are applied in the mixer, sample-accurately
@@ -336,17 +363,37 @@ FA_API fa_result FA_CALL fa_stream_get_param(fa_stream* stream, fa_param param, 
  * A new ramp or fa_stream_set_param on the same parameter replaces a running ramp.
  * Every ramp raises exactly one FA_EVENT_RAMP_DONE (value = ramp->tag): when it
  * reaches the target, or when it is replaced.
- * engine_time must be 0 (start now); scheduled starts come with the crossfade phase. */
-FA_API fa_result FA_CALL fa_stream_ramp_param(fa_stream* stream, fa_param param, float target, fa_time duration, fa_time engine_time, const fa_ramp* ramp);
+ * `device_time` 0 starts it now. Any other value starts it exactly at that time on
+ * the clock of the stream's device (fa_device_get_time); the value holds until
+ * then. If the stream is not playing at that moment, the ramp starts as soon as it
+ * plays. A scheduled ramp on a stream that is not attached: FA_ERROR_INVALID_ARG. */
+FA_API fa_result FA_CALL fa_stream_ramp_param(fa_stream* stream, fa_param param, float target, fa_time duration, fa_time device_time, const fa_ramp* ramp);
 
-/* ---- Markers and crossfade -------------------------------------------- */
+/* ---- Markers ---------------------------------------------------------- */
 
+/* Markers are positions in the stream (source frames) that shape its playback.
+ * All are optional; set one to FA_FRAMES_UNSET to clear it.
+ *
+ * CUE_IN          Where playback starts: fa_stream_play from stopped or ended,
+ *                 fa_stream_stop, queues and crossfades all go here. Setting it on
+ *                 a stopped stream moves the stream there. With FA_OPEN_LOOP the
+ *                 stream loops from CUE_OUT back to CUE_IN.
+ * CUE_OUT         Where playback ends: the stream ends there exactly (FA_EVENT_ENDED).
+ * FADE_IN_END     Fades in from CUE_IN (or 0) to here, with the FA_FADE_IN shape.
+ * FADE_OUT_START  Fades out from here to CUE_OUT (or the end), with the FA_FADE_OUT shape.
+ * MIX_POINT       Where the stream queued after this one starts (fa_stream_set_next).
+ *
+ * Marker fades depend only on the position, so seeking into a fade plays it at the
+ * right level, and they multiply with volume, crossfades, normalization and buses.
+ * FA_EVENT_MARKER (value = the fa_marker) is raised when playback passes a marker.
+ * Changing CUE_OUT while playing takes effect at once (the stream re-buffers from
+ * the current position when audio past the new CUE_OUT was already decoded). */
 typedef enum fa_marker {
     FA_MARKER_CUE_IN = 0,
     FA_MARKER_CUE_OUT,
     FA_MARKER_FADE_IN_END,
     FA_MARKER_FADE_OUT_START,
-    FA_MARKER_MIX_POINT /* where the next queued stream starts */
+    FA_MARKER_MIX_POINT
 } fa_marker;
 
 /* "No marker": set a marker to FA_FRAMES_UNSET to clear it; get returns it for
@@ -356,7 +403,82 @@ typedef enum fa_marker {
 FA_API fa_result FA_CALL fa_stream_set_marker(fa_stream* stream, fa_marker marker, fa_frames frame);
 FA_API fa_result FA_CALL fa_stream_get_marker(fa_stream* stream, fa_marker marker, fa_frames* out_frame);
 
+typedef enum fa_fade { FA_FADE_IN = 0, FA_FADE_OUT } fa_fade;
+
+/* Shape of the marker fades (the tag is ignored). The default for both is
+ * FA_CURVE_EQUAL_POWER, so two overlapping marker fades keep constant loudness.
+ * The fade-out is the fade-in shape played backwards (gain = shape(1 - t)). */
+FA_API fa_result FA_CALL fa_stream_set_fade_curve(fa_stream* stream, fa_fade fade, const fa_ramp* shape);
+/* points of a FA_CURVE_POINTS shape are not returned (points NULL, point_count set). */
+FA_API fa_result FA_CALL fa_stream_get_fade_curve(fa_stream* stream, fa_fade fade, fa_ramp* out_shape);
+
+/* ---- Crossfades and queues -------------------------------------------- */
+
+/* Crossfades now: `to` starts (from CUE_IN if stopped or ended, else where it is)
+ * and fades in while `from` fades out, both starting on the same frame, over
+ * `duration`, with the shape in `ramp` (NULL = equal power). `from`'s gain is the
+ * shape played backwards, so the pair is symmetric (equal power stays at constant
+ * loudness). When the fade-out is done `from` ends (FA_STATE_ENDED, FA_EVENT_ENDED;
+ * fa_stream_play starts it again from CUE_IN). Both raise FA_EVENT_RAMP_DONE with
+ * ramp->tag when their fade is done.
+ * `from` must be attached; `to` is attached to `from`'s device and bus if it is
+ * not attached yet (another device: FA_ERROR_INVALID_ARG). The fades are crossfade
+ * gains of their own, separate from FA_PARAM_VOLUME, so a user's volume setting is
+ * kept. The start is one device period ahead (about 10 ms), so both streams are
+ * guaranteed to begin on the same frame. */
 FA_API fa_result FA_CALL fa_crossfade(fa_stream* from, fa_stream* to, fa_time duration, const fa_ramp* ramp);
+
+/* Queues `next` to start automatically, sample-accurately, when `stream` reaches
+ * its mix point:
+ *   - its FA_MARKER_MIX_POINT, if set;
+ *   - else `crossfade` before its end (CUE_OUT, or the length), if crossfade > 0
+ *     and the end is known;
+ *   - else right after its last frame: gapless playback.
+ * With crossfade > 0, `stream` fades out over `crossfade` from the mix point (and
+ * ends when the fade is done) unless it has a FADE_OUT_START marker, and `next`
+ * fades in over `crossfade` unless it has a FADE_IN_END marker; markers win.
+ * `shape` is the crossfade shape (NULL = equal power, tag ignored).
+ * `next` starts at its CUE_IN (or where it is, if paused) and raises
+ * FA_EVENT_STARTED. It is attached to `stream`'s device and bus if needed, and
+ * reports FA_STATE_SCHEDULED while it waits. It may have a next of its own, so a
+ * playlist can be queued as a chain. If `stream` has already ended, `next` starts
+ * at once. next NULL removes the queued stream (it goes back to stopped).
+ * `stream` must be attached; `next` must not be playing (FA_ERROR_BUSY) or on
+ * another device (FA_ERROR_INVALID_ARG). Setting a new next replaces the old one. */
+FA_API fa_result FA_CALL fa_stream_set_next(fa_stream* stream, fa_stream* next, fa_time crossfade, const fa_ramp* shape);
+/* *out_next = the queued stream, or NULL (none, or it has started already). */
+FA_API fa_result FA_CALL fa_stream_get_next(fa_stream* stream, fa_stream** out_next);
+
+/* ---- Mix buses and the channel matrix ---------------------------------- */
+
+/* A bus is a group of streams on one device with its own volume and pan: decks,
+ * groups, a cue/preview channel. Stream gains, then bus gains, then the device
+ * limiter. A DJ crossfader is two buses whose volumes are ramped or set in
+ * opposite directions:
+ *
+ *     deck A -> bus 1 -+
+ *                      +-> device master -> limiter -> speakers
+ *     deck B -> bus 2 -+
+ *
+ * Bus volume (linear >= 0) and pan (-1..1) take fa_param values like streams, with
+ * the same 5 ms smoothing, curves and scheduled starts; bus ramps run whenever the
+ * device runs, and raise no events. Route a stream with fa_stream_attach(stream,
+ * device, bus). Buses are released by fa_bus_destroy or fa_device_close; streams
+ * still on a destroyed bus continue on the device's master mix. */
+FA_API fa_result FA_CALL fa_bus_create(fa_device* device, fa_bus** out_bus);
+FA_API void FA_CALL fa_bus_destroy(fa_bus* bus);
+FA_API fa_result FA_CALL fa_bus_set_param(fa_bus* bus, fa_param param, float value);
+FA_API fa_result FA_CALL fa_bus_get_param(fa_bus* bus, fa_param param, float* out_value);
+FA_API fa_result FA_CALL fa_bus_ramp_param(fa_bus* bus, fa_param param, float target, fa_time duration, fa_time device_time, const fa_ramp* ramp);
+
+/* Routes the stream's source channels to the device's channels with your own
+ * gains: weights[in * out_channels + out] is the gain from source channel `in` to
+ * device channel `out`. in_channels must be the source's channel count and
+ * out_channels the device's (2). Use it for custom downmixes, swapping or muting
+ * channels, or sending one channel of a karaoke track to both speakers.
+ * weights NULL restores the default mapping. Takes effect at once (an attached
+ * stream re-buffers from where it is). */
+FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* weights, uint32_t in_channels, uint32_t out_channels);
 
 /* ---- Normalization ---------------------------------------------------- */
 
@@ -453,8 +575,9 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
  * FA_EVENT_DEVICE_CHANGED  position               0
  * FA_EVENT_LOUDNESS_FINAL  position               0
  * FA_EVENT_RAMP_DONE       position               fa_ramp.tag of the finished ramp
+ * FA_EVENT_STARTED         position               0
  *
- * Delivered today: ENDED, RAMP_DONE and LOUDNESS_FINAL. The others are raised by the features
+ * Delivered today: ENDED, MARKER, LOUDNESS_FINAL, RAMP_DONE and STARTED. The others are raised by the features
  * that produce them as those land (see docs/features). */
 typedef enum fa_event_type {
     FA_EVENT_ENDED = 0,
@@ -466,7 +589,8 @@ typedef enum fa_event_type {
     FA_EVENT_DECODE_ERROR,    /* recovered: data skipped, playback continues */
     FA_EVENT_DEVICE_CHANGED,
     FA_EVENT_LOUDNESS_FINAL,  /* the stream's final loudness is known (fa_stream_get_loudness) */
-    FA_EVENT_RAMP_DONE        /* a ramp reached its target or was replaced */
+    FA_EVENT_RAMP_DONE,       /* a ramp reached its target or was replaced */
+    FA_EVENT_STARTED          /* a scheduled, crossfaded or queued start happened */
 } fa_event_type;
 
 typedef struct fa_event {

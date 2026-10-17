@@ -7,7 +7,7 @@
 | `fa_engine` | The library instance: thread pool, caches, normalization settings. Usually one per app. | `fa_engine_create` | `fa_engine_destroy` |
 | `fa_device` | An opened output device. `NULL` id = the system's primary device, and it follows the primary device when that changes. | `fa_device_open` | `fa_device_close` |
 | `fa_stream` | Anything that produces audio: file, memory, custom I/O, URL, pushed PCM/packets, CD track. The format is detected from the content by the decoder registry ([streams](features/streams.md)). | `fa_stream_open_*` | `fa_stream_close` |
-| `fa_bus` | A mix group (deck, cue bus). Streams attach to a bus or straight to the device. | (planned) | (planned) |
+| `fa_bus` | A mix group (deck, cue bus) with its own volume and pan. Streams attach to a bus or straight to the device ([buses](features/buses.md)). | `fa_bus_create` | `fa_bus_destroy` or `fa_device_close` |
 
 There is **no hidden state**: every call names the object it acts on. Unlike BASS there is no "current device" per thread and no "last error" to poll.
 
@@ -21,6 +21,7 @@ In .NET, errors become a `FatzAudioException` with an `ErrorCode`.
 
 - **Frames** (`fa_frames`, int64) are sample-exact positions: one frame is one sample on every channel.
 - **Time** (`fa_time`, int64 nanoseconds) is used for durations, markers and clocks.
+- `fa_device_get_time()` is the **device clock**: the audio the device has mixed since it opened. Scheduled starts, ramps, crossfades and queues are timed on it, exact to the frame ([crossfade](features/crossfade.md)).
 - `fa_stream_get_clock()` returns the presentation time of the audio *currently leaving the speaker*, with device latency included. Sync video or CD+G graphics to this value and it stays in sync through pauses, seeks and tempo changes.
 
 ## Threads

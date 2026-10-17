@@ -7,12 +7,16 @@ namespace FatzAudio;
 /// <summary>Event data for stream events that carry a position (position reached, marker, device change).</summary>
 public sealed class StreamEventArgs : EventArgs
 {
-    internal StreamEventArgs(TimeSpan position, long frame, long value)
+    internal StreamEventArgs(TimeSpan position, long frame, long value, MarkerKind? marker = null)
     {
         Position = position;
         Frame = frame;
         Value = value;
+        Marker = marker;
     }
+
+    /// <summary>For <see cref="AudioStream.MarkerReached"/>: which marker was passed; otherwise null.</summary>
+    public MarkerKind? Marker { get; }
 
     /// <summary>Stream position of the event.</summary>
     public TimeSpan Position { get; }
@@ -34,7 +38,7 @@ public delegate void DspProcessor(Span<float> samples, int channels);
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>Events</b> (<see cref="Ended"/>, <see cref="MetadataChanged"/>, <see cref="Stalled"/>, <see cref="Resumed"/>,
+/// <b>Events</b> (<see cref="Ended"/>, <see cref="Started"/>, <see cref="MetadataChanged"/>, <see cref="Stalled"/>, <see cref="Resumed"/>,
 /// <see cref="DecodeError"/>, <see cref="LoudnessFinal"/>, <see cref="PositionReached"/>, <see cref="MarkerReached"/>,
 /// <see cref="DeviceChanged"/>) are raised on a native engine thread, never on your UI thread. Handlers must return
 /// quickly and must not block; marshal to your own context if needed. Exceptions thrown by handlers are swallowed.
@@ -162,21 +166,71 @@ public unsafe class AudioStream : IDisposable
     public void PlayOn(OutputDevice device)
     {
         ArgumentNullException.ThrowIfNull(device);
+        AttachTo(device, null);
+        device.Start();
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_play(Handle));
+    }
+
+    /// <summary>
+    /// Plays the stream through a mix bus: like <see cref="PlayOn(OutputDevice)"/> on the bus's device, with
+    /// the bus's volume and pan applied. Moving a playing stream between buses of one device is seamless.
+    /// </summary>
+    /// <param name="bus">The bus.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="bus"/> is null.</exception>
+    /// <exception cref="FatzAudioException">The stream is decode-only (<see cref="ErrorCode.InvalidArgument"/>) or the device failed.</exception>
+    /// <example>
+    /// <code>
+    /// using var deck = output.CreateBus();
+    /// song.PlayOn(deck);
+    /// deck.Volume = 0.5f;
+    /// </code>
+    /// </example>
+    public void PlayOn(MixBus bus)
+    {
+        ArgumentNullException.ThrowIfNull(bus);
+        AttachTo(bus.Device, bus);
+        bus.Device.Start();
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_play(Handle));
+    }
+
+    /// <summary>The bus this stream plays through, or null for the device's master mix.</summary>
+    public MixBus? Bus => _bus;
+
+    private MixBus? _bus;
+
+    private void AttachTo(OutputDevice device, MixBus? bus)
+    {
         var h = Handle;
         var dh = device.Handle;
-        if (!ReferenceEquals(_device, device))
+        if (ReferenceEquals(_device, device) && ReferenceEquals(_bus, bus)) return;
+        var bh = bus?.Handle;
+        bool added = false;
+        try
         {
-            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_attach(h, dh, 0));
-            h.AttachDevice(dh);
-            _device = device;
+            bh?.DangerousAddRef(ref added);
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_attach(h, dh, bh?.DangerousGetHandle() ?? 0));
         }
-        device.Start();
-        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_play(h));
+        finally
+        {
+            if (added) bh!.DangerousRelease();
+        }
+        if (!ReferenceEquals(_device, device)) h.AttachDevice(dh);
+        _device = device;
+        _bus = bus;
+    }
+
+    // The native side attached `other` to this stream's device (crossfade, queue): mirror it here.
+    private void AdoptDevice(AudioStream other)
+    {
+        if (_device is null || ReferenceEquals(other._device, _device)) return;
+        other.Handle.AttachDevice(_device.Handle);
+        other._device = _device;
+        other._bus = _bus;
     }
 
     /// <summary>
     /// Removes the stream from its output device. It keeps its position, so a later
-    /// <see cref="PlayOn"/> continues where it left off. Does nothing if the stream is not attached.
+    /// <see cref="PlayOn(OutputDevice)"/> continues where it left off. Does nothing if the stream is not attached.
     /// </summary>
     /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
     /// <example>
@@ -191,9 +245,13 @@ public unsafe class AudioStream : IDisposable
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_detach(h));
         h.DetachDevice();
         _device = null;
+        _bus = null;
     }
 
-    /// <summary>Starts or resumes playback. The stream must have been attached with <see cref="PlayOn"/> before.</summary>
+    /// <summary>
+    /// Starts or resumes playback. A stopped or ended stream starts at <see cref="StreamMarkers.CueIn"/> (or the
+    /// start); a paused one continues where it was. The stream must have been attached with <see cref="PlayOn(OutputDevice)"/> before.
+    /// </summary>
     /// <exception cref="InvalidOperationException">The stream is not attached to a device.</exception>
     /// <exception cref="FatzAudioException">The native call failed.</exception>
     public void Play()
@@ -204,17 +262,38 @@ public unsafe class AudioStream : IDisposable
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_play(h));
     }
 
-    /// <summary>Starts playback at a precise engine time (sample accurate).</summary>
-    /// <param name="engineTime">Time on the <see cref="AudioEngine.Time"/> clock.</param>
-    /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
-    public void PlayAt(TimeSpan engineTime) =>
-        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_play_at(Handle, TimeConvert.ToNanoseconds(engineTime)));
+    /// <summary>
+    /// Like <see cref="Play"/>, but the first frame is heard exactly at <paramref name="deviceTime"/> on the
+    /// <see cref="OutputDevice.Time"/> clock of the stream's device. Until then <see cref="State"/> is
+    /// <see cref="StreamState.Scheduled"/>; <see cref="Started"/> is raised when it starts. A time already past
+    /// starts it at once.
+    /// </summary>
+    /// <param name="deviceTime">Start time on the device clock.</param>
+    /// <exception cref="InvalidOperationException">The stream is not attached to a device.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="deviceTime"/> is negative.</exception>
+    /// <example>
+    /// <code>
+    /// drums.PlayOn(output); drums.Pause();
+    /// bass.PlayOn(output);  bass.Pause();
+    /// var at = output.Time + TimeSpan.FromMilliseconds(100);
+    /// drums.PlayAt(at);
+    /// bass.PlayAt(at);      // sample-locked
+    /// </code>
+    /// </example>
+    public void PlayAt(TimeSpan deviceTime)
+    {
+        if (deviceTime < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(deviceTime));
+        var h = Handle;
+        if (_device is null) throw new InvalidOperationException("Call PlayOn(device) first.");
+        _device.Start();
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_play_at(h, TimeConvert.ToNanoseconds(deviceTime)));
+    }
 
-    /// <summary>Pauses playback, keeping the position.</summary>
+    /// <summary>Pauses playback, keeping the position. Also cancels a scheduled or queued start.</summary>
     /// <exception cref="FatzAudioException">The native call failed.</exception>
     public void Pause() => FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_pause(Handle));
 
-    /// <summary>Stops playback and rewinds to the start.</summary>
+    /// <summary>Stops playback and rewinds to <see cref="StreamMarkers.CueIn"/> (or the start). Also cancels a scheduled or queued start.</summary>
     /// <exception cref="FatzAudioException">The native call failed.</exception>
     public void Stop() => FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_stop(Handle));
 
@@ -229,7 +308,7 @@ public unsafe class AudioStream : IDisposable
         }
     }
 
-    /// <summary>Playback position; setting it seeks.</summary>
+    /// <summary>Playback position; setting it seeks (a stopped stream becomes paused at the new position).</summary>
     /// <exception cref="ArgumentOutOfRangeException">The value is negative.</exception>
     /// <exception cref="FatzAudioException">Seeking failed (for example <see cref="ErrorCode.NotSeekable"/>).</exception>
     public TimeSpan Position
@@ -318,20 +397,32 @@ public unsafe class AudioStream : IDisposable
     /// <param name="target">Target value.</param>
     /// <param name="duration">Ramp length.</param>
     /// <param name="curve">Ramp shape; defaults to <see cref="Curve.Linear"/>.</param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="duration"/> is negative.</exception>
-    /// <exception cref="FatzAudioException">The parameter cannot be ramped yet (<see cref="ErrorCode.NotImplemented"/> for rate, tempo and pitch).</exception>
+    /// <param name="startAt">
+    /// When to start, on the <see cref="OutputDevice.Time"/> clock of the stream's device; null starts now.
+    /// The value holds until then. If the stream is not playing at that moment, the ramp starts when it plays.
+    /// </param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="duration"/> or <paramref name="startAt"/> is negative.</exception>
+    /// <exception cref="FatzAudioException">The parameter cannot be ramped yet (<see cref="ErrorCode.NotImplemented"/> for rate, tempo and pitch), or <paramref name="startAt"/> was given for a stream that is not attached (<see cref="ErrorCode.InvalidArgument"/>).</exception>
     /// <example>
     /// <code>
-    /// song.Ramp(AudioParameter.Volume, 0f, TimeSpan.FromSeconds(3), Curve.EqualPower); // fade out
+    /// song.Ramp(AudioParameter.Volume, 0f, TimeSpan.FromSeconds(3), Curve.EqualPower);   // fade out now
+    /// song.Ramp(AudioParameter.Volume, 0.2f, TimeSpan.FromSeconds(1), Curve.SCurve,
+    ///           startAt: output.Time + TimeSpan.FromSeconds(10));                         // duck in 10 s
     /// </code>
     /// </example>
-    public void Ramp(AudioParameter parameter, float target, TimeSpan duration, Curve? curve = null)
+    public void Ramp(AudioParameter parameter, float target, TimeSpan duration, Curve? curve = null, TimeSpan? startAt = null)
     {
         if (duration < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(duration));
-        var ramp = (curve ?? Curve.Linear).ToNative();
+        if (startAt < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(startAt));
+        var c = curve ?? Curve.Linear;
+        var ramp = c.ToNative();
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_ramp_param(
-            Handle, (int)parameter, target, TimeConvert.ToNanoseconds(duration), 0, &ramp));
+            Handle, (int)parameter, target, TimeConvert.ToNanoseconds(duration), StartTime(startAt), &ramp));
+        GC.KeepAlive(c);
     }
+
+    // 0 means "now" natively; a real start time of exactly 0 is in the past anyway.
+    private static long StartTime(TimeSpan? at) => at is { } t ? Math.Max(1, TimeConvert.ToNanoseconds(t)) : 0;
 
     /// <summary>
     /// Starts a ramp and completes when the engine reports it finished: when the parameter
@@ -343,8 +434,9 @@ public unsafe class AudioStream : IDisposable
     /// <param name="duration">Ramp length.</param>
     /// <param name="curve">Ramp shape; defaults to <see cref="Curve.Linear"/>.</param>
     /// <param name="cancellationToken">Cancels the wait (the native ramp continues).</param>
+    /// <param name="startAt">When to start, on the <see cref="OutputDevice.Time"/> clock; null starts now.</param>
     /// <returns>A task that completes when the ramp has finished.</returns>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="duration"/> is negative.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="duration"/> or <paramref name="startAt"/> is negative.</exception>
     /// <exception cref="FatzAudioException">The parameter cannot be ramped yet (<see cref="ErrorCode.NotImplemented"/> for rate, tempo and pitch).</exception>
     /// <example>
     /// <code>
@@ -353,18 +445,21 @@ public unsafe class AudioStream : IDisposable
     /// </code>
     /// </example>
     public Task RampAsync(AudioParameter parameter, float target, TimeSpan duration, Curve? curve = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default, TimeSpan? startAt = null)
     {
         if (duration < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(duration));
-        long tag = Interlocked.Increment(ref _nextRampTag);
+        if (startAt < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(startAt));
+        long tag = Interlocked.Increment(ref s_nextRampTag);
         var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         lock (_ramps) _ramps[tag] = tcs;
         try
         {
-            var ramp = (curve ?? Curve.Linear).ToNative();
+            var c = curve ?? Curve.Linear;
+            var ramp = c.ToNative();
             ramp.Tag = tag;
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_ramp_param(
-                Handle, (int)parameter, target, TimeConvert.ToNanoseconds(duration), 0, &ramp));
+                Handle, (int)parameter, target, TimeConvert.ToNanoseconds(duration), StartTime(startAt), &ramp));
+            GC.KeepAlive(c);
         }
         catch
         {
@@ -376,7 +471,7 @@ public unsafe class AudioStream : IDisposable
     }
 
     private readonly Dictionary<long, TaskCompletionSource> _ramps = new();
-    private long _nextRampTag;
+    private static long s_nextRampTag; // unique across streams: a crossfade raises its tag on both
 
     private void CompleteRamp(long tag)
     {
@@ -394,23 +489,147 @@ public unsafe class AudioStream : IDisposable
     /// <summary>Marker positions (cue in/out, fades, mix point).</summary>
     public StreamMarkers Markers { get; }
 
-    /// <summary>Fades this stream out and <paramref name="next"/> in simultaneously.</summary>
-    /// <param name="next">The stream to fade in; it should be attached to the same device.</param>
+    /// <summary>
+    /// Crossfades now: <paramref name="next"/> starts (from its cue-in if stopped or ended, else where it is)
+    /// and fades in while this stream fades out, both from the same frame. This stream's gain is the curve
+    /// played backwards, so the pair is symmetric. When the fade-out is done this stream ends
+    /// (<see cref="Ended"/>; <see cref="Play"/> starts it again from its cue-in). The fades are crossfade gains
+    /// of their own: <see cref="Volume"/> is left as the user set it.
+    /// </summary>
+    /// <param name="next">The stream to fade in. It joins this stream's device and bus if it is not attached yet.</param>
     /// <param name="duration">Length of the crossfade.</param>
-    /// <param name="curve">Fade shape; defaults to <see cref="Curve.EqualPower"/>.</param>
+    /// <param name="curve">Fade shape; defaults to <see cref="Curve.EqualPower"/> (constant loudness).</param>
+    /// <returns>A task that completes when the crossfade is done.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="next"/> is null.</exception>
-    /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="duration"/> is negative.</exception>
+    /// <exception cref="FatzAudioException">This stream is not attached, or <paramref name="next"/> plays on another device (<see cref="ErrorCode.InvalidArgument"/>).</exception>
     /// <example>
     /// <code>
-    /// current.CrossfadeTo(next, TimeSpan.FromSeconds(5));
+    /// await current.CrossfadeTo(next, TimeSpan.FromSeconds(5));
+    /// current.Dispose();
     /// </code>
     /// </example>
-    public void CrossfadeTo(AudioStream next, TimeSpan duration, Curve? curve = null)
+    public Task CrossfadeTo(AudioStream next, TimeSpan duration, Curve? curve = null)
     {
         ArgumentNullException.ThrowIfNull(next);
-        var ramp = (curve ?? Curve.EqualPower).ToNative();
-        FatzAudioException.ThrowIfFailed(NativeMethods.fa_crossfade(Handle, next.Handle, TimeConvert.ToNanoseconds(duration), &ramp));
+        if (duration < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(duration));
+        var h = Handle;
+        var nh = next.Handle;
+        if (_device is null) throw new InvalidOperationException("Call PlayOn(device) first.");
+        long tag = Interlocked.Increment(ref s_nextRampTag);
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_ramps) _ramps[tag] = tcs;
+        try
+        {
+            var c = curve ?? Curve.EqualPower;
+            var ramp = c.ToNative();
+            ramp.Tag = tag;
+            _device.Start();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_crossfade(h, nh, TimeConvert.ToNanoseconds(duration), &ramp));
+            GC.KeepAlive(c);
+        }
+        catch
+        {
+            lock (_ramps) _ramps.Remove(tag);
+            throw;
+        }
+        AdoptDevice(next);
+        return tcs.Task;
     }
+
+    /// <summary>
+    /// Queues <paramref name="next"/> to start automatically, to the exact frame, when this stream reaches its
+    /// mix point: <see cref="StreamMarkers.MixPoint"/> if set; else <paramref name="crossfade"/> before its end;
+    /// else right after its last frame (gapless). With a crossfade, this stream fades out over it (and ends) unless
+    /// it has a <see cref="StreamMarkers.FadeOutStart"/>, and <paramref name="next"/> fades in over it unless it has a
+    /// <see cref="StreamMarkers.FadeInEnd"/>; markers win.
+    /// </summary>
+    /// <param name="next">
+    /// The stream to start. It joins this stream's device and bus if needed, reports
+    /// <see cref="StreamState.Scheduled"/> while it waits, and raises <see cref="Started"/> when it starts. It may
+    /// have a next of its own, so a playlist can be queued as a chain.
+    /// </param>
+    /// <param name="crossfade">Crossfade length; zero (the default) plays gapless.</param>
+    /// <param name="curve">Crossfade shape; defaults to <see cref="Curve.EqualPower"/>.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="next"/> is null.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="crossfade"/> is negative.</exception>
+    /// <exception cref="FatzAudioException"><paramref name="next"/> is already playing (<see cref="ErrorCode.Busy"/>), on another device or this stream is not attached (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <example>
+    /// <code>
+    /// song1.PlayOn(output);
+    /// song1.QueueNext(song2, TimeSpan.FromSeconds(6));    // 6 s crossfade
+    /// song2.Started += (_, _) => song2.QueueNext(song3);  // then gapless into song3
+    /// </code>
+    /// </example>
+    public void QueueNext(AudioStream next, TimeSpan crossfade = default, Curve? curve = null)
+    {
+        ArgumentNullException.ThrowIfNull(next);
+        if (crossfade < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(crossfade));
+        var h = Handle;
+        var nh = next.Handle;
+        var c = curve ?? Curve.EqualPower;
+        var ramp = c.ToNative();
+        bool added = false;
+        try
+        {
+            nh.DangerousAddRef(ref added);
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_next(h, nh.DangerousGetHandle(), TimeConvert.ToNanoseconds(crossfade), &ramp));
+        }
+        finally
+        {
+            if (added) nh.DangerousRelease();
+        }
+        GC.KeepAlive(c);
+        AdoptDevice(next);
+        _queued = next;
+    }
+
+    /// <summary>Removes the stream queued with <see cref="QueueNext"/>; it goes back to stopped.</summary>
+    public void ClearNext()
+    {
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_next(Handle, 0, 0, null));
+        _queued = null;
+    }
+
+    /// <summary>The stream queued with <see cref="QueueNext"/> that has not started yet, or null.</summary>
+    public AudioStream? Next
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_next(Handle, out nint n));
+            var q = _queued;
+            return n != 0 && q is not null && !q._handle.IsClosed && q._handle.DangerousGetHandle() == n ? q : null;
+        }
+    }
+
+    private AudioStream? _queued;
+
+    /// <summary>
+    /// Routes the source channels to the device's channels with your own gains: <c>weights[input, output]</c>
+    /// is the gain from source channel <c>input</c> to device channel <c>output</c>. Use it for custom downmixes,
+    /// swapping or muting channels, or sending one channel of a karaoke track to both speakers.
+    /// </summary>
+    /// <param name="weights">A [source channels, 2] array of gains.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="weights"/> is null.</exception>
+    /// <exception cref="FatzAudioException">The array does not match the source's channel count and the device's 2 channels (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <example>
+    /// <code>
+    /// // Karaoke: the guide vocal is on the right channel; play only the left (music) on both speakers.
+    /// song.SetMatrix(new float[,] { { 1f, 1f }, { 0f, 0f } });
+    /// </code>
+    /// </example>
+    public void SetMatrix(float[,] weights)
+    {
+        ArgumentNullException.ThrowIfNull(weights);
+        fixed (float* p = weights)
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_matrix(
+                Handle, p, (uint)weights.GetLength(0), (uint)weights.GetLength(1)));
+        }
+    }
+
+    /// <summary>Restores the default channel mapping (undoes <see cref="SetMatrix"/>).</summary>
+    public void ResetMatrix() => FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_matrix(Handle, null, 0, 0));
 
     // ---- Decode / analysis -----------------------------------------------------
 
@@ -556,7 +775,9 @@ public unsafe class AudioStream : IDisposable
     public event EventHandler? LoudnessFinal;
     /// <summary>Raised when a position requested with <see cref="AddPositionEvent"/> is reached. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler<StreamEventArgs>? PositionReached;
-    /// <summary>Raised when a marker is passed. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
+    /// <summary>Raised when a scheduled, crossfaded or queued start happened (<see cref="PlayAt"/>, <see cref="CrossfadeTo"/>, <see cref="QueueNext"/>). Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
+    public event EventHandler? Started;
+    /// <summary>Raised when a marker is passed (<see cref="StreamEventArgs.Marker"/> says which). Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler<StreamEventArgs>? MarkerReached;
     /// <summary>Raised when the output device changed. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler<StreamEventArgs>? DeviceChanged;
@@ -613,7 +834,7 @@ public unsafe class AudioStream : IDisposable
             {
                 case 0: Ended?.Invoke(this, EventArgs.Empty); break;
                 case 1: PositionReached?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
-                case 2: MarkerReached?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
+                case 2: MarkerReached?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value, (MarkerKind)value)); break;
                 case 3: MetadataChanged?.Invoke(this, EventArgs.Empty); break;
                 case 4: Stalled?.Invoke(this, EventArgs.Empty); break;
                 case 5: Resumed?.Invoke(this, EventArgs.Empty); break;
@@ -624,6 +845,7 @@ public unsafe class AudioStream : IDisposable
                     CompleteRamp(value);
                     RampCompleted?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value));
                     break;
+                case 10: Started?.Invoke(this, EventArgs.Empty); break;
             }
         }
         catch

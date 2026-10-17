@@ -33,6 +33,8 @@ FA_API void FA_CALL fa_open_options_init(fa_open_options* options)
 
 static int is_attached(struct fa_stream* s) { return s->device != NULL; }
 
+static fa_frames marker(struct fa_stream* s, int m) { return fa_load64(&s->markers[m]); }
+
 /* ---- open / close ------------------------------------------------------- */
 
 void fa_stream_free_memory(struct fa_stream* s)
@@ -50,6 +52,7 @@ static void release_chain(struct fa_stream* s)
     fa_ring_free(&s->ring);
     free(s->in_buf); s->in_buf = NULL;
     free(s->out_buf); s->out_buf = NULL;
+    free(s->mat_buf); s->mat_buf = NULL;
     s->in_cap = s->out_cap = s->in_count = s->in_offset = 0;
     s->decoded = 0;
     s->draining = 0;
@@ -60,6 +63,7 @@ static void stream_discard(struct fa_stream* s)
 {
     if (s->run_meter_ready) fa_meter_free(&s->run_meter);
     free(s->path);
+    free(s->matrix);
     if (s->decoder_ready) fa_decoder_close(&s->decoder);
     fa_source_close(&s->source);
     fa_stream_free_memory(s);
@@ -94,12 +98,14 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
     fa_store_float(&s->norm_album, NAN);
     fa_store_float(&s->norm_est, NAN);
     fa_store32(&s->state, FA_STATE_STOPPED);
-    for (i = 0; i < FA_MARKER_COUNT; i++) s->markers[i] = FA_FRAMES_UNSET;
-    for (i = 0; i < FA_MIX_PARAMS; i++) {
-        fa_store32(&s->mailbox[i].word, FA_CMD_CLAIMED); /* nothing pending */
-        s->voice[i].value = i == FA_PARAM_VOLUME ? 1.0f : 0.0f;
-        s->mailbox[i].last_target = s->voice[i].value;
-        fa_store_float(&s->current[i], s->voice[i].value);
+    for (i = 0; i < FA_MARKER_COUNT; i++) fa_store64(&s->markers[i], FA_FRAMES_UNSET);
+    for (i = 0; i < FA_STREAM_LANES; i++) fa_lane_init(&s->lanes[i], i == FA_PARAM_PAN ? 0.0f : 1.0f);
+    {
+        fa_shape eq;
+        fa_shape_from_ramp(NULL, FA_CURVE_EQUAL_POWER, &eq);
+        fa_shape_store(&s->fade_shape[FA_FADE_IN], &eq);
+        fa_shape_store(&s->fade_shape[FA_FADE_OUT], &eq);
+        fa_shape_store(&s->xfade_shape, &eq);
     }
     *out = s;
     return FA_OK;
@@ -212,6 +218,8 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
     if (stream->run_meter_ready) { fa_meter_free(&stream->run_meter); stream->run_meter_ready = 0; }
     free(stream->path);
     stream->path = NULL;
+    free(stream->matrix);
+    stream->matrix = NULL;
     fa_mutex_unlock(&stream->decode_lock);
 
     /* The memory goes to the event thread, which frees it after delivering (and
@@ -265,34 +273,69 @@ static void update_estimate(struct fa_stream* s, const float* frames, fa_frames 
     }
 }
 
+/* Where the stream ends (CUE_OUT, else the length; -1 = unknown) and where it loops back to. */
+static fa_frames end_frame(struct fa_stream* s)
+{
+    fa_frames out = marker(s, FA_MARKER_CUE_OUT);
+    if (out != FA_FRAMES_UNSET && (s->decoder.length < 0 || out < s->decoder.length)) return out;
+    return s->decoder.length;
+}
+
+static fa_frames loop_start(struct fa_stream* s)
+{
+    fa_frames in = marker(s, FA_MARKER_CUE_IN), end = end_frame(s);
+    return (in != FA_FRAMES_UNSET && (end < 0 || in < end)) ? in : 0;
+}
+
+/* The custom channel matrix: in_buf (source channels) -> mat_buf (device channels). */
+static void apply_matrix(struct fa_stream* s, const float* in, fa_frames n)
+{
+    uint32_t ch = s->decoder.format.channels, i, o;
+    fa_frames f;
+    for (f = 0; f < n; f++) {
+        for (o = 0; o < FA_DEVICE_CHANNELS; o++) {
+            float acc = 0.0f;
+            for (i = 0; i < ch; i++) acc += in[(size_t)f * ch + i] * s->matrix[i * FA_DEVICE_CHANNELS + o];
+            s->mat_buf[(size_t)f * FA_DEVICE_CHANNELS + o] = acc;
+        }
+    }
+}
+
 /* Decodes, converts to the device format and appends to the ring until it is
- * full, `max_frames` were produced, or the source ended. Caller holds decode_lock. */
+ * full, `max_frames` were produced, or the source ended (at CUE_OUT, if set).
+ * Caller holds decode_lock. */
 void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
 {
     uint32_t ch = s->decoder.format.channels;
+    uint32_t conv_ch = s->matrix ? FA_DEVICE_CHANNELS : ch;
     int64_t produced = 0;
     int just_looped = 0;
     if (!s->ring.data || fa_load32(&s->eof)) return;
 
     while (produced < max_frames) {
         ma_uint64 in_n, out_n;
+        const float* conv_in;
         int64_t room = fa_ring_writable(&s->ring);
         if (room <= 0) break;
         if (s->in_count == 0) {
-            fa_frames got = 0;
+            fa_frames got = 0, want = s->in_cap, end = end_frame(s);
             if (s->draining) {                    /* the resampler has given back everything */
                 fa_store32(&s->eof, 1);
                 break;
             }
-            fa_decoder_read(&s->decoder, s->in_buf, s->in_cap, &got);
+            if (end >= 0 && s->src_pos + want > end) want = end - s->src_pos;
+            if (want > 0) fa_decoder_read(&s->decoder, s->in_buf, want, &got);
             s->in_offset = 0;
             s->in_count = got;
             s->decoded += got;
+            s->src_pos += got;
             if (got == 0) {
+                fa_frames back = loop_start(s);
                 ma_uint64 latency;
-                if ((s->flags & FA_OPEN_LOOP) && !just_looped && fa_decoder_seek(&s->decoder, 0) == FA_OK) {
+                if ((s->flags & FA_OPEN_LOOP) && !just_looped && fa_decoder_seek(&s->decoder, back) == FA_OK) {
                     just_looped = 1; /* a second empty read right after looping = empty source */
-                    continue;            /* the converter keeps its state: the loop joins seamlessly */
+                    s->src_pos = back;
+                    continue;        /* the converter keeps its state: the loop joins seamlessly */
                 }
                 /* The resampler still holds the last few frames: push them out with
                  * silence (its input latency) before calling it the end. */
@@ -300,6 +343,7 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 if (latency > 0) {
                     if (latency > (ma_uint64)s->in_cap) latency = (ma_uint64)s->in_cap;
                     memset(s->in_buf, 0, (size_t)latency * ch * sizeof(float));
+                    if (s->matrix) memset(s->mat_buf, 0, (size_t)latency * conv_ch * sizeof(float));
                     s->in_count = (fa_frames)latency;
                     s->draining = 1;
                     continue;
@@ -309,10 +353,12 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
             }
             just_looped = 0;
             update_estimate(s, s->in_buf, got);
+            if (s->matrix) apply_matrix(s, s->in_buf, got);
         }
+        conv_in = s->matrix ? s->mat_buf : s->in_buf;
         in_n = (ma_uint64)s->in_count;
         out_n = (ma_uint64)(room < s->out_cap ? room : s->out_cap);
-        ma_data_converter_process_pcm_frames(&s->converter, s->in_buf + (size_t)s->in_offset * ch, &in_n,
+        ma_data_converter_process_pcm_frames(&s->converter, conv_in + (size_t)s->in_offset * conv_ch, &in_n,
                                              s->out_buf, &out_n);
         if (out_n > 0) fa_ring_write(&s->ring, s->out_buf, (int64_t)out_n);
         s->in_offset += (fa_frames)in_n;
@@ -322,16 +368,30 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
     }
 }
 
+/* Source position (not wrapped) after `played` device frames since seek_base. */
+static double linear_position(struct fa_stream* s, int64_t played)
+{
+    return (double)fa_load64(&s->seek_base) + (double)played * (double)s->decoder.format.sample_rate / (double)s->dev_rate;
+}
+
+/* Wraps a linear position into the loop (CUE_IN..CUE_OUT) of looping streams, and
+ * clamps it to the end of other streams. */
+static fa_frames wrap_position(struct fa_stream* s, fa_frames pos)
+{
+    fa_frames end = end_frame(s);
+    if ((s->flags & FA_OPEN_LOOP) && end > 0 && pos >= end) {
+        fa_frames back = loop_start(s), len = end - back;
+        return len > 0 ? back + (pos - end) % len : back;
+    }
+    if (end >= 0 && pos > end) pos = end;
+    return pos;
+}
+
 /* Source position from the frames the device has consumed. Exact for a fixed
  * rate ratio; the resampler's few frames of delay are not subtracted. */
 static fa_frames attached_position(struct fa_stream* s)
 {
-    fa_frames base = fa_load64(&s->seek_base);
-    int64_t played = fa_load64(&s->played);
-    fa_frames pos = base + (fa_frames)((double)played * (double)s->decoder.format.sample_rate / (double)s->dev_rate + 0.5);
-    if ((s->flags & FA_OPEN_LOOP) && s->decoder.length > 0) pos %= s->decoder.length;
-    else if (s->decoder.length >= 0 && pos > s->decoder.length) pos = s->decoder.length;
-    return pos;
+    return wrap_position(s, (fa_frames)(linear_position(s, fa_load64(&s->played)) + 0.5));
 }
 
 fa_frames fa_stream_position_now(struct fa_stream* s)
@@ -348,6 +408,7 @@ static fa_result restart_at_locked(struct fa_stream* s, fa_frames frame)
         r = fa_decoder_seek(&s->decoder, frame);
     if (r != FA_OK) return r;
     fa_store64(&s->position, frame);
+    s->src_pos = frame;
     if (s->ring.data) {
         fa_ring_reset(&s->ring);
         s->in_count = s->in_offset = 0;
@@ -373,20 +434,49 @@ static fa_result build_chain_locked(struct fa_stream* s, fa_device* dev)
     if (capacity < 2048) capacity = 2048;
 
     release_chain(s);
-    cc = ma_data_converter_config_init(ma_format_f32, ma_format_f32, ch, FA_DEVICE_CHANNELS,
-                                       s->decoder.format.sample_rate, dev->rate);
+    cc = ma_data_converter_config_init(ma_format_f32, ma_format_f32, s->matrix ? FA_DEVICE_CHANNELS : ch,
+                                       FA_DEVICE_CHANNELS, s->decoder.format.sample_rate, dev->rate);
     if (ma_data_converter_init(&cc, NULL, &s->converter) != MA_SUCCESS) return FA_ERROR_OUT_OF_MEMORY;
     s->converter_ready = 1;
     s->in_cap = FA_DECODE_CHUNK;
     s->out_cap = FA_DECODE_CHUNK * 2;
     s->in_buf = (float*)malloc((size_t)s->in_cap * ch * sizeof(float));
     s->out_buf = (float*)malloc((size_t)s->out_cap * FA_DEVICE_CHANNELS * sizeof(float));
-    if (!s->in_buf || !s->out_buf || fa_ring_init(&s->ring, FA_DEVICE_CHANNELS, capacity) != FA_OK) {
+    if (s->matrix) s->mat_buf = (float*)malloc((size_t)s->in_cap * FA_DEVICE_CHANNELS * sizeof(float));
+    if (!s->in_buf || !s->out_buf || (s->matrix && !s->mat_buf) || fa_ring_init(&s->ring, FA_DEVICE_CHANNELS, capacity) != FA_OK) {
         release_chain(s);
         return FA_ERROR_OUT_OF_MEMORY;
     }
     return FA_OK;
 }
+
+/* ---- queues: references between streams ----------------------------------- */
+
+/* A queued stream that will not start after all goes back to stopped. */
+static void unqueue(struct fa_stream* n)
+{
+    if (n && fa_load64(&n->start_frame) == FA_START_QUEUED)
+        fa_cas32(&n->state, FA_STATE_SCHEDULED, FA_STATE_STOPPED);
+}
+
+/* Drops every queue link to and from `s` on its device. The audio thread may be
+ * starting one right now; the caller waits for quiescence before freeing anything.
+ * Caller holds s->api_lock; takes the device lock. */
+static void drop_queue_links(struct fa_stream* s)
+{
+    fa_device* dev = s->device;
+    fa_voice_list* list;
+    uint32_t i;
+    unqueue((struct fa_stream*)fa_exchange_ptr(&s->queued, NULL));
+    if (!dev) return;
+    fa_mutex_lock(&dev->lock);
+    list = (fa_voice_list*)fa_load_ptr(&dev->voices);
+    if (list)
+        for (i = 0; i < list->count; i++) fa_cas_ptr(&list->items[i]->queued, s, NULL);
+    fa_mutex_unlock(&dev->lock);
+}
+
+/* ---- attach / detach ---------------------------------------------------- */
 
 /* Caller holds api_lock. */
 static void detach_locked(struct fa_stream* s)
@@ -394,22 +484,27 @@ static void detach_locked(struct fa_stream* s)
     fa_device* dev = s->device;
     fa_frames pos;
     if (!dev) return;
+    drop_queue_links(s);
     fa_device_remove_voice(dev, s);          /* waits until the audio thread let go */
     fa_engine_track_stream(s->engine, s, 0);
     fa_mutex_lock(&s->decode_lock);          /* waits for a worker still filling it */
     pos = attached_position(s);
     s->dev_rate = 0;
     s->device = NULL;
+    fa_exchange_ptr(&s->bus, NULL);
     /* Continue later from what was actually heard, not from what was decoded ahead.
      * A forward-only source cannot go back: the audio buffered ahead is skipped, and
      * the position says where decoding really continues. */
     if (fa_decoder_seek(&s->decoder, pos) != FA_OK && !s->decoder.seekable)
         pos = fa_load64(&s->seek_base) + s->decoded;
     fa_store64(&s->position, pos);
+    s->src_pos = pos;
     release_chain(s);
     fa_store32(&s->eof, 0);
     fa_mutex_unlock(&s->decode_lock);
     fa_cas32(&s->state, FA_STATE_PLAYING, FA_STATE_PAUSED);
+    if (fa_load64(&s->start_frame) == FA_START_QUEUED) fa_cas32(&s->state, FA_STATE_SCHEDULED, FA_STATE_STOPPED);
+    else fa_cas32(&s->state, FA_STATE_SCHEDULED, FA_STATE_PAUSED);
 }
 
 FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, fa_bus* bus)
@@ -417,12 +512,16 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
     fa_result r;
     int was_playing;
     if (!stream || !device) return FA_ERROR_INVALID_ARG;
-    if (bus) return FA_ERROR_NOT_IMPLEMENTED;
+    if (bus && bus->device != device) return FA_ERROR_INVALID_ARG;
     if (stream->flags & FA_OPEN_DECODE_ONLY) return FA_ERROR_INVALID_ARG;
     if (device->engine != stream->engine) return FA_ERROR_INVALID_ARG; /* events and cleanup are per engine */
 
     fa_mutex_lock(&stream->api_lock);
-    if (stream->device == device) { fa_mutex_unlock(&stream->api_lock); return FA_OK; }
+    if (stream->device == device) {
+        fa_exchange_ptr(&stream->bus, bus);  /* the mixer picks it up on its next block */
+        fa_mutex_unlock(&stream->api_lock);
+        return FA_OK;
+    }
     was_playing = stream->device && fa_load32(&stream->state) == FA_STATE_PLAYING;
     if (stream->device) detach_locked(stream);  /* pauses it */
 
@@ -433,16 +532,18 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
         int p;
         /* Ramp counters are in device frames: keep a running ramp's remaining time
          * when moving to a device with another rate. Nothing mixes this stream now. */
-        for (p = 0; p < FA_MIX_PARAMS; p++) {
-            fa_param_voice* v = &stream->voice[p];
+        for (p = 0; p < FA_STREAM_LANES; p++) {
+            fa_param_voice* v = &stream->lanes[p].v;
             if (v->active && stream->voice_rate && stream->voice_rate != device->rate) {
                 double k = (double)device->rate / (double)stream->voice_rate;
                 v->total = (int64_t)((double)v->total * k + 0.5);
                 v->done = (int64_t)((double)v->done * k + 0.5);
             }
+            v->at = -1;  /* a start time on the old device's clock means nothing here */
         }
         stream->voice_rate = device->rate;
         stream->dev_rate = device->rate;
+        stream->src_pos = pos;
         fa_store64(&stream->seek_base, pos);
         fa_store64(&stream->played, 0);
         fa_store32(&stream->eof, 0);
@@ -452,6 +553,7 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
     fa_mutex_unlock(&stream->decode_lock);
     if (r == FA_OK) {
         stream->device = device;
+        fa_exchange_ptr(&stream->bus, bus);
         /* Track it first: from the moment the voice is live, events it spills must be found. */
         fa_engine_track_stream(stream->engine, stream, 1);
         r = fa_device_add_voice(device, stream);
@@ -461,6 +563,7 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
         } else {
             fa_engine_track_stream(stream->engine, stream, 0);
             stream->device = NULL;
+            fa_exchange_ptr(&stream->bus, NULL);
             fa_mutex_lock(&stream->decode_lock);
             stream->dev_rate = 0;
             release_chain(stream);
@@ -478,6 +581,36 @@ FA_API fa_result FA_CALL fa_stream_detach(fa_stream* stream)
     detach_locked(stream);
     fa_mutex_unlock(&stream->api_lock);
     return FA_OK;
+}
+
+/* ---- lanes (parameters) ---------------------------------------------------- */
+
+/* Posts a command to one of the stream's lanes. Caller holds api_lock. */
+static void post_lane_locked(struct fa_stream* s, int lane, float target, int64_t ns, const fa_shape* shape,
+                             int64_t tag, int notify, int64_t at, int flags)
+{
+    int64_t replaced_tag = 0;
+    int32_t done_seq;
+    /* A replaced ramp that never started gets its RAMP_DONE from here. Its sequence
+     * number is taken before the new command becomes visible, so it is delivered
+     * before anything the new command raises. */
+    fa_mutex_lock(&s->engine->list_lock);
+    done_seq = fa_fetch_add32(&s->engine->event_seq, 1);
+    if (fa_lane_post(&s->lanes[lane], target, ns, shape, tag, notify, at, flags, &replaced_tag)) {
+        fa_event ev;
+        ev.type = FA_EVENT_RAMP_DONE;
+        ev.stream = s;
+        ev.frame = fa_stream_position_now(s);
+        ev.value = replaced_tag;
+        fa_engine_post_event_locked(s->engine, &ev, done_seq);
+    }
+    fa_mutex_unlock(&s->engine->list_lock);
+}
+
+/* Device frame of a device time; caller holds api_lock and the stream is attached. */
+static int64_t device_frame(struct fa_stream* s, fa_time t)
+{
+    return (int64_t)((double)t * (double)s->device->rate / 1e9 + 0.5);
 }
 
 /* ---- transport ----------------------------------------------------------- */
@@ -499,16 +632,48 @@ static fa_result seek_locked(struct fa_stream* s, fa_frames frame)
     return r;
 }
 
+/* Back to the start (CUE_IN) with the crossfade gain reset, for a fresh play.
+ * Caller holds api_lock. */
+static void rewind_locked(struct fa_stream* s)
+{
+    fa_frames in = marker(s, FA_MARKER_CUE_IN);
+    if (in == FA_FRAMES_UNSET) in = 0;
+    if (s->decoder.seekable && (in != fa_stream_position_now(s) || fa_load32(&s->eof)))
+        seek_locked(s, in);
+    post_lane_locked(s, FA_LANE_FADE, 1.0f, 0, NULL, 0, 0, -1, 0);
+}
+
+/* Caller holds api_lock; the stream is attached. */
+static void start_locked(struct fa_stream* s, int64_t at_frame)
+{
+    int32_t st = fa_load32(&s->state);
+    if (st == FA_STATE_ENDED || st == FA_STATE_STOPPED) rewind_locked(s);
+    if (at_frame < 0) {
+        fa_store32(&s->state, FA_STATE_PLAYING);
+        return;
+    }
+    fa_store64(&s->start_frame, at_frame);
+    fa_store32(&s->state, FA_STATE_SCHEDULED);
+}
+
 FA_API fa_result FA_CALL fa_stream_play(fa_stream* stream)
 {
     fa_result r = FA_OK;
     if (!stream) return FA_ERROR_INVALID_ARG;
     fa_mutex_lock(&stream->api_lock);
     if (!is_attached(stream)) r = FA_ERROR_INVALID_ARG;
-    else {
-        if (fa_load32(&stream->state) == FA_STATE_ENDED) seek_locked(stream, 0);
-        fa_store32(&stream->state, FA_STATE_PLAYING);
-    }
+    else start_locked(stream, -1);
+    fa_mutex_unlock(&stream->api_lock);
+    return r;
+}
+
+FA_API fa_result FA_CALL fa_stream_play_at(fa_stream* stream, fa_time device_time)
+{
+    fa_result r = FA_OK;
+    if (!stream || device_time < 0) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&stream->api_lock);
+    if (!is_attached(stream)) r = FA_ERROR_INVALID_ARG;
+    else start_locked(stream, device_frame(stream, device_time));
     fa_mutex_unlock(&stream->api_lock);
     return r;
 }
@@ -519,7 +684,8 @@ FA_API fa_result FA_CALL fa_stream_pause(fa_stream* stream)
     if (!stream) return FA_ERROR_INVALID_ARG;
     fa_mutex_lock(&stream->api_lock);
     if (!is_attached(stream)) r = FA_ERROR_INVALID_ARG;
-    else if (fa_cas32(&stream->state, FA_STATE_PLAYING, FA_STATE_PAUSED))
+    else if (fa_cas32(&stream->state, FA_STATE_PLAYING, FA_STATE_PAUSED) ||
+             fa_cas32(&stream->state, FA_STATE_SCHEDULED, FA_STATE_PAUSED))
         fa_device_wait_quiescent(stream->device); /* once we return, nothing more is mixed */
     fa_mutex_unlock(&stream->api_lock);
     return r;
@@ -533,7 +699,7 @@ FA_API fa_result FA_CALL fa_stream_stop(fa_stream* stream)
     if (!is_attached(stream)) r = FA_ERROR_INVALID_ARG;
     else {
         fa_store32(&stream->state, FA_STATE_STOPPED);
-        if (stream->decoder.seekable) seek_locked(stream, 0);
+        if (stream->decoder.seekable) rewind_locked(stream);
         else fa_device_wait_quiescent(stream->device);
     }
     fa_mutex_unlock(&stream->api_lock);
@@ -553,7 +719,11 @@ FA_API fa_result FA_CALL fa_stream_seek(fa_stream* stream, fa_frames frame)
     if (!stream || frame < 0) return FA_ERROR_INVALID_ARG;
     fa_mutex_lock(&stream->api_lock);
     r = seek_locked(stream, frame);
-    if (r == FA_OK) fa_cas32(&stream->state, FA_STATE_ENDED, FA_STATE_PAUSED);
+    if (r == FA_OK) {
+        /* Stopped and ended mean "at the start" and "at the end": a seek leaves both. */
+        fa_cas32(&stream->state, FA_STATE_ENDED, FA_STATE_PAUSED);
+        fa_cas32(&stream->state, FA_STATE_STOPPED, FA_STATE_PAUSED);
+    }
     fa_mutex_unlock(&stream->api_lock);
     return r;
 }
@@ -583,68 +753,6 @@ FA_API fa_result FA_CALL fa_stream_get_clock(fa_stream* stream, fa_time* out_pts
 
 /* ---- parameters ---------------------------------------------------------- */
 
-static fa_result post_param(struct fa_stream* s, fa_param param, float target, fa_time duration_ns,
-                            const fa_ramp* ramp, int notify)
-{
-    fa_param_mailbox* m = &s->mailbox[param];
-    int32_t old, seq;
-    fa_param_slot* slot;
-    float b[4] = { 0, 0, 0, 0 };
-    int i, has_start = 0;
-    float start = 0.0f;
-
-    fa_mutex_lock(&s->api_lock);
-    old = fa_load32(&m->word);
-    seq = ((old & ~FA_CMD_CLAIMED) + 1) & ~FA_CMD_CLAIMED;
-    slot = &m->slot[seq & 1];
-    if (notify && !(old & FA_CMD_CLAIMED)) {
-        /* A ramp replacing a command the mixer has not applied yet: keep the value a
-         * plain set asked for, so "volume = 0, then ramp to 1" still fades in from 0.
-         * (A plain set replacing one simply takes over, gliding from what is heard.) */
-        if (!m->last_notify) { has_start = 1; start = m->last_target; }
-        else if (m->last_has_start) { has_start = 1; start = m->last_start; }
-    }
-    fa_store32(&slot->has_start, has_start);
-    fa_store_float(&slot->start, start);
-    if (ramp) { b[0] = ramp->bezier_x1; b[1] = ramp->bezier_y1; b[2] = ramp->bezier_x2; b[3] = ramp->bezier_y2; }
-    fa_store_float(&slot->target, target);
-    fa_store64(&slot->frames_ns, duration_ns);
-    fa_store32(&slot->curve, ramp ? (int32_t)ramp->curve : FA_CURVE_LINEAR);
-    for (i = 0; i < 4; i++) fa_store_float(&slot->bezier[i], b[i]);
-    fa_store64(&slot->tag, ramp ? ramp->tag : 0);
-    fa_store32(&slot->notify, notify);
-
-    /* Publish. If the audio thread never claimed the previous command, it never
-     * started, so its RAMP_DONE is ours to raise (the audio thread will not). Its
-     * sequence number is taken before the new command becomes visible, so it is
-     * delivered before anything the new command raises. */
-    {
-        int32_t prev, done_seq;
-        fa_mutex_lock(&s->engine->list_lock);
-        done_seq = fa_fetch_add32(&s->engine->event_seq, 1);
-        for (;;) {
-            prev = fa_load32(&m->word);
-            if (fa_cas32(&m->word, prev, seq)) break;
-        }
-        if (!(prev & FA_CMD_CLAIMED) && m->last_notify) {
-            fa_event ev;
-            ev.type = FA_EVENT_RAMP_DONE;
-            ev.stream = s;
-            ev.frame = fa_stream_position_now(s);
-            ev.value = m->last_tag;
-            fa_engine_post_event_locked(s->engine, &ev, done_seq);
-        }
-        fa_mutex_unlock(&s->engine->list_lock);
-    }
-    m->last_notify = notify;
-    m->last_tag = ramp ? ramp->tag : 0;
-    m->last_target = target;
-    m->last_has_start = has_start;
-    m->last_start = start;
-    fa_mutex_unlock(&s->api_lock);
-    return FA_OK;
-}
-
 static fa_result check_param(fa_param param, float* value)
 {
     if (param == FA_PARAM_VOLUME) {
@@ -661,63 +769,274 @@ static fa_result check_param(fa_param param, float* value)
     return FA_ERROR_INVALID_ARG;
 }
 
+fa_result fa_param_check(fa_param param, float* value) { return check_param(param, value); }
+
 FA_API fa_result FA_CALL fa_stream_set_param(fa_stream* stream, fa_param param, float value)
 {
     fa_result r;
     if (!stream) return FA_ERROR_INVALID_ARG;
     r = check_param(param, &value);
     if (r != FA_OK) return r;
-    return post_param(stream, param, value, FA_DEZIPPER_NS, NULL, 0);
+    fa_mutex_lock(&stream->api_lock);
+    post_lane_locked(stream, param, value, FA_DEZIPPER_NS, NULL, 0, 0, -1, 0);
+    fa_mutex_unlock(&stream->api_lock);
+    return FA_OK;
 }
 
-FA_API fa_result FA_CALL fa_stream_ramp_param(fa_stream* stream, fa_param param, float target, fa_time duration, fa_time engine_time, const fa_ramp* ramp)
+FA_API fa_result FA_CALL fa_stream_ramp_param(fa_stream* stream, fa_param param, float target, fa_time duration, fa_time device_time, const fa_ramp* ramp)
 {
     fa_result r;
-    if (!stream || duration < 0) return FA_ERROR_INVALID_ARG;
-    if (ramp && ((int)ramp->curve < 0 || ramp->curve > FA_CURVE_BEZIER)) return FA_ERROR_INVALID_ARG;
+    fa_shape shape;
+    if (!stream || duration < 0 || device_time < 0) return FA_ERROR_INVALID_ARG;
+    r = fa_shape_from_ramp(ramp, FA_CURVE_LINEAR, &shape);
+    if (r != FA_OK) return r;
     r = check_param(param, &target);
     if (r != FA_OK) return r;
-    if (engine_time != 0) return FA_ERROR_NOT_IMPLEMENTED;
-    return post_param(stream, param, target, duration, ramp, 1);
+    fa_mutex_lock(&stream->api_lock);
+    if (device_time != 0 && !is_attached(stream)) r = FA_ERROR_INVALID_ARG;
+    else post_lane_locked(stream, param, target, duration, &shape, ramp ? ramp->tag : 0, 1,
+                          device_time ? device_frame(stream, device_time) : -1, 0);
+    fa_mutex_unlock(&stream->api_lock);
+    return r;
 }
 
 FA_API fa_result FA_CALL fa_stream_get_param(fa_stream* stream, fa_param param, float* out_value)
 {
-    fa_param_mailbox* m;
     float v = 0.0f;
     fa_result r;
     if (!stream || !out_value) return FA_ERROR_INVALID_ARG;
     r = check_param(param, &v);
     if (r != FA_OK) return r;
-    m = &stream->mailbox[param];
     fa_mutex_lock(&stream->api_lock);
-    /* A plain set that the mixer has not picked up yet reads back as the new value. */
-    if (!(fa_load32(&m->word) & FA_CMD_CLAIMED) && !m->last_notify) *out_value = m->last_target;
-    else if (!(fa_load32(&m->word) & FA_CMD_CLAIMED) && m->last_has_start) *out_value = m->last_start;
-    else *out_value = fa_load_float(&stream->current[param]);
+    *out_value = fa_lane_get(&stream->lanes[param]);
     fa_mutex_unlock(&stream->api_lock);
     return FA_OK;
 }
 
 /* ---- markers ------------------------------------------------------------ */
 
-FA_API fa_result FA_CALL fa_stream_set_marker(fa_stream* stream, fa_marker marker, fa_frames frame)
+FA_API fa_result FA_CALL fa_stream_set_marker(fa_stream* stream, fa_marker which, fa_frames frame)
 {
-    if (!stream || (int)marker < 0 || (int)marker >= FA_MARKER_COUNT) return FA_ERROR_INVALID_ARG;
+    fa_frames old;
+    if (!stream || (int)which < 0 || (int)which >= FA_MARKER_COUNT) return FA_ERROR_INVALID_ARG;
     if (frame < 0 && frame != FA_FRAMES_UNSET) return FA_ERROR_INVALID_ARG;
     fa_mutex_lock(&stream->api_lock);
-    stream->markers[marker] = frame;
+    old = fa_exchange64(&stream->markers[which], frame);
+    if (which == FA_MARKER_CUE_IN && fa_load32(&stream->state) == FA_STATE_STOPPED && stream->decoder.seekable) {
+        /* Stopped means "at the start": move there. */
+        fa_frames in = frame == FA_FRAMES_UNSET ? 0 : frame;
+        if (stream->decoder.length < 0 || in <= stream->decoder.length) seek_locked(stream, in);
+    }
+    if (which == FA_MARKER_CUE_OUT && old != frame && is_attached(stream) && stream->decoder.seekable) {
+        /* Audio decoded ahead may already run past the new end (or stop short of a
+         * later one): decode again from where playback is. */
+        fa_frames pos = fa_stream_position_now(stream);
+        if (frame == FA_FRAMES_UNSET || pos < frame) seek_locked(stream, pos);
+    }
     fa_mutex_unlock(&stream->api_lock);
     return FA_OK;
 }
 
-FA_API fa_result FA_CALL fa_stream_get_marker(fa_stream* stream, fa_marker marker, fa_frames* out_frame)
+FA_API fa_result FA_CALL fa_stream_get_marker(fa_stream* stream, fa_marker which, fa_frames* out_frame)
 {
-    if (!stream || !out_frame || (int)marker < 0 || (int)marker >= FA_MARKER_COUNT) return FA_ERROR_INVALID_ARG;
+    if (!stream || !out_frame || (int)which < 0 || (int)which >= FA_MARKER_COUNT) return FA_ERROR_INVALID_ARG;
+    *out_frame = marker(stream, which);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_set_fade_curve(fa_stream* stream, fa_fade fade, const fa_ramp* shape)
+{
+    fa_shape sh;
+    fa_result r;
+    if (!stream || (fade != FA_FADE_IN && fade != FA_FADE_OUT)) return FA_ERROR_INVALID_ARG;
+    r = fa_shape_from_ramp(shape, FA_CURVE_EQUAL_POWER, &sh);
+    if (r != FA_OK) return r;
     fa_mutex_lock(&stream->api_lock);
-    *out_frame = stream->markers[marker];
+    fa_shape_store(&stream->fade_shape[fade], &sh);
     fa_mutex_unlock(&stream->api_lock);
     return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_fade_curve(fa_stream* stream, fa_fade fade, fa_ramp* out_shape)
+{
+    fa_shape sh;
+    if (!stream || !out_shape || (fade != FA_FADE_IN && fade != FA_FADE_OUT)) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&stream->api_lock);
+    fa_shape_load(&stream->fade_shape[fade], &sh);
+    fa_mutex_unlock(&stream->api_lock);
+    fa_shape_to_ramp(&sh, out_shape);
+    return FA_OK;
+}
+
+/* ---- crossfades and queues -------------------------------------------------- */
+
+/* Makes sure `next` plays on `stream`'s device, through the same bus. */
+static fa_result join_device(struct fa_stream* stream, struct fa_stream* next, fa_device** out_dev)
+{
+    fa_device* dev;
+    fa_bus* bus;
+    fa_device* other;
+    fa_mutex_lock(&stream->api_lock);
+    dev = stream->device;
+    bus = (fa_bus*)fa_load_ptr(&stream->bus);
+    fa_mutex_unlock(&stream->api_lock);
+    if (!dev) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&next->api_lock);
+    other = next->device;
+    fa_mutex_unlock(&next->api_lock);
+    if (other && other != dev) return FA_ERROR_INVALID_ARG;
+    if (!other) {
+        fa_result r = fa_stream_attach(next, dev, bus);
+        if (r != FA_OK) return r;
+    }
+    *out_dev = dev;
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_crossfade(fa_stream* from, fa_stream* to, fa_time duration, const fa_ramp* ramp)
+{
+    fa_shape shape;
+    fa_device* dev;
+    fa_result r;
+    int64_t at, tag;
+    if (!from || !to || from == to || duration < 0) return FA_ERROR_INVALID_ARG;
+    if (from->engine != to->engine || (to->flags & FA_OPEN_DECODE_ONLY)) return FA_ERROR_INVALID_ARG;
+    r = fa_shape_from_ramp(ramp, FA_CURVE_EQUAL_POWER, &shape);
+    if (r != FA_OK) return r;
+    r = join_device(from, to, &dev);
+    if (r != FA_OK) return r;
+    tag = ramp ? ramp->tag : 0;
+    /* One period ahead: both commands are surely taken before that callback starts. */
+    at = fa_load64(&dev->clock) + fa_load32(&dev->period);
+
+    fa_mutex_lock(&to->api_lock);
+    if (to->device == dev) {
+        if (fa_load32(&to->state) != FA_STATE_PLAYING) {
+            start_locked(to, at);
+            post_lane_locked(to, FA_LANE_FADE, 0.0f, 0, NULL, 0, 0, -1, 0);
+        }
+        post_lane_locked(to, FA_LANE_FADE, 1.0f, duration, &shape, tag, 1, at, 0);
+    } else {
+        r = FA_ERROR_INVALID_ARG;  /* moved away meanwhile */
+    }
+    fa_mutex_unlock(&to->api_lock);
+    if (r != FA_OK) return r;
+
+    fa_mutex_lock(&from->api_lock);
+    if (from->device == dev)
+        post_lane_locked(from, FA_LANE_FADE, 0.0f, duration, &shape, tag, 1, at, FA_LANE_MIRROR | FA_LANE_END_STREAM);
+    fa_mutex_unlock(&from->api_lock);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_set_next(fa_stream* stream, fa_stream* next, fa_time crossfade, const fa_ramp* shape)
+{
+    fa_shape sh;
+    fa_device* dev;
+    fa_result r;
+    struct fa_stream* old;
+    int start_now = 0;
+    if (!stream || next == stream || crossfade < 0) return FA_ERROR_INVALID_ARG;
+    if (!next) {
+        fa_mutex_lock(&stream->api_lock);
+        unqueue((struct fa_stream*)fa_exchange_ptr(&stream->queued, NULL));
+        fa_mutex_unlock(&stream->api_lock);
+        return FA_OK;
+    }
+    if (next->engine != stream->engine || (next->flags & FA_OPEN_DECODE_ONLY)) return FA_ERROR_INVALID_ARG;
+    r = fa_shape_from_ramp(shape, FA_CURVE_EQUAL_POWER, &sh);
+    if (r != FA_OK) return r;
+    if (fa_load32(&next->state) == FA_STATE_PLAYING) return FA_ERROR_BUSY;
+    r = join_device(stream, next, &dev);
+    if (r != FA_OK) return r;
+
+    /* Ready to go: positioned at its cue-in and buffered, waiting for the trigger. */
+    fa_mutex_lock(&next->api_lock);
+    if (next->device != dev) r = FA_ERROR_INVALID_ARG;
+    else if (fa_load32(&next->state) == FA_STATE_PLAYING) r = FA_ERROR_BUSY;
+    else {
+        int32_t st = fa_load32(&next->state);
+        if (st == FA_STATE_ENDED || st == FA_STATE_STOPPED) rewind_locked(next);
+        fa_store64(&next->start_frame, FA_START_QUEUED);
+        fa_store32(&next->state, FA_STATE_SCHEDULED);
+    }
+    fa_mutex_unlock(&next->api_lock);
+    if (r != FA_OK) return r;
+
+    fa_mutex_lock(&stream->api_lock);
+    if (stream->device != dev) r = FA_ERROR_INVALID_ARG;
+    else {
+        fa_store64(&stream->xfade_ns, crossfade);
+        fa_shape_store(&stream->xfade_shape, &sh);
+        old = (struct fa_stream*)fa_exchange_ptr(&stream->queued, next);
+        if (old != next) unqueue(old);
+        start_now = fa_load32(&stream->state) == FA_STATE_ENDED;
+    }
+    fa_mutex_unlock(&stream->api_lock);
+    if (r != FA_OK) { unqueue(next); return r; }
+
+    if (start_now && fa_cas_ptr(&stream->queued, next, NULL)) {
+        /* Too late for a transition: the stream has already ended. */
+        fa_mutex_lock(&next->api_lock);
+        if (fa_load32(&next->state) == FA_STATE_SCHEDULED) fa_store32(&next->state, FA_STATE_PLAYING);
+        fa_mutex_unlock(&next->api_lock);
+    }
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_next(fa_stream* stream, fa_stream** out_next)
+{
+    if (!stream || !out_next) return FA_ERROR_INVALID_ARG;
+    *out_next = (fa_stream*)fa_load_ptr(&stream->queued);
+    return FA_OK;
+}
+
+/* ---- channel matrix ----------------------------------------------------- */
+
+FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* weights, uint32_t in_channels, uint32_t out_channels)
+{
+    float* m = NULL;
+    fa_result r = FA_OK;
+    uint32_t i;
+    if (!stream) return FA_ERROR_INVALID_ARG;
+    if (weights) {
+        if (in_channels != stream->decoder.format.channels || out_channels != FA_DEVICE_CHANNELS) return FA_ERROR_INVALID_ARG;
+        for (i = 0; i < in_channels * out_channels; i++)
+            if (!(weights[i] == weights[i]) || fabsf(weights[i]) > 1000.0f) return FA_ERROR_INVALID_ARG;
+        m = (float*)malloc((size_t)in_channels * out_channels * sizeof(float));
+        if (!m) return FA_ERROR_OUT_OF_MEMORY;
+        memcpy(m, weights, (size_t)in_channels * out_channels * sizeof(float));
+    }
+    fa_mutex_lock(&stream->api_lock);
+    if (is_attached(stream)) {
+        fa_frames pos = fa_stream_position_now(stream);
+        fa_store32(&stream->flushing, 1);
+        fa_device_wait_quiescent(stream->device);
+        fa_engine_track_stream(stream->engine, stream, 0);  /* workers look at the ring we replace */
+        fa_mutex_lock(&stream->decode_lock);
+        free(stream->matrix);
+        stream->matrix = m;
+        r = build_chain_locked(stream, stream->device);
+        if (r == FA_OK) {
+            /* restart_at_locked only seeks the decoder when needed: force it, the
+             * buffers are new. */
+            fa_store64(&stream->seek_base, pos);
+            fa_store64(&stream->played, 0);
+            fa_store32(&stream->eof, 1);
+            r = restart_at_locked(stream, pos);
+        }
+        fa_mutex_unlock(&stream->decode_lock);
+        fa_engine_track_stream(stream->engine, stream, 1);
+        if (r == FA_OK) fa_store32(&stream->flushing, 0);
+        /* On failure the stream stays silent (flushing) until the next attach. */
+    } else {
+        fa_mutex_lock(&stream->decode_lock);
+        free(stream->matrix);
+        stream->matrix = m;
+        fa_mutex_unlock(&stream->decode_lock);
+    }
+    fa_mutex_unlock(&stream->api_lock);
+    return r;
 }
 
 /* ---- events ------------------------------------------------------------- */
@@ -760,68 +1079,34 @@ static void push_event(fa_device* dev, struct fa_stream* s, fa_event_type type, 
     fa_audio_post_event(dev, s, type, attached_position(s), value);
 }
 
-/* Ends a ramp that has run its course (or had zero length) at its target. */
-static void finish_ramp(struct fa_stream* s, fa_device* dev, fa_param_voice* v)
-{
-    v->active = 0;
-    v->value = v->target;
-    if (v->notify) push_event(dev, s, FA_EVENT_RAMP_DONE, v->tag);
-}
-
-/* Takes a new parameter command if one is waiting (see fa_param_mailbox). */
-static void take_command(struct fa_stream* s, fa_device* dev, int p, int playing)
-{
-    fa_param_mailbox* m = &s->mailbox[p];
-    fa_param_voice* v = &s->voice[p];
-    fa_param_slot* slot;
-    int32_t w = fa_load32(&m->word);
-    float target, start, b[4];
-    int64_t ns, tag;
-    int curve, notify, has_start, i;
-    if (w & FA_CMD_CLAIMED) return;
-    slot = &m->slot[w & 1];
-    target = fa_load_float(&slot->target);
-    ns = fa_load64(&slot->frames_ns);
-    curve = fa_load32(&slot->curve);
-    for (i = 0; i < 4; i++) b[i] = fa_load_float(&slot->bezier[i]);
-    tag = fa_load64(&slot->tag);
-    notify = fa_load32(&slot->notify);
-    has_start = fa_load32(&slot->has_start);
-    start = fa_load_float(&slot->start);
-    if (!fa_cas32(&m->word, w, w | FA_CMD_CLAIMED)) return; /* replaced meanwhile; take it next time */
-    if (has_start) v->value = start;
-
-    if (v->active && v->notify) push_event(dev, s, FA_EVENT_RAMP_DONE, v->tag); /* replaced */
-    if (!notify && !(playing && s->was_audible)) {
-        /* A plain set while nothing was audible applies at once; no glide needed. */
-        v->active = 0;
-        v->value = target;
-        return;
-    }
-    v->active = 1;
-    v->start = v->value;
-    v->target = target;
-    v->total = (int64_t)((double)ns * dev->rate / 1e9 + 0.5);
-    v->done = 0;
-    v->curve = curve;
-    memcpy(v->bezier, b, sizeof(b));
-    v->notify = notify;
-    v->tag = tag;
-}
-
-/* Value of parameter p after `frames` more frames of the active ramp. */
-static float ramp_value(fa_param_voice* v, int64_t at)
-{
-    float t;
-    if (at >= v->total) return v->target;
-    t = (float)((double)at / (double)v->total);
-    return v->start + (v->target - v->start) * fa_curve_eval(v->curve, v->bezier, t, v->target >= v->start);
-}
-
 static void stereo_gains(float vol, float pan, float* gl, float* gr)
 {
     *gl = vol * (pan > 0.0f ? 1.0f - pan : 1.0f);
     *gr = vol * (pan < 0.0f ? 1.0f + pan : 1.0f);
+}
+
+void fa_bus_gains_at(struct fa_bus* b, fa_device* dev, int64_t off, float* gl, float* gr)
+{
+    int64_t clock = fa_load64(&dev->clock);
+    stereo_gains(fa_lane_value_at_frame(&b->lanes[FA_PARAM_VOLUME].v, clock, clock + off),
+                 fa_lane_value_at_frame(&b->lanes[FA_PARAM_PAN].v, clock, clock + off), gl, gr);
+}
+
+/* Shortens a block so it ends where a bus ramp starts or ends: gains are exact
+ * at block edges only. */
+static int64_t bus_block(struct fa_bus* b, int64_t clock, int64_t now, int64_t blk)
+{
+    int p;
+    for (p = 0; p < FA_MIX_PARAMS; p++) {
+        const fa_param_voice* v = &b->lanes[p].v;
+        int64_t begin, end;
+        if (!v->active) continue;
+        begin = v->at > clock ? v->at : clock;
+        end = begin + (v->total - v->done);
+        if (begin > now && begin - now < blk) blk = begin - now;
+        else if (begin <= now && end > now && end - now < blk) blk = end - now;
+    }
+    return blk;
 }
 
 static void mix_region(float* out, const float* in, int64_t n, float l0, float r0, float l1, float r1)
@@ -851,20 +1136,192 @@ static float norm_glide(float db, float target, int64_t frames, uint32_t rate)
     return db + step < target ? db + step : target;
 }
 
+/* Marker positions and fade shapes, read once per callback. */
+typedef struct mix_markers {
+    fa_frames m[FA_MARKER_COUNT];
+    fa_frames fade_in_from, fade_in_to, fade_out_from, fade_out_to; /* -1 = no fade */
+    fa_shape in_shape, out_shape;
+} mix_markers;
+
+static void load_markers(struct fa_stream* s, mix_markers* mk)
+{
+    int i;
+    for (i = 0; i < FA_MARKER_COUNT; i++) mk->m[i] = marker(s, i);
+    mk->fade_in_from = mk->fade_in_to = mk->fade_out_from = mk->fade_out_to = -1;
+    if (mk->m[FA_MARKER_FADE_IN_END] != FA_FRAMES_UNSET) {
+        fa_frames a = mk->m[FA_MARKER_CUE_IN] != FA_FRAMES_UNSET ? mk->m[FA_MARKER_CUE_IN] : 0;
+        if (mk->m[FA_MARKER_FADE_IN_END] > a) {
+            mk->fade_in_from = a;
+            mk->fade_in_to = mk->m[FA_MARKER_FADE_IN_END];
+            fa_shape_load(&s->fade_shape[FA_FADE_IN], &mk->in_shape);
+        }
+    }
+    if (mk->m[FA_MARKER_FADE_OUT_START] != FA_FRAMES_UNSET) {
+        fa_frames e = end_frame(s);
+        if (e > mk->m[FA_MARKER_FADE_OUT_START]) {
+            mk->fade_out_from = mk->m[FA_MARKER_FADE_OUT_START];
+            mk->fade_out_to = e;
+            fa_shape_load(&s->fade_shape[FA_FADE_OUT], &mk->out_shape);
+        }
+    }
+}
+
+/* Gain of the marker fades at source position `pos`. */
+static float marker_gain(const mix_markers* mk, double pos)
+{
+    float g = 1.0f;
+    if (mk->fade_in_to >= 0 && pos < (double)mk->fade_in_to) {
+        double t = (pos - (double)mk->fade_in_from) / (double)(mk->fade_in_to - mk->fade_in_from);
+        g *= t <= 0.0 ? fa_shape_eval(&mk->in_shape, 0.0f, 1) : fa_shape_eval(&mk->in_shape, (float)t, 1);
+    }
+    if (mk->fade_out_to >= 0 && pos > (double)mk->fade_out_from) {
+        double t = (pos - (double)mk->fade_out_from) / (double)(mk->fade_out_to - mk->fade_out_from);
+        g *= fa_shape_eval(&mk->out_shape, t >= 1.0 ? 0.0f : (float)(1.0 - t), 1);
+    }
+    return g;
+}
+
+/* Source position for the fades: wrapped into the loop, not clamped. */
+static double fade_position(struct fa_stream* s, int64_t played)
+{
+    double lin = linear_position(s, played);
+    fa_frames end = end_frame(s);
+    if ((s->flags & FA_OPEN_LOOP) && end > 0 && lin >= (double)end) {
+        fa_frames back = loop_start(s), len = end - back;
+        if (len > 0) return (double)back + fmod(lin - (double)end, (double)len);
+    }
+    return lin;
+}
+
+/* FA_EVENT_MARKER for every marker passed between `played0` and `played1`. */
+static void marker_events(struct fa_stream* s, fa_device* dev, const mix_markers* mk, int64_t played0, int64_t played1, int ended)
+{
+    fa_frames p0 = (fa_frames)(linear_position(s, played0) + 0.5);
+    fa_frames p1 = (fa_frames)(linear_position(s, played1) + 0.5);
+    fa_frames end = end_frame(s), back = loop_start(s), w0, w1;
+    int looping = (s->flags & FA_OPEN_LOOP) && end > 0 && end > back;
+    int i;
+    if (p1 <= p0 && !ended) return;
+    w0 = wrap_position(s, p0);
+    w1 = wrap_position(s, p1);
+    for (i = 0; i < FA_MARKER_COUNT; i++) {
+        fa_frames m = mk->m[i];
+        int hit;
+        if (m == FA_FRAMES_UNSET) continue;
+        if (looping && p1 - p0 >= end - back) hit = m >= back && m < end;
+        else if (looping && w1 < w0) hit = (m >= w0 && m < end) || (m >= back && m < w1);
+        else hit = m >= w0 && (m < w1 || (ended && m == w1));
+        if (hit) fa_audio_post_event(dev, s, FA_EVENT_MARKER, m, i);
+    }
+}
+
+/* Ends the stream from the audio thread (its data ran out, or a crossfade-out finished). */
+static void end_stream(struct fa_stream* s, fa_device* dev)
+{
+    if (fa_cas32(&s->state, FA_STATE_PLAYING, FA_STATE_ENDED)) push_event(dev, s, FA_EVENT_ENDED, 0);
+}
+
+/* A lane's ramp ran its course. Returns 1 when that ends the stream. */
+static int finish_lane(struct fa_stream* s, fa_device* dev, fa_param_voice* v)
+{
+    v->active = 0;
+    v->value = v->target;
+    if (v->notify) push_event(dev, s, FA_EVENT_RAMP_DONE, v->tag);
+    if (v->flags & FA_LANE_END_STREAM) {
+        v->value = 1.0f;  /* a later play starts at full crossfade gain */
+        return 1;
+    }
+    return 0;
+}
+
+/* Frames from now until `s` reaches its mix point, or -1 if not within `frames`. */
+static int64_t frames_to_mix_point(struct fa_stream* s, uint32_t frames)
+{
+    fa_frames mix = marker(s, FA_MARKER_MIX_POINT);
+    int64_t xf_ns = fa_load64(&s->xfade_ns);
+    double sr = (double)s->decoder.format.sample_rate, dr = (double)s->dev_rate;
+    if (mix == FA_FRAMES_UNSET && xf_ns > 0) {
+        fa_frames end = end_frame(s);
+        if (end >= 0) {
+            mix = end - (fa_frames)((double)xf_ns * sr / 1e9 + 0.5);
+            if (mix < 0) mix = 0;
+        }
+    }
+    if (mix != FA_FRAMES_UNSET) {
+        double dist = (double)mix - fade_position(s, fa_load64(&s->played));
+        int64_t k;
+        if (dist < 0.0 && (s->flags & FA_OPEN_LOOP)) {
+            fa_frames end = end_frame(s), back = loop_start(s);
+            if (end > back) dist += (double)(end - back);
+        }
+        k = dist <= 0.0 ? 0 : (int64_t)ceil(dist * dr / sr - 1e-9);
+        if (k < (int64_t)frames) return k;
+    }
+    /* At the end: gapless (or the fallback when the end was not known in advance). */
+    if (fa_load32(&s->eof) && !(s->flags & FA_OPEN_LOOP)) {
+        int64_t left = fa_ring_readable(&s->ring);
+        if (left < (int64_t)frames) return left;
+    }
+    return -1;
+}
+
+void fa_stream_check_queue(struct fa_stream* s, fa_device* dev, uint32_t frames)
+{
+    struct fa_stream* next = (struct fa_stream*)fa_load_ptr(&s->queued);
+    int64_t k, at, xf_ns;
+    if (!next || fa_load32(&s->state) != FA_STATE_PLAYING || fa_load32(&s->flushing) || !s->dev_rate) return;
+    k = frames_to_mix_point(s, frames);
+    if (k < 0) return;
+    if (!fa_cas_ptr(&s->queued, next, NULL)) return;   /* changed by an API thread meanwhile */
+    if (fa_load32(&next->state) != FA_STATE_SCHEDULED || fa_load64(&next->start_frame) != FA_START_QUEUED) return;
+    at = fa_load64(&dev->clock) + k;
+    xf_ns = fa_load64(&s->xfade_ns);
+    if (xf_ns > 0) {
+        int64_t xf = (int64_t)((double)xf_ns * dev->rate / 1e9 + 0.5);
+        fa_shape shape;
+        fa_shape_load(&s->xfade_shape, &shape);
+        if (marker(s, FA_MARKER_FADE_OUT_START) == FA_FRAMES_UNSET)
+            fa_lane_start_ramp(&s->lanes[FA_LANE_FADE], s->lanes[FA_LANE_FADE].v.value, 0.0f, xf, at, &shape,
+                               FA_LANE_MIRROR | FA_LANE_END_STREAM);
+        if (marker(next, FA_MARKER_FADE_IN_END) == FA_FRAMES_UNSET)
+            fa_lane_start_ramp(&next->lanes[FA_LANE_FADE], 0.0f, 1.0f, xf, at, &shape, 0);
+    }
+    fa_store64(&next->start_frame, at);
+}
+
 void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames)
 {
-    int64_t avail, n, done = 0;
-    int p, playing;
+    int64_t avail, n, done = 0, clock, off = 0, played0;
+    int p, playing, audible, ended = 0;
+    int32_t state;
     float norm_target, norm_lin;
+    mix_markers mk;
+    struct fa_bus* bus;
     if (fa_load32(&s->flushing)) return;
-    playing = fa_load32(&s->state) == FA_STATE_PLAYING;
-    for (p = 0; p < FA_MIX_PARAMS; p++) {
-        take_command(s, dev, p, playing);
-        /* A zero-length ramp is a jump: the first sample already uses the target. */
-        if (s->voice[p].active && s->voice[p].done >= s->voice[p].total) finish_ramp(s, dev, &s->voice[p]);
+    clock = fa_load64(&dev->clock);
+
+    state = fa_load32(&s->state);
+    if (state == FA_STATE_SCHEDULED) {
+        int64_t start = fa_load64(&s->start_frame);
+        if (start != FA_START_QUEUED && start < clock + (int64_t)frames &&
+            fa_cas32(&s->state, FA_STATE_SCHEDULED, FA_STATE_PLAYING)) {
+            off = start > clock ? start - clock : 0;
+            state = FA_STATE_PLAYING;
+            push_event(dev, s, FA_EVENT_STARTED, 0);
+        }
+    }
+    playing = state == FA_STATE_PLAYING;
+    audible = playing && s->was_audible;
+    for (p = 0; p < FA_STREAM_LANES; p++) {
+        int64_t tag = 0;
+        fa_param_voice* v = &s->lanes[p].v;
+        if (fa_lane_take(&s->lanes[p], audible, dev->rate, &tag)) push_event(dev, s, FA_EVENT_RAMP_DONE, tag);
+        /* A zero-length ramp that has started is a jump: the first sample already uses the target. */
+        if (playing && v->active && v->done >= v->total && (v->at < 0 || v->at <= clock + off))
+            if (finish_lane(s, dev, v)) { end_stream(s, dev); playing = 0; }
     }
     if (!playing) {
-        for (p = 0; p < FA_MIX_PARAMS; p++) fa_store_float(&s->current[p], s->voice[p].value);
+        for (p = 0; p < FA_STREAM_LANES; p++) fa_store_float(&s->lanes[p].current, s->lanes[p].v.value);
         s->was_audible = 0;
         return;
     }
@@ -872,57 +1329,84 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
     if (!s->was_audible) s->norm_db = norm_target; /* nothing heard yet: start at the right gain */
     s->was_audible = 1;
     norm_lin = db_to_gain(s->norm_db);
+    load_markers(s, &mk);
+    played0 = fa_load64(&s->played);
+    bus = (struct fa_bus*)fa_load_ptr(&s->bus);
 
     avail = fa_ring_readable(&s->ring);
-    n = avail < (int64_t)frames ? avail : (int64_t)frames;
+    n = avail < (int64_t)frames - off ? avail : (int64_t)frames - off;
 
-    while (done < n) {
+    while (done < n && !ended) {
         /* Blocks of FA_RAMP_BLOCK frames: gains are exact at block edges and
-         * interpolated linearly inside, so ramps and changes are click-free. */
+         * interpolated linearly inside, so ramps and changes are click-free. Blocks
+         * also end exactly where a ramp starts or ends. */
         int64_t blk = n - done < FA_RAMP_BLOCK ? n - done : FA_RAMP_BLOCK;
-        float v0[FA_MIX_PARAMS], v1[FA_MIX_PARAMS], l0, r0, l1, r1;
+        int64_t now = clock + off + done, pl = played0 + done;
+        float v0[FA_STREAM_LANES], v1[FA_STREAM_LANES], g0, g1, l0, r0, l1, r1;
+        float bl0 = 1.0f, br0 = 1.0f, bl1 = 1.0f, br1 = 1.0f;
         const float *p1, *p2;
         int64_t n1, n2;
-        for (p = 0; p < FA_MIX_PARAMS; p++) {   /* end blocks exactly where ramps end */
-            fa_param_voice* v = &s->voice[p];
-            if (v->active && v->total - v->done > 0 && v->total - v->done < blk) blk = v->total - v->done;
+        for (p = 0; p < FA_STREAM_LANES; p++) {
+            fa_param_voice* v = &s->lanes[p].v;
+            if (!v->active) continue;
+            if (v->at > now) { if (v->at - now < blk) blk = v->at - now; }
+            else if (v->total - v->done > 0 && v->total - v->done < blk) blk = v->total - v->done;
         }
-        for (p = 0; p < FA_MIX_PARAMS; p++) {
-            fa_param_voice* v = &s->voice[p];
+        if (bus) blk = bus_block(bus, clock, now, blk);
+        for (p = 0; p < FA_STREAM_LANES; p++) {
+            fa_param_voice* v = &s->lanes[p].v;
             v0[p] = v->value;
-            v1[p] = v->active ? ramp_value(v, v->done + blk) : v->value;
+            v1[p] = (v->active && v->at <= now) ? fa_lane_ramp_value(v, v->done + blk) : v->value;
         }
+        g0 = v0[FA_PARAM_VOLUME] * v0[FA_LANE_FADE] * marker_gain(&mk, fade_position(s, pl));
+        g1 = v1[FA_PARAM_VOLUME] * v1[FA_LANE_FADE] * marker_gain(&mk, fade_position(s, pl + blk));
         {
             float nd1 = norm_glide(s->norm_db, norm_target, blk, dev->rate);
             float nl1 = nd1 == s->norm_db ? norm_lin : db_to_gain(nd1);
-            stereo_gains(v0[FA_PARAM_VOLUME] * norm_lin, v0[FA_PARAM_PAN], &l0, &r0);
-            stereo_gains(v1[FA_PARAM_VOLUME] * nl1, v1[FA_PARAM_PAN], &l1, &r1);
+            stereo_gains(g0 * norm_lin, v0[FA_PARAM_PAN], &l0, &r0);
+            stereo_gains(g1 * nl1, v1[FA_PARAM_PAN], &l1, &r1);
             s->norm_db = nd1;
             norm_lin = nl1;
         }
+        if (bus) {
+            fa_bus_gains_at(bus, dev, off + done, &bl0, &br0);
+            fa_bus_gains_at(bus, dev, off + done + blk, &bl1, &br1);
+            l0 *= bl0; r0 *= br0; l1 *= bl1; r1 *= br1;
+        }
         fa_ring_regions(&s->ring, blk, &p1, &n1, &p2, &n2);
-        mix_region(out + done * 2, p1, n1, l0, r0, l0 + (l1 - l0) * (float)n1 / (float)blk, r0 + (r1 - r0) * (float)n1 / (float)blk);
-        if (n2 > 0) mix_region(out + (done + n1) * 2, p2, n2, l0 + (l1 - l0) * (float)n1 / (float)blk,
-                               r0 + (r1 - r0) * (float)n1 / (float)blk, l1, r1);
+        {
+            float* o = out + (off + done) * 2;
+            float lm = l0 + (l1 - l0) * (float)n1 / (float)blk, rm = r0 + (r1 - r0) * (float)n1 / (float)blk;
+            mix_region(o, p1, n1, l0, r0, lm, rm);
+            if (n2 > 0) mix_region(o + n1 * 2, p2, n2, lm, rm, l1, r1);
+        }
         fa_ring_advance_read(&s->ring, blk);
         fa_fetch_add64(&s->played, blk);
         done += blk;
 
-        for (p = 0; p < FA_MIX_PARAMS; p++) {
-            fa_param_voice* v = &s->voice[p];
+        for (p = 0; p < FA_STREAM_LANES; p++) {
+            fa_param_voice* v = &s->lanes[p].v;
             v->value = v1[p];
-            if (!v->active) continue;
+            if (!v->active || v->at > now) continue;
+            v->at = -1;
             v->done += blk;
-            if (v->done >= v->total) finish_ramp(s, dev, v);
+            if (v->done >= v->total && finish_lane(s, dev, v)) ended = 1;
         }
     }
-    for (p = 0; p < FA_MIX_PARAMS; p++) fa_store_float(&s->current[p], s->voice[p].value);
+    for (p = 0; p < FA_STREAM_LANES; p++) fa_store_float(&s->lanes[p].current, s->lanes[p].v.value);
 
-    if (n < (int64_t)frames) {
-        if (fa_load32(&s->eof) && fa_ring_readable(&s->ring) == 0) {
-            if (fa_cas32(&s->state, FA_STATE_PLAYING, FA_STATE_ENDED)) push_event(dev, s, FA_EVENT_ENDED, 0);
-        } else {
-            fa_fetch_add32(&s->underruns, 1);
-        }
+    if (ended) {
+        marker_events(s, dev, &mk, played0, played0 + done, 0);
+        end_stream(s, dev);
+        return;
     }
+    if (n < (int64_t)frames - off) {
+        if (fa_load32(&s->eof) && fa_ring_readable(&s->ring) == 0) {
+            marker_events(s, dev, &mk, played0, played0 + done, 1);
+            end_stream(s, dev);
+            return;
+        }
+        fa_fetch_add32(&s->underruns, 1);
+    }
+    marker_events(s, dev, &mk, played0, played0 + done, 0);
 }

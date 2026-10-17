@@ -2,6 +2,7 @@
  * the parameter value is start + (target - start) * shape. */
 #include "fa_internal.h"
 #include <math.h>
+#include <string.h>
 
 #define FA_PI 3.14159265358979323846
 
@@ -59,4 +60,83 @@ float fa_curve_eval(int curve, const float bezier[4], float t, int rising)
     default:
         return t;
     }
+}
+
+/* Point list: values at evenly spaced times, joined by straight lines. */
+static float points_eval(const fa_shape* sh, float t)
+{
+    float x = t * (float)(sh->npoints - 1);
+    int i = (int)x;
+    if (i >= sh->npoints - 1) return sh->points[sh->npoints - 1];
+    return sh->points[i] + (sh->points[i + 1] - sh->points[i]) * (x - (float)i);
+}
+
+float fa_shape_eval(const fa_shape* sh, float t, int rising)
+{
+    if (sh->curve == FA_CURVE_POINTS) {
+        if (t <= 0.0f) return sh->points[0];
+        if (t >= 1.0f) return sh->points[sh->npoints - 1];
+        return points_eval(sh, t);
+    }
+    return fa_curve_eval(sh->curve, sh->bezier, t, rising);
+}
+
+float fa_shape_eval_mirror(const fa_shape* sh, float t)
+{
+    return 1.0f - fa_shape_eval(sh, 1.0f - t, 1);
+}
+
+fa_result fa_shape_from_ramp(const fa_ramp* r, int fallback, fa_shape* out)
+{
+    uint32_t i;
+    memset(out, 0, sizeof(*out));
+    if (!r) { out->curve = fallback; return FA_OK; }
+    if ((int)r->curve < 0 || r->curve > FA_CURVE_POINTS) return FA_ERROR_INVALID_ARG;
+    out->curve = r->curve;
+    if (r->curve == FA_CURVE_BEZIER) {
+        if (!(r->bezier_x1 >= 0.0f && r->bezier_x1 <= 1.0f && r->bezier_x2 >= 0.0f && r->bezier_x2 <= 1.0f))
+            return FA_ERROR_INVALID_ARG;
+        if (r->bezier_y1 != r->bezier_y1 || r->bezier_y2 != r->bezier_y2) return FA_ERROR_INVALID_ARG;
+        out->bezier[0] = r->bezier_x1; out->bezier[1] = r->bezier_y1;
+        out->bezier[2] = r->bezier_x2; out->bezier[3] = r->bezier_y2;
+    }
+    if (r->curve == FA_CURVE_POINTS) {
+        if (!r->points || r->point_count < 2 || r->point_count > FA_CURVE_MAX_POINTS) return FA_ERROR_INVALID_ARG;
+        for (i = 0; i < r->point_count; i++) {
+            if (!(r->points[i] == r->points[i]) || fabsf(r->points[i]) > 1e6f) return FA_ERROR_INVALID_ARG;
+            out->points[i] = r->points[i];
+        }
+        out->npoints = (int)r->point_count;
+    }
+    return FA_OK;
+}
+
+void fa_shape_to_ramp(const fa_shape* sh, fa_ramp* out)
+{
+    memset(out, 0, sizeof(*out));
+    out->curve = (fa_curve)sh->curve;
+    out->bezier_x1 = sh->bezier[0]; out->bezier_y1 = sh->bezier[1];
+    out->bezier_x2 = sh->bezier[2]; out->bezier_y2 = sh->bezier[3];
+    out->point_count = (uint32_t)sh->npoints;
+}
+
+void fa_shape_store(fa_shape_atomic* a, const fa_shape* sh)
+{
+    int i;
+    fa_store32(&a->curve, sh->curve);
+    for (i = 0; i < 4; i++) fa_store_float(&a->bezier[i], sh->bezier[i]);
+    for (i = 0; i < sh->npoints; i++) fa_store_float(&a->points[i], sh->points[i]);
+    fa_store32(&a->npoints, sh->npoints);
+}
+
+void fa_shape_load(fa_shape_atomic* a, fa_shape* out)
+{
+    int i;
+    out->curve = fa_load32(&a->curve);
+    for (i = 0; i < 4; i++) out->bezier[i] = fa_load_float(&a->bezier[i]);
+    out->npoints = fa_load32(&a->npoints);
+    if (out->npoints < 0 || out->npoints > FA_CURVE_MAX_POINTS) out->npoints = 0;
+    for (i = 0; i < out->npoints; i++) out->points[i] = fa_load_float(&a->points[i]);
+    /* A point list caught half-written has fewer than 2 points: fall back to linear. */
+    if (out->curve == FA_CURVE_POINTS && out->npoints < 2) out->curve = FA_CURVE_LINEAR;
 }

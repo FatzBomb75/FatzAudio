@@ -6,11 +6,12 @@ One page per feature, each with: what it does, C example, C# example, options, t
 |---|---|---|
 | Devices (output, start/stop, silent output) | [devices.md](devices.md) | ✅ output; input and default following 🗓️ |
 | Opening and decoding streams (format detection, custom I/O) | [streams.md](streams.md) | ✅ |
-| Playback, buffering and threads (decode-ahead, transport, clock) | [playback.md](playback.md) | ✅ |
-| Volume, pan and ramps (curves, ramp-done) | [ramps.md](ramps.md) | ✅ volume and pan |
-| Events | [events.md](events.md) | ✅ ended, ramp done, loudness final |
+| Playback, buffering and threads (decode-ahead, transport, device clock) | [playback.md](playback.md) | ✅ |
+| Volume, pan and ramps (7 curves, scheduled starts, ramp-done) | [ramps.md](ramps.md) | ✅ volume and pan |
+| Events | [events.md](events.md) | ✅ ended, ramp done, marker, started, loudness final |
 | Loudness normalization (R128 scans, tags, cache, limiter) | [normalization.md](normalization.md) | ✅ |
-| Crossfade, markers and curves | crossfade.md | 🗓️ |
+| Crossfades, markers, queues and gapless, scheduled starts | [crossfade.md](crossfade.md) | ✅ |
+| Buses (decks, groups) and the channel matrix | [buses.md](buses.md) | ✅ |
 | Tempo and pitch | tempo-pitch.md | 🗓️ |
 | FFmpeg hand-off and A/V sync | ffmpeg.md | 🗓️ |
 | Web streams and HLS | web-streams.md | 🗓️ |

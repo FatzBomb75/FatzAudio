@@ -9,7 +9,8 @@ Each stream has one event callback. The audio thread queues events without locki
 | `FA_EVENT_ENDED` | position at the end | 0 | ✅ |
 | `FA_EVENT_RAMP_DONE` | position | the ramp's `tag` | ✅ |
 | `FA_EVENT_POSITION` | the requested frame | 0 | 🧩 |
-| `FA_EVENT_MARKER` | the marker's frame | the `fa_marker` | 🗓️ crossfade phase |
+| `FA_EVENT_MARKER` | the marker's frame | the `fa_marker` | ✅ ([markers](crossfade.md#markers)) |
+| `FA_EVENT_STARTED` | position at the start | 0 | ✅ after `play_at`, a crossfade or a queue ([crossfade](crossfade.md)) |
 | `FA_EVENT_METADATA` | position | 0 | 🗓️ web streams |
 | `FA_EVENT_STALLED` / `RESUMED` | position | 0 | 🗓️ web streams |
 | `FA_EVENT_DECODE_ERROR` | position | the `fa_result` | 🗓️ |
@@ -40,6 +41,8 @@ fa_stream_set_event_callback(s, on_event, my_state);
 ```csharp
 song.Ended += (_, _) => Console.WriteLine("done");
 song.RampCompleted += (_, e) => Console.WriteLine($"ramp {e.Value} done at {e.Position}");
+song.Started += (_, _) => Console.WriteLine("started");
+song.MarkerReached += (_, e) => Console.WriteLine($"{e.Marker} reached");
 ```
 
 ## Lifetime guarantees

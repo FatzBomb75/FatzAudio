@@ -184,7 +184,6 @@ public class EngineTests
         var ex = Assert.Throws<FatzAudioException>(() => s.Ramp(AudioParameter.Tempo, 1.2f, TimeSpan.FromSeconds(1), Curve.EqualPower));
         Assert.Equal(ErrorCode.NotImplemented, ex.ErrorCode);
         Assert.Contains("mplemented", ex.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.Equal(ErrorCode.NotImplemented, Assert.Throws<FatzAudioException>(() => _ = engine.Time).ErrorCode);
         Assert.Equal(ErrorCode.NotImplemented, Assert.Throws<FatzAudioException>(() => engine.OpenUrl("http://localhost/x.mp3")).ErrorCode);
     }
 

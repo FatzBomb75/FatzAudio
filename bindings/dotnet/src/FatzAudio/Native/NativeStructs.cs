@@ -75,11 +75,13 @@ internal unsafe struct FaFormatInfo
 }
 
 [StructLayout(LayoutKind.Sequential)]
-internal struct FaRamp
+internal unsafe struct FaRamp
 {
     public int Curve;
     public float BezierX1, BezierY1, BezierX2, BezierY2;
     public long Tag;
+    public float* Points;
+    public uint PointCount;
 }
 
 [StructLayout(LayoutKind.Sequential)]

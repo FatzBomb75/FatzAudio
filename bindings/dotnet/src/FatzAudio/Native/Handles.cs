@@ -112,6 +112,29 @@ internal sealed class StreamHandle : SafeHandle
     }
 }
 
+/// <summary>Owns an <c>fa_bus*</c> and keeps its device (and so its engine) alive.</summary>
+internal sealed class BusHandle : SafeHandle
+{
+    private DeviceHandle? _device;
+
+    public BusHandle() : base(0, true) { }
+    public override bool IsInvalid => handle == 0;
+
+    public void Initialize(nint native, DeviceHandle device)
+    {
+        _device = HandleRef.AddRef(device);
+        SetHandle(native);
+    }
+
+    protected override bool ReleaseHandle()
+    {
+        NativeMethods.fa_bus_destroy(handle);
+        _device?.DangerousRelease();
+        _device = null;
+        return true;
+    }
+}
+
 internal static class HandleRef
 {
     public static T AddRef<T>(T handle) where T : SafeHandle

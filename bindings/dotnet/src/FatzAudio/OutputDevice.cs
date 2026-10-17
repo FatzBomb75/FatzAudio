@@ -3,7 +3,7 @@ using FatzAudio.Native;
 namespace FatzAudio;
 
 /// <summary>
-/// An opened playback device. Attach streams with <see cref="AudioStream.PlayOn"/>.
+/// An opened playback device. Attach streams with <see cref="AudioStream.PlayOn(OutputDevice)"/>.
 /// </summary>
 /// <remarks>
 /// Disposing a device stops it. If streams are still attached the native device object stays alive
@@ -81,6 +81,61 @@ public sealed class OutputDevice : IDisposable
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_get_latency(Handle, out long ns));
             return TimeConvert.FromNanoseconds(ns);
         }
+    }
+
+    /// <summary>
+    /// The device's sample clock: how much audio it has mixed since it was opened. It advances only while
+    /// the device runs and never jumps. <see cref="AudioStream.PlayAt"/>, scheduled ramps and queues are
+    /// placed on this clock to the exact frame. It moves in steps of one device period, so schedule at least
+    /// one period ahead (<c>Time + 50 ms</c> is always safe).
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The device was disposed.</exception>
+    /// <example>
+    /// <code>
+    /// var start = output.Time + TimeSpan.FromMilliseconds(100);
+    /// left.PlayAt(start);
+    /// right.PlayAt(start);   // both start on the same frame
+    /// </code>
+    /// </example>
+    public TimeSpan Time
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_get_time(Handle, out long ns));
+            return TimeConvert.FromNanoseconds(ns);
+        }
+    }
+
+    /// <summary>
+    /// Creates a mix bus on this device: a group of streams with its own volume and pan, such as a DJ deck or
+    /// a preview channel. Route streams to it with <see cref="AudioStream.PlayOn(MixBus)"/>.
+    /// </summary>
+    /// <returns>The bus; dispose it when done (its streams then continue on the device's master mix).</returns>
+    /// <exception cref="ObjectDisposedException">The device was disposed.</exception>
+    /// <example>
+    /// <code>
+    /// using var deckA = output.CreateBus();
+    /// using var deckB = output.CreateBus();
+    /// trackA.PlayOn(deckA);
+    /// trackB.PlayOn(deckB);
+    /// deckA.Volume = 0.3f;    // crossfader towards B
+    /// </code>
+    /// </example>
+    public MixBus CreateBus()
+    {
+        var h = Handle;
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_bus_create(h, out nint native));
+        var bh = new BusHandle();
+        try
+        {
+            bh.Initialize(native, h);
+        }
+        catch
+        {
+            NativeMethods.fa_bus_destroy(native);
+            throw;
+        }
+        return new MixBus(this, bh);
     }
 
     /// <summary>Starts the device so that attached, playing streams become audible. Does nothing if already started.</summary>

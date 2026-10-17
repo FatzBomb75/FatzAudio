@@ -16,7 +16,8 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | Positions in bytes, converted with `Bytes2Seconds` | Positions in frames (sample-exact) or nanoseconds | No byte arithmetic that breaks when the format is float or multichannel |
 | `BASS_ChannelSetSync` with numeric `BASS_SYNC_*` types and a `SYNCPROC` | One event callback per stream with typed `fa_event`; .NET uses normal C# events | One handler instead of a sync per event type |
 | Volume/pan via `BASS_ChannelSetAttribute(h, BASS_ATTRIB_VOL, v)` | `fa_stream_set_param(s, FA_PARAM_VOLUME, v)`; .NET: `stream.Volume = v` | |
-| Fades via `BASS_ChannelSlideAttribute` (linear or log only) | `fa_stream_ramp_param` with linear, equal-power, log, exp, S-curve or bezier | |
+| Fades via `BASS_ChannelSlideAttribute` (linear or log only) | `fa_stream_ramp_param` with linear, equal-power, log, exp, S-curve, bezier or your own points, optionally starting at an exact time | |
+| Crossfades built by hand from two slides and a `BASS_SYNC_POS` | `fa_crossfade`, or `fa_stream_set_next` to crossfade (or go gapless) automatically at the mix point | No sync juggling; both sides start on the same frame |
 | Tempo/pitch need bass_fx and a separate "tempo stream" wrapping the source | `FA_PARAM_TEMPO` and `FA_PARAM_PITCH` on any stream | No wrapper streams to create and free |
 | Sync with external video means pushing PCM and correcting drift by hand | `fa_stream_get_clock` gives the presentation time leaving the speaker | Video follows the audio clock; no manual resync |
 
@@ -66,7 +67,7 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
 | BASS_ChannelPlay / BASS_ChannelStart | `fa_stream_attach` + `fa_stream_play` | `stream.PlayOn(device)` | ✅ |
-| BASS_ChannelPlay at a precise time | `fa_stream_play_at` | | 🧩 (crossfade phase) |
+| BASS_ChannelPlay at a precise time | `fa_stream_play_at` on the device clock (`fa_device_get_time`) ([crossfade](../features/crossfade.md#the-device-clock)) | `stream.PlayAt(output.Time + delay)` | ✅ |
 | BASS_ChannelPause / BASS_ChannelStop | `fa_stream_pause` / `fa_stream_stop` | `Pause()` / `Stop()` | ✅ |
 | BASS_ChannelIsActive | `fa_stream_get_state` | `stream.State` | ✅ |
 | BASS_ChannelGetInfo | `fa_stream_get_info` (the source's own format; unchanged by attaching) | `stream.Info` | ✅ |
@@ -77,22 +78,32 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS_ChannelSetAttribute VOL / PAN | `fa_stream_set_param` VOLUME / PAN, de-zippered over 5 ms ([ramps](../features/ramps.md)) | `Volume` / `Pan` | ✅ |
 | BASS_ChannelSetAttribute FREQ | `FA_PARAM_RATE` | `Rate` | 🧩 |
 | BASS_ChannelSetAttributeEx / GetAttributeEx | Typed functions per feature instead | | ➖ (by design) |
-| BASS_ChannelSlideAttribute | `fa_stream_ramp_param` with 6 curves ([ramps](../features/ramps.md)) | `Ramp(...)` / `await RampAsync(...)` | ✅ volume, pan |
+| BASS_ChannelSlideAttribute | `fa_stream_ramp_param` with 7 curves and an optional exact start time ([ramps](../features/ramps.md)) | `Ramp(...)` / `await RampAsync(...)` | ✅ volume, pan |
 | BASS_ChannelIsSliding | `FA_EVENT_RAMP_DONE` (one per ramp, tagged) instead of polling | `RampAsync` task, `RampCompleted` event | ✅ |
 | BASS_ChannelSetSync / RemoveSync | `fa_stream_set_event_callback`; one callback receives every event type ([events](../features/events.md)) | `Ended`, `RampCompleted`, … events | ✅ |
 | BASS_SYNC_END | `FA_EVENT_ENDED` | `Ended` | ✅ |
 | BASS_SYNC_SLIDE | `FA_EVENT_RAMP_DONE` | `RampCompleted` / `RampAsync` | ✅ |
 | BASS_SYNC_POS | `fa_stream_add_position_event` + `FA_EVENT_POSITION` | `AddPositionEvent`, `PositionReached` | 🧩 |
-| BASS_SYNC_MIXTIME | Not needed: callbacks never run on the audio thread, so any call is safe in them; sample-accurate actions use ramps and (later) `play_at` | — | ➖ (by design) |
+| BASS_SYNC_POS used to start a crossfade or the next track | Markers (`FA_MARKER_MIX_POINT`, fades) and `fa_stream_set_next` ([crossfade](../features/crossfade.md)) | `stream.Markers`, `QueueNext` | ✅ |
+| BASS_SYNC_POS used to end playback early (trim) | `FA_MARKER_CUE_OUT` (exact end) and `FA_MARKER_CUE_IN` | `Markers.CueOut`, `Markers.CueIn` | ✅ |
+| `FA_EVENT_MARKER` has no BASS equivalent | Raised when playback passes a marker | `MarkerReached` | ✅ |
+| BASS_SYNC_MIXTIME | Not needed: callbacks never run on the audio thread, so any call is safe in them. Sample-accurate actions are scheduled instead: `fa_stream_play_at`, ramps with a start time, and queues (`fa_stream_set_next`) that start the next track on the exact frame | — | ➖ (by design) |
 | BASS_ChannelSetDSP (+Ex) / RemoveDSP | `fa_stream_add_dsp` / `fa_stream_remove_dsp` | | 🧩 |
 | BASS_ChannelGetLevel (+Ex) | `fa_stream_get_levels` | `GetLevels()` | 🧩 |
 | BASS_ChannelGetData (FFT) | Planned `fa_stream_get_spectrum` | | 🗓️ |
 | BASS_ChannelGetTags | Planned `fa_stream_get_tags` (one reader for all formats) | | 🗓️ |
-| BASS_ChannelFlags (loop) | `FA_OPEN_LOOP`; runtime toggle planned | | ✅ open-time only |
-| BASS_ChannelSetLink / RemoveLink | Buses and `fa_stream_play_at` (sample-accurate group start) | | 🗓️ |
+| BASS_ChannelFlags (loop) | `FA_OPEN_LOOP`, looping between the cue-in and cue-out markers; runtime toggle planned | | ✅ open-time only |
+| BASS_POS_LOOP / BASS_POS_END (loop start, end position) | `FA_MARKER_CUE_IN` / `FA_MARKER_CUE_OUT` | `Markers.CueIn` / `Markers.CueOut` | ✅ |
+| BASS_ChannelSetLink / RemoveLink | `fa_stream_play_at` with the same time starts streams on the same frame; a bus ([buses](../features/buses.md)) groups their volume and pan | `PlayAt`, `MixBus` | ✅ |
 | BASS_ChannelLock | Not needed: parameter changes are applied atomically per buffer | — | ➖ (by design) |
 | BASS_ChannelSetDevice / GetDevice | `fa_stream_attach` to the new device moves the stream and keeps its position; `fa_stream_detach` removes it | `stream.PlayOn(other)`, `stream.Detach()`, `stream.Device` | ✅ |
 | BASS_ChannelRef | Not needed: handles stay valid until you close them | — | ➖ (by design) |
+
+### Device clock
+
+| BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| BASS_ChannelGetPosition on a playing channel used as a timeline | `fa_device_get_time`: frames the device mixed since it opened, in ns; never jumps on seek or track change | `output.Time` | ✅ |
 
 ### Effects
 
@@ -148,6 +159,21 @@ BASS has no normalization: apps measure each file themselves with a decode pass 
 |---|---|---|
 | BASS_PluginLoad / Free / Enable | Not needed: all formats are built in and detected from content | ➖ (by design) |
 | BASS_PluginGetInfo | `fa_format_count` + `fa_format_get_info`; .NET `AudioEngine.SupportedFormats` | ✅ |
+
+### BASSmix (mixer streams)
+
+The legacy app doesn't ship bassmix.dll, but mixer-style code built on `BASS_ChannelSetLink` and slides maps here too.
+
+| BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| BASS_Mixer_StreamCreate + BASS_Mixer_StreamAddChannel | `fa_bus_create` + `fa_stream_attach(s, device, bus)`; no extra stream or buffer ([buses](../features/buses.md)) | `output.CreateBus()`, `stream.PlayOn(bus)` | ✅ |
+| BASS_Mixer_ChannelRemove | `fa_stream_attach(s, device, NULL)` (master mix) or `fa_stream_detach` | `PlayOn(output)`, `Detach()` | ✅ |
+| BASS_Mixer_ChannelSetMatrix (+Ex) | `fa_stream_set_matrix` | `SetMatrix(float[,])`, `ResetMatrix()` | ✅ |
+| BASS_Mixer_ChannelSetEnvelope (volume/pan envelope) | Ramps with start times, point curves, marker fades | `Ramp(..., startAt)`, `Curve.Points`, `Markers` | ✅ |
+| BASS_Mixer_ChannelSetPosition / GetPosition | `fa_stream_seek` / `fa_stream_get_position` | `Position` | ✅ |
+| BASS_ATTRIB_VOL on the mixer stream | `fa_bus_set_param` / `fa_bus_ramp_param` | `bus.Volume`, `bus.Ramp` | ✅ |
+| BASS_MIXER_CHAN_NORAMPIN | Not needed: starts are exact and fades are explicit | — | ➖ (by design) |
+| BASS_Split_* (one source to several outputs) | Not provided yet | | 🗓️ |
 
 ## 3. Add-on map
 
@@ -294,4 +320,60 @@ song.PlayOn(output);
 
 When porting, delete the analysis pass and the `BASS_ATTRIB_VOL` call that applied its result; keep using volume for fades and the user's volume control. If your library database already holds loudness values, pass them with `fa_stream_set_loudness` / `song.SetLoudness(lufs)` and no file is scanned at all.
 
-*More patterns (crossfades, tempo, FFmpeg hand-off, CD+G) are added here as each feature lands.*
+### Crossfade to the next track
+
+BASS (typical app code):
+```c
+/* At a position sync near the end of the current track: */
+HSTREAM next = BASS_StreamCreateFile(FALSE, path, 0, 0, 0);
+BASS_ChannelSetAttribute(next, BASS_ATTRIB_VOL, 0);
+BASS_ChannelPlay(next, FALSE);                                /* starts whenever the next update runs */
+BASS_ChannelSlideAttribute(next, BASS_ATTRIB_VOL, 1, 5000);   /* linear or log only */
+BASS_ChannelSlideAttribute(cur, BASS_ATTRIB_VOL, -1, 5000);   /* -1 = stop when the slide ends */
+/* ...and the user's volume setting is lost, because the fade used BASS_ATTRIB_VOL. */
+```
+
+FatzAudio:
+```c
+fa_stream_open_path(engine, path, NULL, &next);
+fa_crossfade(cur, next, 5000000000LL, NULL);   /* equal power; both start on the same frame */
+/* cur ends by itself when its fade is done (FA_EVENT_ENDED) */
+```
+
+.NET:
+```csharp
+var next = engine.OpenFile(path);
+await current.CrossfadeTo(next, TimeSpan.FromSeconds(5));
+current.Dispose();
+current = next;
+```
+
+When porting, delete the position sync and both slides. The volume the user set stays as it was, because crossfades have their own gain.
+
+### Gapless playlist or automatic crossfade
+
+BASS: a `BASS_SYNC_END | BASS_SYNC_MIXTIME` sync that creates and starts the next stream inside the mixer, with a small gap or overlap depending on the update period.
+
+FatzAudio:
+```c
+fa_stream_set_next(cur, next, 0, NULL);               /* gapless, to the sample */
+fa_stream_set_next(cur, next, 6000000000LL, NULL);    /* or: 6 s crossfade before the end */
+/* FA_EVENT_STARTED on next: queue the one after it */
+```
+
+.NET:
+```csharp
+current.QueueNext(next);                               // gapless
+current.QueueNext(next, TimeSpan.FromSeconds(6));      // or a 6 s crossfade
+next.Started += (_, _) => next.QueueNext(OpenFollowing());
+```
+
+Per-track points from your database (where the intro starts, where the outro fades, where the next song should come in) go into markers: `Markers.CueIn`, `CueOut`, `FadeOutStart`, `MixPoint`. The queue uses them.
+
+### Two decks and a crossfader
+
+BASS: two channels and two `BASS_ChannelSetAttribute(h, BASS_ATTRIB_VOL, ...)` calls from the slider, or a BASSmix mixer per deck.
+
+FatzAudio: one bus per deck, and the slider sets or ramps the bus volumes ([buses](../features/buses.md)). In .NET: `deckA.Volume = MathF.Cos(x * MathF.PI / 2); deckB.Volume = MathF.Sin(x * MathF.PI / 2);`.
+
+*More patterns (tempo, FFmpeg hand-off, CD+G) are added here as each feature lands.*
