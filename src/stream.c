@@ -37,6 +37,7 @@ static int is_attached(struct fa_stream* s) { return s->device != NULL; }
 
 void fa_stream_free_memory(struct fa_stream* s)
 {
+    free(s->carry);
     fa_mutex_destroy(&s->norm_lock);
     fa_mutex_destroy(&s->cb_lock);
     fa_mutex_destroy(&s->decode_lock);
@@ -50,6 +51,8 @@ static void release_chain(struct fa_stream* s)
     fa_ring_free(&s->ring);
     free(s->in_buf); s->in_buf = NULL;
     free(s->out_buf); s->out_buf = NULL;
+    free(s->hist); s->hist = NULL;
+    s->hist_cap = 0;
     s->in_cap = s->out_cap = s->in_count = s->in_offset = 0;
     s->decoded = 0;
     s->draining = 0;
@@ -267,6 +270,44 @@ static void update_estimate(struct fa_stream* s, const float* frames, fa_frames 
 
 /* Decodes, converts to the device format and appends to the ring until it is
  * full, `max_frames` were produced, or the source ended. Caller holds decode_lock. */
+/* Appends source frames to the history of a forward-only stream (see `hist`). */
+static void hist_write(struct fa_stream* s, const float* in, fa_frames n)
+{
+    uint32_t ch = s->decoder.format.channels;
+    fa_frames at, first;
+    if (n > s->hist_cap) { in += (size_t)(n - s->hist_cap) * ch; n = s->hist_cap; }
+    at = s->decoded % s->hist_cap;
+    first = s->hist_cap - at < n ? s->hist_cap - at : n;
+    memcpy(s->hist + (size_t)at * ch, in, (size_t)first * ch * sizeof(float));
+    memcpy(s->hist, in + (size_t)first * ch, (size_t)(n - first) * ch * sizeof(float));
+}
+
+/* Detaching a forward-only stream: moves the `unheard` most recent source frames from
+ * the history to the front of `carry`, so they play on the next attach. Caller holds
+ * decode_lock. Returns 0 if it could not (out of memory), and nothing changes. */
+static int keep_unheard(struct fa_stream* s, fa_frames unheard)
+{
+    uint32_t ch = s->decoder.format.channels;
+    fa_frames left = s->carry_count, total, start, first;
+    float* buf;
+    if (unheard > s->decoded) unheard = s->decoded;
+    if (unheard > s->hist_cap) unheard = s->hist_cap;
+    if (unheard <= 0) return 1;
+    total = unheard + left;
+    buf = (float*)malloc((size_t)total * ch * sizeof(float));
+    if (!buf) return 0;
+    start = (s->decoded - unheard) % s->hist_cap;
+    first = s->hist_cap - start < unheard ? s->hist_cap - start : unheard;
+    memcpy(buf, s->hist + (size_t)start * ch, (size_t)first * ch * sizeof(float));
+    memcpy(buf + (size_t)first * ch, s->hist, (size_t)(unheard - first) * ch * sizeof(float));
+    if (left > 0) memcpy(buf + (size_t)unheard * ch, s->carry + (size_t)s->carry_offset * ch, (size_t)left * ch * sizeof(float));
+    free(s->carry);
+    s->carry = buf;
+    s->carry_count = total;
+    s->carry_offset = 0;
+    return 1;
+}
+
 void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
 {
     uint32_t ch = s->decoder.format.channels;
@@ -284,7 +325,16 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 fa_store32(&s->eof, 1);
                 break;
             }
-            fa_decoder_read(&s->decoder, s->in_buf, s->in_cap, &got);
+            int from_carry = s->carry_count > 0;
+            if (from_carry) {                     /* audio decoded ahead before a detach */
+                got = s->carry_count < s->in_cap ? s->carry_count : s->in_cap;
+                memcpy(s->in_buf, s->carry + (size_t)s->carry_offset * ch, (size_t)got * ch * sizeof(float));
+                s->carry_offset += got;
+                s->carry_count -= got;
+            } else {
+                fa_decoder_read(&s->decoder, s->in_buf, s->in_cap, &got);
+            }
+            if (s->hist) hist_write(s, s->in_buf, got);
             s->in_offset = 0;
             s->in_count = got;
             s->decoded += got;
@@ -308,7 +358,7 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 break;
             }
             just_looped = 0;
-            update_estimate(s, s->in_buf, got);
+            if (!from_carry) update_estimate(s, s->in_buf, got); /* carried audio was measured */
         }
         in_n = (ma_uint64)s->in_count;
         out_n = (ma_uint64)(room < s->out_cap ? room : s->out_cap);
@@ -329,7 +379,8 @@ static fa_frames attached_position(struct fa_stream* s)
     fa_frames base = fa_load64(&s->seek_base);
     int64_t played = fa_load64(&s->played);
     fa_frames pos = base + (fa_frames)((double)played * (double)s->decoder.format.sample_rate / (double)s->dev_rate + 0.5);
-    if ((s->flags & FA_OPEN_LOOP) && s->decoder.length > 0) pos %= s->decoder.length;
+    /* Only a seekable source loops (looping seeks back to 0); a forward-only one ends. */
+    if ((s->flags & FA_OPEN_LOOP) && s->decoder.seekable && s->decoder.length > 0) pos %= s->decoder.length;
     else if (s->decoder.length >= 0 && pos > s->decoder.length) pos = s->decoder.length;
     return pos;
 }
@@ -381,7 +432,13 @@ static fa_result build_chain_locked(struct fa_stream* s, fa_device* dev)
     s->out_cap = FA_DECODE_CHUNK * 2;
     s->in_buf = (float*)malloc((size_t)s->in_cap * ch * sizeof(float));
     s->out_buf = (float*)malloc((size_t)s->out_cap * FA_DEVICE_CHANNELS * sizeof(float));
-    if (!s->in_buf || !s->out_buf || fa_ring_init(&s->ring, FA_DEVICE_CHANNELS, capacity) != FA_OK) {
+    if (!s->decoder.seekable) {
+        /* Everything not yet heard: the ring, the input chunk and the resampler's delay. */
+        s->hist_cap = (fa_frames)((double)capacity * s->decoder.format.sample_rate / dev->rate) + 2 * s->in_cap + 256;
+        s->hist = (float*)malloc((size_t)s->hist_cap * ch * sizeof(float));
+    }
+    if (!s->in_buf || !s->out_buf || (!s->decoder.seekable && !s->hist) ||
+        fa_ring_init(&s->ring, FA_DEVICE_CHANNELS, capacity) != FA_OK) {
         release_chain(s);
         return FA_ERROR_OUT_OF_MEMORY;
     }
@@ -401,10 +458,12 @@ static void detach_locked(struct fa_stream* s)
     s->dev_rate = 0;
     s->device = NULL;
     /* Continue later from what was actually heard, not from what was decoded ahead.
-     * A forward-only source cannot go back: the audio buffered ahead is skipped, and
-     * the position says where decoding really continues. */
-    if (fa_decoder_seek(&s->decoder, pos) != FA_OK && !s->decoder.seekable)
-        pos = fa_load64(&s->seek_base) + s->decoded;
+     * A forward-only source cannot go back, so it keeps the audio decoded ahead and
+     * plays it first on the next attach. */
+    if (s->decoder.seekable) fa_decoder_seek(&s->decoder, pos);
+    else if (!keep_unheard(s, fa_load64(&s->seek_base) + s->decoded - pos)) {
+        pos = fa_load64(&s->seek_base) + s->decoded; /* out of memory: skip it as before */
+    }
     fa_store64(&s->position, pos);
     release_chain(s);
     fa_store32(&s->eof, 0);

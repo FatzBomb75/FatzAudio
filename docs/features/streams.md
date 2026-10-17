@@ -107,7 +107,7 @@ Ownership rules for `user`:
 - After a successful open, `close` is called **exactly once**, from `fa_stream_close`, after the last `read`/`seek`/`length` call.
 - The callbacks are never called at the same time for one stream, but they can be called from engine threads.
 - `seek` may be `NULL` for forward-only sources such as pipes or sockets. The stream still opens and plays (a `length` callback is fine too), but `fa_stream_seek` returns `FA_ERROR_NOT_SEEKABLE` and `fa_stream_info.seekable` is 0.
-- A forward-only stream that is detached while playing skips the audio that was decoded ahead, because it can't go back. Its position then says where it really continues.
+- A forward-only stream that is detached while playing keeps the audio it had decoded ahead and plays it first when you attach it again, so nothing is skipped, even on a device with a different sample rate. Its position is where you stopped hearing it, as with any other stream.
 - `seek` is called by `fa_stream_seek` itself, so a seek your callback refuses fails right there.
 
 ## C#
