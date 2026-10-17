@@ -391,11 +391,13 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
     fa_mutex_unlock(&stream->decode_lock);
     if (r == FA_OK) {
         stream->device = device;
+        /* Track it first: from the moment the voice is live, events it spills must be found. */
+        fa_engine_track_stream(stream->engine, stream, 1);
         r = fa_device_add_voice(device, stream);
         if (r == FA_OK) {
-            fa_engine_track_stream(stream->engine, stream, 1);
             if (was_playing) fa_cas32(&stream->state, FA_STATE_PAUSED, FA_STATE_PLAYING); /* a move keeps playing */
         } else {
+            fa_engine_track_stream(stream->engine, stream, 0);
             stream->device = NULL;
             fa_mutex_lock(&stream->decode_lock);
             stream->dev_rate = 0;
@@ -533,9 +535,10 @@ static fa_result post_param(struct fa_stream* s, fa_param param, float target, f
     old = fa_load32(&m->word);
     seq = ((old & ~FA_CMD_CLAIMED) + 1) & ~FA_CMD_CLAIMED;
     slot = &m->slot[seq & 1];
-    if (!(old & FA_CMD_CLAIMED)) {
-        /* Replacing a command the mixer has not applied yet: keep the value a plain
-         * set asked for, so "volume = 0, then ramp to 1" still fades in from 0. */
+    if (notify && !(old & FA_CMD_CLAIMED)) {
+        /* A ramp replacing a command the mixer has not applied yet: keep the value a
+         * plain set asked for, so "volume = 0, then ramp to 1" still fades in from 0.
+         * (A plain set replacing one simply takes over, gliding from what is heard.) */
         if (!m->last_notify) { has_start = 1; start = m->last_target; }
         else if (m->last_has_start) { has_start = 1; start = m->last_start; }
     }
@@ -550,9 +553,13 @@ static fa_result post_param(struct fa_stream* s, fa_param param, float target, f
     fa_store32(&slot->notify, notify);
 
     /* Publish. If the audio thread never claimed the previous command, it never
-     * started, so its RAMP_DONE is ours to raise (the audio thread will not). */
+     * started, so its RAMP_DONE is ours to raise (the audio thread will not). Its
+     * sequence number is taken before the new command becomes visible, so it is
+     * delivered before anything the new command raises. */
     {
-        int32_t prev;
+        int32_t prev, done_seq;
+        fa_mutex_lock(&s->engine->list_lock);
+        done_seq = fa_fetch_add32(&s->engine->event_seq, 1);
         for (;;) {
             prev = fa_load32(&m->word);
             if (fa_cas32(&m->word, prev, seq)) break;
@@ -563,8 +570,9 @@ static fa_result post_param(struct fa_stream* s, fa_param param, float target, f
             ev.stream = s;
             ev.frame = fa_stream_position_now(s);
             ev.value = m->last_tag;
-            fa_engine_post_event(s->engine, &ev);
+            fa_engine_post_event_locked(s->engine, &ev, done_seq);
         }
+        fa_mutex_unlock(&s->engine->list_lock);
     }
     m->last_notify = notify;
     m->last_tag = ramp ? ramp->tag : 0;

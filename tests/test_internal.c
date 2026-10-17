@@ -637,6 +637,111 @@ static void test_forward_only_detach_position(void)
     free(wav);
 }
 
+static void test_consecutive_sets_glide_from_heard(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    float out[2 * 64];
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(s, out, 64);                              /* audible at volume 1 */
+    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_VOLUME, 0.0f), FA_OK);
+    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_VOLUME, 0.5f), FA_OK); /* replaces it before mixing */
+    render(s, out, 64);
+    CHECK_NEAR(out[0], 0.5, 1e-3);                   /* glides from 1, no jump to silence */
+    fa_stream_close(s);
+}
+
+static void test_slow_callback_loses_nothing(void)
+{
+    fa_stream* s = open_attached(g_dev->rate * 4, 0, FA_OPEN_LOOP);
+    recorder rec;
+    fa_ramp r;
+    fa_event park;
+    float out[2 * 16];
+    int i, total = FA_EVENT_QUEUE_SIZE + 200;
+    rec_init(&rec);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(s, record_and_hold, &rec), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    fa_store32(&g_hold, 1);                          /* the app's callback blocks */
+    memset(&park, 0, sizeof(park));
+    park.type = FA_EVENT_STALLED;
+    park.stream = s;
+    fa_engine_post_event(g_engine, &park);
+    CHECK_EQ(count_events(&rec, FA_EVENT_STALLED, 1), 1);
+    memset(&r, 0, sizeof(r));
+    for (i = 0; i < total; i++) {
+        r.tag = i;
+        CHECK_EQ(fa_stream_ramp_param(s, FA_PARAM_VOLUME, (float)(i & 1), 0, 0, &r), FA_OK);
+        render(s, out, 16);
+        if (i % 100 == 99) fa_sleep_ms(10);          /* audio callbacks are spaced out in time */
+    }
+    fa_store32(&g_hold, 0);
+    CHECK_EQ(count_events(&rec, FA_EVENT_RAMP_DONE, total), total);
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
+static void test_publishing_audio_event_holds_later_ones(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    recorder rec;
+    fa_qevent early;
+    fa_event later;
+    rec_init(&rec);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    /* An audio thread took a sequence number and was preempted before publishing. */
+    fa_fetch_add32(&g_dev->publishing, 1);
+    memset(&early, 0, sizeof(early));
+    early.ev.type = FA_EVENT_STALLED;
+    early.ev.stream = s;
+    early.seq = fa_fetch_add32(&g_engine->event_seq, 1);
+    memset(&later, 0, sizeof(later));
+    later.type = FA_EVENT_RESUMED;
+    later.stream = s;
+    fa_engine_post_event(g_engine, &later);          /* a later API event */
+    fa_sleep_ms(30);
+    fa_mutex_lock(&rec.lock);
+    CHECK_EQ(rec.count, 0);                          /* held back */
+    fa_mutex_unlock(&rec.lock);
+    CHECK(fa_event_queue_push(&g_dev->events, &early));
+    fa_fetch_add32(&g_dev->publishing, -1);
+    CHECK_EQ(count_events(&rec, FA_EVENT_RESUMED, 1), 1);
+    CHECK_EQ(rec.ev[0].type, FA_EVENT_STALLED);      /* in sequence order */
+    CHECK_EQ(rec.ev[1].type, FA_EVENT_RESUMED);
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
+static void test_counters_wrap(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    recorder rec;
+    fa_ramp r;
+    float out[2 * 16];
+    int i;
+    rec_init(&rec);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    fa_mutex_lock(&g_engine->list_lock);             /* queue is empty and nobody is draining */
+    fa_store32(&g_dev->events.head, 0x7FFFFFFE);
+    fa_store32(&g_dev->events.tail, 0x7FFFFFFE);
+    fa_store32(&g_engine->event_seq, 0x7FFFFFFE);
+    fa_mutex_unlock(&g_engine->list_lock);
+    memset(&r, 0, sizeof(r));
+    for (i = 0; i < 6; i++) {
+        r.tag = i;
+        CHECK_EQ(fa_stream_ramp_param(s, FA_PARAM_VOLUME, 0.5f, 0, 0, &r), FA_OK);
+        render(s, out, 16);
+    }
+    CHECK_EQ(count_events(&rec, FA_EVENT_RAMP_DONE, 6), 6);
+    for (i = 0; i < 6; i++) CHECK_EQ(rec.ev[i].value, i);
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -668,6 +773,10 @@ int main(void)
     RUN(test_move_keeps_playing);
     RUN(test_resampled_end_is_complete);
     RUN(test_forward_only_detach_position);
+    RUN(test_consecutive_sets_glide_from_heard);
+    RUN(test_slow_callback_loses_nothing);
+    RUN(test_publishing_audio_event_holds_later_ones);
+    RUN(test_counters_wrap);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

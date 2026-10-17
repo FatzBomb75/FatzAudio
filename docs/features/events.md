@@ -47,5 +47,5 @@ song.RampCompleted += (_, e) => Console.WriteLine($"ramp {e.Value} done at {e.Po
 - When `fa_stream_set_event_callback` (replacing a callback) or `fa_stream_close` returns, the previous callback isn't running and won't be called again, so you can free its `user` data. The one exception is calling them from inside that callback itself.
 - Events queued for a stream that has since been closed are dropped, not delivered.
 - Events for a stream arrive in the order they happened, whether the audio thread raised them (a ramp finishing) or an API call did (a ramp replaced before it started).
-- `ENDED` and `RAMP_DONE` are never lost, so a `RampAsync` always completes. Each device queues up to 1024 events between event-thread rounds (every few milliseconds); past that, these two are parked on the stream until the next round.
+- `ENDED` and `RAMP_DONE` aren't lost, so a `RampAsync` always completes. A slow callback only delays later events: the decode workers keep moving events off the audio thread's queue every few milliseconds while your callback runs.
 - Closing a device delivers what it had queued. A callback may also call `fa_engine_destroy` after closing the engine's streams; the teardown finishes once the callback returns.

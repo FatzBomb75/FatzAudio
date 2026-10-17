@@ -74,6 +74,7 @@ static void worker_main(void* arg)
         struct fa_stream* s;
         struct fa_stream* pick = NULL;
         double best = 2.0;
+        fa_event_collect_locked(e);  /* keeps the audio thread's event queues drained */
         for (s = e->streams; s; s = s->next) {
             double fill;
             if (!fa_stream_needs_work(s)) continue;

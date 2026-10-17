@@ -159,8 +159,15 @@ int fa_event_queue_pop(fa_event_queue* q, fa_qevent* out);
  * ENDED and RAMP_DONE are not lost (a RampAsync waits on them). */
 void fa_audio_post_event(struct fa_device* d, struct fa_stream* s, fa_event_type type, int64_t frame, int64_t value);
 
-/* From any non-audio thread. */
+/* From any non-audio thread. The _locked form takes a sequence number the caller
+ * got with fa_fetch_add32(&engine->event_seq, 1) while holding list_lock. */
 void fa_engine_post_event(fa_engine* engine, const fa_event* ev);
+void fa_engine_post_event_locked(fa_engine* engine, const fa_event* ev, int32_t seq);
+
+/* Moves events from the device queues and spill slots to the pending list, so a
+ * slow event callback cannot let them fill up. Caller holds list_lock; decode
+ * workers and the event thread both call it. Returns how many were moved. */
+uint32_t fa_event_collect_locked(fa_engine* e);
 
 /* Moves a device's queued events (and a stream's spilled ones) to the engine's
  * pending list. Caller holds list_lock and the audio thread must not be using them. */
@@ -210,6 +217,7 @@ struct fa_device {
     fa_atomic64 epoch;           /* odd while the audio callback runs */
     fa_event_queue events;       /* audio callback -> event thread */
     fa_atomic32 spilled;         /* 1 = some stream on this device used its spill slots */
+    fa_atomic32 publishing;      /* audio thread is between taking a sequence number and publishing */
     struct fa_device* next;      /* engine->devices */
 };
 
