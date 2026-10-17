@@ -16,7 +16,13 @@
 /* ---- Atomics (seq_cst; lock-free on every supported target) ---------------- */
 
 typedef struct { volatile int32_t v; } fa_atomic32;
-typedef struct { volatile int64_t v; } fa_atomic64;
+#if defined(FA_MSVC_ATOMICS)
+typedef struct { volatile int64_t v; } fa_atomic64;   /* MSVC aligns int64_t to 8 */
+#else
+/* 8-byte aligned even where int64_t is only 4 (32-bit x86 Linux and Android): a
+ * misaligned 64-bit atomic can straddle two cache lines, a split lock. */
+typedef struct { _Alignas(8) volatile int64_t v; } fa_atomic64;
+#endif
 typedef struct { void* volatile v; } fa_atomic_ptr;
 
 #if defined(FA_MSVC_ATOMICS)

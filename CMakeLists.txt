@@ -23,8 +23,15 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
-option(FA_BUILD_TESTS "Build FatzAudio tests" ON)
-option(FA_BUILD_TOOLS "Build the listening and comparison tools (tools/)" ON)
+# iOS executables need an app bundle and a signed device or simulator to run, so
+# an iOS build makes only the library (docs/building.md).
+if(IOS)
+    set(FA_EXECUTABLES_DEFAULT OFF)
+else()
+    set(FA_EXECUTABLES_DEFAULT ON)
+endif()
+option(FA_BUILD_TESTS "Build FatzAudio tests" ${FA_EXECUTABLES_DEFAULT})
+option(FA_BUILD_TOOLS "Build the listening and comparison tools (tools/)" ${FA_EXECUTABLES_DEFAULT})
 
 set(FA_SOURCES
     src/engine.c
@@ -101,6 +108,12 @@ if(WIN32)
 elseif(APPLE)
     enable_language(OBJC)
     list(APPEND FA_SOURCES src/net_https_apple.m src/disc_mac.c)
+    # Objective-C files (and miniaudio on iOS) export only fa_*, like the C ones.
+    set(CMAKE_OBJC_VISIBILITY_PRESET hidden)
+    if(IOS)
+        # miniaudio sets up the AVAudioSession on iOS, which is Objective-C.
+        set_source_files_properties(src/miniaudio_impl.c PROPERTIES LANGUAGE OBJC)
+    endif()
 else()
     list(APPEND FA_SOURCES src/net_https_curl.c src/disc_linux.c)
 endif()
@@ -136,7 +149,11 @@ if(WIN32)
     set(FA_NET_LIBS ws2_32 winhttp mfuuid ole32)
 elseif(APPLE)
     set(FA_NET_LIBS "-framework Foundation" "-framework CFNetwork")
-    if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    if(IOS)
+        # miniaudio links Core Audio directly on iOS (no runtime loading there).
+        list(APPEND FA_NET_LIBS "-framework CoreFoundation" "-framework CoreAudio"
+            "-framework AudioToolbox" "-framework AVFoundation")
+    else()
         list(APPEND FA_NET_LIBS "-framework IOKit" "-framework CoreFoundation")
     endif()
     set_source_files_properties(src/net_https_apple.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -146,6 +163,40 @@ endif()
 target_link_libraries(fatzaudio PRIVATE ${FA_NET_LIBS})
 if(UNIX)
     target_link_libraries(fatzaudio PRIVATE m)
+endif()
+if(ANDROID)
+    # The C++ runtime is linked in (the NDK's default c++_static), so the .so needs
+    # no libc++_shared.so; keep its symbols out of the export table so they cannot
+    # clash with the app's own C++ runtime. 16 KB pages: required by Android 15+
+    # devices with 16 KB pages and by Google Play (NDK r28 and later do it anyway).
+    # Release builds drop the NDK's debug info (10 MB) but keep the symbol table,
+    # so crash reports still name functions.
+    target_link_options(fatzaudio PRIVATE "-Wl,--exclude-libs,ALL" "-Wl,-z,max-page-size=16384"
+        "$<$<CONFIG:Release,MinSizeRel>:-Wl,--strip-debug>")
+elseif(IOS)
+    set(FA_IOS_BUNDLE_ID "com.fatzaudio.fatzaudio" CACHE STRING "CFBundleIdentifier of fatzaudio.framework")
+    # iOS apps embed dynamic code only as frameworks: fatzaudio.framework, combined
+    # into fatzaudio.xcframework by tools/build-xcframework.sh.
+    # CMake's own Info.plist template has no MinimumOSVersion, which the App Store
+    # requires of embedded frameworks.
+    if(CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
+        set(FA_IOS_PLATFORM iPhoneSimulator)
+    else()
+        set(FA_IOS_PLATFORM iPhoneOS)
+    endif()
+    if(CMAKE_OSX_DEPLOYMENT_TARGET)
+        set(FA_IOS_MIN ${CMAKE_OSX_DEPLOYMENT_TARGET})
+    else()
+        set(FA_IOS_MIN 13.0)
+    endif()
+    configure_file(cmake/ios-framework-Info.plist.in ${CMAKE_BINARY_DIR}/ios-framework-Info.plist.in @ONLY)
+    set_target_properties(fatzaudio PROPERTIES
+        FRAMEWORK TRUE
+        MACOSX_FRAMEWORK_INFO_PLIST ${CMAKE_BINARY_DIR}/ios-framework-Info.plist.in
+        MACOSX_FRAMEWORK_IDENTIFIER ${FA_IOS_BUNDLE_ID}
+        MACOSX_FRAMEWORK_SHORT_VERSION_STRING ${PROJECT_VERSION}
+        MACOSX_FRAMEWORK_BUNDLE_VERSION ${PROJECT_VERSION}
+        PUBLIC_HEADER "include/fatzaudio/fatzaudio.h;include/fatzaudio/fatzaudio_ffmpeg.h")
 endif()
 
 if(MSVC)
