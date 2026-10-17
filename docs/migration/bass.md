@@ -283,6 +283,7 @@ Opus and Vorbis are built-in formats: `.opus` and `.ogg` files, chained files, O
 | BASS_OPUS_StreamCreate (`BASS_OPUS_HEAD`) + BASS_OPUS_StreamPutData (raw packets) | `fa_stream_open_packets` with codec `opus`, the `OpusHead` as extradata (or none for plain mono/stereo), then `fa_stream_push_packet` ([FFmpeg hand-off](../features/ffmpeg.md)) | `engine.OpenPackets`, `PushPacket` | ✅ |
 | BASS_PluginLoad("bassopus.dll") | Not needed: built in | — | ➖ (by design) |
 | BASS_CONFIG_OGG_PRESCAN (exact length and seeking of chained/VBR files) | Always exact: the length comes from the last page, chained files are read once at open | automatic | ✅ |
+| BASS_ChannelSetPosition on Opus and Vorbis | `fa_stream_seek`: lands on the frame asked for. Opus decodes 300 ms ahead of the target, so the audio after a seek matches a straight decode (bassopus: about 30 dB off in Ogg, 55 dB in WebM); Vorbis is bit exact. About a millisecond per seek ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | `stream.Position` | ✅ |
 | BASS_ATTRIB_OPUS_GAIN / the header's output gain | The header gain is applied; add your own with the stream volume | `stream.Volume` | ✅ |
 | BASS_ATTRIB_OPUS_ORIGFREQ (the encoder's input rate) | Not exposed: Opus always decodes at 48 kHz | — | ➖ |
 | BASS_ChannelGetTags(BASS_TAG_OGG) | ReplayGain / R128 comments are used for normalization automatically, and radio titles come through `fa_stream_get_metadata`; a general tag reader is planned | | 🗓️ |

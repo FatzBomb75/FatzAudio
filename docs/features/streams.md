@@ -201,7 +201,7 @@ fa_stream_open_path(engine, "song.opus", NULL, &s);     /* or .ogg, .oga */
 using var s = engine.OpenFile("song.opus");
 ```
 
-- **Length and seeking** are sample exact. The length comes from the last page's granule position, Opus pre-skip is dropped, and the end is trimmed where the encoder padded it. Opus restarts 80 ms before a seek target, as the format asks.
+- **Length and seeking** are sample exact. The length comes from the last page's granule position, Opus pre-skip is dropped, and the end is trimmed where the encoder padded it. Opus restarts 300 ms before a seek target (the format asks for at least 80 ms, which can leave the first audio after a seek only 30 dB from a straight decode; 300 ms brings it within about 80 dB). A seek decodes only the packets it needs: the rest of the page it lands on is skipped, so a seek takes about a millisecond.
 - **Output gain** in the Opus header is applied, and ReplayGain / R128 tags in the comment header (`R128_TRACK_GAIN` in OpusTags, `REPLAYGAIN_*` in Vorbis comments) feed normalization like any other tags ([normalization](normalization.md)).
 - **Channels:** up to 8 channels come out in the standard speaker order (see [Dolby Digital](dolby.md#channels)), not Ogg's own order. Quadraphonic sound plays as 5 channels with a silent centre. Opus ambisonics (mapping family 2) plays its channels as they are; family 3 needs FFmpeg.
 - **Chained files** (songs joined one after another, each with its own headers) play straight through. The first song sets the stream's rate and channels; later songs with a different format are converted. On a seekable local file the length and seeking cover every song (the file's page headers are read once at open). A chained file over HTTP plays through but can't seek.

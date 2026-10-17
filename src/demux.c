@@ -118,6 +118,8 @@ fa_result fa_br_read_alloc(fa_br* b, size_t n, size_t max, uint8_t** buf, size_t
 
 /* ---- codec knowledge -------------------------------------------------------------- */
 
+#define OPUS_PREROLL_S 0.3     /* decoded before an Opus seek target, at least */
+
 typedef struct codec_info {
     const char* name;
     int packets_back;   /* packets decoded before a seek target */
@@ -131,7 +133,7 @@ static const codec_info codecs[] = {
     { "mp2", 1, 0, 1 }, { "mp1", 1, 0, 1 }, { "vorbis", 1, 0, 0 },
     /* An MP3 frame's data may start up to 511 bytes back, in earlier frames. */
     { "mp3", 1, 1024, 1 },
-    /* Opus converges within its time pre-roll (seek_preroll_s). */
+    /* Opus converges within its time pre-roll (seek_preroll_s, OPUS_PREROLL_S). */
     { "opus", 1, 0, 1 },
     /* TrueHD decodes from a major sync, at least every 128 access units. */
     { "truehd", 130, 0, 0 }, { "mlp", 130, 0, 0 },
@@ -385,7 +387,10 @@ static void codec_settings(fa_track* t, const fa_codec_params* p)
     t->p.codec.extradata_size = 0;
     t->packets_back = ci ? ci->packets_back : pcm_bytes(p->codec) > 0 ? 0 : 1;
     t->bytes_back = ci ? ci->bytes_back : 0;
-    if (strcmp(p->codec, "opus") == 0 && t->p.seek_preroll_s <= 0) t->p.seek_preroll_s = 0.08;
+    /* Opus asks for 80 ms (RFC 7845 4.6), after which the audio can still be only
+     * 30 dB from a straight decode; after 300 ms it is within about 80 dB. This
+     * overrides a container's shorter SeekPreRoll (WebM writes 80 ms). */
+    if (strcmp(p->codec, "opus") == 0 && t->p.seek_preroll_s < OPUS_PREROLL_S) t->p.seek_preroll_s = OPUS_PREROLL_S;
     /* FFmpeg's WMA 1 and 2 give their first audio a packet or two late. */
     t->trails = strcmp(p->codec, "wmav1") == 0 || strcmp(p->codec, "wmav2") == 0;
 }
