@@ -21,7 +21,8 @@ static ma_result on_seek(ma_decoder* d, ma_int64 offset, ma_seek_origin origin)
     int64_t target = offset;
     if (origin == ma_seek_origin_current) target = fa_source_tell(src) + offset;
     else if (origin == ma_seek_origin_end) {
-        if (src->length < 0) return MA_NOT_IMPLEMENTED;
+        /* Going to the end of a forward-only source would consume all of it. */
+        if (src->length < 0 || !src->seekable) return MA_NOT_IMPLEMENTED;
         target = src->length + offset;
     }
     return fa_source_seek(src, target) == FA_OK ? MA_SUCCESS : MA_BAD_SEEK;
@@ -80,17 +81,41 @@ static void ma_close(fa_decoder* dec)
     }
 }
 
+/* WAV/AIFF use dr_wav directly (see miniaudio_impl.c) so a forward-only source
+ * can be opened in sequential mode. */
 static fa_result wav_open(fa_decoder* dec)
 {
     const uint8_t* head;
     size_t n = fa_source_peek(dec->src, &head);
-    fa_result r = open_with(dec, ma_encoding_format_wav);
-    if (r == FA_OK) {
-        int aiff = n >= 4 && memcmp(head, "FORM", 4) == 0;
-        snprintf(dec->codec, sizeof(dec->codec), "pcm");
-        snprintf(dec->container, sizeof(dec->container), "%s", aiff ? "aiff" : "wav");
-    }
-    return r;
+    uint32_t rate = 0, channels = 0;
+    uint64_t frames = 0;
+    fa_result r = fa_drwav_open(dec->src, !dec->src->seekable, &dec->impl, &rate, &channels, &frames);
+    if (r != FA_OK) return r;
+    dec->format.sample_rate = rate;
+    dec->format.channels = channels;
+    dec->seekable = dec->src->seekable;
+    if (frames > 0) dec->length = (fa_frames)frames;
+    snprintf(dec->codec, sizeof(dec->codec), "pcm");
+    snprintf(dec->container, sizeof(dec->container), "%s", n >= 4 && memcmp(head, "FORM", 4) == 0 ? "aiff" : "wav");
+    return FA_OK;
+}
+
+static fa_result wav_read(fa_decoder* dec, float* out, fa_frames frames, fa_frames* got)
+{
+    uint64_t n = fa_drwav_read(dec->impl, out, (uint64_t)frames);
+    *got = (fa_frames)n;
+    return n > 0 ? FA_OK : FA_ERROR_END_OF_STREAM;
+}
+
+static fa_result wav_seek(fa_decoder* dec, fa_frames frame)
+{
+    return fa_drwav_seek(dec->impl, (uint64_t)frame) ? FA_OK : FA_ERROR_NOT_SEEKABLE;
+}
+
+static void wav_close(fa_decoder* dec)
+{
+    fa_drwav_close(dec->impl);
+    dec->impl = NULL;
 }
 
 static fa_result flac_open(fa_decoder* dec) { return open_with(dec, ma_encoding_format_flac); }
@@ -99,7 +124,7 @@ static fa_result mp3_open(fa_decoder* dec) { return open_with(dec, ma_encoding_f
 const fa_decoder_vtable fa_decoder_wav = {
     "wav", "WAV, RF64, Wave64 and AIFF (PCM, float, ADPCM)", "wav;wave;rf64;w64;bwf;aif;aiff;aifc",
     "audio/wav;audio/x-wav;audio/wave;audio/vnd.wave;audio/aiff;audio/x-aiff",
-    fa_probe_wav, wav_open, ma_read, ma_seek, ma_close
+    fa_probe_wav, wav_open, wav_read, wav_seek, wav_close
 };
 
 const fa_decoder_vtable fa_decoder_flac = {

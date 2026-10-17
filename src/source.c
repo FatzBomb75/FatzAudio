@@ -97,13 +97,19 @@ fa_result fa_source_open_io(fa_source* src, const fa_io_callbacks* io, void* use
 static int64_t io_read_raw(fa_source* src, void* buf, size_t n)
 {
     size_t done = 0;
+    int64_t err = 0;
     while (done < n) {
         int64_t r = src->io.read(src->io_user, (uint8_t*)buf + done, n - done);
-        if (r < 0) return done > 0 ? (int64_t)done : r;
+        if (r < 0) { err = r; break; }
         if (r == 0) break;
         done += (size_t)r;
     }
+    /* Count what was read even when a later call failed: the app's cursor moved. */
     src->raw_pos += (int64_t)done;
+    if (err < 0) {
+        if (src->error == FA_OK) src->error = (fa_result)err;
+        if (done == 0) return err;
+    }
     return (int64_t)done;
 }
 
@@ -145,7 +151,10 @@ int64_t fa_source_read(fa_source* src, void* buf, size_t n)
     if (src->kind == FA_SOURCE_FILE) {
         size_t got = fread(out, 1, n, src->file);
         src->pos += (int64_t)got;
-        if (got == 0 && ferror(src->file)) return FA_ERROR_IO;
+        if (ferror(src->file)) {
+            if (src->error == FA_OK) src->error = FA_ERROR_IO;
+            if (got == 0) return FA_ERROR_IO;
+        }
         return (int64_t)got;
     }
 
@@ -160,7 +169,10 @@ int64_t fa_source_read(fa_source* src, void* buf, size_t n)
     }
     if (src->raw_pos != src->pos) {
         if (!src->seekable) return done > 0 ? (int64_t)done : FA_ERROR_NOT_SEEKABLE;
-        if (src->io.seek(src->io_user, src->pos) != FA_OK) return done > 0 ? (int64_t)done : FA_ERROR_IO;
+        if (src->io.seek(src->io_user, src->pos) != FA_OK) {
+            if (src->error == FA_OK) src->error = FA_ERROR_IO;
+            return done > 0 ? (int64_t)done : FA_ERROR_IO;
+        }
         src->raw_pos = src->pos;
     }
     {
@@ -183,6 +195,12 @@ fa_result fa_source_seek(fa_source* src, int64_t offset)
         if (file_seek(src->file, offset, SEEK_SET) != 0) return FA_ERROR_IO;
         break;
     default:
+        if (src->seekable && offset >= (int64_t)src->prefix_len) {
+            /* Ask the app now, so a seek it rejects fails here rather than on a later read. */
+            if (src->io.seek(src->io_user, offset) != FA_OK) return FA_ERROR_IO;
+            src->raw_pos = offset;
+            break;
+        }
         /* Inside the prefix, or forward on a non-seekable source, is always possible;
          * the actual repositioning happens lazily on the next read. */
         if (!src->seekable && offset > (int64_t)src->prefix_len && offset != src->raw_pos) {

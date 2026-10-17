@@ -148,11 +148,17 @@ static buf make_mp3(uint32_t nframes, int with_id3)
 
 /* ---- custom I/O ------------------------------------------------------------ */
 
-typedef struct mem_io { const uint8_t* p; size_t n, pos; int closes; } mem_io;
+/* fail_at: reads at or past this byte fail (0 = never); seek_limit: seeks past it
+ * are refused (0 = no limit). */
+typedef struct mem_io { const uint8_t* p; size_t n, pos; int closes; size_t fail_at, seek_limit; } mem_io;
 static int64_t FA_CALL io_read(void* u, void* dst, size_t bytes)
 {
     mem_io* m = (mem_io*)u;
     size_t k = m->n - m->pos;
+    if (m->fail_at) {
+        if (m->pos >= m->fail_at) return FA_ERROR_IO;
+        if (k > m->fail_at - m->pos) k = m->fail_at - m->pos; /* partial, then the error */
+    }
     if (bytes > 1000) bytes = 1000; /* force short reads */
     if (k > bytes) k = bytes;
     memcpy(dst, m->p + m->pos, k);
@@ -163,6 +169,7 @@ static fa_result FA_CALL io_seek(void* u, int64_t off)
 {
     mem_io* m = (mem_io*)u;
     if (off < 0 || (size_t)off > m->n) return FA_ERROR_INVALID_ARG;
+    if (m->seek_limit && (size_t)off > m->seek_limit) return FA_ERROR_IO;
     m->pos = (size_t)off;
     return FA_OK;
 }
@@ -347,6 +354,120 @@ static void test_open_io_failure_keeps_ownership(void)
     CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, NULL, &s), FA_ERROR_INVALID_ARG);
 }
 
+/* A forward-only source that still reports its length: no seek to the end. */
+static void test_forward_only_with_length(void)
+{
+    buf media = make_wav(22050, 1, 30000);
+    mem_io m = { 0 };
+    fa_io_callbacks io = { io_read, NULL, io_length, io_close };
+    fa_open_options o = decode_only();
+    fa_stream* s = NULL;
+    int nonzero;
+    m.p = media.p; m.n = media.n;
+    CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_OK);
+    CHECK_EQ(read_all(s, 1, &nonzero), 30000);
+    fa_stream_close(s);
+    free(media.p);
+}
+
+/* AIFF whose sound data runs past the 8 KB prefix, from a forward-only source. */
+static void test_forward_only_aiff(void)
+{
+    buf media = make_aiff(44100, 2, 20000);
+    mem_io m = { 0 };
+    fa_io_callbacks io = { io_read, NULL, NULL, io_close };
+    fa_open_options o = decode_only();
+    fa_stream* s = NULL;
+    fa_stream_info info;
+    int nonzero;
+    m.p = media.p; m.n = media.n;
+    CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.container, "aiff") == 0);
+    CHECK_EQ(read_all(s, 2, &nonzero), 20000);
+    CHECK(nonzero);
+    fa_stream_close(s);
+    free(media.p);
+}
+
+/* Cover art makes the ID3v2 tag bigger than the probe window. */
+static buf with_big_id3(buf inner, size_t tag)
+{
+    buf b = { 0 };
+    uint8_t h[10] = { 'I', 'D', '3', 4, 0, 0, 0, 0, 0, 0 };
+    size_t i, body = tag - 10;
+    h[6] = (uint8_t)((body >> 21) & 0x7F); h[7] = (uint8_t)((body >> 14) & 0x7F);
+    h[8] = (uint8_t)((body >> 7) & 0x7F);  h[9] = (uint8_t)(body & 0x7F);
+    put(&b, h, 10);
+    for (i = 0; i < body; i++) put8(&b, 0);
+    put(&b, inner.p, inner.n);
+    free(inner.p);
+    return b;
+}
+
+static void test_flac_after_big_id3(void)
+{
+    check_decodes(with_big_id3(make_flac(44100, 2, 6000, 0), 20000), "flac", "flac", 44100, 2, 6000, 1);
+}
+
+static void test_flac_after_big_id3_forward_only(void)
+{
+    buf media = with_big_id3(make_flac(44100, 1, 6000, 0), 20000);
+    mem_io m = { 0 };
+    fa_io_callbacks io = { io_read, NULL, NULL, io_close };
+    fa_open_options o = decode_only();
+    fa_stream* s = NULL;
+    fa_stream_info info;
+    int nonzero;
+    m.p = media.p; m.n = media.n;
+    o.mime_hint = "audio/flac";           /* nothing past the tag can be looked at */
+    CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.codec, "flac") == 0);
+    CHECK_EQ(read_all(s, 1, &nonzero), 6000);
+    fa_stream_close(s);
+    free(media.p);
+}
+
+static void test_io_read_error_is_reported(void)
+{
+    buf media = make_wav(22050, 1, 30000);    /* 60 KB */
+    mem_io m = { 0 };
+    fa_io_callbacks io = { io_read, NULL, NULL, io_close };
+    fa_open_options o = decode_only();
+    fa_stream* s = NULL;
+    float tmp[1000];
+    fa_frames got = 0, total = 0;
+    fa_result r;
+    m.p = media.p; m.n = media.n;
+    m.fail_at = 20500;                       /* past the prefix, mid-frame */
+    CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_OK);
+    while ((r = fa_stream_read(s, tmp, 1000, &got)) == FA_OK) total += got;
+    CHECK_EQ(r, FA_ERROR_IO);                /* not a quiet end of stream */
+    CHECK_EQ(total, (20500 - 44) / 2);       /* everything before the failure was delivered */
+    fa_stream_close(s);
+    free(media.p);
+}
+
+static void test_io_seek_refused(void)
+{
+    buf media = make_wav(22050, 1, 30000);
+    mem_io m = { 0 };
+    fa_io_callbacks io = { io_read, io_seek, io_length, io_close };
+    fa_open_options o = decode_only();
+    fa_stream* s = NULL;
+    fa_frames pos = -1;
+    m.p = media.p; m.n = media.n;
+    m.seek_limit = 30000;
+    CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_OK);
+    CHECK(fa_stream_seek(s, 25000) != FA_OK); /* byte 50044: the app refuses */
+    CHECK_EQ(fa_stream_seek(s, 10000), FA_OK);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_EQ(pos, 10000);
+    fa_stream_close(s);
+    free(media.p);
+}
+
 static void test_read_end_of_stream(void)
 {
     buf media = make_wav(8000, 1, 100);
@@ -515,6 +636,12 @@ int main(void)
     RUN(test_open_io_seekable);
     RUN(test_open_io_forward_only);
     RUN(test_open_io_failure_keeps_ownership);
+    RUN(test_forward_only_with_length);
+    RUN(test_forward_only_aiff);
+    RUN(test_flac_after_big_id3);
+    RUN(test_flac_after_big_id3_forward_only);
+    RUN(test_io_read_error_is_reported);
+    RUN(test_io_seek_refused);
     RUN(test_read_end_of_stream);
     RUN(test_markers);
     RUN(test_device_start_stop_idempotent);

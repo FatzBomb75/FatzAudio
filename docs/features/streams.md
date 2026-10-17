@@ -15,7 +15,7 @@ More formats are added to the same registry (Ogg Vorbis, Opus, AAC, AC-3/E-AC-3 
 ### How detection works
 
 1. The first 8 KB of the source are read once and kept, so detection works even on sources that can't seek.
-2. A leading ID3v2 tag is skipped.
+2. A leading ID3v2 tag is skipped. If the tag is bigger than the 8 KB window (cover art often is), detection reads the 8 KB right after it instead. A forward-only source can't do that, so there the file name or `mime_hint` picks the decoder.
 3. Every decoder in the registry scores the data from 0 to 100: magic bytes for WAV/AIFF/FLAC, two chained valid frame headers for MP3.
 4. The best-scoring decoder opens the stream. If it rejects the data, the next candidate gets a turn.
 5. The file extension and `mime_hint` only break ties. A FLAC file named `song.mp3` still opens as FLAC.
@@ -76,6 +76,7 @@ fa_stream_close(s);
 
 - `FA_OK` with 1 or more frames. A short read doesn't mean the end; keep calling.
 - `FA_ERROR_END_OF_STREAM` with 0 frames once everything has been read. Further calls return the same until you seek.
+- `FA_ERROR_IO` (or whatever error your `read` callback returned) if reading the source failed. The frames decoded before the failure are returned first, so the error arrives with 0 frames, never instead of real audio.
 - `FA_ERROR_BUSY` if the stream is attached to a device, because the device pulls it then.
 
 ### Custom I/O (your own reader)
@@ -105,7 +106,9 @@ Ownership rules for `user`:
 - The stream owns `user` **only if `fa_stream_open_io` returns `FA_OK`**. On failure `close` is not called, so clean up yourself.
 - After a successful open, `close` is called **exactly once**, from `fa_stream_close`, after the last `read`/`seek`/`length` call.
 - The callbacks are never called at the same time for one stream, but they can be called from engine threads.
-- `seek` may be `NULL` for forward-only sources such as pipes or sockets. The stream still opens and plays, but `fa_stream_seek` returns `FA_ERROR_NOT_SEEKABLE` and `fa_stream_info.seekable` is 0.
+- `seek` may be `NULL` for forward-only sources such as pipes or sockets. The stream still opens and plays (a `length` callback is fine too), but `fa_stream_seek` returns `FA_ERROR_NOT_SEEKABLE` and `fa_stream_info.seekable` is 0.
+- A forward-only stream that is detached while playing skips the audio that was decoded ahead, because it can't go back. Its position then says where it really continues.
+- `seek` is called by `fa_stream_seek` itself, so a seek your callback refuses fails right there.
 
 ## C#
 

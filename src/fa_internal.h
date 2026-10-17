@@ -26,6 +26,7 @@ typedef struct fa_source {
     int64_t raw_pos;   /* position of the app's callbacks (FA_SOURCE_IO) */
     int64_t length;    /* bytes, -1 = unknown */
     int seekable;
+    fa_result error;   /* first read failure of the app's callbacks or the file, else FA_OK */
     int prefix_filled;
     size_t prefix_len;
     uint8_t prefix[FA_PROBE_BYTES];
@@ -79,6 +80,14 @@ fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint
 fa_result fa_decoder_read(fa_decoder* dec, float* out, fa_frames frames, fa_frames* got);
 fa_result fa_decoder_seek(fa_decoder* dec, fa_frames frame);
 void fa_decoder_close(fa_decoder* dec);
+
+/* dr_wav glue (miniaudio_impl.c: dr_wav's API is only visible there).
+ * `sequential` = stop at the audio data, for sources that cannot seek back. */
+fa_result fa_drwav_open(fa_source* src, int sequential, void** out_impl,
+                        uint32_t* out_rate, uint32_t* out_channels, uint64_t* out_frames);
+uint64_t fa_drwav_read(void* impl, float* out, uint64_t frames);
+int fa_drwav_seek(void* impl, uint64_t frame);
+void fa_drwav_close(void* impl);
 
 /* Registry contents, defined in decoder.c. */
 extern const fa_decoder_vtable* const fa_decoder_registry[];
@@ -268,6 +277,8 @@ struct fa_stream {
     int converter_ready;
     float* in_buf;
     fa_frames in_cap, in_count, in_offset;
+    fa_frames decoded;           /* source frames read from the decoder since seek_base */
+    int draining;                /* the source ended; in_buf holds silence that flushes the resampler */
     float* out_buf;
     fa_frames out_cap;
     fa_atomic32 eof;             /* the worker has written the last frame */

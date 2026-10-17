@@ -87,6 +87,15 @@ internal sealed class StreamHandle : SafeHandle
         previous?.DangerousRelease();
     }
 
+    /// <summary>Releases the device reference taken by <see cref="AttachDevice"/>, so a detached
+    /// stream no longer keeps its old device open.</summary>
+    public void DetachDevice()
+    {
+        var previous = _device;
+        _device = null;
+        previous?.DangerousRelease();
+    }
+
     protected override bool ReleaseHandle()
     {
         NativeMethods.fa_stream_close(handle);

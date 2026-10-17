@@ -187,7 +187,9 @@ public unsafe class AudioStream : IDisposable
     /// </example>
     public void Detach()
     {
-        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_detach(Handle));
+        var h = Handle;
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_detach(h));
+        h.DetachDevice();
         _device = null;
     }
 

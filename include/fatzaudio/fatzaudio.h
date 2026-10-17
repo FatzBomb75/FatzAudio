@@ -253,7 +253,8 @@ FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* o
 /* Routes a stream to a device (bus NULL = the device's master mix). The decoder
  * is not reopened: position, format and parameters are kept. Attaching to the
  * device it is already on is a no-op; attaching to another device moves it there
- * (still keeping its position), and a running ramp keeps its remaining time.
+ * (still keeping its position, and playing if it was), and a running ramp keeps
+ * its remaining time.
  * Decode-only streams, and devices of another engine, cannot be attached
  * (FA_ERROR_INVALID_ARG). */
 FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, fa_bus* bus);

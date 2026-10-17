@@ -48,6 +48,8 @@ static void release_chain(struct fa_stream* s)
     free(s->in_buf); s->in_buf = NULL;
     free(s->out_buf); s->out_buf = NULL;
     s->in_cap = s->out_cap = s->in_count = s->in_offset = 0;
+    s->decoded = 0;
+    s->draining = 0;
 }
 
 /* Frees a stream that was never published to anyone (failed open). */
@@ -218,12 +220,28 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
         if (room <= 0) break;
         if (s->in_count == 0) {
             fa_frames got = 0;
+            if (s->draining) {                    /* the resampler has given back everything */
+                fa_store32(&s->eof, 1);
+                break;
+            }
             fa_decoder_read(&s->decoder, s->in_buf, s->in_cap, &got);
             s->in_offset = 0;
             s->in_count = got;
+            s->decoded += got;
             if (got == 0) {
+                ma_uint64 latency;
                 if ((s->flags & FA_OPEN_LOOP) && !just_looped && fa_decoder_seek(&s->decoder, 0) == FA_OK) {
                     just_looped = 1; /* a second empty read right after looping = empty source */
+                    continue;            /* the converter keeps its state: the loop joins seamlessly */
+                }
+                /* The resampler still holds the last few frames: push them out with
+                 * silence (its input latency) before calling it the end. */
+                latency = ma_data_converter_get_input_latency(&s->converter);
+                if (latency > 0) {
+                    if (latency > (ma_uint64)s->in_cap) latency = (ma_uint64)s->in_cap;
+                    memset(s->in_buf, 0, (size_t)latency * ch * sizeof(float));
+                    s->in_count = (fa_frames)latency;
+                    s->draining = 1;
                     continue;
                 }
                 fa_store32(&s->eof, 1);
@@ -272,6 +290,8 @@ static fa_result restart_at_locked(struct fa_stream* s, fa_frames frame)
     if (s->ring.data) {
         fa_ring_reset(&s->ring);
         s->in_count = s->in_offset = 0;
+        s->decoded = 0;
+        s->draining = 0;
         if (s->converter_ready) ma_data_converter_reset(&s->converter);
         fa_store32(&s->eof, 0);
         fa_store64(&s->played, 0);
@@ -320,8 +340,10 @@ static void detach_locked(struct fa_stream* s)
     s->dev_rate = 0;
     s->device = NULL;
     /* Continue later from what was actually heard, not from what was decoded ahead.
-     * (A forward-only source cannot go back: its buffered audio is skipped.) */
-    fa_decoder_seek(&s->decoder, pos);
+     * A forward-only source cannot go back: the audio buffered ahead is skipped, and
+     * the position says where decoding really continues. */
+    if (fa_decoder_seek(&s->decoder, pos) != FA_OK && !s->decoder.seekable)
+        pos = fa_load64(&s->seek_base) + s->decoded;
     fa_store64(&s->position, pos);
     release_chain(s);
     fa_store32(&s->eof, 0);
@@ -332,6 +354,7 @@ static void detach_locked(struct fa_stream* s)
 FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, fa_bus* bus)
 {
     fa_result r;
+    int was_playing;
     if (!stream || !device) return FA_ERROR_INVALID_ARG;
     if (bus) return FA_ERROR_NOT_IMPLEMENTED;
     if (stream->flags & FA_OPEN_DECODE_ONLY) return FA_ERROR_INVALID_ARG;
@@ -339,7 +362,8 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
 
     fa_mutex_lock(&stream->api_lock);
     if (stream->device == device) { fa_mutex_unlock(&stream->api_lock); return FA_OK; }
-    if (stream->device) detach_locked(stream);
+    was_playing = stream->device && fa_load32(&stream->state) == FA_STATE_PLAYING;
+    if (stream->device) detach_locked(stream);  /* pauses it */
 
     fa_mutex_lock(&stream->decode_lock);
     r = build_chain_locked(stream, device);
@@ -368,8 +392,10 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
     if (r == FA_OK) {
         stream->device = device;
         r = fa_device_add_voice(device, stream);
-        if (r == FA_OK) fa_engine_track_stream(stream->engine, stream, 1);
-        else {
+        if (r == FA_OK) {
+            fa_engine_track_stream(stream->engine, stream, 1);
+            if (was_playing) fa_cas32(&stream->state, FA_STATE_PAUSED, FA_STATE_PLAYING); /* a move keeps playing */
+        } else {
             stream->device = NULL;
             fa_mutex_lock(&stream->decode_lock);
             stream->dev_rate = 0;

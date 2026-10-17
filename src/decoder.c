@@ -45,6 +45,7 @@ static const char* extension_of(const char* path)
 
 fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint, const char* mime_hint)
 {
+    uint8_t after[FA_PROBE_BYTES];
     const uint8_t* head;
     size_t n, id3;
     int scores[16];
@@ -58,10 +59,23 @@ fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint
     n = fa_source_peek(src, &head);
     if (n == 0) return src->length == 0 ? FA_ERROR_UNSUPPORTED_FORMAT : FA_ERROR_IO;
     id3 = fa_probe_id3v2_size(head, n);
+    if (id3 > 0 && id3 + 16 > n) {
+        /* A tag (usually cover art) fills the window. Look right after it when the
+         * source can seek back; otherwise only the name or MIME type can decide. */
+        if (src->seekable && fa_source_seek(src, (int64_t)id3) == FA_OK) {
+            int64_t got = fa_source_read(src, after, sizeof(after));
+            head = after;
+            n = got > 0 ? (size_t)got : 0;
+            id3 = 0;
+        } else {
+            head = NULL;
+            n = 0;
+        }
+    }
 
     for (i = 0; i < count; i++) {
         const fa_decoder_vtable* vt = fa_decoder_registry[i];
-        int s = vt->probe(head, n, id3);
+        int s = n ? vt->probe(head, n, id3) : 1;  /* nothing to look at: every format is possible */
         /* Name and mime type only break ties between formats the content allows. */
         if (s > 0 && ext && list_contains(vt->extensions, ext, strlen(ext))) s += 2;
         if (s > 0 && mime_hint && list_contains(vt->mime_types, mime_hint, strlen(mime_hint))) s += 1;
@@ -99,15 +113,22 @@ fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint
 
 fa_result fa_decoder_read(fa_decoder* dec, float* out, fa_frames frames, fa_frames* got)
 {
+    fa_result r;
     *got = 0;
     if (frames <= 0) return FA_OK;
-    return dec->vt->read(dec, out, frames, got);
+    r = dec->vt->read(dec, out, frames, got);
+    /* The dr_* decoders see a failed read as a short one and report the end of the
+     * stream; the source remembers the failure, so report it instead (once the
+     * frames decoded before it have been handed out). */
+    if (*got == 0 && dec->src->error != FA_OK) return dec->src->error;
+    return r;
 }
 
 fa_result fa_decoder_seek(fa_decoder* dec, fa_frames frame)
 {
     if (!dec->seekable) return FA_ERROR_NOT_SEEKABLE;
     if (frame < 0 || (dec->length >= 0 && frame > dec->length)) return FA_ERROR_INVALID_ARG;
+    dec->src->error = FA_OK;      /* a read failure before the seek no longer applies */
     return dec->vt->seek(dec, frame);
 }
 

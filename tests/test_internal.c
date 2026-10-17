@@ -556,6 +556,87 @@ static void test_destroy_engine_inside_callback(void)
     fa_sleep_ms(50);
 }
 
+static void test_move_keeps_playing(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 1, 0);
+    fa_device* other = NULL;
+    fa_stream_state st;
+    float out[2 * 256];
+    CHECK(s != NULL);
+    CHECK_EQ(fa_device_open(g_engine, NULL, &other), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(s, out, 256);
+    CHECK_EQ(fa_stream_attach(s, other, NULL), FA_OK);   /* move while playing */
+    CHECK_EQ(fa_stream_get_state(s, &st), FA_OK);
+    CHECK_EQ(st, FA_STATE_PLAYING);
+    CHECK_EQ(fa_stream_detach(s), FA_OK);                /* an explicit detach still pauses */
+    CHECK_EQ(fa_stream_get_state(s, &st), FA_OK);
+    CHECK_EQ(st, FA_STATE_PAUSED);
+    fa_stream_close(s);
+    fa_device_close(other);
+}
+
+/* At the end of a resampled stream the converter's last frames still come out. */
+static void test_resampled_end_is_complete(void)
+{
+    uint32_t src_rate = g_dev->rate / 3, frames = 1600, total = 0, i, guard;
+    size_t n;
+    uint8_t* wav = make_wav(src_rate, frames, 0, &n);
+    fa_stream* s = NULL;
+    fa_stream_state st = FA_STATE_PLAYING;
+    float out[2 * 512];
+    CHECK_EQ(fa_stream_open_memory(g_engine, wav, n, NULL, &s), FA_OK);
+    free(wav);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    for (guard = 0; guard < 100 && st == FA_STATE_PLAYING; guard++) {
+        render(s, out, 512);
+        for (i = 0; i < 512; i++) if (out[i * 2] > 0.25f) total++;
+        fa_stream_get_state(s, &st);
+    }
+    CHECK_EQ(st, FA_STATE_ENDED);
+    CHECK(total >= frames * 3 - 1);                  /* every input frame came out, x3 */
+    fa_stream_close(s);
+}
+
+typedef struct fwd_io { const uint8_t* p; size_t n, pos; } fwd_io;
+static int64_t FA_CALL fwd_read(void* u, void* dst, size_t bytes)
+{
+    fwd_io* m = (fwd_io*)u;
+    size_t k = m->n - m->pos;
+    if (k > bytes) k = bytes;
+    memcpy(dst, m->p + m->pos, k);
+    m->pos += k;
+    return (int64_t)k;
+}
+
+static void test_forward_only_detach_position(void)
+{
+    size_t n;
+    uint8_t* wav = make_wav(g_dev->rate, g_dev->rate * 2, 1, &n);
+    fwd_io io_state = { 0 };
+    fa_io_callbacks io = { fwd_read, NULL, NULL, NULL };
+    fa_stream* s = NULL;
+    fa_frames pos = 0;
+    float out[2 * 256];
+    uint32_t i;
+    io_state.p = wav; io_state.n = n;
+    CHECK_EQ(fa_stream_open_io(g_engine, &io, &io_state, NULL, &s), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(s, out, 256);
+    fa_sleep_ms(30);                                  /* decoded well past what was heard */
+    CHECK_EQ(fa_stream_detach(s), FA_OK);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK(pos > 256);                                 /* can't go back: it says where it really is */
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(s, out, 256);
+    for (i = 0; i < 256; i++) CHECK(out[i * 2] == expected(1, (uint32_t)pos + i));
+    fa_stream_close(s);
+    free(wav);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -584,6 +665,9 @@ int main(void)
     RUN(test_ramp_keeps_time_across_rates);
     RUN(test_attach_rejects_other_engine);
     RUN(test_destroy_engine_inside_callback);
+    RUN(test_move_keeps_playing);
+    RUN(test_resampled_end_is_complete);
+    RUN(test_forward_only_detach_position);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);
