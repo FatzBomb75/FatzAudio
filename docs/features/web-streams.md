@@ -9,7 +9,7 @@
 | An HLS playlist (`.m3u8`), on demand or live | The best audio variant, MPEG-TS, fMP4 or plain audio segments, AES-128 encryption. On-demand HLS is seekable to the frame |
 | A `.pls` or `.m3u` playlist (what radio sites usually link to) | Its first entry is played |
 
-The format is detected from the content, as for files ([streams](streams.md#how-detection-works)): WAV, FLAC, MP3, AAC, AC-3 and E-AC-3, also inside HLS segments (MPEG-TS, fMP4 or packed audio). AAC, which most HLS and many radio stations use, decodes through the FFmpeg your app already has ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)); without it an AAC station returns `FA_ERROR_PROVIDER_MISSING`.
+The format is detected from the content, as for files ([streams](streams.md#how-detection-works)): WAV, FLAC, MP3, Ogg Opus, Ogg Vorbis, AAC, AC-3 and E-AC-3, also inside HLS segments (MPEG-TS, fMP4 or packed audio). AAC, which most HLS and many radio stations use, decodes through the FFmpeg your app already has ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)); without it an AAC station returns `FA_ERROR_PROVIDER_MISSING`.
 
 ## C
 
@@ -159,6 +159,8 @@ MP3 and AAC files over the network seek by estimated byte position, as most play
 ## Song titles (ICY metadata)
 
 Radio servers send the title of the song inside the audio data, every few KB. The title is downloaded seconds before you hear it (the buffer), so FatzAudio keeps it until playback reaches the byte where it was sent, then raises `FA_EVENT_METADATA`. `value` is the title's `seq` (1, 2, ...), and `fa_stream_get_metadata` returns the title heard now, never one that is still in the buffer. Events are delivered on the event thread, so when titles change faster than that (a decode-only stream read faster than real time), `fa_stream_get_metadata` in the handler can already return a newer title: compare its `seq` with the event's `value`. The .NET `MetadataChanged` skips such stale events and raises only the latest title.
+
+Ogg radio (Opus or Vorbis) has no ICY titles: every song starts a new Ogg link with its own comment header, and its `ARTIST` and `TITLE` become `stream_title` ("Artist - Title"), announced the same way at the song's first sample.
 
 `stream_title` is the title exactly as the station sends it; `artist` and `title` split it at the first `" - "`. Titles in Latin-1, which older servers send, are converted to UTF-8. Station details (`station`, `genre`, `description`, `station_url`, `bitrate_kbps`) come from the `icy-*` response headers.
 

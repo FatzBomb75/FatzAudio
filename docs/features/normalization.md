@@ -31,7 +31,7 @@ For each stream, the first of these that is available wins:
 | # | Source | Speed | `fa_loudness.source` |
 |---|---|---|---|
 | 1 | A value your app stored earlier, given with `fa_stream_set_loudness` | instant | `FA_LOUDNESS_APP` |
-| 2 | ReplayGain 2 or R128 tags in the file (ID3v2 `TXXX`, FLAC Vorbis comments, APEv2) | instant | `FA_LOUDNESS_TAGS` |
+| 2 | ReplayGain 2 or R128 tags in the file (ID3v2 `TXXX`, FLAC and Ogg Vorbis comments, OpusTags, APEv2) | instant | `FA_LOUDNESS_TAGS` |
 | 3 | The scan cache (`fa_engine_config.cache_directory`), keyed by the file's content | instant | `FA_LOUDNESS_CACHE` |
 | 4 | A background scan of the file, then written to the cache | see below | `FA_LOUDNESS_SCAN` |
 | 5 | Until one of the above is known, and for streams that cannot be scanned: a running estimate over the last 15 s of decoded audio | continuous | `FA_LOUDNESS_ESTIMATE` |

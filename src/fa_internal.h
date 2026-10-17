@@ -141,6 +141,8 @@ extern const fa_decoder_vtable fa_decoder_mp3;
 /* Containers with packet codecs (demux_mp4.c, demux_mkv.c). */
 extern const fa_decoder_vtable fa_decoder_mp4;
 extern const fa_decoder_vtable fa_decoder_mkv;
+/* Ogg Opus and Ogg Vorbis (demux_ogg.c). */
+extern const fa_decoder_vtable fa_decoder_ogg;
 /* Raw AC-3 / E-AC-3 streams (dec_ac3.c). */
 extern const fa_decoder_vtable fa_decoder_ac3;
 /* AAC in ADTS frames (demux_adts.c). */
@@ -374,6 +376,8 @@ typedef struct fa_tag_loudness {
 
 /* Reads ID3v2 (TXXX), FLAC Vorbis comments and APEv2. Moves the read position. */
 void fa_tags_read_loudness(fa_source* src, fa_tag_loudness* out);
+/* The comment header of an Ogg Opus or Vorbis file (demux_ogg.c). */
+void fa_ogg_read_loudness(fa_source* src, fa_tag_loudness* out);
 /* A Vorbis comment block (FLAC, Ogg Vorbis/Opus): vendor, count, "KEY=value" items. */
 void fa_tags_parse_vorbis_comments(const uint8_t* data, size_t size, fa_tag_loudness* out);
 
@@ -818,7 +822,7 @@ void fa_buses_free_all(fa_device* dev);               /* fa_device_close, no cal
 
 /* ---- Packet codecs (codec.c, ffmpeg.c) ----------------------------------------
  * Decode one compressed packet at a time into interleaved F32. Built-in codecs
- * (PCM, MP3) come first; FFmpeg, loaded at runtime, does the rest. */
+ * (PCM, MP3, AC-3, Opus, Vorbis) come first; FFmpeg, loaded at runtime, does the rest. */
 
 typedef struct fa_codec fa_codec;
 
@@ -881,6 +885,12 @@ fa_result fa_ffmpeg_open_codec(fa_codec* c, const fa_codec_params* p);
 /* Sets a decoder option (AVOption, searched in the decoder's own options too) on
  * a codec fa_ffmpeg_open_codec opened. */
 void fa_ffmpeg_codec_option(fa_codec* c, const char* name, const char* value);
+
+/* codec_xiph.c: the built-in Opus and Vorbis codecs (libopus, libvorbis).
+ * FA_ERROR_UNSUPPORTED_FORMAT for headers they cannot set up alone. */
+fa_result fa_xiph_codec_open(fa_codec* c, const fa_codec_params* p);
+/* Splits Vorbis extradata (Xiph lacing, or 16-bit lengths) into its three headers. */
+int fa_xiph_split_headers(const uint8_t* p, size_t n, const uint8_t* out[3], size_t out_len[3]);
 
 /* dec_ac3.c: the built-in Dolby Digital / Dolby Digital Plus codec, and the
  * samples in an AC-3 or E-AC-3 packet from its frame headers (-1 if none). */

@@ -1,0 +1,906 @@
+/* Ogg (RFC 3533) with Opus (RFC 7845) or Vorbis audio: .ogg, .oga, .opus files
+ * and Ogg web radio. Pages are read and checked here; the packets go to the
+ * built-in codecs (codec_xiph.c) through the shared track decoder (demux.c).
+ *
+ * Timeline: a page's granule position is the end of the last packet that
+ * completes on it. Packet times follow from packet durations (Opus: the TOC;
+ * Vorbis: half of each pair of neighbouring block sizes), forward from the
+ * previous page's granule while reading on, backward from the page's own granule
+ * after a jump. The first audible frame of each link is time 0 of that link, so
+ * an Opus pre-skip lands before 0 (the codec drops it, like Matroska's
+ * CodecDelay), and the last page's granule trims the end.
+ *
+ * Chained streams (one song after another, each with its own headers, as Ogg
+ * radio sends them) play through: the codec is opened again at each new link,
+ * and on a web stream the new song's comments become its title. A seekable
+ * chained file is read once at open so the length and seeking cover every link.
+ * Multiplexed files (audio next to video) play their audio: `audio_track` picks
+ * among the audio streams that start the file. */
+#include "demux.h"
+#include "net.h"
+#include <vorbis/codec.h>
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define OGG_HEADER 27
+#define OGG_MAX_BODY (255 * 255)
+#define OGG_MAX_PACKET (16u << 20)   /* larger: corrupt or not audio */
+#define OGG_RESYNC_MAX (1 << 20)     /* bytes searched for the next page */
+#define OGG_MAX_LINKS 4096
+#define OGG_MAX_QUEUE 256            /* packets completed on one page (at most 255) */
+#define OGG_NO_GRAN INT64_MIN
+
+enum { OGG_NONE = 0, OGG_OPUS, OGG_VORBIS };
+
+typedef struct oggs_page {
+    int64_t pos;            /* file offset */
+    uint32_t size;          /* header + body */
+    uint8_t flags;          /* 1 continued, 2 first (BOS), 4 last (EOS) */
+    int64_t granule;        /* -1 = no packet completes here */
+    uint32_t serial, seq;
+    uint32_t nseg;
+    uint8_t lace[255];
+    uint32_t body_len;
+} oggs_page;
+
+typedef struct oggs_link {
+    int64_t start;          /* file offset of its first page */
+    int64_t data;           /* first page after its headers */
+    int64_t end;            /* offset after its last page, -1 = unknown */
+    uint32_t serial;
+    int kind;
+    uint32_t rate, channels, preskip;
+    int bs[2];              /* Vorbis block sizes */
+    int64_t first_gran;     /* granule where its first packet starts; OGG_NO_GRAN = not seen yet */
+    int64_t last_gran;      /* granule of its last page, OGG_NO_GRAN = unknown */
+    int64_t base;           /* pts of its first audible frame */
+    vorbis_info vi;         /* Vorbis: mode table for the block sizes */
+    vorbis_comment vc;
+    int vi_ready;
+    uint8_t* extra;         /* the codec's extradata: OpusHead, or the 3 Vorbis headers laced */
+    size_t extra_len;
+    fa_codec_params params;
+} oggs_link;
+
+typedef struct oggs_pkt {
+    size_t off, len;
+    int64_t pts, dur, trim;
+    const fa_codec_params* reopen;
+} oggs_pkt;
+
+typedef struct ogg {
+    fa_br br;
+    fa_track track;
+    fa_decoder* dec;
+    uint32_t crc[256];
+    oggs_link** links;       /* each one allocated alone: pointers to them stay valid */
+    int nlinks, cap_links;
+    uint32_t group[16];     /* serials of the first link's logical streams */
+    int ngroup;
+    int cur;                /* link being read */
+    int codec_link;         /* link the codec is set up for */
+    int enumerated;         /* every link is known (a seekable file) */
+    int scanning;           /* reading the whole file at open: nothing is handed out */
+    double rate0;           /* pts units per second (the first link's rate) */
+    uint8_t body[OGG_MAX_BODY];
+    /* The packet being put together across pages. */
+    uint8_t* pend;
+    size_t pend_len, pend_cap;
+    int pend_valid;
+    uint32_t last_seq;
+    int have_seq;
+    /* Packets completed on the current page. */
+    uint8_t* qdata;
+    size_t qdata_len, qdata_cap;
+    oggs_pkt q[OGG_MAX_QUEUE];
+    int nq, iq;
+    int64_t gran;           /* granule after the last packet of the current link, OGG_NO_GRAN = unknown */
+    int prev_bs;            /* Vorbis: block size of the previous packet, 0 = first of the link, -1 = unknown */
+    int64_t next_pts;       /* pts after the last packet put in the queue */
+    const fa_codec_params* reopen;   /* goes with the next packet handed out */
+    fa_net* net;            /* web stream: song titles of chained links go here */
+    oggs_page held;         /* a page read one too far, handed out again next (the */
+    int has_held;           /* source may not be able to go back to it) */
+    int at_end;
+} ogg;
+
+/* ---- pages ------------------------------------------------------------------------------ */
+
+static void crc_init(uint32_t* t)
+{
+    uint32_t i, j, r;
+    for (i = 0; i < 256; i++) {
+        r = i << 24;
+        for (j = 0; j < 8; j++) r = (r & 0x80000000u) ? (r << 1) ^ 0x04C11DB7u : r << 1;
+        t[i] = r;
+    }
+}
+
+static uint32_t crc_update(const uint32_t* t, uint32_t crc, const uint8_t* p, size_t n)
+{
+    while (n--) crc = (crc << 8) ^ t[((crc >> 24) ^ *p++) & 0xFF];
+    return crc;
+}
+
+static uint32_t le32(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+static uint64_t le64(const uint8_t* p) { return (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32); }
+
+/* Reads the page at `pos`, whose first `have` header bytes are already in h, into
+ * pg and o->body. 1 = a valid page, 0 = not one (the reader is left wherever
+ * reading stopped), -1 = the data ends first. */
+static int page_rest(ogg* o, uint8_t* h, size_t have, int64_t pos, oggs_page* pg)
+{
+    uint32_t i, crc;
+    size_t got = fa_br_read(&o->br, h + have, OGG_HEADER - have);
+    if (got < OGG_HEADER - have) return -1;
+    if (memcmp(h, "OggS", 4) != 0 || h[4] != 0) return 0;
+    pg->nseg = h[26];
+    if (fa_br_read(&o->br, h + OGG_HEADER, pg->nseg) < pg->nseg) return -1;
+    pg->body_len = 0;
+    for (i = 0; i < pg->nseg; i++) pg->body_len += h[OGG_HEADER + i];
+    if (fa_br_read(&o->br, o->body, pg->body_len) < pg->body_len) return -1;
+    crc = le32(h + 22);
+    memset(h + 22, 0, 4);
+    if (crc_update(o->crc, crc_update(o->crc, 0, h, OGG_HEADER + pg->nseg), o->body, pg->body_len) != crc) return 0;
+    pg->pos = pos;
+    pg->size = OGG_HEADER + pg->nseg + pg->body_len;
+    pg->flags = h[5];
+    pg->granule = (int64_t)le64(h + 6);
+    pg->serial = le32(h + 14);
+    pg->seq = le32(h + 18);
+    memcpy(pg->lace, h + OGG_HEADER, pg->nseg);
+    return 1;
+}
+
+/* The next valid page at or after the reader's position, searching at most
+ * `limit` bytes. FA_ERROR_END_OF_STREAM when there is none. */
+static fa_result next_page(ogg* o, oggs_page* pg, int64_t limit)
+{
+    uint8_t h[OGG_HEADER + 255];
+    int64_t start = fa_br_tell(&o->br), pos = start;
+    int r;
+    if (o->has_held) {
+        *pg = o->held;           /* its body is still in o->body */
+        o->has_held = 0;
+        return FA_OK;
+    }
+    r = page_rest(o, h, 0, pos, pg);
+    while (r == 0) {
+        uint32_t win = 0;
+        /* Not a page: on to the next "OggS", one byte after the false start where
+         * the source can go back there, else from where reading stopped. */
+        fa_br_seek(&o->br, pos + 1);
+        for (;;) {
+            uint8_t c;
+            if (fa_br_tell(&o->br) - start > limit || fa_br_read(&o->br, &c, 1) < 1) return FA_ERROR_END_OF_STREAM;
+            win = (win << 8) | c;
+            if (win == 0x4F676753u) break;     /* "OggS" */
+        }
+        pos = fa_br_tell(&o->br) - 4;
+        memcpy(h, "OggS", 4);
+        r = page_rest(o, h, 4, pos, pg);
+    }
+    return r > 0 ? FA_OK : FA_ERROR_END_OF_STREAM;
+}
+
+/* Moves the reader; a held page is forgotten. */
+static fa_result seek_to(ogg* o, int64_t pos)
+{
+    o->has_held = 0;
+    return fa_br_seek(&o->br, pos);
+}
+
+/* ---- packets ----------------------------------------------------------------------------- */
+
+static int pend_add(ogg* o, const uint8_t* p, size_t n)
+{
+    if (o->pend_len + n > OGG_MAX_PACKET) return 0;
+    if (o->pend_len + n > o->pend_cap) {
+        size_t cap = o->pend_cap ? o->pend_cap : 8192;
+        uint8_t* b;
+        while (cap < o->pend_len + n) cap *= 2;
+        b = (uint8_t*)realloc(o->pend, cap);
+        if (!b) return 0;
+        o->pend = b;
+        o->pend_cap = cap;
+    }
+    memcpy(o->pend + o->pend_len, p, n);
+    o->pend_len += n;
+    return 1;
+}
+
+/* Splits the page's body into packets: completed ones go to the queue, an
+ * unfinished last one waits in o->pend. */
+static fa_result page_packets(ogg* o, const oggs_page* pg)
+{
+    size_t pos = 0;
+    uint32_t i;
+    o->nq = o->iq = 0;
+    o->qdata_len = 0;
+    if (o->have_seq && pg->seq != o->last_seq + 1) o->pend_valid = 0;    /* a page is missing */
+    o->last_seq = pg->seq;
+    o->have_seq = 1;
+    if (!(pg->flags & 1) || !o->pend_valid) {
+        /* Not continued from a packet we hold: a continuation is dropped. */
+        int skip = (pg->flags & 1) != 0;
+        o->pend_len = 0;
+        o->pend_valid = 1;
+        if (skip) {
+            for (i = 0; i < pg->nseg; i++) {
+                pos += pg->lace[i];
+                if (pg->lace[i] < 255) { i++; break; }
+            }
+            if (i == pg->nseg && (pg->nseg == 0 || pg->lace[pg->nseg - 1] == 255)) {
+                o->pend_valid = 0;               /* still inside the lost packet */
+                return FA_OK;
+            }
+        } else {
+            i = 0;
+        }
+    } else {
+        i = 0;
+    }
+    for (; i < pg->nseg; i++) {
+        if (!pend_add(o, o->body + pos, pg->lace[i])) {
+            if (o->pend_len + pg->lace[i] > OGG_MAX_PACKET) { o->pend_len = 0; o->pend_valid = 0; return FA_OK; }
+            return FA_ERROR_OUT_OF_MEMORY;
+        }
+        pos += pg->lace[i];
+        if (pg->lace[i] < 255) {
+            oggs_pkt* q;
+            if (o->nq == OGG_MAX_QUEUE) return FA_ERROR_UNSUPPORTED_FORMAT;
+            if (o->qdata_len + o->pend_len > o->qdata_cap) {
+                size_t cap = o->qdata_cap ? o->qdata_cap : 16384;
+                uint8_t* b;
+                while (cap < o->qdata_len + o->pend_len) cap *= 2;
+                b = (uint8_t*)realloc(o->qdata, cap);
+                if (!b) return FA_ERROR_OUT_OF_MEMORY;
+                o->qdata = b;
+                o->qdata_cap = cap;
+            }
+            q = &o->q[o->nq++];
+            memset(q, 0, sizeof(*q));
+            q->off = o->qdata_len;
+            q->len = o->pend_len;
+            if (o->pend_len) memcpy(o->qdata + o->qdata_len, o->pend, o->pend_len);
+            o->qdata_len += o->pend_len;
+            o->pend_len = 0;
+        }
+    }
+    return FA_OK;
+}
+
+/* Samples a packet adds to the timeline; -1 = not known (a Vorbis packet whose
+ * neighbour before it was not seen). Moves the Vorbis block size state on. */
+static int64_t packet_duration(ogg* o, oggs_link* l, const uint8_t* d, size_t n)
+{
+    if (l->kind == OGG_OPUS) {
+        uint32_t rate = 0;
+        int64_t s = fa_demux_packet_samples("opus", l->channels, 48000, d, n, &rate);
+        return s < 0 ? 0 : s;       /* a corrupt packet decodes to nothing */
+    } else {
+        ogg_packet op;
+        long bs;
+        int64_t dur;
+        memset(&op, 0, sizeof(op));
+        op.packet = (unsigned char*)d;
+        op.bytes = (long)n;
+        bs = n > 0 && !(d[0] & 1) ? vorbis_packet_blocksize(&l->vi, &op) : -1;
+        if (bs <= 0) return 0;      /* not an audio packet: no samples */
+        dur = o->prev_bs < 0 ? -1 : o->prev_bs == 0 ? 0 : (o->prev_bs + bs) / 4;
+        o->prev_bs = (int)bs;
+        return dur;
+    }
+}
+
+/* Puts times on the packets of a page that belongs to link `l`. */
+static void time_packets(ogg* o, oggs_link* l, const oggs_page* pg)
+{
+    int64_t g = pg->granule, sum = 0, at;
+    double scale = o->rate0 / (double)l->rate;
+    int i, known = 1;
+    for (i = 0; i < o->nq; i++) {
+        oggs_pkt* q = &o->q[i];
+        q->dur = packet_duration(o, l, o->qdata + q->off, q->len);
+        if (q->dur < 0) known = 0;
+        else sum += q->dur;
+    }
+    if (o->nq == 0) return;
+    /* A link's first page with more audio than its granule: the stream starts at
+     * 0 and (on its last page) the end is trimmed. */
+    if (o->gran == OGG_NO_GRAN && l->first_gran == OGG_NO_GRAN && known && g >= 0 && g < sum) o->gran = 0;
+    if (o->gran != OGG_NO_GRAN && (g < 0 || (pg->flags & 4) || g <= o->gran + sum)) {
+        /* Forward from where the last page ended; the last page's granule trims. */
+        at = o->gran;
+        for (i = 0; i < o->nq; i++) {
+            oggs_pkt* q = &o->q[i];
+            int64_t d = q->dur < 0 ? 0 : q->dur;
+            q->pts = at;
+            if ((pg->flags & 4) && g >= 0 && at + d > g) q->trim = at + d - (g > at ? g : at);
+            at += d;
+        }
+        o->gran = g >= 0 ? g : at;
+    } else if (g >= 0) {
+        /* Backward from this page's granule. */
+        at = g;
+        for (i = o->nq - 1; i >= 0; i--) {
+            oggs_pkt* q = &o->q[i];
+            if (q->dur < 0) { q->pts = OGG_NO_GRAN; continue; }
+            at -= q->dur;
+            q->pts = at;
+        }
+        if (l->first_gran == OGG_NO_GRAN && known) l->first_gran = at;
+        o->gran = g;
+    } else {
+        for (i = 0; i < o->nq; i++) o->q[i].pts = OGG_NO_GRAN;
+        return;
+    }
+    if (l->first_gran == OGG_NO_GRAN) l->first_gran = o->q[0].pts != OGG_NO_GRAN ? o->q[0].pts : g;
+    for (i = 0; i < o->nq; i++) {
+        oggs_pkt* q = &o->q[i];
+        if (q->pts == OGG_NO_GRAN) { q->pts = FA_DEMUX_NO_PTS; continue; }
+        q->pts = l->base + (int64_t)llround((double)(q->pts - l->first_gran - (int64_t)l->preskip) * scale);
+        q->trim = (int64_t)llround((double)q->trim * scale);
+        if (q->dur >= 0) {
+            q->dur = (int64_t)llround((double)q->dur * scale);
+            o->next_pts = q->pts + q->dur - q->trim;
+        }
+    }
+}
+
+/* ---- links -------------------------------------------------------------------------------- */
+
+static void link_free(oggs_link* l)
+{
+    if (l->vi_ready) { vorbis_comment_clear(&l->vc); vorbis_info_clear(&l->vi); }
+    free(l->extra);
+    memset(l, 0, sizeof(*l));
+}
+
+static void links_free(ogg* o, int from, int to)
+{
+    int i;
+    for (i = from; i < to; i++) {
+        link_free(o->links[i]);
+        free(o->links[i]);
+        o->links[i] = NULL;
+    }
+}
+
+static int kind_of(const uint8_t* p, size_t n)
+{
+    if (n >= 19 && memcmp(p, "OpusHead", 8) == 0) return OGG_OPUS;
+    if (n >= 30 && p[0] == 1 && memcmp(p + 1, "vorbis", 6) == 0) return OGG_VORBIS;
+    return OGG_NONE;
+}
+
+/* "ARTIST - TITLE" from a comment packet (after its magic), for web radio. */
+static void comment_title(const uint8_t* p, size_t n, char* out, size_t cap)
+{
+    char artist[256] = "", title[512] = "";
+    size_t pos;
+    uint32_t count, i;
+    out[0] = '\0';
+    if (n < 8) return;
+    pos = 4 + (size_t)le32(p);
+    if (pos < 4 || pos + 4 > n) return;
+    count = le32(p + pos);
+    pos += 4;
+    for (i = 0; i < count && pos + 4 <= n; i++) {
+        uint32_t len = le32(p + pos);
+        const char* s = (const char*)p + pos + 4;
+        pos += 4;
+        if (len > n - pos) return;
+        if (len > 7 && strncmp(s, "ARTIST=", 7) == 0 && !artist[0]) snprintf(artist, sizeof(artist), "%.*s", (int)(len - 7), s + 7);
+        else if (len > 7 && (strncmp(s, "TITLE=", 6) == 0 || strncmp(s, "title=", 6) == 0) && !title[0])
+            snprintf(title, sizeof(title), "%.*s", (int)(len - 6), s + 6);
+        else if (len > 7 && strncmp(s, "artist=", 7) == 0 && !artist[0]) snprintf(artist, sizeof(artist), "%.*s", (int)(len - 7), s + 7);
+        pos += len;
+    }
+    if (artist[0] && title[0]) snprintf(out, cap, "%s - %s", artist, title);
+    else snprintf(out, cap, "%s", title[0] ? title : artist);
+}
+
+/* Reads a link's headers, starting at its BOS page group at the reader's
+ * position: picks audio stream `want` (0-based) among the group's audio streams,
+ * then collects its header packets. *out_audio = the group's audio stream count. */
+static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_tag_loudness* tags)
+{
+    oggs_page pg;
+    uint8_t* hdr[3] = { NULL, NULL, NULL };
+    size_t hlen[3] = { 0, 0, 0 };
+    int nh = 0, need = 0, audio = 0, picked = 0, i;
+    char title[1024];
+    fa_result r;
+    memset(l, 0, sizeof(*l));
+    l->first_gran = l->last_gran = OGG_NO_GRAN;
+    l->end = -1;
+    l->start = fa_br_tell(&o->br);
+    title[0] = '\0';
+    /* The BOS pages: one per logical stream, each with exactly one packet. */
+    for (;;) {
+        r = next_page(o, &pg, OGG_RESYNC_MAX);
+        if (r != FA_OK) break;
+        if (!(pg.flags & 2)) {
+            o->held = pg;
+            o->has_held = 1;
+            break;
+        }
+        if (o->ngroup < 16) o->group[o->ngroup++] = pg.serial;
+        if (pg.nseg == 0 || pg.lace[pg.nseg - 1] == 255) continue;
+        if (kind_of(o->body, pg.body_len) != OGG_NONE) {
+            if (audio++ == want) {
+                l->start = pg.pos;
+                l->serial = pg.serial;
+                l->kind = kind_of(o->body, pg.body_len);
+                hdr[0] = (uint8_t*)malloc(pg.body_len);
+                if (!hdr[0]) { r = FA_ERROR_OUT_OF_MEMORY; goto done; }
+                memcpy(hdr[0], o->body, pg.body_len);
+                hlen[0] = pg.body_len;
+                nh = 1;
+                picked = 1;
+            }
+        }
+    }
+    if (out_audio) *out_audio = audio;
+    if (!picked) { r = audio > 0 ? FA_ERROR_NOT_FOUND : FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
+    need = l->kind == OGG_OPUS ? 2 : 3;
+    /* The other headers of our stream (other streams' pages are skipped). */
+    o->pend_len = 0;
+    o->pend_valid = 1;
+    o->have_seq = 0;
+    while (nh < need) {
+        r = next_page(o, &pg, OGG_RESYNC_MAX);
+        if (r != FA_OK) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
+        if (pg.serial != l->serial) continue;
+        r = page_packets(o, &pg);
+        if (r != FA_OK) goto done;
+        for (i = 0; i < o->nq && nh < need; i++) {
+            hdr[nh] = (uint8_t*)malloc(o->q[i].len ? o->q[i].len : 1);
+            if (!hdr[nh]) { r = FA_ERROR_OUT_OF_MEMORY; goto done; }
+            memcpy(hdr[nh], o->qdata + o->q[i].off, o->q[i].len);
+            hlen[nh++] = o->q[i].len;
+        }
+    }
+    o->nq = o->iq = 0;
+    l->data = fa_br_tell(&o->br);
+    if (l->kind == OGG_OPUS) {
+        const uint8_t* h = hdr[0];
+        l->channels = h[9];
+        l->preskip = (uint32_t)h[10] | ((uint32_t)h[11] << 8);
+        l->rate = 48000;
+        l->extra = hdr[0];
+        l->extra_len = hlen[0];
+        hdr[0] = NULL;
+        if (hlen[1] >= 8 && memcmp(hdr[1], "OpusTags", 8) == 0) {
+            comment_title(hdr[1] + 8, hlen[1] - 8, title, sizeof(title));
+            if (tags) fa_tags_parse_vorbis_comments(hdr[1] + 8, hlen[1] - 8, tags);
+        }
+        l->params.codec = "opus";
+    } else {
+        size_t n = 1, k;
+        uint8_t* e;
+        vorbis_info_init(&l->vi);
+        vorbis_comment_init(&l->vc);
+        l->vi_ready = 1;
+        for (i = 0; i < 3; i++) {
+            ogg_packet op;
+            memset(&op, 0, sizeof(op));
+            op.packet = hdr[i];
+            op.bytes = (long)hlen[i];
+            op.b_o_s = i == 0;
+            op.packetno = i;
+            if (hlen[i] > 0x7FFFFFFF || vorbis_synthesis_headerin(&l->vi, &l->vc, &op) != 0) {
+                r = FA_ERROR_UNSUPPORTED_FORMAT;
+                goto done;
+            }
+        }
+        if (l->vi.rate <= 0 || l->vi.channels <= 0) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
+        l->rate = (uint32_t)l->vi.rate;
+        l->channels = (uint32_t)l->vi.channels;
+        l->bs[0] = vorbis_info_blocksize(&l->vi, 0);
+        l->bs[1] = vorbis_info_blocksize(&l->vi, 1);
+        if (hlen[1] > 7) {
+            comment_title(hdr[1] + 7, hlen[1] - 7, title, sizeof(title));
+            if (tags) fa_tags_parse_vorbis_comments(hdr[1] + 7, hlen[1] - 7, tags);
+        }
+        /* Xiph lacing: 2, the sizes of the first two, then all three. */
+        for (i = 0; i < 2; i++) n += hlen[i] / 255 + 1;
+        e = (uint8_t*)malloc(n + hlen[0] + hlen[1] + hlen[2]);
+        if (!e) { r = FA_ERROR_OUT_OF_MEMORY; goto done; }
+        k = 0;
+        e[k++] = 2;
+        for (i = 0; i < 2; i++) {
+            size_t v = hlen[i];
+            while (v >= 255) { e[k++] = 255; v -= 255; }
+            e[k++] = (uint8_t)v;
+        }
+        for (i = 0; i < 3; i++) { memcpy(e + k, hdr[i], hlen[i]); k += hlen[i]; }
+        l->extra = e;
+        l->extra_len = k;
+        l->params.codec = "vorbis";
+    }
+    l->params.struct_size = sizeof(l->params);
+    l->params.sample_rate = l->rate;
+    l->params.channels = l->channels;
+    l->params.extradata = l->extra;
+    l->params.extradata_size = l->extra_len;
+    if (o->net && title[0] && !o->scanning) fa_net_meta_add_frame(o->net, o->next_pts > 0 ? o->next_pts : 0, title);
+    r = FA_OK;
+done:
+    for (i = 0; i < 3; i++) free(hdr[i]);
+    if (r != FA_OK) link_free(l);
+    return r;
+}
+
+static fa_result add_link(ogg* o, oggs_link** out)
+{
+    if (o->nlinks == o->cap_links) {
+        int cap = o->cap_links ? o->cap_links * 2 : 4;
+        oggs_link** p;
+        if (cap > OGG_MAX_LINKS) return FA_ERROR_UNSUPPORTED_FORMAT;
+        p = (oggs_link**)realloc(o->links, sizeof(*p) * (size_t)cap);
+        if (!p) return FA_ERROR_OUT_OF_MEMORY;
+        o->links = p;
+        o->cap_links = cap;
+    }
+    *out = (oggs_link*)calloc(1, sizeof(oggs_link));
+    if (!*out) return FA_ERROR_OUT_OF_MEMORY;
+    o->links[o->nlinks++] = *out;
+    return FA_OK;
+}
+
+/* Forgets a link read_link could not use (the last one added). */
+static void drop_last_link(ogg* o)
+{
+    links_free(o, o->nlinks - 1, o->nlinks);
+    o->nlinks--;
+}
+
+static int64_t link_length(const ogg* o, const oggs_link* l)
+{
+    if (l->first_gran == OGG_NO_GRAN || l->last_gran == OGG_NO_GRAN) return -1;
+    {
+        int64_t n = l->last_gran - l->first_gran - (int64_t)l->preskip;
+        if (n < 0) n = 0;
+        return (int64_t)llround((double)n * o->rate0 / (double)l->rate);
+    }
+}
+
+/* ---- reading ----------------------------------------------------------------------------- */
+
+/* Reads pages until the queue holds packets of the current link. */
+static fa_result fill_queue(ogg* o)
+{
+    for (;;) {
+        oggs_page pg;
+        oggs_link* l = o->links[o->cur];
+        fa_result r;
+        if (o->iq < o->nq) return FA_OK;
+        if (o->at_end) return FA_ERROR_END_OF_STREAM;
+        r = next_page(o, &pg, OGG_RESYNC_MAX);
+        if (r != FA_OK) { o->at_end = 1; return FA_ERROR_END_OF_STREAM; }
+        if (pg.flags & 2) {
+            /* The next link of a chained stream. */
+            int known = -1, i;
+            for (i = o->cur + 1; i < o->nlinks; i++)
+                if (o->links[i]->start == pg.pos) { known = i; break; }
+            if (known >= 0) {
+                o->cur = known;
+                r = seek_to(o, o->links[known]->data);
+                if (r != FA_OK) return r;
+            } else {
+                oggs_link* nl;
+                o->held = pg;
+                o->has_held = 1;
+                r = add_link(o, &nl);
+                if (r != FA_OK) return r;
+                r = read_link(o, nl, 0, NULL, NULL);
+                if (r == FA_ERROR_OUT_OF_MEMORY) return r;
+                if (r != FA_OK) {
+                    /* Not audio we know: its pages are skipped. */
+                    drop_last_link(o);
+                    continue;
+                }
+                nl->base = o->next_pts;
+                if (!o->enumerated && !o->scanning) {
+                    /* A stream that cannot seek back keeps only the link it plays. */
+                    links_free(o, 0, o->nlinks - 1);
+                    o->links[0] = nl;
+                    o->nlinks = 1;
+                }
+                o->cur = o->nlinks - 1;
+            }
+            o->gran = OGG_NO_GRAN;
+            o->prev_bs = 0;
+            o->pend_len = 0;
+            o->pend_valid = 1;
+            o->have_seq = 0;
+            o->codec_link = o->cur;
+            o->reopen = &o->links[o->cur]->params;
+            continue;
+        }
+        if (pg.serial != l->serial) continue;
+        r = page_packets(o, &pg);
+        if (r != FA_OK) return r;
+        time_packets(o, l, &pg);
+        /* The last granule seen; a file's last page was read at open. */
+        if (pg.granule >= 0 && (o->scanning || !o->enumerated)) l->last_gran = pg.granule;
+    }
+}
+
+static fa_result ogg_next(void* ctx, fa_demux_packet* out)
+{
+    ogg* o = (ogg*)ctx;
+    oggs_pkt* q;
+    fa_result r = fill_queue(o);
+    if (r != FA_OK) return r;
+    q = &o->q[o->iq++];
+    out->data = o->qdata + q->off;
+    out->size = q->len;
+    out->pts = q->pts;
+    out->duration = q->dur;
+    out->trim_end = q->trim;
+    out->reopen = o->reopen;
+    o->reopen = NULL;
+    return FA_OK;
+}
+
+/* The last page of `serial` that starts before `hi`, with a granule below `g`
+ * (from a binary search over pages); -1 = none after `lo`. */
+static int64_t find_page_before(ogg* o, uint32_t serial, int64_t lo, int64_t hi, int64_t g, int64_t* out_gran)
+{
+    int64_t best = -1, a = lo, b = hi;
+    oggs_page pg;
+    *out_gran = -1;
+    while (b - a > 65536) {
+        int64_t mid = a + (b - a) / 2, got = -1;
+        if (seek_to(o, mid) != FA_OK) return best;
+        while (next_page(o, &pg, b - mid) == FA_OK && pg.pos < b) {
+            if (pg.serial == serial && pg.granule >= 0) { got = pg.granule; break; }
+        }
+        if (got >= 0 && got < g) { best = pg.pos; *out_gran = got; a = pg.pos + pg.size; }
+        else b = mid;
+    }
+    /* The rest page by page. */
+    if (seek_to(o, a) != FA_OK) return best;
+    while (next_page(o, &pg, OGG_RESYNC_MAX) == FA_OK && pg.pos < hi) {
+        if (pg.serial != serial || pg.granule < 0) continue;
+        if (pg.granule >= g) break;
+        best = pg.pos;
+        *out_gran = pg.granule;
+    }
+    return best;
+}
+
+static fa_result ogg_seek(void* ctx, int64_t t, int packets_back, size_t bytes_back)
+{
+    ogg* o = (ogg*)ctx;
+    oggs_link* l;
+    int k = 0, i;
+    int64_t g, at, gran, end;
+    (void)packets_back;
+    (void)bytes_back;
+    for (i = 1; i < o->nlinks; i++)
+        if (o->links[i]->base <= t) k = i;
+    l = o->links[k];
+    g = (int64_t)llround((double)(t - l->base) * (double)l->rate / o->rate0) + l->first_gran + (int64_t)l->preskip;
+    /* Vorbis needs the packet before the one holding the target: a long block back. */
+    if (l->kind == OGG_VORBIS) g -= l->bs[1] > 0 ? l->bs[1] : 8192;
+    end = l->end >= 0 ? l->end : o->br.src->length >= 0 ? o->br.src->length : INT64_MAX;
+    at = g > l->first_gran ? find_page_before(o, l->serial, l->data, end, g, &gran) : -1;
+    if (at < 0) at = l->data;
+    o->cur = k;
+    o->nq = o->iq = 0;
+    o->pend_len = 0;
+    o->have_seq = 0;
+    o->at_end = 0;
+    /* From the link's first audio page the times run forward from its start;
+     * from anywhere else they come from the first granule, and a packet that
+     * continues from the page before is dropped. */
+    o->gran = at == l->data ? l->first_gran : OGG_NO_GRAN;
+    o->prev_bs = at == l->data ? 0 : -1;
+    o->pend_valid = at == l->data;
+    if (o->codec_link != k) {
+        o->codec_link = k;
+        o->reopen = &l->params;
+    }
+    return seek_to(o, at);
+}
+
+static const fa_demux_ops ogg_ops = { ogg_next, ogg_seek };
+
+/* ---- open ------------------------------------------------------------------------------- */
+
+static void ogg_free(ogg* o)
+{
+    links_free(o, 0, o->nlinks);
+    free(o->links);
+    free(o->pend);
+    free(o->qdata);
+    fa_br_free(&o->br);
+    free(o);
+}
+
+static int in_group(const ogg* o, uint32_t serial)
+{
+    int i;
+    for (i = 0; i < o->ngroup; i++)
+        if (o->group[i] == serial) return 1;
+    return 0;
+}
+
+/* The granule of the last page of `serial` in the file (read from its tail).
+ * *out_chained = a stream that did not start the file comes after it. */
+static int64_t last_granule(ogg* o, uint32_t serial, int* out_chained)
+{
+    int64_t len = o->br.src->length, from = len, gran = -1;
+    oggs_page pg;
+    *out_chained = 0;
+    while (from > 0 && gran < 0) {
+        int64_t back = len - from + 2 * (OGG_HEADER + 255 + OGG_MAX_BODY);
+        int64_t at = len - back < 0 ? 0 : len - back;
+        if (seek_to(o, at) != FA_OK) return -1;
+        int ended = 0;
+        while (next_page(o, &pg, from - at) == FA_OK && pg.pos < from) {
+            /* Another stream, a stream starting, or pages after the end. */
+            if (!in_group(o, pg.serial) || (pg.pos > 0 && (pg.flags & 2)) || (ended && pg.serial == serial)) *out_chained = 1;
+            if (pg.serial == serial && pg.granule >= 0) gran = pg.granule;
+            if (pg.serial == serial && (pg.flags & 4)) ended = 1;
+        }
+        if (*out_chained || at == 0 || back > (16 << 20)) break;
+        from = at;
+    }
+    return gran;
+}
+
+/* Back to the start of the first link's audio. */
+static fa_result rewind_first(ogg* o)
+{
+    o->cur = 0;
+    o->at_end = 0;
+    o->nq = o->iq = 0;
+    o->gran = OGG_NO_GRAN;
+    o->prev_bs = 0;
+    o->next_pts = 0;
+    o->pend_len = 0;
+    o->pend_valid = 1;
+    o->have_seq = 0;
+    o->codec_link = 0;
+    o->reopen = NULL;
+    return seek_to(o, o->links[0]->data);
+}
+
+static fa_result ogg_open(fa_decoder* dec)
+{
+    ogg* o = (ogg*)calloc(1, sizeof(ogg));
+    oggs_link* l;
+    fa_track_params tp;
+    int audio = 0, want = dec->audio_track < 0 ? 0 : dec->audio_track, chained = 0, i;
+    fa_result r;
+    if (!o) return FA_ERROR_OUT_OF_MEMORY;
+    o->dec = dec;
+    crc_init(o->crc);
+    r = fa_br_init(&o->br, dec->src);
+    if (r != FA_OK) { free(o); return r; }
+    /* A web stream's source reads from its fa_net (stream.c, net_hls.c). */
+    if (dec->src->remote && dec->src->kind == FA_SOURCE_IO) o->net = (fa_net*)dec->src->io_user;
+    r = add_link(o, &l);
+    if (r == FA_OK) r = read_link(o, l, want, &audio, NULL);
+    if (r != FA_OK) goto fail;
+    dec->track_count = audio;
+    o->rate0 = (double)l->rate;
+
+    if (dec->src->seekable && dec->src->length > 0) {
+        int64_t g = last_granule(o, l->serial, &chained);
+        if (!chained) {
+            o->enumerated = 1;
+            l->end = dec->src->length;
+            l->last_gran = g >= 0 ? g : OGG_NO_GRAN;
+        } else if (!dec->src->remote) {
+            /* Read the whole file once: every link's start, headers and granules. */
+            o->scanning = 1;
+            o->enumerated = 1;
+            r = rewind_first(o);
+            while (r == FA_OK && (r = fill_queue(o)) == FA_OK) o->iq = o->nq;
+            if (r != FA_ERROR_END_OF_STREAM) goto fail;
+            o->scanning = 0;
+            for (i = 0; i < o->nlinks; i++) {
+                oggs_link* li = o->links[i];
+                li->end = i + 1 < o->nlinks ? o->links[i + 1]->start : dec->src->length;
+                if (link_length(o, li) < 0) o->enumerated = 0;
+                if (i > 0) {
+                    int64_t n = link_length(o, o->links[i - 1]);
+                    li->base = o->links[i - 1]->base + (n > 0 ? n : 0);
+                }
+            }
+        }
+    }
+    r = rewind_first(o);
+    if (r != FA_OK) goto fail;
+    /* The first link's start granule comes from its first audio page. */
+    if (l->first_gran == OGG_NO_GRAN && dec->src->seekable) {
+        r = fill_queue(o);
+        if (r != FA_OK && r != FA_ERROR_END_OF_STREAM) goto fail;
+        r = rewind_first(o);
+        if (r != FA_OK) goto fail;
+    }
+
+    memset(&tp, 0, sizeof(tp));
+    tp.codec = l->params;
+    tp.time_base = 1.0 / o->rate0;
+    tp.start = 0;
+    tp.end = FA_DEMUX_NO_PTS;
+    if (o->enumerated) {
+        int64_t total = 0;
+        for (i = 0; i < o->nlinks && total >= 0; i++) {
+            int64_t n = link_length(o, o->links[i]);
+            total = n < 0 ? -1 : total + n;
+        }
+        if (total >= 0) { tp.end = total; tp.clip_to_end = 1; }
+    }
+    tp.last_pts = FA_DEMUX_NO_PTS;
+    tp.seek_preroll_s = l->kind == OGG_OPUS ? 0.08 : 0.0;
+    r = fa_track_open(&o->track, dec, &ogg_ops, o, &tp);
+    if (r != FA_OK) goto fail;
+    dec->impl = o;
+    /* A chained web file is played through; its links are not known up front. */
+    dec->seekable = dec->src->seekable && o->enumerated;
+    snprintf(dec->container, sizeof(dec->container), "ogg");
+    return FA_OK;
+fail:
+    ogg_free(o);
+    return r;
+}
+
+static fa_result ogg_read(fa_decoder* dec, float* out, fa_frames frames, fa_frames* got)
+{
+    return fa_track_read(&((ogg*)dec->impl)->track, out, frames, got);
+}
+
+static fa_result ogg_dec_seek(fa_decoder* dec, fa_frames frame)
+{
+    return fa_track_seek(&((ogg*)dec->impl)->track, frame);
+}
+
+static void ogg_close(fa_decoder* dec)
+{
+    ogg* o = (ogg*)dec->impl;
+    if (!o) return;
+    fa_track_close(&o->track);
+    ogg_free(o);
+    dec->impl = NULL;
+}
+
+/* "OggS" at the start, with a BOS page. */
+static int ogg_probe(const uint8_t* d, size_t n, size_t id3)
+{
+    (void)id3;
+    if (n < OGG_HEADER || memcmp(d, "OggS", 4) != 0 || d[4] != 0 || !(d[5] & 2)) return 0;
+    return 100;
+}
+
+const fa_decoder_vtable fa_decoder_ogg = {
+    "ogg", "Ogg Opus and Ogg Vorbis", "ogg;oga;opus;ogv;ogx",
+    "audio/ogg;application/ogg;audio/opus;audio/vorbis;audio/x-vorbis+ogg;video/ogg",
+    ogg_probe, ogg_open, ogg_read, ogg_dec_seek, ogg_close, 1
+};
+
+/* ---- loudness tags --------------------------------------------------------------------------- */
+
+void fa_ogg_read_loudness(fa_source* src, fa_tag_loudness* out)
+{
+    ogg* o;
+    oggs_link* l;
+    const uint8_t* head;
+    size_t n = fa_source_peek(src, &head);
+    if (n < OGG_HEADER || memcmp(head, "OggS", 4) != 0) return;
+    o = (ogg*)calloc(1, sizeof(ogg));
+    if (!o) return;
+    crc_init(o->crc);
+    o->scanning = 1;
+    if (fa_source_seek(src, 0) == FA_OK && fa_br_init(&o->br, src) == FA_OK && add_link(o, &l) == FA_OK)
+        read_link(o, l, 0, NULL, out);
+    ogg_free(o);
+}

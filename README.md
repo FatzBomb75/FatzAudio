@@ -7,11 +7,14 @@ The current backend uses [miniaudio](https://github.com/mackron/miniaudio) (vend
 FatzAudio's own decoder registry. Time stretching uses
 [Signalsmith Stretch](https://github.com/Signalsmith-Audio/signalsmith-stretch) (MIT, vendored in
 `third_party/signalsmith`, wrapped in `src/stretch.cpp`, the library's only C++ file).
+Opus and Vorbis decode with [libopus](https://opus-codec.org/) 1.5.2 and
+[libvorbis](https://xiph.org/vorbis/) 1.3.7 (with the later fixes on master) and libogg 1.3.6 (BSD, vendored in `third_party/opus`,
+`third_party/vorbis` and `third_party/ogg`, see `third_party/xiph.cmake`), statically linked.
 
 Status: core engine (phase 1), loudness normalization (phase 2) and crossfades (phase 3) done. Decoding runs ahead on worker threads into lock-free ring
 buffers; the audio callback only mixes. Implemented: engine (with a silent null output for tests),
 device enumeration/open/start/stop/volume/latency, streams from files, memory and custom I/O
-with format detection from content (WAV/AIFF/RF64/W64, FLAC, MP3, AC-3/E-AC-3), attach/detach/move between
+with format detection from content (WAV/AIFF/RF64/W64, FLAC, MP3, Ogg Opus/Vorbis, AC-3/E-AC-3), attach/detach/move between
 devices keeping position, play/pause/stop/seek/position/clock/state, volume and pan with
 ramps on seven curves (including your own points), sample-accurate scheduled starts on the device clock,
 crossfades, queues with gapless playback, cue/fade/mix-point markers, mix buses, a per-stream channel

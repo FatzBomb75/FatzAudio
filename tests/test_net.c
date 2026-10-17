@@ -52,6 +52,8 @@ static uint8_t* g_mp3;          /* tests/data/net/tone_cbr.mp3 */
 static size_t g_mp3_n;
 static uint8_t* g_mp3x;         /* tests/data/net/tone_xing.mp3 (Xing header, ID3 tag) */
 static size_t g_mp3x_n;
+static uint8_t* g_oggradio;     /* tests/data/ogg/radio.opus: two chained 1 s songs with titles */
+static size_t g_oggradio_n;
 static uint8_t* g_aac;          /* tests/data/net/tone.aac (ADTS, 131 frames at 44.1 kHz) */
 static size_t g_aac_n;
 static uint8_t* g_aac_tagged;   /* g_aac after a 30 KB ID3v2 tag (cover art) */
@@ -366,6 +368,15 @@ static void serve_radio(sock_t s, const char* req, const uint8_t* body, size_t n
     }
 }
 
+/* An Ogg Opus station: the two chained songs of radio.opus over and over, each
+ * song's title in its own comment header (no ICY metadata). */
+static void serve_ogg_radio(sock_t s)
+{
+    if (send_str(s, "ICY 200 OK\r\nContent-Type: audio/ogg\r\nicy-name: Ogg FM\r\n\r\n")) return;
+    while (!fa_load32(&g_stop))
+        if (send_all(s, g_oggradio, g_oggradio_n)) return;
+}
+
 static void serve_hls(sock_t s, const char* req, const char* path)
 {
     char text[2048], head[256];
@@ -520,6 +531,7 @@ static void handle_request(sock_t s)
         if (!send_str(s, head)) send_str(s, body);
     }
     else if (strcmp(path, "/radio") == 0) serve_radio(s, req, g_mp3, g_mp3_n, "audio/mpeg", 128);
+    else if (strcmp(path, "/oggradio") == 0) serve_ogg_radio(s);
     else if (strcmp(path, "/radio.aac") == 0) serve_radio(s, req, g_aac, g_aac_n, "audio/aacp", 64);
     else if (strcmp(path, "/tone.aac") == 0) serve_bytes(s, req, g_aac, g_aac_n, "audio/aac", 1, 0);
     else if (strcmp(path, "/tagged.aac") == 0) serve_bytes(s, req, g_aac_tagged, g_aac_tagged_n, "audio/aac", 1, 0);
@@ -1263,6 +1275,50 @@ static void test_hls_aac(void)
     fa_stream_close(s);
 }
 
+/* Ogg radio: every song is a new link with its own headers; its comments become
+ * the title, announced where the song starts. */
+static void test_ogg_radio_titles(void)
+{
+    fa_result r;
+    fa_stream* s = open_url("/oggradio", FA_OPEN_DECODE_ONLY, &r);
+    fa_stream_info info;
+    fa_metadata md;
+    meta_log log;
+    float buf[4096 * 2];
+    fa_frames total = 0;
+    CHECK_EQ(r, FA_OK);
+    memset(&log, 0, sizeof(log));
+    fa_mutex_init(&log.lock);
+    fa_stream_set_event_callback(s, on_event, &log);
+    fa_stream_get_info(s, &info);
+    CHECK(strcmp(info.codec, "opus") == 0);
+    CHECK(strcmp(info.container, "ogg") == 0);
+    CHECK_EQ(info.format.sample_rate, 48000);
+    CHECK(!info.seekable);
+    while (total < 24000) { fa_frames got = 0; fa_stream_read(s, buf, 4096, &got); CHECK(got > 0); total += got; }
+    CHECK_EQ(fa_stream_get_metadata(s, &md), FA_OK);
+    CHECK_STR(md.station, "Ogg FM");
+    CHECK_STR(md.stream_title, "Artist A - Song 1");
+    CHECK_STR(md.title, "Song 1");
+    CHECK_EQ(md.seq, 1);
+    /* Into the second song, then around to the first again. */
+    while (total < 72000) { fa_frames got = 0; fa_stream_read(s, buf, 4096, &got); CHECK(got > 0); total += got; }
+    CHECK_EQ(fa_stream_get_metadata(s, &md), FA_OK);
+    CHECK_STR(md.stream_title, "Artist B - Song 2");
+    CHECK_EQ(md.seq, 2);
+    while (total < 120000) { fa_frames got = 0; fa_stream_read(s, buf, 4096, &got); CHECK(got > 0); total += got; }
+    CHECK_EQ(fa_stream_get_metadata(s, &md), FA_OK);
+    CHECK_STR(md.stream_title, "Artist A - Song 1");
+    CHECK_EQ(md.seq, 3);
+    CHECK(wait_events(&log, 3) >= 3);
+    printf("  songs announced at frames %lld and %lld (start at 48000 and 96000)\n",
+           (long long)log.frame[1], (long long)log.frame[2]);
+    CHECK(llabs((long long)log.frame[1] - 48000) < 4800);
+    CHECK(llabs((long long)log.frame[2] - 96000) < 4800);
+    fa_stream_close(s);
+    fa_mutex_destroy(&log.lock);
+}
+
 static void test_playlist_file_is_followed(void)
 {
     fa_result r;
@@ -1607,7 +1663,8 @@ int main(void)
     g_mp3x = read_file(FA_TEST_DATA_DIR "/net/tone_xing.mp3", &g_mp3x_n);
     g_aac = read_file(FA_TEST_DATA_DIR "/net/tone.aac", &g_aac_n);
     g_ac3 = read_file(FA_TEST_DATA_DIR "/tone.ac3", &g_ac3_n);
-    if (!g_mp3 || !g_mp3x || !g_aac || !g_ac3) { fprintf(stderr, "missing test data in %s\n", FA_TEST_DATA_DIR "/net"); return 1; }
+    g_oggradio = read_file(FA_TEST_DATA_DIR "/ogg/radio.opus", &g_oggradio_n);
+    if (!g_mp3 || !g_mp3x || !g_aac || !g_ac3 || !g_oggradio) { fprintf(stderr, "missing test data in %s\n", FA_TEST_DATA_DIR "/net"); return 1; }
     make_wav();
     make_hls();
     make_hls_aac();
@@ -1638,6 +1695,7 @@ int main(void)
     RUN(test_redirect_and_errors);
     RUN(test_reconnect_resumes);
     RUN(test_icy_radio_decode_only);
+    RUN(test_ogg_radio_titles);
     RUN(test_playlist_file_is_followed);
     RUN(test_icy_radio_attached);
     RUN(test_stall_and_resume);
@@ -1658,6 +1716,7 @@ int main(void)
     free(g_ac3_seg[0].p);
     free(g_ac3_seg[1].p);
     free(g_ac3);
+    free(g_oggradio);
     free(g_mp3);
     free(g_mp3x);
     free(g_aac);

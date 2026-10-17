@@ -350,6 +350,14 @@ static fa_result fill(fa_track* t)
             break;
         }
         if (r != FA_OK) return r;
+        if (pk.reopen) {
+            fa_codec_close(&t->codec);
+            t->codec_ready = 0;
+            r = fa_codec_open(&t->codec, pk.reopen);
+            if (r != FA_OK) { t->eof = 1; return r; }    /* the next song cannot be decoded */
+            t->codec_ready = 1;
+            t->codec.dynamic_range = t->dec->dynamic_range;
+        }
         r = t->codec.vt->decode(&t->codec, pk.data, pk.size);
         if (r == FA_ERROR_OUT_OF_MEMORY) return r;
         if (r != FA_OK || t->codec.out_frames <= 0 || t->codec.rate == 0 || t->codec.channels == 0) {
@@ -450,6 +458,7 @@ fa_result fa_track_seek(fa_track* t, fa_frames frame)
     fa_frames want = frame - (fa_frames)llround(t->p.seek_preroll_s * t->dec->format.sample_rate);
     double at = (double)t->p.start + (double)(want - t->lead) / t->fpt;
     fa_result r;
+    if (!t->codec_ready) return FA_ERROR_UNSUPPORTED_FORMAT;
     if (t->codec.vt->flush) t->codec.vt->flush(&t->codec);
     fa_pcm_conv_reset(&t->conv);
     t->count = t->off = 0;

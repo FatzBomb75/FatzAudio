@@ -50,6 +50,9 @@ typedef struct fa_demux_packet {
     int64_t pts;       /* time base units, FA_DEMUX_NO_PTS = right after the previous packet */
     int64_t duration;  /* time base units, -1 = unknown */
     int64_t trim_end;  /* time base units to drop from the end of this packet's audio */
+    /* Not NULL: the codec is opened again with these parameters before this packet
+     * (a chained Ogg stream starting its next song). */
+    const fa_codec_params* reopen;
 } fa_demux_packet;
 
 typedef struct fa_demux_ops {
