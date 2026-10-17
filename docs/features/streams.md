@@ -9,13 +9,16 @@ A stream is anything that produces audio. You open it from a file, a memory bloc
 | WAV | RIFF, RIFX, RF64, Wave64, AIFF, AIFF-C (PCM, float, ADPCM, A-law, µ-law) | `pcm` (container `wav` or `aiff`) |
 | FLAC | Native FLAC, with or without a leading ID3v2 tag | `flac` |
 | MP3 | MPEG-1, 2 and 2.5 Layer III, with or without ID3v2 tags | `mp3` |
+| AAC (ADTS) | `.aac` files, AAC internet radio and AAC in HLS segments: AAC-LC, HE-AAC and HE-AAC v2 in ADTS frames, with or without ID3v2 tags | `aac` (container `adts`) |
 | MP4, M4A, MOV | ISO MP4 and QuickTime, including fragmented MP4. Audio tracks only: video is never read | the track's codec: `aac`, `mp3`, `ac3`, `eac3`, `opus`, `flac`, `alac`, `pcm_*`, ... (container `mp4` or `mov`) |
 | Matroska, WebM | MKV, MKA, WebM, including live layouts (unknown sizes, no Cues). Audio tracks only | `aac`, `mp3`, `ac3`, `eac3`, `opus`, `vorbis`, `flac`, `pcm_*`, ... (container `matroska` or `webm`) |
 | Dolby Digital, Dolby Digital Plus | Raw `.ac3` and `.ec3` streams, up to 7.1 ([Dolby Digital](dolby.md)) | `ac3` or `eac3` (container `ac3` or `ec3`) |
 
-Inside MP4 and Matroska, PCM, MP3, AC-3 and E-AC-3 tracks decode built in; every other codec (AAC, Opus, Vorbis, FLAC, ALAC, DTS, TrueHD) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`.
+Inside MP4 and Matroska, PCM, MP3, AC-3 and E-AC-3 tracks decode built in; every other codec (AAC, Opus, Vorbis, FLAC, ALAC, DTS, TrueHD) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`. The same goes for `.aac` files and AAC streams.
 
-More formats are added to the same registry (Ogg Vorbis and Opus, raw AAC files, and built-in decoders for the codecs above follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
+An `.aac` file on disk or in memory is indexed when it opens (a quick pass over the frame headers, without decoding), so its length and seeks are exact. Over the network, and from your own read callbacks when they can seek, the length and seek positions are estimated from the frame sizes at the start, as for MP3 without a seek table. Junk between frames, such as a radio stream joined in the middle of a frame or ID3 tags between HLS segments, is skipped.
+
+More formats are added to the same registry (Ogg Vorbis and Opus, and built-in or OS decoders for the codecs above follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
 
 Apps that demux files themselves (for example with FFmpeg, for the video) can push compressed packets or decoded frames instead of opening a file: see [FFmpeg hand-off and A/V sync](ffmpeg.md).
 
