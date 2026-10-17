@@ -457,13 +457,31 @@ public unsafe class AudioStream : IDisposable
         return new StreamLevels(peak, rms);
     }
 
-    /// <summary>The loudness measurement of this stream (an estimate until <see cref="LoudnessFinal"/> is raised).</summary>
+    /// <summary>
+    /// The best loudness known for this stream right now and the gain normalization gives it. Starts the
+    /// analysis if it has not run yet (also with normalization off), and never waits for it: until
+    /// <see cref="LoudnessFinal"/> is raised the value may be an estimate or unknown.
+    /// </summary>
     /// <returns>The loudness.</returns>
-    /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
     public Loudness GetLoudness()
     {
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_loudness(Handle, out FaLoudness l));
-        return new Loudness(l.IntegratedLufs, l.RangeLu, l.TruePeakDbtp, l.IsFinal != 0);
+        return Loudness.From(l);
+    }
+
+    /// <summary>
+    /// Supplies a loudness your app measured or stored earlier (for example from its library database).
+    /// It wins over tags, the cache and scans, and cancels a scan in progress.
+    /// </summary>
+    /// <param name="integratedLufs">Integrated loudness in LUFS.</param>
+    /// <param name="rangeLu">Loudness range in LU, if known.</param>
+    /// <param name="truePeakDbtp">True peak in dBTP, if known.</param>
+    /// <exception cref="ArgumentException"><paramref name="integratedLufs"/> is NaN.</exception>
+    public void SetLoudness(double integratedLufs, double rangeLu = double.NaN, double truePeakDbtp = double.NaN)
+    {
+        if (double.IsNaN(integratedLufs)) throw new ArgumentException("Loudness must be a number.", nameof(integratedLufs));
+        var l = new FaLoudness { IntegratedLufs = integratedLufs, RangeLu = rangeLu, TruePeakDbtp = truePeakDbtp, IsFinal = 1 };
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_loudness(Handle, in l));
     }
 
     /// <summary>Requests a <see cref="PositionReached"/> event when playback reaches a position.</summary>
@@ -534,7 +552,7 @@ public unsafe class AudioStream : IDisposable
     public event EventHandler? Resumed;
     /// <summary>Raised when a recoverable decode error occurred (data skipped, playback continues). Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? DecodeError;
-    /// <summary>Raised when the loudness measurement is complete. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
+    /// <summary>Raised when the stream's final loudness is known (from tags, the cache or a scan); <see cref="GetLoudness"/> then returns it. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? LoudnessFinal;
     /// <summary>Raised when a position requested with <see cref="AddPositionEvent"/> is reached. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler<StreamEventArgs>? PositionReached;

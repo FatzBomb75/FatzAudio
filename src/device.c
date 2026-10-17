@@ -1,4 +1,5 @@
 #include "fa_internal.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,6 +77,14 @@ FA_API fa_result FA_CALL fa_device_get_info(fa_engine* engine, fa_device_type ty
  * pointer and mixes each stream's pre-decoded ring buffer. `epoch` is odd while
  * it runs, which lets API threads wait until it no longer sees an old list
  * (fa_device_wait_quiescent) before freeing anything it might touch. */
+/* Linear ceiling of the output limiter, 0 = off. */
+static float limiter_ceiling(fa_engine* e)
+{
+    int mode = fa_load32(&e->limiter_mode);
+    int on = mode == FA_LIMITER_ON || (mode == FA_LIMITER_AUTO && fa_load32(&e->norm_mode) != FA_NORMALIZE_OFF);
+    return on ? powf(10.0f, fa_load_float(&e->limiter_ceiling) / 20.0f) : 0.0f;
+}
+
 static void data_callback(ma_device* d, void* output, const void* input, ma_uint32 frames)
 {
     fa_device* dev = (fa_device*)d->pUserData;
@@ -87,6 +96,7 @@ static void data_callback(ma_device* d, void* output, const void* input, ma_uint
     list = (fa_voice_list*)fa_load_ptr(&dev->voices);
     if (list)
         for (i = 0; i < list->count; i++) fa_stream_mix(list->items[i], dev, (float*)output, frames);
+    fa_limiter_process(&dev->limiter, (float*)output, frames, limiter_ceiling(dev->engine));
     fa_fetch_add64(&dev->epoch, 1);
 }
 
@@ -185,6 +195,12 @@ FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id
         return FA_ERROR_DEVICE;
     }
     d->rate = d->device.sampleRate;
+    if (fa_limiter_init(&d->limiter, d->rate, FA_DEVICE_CHANNELS) != FA_OK) {
+        ma_device_uninit(&d->device);
+        fa_mutex_destroy(&d->lock);
+        free(d);
+        return FA_ERROR_OUT_OF_MEMORY;
+    }
 
     fa_mutex_lock(&engine->list_lock);
     d->next = engine->devices;
@@ -212,6 +228,7 @@ FA_API void FA_CALL fa_device_close(fa_device* device)
         if (*pp == device) { *pp = device->next; break; }
     fa_event_rescue_device(device->engine, device);
     fa_mutex_unlock(&device->engine->list_lock);
+    fa_limiter_free(&device->limiter);
     free(fa_load_ptr(&device->voices));
     fa_mutex_destroy(&device->lock);
     free(device);
@@ -258,5 +275,6 @@ FA_API fa_result FA_CALL fa_device_get_latency(fa_device* device, fa_time* out_l
     if (rate == 0) { *out_latency = 0; return FA_OK; }
     *out_latency = (fa_time)((double)device->device.playback.internalPeriodSizeInFrames *
                              (double)device->device.playback.internalPeriods * 1e9 / (double)rate);
+    if (device->rate) *out_latency += (fa_time)((double)device->limiter.delay * 1e9 / (double)device->rate);
     return FA_OK;
 }

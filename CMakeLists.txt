@@ -26,6 +26,11 @@ set(FA_SOURCES
     src/ring.c
     src/curve.c
     src/event.c
+    src/loudness.c
+    src/tags.c
+    src/scan.c
+    src/normalize.c
+    src/limiter.c
     src/stubs.c
     src/miniaudio_impl.c
     src/fa_internal.h

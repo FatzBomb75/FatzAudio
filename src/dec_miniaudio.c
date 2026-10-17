@@ -124,17 +124,17 @@ static fa_result mp3_open(fa_decoder* dec) { return open_with(dec, ma_encoding_f
 const fa_decoder_vtable fa_decoder_wav = {
     "wav", "WAV, RF64, Wave64 and AIFF (PCM, float, ADPCM)", "wav;wave;rf64;w64;bwf;aif;aiff;aifc",
     "audio/wav;audio/x-wav;audio/wave;audio/vnd.wave;audio/aiff;audio/x-aiff",
-    fa_probe_wav, wav_open, wav_read, wav_seek, wav_close
+    fa_probe_wav, wav_open, wav_read, wav_seek, wav_close, 1
 };
 
 const fa_decoder_vtable fa_decoder_flac = {
     "flac", "Free Lossless Audio Codec", "flac;fla",
     "audio/flac;audio/x-flac",
-    fa_probe_flac, flac_open, ma_read, ma_seek, ma_close
+    fa_probe_flac, flac_open, ma_read, ma_seek, ma_close, 1
 };
 
 const fa_decoder_vtable fa_decoder_mp3 = {
     "mp3", "MPEG-1/2/2.5 Layer III", "mp3",
     "audio/mpeg;audio/mp3;audio/x-mp3",
-    fa_probe_mp3, mp3_open, ma_read, ma_seek, ma_close
+    fa_probe_mp3, mp3_open, ma_read, ma_seek, ma_close, 0
 };

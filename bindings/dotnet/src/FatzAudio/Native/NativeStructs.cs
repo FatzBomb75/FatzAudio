@@ -89,6 +89,8 @@ internal struct FaLoudness
     public double RangeLu;
     public double TruePeakDbtp;
     public int IsFinal;
+    public int Source;
+    public double GainDb;
 }
 
 [StructLayout(LayoutKind.Sequential)]

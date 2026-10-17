@@ -100,6 +100,21 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 |---|---|---|
 | BASS_ChannelSetFX / RemoveFX, BASS_FXSetParameters / GetParameters / Reset / SetPriority / SetBypass / Free | One effects chain per stream (EQ, compressor, reverb, echo, chorus, flanger, distortion) | 🗓️ |
 
+### Loudness and normalization
+
+BASS has no normalization: apps measure each file themselves with a decode pass and then set the volume. FatzAudio does it for every stream ([normalization](../features/normalization.md)).
+
+| BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| Your own analysis: decode stream (`BASS_STREAM_DECODE`) + `BASS_ChannelGetData`/`GetLevel` loop, compute a gain, then `BASS_ChannelSetAttribute(h, BASS_ATTRIB_VOL, gain)` | `fa_engine_set_normalization(engine, FA_NORMALIZE_TRACK, -16)` once. Tags, cache and a parallel audio-only background scan; playback starts at once and glides to the exact gain | `engine.SetNormalization(NormalizeMode.Track, -16)` | ✅ |
+| Storing your analysis result and reapplying it next time | `fa_stream_set_loudness` (wins over everything); results cached automatically in `fa_engine_config.cache_directory` | `stream.SetLoudness(lufs)`, `AudioEngineOptions.CacheDirectory` | ✅ |
+| Analysing files ahead of playback (library import) | `fa_scan_loudness_path`: audio only, all cores, cached | `engine.ScanLoudness(path)` | ✅ |
+| `BASS_ATTRIB_VOLDSP` to boost above 1.0 | Normalization gain is separate from `FA_PARAM_VOLUME` and boosts up to +12 dB; volume stays free for fades | automatic | ✅ |
+| Reading ReplayGain tags yourself (`BASS_ChannelGetTags` + parsing) | Read automatically: ID3v2 `TXXX`, FLAC Vorbis comments, APEv2; RG2 and R128 | automatic | ✅ |
+| BASSloud: `BASS_Loudness_Start` / `GetLevel` (integrated, range, true peak) | `fa_stream_get_loudness`, `fa_scan_loudness_path` (BS.1770-4 / R128) | `GetLoudness()`, `ScanLoudness()` | ✅ integrated, range, true peak; momentary/short-term meters 🗓️ |
+| bass_fx `BASS_FX_BFX_DAMP` (dynamic amplification) on live streams | Running loudness estimate drives the gain for streams that can't be scanned | automatic | ✅ |
+| bass_fx `BASS_FX_BFX_COMPRESSOR2` used to stop clipping | `fa_engine_set_limiter`: true-peak, look-ahead, on every device | `engine.SetLimiter(...)` | ✅ |
+
 ### Samples (in-memory sounds)
 
 | BASS | FatzAudio | Status |
@@ -145,7 +160,7 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | basswebm.dll | Built-in Matroska/WebM demuxer | 🗓️ |
 | basswma.dll | Decode via Media Foundation on Windows / FFmpeg bridge; encoding not provided | 🗓️ / ➖ |
 | bassmidi.dll | Built-in MIDI synth (SF2, later SFZ/SF3); soundfont via stream options | 🗓️ |
-| bass_fx.dll | Tempo/pitch/rate params on every stream; reverse and BPM planned | 🗓️ |
+| bass_fx.dll | Tempo/pitch/rate params on every stream; reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | 🗓️ tempo/pitch, ✅ level control |
 | basscd.dll | Disc source + CD+G; analog playback not provided | 🗓️ |
 
 ## 4. Common patterns
@@ -248,4 +263,35 @@ BASS: `BASS_ChannelSetSync(h, BASS_SYNC_END, 0, EndProc, user);`. The SYNCPROC r
 
 FatzAudio: `fa_stream_set_event_callback(s, on_event, user);` and handle `FA_EVENT_ENDED`. The callback runs on the event thread, so it can start the next track, close the stream, or update state directly. .NET: `song.Ended += ...`.
 
-*More patterns (crossfades, tempo, FFmpeg hand-off, normalization, CD+G) are added here as each feature lands.*
+### Normalize loudness (replaces your own analysis pass)
+
+BASS (typical app code):
+```c
+/* 1. Analyse: decode the whole file once, on your own thread. Slow on long videos. */
+HSTREAM dec = BASS_StreamCreateFile(FALSE, path, 0, 0, BASS_STREAM_DECODE | BASS_SAMPLE_FLOAT);
+while (BASS_ChannelIsActive(dec)) { BASS_ChannelGetData(dec, buf, sizeof(buf)); /* your RMS/peak math */ }
+BASS_StreamFree(dec);
+/* 2. Play, then set the gain you computed. */
+HSTREAM h = BASS_StreamCreateFile(FALSE, path, 0, 0, 0);
+BASS_ChannelSetAttribute(h, BASS_ATTRIB_VOL, gain);
+BASS_ChannelPlay(h, FALSE);
+```
+
+FatzAudio:
+```c
+fa_engine_set_normalization(engine, FA_NORMALIZE_TRACK, -16.0);  /* once, at startup */
+fa_stream_open_path(engine, path, NULL, &s);                      /* analysis starts in the background */
+fa_stream_attach(s, device, NULL);
+fa_stream_play(s);                                                /* no gain to set */
+```
+
+.NET:
+```csharp
+engine.SetNormalization(NormalizeMode.Track, -16);   // once
+using var song = engine.OpenFile(path);
+song.PlayOn(output);
+```
+
+When porting, delete the analysis pass and the `BASS_ATTRIB_VOL` call that applied its result; keep using volume for fades and the user's volume control. If your library database already holds loudness values, pass them with `fa_stream_set_loudness` / `song.SetLoudness(lufs)` and no file is scanned at all.
+
+*More patterns (crossfades, tempo, FFmpeg hand-off, CD+G) are added here as each feature lands.*

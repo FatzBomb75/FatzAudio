@@ -103,23 +103,60 @@ public enum AudioParameter
     Pitch = 4,
 }
 
-/// <summary>Loudness normalization mode of the engine.</summary>
+/// <summary>Loudness normalization mode of the engine (see <see cref="AudioEngine.SetNormalization"/>).</summary>
 public enum NormalizeMode
 {
-    /// <summary>No normalization.</summary>
+    /// <summary>No normalization (the default).</summary>
     Off = 0,
-    /// <summary>Per-stream integrated loudness.</summary>
+    /// <summary>Every stream plays at the target loudness.</summary>
     Track = 1,
-    /// <summary>Use album gain tags when present.</summary>
+    /// <summary>
+    /// Album gain from ReplayGain or R128 tags when present, so an album's quiet and loud songs keep
+    /// their balance; streams without album tags are normalized per track.
+    /// </summary>
     Album = 2,
 }
 
-/// <summary>Result of a loudness measurement (EBU R128).</summary>
-/// <param name="IntegratedLufs">Integrated loudness in LUFS.</param>
-/// <param name="RangeLu">Loudness range in LU.</param>
-/// <param name="TruePeakDbtp">True peak in dBTP.</param>
-/// <param name="IsFinal">False while the value is only an estimate because scanning is still in progress.</param>
-public sealed record Loudness(double IntegratedLufs, double RangeLu, double TruePeakDbtp, bool IsFinal);
+/// <summary>Where a <see cref="Loudness"/> value came from.</summary>
+public enum LoudnessSource
+{
+    /// <summary>Nothing is known yet.</summary>
+    None = 0,
+    /// <summary>A running estimate from the audio decoded so far (live streams, or while a scan runs).</summary>
+    Estimate = 1,
+    /// <summary>ReplayGain 2 or R128 tags in the file.</summary>
+    Tags = 2,
+    /// <summary>An earlier scan of the same content, from <see cref="AudioEngineOptions.CacheDirectory"/>.</summary>
+    Cache = 3,
+    /// <summary>A full scan of the file.</summary>
+    Scan = 4,
+    /// <summary>A value the app supplied with <see cref="AudioStream.SetLoudness"/>.</summary>
+    App = 5,
+}
+
+/// <summary>When the output limiter runs (see <see cref="AudioEngine.SetLimiter"/>).</summary>
+public enum LimiterMode
+{
+    /// <summary>On while normalization is on (the default).</summary>
+    Auto = 0,
+    /// <summary>Always on.</summary>
+    On = 1,
+    /// <summary>Always off.</summary>
+    Off = 2,
+}
+
+/// <summary>Loudness of a stream or file (ITU-R BS.1770-4 / EBU R128). Unknown values are <see cref="double.NaN"/>.</summary>
+/// <param name="IntegratedLufs">Integrated loudness in LUFS; negative infinity for digital silence.</param>
+/// <param name="RangeLu">Loudness range in LU (EBU Tech 3342).</param>
+/// <param name="TruePeakDbtp">True peak in dBTP (from tags: the sample peak in dBFS).</param>
+/// <param name="IsFinal">False while the value is only an estimate (or nothing is known yet).</param>
+/// <param name="Source">Where the value came from.</param>
+/// <param name="GainDb">The gain normalization applies to the stream with the engine's current settings, in dB (0 when off or opted out).</param>
+public sealed record Loudness(double IntegratedLufs, double RangeLu, double TruePeakDbtp, bool IsFinal, LoudnessSource Source, double GainDb)
+{
+    internal static Loudness From(in Native.FaLoudness l) =>
+        new(l.IntegratedLufs, l.RangeLu, l.TruePeakDbtp, l.IsFinal != 0, (LoudnessSource)l.Source, l.GainDb);
+}
 
 /// <summary>Peak and RMS levels per channel, linear 0..1.</summary>
 /// <param name="Peak">Peak level per channel.</param>
@@ -153,7 +190,7 @@ public sealed record StreamOptions
     public bool Loop { get; init; }
     /// <summary>Build an exact seek index and length before the open call returns (slower to open).</summary>
     public bool Prescan { get; init; }
-    /// <summary>Opt this stream out of engine loudness normalization.</summary>
+    /// <summary>Opt this stream out of engine loudness normalization (jingles, sound effects, already-mastered mixes).</summary>
     public bool NoNormalize { get; init; }
     /// <summary>Audio track to use in multi-track containers; -1 selects the default.</summary>
     public int AudioTrack { get; init; } = -1;
@@ -175,7 +212,10 @@ public sealed record AudioEngineOptions
     public TimeSpan? Period { get; init; }
     /// <summary>Decode worker threads; 0 uses the number of cores (at most 8).</summary>
     public int WorkerThreads { get; init; }
-    /// <summary>Directory for the loudness and seek-index cache; null disables the cache.</summary>
+    /// <summary>
+    /// Directory for the loudness scan cache (one small file per scanned file, keyed by its content, so
+    /// renamed or moved files still hit); created if missing. Null disables the cache.
+    /// </summary>
     public string? CacheDirectory { get; init; }
     /// <summary>
     /// Output devices play into a silent output that still runs in real time. Use it for automated

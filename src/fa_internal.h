@@ -34,6 +34,8 @@ typedef struct fa_source {
 
 fa_result fa_source_open_path(fa_source* src, const char* path);
 fa_result fa_source_open_memory(fa_source* src, const void* data, size_t size);
+/* Like fa_source_open_memory but without a copy: `data` must outlive the source. */
+fa_result fa_source_open_memory_ref(fa_source* src, const void* data, size_t size);
 fa_result fa_source_open_io(fa_source* src, const fa_io_callbacks* io, void* user);
 /* Returns the first bytes of the source (up to FA_PROBE_BYTES) without moving the read position. */
 size_t fa_source_peek(fa_source* src, const uint8_t** out_data);
@@ -61,6 +63,10 @@ typedef struct fa_decoder_vtable {
     fa_result (*read)(fa_decoder* dec, float* out, fa_frames frames, fa_frames* got);
     fa_result (*seek)(fa_decoder* dec, fa_frames frame);
     void (*close)(fa_decoder* dec);
+    /* 1 if seeking costs about the same wherever it lands (an index or binary
+     * search), so the loudness scanner can split files into chunks. 0 if a seek
+     * decodes from the start (MP3 without a seek table): scanned in one pass. */
+    int fast_seek;
 } fa_decoder_vtable;
 
 struct fa_decoder {
@@ -130,6 +136,108 @@ void fa_ring_reset(fa_ring* r);
 /* Shape of a ramp at progress t (0..1) -> 0..1. `rising` tells the equal-power
  * curve whether the value goes up (sin) or down (1 - cos). */
 float fa_curve_eval(int curve, const float bezier[4], float t, int rising);
+
+/* ---- Loudness (loudness.c) ------------------------------------------------ */
+
+#define FA_TP_PHASES 4
+#define FA_TP_TAPS 12
+#define FA_RUNNING_SUBS 150     /* running estimate window: 15 s of 100 ms sub-blocks */
+
+/* Polyphase true-peak detector (BS.1770 Annex 2 style). */
+typedef struct fa_truepeak {
+    uint32_t channels;
+    int phases;                 /* 4 below 88.2 kHz, 2 below 176.4 kHz, else 1 */
+    float coef[FA_TP_PHASES][FA_TP_TAPS];
+    float bound;                /* largest sum of |coef| of a phase */
+    float* hist;                /* per channel: 2 x FA_TP_TAPS */
+    int pos;
+    float peak;                 /* largest |value| measured so far, linear */
+} fa_truepeak;
+
+fa_result fa_truepeak_init(fa_truepeak* tp, uint32_t rate, uint32_t channels);
+void fa_truepeak_free(fa_truepeak* tp);
+/* One interleaved frame in; the largest |interpolated value| it completes out. */
+float fa_truepeak_push(fa_truepeak* tp, const float* frame);
+
+/* K-weighted energy meter: one mean-square energy per 100 ms sub-block. */
+typedef struct fa_meter {
+    uint32_t rate, channels;
+    double b[2][3], a[2][3];
+    double* z;                  /* filter state, 4 per channel */
+    double* weight;             /* channel weights */
+    int64_t sublen, subfill;
+    double subacc;
+    double* subs;               /* sub-block energies */
+    int64_t nsubs, cap;         /* ring mode: nsubs counts every sub-block ever */
+    int ring;
+    int64_t skip;               /* frames to filter without measuring (warm-up) */
+    int with_peak;
+    fa_truepeak tp;
+} fa_meter;
+
+/* ring_subs > 0 keeps only the newest ring_subs sub-blocks (running estimate). */
+fa_result fa_meter_init(fa_meter* m, uint32_t rate, uint32_t channels, int with_peak, int64_t ring_subs);
+void fa_meter_free(fa_meter* m);
+void fa_meter_reset(fa_meter* m);
+fa_result fa_meter_process(fa_meter* m, const float* interleaved, int64_t frames);
+double fa_meter_running_lufs(const fa_meter* m);   /* ring mode; NAN until 400 ms measured */
+double fa_meter_peak_dbtp(const fa_meter* m);
+double fa_loudness_integrated(const double* subs, int64_t n); /* -HUGE_VAL for silence */
+double fa_loudness_range(const double* subs, int64_t n);
+
+/* ---- Gain tags (tags.c) ----------------------------------------------------- */
+
+/* Loudness stored in ReplayGain 2 / R128 tags, converted to LUFS. NAN = absent. */
+typedef struct fa_tag_loudness {
+    double track_lufs, album_lufs;
+    double track_peak_db, album_peak_db;   /* sample peak in dBFS */
+} fa_tag_loudness;
+
+/* Reads ID3v2 (TXXX), FLAC Vorbis comments and APEv2. Moves the read position. */
+void fa_tags_read_loudness(fa_source* src, fa_tag_loudness* out);
+/* A Vorbis comment block (FLAC, Ogg Vorbis/Opus): vendor, count, "KEY=value" items. */
+void fa_tags_parse_vorbis_comments(const uint8_t* data, size_t size, fa_tag_loudness* out);
+
+/* ---- Loudness scans (scan.c) ----------------------------------------------- */
+
+typedef struct fa_scan_job fa_scan_job;
+
+/* Starts the background analysis of a stream (tags, then cache, then a chunked
+ * scan on the scan threads). Results arrive via fa_stream_loudness_ready. */
+fa_scan_job* fa_scan_start_stream(struct fa_stream* s, int use_tags);
+/* Cancels if still running, waits until no scan thread uses it, frees it. */
+void fa_scan_release(fa_scan_job* job);
+void fa_scan_shutdown(fa_engine* engine);
+/* Gain normalization gives a stream of loudness `lufs` with the engine's current settings. */
+float fa_engine_norm_gain_db(fa_engine* engine, double lufs);
+
+/* ---- Limiter (limiter.c) ----------------------------------------------------- */
+
+/* Look-ahead true-peak limiter on a device's output. */
+typedef struct fa_limiter {
+    uint32_t channels;
+    int attack;                 /* box-filter length, frames */
+    int window;                 /* sliding-minimum window, frames */
+    int delay;                  /* audio delay, frames */
+    float* audio;               /* delay line, `delay` frames */
+    int apos;
+    float* box;                 /* last `attack` minima */
+    int bpos;
+    double box_sum;
+    int64_t* dq_idx;            /* monotonic deque for the sliding minimum */
+    float* dq_val;
+    int dq_head, dq_count, dq_cap;
+    int64_t n;
+    float gain;                 /* after release smoothing */
+    float release;              /* per-frame release coefficient */
+    fa_truepeak tp;
+    float reduction;            /* smallest gain of the last block (for metering) */
+} fa_limiter;
+
+fa_result fa_limiter_init(fa_limiter* l, uint32_t rate, uint32_t channels);
+void fa_limiter_free(fa_limiter* l);
+/* In place. ceiling <= 0 disables limiting (the delay stays, so toggling is click-free). */
+void fa_limiter_process(fa_limiter* l, float* frames, uint32_t count, float ceiling);
 
 /* ---- Events (event.c) ----------------------------------------------------- */
 
@@ -201,6 +309,20 @@ struct fa_engine {
     fa_atomic32 quit;
     int destroy_on_event_thread; /* fa_engine_destroy ran inside a callback: the event
                                     thread finishes the teardown when it exits */
+
+    /* Normalization and limiter settings, read by the audio thread. */
+    fa_atomic32 norm_mode;       /* fa_normalize_mode */
+    fa_atomic32 norm_target;     /* float LUFS */
+    fa_atomic32 limiter_mode;    /* fa_limiter_mode */
+    fa_atomic32 limiter_ceiling; /* float dBTP */
+
+    /* Loudness scan threads (scan.c) */
+    fa_mutex scan_lock;
+    fa_cond scan_cond;           /* work queued or a job finished */
+    fa_scan_job* scan_queue;
+    fa_thread* scan_threads;
+    uint32_t scan_thread_count;
+    int scan_started;
 };
 
 typedef struct fa_voice_list {
@@ -218,6 +340,7 @@ struct fa_device {
     fa_event_queue events;       /* audio callback -> event thread */
     fa_atomic32 spilled;         /* 1 = some stream on this device used its spill slots */
     fa_atomic32 publishing;      /* audio thread is between taking a sequence number and publishing */
+    fa_limiter limiter;          /* audio thread only */
     struct fa_device* next;      /* engine->devices */
 };
 
@@ -302,6 +425,20 @@ struct fa_stream {
     int was_audible;                     /* audio thread only: mixed in the previous callback */
     fa_atomic32 current[FA_MIX_PARAMS];  /* float bits, published by the audio thread */
 
+    /* Normalization */
+    char* path;                  /* for scans of path streams; NULL otherwise */
+    int32_t audio_track;
+    fa_mutex norm_lock;          /* scan_job, loud, loud_source */
+    fa_scan_job* scan_job;
+    int analysis_tried;
+    fa_loudness loud;            /* final measurement (valid when loud.is_final) */
+    fa_atomic32 norm_track;      /* float LUFS used for gain, NAN = unknown */
+    fa_atomic32 norm_album;      /* float LUFS from album tags, NAN = unknown */
+    fa_atomic32 norm_est;        /* float LUFS running estimate, NAN = none yet */
+    fa_meter run_meter;          /* running estimate; worker-owned under decode_lock */
+    int run_meter_ready;
+    float norm_db;               /* audio thread: gain being applied, dB */
+
     /* Events */
     fa_event_callback callback;
     void* callback_user;
@@ -324,6 +461,11 @@ int fa_stream_needs_work(struct fa_stream* s);
 void fa_stream_fill(struct fa_stream* s, int64_t max_frames);  /* caller holds decode_lock */
 fa_frames fa_stream_position_now(struct fa_stream* s);
 void fa_stream_free_memory(struct fa_stream* s);               /* event thread, from the graveyard */
+
+float fa_stream_norm_target_db(struct fa_stream* s);          /* any thread */
+void fa_stream_start_analysis(struct fa_stream* s);           /* idempotent */
+/* From a scan thread: the final loudness of `s` (album_lufs NAN if unknown). */
+void fa_stream_loudness_ready(struct fa_stream* s, const fa_loudness* l, double album_lufs);
 
 /* engine.c */
 void fa_engine_wake_workers(fa_engine* engine);

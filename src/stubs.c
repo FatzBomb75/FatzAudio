@@ -22,15 +22,6 @@ FA_API fa_result FA_CALL fa_engine_get_time(fa_engine* engine, fa_time* out_time
 FA_API fa_result FA_CALL fa_crossfade(fa_stream* from, fa_stream* to, fa_time duration, const fa_ramp* ramp)
 { FA_UNUSED(from); FA_UNUSED(to); FA_UNUSED(duration); FA_UNUSED(ramp); return FA_ERROR_NOT_IMPLEMENTED; }
 
-FA_API fa_result FA_CALL fa_engine_set_normalization(fa_engine* engine, fa_normalize_mode mode, double target_lufs)
-{ FA_UNUSED(engine); FA_UNUSED(mode); FA_UNUSED(target_lufs); return FA_ERROR_NOT_IMPLEMENTED; }
-
-FA_API fa_result FA_CALL fa_stream_get_loudness(fa_stream* stream, fa_loudness* out_loudness)
-{ FA_UNUSED(stream); FA_UNUSED(out_loudness); return FA_ERROR_NOT_IMPLEMENTED; }
-
-FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* path, fa_loudness* out_loudness)
-{ FA_UNUSED(engine); FA_UNUSED(path); FA_UNUSED(out_loudness); return FA_ERROR_NOT_IMPLEMENTED; }
-
 FA_API fa_result FA_CALL fa_stream_add_position_event(fa_stream* stream, fa_frames frame)
 { FA_UNUSED(stream); FA_UNUSED(frame); return FA_ERROR_NOT_IMPLEMENTED; }
 
