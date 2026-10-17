@@ -240,9 +240,136 @@ FA_API fa_result FA_CALL fa_stream_open_io(fa_engine* engine, const fa_io_callba
 /* Web streams: see "Web streams" below. */
 FA_API fa_result FA_CALL fa_stream_open_url(fa_engine* engine, const char* url, const fa_open_options* options, fa_stream** out_stream);
 
-/* Push stream: the app supplies PCM (any fa_sample_format, planar or interleaved). */
+/* ---- Push streams and the FFmpeg hand-off --------------------------------
+ *
+ * For apps that already read the file themselves, typically with FFmpeg for the
+ * video. Instead of decoding audio to PCM, converting it and keeping it in sync by
+ * hand, hand FatzAudio what you already have and let the video follow its clock:
+ *
+ *   compressed packets   fa_stream_open_packets + fa_stream_push_packet: straight
+ *                        from av_read_frame, no audio decoding in the app at all.
+ *                        FatzAudio decodes them on its worker threads: PCM and MP3
+ *                        built in, everything else (AAC, AC-3, E-AC-3, Opus, ...)
+ *                        through the FFmpeg your app already loaded (never bundled).
+ *   decoded frames       fa_stream_open_push + fa_stream_push_frame: AVFrame data
+ *                        as it is (planar or interleaved, any sample format, any
+ *                        rate), no swresample step.
+ *
+ * Both take FatzAudio's own small structs, so FFmpeg can be upgraded without
+ * rebuilding FatzAudio. fatzaudio_ffmpeg.h fills them from AVCodecParameters,
+ * AVPacket and AVFrame in one line each.
+ *
+ * Timestamps are yours: pass the packet or frame pts in its time base and
+ * fa_stream_get_clock answers in the same timeline (nanoseconds), so a video
+ * renderer shows the frame whose pts matches the clock. Gaps and jumps in the
+ * timestamps move the clock with them; small jitter (under 15 ms) is ignored.
+ *
+ * Pushing never blocks. Use fa_stream_get_buffered to keep about a second queued
+ * (the demuxer reads ahead until then). While the queue runs dry before
+ * fa_stream_push_end, the stream is FA_STATE_BUFFERING (FA_EVENT_STALLED once audio
+ * had played), and it resumes by itself (FA_EVENT_RESUMED) when ~100 ms are queued.
+ * Push streams cannot be seeked: seek your demuxer, call fa_stream_push_flush, and
+ * push from the new position. */
+
+#define FA_PTS_NONE INT64_MIN   /* "no timestamp": the same value as FFmpeg's AV_NOPTS_VALUE */
+
+typedef struct fa_rational {    /* the same layout as FFmpeg's AVRational */
+    int32_t num;
+    int32_t den;
+} fa_rational;
+
+/* Describes a compressed audio track: the fields of FFmpeg's AVCodecParameters
+ * that decoding needs, plus the track's time base. */
+typedef struct fa_codec_params {
+    uint32_t struct_size;          /* sizeof(fa_codec_params) */
+    const char* codec;             /* FFmpeg codec name: avcodec_get_name(codecpar->codec_id),
+                                      e.g. "aac", "ac3", "eac3", "mp3", "opus", "flac",
+                                      "pcm_s16le". Copied */
+    uint32_t sample_rate;          /* codecpar->sample_rate */
+    uint32_t channels;             /* codecpar->ch_layout.nb_channels (FFmpeg 5.1+) or ->channels */
+    const void* extradata;         /* codecpar->extradata (AAC config, Opus header, ...); copied */
+    size_t extradata_size;
+    int64_t bit_rate;              /* optional */
+    uint32_t block_align;          /* codecpar->block_align (needed by WMA, ADPCM, PCM) */
+    uint32_t bits_per_coded_sample;/* optional */
+    fa_rational time_base;         /* the track's time base (AVStream->time_base): the unit
+                                      of fa_packet.pts and .duration. {0, 0} = nanoseconds */
+} fa_codec_params;
+
+FA_API void FA_CALL fa_codec_params_init(fa_codec_params* params);
+
+/* One compressed packet, as av_read_frame returns it. The data is copied. */
+typedef struct fa_packet {
+    const void* data;              /* AVPacket->data */
+    size_t size;                   /* AVPacket->size */
+    int64_t pts;                   /* AVPacket->pts in the track's time base, FA_PTS_NONE = right
+                                      after the previous packet */
+    int64_t duration;              /* AVPacket->duration, 0 = unknown */
+} fa_packet;
+
+/* One block of PCM, as an AVFrame holds it. The samples are copied. */
+typedef struct fa_audio_frame {
+    fa_audio_format format;        /* of this frame: sample format (planar or interleaved),
+                                      rate and channels. They may change from frame to
+                                      frame; FatzAudio converts to the stream's format */
+    const void* const* data;       /* planar: one pointer per channel (AVFrame->extended_data);
+                                      interleaved: data[0] */
+    fa_frames frames;              /* samples per channel (AVFrame->nb_samples) */
+    int64_t pts;                   /* in time_base units, FA_PTS_NONE = right after the previous frame */
+    fa_rational time_base;         /* {0, 0} = pts in nanoseconds */
+} fa_audio_frame;
+
+/* A push stream for PCM. `format` is the stream's own format (fa_stream_get_info):
+ * frames in any other format are converted to it. The sample format part only
+ * matters to fa_stream_push_pcm. */
 FA_API fa_result FA_CALL fa_stream_open_push(fa_engine* engine, const fa_audio_format* format, const fa_open_options* options, fa_stream** out_stream);
+/* PCM in the format given to fa_stream_open_push. planes: one per channel for
+ * planar formats, planes[0] for interleaved ones. pts in nanoseconds or FA_PTS_NONE. */
 FA_API fa_result FA_CALL fa_stream_push_pcm(fa_stream* stream, const void* const* planes, fa_frames frames, fa_time pts);
+/* PCM in its own format (decoded AVFrames). Push streams only. */
+FA_API fa_result FA_CALL fa_stream_push_frame(fa_stream* stream, const fa_audio_frame* frame);
+
+/* A push stream for compressed packets of one audio track. Returns
+ * FA_ERROR_PROVIDER_MISSING when the codec needs FFmpeg and none could be loaded
+ * (see fa_ffmpeg_load), FA_ERROR_UNSUPPORTED_FORMAT when FFmpeg has no decoder for it.
+ * The stream's format is the track's rate and channel count. */
+FA_API fa_result FA_CALL fa_stream_open_packets(fa_engine* engine, const fa_codec_params* params, const fa_open_options* options, fa_stream** out_stream);
+/* Queues a packet. A packet that fails to decode is skipped (FA_EVENT_DECODE_ERROR)
+ * and playback continues. */
+FA_API fa_result FA_CALL fa_stream_push_packet(fa_stream* stream, const fa_packet* packet);
+
+/* No more data will come: the stream plays what is queued, then ends (FA_EVENT_ENDED).
+ * fa_stream_push_flush makes it pushable again. */
+FA_API fa_result FA_CALL fa_stream_push_end(fa_stream* stream);
+/* Drops everything queued and decoded ahead, at once (the app seeked). The clock
+ * holds where it was until audio of the new position plays. State is kept: a
+ * playing stream goes on with whatever is pushed next. */
+FA_API fa_result FA_CALL fa_stream_push_flush(fa_stream* stream);
+/* How much pushed audio has not been heard yet (queued, decoded ahead, and in the
+ * device buffer), as a duration. Counted from durations, never timestamps, so a
+ * jump in the timeline adds nothing. A queued packet without a duration counts
+ * like the one before it until it is decoded. */
+FA_API fa_result FA_CALL fa_stream_get_buffered(fa_stream* stream, fa_time* out_duration);
+
+/* ---- FFmpeg at runtime ------------------------------------------------------
+ * FatzAudio never links or bundles FFmpeg. When a packet stream needs a codec it
+ * has no decoder of its own for, it uses the libavcodec and libavutil of your app:
+ *   1. the ones already loaded in the process (your app's FFmpeg), else
+ *   2. the ones the system loader finds (next to your executable, PATH, ...).
+ * fa_ffmpeg_load(directory) loads them from a folder instead (call it first).
+ * Supported: FFmpeg 4.0 to 8.x (libavcodec 58 to 62). */
+typedef struct fa_ffmpeg_info {
+    int32_t loaded;                /* 1 when FFmpeg is in use */
+    uint32_t avcodec_version;      /* (major << 16) | (minor << 8) | micro, 0 if not loaded */
+    uint32_t avutil_version;
+    char avcodec_path[512];        /* where libavcodec was found (file name if unknown) */
+} fa_ffmpeg_info;
+
+/* directory NULL = steps 1 and 2 above. Returns FA_OK when FFmpeg is (already)
+ * loaded, FA_ERROR_PROVIDER_MISSING if no usable libavcodec was found. Once
+ * loaded, FFmpeg stays loaded for the life of the process. */
+FA_API fa_result FA_CALL fa_ffmpeg_load(const char* directory);
+FA_API fa_result FA_CALL fa_ffmpeg_get_info(fa_ffmpeg_info* out_info);
 
 FA_API void FA_CALL fa_stream_close(fa_stream* stream);
 
@@ -406,16 +533,27 @@ FA_API fa_result FA_CALL fa_stream_seek(fa_stream* stream, fa_frames frame);
  * Frames decoded ahead into the buffer are not counted. */
 FA_API fa_result FA_CALL fa_stream_get_position(fa_stream* stream, fa_frames* out_frame);
 
-/* Presentation time of the audio currently leaving the speaker: the stream
- * position converted to nanoseconds, minus the device latency (never below 0).
- * Video and CD+G renderers should follow this clock. Streams that are not
- * attached report their position. */
+/* The presentation clock: the timestamp of the audio leaving the speaker right
+ * now, in nanoseconds. Follow it with your video (or CD+G) renderer: show the
+ * frame whose pts is closest to the clock, and the picture stays in sync by itself.
+ *
+ * - It includes the device latency (the device buffer and the limiter), so it is
+ *   the time actually heard, not the time decoded or mixed.
+ * - It moves smoothly between audio callbacks (interpolated from the device's
+ *   sample clock), so it can be read every video frame.
+ * - It stops when the stream pauses, stalls or ends (once the last audio has left
+ *   the speaker), jumps to the target on a seek, and continues when playback does.
+ * - File streams: the position in the file as time (0 = the start). Push and
+ *   packet streams: in your own timeline, the pts you pushed.
+ * Streams that are not attached report the time of their next frame. */
 FA_API fa_result FA_CALL fa_stream_get_clock(fa_stream* stream, fa_time* out_pts);
 
 /* Decode-only streams (FA_OPEN_DECODE_ONLY): pull interleaved F32 PCM in the
  * format reported by fa_stream_get_info. `buffer` must hold frames * channels floats.
  * Returns FA_OK with 1..frames frames read (short reads happen; keep calling), and
  * FA_ERROR_END_OF_STREAM with *out_frames_read == 0 once the end is reached.
+ * Push and packet streams return FA_OK with 0 frames while nothing is queued, and
+ * FA_ERROR_END_OF_STREAM after fa_stream_push_end once everything was read.
  * Returns FA_ERROR_BUSY for streams attached to a device (the device pulls them). */
 FA_API fa_result FA_CALL fa_stream_read(fa_stream* stream, void* buffer, fa_frames frames, fa_frames* out_frames_read);
 
@@ -684,9 +822,9 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
  * FA_EVENT_RAMP_DONE       position               fa_ramp.tag of the finished ramp
  * FA_EVENT_STARTED         position               0
  *
- * Delivered today: ENDED, MARKER, LOUDNESS_FINAL, RAMP_DONE and STARTED, and METADATA, STALLED and
- * RESUMED from web streams. The others are raised by the features that produce them as those land
- * (see docs/features). */
+ * Delivered today: ENDED, MARKER, LOUDNESS_FINAL, RAMP_DONE and STARTED; METADATA from web
+ * streams; STALLED and RESUMED from push, packet and web streams; DECODE_ERROR from packet
+ * streams. The others are raised by the features that produce them as those land (see docs/features). */
 typedef enum fa_event_type {
     FA_EVENT_ENDED = 0,
     FA_EVENT_POSITION,        /* reached a requested frame */

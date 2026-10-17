@@ -88,6 +88,33 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_stream_push_pcm(StreamHandle stream, void** planes, long frames, long pts);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_push_frame(StreamHandle stream, FaAudioFrame* frame);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_codec_params_init(FaCodecParams* parameters);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_open_packets(EngineHandle engine, FaCodecParams* parameters, FaOpenOptions* options, out nint stream);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_push_packet(StreamHandle stream, FaPacket* packet);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_push_end(StreamHandle stream);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_push_flush(StreamHandle stream);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_buffered(StreamHandle stream, out long duration);
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_ffmpeg_load(string? directory);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_ffmpeg_get_info(out FaFfmpegInfo info);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial void fa_stream_close(nint stream);
 
     // ---- Stream info -------------------------------------------------------

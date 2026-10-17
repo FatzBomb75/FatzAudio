@@ -7,6 +7,8 @@ const fa_decoder_vtable* const fa_decoder_registry[] = {
     &fa_decoder_wav,
     &fa_decoder_flac,
     &fa_decoder_mp3,
+    &fa_decoder_mp4,
+    &fa_decoder_mkv,
 };
 const uint32_t fa_decoder_registry_count = (uint32_t)(sizeof(fa_decoder_registry) / sizeof(fa_decoder_registry[0]));
 
@@ -43,7 +45,8 @@ static const char* extension_of(const char* path)
     return dot + 1;
 }
 
-fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint, const char* mime_hint)
+fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint, const char* mime_hint,
+                          int32_t audio_track)
 {
     uint8_t after[FA_PROBE_BYTES];
     const uint8_t* head;
@@ -96,15 +99,28 @@ fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint
         dec->vt = fa_decoder_registry[best];
         dec->src = src;
         dec->length = -1;
+        dec->audio_track = audio_track < 0 ? -1 : audio_track;
         if (fa_source_seek(src, 0) != FA_OK) return FA_ERROR_NOT_SEEKABLE;
         r = dec->vt->open(dec);
         if (r == FA_OK) {
+            if (dec->track_count <= 0) dec->track_count = 1;
+            if (audio_track >= dec->track_count) {
+                /* A single-track format: there is no second track. */
+                dec->vt->close(dec);
+                memset(dec, 0, sizeof(*dec));
+                return FA_ERROR_NOT_FOUND;
+            }
             dec->format.sample_format = FA_FORMAT_F32;
             if (!dec->codec[0]) snprintf(dec->codec, sizeof(dec->codec), "%s", dec->vt->name);
             if (!dec->container[0]) snprintf(dec->container, sizeof(dec->container), "%s", dec->vt->name);
             return FA_OK;
         }
-        if (r == FA_ERROR_OUT_OF_MEMORY || r == FA_ERROR_IO) return r;
+        /* Definite answers: the data is this format, but the track is missing, the
+         * codec needs FFmpeg or the layout needs seeking. Another format's guess
+         * would only be worse. */
+        if (r == FA_ERROR_OUT_OF_MEMORY || r == FA_ERROR_IO || r == FA_ERROR_NOT_FOUND ||
+            r == FA_ERROR_PROVIDER_MISSING || r == FA_ERROR_NOT_SEEKABLE)
+            return r;
         last = r;
     }
     memset(dec, 0, sizeof(*dec));

@@ -80,11 +80,22 @@ struct fa_decoder {
     int seekable;
     char codec[32];
     char container[32];
+    /* Push decoders: the pts (ns) of the first frame the last read returned, when
+     * the timeline restarts there (a jump in the app's timestamps, or the very
+     * first frame); FA_PTS_NONE when it simply continues. */
+    int64_t anchor_pts;
+    /* Containers: the audio track asked for (-1 = the file's default) and how
+     * many audio tracks the file has (0 is read as 1). */
+    int32_t audio_track;
+    int32_t track_count;
 };
 
 /* Detects the format of `src` and opens the matching decoder. `name_hint` (a path
- * or NULL) and `mime_hint` only break ties when the content is ambiguous. */
-fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint, const char* mime_hint);
+ * or NULL) and `mime_hint` only break ties when the content is ambiguous.
+ * `audio_track`: 0-based among the audio tracks, -1 = default; FA_ERROR_NOT_FOUND
+ * if the file has no such track. */
+fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint, const char* mime_hint,
+                          int32_t audio_track);
 fa_result fa_decoder_read(fa_decoder* dec, float* out, fa_frames frames, fa_frames* got);
 fa_result fa_decoder_seek(fa_decoder* dec, fa_frames frame);
 void fa_decoder_close(fa_decoder* dec);
@@ -117,6 +128,9 @@ extern const uint32_t fa_decoder_registry_count;
 extern const fa_decoder_vtable fa_decoder_wav;
 extern const fa_decoder_vtable fa_decoder_flac;
 extern const fa_decoder_vtable fa_decoder_mp3;
+/* Containers with packet codecs (demux_mp4.c, demux_mkv.c). */
+extern const fa_decoder_vtable fa_decoder_mp4;
+extern const fa_decoder_vtable fa_decoder_mkv;
 
 /* Probing helpers (probe.c). */
 size_t fa_probe_id3v2_size(const uint8_t* data, size_t size);
@@ -147,6 +161,57 @@ void fa_ring_regions(fa_ring* r, int64_t frames, const float** p1, int64_t* n1, 
 void fa_ring_advance_read(fa_ring* r, int64_t frames);
 /* Only while neither side can run (stream flushing and decode lock held). */
 void fa_ring_reset(fa_ring* r);
+
+/* ---- Presentation clock (clock.c) ------------------------------------------
+ * The audio thread writes one record per stretch of a stream it mixes: device
+ * frames [dev, dev + n) carried presentation times pts0..pts1. Any thread maps a
+ * device frame (the one at the speaker now) back to a presentation time. Records
+ * are seqlocked, so readers never block the audio thread. */
+
+#define FA_CLOCK_HISTORY 128
+
+typedef struct fa_clock_rec {
+    fa_atomic64 seq;              /* odd while being written; changes on every write */
+    fa_atomic64 idx;              /* which record (k) this slot holds, -1 = none */
+    fa_atomic64 dev, n, pts0, pts1;
+} fa_clock_rec;
+
+typedef struct fa_clock {
+    fa_clock_rec rec[FA_CLOCK_HISTORY];
+    fa_atomic64 count;            /* records written since the last reset */
+    fa_atomic64 hold;             /* reported until the first record reaches the speaker */
+    fa_atomic32 epoch;            /* odd while being reset */
+} fa_clock;
+
+/* Clears the history; nothing may be recording (the audio thread is kept out). */
+void fa_clock_reset(fa_clock* c, int64_t hold_pts);
+void fa_clock_set_hold(fa_clock* c, int64_t hold_pts);  /* before the first record */
+/* Audio thread. */
+void fa_clock_record(fa_clock* c, int64_t dev, int64_t n, int64_t pts0, int64_t pts1);
+/* Presentation time at device frame `frame` (fractional). */
+int64_t fa_clock_at(fa_clock* c, double frame);
+/* The device frame right after the last one recorded, -1 = none since the reset. */
+int64_t fa_clock_mixed_end(fa_clock* c);
+
+/* Where the timeline restarts inside a push stream's ring: at ring frame `idx`
+ * (frames written since the ring was reset) the pts is `pts`. Single producer (the
+ * decode worker, under decode_lock), single consumer (the audio thread). */
+#define FA_PTSMAP_SIZE 64
+
+#define FA_SRC_ANCHORS 64
+
+typedef struct fa_ptsmap {
+    int64_t idx[FA_PTSMAP_SIZE];
+    int64_t pts[FA_PTSMAP_SIZE];
+    fa_atomic64 write, read;
+    int64_t cur_idx, cur_pts;     /* audio thread: the anchor in effect */
+} fa_ptsmap;
+
+void fa_ptsmap_reset(fa_ptsmap* m);                           /* both sides kept out */
+void fa_ptsmap_add(fa_ptsmap* m, int64_t idx, int64_t pts);   /* drops it when full */
+/* Audio thread: pts at ring frame `idx` (rate: ns_per_frame per ring frame), and in
+ * *out_next the next anchor after `idx` (INT64_MAX = none). */
+int64_t fa_ptsmap_pts(fa_ptsmap* m, int64_t idx, double ns_per_frame, int64_t* out_next);
 
 /* ---- Curves (curve.c) ---------------------------------------------------- */
 
@@ -403,6 +468,11 @@ struct fa_device {
     fa_atomic_ptr buses;         /* fa_bus_list*, read by the audio callback */
     fa_atomic64 clock;           /* frames mixed so far (start of the next callback) */
     fa_atomic32 period;          /* frames of the last callback */
+    /* When the last callback started: its first device frame and the (smoothed)
+     * monotonic time, seqlocked by cb_seq. The presentation clock interpolates from it. */
+    fa_atomic64 cb_seq, cb_frame, cb_time;
+    int64_t cb_prev_time;        /* audio thread: smoothing state */
+    uint32_t cb_prev_frames;
     fa_atomic64 epoch;           /* odd while the audio callback runs */
     fa_event_queue events;       /* audio callback -> event thread */
     fa_atomic32 spilled;         /* 1 = some stream on this device used its spill slots */
@@ -547,6 +617,18 @@ struct fa_stream {
     fa_atomic64 played;          /* device frames consumed since seek_base (audio thread) */
     fa_atomic32 underruns;
 
+    /* Presentation clock (clock.c); pts map and push queue of push streams (push.c). */
+    fa_clock clock;
+    fa_ptsmap ptsmap;
+    struct fa_push* push;        /* NULL for file, memory and I/O streams */
+    fa_atomic64 played_audible;  /* frames played since the last flush (stall events) */
+    int stalled;                 /* audio thread: FA_EVENT_STALLED raised, RESUMED owed */
+    /* Push streams, under decode_lock: the source frames at which the app's timeline
+     * restarted, so audio kept across a detach (carry) keeps its timestamps. */
+    int64_t anchor_pos[FA_SRC_ANCHORS], anchor_pts[FA_SRC_ANCHORS];
+    int64_t anchors;             /* written since the last flush */
+    fa_atomic32 staged;          /* in_buf or carry hold frames not in the ring yet */
+
     /* Parameters */
     fa_lane lanes[FA_STREAM_LANES];      /* VOLUME, PAN, crossfade gain */
     uint32_t voice_rate;                 /* device rate the ramp counters are in */
@@ -589,7 +671,6 @@ struct fa_stream {
     fa_atomic64 meta_frame;      /* INT64_MAX = nothing armed */
     fa_atomic64 meta_seq_armed;
     fa_atomic64 meta_announced;
-    int stalled;                 /* audio thread: FA_EVENT_STALLED sent, RESUMED owed */
 
     struct fa_stream* next;      /* engine->streams or engine->graveyard */
 };
@@ -598,11 +679,20 @@ struct fa_stream {
 /* One audio callback: queue transitions, buses, every voice, the limiter, the clock.
  * The backend's callback calls it; white-box tests call it to play the audio thread. */
 void fa_device_render(fa_device* device, float* out, uint32_t frames);
+/* The same with an explicit callback start time (white-box tests). */
+void fa_device_render_at(fa_device* device, float* out, uint32_t frames, int64_t now_ns);
+/* Device frame at the speaker at monotonic time `now_ns` (latency included). */
+double fa_device_speaker_frame(fa_device* device, int64_t now_ns);
 void fa_device_wait_quiescent(fa_device* device);
 fa_result fa_device_add_voice(fa_device* device, struct fa_stream* stream);
 void fa_device_remove_voice(fa_device* device, struct fa_stream* stream);
 
 /* stream.c */
+/* Presentation clock of `s` at monotonic time `now_ns` (fa_stream_get_clock uses the
+ * current time; tests pass their own). Caller holds api_lock. */
+int64_t fa_stream_clock_at(struct fa_stream* s, int64_t now_ns);
+/* fa_stream_get_buffered at monotonic time `now_ns` (push streams). Caller holds api_lock. */
+int64_t fa_stream_buffered_at(struct fa_stream* s, int64_t now_ns);
 void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames); /* audio thread */
 /* Audio thread, before any voice is mixed: starts queued streams whose
  * predecessor reaches its mix point within this callback. */
@@ -628,6 +718,84 @@ void fa_stream_loudness_ready(struct fa_stream* s, const fa_loudness* l, double 
 void fa_buses_begin(fa_device* dev);                  /* takes new bus commands */
 void fa_buses_end(fa_device* dev, uint32_t frames);   /* advances bus ramps */
 void fa_buses_free_all(fa_device* dev);               /* fa_device_close, no callbacks running */
+
+/* ---- Packet codecs (codec.c, ffmpeg.c) ----------------------------------------
+ * Decode one compressed packet at a time into interleaved F32. Built-in codecs
+ * (PCM, MP3) come first; FFmpeg, loaded at runtime, does the rest. */
+
+typedef struct fa_codec fa_codec;
+
+typedef struct fa_codec_vtable {
+    const char* name;
+    /* Feeds one packet; afterwards codec->out holds out_frames decoded frames
+     * (possibly 0) at codec->rate / codec->channels. */
+    fa_result (*decode)(fa_codec* c, const uint8_t* data, size_t size);
+    void (*flush)(fa_codec* c);
+    void (*close)(fa_codec* c);
+} fa_codec_vtable;
+
+struct fa_codec {
+    const fa_codec_vtable* vt;
+    void* impl;
+    float* out;
+    fa_frames out_frames, out_cap;
+    uint32_t rate, channels;
+    char name[32];
+};
+
+/* Opens a decoder for `p` (validated). FA_ERROR_PROVIDER_MISSING: needs FFmpeg,
+ * which is not available; FA_ERROR_UNSUPPORTED_FORMAT: nobody decodes it. */
+fa_result fa_codec_open(fa_codec* c, const fa_codec_params* p);
+void fa_codec_close(fa_codec* c);
+/* Makes room for `frames` more frames in c->out (keeping what is there). */
+fa_result fa_codec_reserve(fa_codec* c, fa_frames frames, uint32_t channels);
+
+/* Float PCM from one rate and channel count to another (miniaudio's converter),
+ * set up again whenever the input format changes. */
+typedef struct fa_pcm_conv {
+    ma_data_converter conv;
+    int ready;
+    uint32_t rate, channels;      /* the input it is set up for */
+} fa_pcm_conv;
+/* Converts `frames` frames of `in` (rate, channels) to out_rate / out_channels into
+ * *buf from its start, growing it (*cap counts floats); *out_frames = frames written. */
+fa_result fa_pcm_convert(fa_pcm_conv* c, const float* in, fa_frames frames, uint32_t rate, uint32_t channels,
+                         uint32_t out_rate, uint32_t out_channels, float** buf, fa_frames* cap, fa_frames* out_frames);
+void fa_pcm_conv_reset(fa_pcm_conv* c);
+void fa_pcm_conv_free(fa_pcm_conv* c);
+/* Makes *buf hold at least `frames` frames of `channels`, keeping its contents (*cap counts floats). */
+fa_result fa_float_reserve(float** buf, fa_frames* cap, fa_frames frames, uint32_t channels);
+
+/* Sample conversion to interleaved F32. `kind`: FA_SAMPLE_* below. */
+enum { FA_SAMPLE_U8 = 0, FA_SAMPLE_S8, FA_SAMPLE_S16, FA_SAMPLE_S24, FA_SAMPLE_S32, FA_SAMPLE_S64,
+       FA_SAMPLE_F32, FA_SAMPLE_F64 };
+/* planes: `channels` pointers when planar, else planes[0]. big_endian: byte order of
+ * the data (packed formats from files); 0 = native order. */
+void fa_convert_to_f32(const void* const* planes, int kind, int planar, int big_endian,
+                       uint32_t channels, fa_frames frames, float* out);
+/* fa_sample_format -> FA_SAMPLE_* and planar; -1 if invalid. */
+int fa_sample_kind(fa_sample_format f, int* out_planar);
+
+/* ffmpeg.c */
+fa_result fa_ffmpeg_open_codec(fa_codec* c, const fa_codec_params* p);
+int fa_ffmpeg_available(void);   /* loads FFmpeg on first use; 1 if usable */
+
+/* ---- Push streams (push.c) ------------------------------------------------------ */
+
+/* The push decoder (vtable of push streams' fa_decoder). */
+extern const fa_decoder_vtable fa_decoder_push;
+int fa_push_has_input(struct fa_push* p);        /* any thread */
+void fa_push_free(struct fa_push* p);            /* fa_stream_close, under decode_lock */
+fa_result fa_push_init_pcm(struct fa_stream* s, const fa_audio_format* f);
+fa_result fa_push_init_packets(struct fa_stream* s, const fa_codec_params* params);
+/* Under decode_lock: drop everything queued and decoded (fa_stream_push_flush), or
+ * re-anchor the timeline at the next frame (a new ring). */
+void fa_push_flush_locked(struct fa_push* p, int keep_hold);
+void fa_push_restart_timeline(struct fa_push* p);
+/* pts of the next frame the push decoder will hand out (ns). */
+int64_t fa_push_next_pts(struct fa_push* p);
+/* Total duration of everything pushed so far, as a pts end (ns); FA_PTS_NONE if nothing. */
+int64_t fa_push_buffered_ns(struct fa_push* p);
 
 /* engine.c */
 void fa_engine_wake_workers(fa_engine* engine);

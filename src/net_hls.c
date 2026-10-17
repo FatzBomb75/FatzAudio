@@ -882,11 +882,13 @@ typedef struct hls_dec {
 static fa_result hls_open_inner(hls_dec* h)
 {
     fa_io_callbacks io;
+    fa_result r;
     fa_net_io(h->net, &io);
     io.close = NULL;                     /* the stream owns the net */
     fa_source_open_io(&h->src, &io, h->net);
     h->src.remote = 1;
-    if (fa_decoder_open(&h->inner, &h->src, NULL, NULL) != FA_OK) return FA_ERROR_UNSUPPORTED_FORMAT;
+    r = fa_decoder_open(&h->inner, &h->src, NULL, NULL, -1);   /* -1: the default track */
+    if (r != FA_OK) return r == FA_ERROR_PROVIDER_MISSING ? r : FA_ERROR_UNSUPPORTED_FORMAT;  /* needs FFmpeg: say so */
     h->inner_ready = 1;
     return FA_OK;
 }

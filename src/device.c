@@ -83,10 +83,36 @@ static int limiter_on(fa_engine* e)
     return mode == FA_LIMITER_ON || (mode == FA_LIMITER_AUTO && fa_load32(&e->norm_mode) != FA_NORMALIZE_OFF);
 }
 
+/* Publishes when this callback started, for the presentation clock. Callbacks
+ * arrive with a few ms of scheduling jitter while the device consumes frames at an
+ * exact rate, so the time is smoothed: predicted from the previous callback and
+ * pulled 1/16 of the way toward the measured time (a jump over 20 ms resets it). */
+static void publish_callback_time(fa_device* dev, int64_t frame, int64_t now_ns)
+{
+    int64_t t = now_ns;
+    if (dev->cb_prev_time && dev->rate) {
+        int64_t expected = dev->cb_prev_time + (int64_t)((double)dev->cb_prev_frames * 1e9 / (double)dev->rate);
+        int64_t err = now_ns - expected;
+        if (err > -20000000 && err < 20000000) t = expected + err / 16;
+    }
+    fa_fetch_add64(&dev->cb_seq, 1);
+    fa_store64(&dev->cb_frame, frame);
+    fa_store64(&dev->cb_time, t);
+    fa_fetch_add64(&dev->cb_seq, 1);
+    dev->cb_prev_time = t;
+}
+
 void fa_device_render(fa_device* dev, float* out, uint32_t frames)
+{
+    fa_device_render_at(dev, out, frames, fa_monotonic_ns());
+}
+
+void fa_device_render_at(fa_device* dev, float* out, uint32_t frames, int64_t now_ns)
 {
     fa_voice_list* list;
     uint32_t i;
+    publish_callback_time(dev, fa_load64(&dev->clock), now_ns);
+    dev->cb_prev_frames = frames;
     memset(out, 0, (size_t)frames * FA_DEVICE_CHANNELS * sizeof(float));
     fa_buses_begin(dev);
     list = (fa_voice_list*)fa_load_ptr(&dev->voices);
@@ -304,4 +330,21 @@ FA_API fa_result FA_CALL fa_device_get_time(fa_device* device, fa_time* out_time
     if (!device || !out_time) return FA_ERROR_INVALID_ARG;
     *out_time = (fa_time)((double)fa_load64(&device->clock) * 1e9 / (double)device->rate + 0.5);
     return FA_OK;
+}
+
+double fa_device_speaker_frame(fa_device* dev, int64_t now_ns)
+{
+    int64_t s1, s2, frame, t;
+    fa_time latency = 0;
+    double elapsed;
+    do {
+        s1 = fa_load64(&dev->cb_seq);
+        frame = fa_load64(&dev->cb_frame);
+        t = fa_load64(&dev->cb_time);
+        s2 = fa_load64(&dev->cb_seq);
+    } while ((s1 & 1) || s1 != s2);
+    if (s1 == 0) return -1.0;             /* no callback yet: nothing heard */
+    fa_device_get_latency(dev, &latency);
+    elapsed = (double)(now_ns - t);   /* may be slightly negative: the smoothed time can run ahead */
+    return (double)frame + (elapsed - (double)latency) * (double)dev->rate / 1e9;
 }

@@ -222,7 +222,7 @@ static int run_prepare(fa_scan_job* j)
     }
 
     fa_source_seek(&src, 0);
-    r = fa_decoder_open(&dec, &src, j->path, NULL);
+    r = fa_decoder_open(&dec, &src, j->path, NULL, j->audio_track);
     if (r != FA_OK) { j->status = r; fa_source_close(&src); return 1; }
     j->rate = dec.format.sample_rate;
     j->channels = dec.format.channels;
@@ -263,7 +263,7 @@ static void run_chunk(fa_scan_job* j, int k)
     if (fa_load32(&j->cancel)) return;
     r = open_source(j, &src);
     if (r != FA_OK) { c->r = r; return; }
-    r = fa_decoder_open(&dec, &src, j->path, NULL);
+    r = fa_decoder_open(&dec, &src, j->path, NULL, j->audio_track);
     if (r != FA_OK) { c->r = r; fa_source_close(&src); return; }
     if (dec.format.sample_rate != j->rate || dec.format.channels != j->channels) r = FA_ERROR_UNSUPPORTED_FORMAT;
     if (r == FA_OK && k > 0) {

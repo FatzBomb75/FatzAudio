@@ -21,9 +21,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install Linux audio headers
+      - name: Install Linux audio headers and FFmpeg (runtime codecs and the helper test)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libavformat-dev libavcodec-dev
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
       - name: Build
@@ -47,8 +47,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Linux audio headers
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - name: Install Linux audio headers and FFmpeg (runtime codecs and the helper test)
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libavformat-dev libavcodec-dev
       - name: Configure (ASan + UBSan)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
       - name: Build

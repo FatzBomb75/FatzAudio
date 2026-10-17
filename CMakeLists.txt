@@ -33,6 +33,13 @@ set(FA_SOURCES
     src/scan.c
     src/normalize.c
     src/limiter.c
+    src/clock.c
+    src/codec.c
+    src/ffmpeg.c
+    src/push.c
+    src/demux.c
+    src/demux_mp4.c
+    src/demux_mkv.c
     src/stubs.c
     src/miniaudio_impl.c
     src/net_url.c
