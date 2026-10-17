@@ -466,6 +466,10 @@ static fa_result parse_stsd(mp4* m, const box* stbl, fa_codec_params* cp)
         if (b.len >= 2) little = fa_be16(b.p) != 0;
     if (rate == 0) rate = m->timescale;
 
+    /* Common Encryption ('enca' with the real format in 'sinf') and iTunes
+     * FairPlay ('drms') need a licence this library does not have. */
+    if (fourcc == FOURCC('e', 'n', 'c', 'a') || fourcc == FOURCC('d', 'r', 'm', 's')) return FA_ERROR_PROTECTED_CONTENT;
+
     switch (fourcc) {
     case FOURCC('m', 'p', '4', 'a'): {
         uint8_t oti = 0;

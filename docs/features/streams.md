@@ -17,7 +17,9 @@ A stream is anything that produces audio. You open it from a file, a memory bloc
 | WMA, ASF | `.wma`, `.asf` and `.wmv` files (Advanced Systems Format), local or over HTTP: Windows Media Audio 1, 2, 9 Professional, 9 Lossless and Voice, plus PCM, MP3 and AC-3 in ASF. Audio streams only ([WMA](#wma)) | `wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`, `pcm_*`, `mp3`, ... (container `asf`) |
 | MIDI | Standard MIDI Files (format 0, 1, 2), karaoke `.kar`, RIFF `.rmi`; played with a SoundFont 2 you load ([MIDI](midi.md)) | `midi` (container `smf` or `rmid`) |
 
-Inside MP4, Matroska and ASF, PCM, MP3, AC-3, E-AC-3, Opus, Vorbis and FLAC tracks decode built in; every other codec (AAC, ALAC, DTS, TrueHD, and WMA outside Windows) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`. The same goes for `.aac` files and AAC streams.
+Inside MP4, Matroska and ASF, PCM, MP3, AC-3, E-AC-3, Opus, Vorbis, FLAC and ALAC tracks decode built in (ALAC to the bit, all channel layouts up to 7.1 and every bit depth). AAC (AAC-LC, HE-AAC, HE-AAC v2, and xHE-AAC where the system has it) decodes through the operating system's own decoders: Media Foundation on Windows, AudioToolbox on macOS and iOS, MediaCodec on Android. Every other codec (DTS, TrueHD, WMA outside Windows), AAC on Linux, and whatever a system's decoder turns down use the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`. The same goes for `.aac` files and AAC streams.
+
+The system AAC decoders give the same audio as FFmpeg's to within a decoder's rounding, not to the bit. HE-AAC plays at its full rate after SBR, so `format.sample_rate` can be twice the rate the container states; channels come out in the library's order ([channel order](dolby.md)) whichever decoder made them. ADTS frames cannot say whether they carry HE-AAC, nor can MP4 files that leave it implicit, so at 24 kHz and below AudioToolbox is told to expect it: a plain AAC-LC file at such a rate then plays at twice its rate (upsampled, and in stereo if it was mono), which sounds the same. When the ADTS headers of a stream change rate or channels (an HLS variant switch), the system decoder is set up again. The rare ADTS frames a system decoder cannot take (a channel layout in a program config element, several raw data blocks per frame) go to FFmpeg.
 
 An `.aac` file on disk or in memory is indexed when it opens (a quick pass over the frame headers, without decoding), so its length and seeks are exact. Over the network, and from your own read callbacks when they can seek, the length and seek positions are estimated from the frame sizes at the start, as for MP3 without a seek table. Junk between frames, such as a radio stream joined in the middle of a frame or ID3 tags between HLS segments, is skipped. ADTS has no field for the encoder delay, so the first 1024 samples (one frame: the encoder's priming in a file, half a frame's overlap when joining a radio stream) are dropped, as bass_aac does; the audio then starts on the first real sample of files from the usual encoders (FFmpeg, Apple, Fraunhofer), and the length is one frame shorter than the frames hold.
 
@@ -34,6 +36,8 @@ Apps that demux files themselves (for example with FFmpeg, for the video) can pu
 5. The file extension and `mime_hint` only break ties. A FLAC file named `song.mp3` still opens as FLAC.
 
 If nothing matches, the open returns `FA_ERROR_UNSUPPORTED_FORMAT`.
+
+Protected content returns `FA_ERROR_PROTECTED_CONTENT` instead, so the app can tell the user the file is copy-protected rather than broken. That covers DRM-protected WMA/ASF, MP4/M4A with Common Encryption (`enca`) or iTunes FairPlay (`drms`), Matroska/WebM tracks with ContentEncryption, and HLS with `SAMPLE-AES` or another DRM key method. FatzAudio never decrypts these: the licences live with the platform's DRM components.
 
 Karaoke files: a ZIP archive opened with `fa_stream_open_path` or `fa_stream_open_memory` plays the audio file inside it, and `fa_stream_open_path` on an audio file also loads a `.cdg` of the same name next to it (turn that off with `FA_OPEN_NO_CDG`). See [CD+G](cdg.md).
 
@@ -224,7 +228,7 @@ Details:
 - **Several audio streams** (several languages, or multiple-bitrate files): `audio_track` picks one, counting audio streams in the order of the header; -1 is the first. Video streams are skipped without being read.
 - **Web streams**: an ASF file on a web server plays with `fa_stream_open_url`, seekable when the server takes byte ranges, straight through when it doesn't. MMS (`mms://`) and Windows Media Server's HTTP streaming protocol are not supported: the servers that spoke them are gone.
 - **ReplayGain**: `REPLAYGAIN_TRACK_GAIN`, `REPLAYGAIN_ALBUM_GAIN` and the peaks (and `R128_*`) in a WMA file's attributes are used for [normalization](normalization.md), like ID3v2 and FLAC tags.
-- **DRM**: protected files (a Content Encryption object in the header, or an encrypted stream, as with old store purchases and subscription downloads) return `FA_ERROR_UNSUPPORTED_FORMAT`. Only Windows' own DRM components hold the licences to decrypt them.
+- **DRM**: protected files (a Content Encryption object in the header, or an encrypted stream, as with old store purchases and subscription downloads) return `FA_ERROR_PROTECTED_CONTENT`. Only Windows' own DRM components hold the licences to decrypt them.
 - **Not supported**: WMA encoding, and scrambled audio ("audio spread" with a span above 1) has not been tested against real files.
 
 ```c

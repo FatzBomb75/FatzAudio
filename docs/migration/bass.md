@@ -31,6 +31,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 |---|---|---|---|
 | BASS_GetVersion | `fa_version` | `AudioEngine.NativeVersion` | ✅ |
 | BASS_ErrorGetCode | Return value of every call; `fa_result_string` | `FatzAudioException.ErrorCode` | ✅ |
+| BASS_ERROR_WMA_LICENSE (protected WMA) | `FA_ERROR_PROTECTED_CONTENT`, also for encrypted MP4/MKV and SAMPLE-AES HLS | `ErrorCode.ProtectedContent` | ✅ |
 | BASS_Init | `fa_engine_create` + `fa_device_open` | `AudioEngine.Create()` + `engine.OpenOutput()` | ✅ |
 | BASS_Init with device 0 ("no sound") | `FA_ENGINE_NULL_OUTPUT` in `fa_engine_config.flags`: a silent output that still runs in real time ([devices](../features/devices.md#silent-output-for-tests-and-servers)) | `new AudioEngineOptions { NullOutput = true }` | ✅ |
 | BASS_Free | `fa_device_close` + `fa_engine_destroy` | `Dispose()` | ✅ |
@@ -65,7 +66,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_STREAM_PRESCAN | `FA_OPEN_PRESCAN` in `fa_open_options.flags`: MP3 reads every frame header at open. Seeks are exact and fast without it; other formats are always exact ([MP3](../features/streams.md#mp3)) | `new StreamOptions { Prescan = true }` | ✅ |
 | BASS_StreamCreateFile (memory) | `fa_stream_open_memory` | `engine.OpenMemory(bytes)` | ✅ |
 | BASS_StreamCreateFileUser | `fa_stream_open_io`; `close` is called once by `fa_stream_close`, never on a failed open ([custom I/O](../features/streams.md#custom-io-your-own-reader)) | `engine.OpenStream(System.IO.Stream)` | ✅ |
-| BASS_StreamCreateURL | `fa_stream_open_url`: HTTP/HTTPS files with range seeking, Icecast/Shoutcast radio, HLS, `.pls`/`.m3u`; reconnects by itself ([web streams](../features/web-streams.md)) | `engine.OpenUrl(url)` | ✅ WAV/FLAC/MP3/OGG/Opus/AC-3 built in (AAC through the app's FFmpeg) |
+| BASS_StreamCreateURL | `fa_stream_open_url`: HTTP/HTTPS files with range seeking, Icecast/Shoutcast radio, HLS, `.pls`/`.m3u`; reconnects by itself ([web streams](../features/web-streams.md)) | `engine.OpenUrl(url)` | ✅ WAV/FLAC/MP3/OGG/Opus/AC-3 built in (AAC through the OS decoders, or the app's FFmpeg on Linux) |
 | BASS_StreamCreateURL `DOWNLOADPROC` (raw bytes to save a station) | Planned | | 🗓️ |
 | BASS_StreamCreateURL `BASS_STREAM_BLOCK` | Not needed: memory per web stream is bounded (4 MB) and seeking still works | — | ➖ (by design) |
 | BASS_StreamCreateURL `BASS_STREAM_STATUS` (+ `BASS_TAG_HTTP` during connect) | `fa_stream_get_http_header` and `fa_stream_get_net_status` after the open | `GetHttpHeader`, `NetworkStatus` | ✅ |
@@ -244,13 +245,13 @@ The legacy app doesn't ship bassmix.dll, but mixer-style code built on `BASS_Cha
 
 ### bass_aac (AAC)
 
-AAC plays through the ordinary open calls, in MP4/M4A files, video files, `.aac` (ADTS) files, AAC radio and HLS, decoded by the FFmpeg your app already has ([streams](../features/streams.md#supported-formats)). Without FFmpeg the open returns `FA_ERROR_PROVIDER_MISSING`; a built-in or OS AAC decoder is planned.
+AAC plays through the ordinary open calls, in MP4/M4A files, video files, `.aac` (ADTS) files, AAC radio and HLS. It is decoded by the operating system's own AAC decoder (Media Foundation on Windows, AudioToolbox on macOS and iOS, MediaCodec on Android): AAC-LC, HE-AAC and HE-AAC v2, and xHE-AAC where the system has it. On Linux, and where the system turns a stream down, the FFmpeg your app already has decodes it ([streams](../features/streams.md#supported-formats)); only then does a missing FFmpeg return `FA_ERROR_PROVIDER_MISSING`. ALAC in M4A and Matroska is decoded by the library's own decoder on every platform, to the bit.
 
 | bass_aac | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
-| BASS_AAC_StreamCreateFile / BASS_MP4_StreamCreateFile | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ (through FFmpeg) |
-| BASS_AAC_StreamCreateURL / BASS_MP4_StreamCreateURL | `fa_stream_open_url` (AAC radio with song titles, `.aac` and MP4 over HTTP, AAC in HLS) | `engine.OpenUrl` | ✅ (through FFmpeg) |
-| BASS_AAC_StreamCreateFileUser / BASS_MP4_StreamCreateFileUser | `fa_stream_open_io` | `engine.OpenStream` | ✅ (through FFmpeg) |
+| BASS_AAC_StreamCreateFile / BASS_MP4_StreamCreateFile | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ (OS decoder; FFmpeg on Linux) |
+| BASS_AAC_StreamCreateURL / BASS_MP4_StreamCreateURL | `fa_stream_open_url` (AAC radio with song titles, `.aac` and MP4 over HTTP, AAC in HLS) | `engine.OpenUrl` | ✅ (OS decoder; FFmpeg on Linux) |
+| BASS_AAC_StreamCreateFileUser / BASS_MP4_StreamCreateFileUser | `fa_stream_open_io` | `engine.OpenStream` | ✅ (OS decoder; FFmpeg on Linux) |
 | BASS_PluginLoad("bass_aac.dll") | Not needed: built in | — | ➖ (by design) |
 
 ### bass_ac3 (Dolby Digital and Dolby Digital Plus)
@@ -312,7 +313,7 @@ WMA plays through the ordinary open calls: a built-in ASF demuxer, decoded by Wi
 | BASS_WMA_StreamCreateFile (file or memory) | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ (FFmpeg outside Windows) |
 | BASS_WMA_StreamCreateFileUser | `fa_stream_open_io` (forward-only when `seek` is NULL) | `engine.OpenStream` | ✅ |
 | BASS_StreamCreateURL / BASS_WMA_StreamCreateFile on an `http://` WMA/ASF file | `fa_stream_open_url` | `engine.OpenUrl` | ✅ |
-| BASS_WMA_StreamCreateFileAuth (DRM licence) | Protected files return `FA_ERROR_UNSUPPORTED_FORMAT` | — | ➖ (only Windows' DRM components can decrypt them) |
+| BASS_WMA_StreamCreateFileAuth (DRM licence) | Protected files return `FA_ERROR_PROTECTED_CONTENT` | `ErrorCode.ProtectedContent` | ➖ (only Windows' DRM components can decrypt them) |
 | `mms://` URLs, Windows Media Server HTTP streaming (WMSP), BASS_CONFIG_WMA_PREBUF, BASS_CONFIG_WMA_NETSEEK | Not supported | — | ➖ (the protocol and its servers are retired) |
 | `audio_track`-style stream choice in multi-stream / multiple-bitrate files | `fa_open_options.audio_track`, `fa_stream_info.audio_track_count` | `StreamOptions.AudioTrack`, `Info.AudioTrackCount` | ✅ |
 | BASS_TAG_WMA_CODEC (via BASS_ChannelGetTags) | `fa_stream_info.codec` (`wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`) | `Info.Codec` | ✅ |
@@ -436,12 +437,12 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 
 | Legacy DLL | Replaced by | Status |
 |---|---|---|
-| bass_aac.dll | `BASS_AAC_StreamCreateFile`/`URL`/`User` → the normal open calls: MP4/M4A/MOV files (built-in demuxer, any audio track), `.aac` (ADTS) files and AAC radio, and AAC packets (`fa_stream_open_packets`), decoded through the app's FFmpeg; a built-in or OS AAC decoder | ✅ MP4, ADTS and packets via FFmpeg, 🗓️ built-in decoder |
+| bass_aac.dll | `BASS_AAC_StreamCreateFile`/`URL`/`User` → the normal open calls: MP4/M4A/MOV files (built-in demuxer, any audio track), `.aac` (ADTS) files and AAC radio, and AAC packets (`fa_stream_open_packets`), decoded by the OS codecs (Media Foundation, AudioToolbox, MediaCodec), by the app's FFmpeg on Linux and as the fallback | ✅ with OS codecs (FFmpeg on Linux) |
 | bass_ac3.dll | Built-in AC-3 and E-AC-3 decoder: raw `.ac3`/`.ec3` files, MP4/MKV tracks, web streams and HLS, and pushed packets, with dynamic range modes ([Dolby Digital](../features/dolby.md)) | ✅ (passthrough 🗓️) |
 | bassflac.dll | Built-in: `.flac` files, Ogg FLAC (`.oga`), FLAC tracks in MP4 and Matroska, FLAC web streams and FLAC packets through `fa_stream_open_packets`, all with the same decoder ([bassflac](#bassflac)) | ✅ |
-| basshls.dll (if used) | Built-in: `fa_stream_open_url` plays `.m3u8` (MPEG-TS, fMP4, AES-128) | ✅ (AAC segments through the app's FFmpeg) |
+| basshls.dll (if used) | Built-in: `fa_stream_open_url` plays `.m3u8` (MPEG-TS, fMP4, AES-128) | ✅ (AAC segments through the OS decoders, or the app's FFmpeg on Linux) |
 | bassopus.dll | Built-in: `.opus` files, Opus web radio, Opus in WebM/MKV/MP4, and raw packets through `fa_stream_open_packets` ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
-| basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM, MP3, AC-3, Opus and Vorbis tracks built in, AAC and others through the app's FFmpeg ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ |
+| basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM, MP3, AC-3, Opus and Vorbis tracks built in, AAC through the OS decoders, others through the app's FFmpeg ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ |
 | OGG Vorbis in bass.dll | Built-in: `.ogg` files, chained files, Ogg radio with song titles ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
 | basswma.dll | Built-in ASF demuxer (`.wma`, `.asf`, `.wmv` audio; files, memory, your own reader, HTTP), decoded by Media Foundation on Windows and the app's FFmpeg elsewhere; ReplayGain attributes for normalization ([WMA](../features/streams.md#wma)) | ✅ playback; ➖ encoding (record to MP3, FLAC or WAV with `fa_encoder_*` instead), MMS, broadcasting and DRM |
 | bassenc.dll, bassenc_mp3.dll, bassenc_flac.dll (if added later) | Built in: `fa_encoder_*` writes WAV and FLAC itself and MP3 through the app's LAME ([recording and encoding](../features/recording-encoding.md)) | ✅ WAV/FLAC/MP3, 🗓️ Opus/AAC/casting |

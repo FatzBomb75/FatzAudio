@@ -240,6 +240,19 @@ int64_t fa_demux_packet_samples(const char* codec, uint32_t channels, uint32_t r
         *out_rate = rate;
         return flac_samples(d, n);
     }
+    /* ALAC: only a partial frame (a file's last) says its size; a whole one holds
+     * the frame length of the codec's configuration. The first element's header:
+     * type (3 bits), tag (4), unused (12), partial (1), shift (2), verbatim (1),
+     * then the 32-bit count. */
+    if (strcmp(codec, "alac") == 0 && rate > 0 && n >= 7) {
+        uint32_t type = d[0] >> 5;
+        if ((type == 0 || type == 1 || type == 3) && (d[2] & 0x10)) {
+            uint64_t v = ((uint64_t)d[2] << 32) | ((uint64_t)d[3] << 24) | ((uint64_t)d[4] << 16) |
+                         ((uint64_t)d[5] << 8) | d[6];
+            *out_rate = rate;
+            return (int64_t)((v >> 1) & 0xFFFFFFFFu);
+        }
+    }
     return -1;
 }
 
@@ -313,6 +326,8 @@ static fa_result emit(fa_track* t, const fa_demux_packet* pk)
     dc = pk->duration >= 0 ? (fa_frames)llround((double)pk->duration * t->fpt) : -1;
     d = packet_frames(t, pk->data, pk->size);
     if (d < 0 && t->p.precision == 0) d = dc;
+    /* A system decoder's output may be an earlier packet's: the count is its own. */
+    if (t->codec.trails) d = dc = -1;
 
     if (placing) {
         fa_frames gap_from = t->next_pos;
@@ -391,8 +406,9 @@ static void codec_settings(fa_track* t, const fa_codec_params* p)
      * 30 dB from a straight decode; after 300 ms it is within about 80 dB. This
      * overrides a container's shorter SeekPreRoll (WebM writes 80 ms). */
     if (strcmp(p->codec, "opus") == 0 && t->p.seek_preroll_s < OPUS_PREROLL_S) t->p.seek_preroll_s = OPUS_PREROLL_S;
-    /* FFmpeg's WMA 1 and 2 give their first audio a packet or two late. */
-    t->trails = strcmp(p->codec, "wmav1") == 0 || strcmp(p->codec, "wmav2") == 0;
+    /* FFmpeg's WMA 1 and 2 give their first audio a packet or two late; so may the
+     * systems' decoders (MediaCodec decodes asynchronously). */
+    t->trails = strcmp(p->codec, "wmav1") == 0 || strcmp(p->codec, "wmav2") == 0 || t->codec.trails;
 }
 
 /* A chained stream's next song: its own codec, set up from its own headers. */
@@ -424,8 +440,12 @@ static fa_result fill(fa_track* t)
             /* The codec gives back what it still holds (decoders with delayed
              * output), one block per call until it has nothing left. */
             t->draining = 1;
-            if (t->format_known && t->codec.vt->decode(&t->codec, NULL, 0) == FA_OK && t->codec.out_frames > 0 &&
+            if (t->codec_ready && t->codec.vt->decode(&t->codec, NULL, 0) == FA_OK && t->codec.out_frames > 0 &&
                 t->codec.rate != 0 && t->codec.channels != 0) {
+                /* A trailing decoder may give a short file's first audio only now. */
+                if (!t->format_known) learn_format(t);
+                if (t->quiet && t->place) pk.pts = t->quiet_pts;
+                t->quiet = 0;
                 r = emit(t, &pk);
                 if (r != FA_OK) return r;
                 continue;
@@ -568,7 +588,7 @@ void fa_track_close(fa_track* t)
 
 /* ---- AAC ---------------------------------------------------------------------------- */
 
-static const uint32_t aac_rates[13] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000,
+const uint32_t fa_aac_rates[13] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000,
                                         22050, 16000, 12000, 11025, 8000, 7350 };
 
 typedef struct bitw { uint8_t* p; size_t bit; } bitw;
@@ -585,7 +605,7 @@ static void put_rate(bitw* w, uint32_t rate)
 {
     int i;
     for (i = 0; i < 13; i++)
-        if (aac_rates[i] == rate) { put_bits(w, (uint32_t)i, 4); return; }
+        if (fa_aac_rates[i] == rate) { put_bits(w, (uint32_t)i, 4); return; }
     put_bits(w, 15, 4);
     put_bits(w, rate, 24);
 }

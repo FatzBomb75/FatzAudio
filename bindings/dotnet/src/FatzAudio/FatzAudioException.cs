@@ -38,6 +38,8 @@ public enum ErrorCode
     NoDisc = -14,
     /// <summary>A MIDI file was opened with no soundfont: set <see cref="AudioEngine.DefaultSoundFont"/> or <see cref="StreamOptions.SoundFont"/>.</summary>
     NoSoundFont = -15,
+    /// <summary>The file or stream is DRM-protected or encrypted (protected WMA, FairPlay or Common Encryption MP4, encrypted Matroska, SAMPLE-AES HLS) and cannot be played.</summary>
+    ProtectedContent = -16,
 }
 
 /// <summary>
