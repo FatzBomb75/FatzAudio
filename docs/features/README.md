@@ -5,7 +5,7 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Feature | Page | Status |
 |---|---|---|
 | Devices (output, start/stop, silent output) | [devices.md](devices.md) | ✅ output; input and default following 🗓️ |
-| Opening and decoding streams (format detection, custom I/O, MP4 and MKV audio tracks, Ogg Opus and Vorbis) | [streams.md](streams.md) | ✅ |
+| Opening and decoding streams (format detection, custom I/O, MP4 and MKV audio tracks, Ogg Opus, Vorbis and FLAC, FLAC in MP4 and MKV) | [streams.md](streams.md) | ✅ |
 | Playback, buffering and threads (decode-ahead, transport, device clock) | [playback.md](playback.md) | ✅ |
 | Volume, pan and ramps (7 curves, scheduled starts, ramp-done) | [ramps.md](ramps.md) | ✅ volume and pan |
 | Events | [events.md](events.md) | ✅ ended, ramp done, marker, started, loudness final, metadata, stalled/resumed, decode error, MIDI text |

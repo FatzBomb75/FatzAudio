@@ -284,6 +284,21 @@ Opus and Vorbis are built-in formats: `.opus` and `.ogg` files, chained files, O
 | BASS_ATTRIB_OPUS_ORIGFREQ (the encoder's input rate) | Not exposed: Opus always decodes at 48 kHz | — | ➖ |
 | BASS_ChannelGetTags(BASS_TAG_OGG) | ReplayGain / R128 comments are used for normalization automatically, and radio titles come through `fa_stream_get_metadata`; a general tag reader is planned | | 🗓️ |
 
+### bassflac
+
+FLAC is a built-in format wherever it appears: `.flac` files, Ogg FLAC, FLAC tracks in MP4 and Matroska, and FLAC frames your app pushes. One decoder (miniaudio's dr_flac) handles all of them, so a track decodes to the same samples whatever it is packed in ([streams](../features/streams.md)).
+
+| bassflac | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| BASS_FLAC_StreamCreateFile (`.flac` and Ogg FLAC) | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ |
+| BASS_FLAC_StreamCreateURL | `fa_stream_open_url` (FLAC and Ogg FLAC streams, Ogg FLAC radio titles from the comment block) | `engine.OpenUrl` | ✅ |
+| BASS_FLAC_StreamCreateFileUser | `fa_stream_open_io` | `engine.OpenStream` | ✅ |
+| FLAC in MP4 / Matroska (bassflac via basswebm or the MP4 demuxer) | Built in, no FFmpeg; `audio_track` picks the track | `StreamOptions.AudioTrack` | ✅ |
+| Raw FLAC frames (decoding packets from your own demuxer) | `fa_stream_open_packets` with codec `flac` and the 34-byte STREAMINFO as extradata (or none: then the rate, channels and `bits_per_coded_sample` are used) ([FFmpeg hand-off](../features/ffmpeg.md)) | `engine.OpenPackets`, `PushPacket` | ✅ |
+| BASS_PluginLoad("bassflac.dll") | Not needed: built in | — | ➖ (by design) |
+| BASS_ChannelGetTags(BASS_TAG_VENDOR / BASS_TAG_OGG on FLAC) | ReplayGain / R128 comments feed normalization automatically; a general tag reader is planned | | 🗓️ |
+| BASS_ChannelGetTags(BASS_TAG_FLAC_CUE / BASS_TAG_FLAC_PICTURE / BASS_TAG_FLAC_METADATA) | Planned with the general tag reader | | 🗓️ |
+
 ### bass_fx tempo, pitch and rate
 
 bass_fx needs a decode stream wrapped in a separate tempo stream; FatzAudio puts three parameters on every stream ([tempo and pitch](../features/tempo-pitch.md)).
@@ -398,7 +413,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 |---|---|---|
 | bass_aac.dll | `BASS_AAC_StreamCreateFile`/`URL`/`User` → the normal open calls: MP4/M4A/MOV files (built-in demuxer, any audio track), `.aac` (ADTS) files and AAC radio, and AAC packets (`fa_stream_open_packets`), decoded through the app's FFmpeg; a built-in or OS AAC decoder | ✅ MP4, ADTS and packets via FFmpeg, 🗓️ built-in decoder |
 | bass_ac3.dll | Built-in AC-3 and E-AC-3 decoder: raw `.ac3`/`.ec3` files, MP4/MKV tracks, web streams and HLS, and pushed packets, with dynamic range modes ([Dolby Digital](../features/dolby.md)) | ✅ (passthrough 🗓️) |
-| bassflac.dll | Built-in | ✅ |
+| bassflac.dll | Built-in: `.flac` files, Ogg FLAC (`.oga`), FLAC tracks in MP4 and Matroska, FLAC web streams and FLAC packets through `fa_stream_open_packets`, all with the same decoder ([bassflac](#bassflac)) | ✅ |
 | basshls.dll (if used) | Built-in: `fa_stream_open_url` plays `.m3u8` (MPEG-TS, fMP4, AES-128) | ✅ (AAC segments through the app's FFmpeg) |
 | bassopus.dll | Built-in: `.opus` files, Opus web radio, Opus in WebM/MKV/MP4, and raw packets through `fa_stream_open_packets` ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
 | basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM, MP3, AC-3, Opus and Vorbis tracks built in, AAC and others through the app's FFmpeg ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ |
