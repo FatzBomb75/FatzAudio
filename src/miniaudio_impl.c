@@ -1,6 +1,8 @@
 /* miniaudio implementation lives in its own translation unit. miniaudio embeds
  * dr_wav / dr_mp3 / dr_flac, so WAV, MP3 and FLAC decoding come from it. */
 #define MINIAUDIO_IMPLEMENTATION
+/* minimp3 synthesizes in float: keep it, rather than rounding to 16 bits. */
+#define MA_DR_MP3_FLOAT_OUTPUT
 #include "miniaudio.h"
 
 /* ---- dr_wav glue for dec_miniaudio.c --------------------------------------- */
@@ -91,14 +93,12 @@ int fa_mp3dec_decode(void* dec, const uint8_t* data, int size, float* pcm, int* 
                      int* out_channels, int* out_rate)
 {
     ma_dr_mp3dec_frame_info info;
-    ma_int16 s16[MA_DR_MP3_MAX_SAMPLES_PER_FRAME];
-    int frames, i;
+    int frames;
     memset(&info, 0, sizeof(info));
-    frames = ma_dr_mp3dec_decode_frame((ma_dr_mp3dec*)dec, data, size, s16, &info);
+    frames = ma_dr_mp3dec_decode_frame((ma_dr_mp3dec*)dec, data, size, pcm, &info);
     *out_frames = frames;
     *out_channels = info.channels;
     *out_rate = info.sample_rate;
-    for (i = 0; i < frames * info.channels; i++) pcm[i] = (float)s16[i] * (1.0f / 32768.0f);
     return info.frame_bytes;
 }
 
@@ -134,7 +134,12 @@ static ma_bool32 mp3_on_seek(void* user, int offset, ma_dr_mp3_seek_origin origi
 static int drmp3_start(fa_drmp3* m)
 {
     m->base = fa_source_tell(m->src);
-    return ma_dr_mp3_init(&m->dr, mp3_on_read, mp3_on_seek, NULL, NULL, m, NULL) ? 1 : 0;
+    if (!ma_dr_mp3_init(&m->dr, mp3_on_read, mp3_on_seek, NULL, NULL, m, NULL)) return 0;
+    /* Without a LAME header dr_mp3 keeps the filter bank's 529-sample delay;
+     * drop it as local files do (dec_mp3.c), so a web stream and the same file
+     * on disk start on the same sample. */
+    if (m->dr.delayInPCMFrames == 0) m->dr.delayInPCMFrames = 529;
+    return 1;
 }
 
 fa_result fa_drmp3_open(fa_source* src, void** out_impl, uint32_t* out_rate, uint32_t* out_channels,

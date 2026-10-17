@@ -781,7 +781,7 @@ static fa_result midi_open(fa_decoder* dec)
 const fa_decoder_vtable fa_decoder_midi = {
     "midi", "Standard MIDI File and RIFF MIDI (SoundFont 2 synthesizer)", "mid;midi;kar;rmi;smf",
     "audio/midi;audio/x-midi;audio/mid;audio/sp-midi",
-    fa_probe_midi, midi_open, midi_read, midi_seek, midi_close, 0, NULL
+    fa_probe_midi, midi_open, midi_read, midi_seek, midi_close, 0, NULL, NULL
 };
 
 /* ---- MIDI stream API ---------------------------------------------------------- */

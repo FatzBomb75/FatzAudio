@@ -1039,7 +1039,16 @@ static void test_reconnect_resumes(void)
     CHECK_EQ(n, WAV_FRAMES);
     for (i = 0; i < n; i++) if (got[i * 2] != wav_left(i)) { CHECK_EQ(i, -1); }
     free(got);
-    CHECK_EQ(fa_stream_get_net_status(s, &st), FA_OK);
+    /* The decoder stops at the end of the WAV data, which can be before the download
+     * thread sees the connection end and marks the download finished. */
+    {
+        int64_t until = fa_monotonic_ns() + 5000000000LL;
+        do {
+            CHECK_EQ(fa_stream_get_net_status(s, &st), FA_OK);
+            if (st.finished) break;
+            fa_sleep_ms(5);
+        } while (fa_monotonic_ns() < until);
+    }
     CHECK(st.reconnects >= 1);
     CHECK(st.finished);
     fa_stream_close(s);
@@ -1133,7 +1142,7 @@ static void test_icy_radio_decode_only(void)
 
 /* ---- AAC (ADTS) ------------------------------------------------------------------- */
 
-#define AAC_FRAMES (131 * 1024)
+#define AAC_FRAMES (130 * 1024)   /* 131 frames less the priming */
 
 /* Two decodes of the same AAC: the same audio, as a signal to noise ratio in dB
  * over the first `n` samples (any decoder: the system's on Windows, macOS, iOS and

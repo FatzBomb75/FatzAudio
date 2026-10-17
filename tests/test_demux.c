@@ -517,10 +517,10 @@ static void test_adts_file(void)
     CHECK(strcmp(info.container, "adts") == 0);
     CHECK_EQ(info.format.sample_rate, 44100);
     CHECK_EQ(info.format.channels, 2);
-    CHECK_EQ(info.length_frames, ADTS_FRAMES * 1024);   /* every frame, from the index */
+    CHECK_EQ(info.length_frames, (ADTS_FRAMES - 1) * 1024);   /* every frame but the priming, from the index */
     CHECK_EQ(info.seekable, 1);
     full = read_all(s, 2, &n);
-    CHECK_EQ(n, ADTS_FRAMES * 1024);
+    CHECK_EQ(n, (ADTS_FRAMES - 1) * 1024);
     CHECK_NEAR(freq(full, 4410, 128000, 2, 44100), 440.0, 2.0);
     CHECK_NEAR(rms(full, 4410, 128000, 2), 0.0625, 0.01);
     CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), AAC_SEEK_TOL, &worst));
@@ -578,9 +578,9 @@ static void test_adts_junk_and_tags(void)
     CHECK_EQ(r, FA_OK);
     CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
     CHECK(strcmp(info.container, "adts") == 0);
-    CHECK_EQ(info.length_frames, ADTS_FRAMES * 1024);   /* the tag between frames is skipped */
+    CHECK_EQ(info.length_frames, (ADTS_FRAMES - 1) * 1024);   /* the tag between frames is skipped */
     a = read_all(s, 2, &na);
-    CHECK_EQ(na, ADTS_FRAMES * 1024);
+    CHECK_EQ(na, (ADTS_FRAMES - 1) * 1024);
     fa_stream_close(s);
     /* The same from a forward-only source: found by sliding to the next header. */
     m.p = data;
@@ -612,7 +612,8 @@ static void test_adts_junk_and_format_change(void)
     fa_stream* s = NULL;
     fa_stream_info info;
     float *x, *y;
-    int64_t nx, ny, expect = ADTS_FRAMES * 1024 + 25 * 940;   /* 1024 frames at 48 kHz last 940 at 44.1 */
+    int64_t nx, ny, expect = (ADTS_FRAMES - 1) * 1024 + 25 * 940;   /* 1024 frames at 48 kHz last 940 at 44.1;
+                                                                     the priming is dropped once, at the start */
     mem_io m;
     fa_io_callbacks io = { io_read, NULL, NULL, io_close };
     fa_result r;
@@ -1177,6 +1178,146 @@ static void test_aac_51_channel_order(void)
     fa_stream_close(s);
 }
 
+/* ---- MP3 files (dec_mp3.c) ---------------------------------------------------------- */
+
+/* Where a 440 Hz sine of phase 0 at sample 0 sits in channel 0 of p: its lag
+ * in samples, modulo one period (0 .. rate / 440). */
+static double sine_lag(const float* p, int64_t from, int64_t to, uint32_t ch, uint32_t rate)
+{
+    double a = 0, b = 0, w = 2 * 3.14159265358979 * 440.0 / rate, period = rate / 440.0, lag;
+    int64_t i;
+    for (i = from; i < to; i++) {
+        a += p[i * ch] * sin(w * (double)i);
+        b += p[i * ch] * cos(w * (double)i);
+    }
+    /* p[i] ~ sin(w (i - lag)) = sin(w i) cos(w lag) - cos(w i) sin(w lag) */
+    lag = atan2(-b, a) / w;
+    while (lag < 0) lag += period;
+    while (lag >= period) lag -= period;
+    return lag;
+}
+
+/* net/tone.aac starts on the first real sample: FFmpeg's encoder primes with 1024
+ * samples, which the ADTS reader drops, so the sine has no lag (bass_aac agrees). */
+static void test_adts_start(void)
+{
+    fa_stream* s;
+    float* full;
+    int64_t n;
+    double lag, period = 44100 / 440.0;
+    fa_result r = open_file("net/tone.aac", -1, &s);
+    SKIP_NO_FFMPEG(r);
+    CHECK_EQ(r, FA_OK);
+    full = read_all(s, 2, &n);
+    lag = sine_lag(full, 4410, 44100, 2, 44100);
+    printf("  ADTS start lag: %.2f frames\n", lag);
+    CHECK(lag < 1.0 || lag > period - 1.0);
+    free(full);
+    fa_stream_close(s);
+}
+
+static fa_result open_mp3(const char* name, uint32_t flags, fa_stream** s)
+{
+    char path[512];
+    fa_open_options o;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY | flags;
+    snprintf(path, sizeof(path), "%s/mp3/%s", FA_TEST_DATA_DIR, name);
+    return fa_stream_open_path(g_engine, path, &o, s);
+}
+
+/* Length, start and exact seeks of one file. `lag`: where the audio starts
+ * against the source (the encoder delay the file does not record). */
+static void check_mp3(const char* name, uint32_t rate, uint32_t channels, int64_t length, double lag)
+{
+    static const int64_t targets[] = { 0, 1, 1151, 1152, 1153, 100000, 2000, 2577, 60000, 61000, 62500,
+                                       175000, 170000, 30000, 5, 88199, 44100, 44101 };
+    int prescan;
+    for (prescan = 0; prescan < 2; prescan++) {
+        fa_stream* s;
+        fa_stream_info info;
+        float* full;
+        int64_t n;
+        double worst, period = rate / 440.0, d;
+        CHECK_EQ(open_mp3(name, prescan ? FA_OPEN_PRESCAN : 0, &s), FA_OK);
+        CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+        CHECK(strcmp(info.codec, "mp3") == 0);
+        CHECK_EQ(info.format.sample_rate, rate);
+        CHECK_EQ(info.format.channels, channels);
+        CHECK_EQ(info.seekable, 1);
+        if (length > 0) CHECK_EQ(info.length_frames, length);
+        full = read_all(s, channels, &n);
+        CHECK_EQ(n, info.length_frames);
+        d = fabs(sine_lag(full, n / 4, n * 3 / 4, channels, rate) - lag);
+        if (d > period / 2) d = period - d;
+        CHECK(d < 0.5);
+        /* Every seek gives exactly the samples of the straight decode. */
+        CHECK(seek_matches(s, full, n, channels, targets, (int)(sizeof(targets) / sizeof(targets[0])), 0.0, &worst));
+        free(full);
+        fa_stream_close(s);
+    }
+}
+
+/* LAME header: encoder delay and padding trimmed, the exact source length. */
+static void test_mp3_cbr(void) { check_mp3("cbr.mp3", 44100, 2, 176400, 0.0); }
+static void test_mp3_vbr(void) { check_mp3("vbr.mp3", 44100, 2, 176400, 0.0); }
+/* One granule per frame; the reservoir spans several small frames. */
+static void test_mp3_mpeg2(void) { check_mp3("mpeg2.mp3", 22050, 1, 88200, 0.0); }
+
+/* No header: only the decoder's 529-sample delay is known, so the audio starts
+ * after LAME's 576-sample encoder delay (as in BASS), and the length is counted
+ * at open: the frames' samples less those 529. */
+static void test_mp3_no_header(void)
+{
+    double period = 44100 / 440.0;
+    check_mp3("noxing.mp3", 44100, 2, 155 * 1152 - 529, fmod(576.0, period));
+}
+
+/* Junk between frames is skipped the same way when playing and when seeking. */
+static void test_mp3_junk(void)
+{
+    static const int64_t targets[] = { 0, 90000, 50000, 120000, 1 };
+    size_t size, i;
+    uint8_t* data = load_file("mp3/cbr.mp3", &size);
+    uint8_t* bad;
+    fa_open_options o;
+    fa_stream* s;
+    fa_stream_info info;
+    float* full;
+    int64_t n;
+    double worst;
+    CHECK(data != NULL);
+    bad = (uint8_t*)malloc(size + 3000);
+    memcpy(bad, data, size / 2);
+    for (i = 0; i < 3000; i++) bad[size / 2 + i] = (uint8_t)(i * 37 + (i >> 3));
+    memcpy(bad + size / 2 + 3000, data + size / 2, size - size / 2);
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    CHECK_EQ(fa_stream_open_memory(g_engine, bad, size + 3000, &o, &s), FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    full = read_all(s, 2, &n);
+    CHECK(n > 170000 && n <= 176400);
+    CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), 0.0, &worst));
+    free(full);
+    fa_stream_close(s);
+    /* Cut in the middle of a frame: plays up to the last whole frame. */
+    CHECK_EQ(fa_stream_open_memory(g_engine, data, size / 3 + 77, &o, &s), FA_OK);
+    full = read_all(s, 2, &n);
+    CHECK(n > 40000 && n < 70000);
+    CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), 0.0, &worst));
+    CHECK_EQ(fa_stream_seek(s, 150000), FA_OK);
+    {
+        float buf[64];
+        fa_frames got = 1;
+        fa_stream_read(s, buf, 32, &got);
+        CHECK_EQ(got, 0);
+    }
+    free(full);
+    fa_stream_close(s);
+    free(bad);
+    free(data);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -1200,11 +1341,17 @@ int main(void)
     RUN(test_webm_opus);
     RUN(test_forward_only_sources);
     RUN(test_adts_file);
+    RUN(test_adts_start);
     RUN(test_adts_junk_and_tags);
     RUN(test_adts_junk_and_format_change);
     RUN(test_mkv_lacing_and_live_layout);
     RUN(test_damaged_files_do_not_crash);
     RUN(test_scan_video_file);
+    RUN(test_mp3_cbr);
+    RUN(test_mp3_vbr);
+    RUN(test_mp3_mpeg2);
+    RUN(test_mp3_no_header);
+    RUN(test_mp3_junk);
 
     fa_engine_destroy(g_engine);
     if (g_failures) { printf("%d failure(s)\n", g_failures); return 1; }

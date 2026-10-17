@@ -1024,5 +1024,5 @@ static int asf_probe(const uint8_t* d, size_t n, size_t id3)
 const fa_decoder_vtable fa_decoder_asf = {
     "asf", "ASF and Windows Media Audio (.wma, .asf, .wmv; audio streams)", "wma;asf;wmv",
     "audio/x-ms-wma;video/x-ms-asf;video/x-ms-wmv;application/vnd.ms-asf;audio/x-ms-asf",
-    asf_probe, asf_open, asf_read, asf_seek, asf_close, 1, asf_lag
+    asf_probe, asf_open, asf_read, asf_seek, asf_close, 1, asf_lag, NULL
 };

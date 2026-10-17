@@ -172,6 +172,7 @@ static fa_result stream_open_decoder(struct fa_stream* s, const char* name_hint,
     r = fa_decoder_open(&s->decoder, &s->source, name_hint, options ? options->mime_hint : NULL,
                         options ? options->audio_track : -1, &env);
     if (r != FA_OK) return r;
+    if ((s->flags & FA_OPEN_PRESCAN) && s->decoder.vt->prescan) s->decoder.vt->prescan(&s->decoder);
     s->decoder_ready = 1;
     s->midi = fa_midi_of(&s->decoder);
     if (!s->midi) {
@@ -1719,7 +1720,7 @@ static fa_result post_tempo_locked(struct fa_stream* s, fa_param param, float ta
 {
     double sr = (double)s->decoder.format.sample_rate;
     int64_t len = (int64_t)((double)duration * sr / 1e9 + 0.5), start = FA_TPARAM_NOW, old_tag = 0;
-    int replaced, wanted;
+    int replaced, wanted, held;
     if (s->push && param != FA_PARAM_PITCH) return FA_ERROR_NOT_IMPLEMENTED;
     if (s->decoder.format.channels > FA_TEMPO_MAX_CHANNELS && !s->matrix &&
         (notify || len > 0 || target != (param == FA_PARAM_PITCH ? 0.0f : 1.0f)))
@@ -1729,6 +1730,11 @@ static fa_result post_tempo_locked(struct fa_stream* s, fa_param param, float ta
         int64_t ring = fa_load64(&s->played) + (device_frame(s, device_time) - fa_load64(&s->device->clock));
         start = ring > 0 ? (int64_t)((double)ring * sr / (double)s->dev_rate + 0.5) : 0;
     }
+    /* A first use may restart the stream (below). Workers are kept out from the post
+     * on: one still decoding the old timeline, up to the whole decode-ahead buffer
+     * past what is heard, would start (or even finish) the ramp there. */
+    held = !fa_load32(&s->tempo_live) && is_attached(s) && s->decoder.seekable && fa_load32(&s->state) != FA_STATE_ENDED;
+    if (held) fa_mutex_lock(&s->decode_lock);
     fa_mutex_lock(&s->tempo_lock);
     replaced = fa_tparam_post(&s->tparams[tempo_slot(param)], target, len, shape, tag, notify, start, &old_tag);
     wanted = tempo_wanted_locked(s);
@@ -1736,11 +1742,19 @@ static fa_result post_tempo_locked(struct fa_stream* s, fa_param param, float ta
     if (replaced) tempo_ramp_done(s, old_tag);
     if (wanted && !fa_load32(&s->tempo_live)) {
         fa_store32(&s->tempo_live, 1);
-        /* First use: decode again from what is heard now, so the change does not
-         * wait for the whole decode-ahead buffer to play out. */
-        if (is_attached(s) && s->decoder.seekable && fa_load32(&s->state) != FA_STATE_ENDED)
-            seek_locked(s, fa_stream_position_now(s));
+        if (held) {
+            /* First use: decode again from what is heard now, so the change does not
+             * wait for the whole decode-ahead buffer to play out. (The audio thread
+             * never takes decode_lock, so waiting for it here is safe.) */
+            fa_frames pos;
+            fa_store32(&s->flushing, 1);
+            fa_device_wait_quiescent(s->device);   /* the mixer now skips this stream */
+            pos = fa_stream_position_now(s);       /* after the mixer let go: nothing more is consumed */
+            restart_at_locked(s, pos);
+            fa_store32(&s->flushing, 0);
+        }
     }
+    if (held) fa_mutex_unlock(&s->decode_lock);
     return FA_OK;
 }
 

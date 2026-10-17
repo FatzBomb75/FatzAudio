@@ -57,7 +57,9 @@ static void render(int64_t frames)
             int ready = 1;
             for (i = 0; i < list->count; i++) {
                 fa_stream* s = list->items[i];
-                int waiting = s->push ? fa_push_has_input(s->push) : 1;
+                /* A push stream with nothing queued may still hold audio kept by a
+                 * detach (carry) or read but not converted yet: `staged`. */
+                int waiting = s->push ? fa_push_has_input(s->push) || fa_load32(&s->staged) : 1;
                 if (waiting && fa_ring_readable(&s->ring) < (int64_t)n && !fa_load32(&s->eof) && !fa_load32(&s->flushing)) ready = 0;
             }
             if (ready) break;
@@ -539,16 +541,25 @@ static void test_buffered_counts_the_device_while_draining(void)
  * never sees a record half-extended (the old length with the new end). */
 static fa_clock g_race_clock;
 static fa_atomic64 g_race_written;
+static fa_atomic64 g_race_reads;
 static fa_atomic32 g_race_stop;
+
+/* 200000 callbacks of 480 frames make about 92 records (one is extended up to 2^20
+ * frames), fewer than FA_CLOCK_HISTORY: a reader that was descheduled for a while
+ * still finds its frame in the history instead of before the oldest record. */
+#define RACE_CALLBACKS 200000
 
 static void race_writer(void* arg)
 {
     int64_t k;
     (void)arg;
-    for (k = 0; k < 400000 && !fa_load32(&g_race_stop); k++) {
+    for (k = 0; k < RACE_CALLBACKS; k++) {
         /* 480 frames, 10 ms each: one rate throughout, so every record extends the last. */
         fa_clock_record(&g_race_clock, k * 480, 480, k * 10000000, (k + 1) * 10000000);
         fa_store64(&g_race_written, (k + 1) * 480);
+        /* Stays within reach of the reader, so the two overlap even when the reader
+         * thread gets little CPU (busy CI machines). */
+        while (fa_load64(&g_race_reads) * 100 < k) fa_sleep_ms(0);
     }
     fa_store32(&g_race_stop, 1);
 }
@@ -559,6 +570,7 @@ static void test_clock_records_extend_atomically(void)
     int64_t bad = 0, reads = 0;
     fa_clock_reset(&g_race_clock, 0);
     fa_store64(&g_race_written, 0);
+    fa_store64(&g_race_reads, 0);
     fa_store32(&g_race_stop, 0);
     CHECK_EQ(fa_thread_create(&t, race_writer, NULL), 0);
     while (!fa_load32(&g_race_stop)) {
@@ -567,7 +579,7 @@ static void test_clock_records_extend_atomically(void)
         f = w - 240 - (reads % 200);              /* inside what is written */
         if (f < 0) f = 0;
         if (llabs(fa_clock_at(&g_race_clock, (double)f) - (int64_t)((double)f * 1e9 / 48000.0)) > 1) bad++;
-        reads++;
+        fa_store64(&g_race_reads, ++reads);
     }
     fa_thread_join(&t);
     CHECK(reads > 1000);

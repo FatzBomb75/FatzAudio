@@ -75,6 +75,9 @@ typedef struct fa_decoder_vtable {
     int fast_seek;
     /* Optional (NULL = 0, 0): see fa_decoder_lag. */
     void (*lag)(fa_decoder* dec, int64_t* out_bytes, int64_t* out_frames);
+    /* Optional (FA_OPEN_PRESCAN): reads the whole file's layout now, so the
+     * length is exact and every seek is fast. */
+    void (*prescan)(fa_decoder* dec);
 } fa_decoder_vtable;
 
 struct fa_decoder {
@@ -83,6 +86,9 @@ struct fa_decoder {
     void* impl;
     fa_audio_format format;  /* always FA_FORMAT_F32 interleaved */
     fa_frames length;        /* -1 = unknown */
+    /* Frames the decoder drops at the start of the data (ADTS priming): a duration
+     * that a playlist gives for the same data (HLS) is that much longer. */
+    fa_frames lead_trim;
     int seekable;
     char codec[32];
     char container[32];
@@ -140,6 +146,16 @@ void fa_drmp3_close(void* impl);
  * (room for max_frames at up to 8 channels). Frames decoded, -1 if it is not FLAC. */
 int64_t fa_drflac_decode_memory(const void* data, size_t size, float* out, uint64_t max_frames,
                                 uint32_t* out_channels, uint32_t* out_rate);
+/* dr_mp3's frame decoder (minimp3) lives in miniaudio_impl.c, where its API is
+ * visible. fa_mp3dec_decode decodes the first frame in data[0..size); returns the
+ * bytes used (0 = needs more data) and writes up to 1152 interleaved frames to
+ * pcm. Free with free(). */
+void* fa_mp3dec_create(void);
+int fa_mp3dec_decode(void* dec, const uint8_t* data, int size, float* pcm, int* out_frames,
+                     int* out_channels, int* out_rate);
+void fa_mp3dec_reset(void* dec);
+/* MP3 through dr_mp3 (dec_miniaudio.c): network sources and free-format files. */
+fa_result fa_mp3_open_fallback(fa_decoder* dec);
 
 /* Bytes the decoder has read from its source but not decoded yet, and frames it has
  * decoded but not returned yet (0 when it does not know). Places ICY titles exactly. */
@@ -369,7 +385,8 @@ void fa_tmap_release(fa_tmap* m, int64_t at);   /* audio thread */
 typedef struct fa_truepeak {
     uint32_t channels;
     int phases;                 /* 4 below 88.2 kHz, 2 below 176.4 kHz, else 1 */
-    float coef[FA_TP_PHASES][FA_TP_TAPS];
+    float coef[FA_TP_TAPS][FA_TP_PHASES];   /* tap-major: the phases of one tap side by side */
+    float* wide;                /* SIMD builds: coef[t][p] repeated 4 times, [t][p][4] (block measuring) */
     float bound;                /* largest sum of |coef| of a phase */
     float* hist;                /* per channel: 2 x FA_TP_TAPS */
     int pos;

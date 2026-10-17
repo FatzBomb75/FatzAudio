@@ -912,7 +912,8 @@ static fa_result hls_open(fa_decoder* dec)
     duration = h->net->hls_duration;
     fa_mutex_unlock(&h->net->lock);
     dec->seekable = duration >= 0;
-    dec->length = duration >= 0 ? (fa_frames)(duration * dec->format.sample_rate + 0.5) : -1;
+    dec->length = duration >= 0 ? (fa_frames)(duration * dec->format.sample_rate + 0.5) - h->inner.lead_trim : -1;
+    if (duration >= 0 && dec->length < 0) dec->length = 0;
     snprintf(dec->codec, sizeof(dec->codec), "%s", h->inner.codec);
     snprintf(dec->container, sizeof(dec->container), "hls");
     return FA_OK;
@@ -973,5 +974,5 @@ static int hls_probe(const uint8_t* data, size_t size, size_t id3) { (void)data;
 /* Not in the registry: URL streams that turn out to be HLS use it directly. */
 const fa_decoder_vtable fa_decoder_hls = {
     "hls", "HTTP Live Streaming", "m3u8", "application/vnd.apple.mpegurl;application/x-mpegurl",
-    hls_probe, hls_open, hls_read, hls_seek, hls_close, 0, NULL
+    hls_probe, hls_open, hls_read, hls_seek, hls_close, 0, NULL, NULL
 };

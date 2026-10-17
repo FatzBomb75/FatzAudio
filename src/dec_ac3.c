@@ -670,5 +670,5 @@ static void raw_close(fa_decoder* dec)
 const fa_decoder_vtable fa_decoder_ac3 = {
     "ac3", "Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3)", "ac3;ec3;eac3;a52;ddp",
     "audio/ac3;audio/eac3;audio/vnd.dolby.dd-raw;audio/x-ac3;audio/x-eac3",
-    raw_probe, raw_open, raw_read, raw_seek, raw_close, 1, NULL
+    raw_probe, raw_open, raw_read, raw_seek, raw_close, 1, NULL, NULL
 };

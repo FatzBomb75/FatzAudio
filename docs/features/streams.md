@@ -21,7 +21,7 @@ Inside MP4, Matroska and ASF, PCM, MP3, AC-3, E-AC-3, Opus, Vorbis and FLAC trac
 
 The system decoders give the same audio as FFmpeg's to within a decoder's rounding, not to the bit (ALAC, being lossless, is the same everywhere). HE-AAC plays at its full rate after SBR, so `format.sample_rate` can be twice the rate the container states; channels come out in the library's order ([channel order](dolby.md)) whichever decoder made them. ADTS frames cannot say whether they carry HE-AAC, nor can MP4 files that leave it implicit, so at 24 kHz and below AudioToolbox is told to expect it: a plain AAC-LC file at such a rate then plays at twice its rate (upsampled, and in stereo if it was mono), which sounds the same. When the ADTS headers of a stream change rate or channels (an HLS variant switch), the system decoder is set up again. The rare ADTS frames a system decoder cannot take (a channel layout in a program config element, several raw data blocks per frame) and ALAC with more than two channels on Windows and Android go to FFmpeg.
 
-An `.aac` file on disk or in memory is indexed when it opens (a quick pass over the frame headers, without decoding), so its length and seeks are exact. Over the network, and from your own read callbacks when they can seek, the length and seek positions are estimated from the frame sizes at the start, as for MP3 without a seek table. Junk between frames, such as a radio stream joined in the middle of a frame or ID3 tags between HLS segments, is skipped.
+An `.aac` file on disk or in memory is indexed when it opens (a quick pass over the frame headers, without decoding), so its length and seeks are exact. Over the network, and from your own read callbacks when they can seek, the length and seek positions are estimated from the frame sizes at the start, as for MP3 without a seek table. Junk between frames, such as a radio stream joined in the middle of a frame or ID3 tags between HLS segments, is skipped. ADTS has no field for the encoder delay, so the first 1024 samples (one frame: the encoder's priming in a file, half a frame's overlap when joining a radio stream) are dropped, as bass_aac does; the audio then starts on the first real sample of files from the usual encoders (FFmpeg, Apple, Fraunhofer), and the length is one frame shorter than the frames hold.
 
 More formats are added to the same registry (built-in or OS decoders for the codecs above follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
 
@@ -178,6 +178,17 @@ In .NET, `stream.PlayOn(device)` attaches (or moves) and plays, and `stream.Deta
 - `fa_stream_open_memory` copies the data, so you can free your buffer right after the call.
 - Paths are UTF-8. On Windows FatzAudio converts them to UTF-16 internally, so non-ASCII file names work.
 - `audio_track` greater than 0 returns `FA_ERROR_NOT_FOUND` for single-track formats.
+
+## MP3
+
+MP3 files decode built in (minimp3, inside miniaudio), in 32-bit float: nothing is rounded to 16 bits, so the output matches a reference float decoder to about 124 dB.
+
+- **Start and length:** a LAME/Xing header's encoder delay and padding are removed, so the audio starts on the first sample the encoder was given and the length is exact. Without that header the decoder's own 529-frame delay is still removed (the encoder's delay is not recorded anywhere, so a LAME-encoded file then starts 576 frames late, as in BASS).
+- **Seeking is exact and fast**, on files and memory: a seek lands on the frame asked for, with exactly the samples a straight decode gives there. The decoder finds frames by hopping from header to header (no decoding) and keeps the position of every 16th; after a seek it decodes only the few frames before the target that the bit reservoir and the filter bank need, so a seek takes about 0.3 ms. A file with a Xing/LAME header is hopped lazily, up to where you seek, so the first seek far into a long file reads the headers on the way (about 6 ms for 10 minutes; later seeks don't); a file without one is hopped once at open to learn its length.
+- **`FA_OPEN_PRESCAN`** hops the whole file at open: the length then comes from the frames themselves rather than the header's frame count, and no later seek has to read ahead. It is never needed for exact seeks.
+- **Damaged files:** junk between frames is skipped, the same way when playing and when seeking; a frame that can't be decoded plays as silence so the timeline never shifts. A file cut off mid-frame plays up to its last whole frame.
+- **Over the network** the length comes from the Xing header (or the bitrate) and seeks jump to the estimated byte, as nothing past the playing position has been downloaded. Free-format files (no bitrate in the header) also use that decoder.
+- **Loudness scans** cut MP3 files into chunks on all cores like other formats ([normalization](normalization.md#why-the-scan-is-fast-even-on-large-video-files)).
 
 ## Ogg Opus and Ogg Vorbis
 

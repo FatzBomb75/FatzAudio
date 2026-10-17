@@ -16,6 +16,13 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__SSE__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 1)
+#  include <xmmintrin.h>
+#  define FA_TP_SSE 1
+#elif defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64)
+#  include <arm_neon.h>
+#  define FA_TP_NEON 1
+#endif
 
 #define FA_PI 3.14159265358979323846
 
@@ -62,17 +69,52 @@ fa_result fa_truepeak_init(fa_truepeak* tp, uint32_t rate, uint32_t channels)
             h[t] /= sum;
             abs_sum += fabs(h[t]);
             /* Reversed so the dot product runs over the history oldest-first. */
-            tp->coef[p][FA_TP_TAPS - 1 - t] = (float)h[t];
+            tp->coef[FA_TP_TAPS - 1 - t][p] = (float)h[t];
         }
         if ((float)abs_sum > tp->bound) tp->bound = (float)abs_sum;
     }
+#if defined(FA_TP_SSE) || defined(FA_TP_NEON)
+    tp->wide = (float*)malloc(sizeof(float) * FA_TP_TAPS * FA_TP_PHASES * 4);
+    if (!tp->wide) { fa_truepeak_free(tp); return FA_ERROR_OUT_OF_MEMORY; }
+    for (t = 0; t < FA_TP_TAPS; t++)
+        for (p = 0; p < FA_TP_PHASES; p++)
+            for (n = 0; n < 4; n++) tp->wide[(t * FA_TP_PHASES + p) * 4 + n] = tp->coef[t][p];
+#endif
     return FA_OK;
 }
 
 void fa_truepeak_free(fa_truepeak* tp)
 {
     free(tp->hist);
+    free(tp->wide);
     tp->hist = NULL;
+    tp->wide = NULL;
+}
+
+/* The four phases' interpolated values at once: out[p] = sum over t of
+ * coef[t][p] * w[t], each phase summed in tap order as the plain loop does (one
+ * SIMD lane per phase). */
+static void tp_phases(const float (*coef)[FA_TP_PHASES], const float* w, float* out)
+{
+    int t;
+#if defined(FA_TP_SSE)
+    __m128 acc = _mm_setzero_ps();
+    for (t = 0; t < FA_TP_TAPS; t++) acc = _mm_add_ps(acc, _mm_mul_ps(_mm_loadu_ps(coef[t]), _mm_set1_ps(w[t])));
+    _mm_storeu_ps(out, acc);
+#elif defined(FA_TP_NEON)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    for (t = 0; t < FA_TP_TAPS; t++) acc = vaddq_f32(acc, vmulq_f32(vld1q_f32(coef[t]), vdupq_n_f32(w[t])));
+    vst1q_f32(out, acc);
+#else
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (t = 0; t < FA_TP_TAPS; t++) {
+        a0 += coef[t][0] * w[t];
+        a1 += coef[t][1] * w[t];
+        a2 += coef[t][2] * w[t];
+        a3 += coef[t][3] * w[t];
+    }
+    out[0] = a0; out[1] = a1; out[2] = a2; out[3] = a3;
+#endif
 }
 
 /* Appends one sample per channel and returns the largest |value| among the
@@ -81,24 +123,19 @@ void fa_truepeak_free(fa_truepeak* tp)
 static float tp_push(fa_truepeak* tp, const float* frame)
 {
     uint32_t c;
-    int p, t;
-    float m = 0.0f;
+    int p;
+    float m = 0.0f, v[FA_TP_PHASES];
     tp->pos = (tp->pos + 1) % FA_TP_TAPS;
     for (c = 0; c < tp->channels; c++) {
         float* h = tp->hist + (size_t)c * FA_TP_TAPS * 2;
-        const float* w;
+        float a = fabsf(frame[c]);
         h[tp->pos] = h[tp->pos + FA_TP_TAPS] = frame[c];
-        w = h + tp->pos + 1;
-        {
-            float a = fabsf(frame[c]);
-            if (a > m) m = a;
-        }
+        if (a > m) m = a;
         if (tp->phases == 1) continue;
+        tp_phases((const float (*)[FA_TP_PHASES])tp->coef, h + tp->pos + 1, v);
         for (p = 0; p < tp->phases; p++) {
-            float acc = 0.0f;
-            for (t = 0; t < FA_TP_TAPS; t++) acc += tp->coef[p][t] * w[t];
-            acc = fabsf(acc);
-            if (acc > m) m = acc;
+            a = fabsf(v[p]);
+            if (a > m) m = a;
         }
     }
     return m;
@@ -120,36 +157,112 @@ void fa_truepeak_flush(fa_truepeak* tp)
     free(zero);
 }
 
+/* The largest |value| among the samples lin[TAPS - 1 .. TAPS - 1 + n) of one
+ * channel and the points interpolated up to each: lin holds the TAPS - 1
+ * samples before them first. Four samples at a time, each SIMD lane one sample,
+ * each sum in tap order as tp_push forms it, so the result is the same. */
+static float tp_block(const fa_truepeak* tp, const float* lin, int n)
+{
+    int j, p, phases = tp->phases;
+    float m = 0.0f, v[4];
+    for (j = 0; j < n; j++) { float a = fabsf(lin[FA_TP_TAPS - 1 + j]); if (a > m) m = a; }
+    if (phases == 1) return m;
+    j = 0;
+#if defined(FA_TP_SSE)
+    {
+        const float* wide = tp->wide;
+        int t;
+        const __m128 sign = _mm_set1_ps(-0.0f);
+        __m128 mx = _mm_setzero_ps();
+        for (; j + 4 <= n; j += 4) {
+            __m128 a0 = _mm_setzero_ps(), a1 = a0, a2 = a0, a3 = a0;
+            for (t = 0; t < FA_TP_TAPS; t++) {
+                __m128 x = _mm_loadu_ps(lin + j + t);
+                const float* c = wide + t * FA_TP_PHASES * 4;
+                a0 = _mm_add_ps(a0, _mm_mul_ps(_mm_loadu_ps(c), x));
+                a1 = _mm_add_ps(a1, _mm_mul_ps(_mm_loadu_ps(c + 4), x));
+                a2 = _mm_add_ps(a2, _mm_mul_ps(_mm_loadu_ps(c + 8), x));
+                a3 = _mm_add_ps(a3, _mm_mul_ps(_mm_loadu_ps(c + 12), x));
+            }
+            mx = _mm_max_ps(mx, _mm_max_ps(_mm_max_ps(_mm_andnot_ps(sign, a0), _mm_andnot_ps(sign, a1)),
+                                           _mm_max_ps(_mm_andnot_ps(sign, a2), _mm_andnot_ps(sign, a3))));
+        }
+        _mm_storeu_ps(v, mx);
+        for (p = 0; p < 4; p++) if (v[p] > m) m = v[p];
+    }
+#elif defined(FA_TP_NEON)
+    {
+        const float* wide = tp->wide;
+        int t;
+        float32x4_t mx = vdupq_n_f32(0.0f);
+        for (; j + 4 <= n; j += 4) {
+            float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0;
+            for (t = 0; t < FA_TP_TAPS; t++) {
+                float32x4_t x = vld1q_f32(lin + j + t);
+                const float* c = wide + t * FA_TP_PHASES * 4;
+                a0 = vaddq_f32(a0, vmulq_f32(vld1q_f32(c), x));
+                a1 = vaddq_f32(a1, vmulq_f32(vld1q_f32(c + 4), x));
+                a2 = vaddq_f32(a2, vmulq_f32(vld1q_f32(c + 8), x));
+                a3 = vaddq_f32(a3, vmulq_f32(vld1q_f32(c + 12), x));
+            }
+            mx = vmaxq_f32(mx, vmaxq_f32(vmaxq_f32(vabsq_f32(a0), vabsq_f32(a1)), vmaxq_f32(vabsq_f32(a2), vabsq_f32(a3))));
+        }
+        vst1q_f32(v, mx);
+        for (p = 0; p < 4; p++) if (v[p] > m) m = v[p];
+    }
+#endif
+    /* The rest (and every sample without SIMD). */
+    for (; j < n; j++) {
+        tp_phases((const float (*)[FA_TP_PHASES])tp->coef, lin + j, v);
+        for (p = 0; p < phases; p++) { float a = fabsf(v[p]); if (a > m) m = a; }
+    }
+    return m;
+}
+
 /* Measures `frames` interleaved frames. With `measure` 0 the samples only fill
- * the history (warm-up). A block that cannot beat the peak found so far is
- * skipped: no interpolated point can exceed `bound` x the largest input sample
- * it is computed from, so the skip never changes the result. */
+ * the history (warm-up). Blocks of FA_TP_BLOCK frames that cannot beat the peak
+ * found so far are skipped: no interpolated point can exceed `bound` x the
+ * largest input sample it is computed from (the block and the TAPS frames before
+ * it, which are the history), so the skip never changes the result. */
+#define FA_TP_BLOCK 256
 static void tp_process(fa_truepeak* tp, const float* x, int64_t frames, int measure)
 {
     uint32_t ch = tp->channels;
-    int64_t i;
-    float in_max = 0.0f;
-    if (measure) {
-        size_t k, n = (size_t)frames * ch;
-        for (k = 0; k < n; k++) { float a = fabsf(x[k]); if (a > in_max) in_max = a; }
-        for (k = 0; k < (size_t)ch * FA_TP_TAPS * 2; k++) { float a = fabsf(tp->hist[k]); if (a > in_max) in_max = a; }
-    }
-    if (!measure || in_max * tp->bound <= tp->peak) {
+    int64_t at = 0;
+    while (at < frames) {
+        int64_t n = frames - at < FA_TP_BLOCK ? frames - at : FA_TP_BLOCK, i;
+        const float* b = x + (size_t)at * ch;
+        int skip = !measure;
+        uint32_t c;
+        if (measure) {
+            size_t k;
+            float in_max = 0.0f;
+            for (k = 0; k < (size_t)n * ch; k++) { float a = fabsf(b[k]); if (a > in_max) in_max = a; }
+            for (c = 0; c < ch; c++) {
+                const float* h = tp->hist + (size_t)c * FA_TP_TAPS * 2 + tp->pos + 1;   /* the last TAPS */
+                for (k = 0; k < FA_TP_TAPS; k++) { float a = fabsf(h[k]); if (a > in_max) in_max = a; }
+            }
+            skip = in_max * tp->bound <= tp->peak;
+        }
+        if (!skip) {
+            float lin[FA_TP_TAPS - 1 + FA_TP_BLOCK];
+            for (c = 0; c < ch; c++) {
+                float m;
+                memcpy(lin, tp->hist + (size_t)c * FA_TP_TAPS * 2 + tp->pos + 2, sizeof(float) * (FA_TP_TAPS - 1));
+                for (i = 0; i < n; i++) lin[FA_TP_TAPS - 1 + i] = b[(size_t)i * ch + c];
+                m = tp_block(tp, lin, (int)n);
+                if (m > tp->peak) tp->peak = m;
+            }
+        }
         /* Only the last TAPS frames matter for what comes next. */
-        i = frames > FA_TP_TAPS ? frames - FA_TP_TAPS : 0;
-        for (; i < frames; i++) {
-            uint32_t c;
+        for (i = n > FA_TP_TAPS ? n - FA_TP_TAPS : 0; i < n; i++) {
             tp->pos = (tp->pos + 1) % FA_TP_TAPS;
             for (c = 0; c < ch; c++) {
                 float* h = tp->hist + (size_t)c * FA_TP_TAPS * 2;
-                h[tp->pos] = h[tp->pos + FA_TP_TAPS] = x[(size_t)i * ch + c];
+                h[tp->pos] = h[tp->pos + FA_TP_TAPS] = b[(size_t)i * ch + c];
             }
         }
-        return;
-    }
-    for (i = 0; i < frames; i++) {
-        float m = tp_push(tp, x + (size_t)i * ch);
-        if (m > tp->peak) tp->peak = m;
+        at += n;
     }
 }
 
