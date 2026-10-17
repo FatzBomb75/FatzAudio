@@ -9,8 +9,8 @@ loaded at runtime if the app has them.
 | Windows x64 | `fatzaudio.dll` | CI: build and all tests |
 | macOS | `libfatzaudio.dylib` | CI: build and all tests |
 | Linux x64 | `libfatzaudio.so` | CI: build and all tests, plus ASan/UBSan |
-| Android arm64-v8a, x86_64, armeabi-v7a, x86 | `libfatzaudio.so` per ABI | Built with NDK r28; every test suite passes in an Android 14 user space ([below](#run-the-tests-without-a-device)). Not yet in CI |
-| iOS device (arm64), simulator (arm64, x86_64) | `fatzaudio.xcframework` | Build scripted, not yet compiled: needs a Mac |
+| Android arm64-v8a, x86_64, armeabi-v7a, x86 | `libfatzaudio.so` per ABI | CI: build of every ABI with a dependency and export check; all tests on x86_64 and arm64 in an Android 14 user space ([below](#run-the-tests-without-a-device)) |
+| iOS device (arm64), simulator (arm64, x86_64) | `fatzaudio.xcframework` | CI: build only (iOS programs need a signed app to run) |
 
 ## Windows, macOS, Linux
 
