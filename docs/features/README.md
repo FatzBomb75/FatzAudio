@@ -5,7 +5,7 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Feature | Page | Status |
 |---|---|---|
 | Devices (output, start/stop, silent output) | [devices.md](devices.md) | ✅ output; input and default following 🗓️ |
-| Opening and decoding streams (format detection, custom I/O, MP4 and MKV audio tracks) | [streams.md](streams.md) | ✅ |
+| Opening and decoding streams (format detection, custom I/O, MP4 and MKV audio tracks, Ogg Opus and Vorbis) | [streams.md](streams.md) | ✅ |
 | Playback, buffering and threads (decode-ahead, transport, device clock) | [playback.md](playback.md) | ✅ |
 | Volume, pan and ramps (7 curves, scheduled starts, ramp-done) | [ramps.md](ramps.md) | ✅ volume and pan |
 | Events | [events.md](events.md) | ✅ ended, ramp done, marker, started, loudness final, metadata, stalled/resumed, decode error |
@@ -15,7 +15,7 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Tempo, pitch and rate (time-stretch, key change, varispeed, formants) | [tempo-pitch.md](tempo-pitch.md) | ✅ (tempo and rate on push streams 🗓️) |
 | FFmpeg hand-off and A/V sync (packets, frames, presentation clock) | [ffmpeg.md](ffmpeg.md) | ✅ |
 | Web streams and HLS (HTTP/HTTPS, radio titles, reconnects, HLS) | [web-streams.md](web-streams.md) | ✅ |
-| CD+G karaoke graphics (MP3+G, ZIP, surfaces for any renderer) | [cdg.md](cdg.md) | ✅ files; disc 🗓️ |
+| CD+G karaoke graphics (MP3+G, ZIP, CD+G discs, surfaces for any renderer) | [cdg.md](cdg.md) | ✅ |
 | Dolby Digital and Dolby Digital Plus (AC-3, E-AC-3, up to 7.1, dynamic range) | [dolby.md](dolby.md) | ✅ (passthrough 🗓️) |
-| Disc playback (audio CDs and `.cue` images) | [disc.md](disc.md) | ✅ (CD+G from disc 🗓️) |
+| Disc playback (audio CDs, CD+G discs and `.cue` images) | [disc.md](disc.md) | ✅ |
 | Recording and encoding (WAV, FLAC, MP3 via LAME; device, stream or file sources) | [recording-encoding.md](recording-encoding.md) | ✅ WAV/FLAC/MP3; Opus, AAC and casting 🗓️ |

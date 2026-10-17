@@ -532,8 +532,10 @@ FA_API fa_result FA_CALL fa_disc_drive_get_info(uint32_t index, fa_disc_drive_in
 
 typedef enum fa_disc_flags {
     FA_DISC_NO_DEEMPHASIS = 1 << 0,  /* play pre-emphasized tracks as recorded */
-    FA_DISC_NO_C2         = 1 << 1   /* do not ask the drive for C2 error pointers
+    FA_DISC_NO_C2         = 1 << 1,  /* do not ask the drive for C2 error pointers
                                         (for drives that report them wrongly) */
+    FA_DISC_NO_CDG        = 1 << 2   /* do not read the subcode, so tracks get no CD+G
+                                        graphics (for drives that read it slowly) */
 } fa_disc_flags;
 
 typedef struct fa_disc_options {
@@ -643,6 +645,8 @@ FA_API fa_result FA_CALL fa_disc_get_speed(fa_disc* disc, float* out_speed);
  * stereo, seekable, codec "cdda", container "cd". If the disc is taken out while
  * it plays, the stream ends (its last read fails with FA_ERROR_NO_DISC).
  * Normalization uses the running estimate: a disc is not read twice for a scan.
+ * On CD+G discs the graphics are read with the audio and attached to the stream
+ * as they are found (see CD+G below; FA_DISC_NO_CDG turns this off).
  *
  * fa_stream_open_path also opens Windows' TrackNN.cda files (D:\Track01.cda)
  * as the track they stand for. */
@@ -1036,7 +1040,9 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
  *   - fa_stream_open_path / fa_stream_open_memory of a ZIP archive plays the audio
  *     file inside it and loads the .cdg next to it in the archive;
  *   - fa_stream_load_cdg_path / fa_stream_load_cdg_memory attach graphics to any
- *     other stream (web streams, FFmpeg hand-off, other file names).
+ *     other stream (web streams, FFmpeg hand-off, other file names);
+ *   - fa_stream_open_disc reads them from a CD+G disc's subcode while the track
+ *     plays (has_cdg turns 1 once they are found, usually within a second).
  * fa_stream_info.has_cdg is 1 when a stream has graphics.
  *
  * To show them, create a surface (fa_cdg_surface_create) and call

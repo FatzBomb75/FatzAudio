@@ -7,9 +7,9 @@ CD+G songs pair an audio track with a stream of graphics that draws the lyrics, 
 | MP3+G pairs (`song.mp3` + `song.cdg` in one folder), or any other audio format with a `.cdg` of the same name | Nothing: `fa_stream_open_path` loads the `.cdg` automatically (any case: `.cdg`, `.CDG`) |
 | A ZIP archive holding the audio and the `.cdg` | Nothing: `fa_stream_open_path` or `fa_stream_open_memory` of the `.zip` plays the audio inside and loads the graphics |
 | Anything else: another file name, a web stream, the FFmpeg hand-off, a `.cdg` your app already has in memory | `fa_stream_load_cdg_path` / `fa_stream_load_cdg_memory` on the opened stream |
-| Audio CDs with CD+G | Next step of [disc playback](disc.md) (🗓️) |
+| Audio CDs with CD+G (a drive, or a `.cue` image with a `.sub` file) | Nothing: `fa_stream_open_disc` reads the graphics from the disc's subcode while the track plays ([disc playback](disc.md#cdg-karaoke-discs)) |
 
-`fa_stream_info.has_cdg` is 1 when a stream has graphics.
+`fa_stream_info.has_cdg` is 1 when a stream has graphics. On a disc track it turns 1 once the graphics are found, usually in the first second of play, so create the surface anyway: a surface of a stream without graphics stays blank until they arrive.
 
 ## C
 
@@ -172,6 +172,5 @@ Every instruction of the CD+G "TV graphics" mode is implemented: memory preset (
 
 ## Not provided yet
 
-- CD+G from audio CDs (subchannel reading) is the next step of [disc playback](disc.md).
 - CD+EG extended graphics.
 - Ready-made helpers for specific renderers (a D3D11 texture updater, a CVPixelBuffer on Apple). The pixel buffer above covers them all today.

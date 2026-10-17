@@ -9,7 +9,9 @@ For apps that already read the file themselves, usually with FFmpeg because of t
 | Interleaved PCM | `fa_stream_push_pcm` (.NET `Push`) | Plays it |
 | A video renderer to keep in sync | `fa_stream_get_clock` (.NET `Clock`) | Reports the pts of the audio leaving the speaker right now, in your own timeline |
 
-FatzAudio never links or ships FFmpeg. Packet streams decode PCM, MP3, AC-3 and E-AC-3 (Dolby Digital and Dolby Digital Plus, see [Dolby Digital](dolby.md)) themselves and use the FFmpeg your app already loaded for everything else: AAC, Opus, Vorbis, FLAC, DTS, TrueHD, WMA and so on.
+FatzAudio never links or ships FFmpeg. Packet streams decode PCM, MP3, AC-3 and E-AC-3 (Dolby Digital and Dolby Digital Plus, see [Dolby Digital](dolby.md)), Opus and Vorbis themselves and use the FFmpeg your app already loaded for everything else: AAC, FLAC, DTS, TrueHD, WMA and so on.
+
+Raw Opus packets without a container (bassopus's `BASS_OPUS_StreamCreate`) need no FFmpeg either: give `codec = "opus"`, the rate (48000) and channels, and the 19-byte `OpusHead` as `extradata` when you have one (it carries the pre-skip and gain); without it, mono or stereo is assumed with no pre-skip.
 
 ## Packets straight from the demuxer (C)
 

@@ -9,6 +9,7 @@ const fa_decoder_vtable* const fa_decoder_registry[] = {
     &fa_decoder_mp3,
     &fa_decoder_mp4,
     &fa_decoder_mkv,
+    &fa_decoder_ogg,
     &fa_decoder_ac3,
     &fa_decoder_adts,
 };

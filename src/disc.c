@@ -24,6 +24,8 @@ struct fa_disc {
 
     int locked;
     int c2_ok;                      /* the drive returns C2 pointers (cleared when it refuses) */
+    int sub_ok;                     /* the drive returns subcode with audio (likewise) */
+    int c2_sub_ok;                  /* ... and both in one read (some drives do one or the other) */
     int last_state;                 /* FA_CD_* from the last test_ready, -1 = never asked */
     uint32_t change_count;
     fa_atomic32 generation;         /* bumped whenever the disc may have changed */
@@ -424,23 +426,52 @@ static fa_result reread_sector(fa_disc* d, int64_t lba, uint32_t areas, uint8_t*
     return d->ops->read_cd(d->h, lba, 1, areas, out);
 }
 
+/* After the drive refused a read with C2 pointers and/or subcode: the same read
+ * with less, to learn what it cannot do. Updates *c2 / *sub and the drive's flags
+ * on success. A drive that reads either one but not both keeps both: reads that
+ * want subcode then go without C2. */
+static fa_result read_with_less(fa_disc* d, int64_t at, uint32_t n, uint8_t* raw, int* c2, int* sub)
+{
+    if (*c2 && *sub) {
+        if (d->ops->read_cd(d->h, at, n, FA_CD_AREA_AUDIO | FA_CD_AREA_SUB, raw) == FA_OK) {
+            d->c2_sub_ok = 0;
+            *c2 = 0;
+            return FA_OK;
+        }
+        if (d->ops->read_cd(d->h, at, n, FA_CD_AREA_AUDIO | FA_CD_AREA_C2, raw) == FA_OK) {
+            d->sub_ok = 0;
+            *sub = 0;
+            return FA_OK;
+        }
+    }
+    if (d->ops->read_cd(d->h, at, n, FA_CD_AREA_AUDIO, raw) != FA_OK) return FA_ERROR_NOT_IMPLEMENTED;
+    if (*c2) d->c2_ok = 0;
+    if (*sub) d->sub_ok = 0;
+    *c2 = *sub = 0;
+    return FA_OK;
+}
+
 /* Reads `count` sectors from `lba` as 16-bit stereo samples into `out` (count *
- * 1176 values), using `raw` (DISC_CHUNK_SECTORS sectors with C2) as scratch.
+ * 1176 values), using `raw` (DISC_CHUNK_SECTORS full sectors) as scratch. With
+ * `sub_out`, the sectors' subcode too (count * 96 bytes; *out_sub = 1 when the
+ * drive delivered it).
  * Sectors outside [lo, hi), the audio around the track, read as silence. *out_bad
  * counts sectors that stayed damaged (played as read) or unreadable (silence).
  * The disc lock is held per drive command, not for the whole chunk, so status
  * polls and the tray never wait for a long run of retries. */
 static fa_result disc_read_audio(fa_disc* d, int32_t gen, int64_t lba, uint32_t count, int64_t lo, int64_t hi,
-                                 uint8_t* raw, int16_t* out, uint32_t* out_bad)
+                                 uint8_t* raw, int16_t* out, uint8_t* sub_out, int* out_sub, uint32_t* out_bad)
 {
     uint32_t done = 0;
+    int sub_all = sub_out != NULL;  /* subcode came with every read (outside the audio: zeros) */
     *out_bad = 0;
     memset(out, 0, (size_t)count * FA_CD_SECTOR_BYTES);
+    if (sub_out) memset(sub_out, 0, (size_t)count * FA_CD_SUB_BYTES);
 
     while (done < count) {
         int64_t at = lba + done;
-        uint32_t n = count - done, i, stride, areas;
-        int c2;
+        uint32_t n = count - done, i, stride, areas, sub_at;
+        int c2, sub;
         fa_result r;
         if (at < lo || at >= hi) { done++; continue; }   /* silence */
         if (at + n > hi) n = (uint32_t)(hi - at);
@@ -448,19 +479,18 @@ static fa_result disc_read_audio(fa_disc* d, int32_t gen, int64_t lba, uint32_t 
 
         fa_mutex_lock(&d->lock);
         if (fa_load32(&d->generation) != gen) { fa_mutex_unlock(&d->lock); return FA_ERROR_NO_DISC; }
-        c2 = d->c2_ok;
-        areas = FA_CD_AREA_AUDIO | (c2 ? FA_CD_AREA_C2 : 0);
-        r = d->ops->read_cd(d->h, at, n, areas, raw);
-        if (r == FA_ERROR_NOT_IMPLEMENTED && c2 && d->ops->read_cd(d->h, at, n, FA_CD_AREA_AUDIO, raw) == FA_OK) {
-            /* The drive refuses C2 pointers, not this read: go on without them. */
-            d->c2_ok = c2 = 0;
-            areas = FA_CD_AREA_AUDIO;
-            r = FA_OK;
-        }
+        sub = sub_out && d->sub_ok;
+        c2 = d->c2_ok && (!sub || d->c2_sub_ok);
+        r = d->ops->read_cd(d->h, at, n, FA_CD_AREA_AUDIO | (c2 ? FA_CD_AREA_C2 : 0) | (sub ? FA_CD_AREA_SUB : 0), raw);
+        /* The drive refuses C2 pointers or subcode, not this read: go on without. */
+        if (r == FA_ERROR_NOT_IMPLEMENTED && (c2 || sub) && read_with_less(d, at, n, raw, &c2, &sub) == FA_OK) r = FA_OK;
         if (r == FA_ERROR_NO_DISC) disc_forget(d);
         fa_mutex_unlock(&d->lock);
         if (r == FA_ERROR_NO_DISC) return r;
-        stride = FA_CD_SECTOR_BYTES + (c2 ? FA_CD_C2_BYTES : 0);
+        areas = FA_CD_AREA_AUDIO | (c2 ? FA_CD_AREA_C2 : 0) | (sub ? FA_CD_AREA_SUB : 0);
+        sub_at = FA_CD_SECTOR_BYTES + (c2 ? FA_CD_C2_BYTES : 0);
+        if (!sub) sub_all = 0;
+        stride = sub_at + (sub ? FA_CD_SUB_BYTES : 0);
 
         for (i = 0; i < n; i++) {
             uint8_t* sec = raw + (size_t)i * stride;
@@ -484,9 +514,10 @@ static fa_result disc_read_audio(fa_disc* d, int32_t gen, int64_t lba, uint32_t 
                 }
                 if (!ok) {
                     (*out_bad)++;
-                    if (!readable) memset(sec, 0, FA_CD_SECTOR_BYTES);
+                    if (!readable) memset(sec, 0, stride);
                 }
             }
+            if (sub) memcpy(sub_out + (size_t)(done + i) * FA_CD_SUB_BYTES, sec + sub_at, FA_CD_SUB_BYTES);
             {
                 int16_t* o = out + (size_t)(done + i) * (FA_CD_SECTOR_BYTES / 2);
                 int k;
@@ -495,6 +526,7 @@ static fa_result disc_read_audio(fa_disc* d, int32_t gen, int64_t lba, uint32_t 
         }
         done += n;
     }
+    if (out_sub) *out_sub = sub_all;
     return FA_OK;
 }
 
@@ -509,7 +541,9 @@ typedef struct disc_dec {
     fa_frames pos;                  /* next frame of the track */
     int64_t lo, hi;                 /* the readable audio around the track (sectors) */
     int16_t* cache;                 /* DISC_CHUNK_SECTORS sectors of samples */
-    uint8_t* raw;                   /* DISC_CHUNK_SECTORS raw sectors with C2 */
+    uint8_t* raw;                   /* DISC_CHUNK_SECTORS raw sectors with C2 and subcode */
+    uint8_t* sub;                   /* DISC_CHUNK_SECTORS sectors of subcode */
+    fa_disc_cdg* cdg;               /* CD+G from the subcode; NULL = not read */
     int64_t cache_lba;
     uint32_t cache_n;               /* sectors in the cache, 0 = empty */
     int deemph;
@@ -563,8 +597,12 @@ static fa_result disc_dec_read(fa_decoder* dec, float* out, fa_frames frames, fa
             fa_result r;
             x->cache_lba = floor_div(abs, FA_DISC_SECTOR_FRAMES);
             x->cache_n = 0;
-            r = disc_read_audio(x->disc, x->gen, x->cache_lba, DISC_CHUNK_SECTORS, x->lo, x->hi, x->raw, x->cache, &bad);
+            int got_sub = 0, want_sub = fa_disc_cdg_wanted(x->cdg);
+            r = disc_read_audio(x->disc, x->gen, x->cache_lba, DISC_CHUNK_SECTORS, x->lo, x->hi, x->raw, x->cache,
+                                want_sub ? x->sub : NULL, &got_sub, &bad);
             if (r != FA_OK) return *got > 0 ? FA_OK : r;
+            if (got_sub) fa_disc_cdg_feed(x->cdg, x->cache_lba, DISC_CHUNK_SECTORS, x->sub);
+            else if (want_sub) { fa_disc_cdg_free(x->cdg); x->cdg = NULL; }   /* the drive can't */
             x->cache_n = DISC_CHUNK_SECTORS;
             if (bad) post_read_error(x);
         }
@@ -607,6 +645,8 @@ static void disc_dec_close(fa_decoder* dec)
     disc_release(x->disc);
     free(x->cache);
     free(x->raw);
+    free(x->sub);
+    fa_disc_cdg_free(x->cdg);
     free(x);
     dec->impl = NULL;
 }
@@ -635,11 +675,12 @@ fa_result fa_disc_decoder_open(fa_decoder* dec, fa_source* src, fa_disc* d, int3
     x = (disc_dec*)calloc(1, sizeof(*x));
     if (x) {
         x->cache = (int16_t*)malloc((size_t)DISC_CHUNK_SECTORS * FA_CD_SECTOR_BYTES);
-        x->raw = (uint8_t*)malloc((size_t)DISC_CHUNK_SECTORS * (FA_CD_SECTOR_BYTES + FA_CD_C2_BYTES));
+        x->raw = (uint8_t*)malloc((size_t)DISC_CHUNK_SECTORS * (FA_CD_SECTOR_BYTES + FA_CD_C2_BYTES + FA_CD_SUB_BYTES));
+        x->sub = (uint8_t*)malloc((size_t)DISC_CHUNK_SECTORS * FA_CD_SUB_BYTES);
     }
-    if (!x || !x->cache || !x->raw) {
+    if (!x || !x->cache || !x->raw || !x->sub) {
         fa_mutex_unlock(&d->lock);
-        if (x) { free(x->cache); free(x->raw); free(x); }
+        if (x) { free(x->cache); free(x->raw); free(x->sub); free(x); }
         return FA_ERROR_OUT_OF_MEMORY;
     }
     {
@@ -657,6 +698,8 @@ fa_result fa_disc_decoder_open(fa_decoder* dec, fa_source* src, fa_disc* d, int3
     x->gen = fa_load32(&d->generation);
     x->offset = d->opts.read_offset;
     x->deemph = t->preemphasis && !(d->opts.flags & FA_DISC_NO_DEEMPHASIS);
+    if (stream && d->sub_ok && !(stream->flags & FA_OPEN_NO_CDG))
+        x->cdg = fa_disc_cdg_create(stream, t->start_sector, t->sectors);
     deemph_init(x, 44100.0);
     memset(dec, 0, sizeof(*dec));
     dec->vt = &disc_decoder;
@@ -772,6 +815,8 @@ fa_result fa_disc_open_ops(const fa_disc_ops* ops, void* h, const fa_disc_option
         d->opts.flags = options->flags;
     }
     d->c2_ok = !(d->opts.flags & FA_DISC_NO_C2);
+    d->sub_ok = !(d->opts.flags & FA_DISC_NO_CDG);
+    d->c2_sub_ok = 1;
     d->last_state = -1;
     d->bust = (uint8_t*)malloc(FA_CD_SECTOR_BYTES + FA_CD_C2_BYTES + FA_CD_SUB_BYTES);
     fa_store32(&d->refs, 1);

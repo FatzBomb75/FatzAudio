@@ -56,6 +56,8 @@ set(FA_SOURCES
     src/demux_mp4.c
     src/demux_adts.c
     src/demux_mkv.c
+    src/demux_ogg.c
+    src/codec_xiph.c
     src/stubs.c
     src/miniaudio_impl.c
     src/net_url.c
@@ -77,6 +79,7 @@ set(FA_SOURCES
     src/disc_mmc.c
     src/disc_image.c
     src/encode.h
+    src/disc_cdg.c
     src/tempo.h
     src/ac3.h
     src/mdct.h
@@ -95,7 +98,9 @@ else()
     list(APPEND FA_SOURCES src/net_https_curl.c src/disc_linux.c)
 endif()
 
+include(third_party/xiph.cmake)
 add_library(fatzaudio SHARED ${FA_SOURCES})
+target_link_libraries(fatzaudio PRIVATE fa_opus fa_vorbis)
 set_source_files_properties(src/stretch.cpp PROPERTIES
     INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/signalsmith)
 # One self-contained binary: no compiler runtime DLLs next to fatzaudio.dll (the

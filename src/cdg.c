@@ -15,6 +15,7 @@
  * packs, a fraction of a millisecond. Everything runs on the caller's thread under
  * the stream's cdg_lock; the audio thread never sees any of it. */
 #include "cdg.h"
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #if !defined(_WIN32)
@@ -70,6 +71,7 @@ struct fa_cdg_surface {
     cdg_state st;
     cdg_state* checkpoints;       /* [k] = state after (k + 1) * CDG_CHECKPOINT_PACKS packs */
     size_t checkpoint_count;
+    size_t stale_from;            /* packs from here were rewritten (SIZE_MAX = none), under cdg_lock */
 };
 
 /* ---- data --------------------------------------------------------------------- */
@@ -514,6 +516,50 @@ void fa_stream_cdg_attach(struct fa_stream* s, fa_cdg_data* data)
     fa_cdg_data_free(old);
 }
 
+fa_result fa_cdg_data_blank(size_t count, fa_cdg_data** out)
+{
+    uint8_t* bytes;
+    *out = NULL;
+    if (count == 0 || count > ((size_t)256 << 20) / FA_CDG_PACK_BYTES) return FA_ERROR_INVALID_ARG;
+    bytes = (uint8_t*)calloc(count, FA_CDG_PACK_BYTES);
+    if (!bytes) return FA_ERROR_OUT_OF_MEMORY;
+    return fa_cdg_data_adopt(bytes, count * FA_CDG_PACK_BYTES, out);
+}
+
+int fa_stream_cdg_attach_if_none(struct fa_stream* s, fa_cdg_data* data, uint32_t* out_token)
+{
+    int ok;
+    fa_mutex_lock(&s->cdg_lock);
+    ok = s->cdg == NULL;
+    if (ok) {
+        s->cdg = data;
+        *out_token = ++s->cdg_gen;
+    }
+    fa_mutex_unlock(&s->cdg_lock);
+    if (!ok) fa_cdg_data_free(data);
+    return ok;
+}
+
+int fa_stream_cdg_write(struct fa_stream* s, uint32_t token, size_t first, const uint8_t* packs, size_t n)
+{
+    fa_cdg_surface* f;
+    fa_cdg_data* data;
+    int ok;
+    fa_mutex_lock(&s->cdg_lock);
+    data = s->cdg;
+    ok = data && s->cdg_gen == token;   /* any load since bumps the generation */
+    if (ok && first < data->count && n > 0) {
+        if (n > data->count - first) n = data->count - first;
+        memcpy(data->packs + first * FA_CDG_PACK_BYTES, packs, n * FA_CDG_PACK_BYTES);
+        /* Normally the packs arrive well ahead of what is shown; after a seek they
+         * may land behind a surface, which goes back to replay them. */
+        for (f = s->cdg_surfaces; f; f = f->next)
+            if (f->st.next > first && first < f->stale_from) f->stale_from = first;
+    }
+    fa_mutex_unlock(&s->cdg_lock);
+    return ok;
+}
+
 void fa_stream_cdg_close(struct fa_stream* s)
 {
     fa_cdg_surface* f;
@@ -624,6 +670,7 @@ FA_API fa_result FA_CALL fa_cdg_surface_create(fa_stream* stream, const fa_cdg_s
     for (i = 0; i < f->width; i++) f->xmap[i] = (uint16_t)((uint64_t)i * f->win_w / f->width);
     for (i = 0; i < f->height; i++) f->ymap[i] = (uint16_t)((uint64_t)i * f->win_h / f->height);
     state_reset(&f->st);
+    f->stale_from = SIZE_MAX;
     fa_mutex_lock(&stream->cdg_lock);
     f->gen = stream->cdg_gen;
     f->next = stream->cdg_surfaces;
@@ -698,7 +745,14 @@ static fa_result surface_update(fa_cdg_surface* f, fa_time time, fa_cdg_frame* o
     if (offset > 0 && time < INT64_MIN + offset) time = INT64_MIN;
     else if (offset < 0 && time > INT64_MAX + offset) time = INT64_MAX;
     else time -= offset;
-    if (f->gen != s->cdg_gen) { state_reset(&f->st); drop_checkpoints(f); f->gen = s->cdg_gen; }
+    if (f->gen != s->cdg_gen) { state_reset(&f->st); drop_checkpoints(f); f->gen = s->cdg_gen; f->stale_from = SIZE_MAX; }
+    if (f->stale_from != SIZE_MAX) {
+        /* Packs from stale_from changed: only checkpoints before them still hold. */
+        size_t keep = f->stale_from / CDG_CHECKPOINT_PACKS;
+        if (keep < f->checkpoint_count) f->checkpoint_count = keep;
+        if (f->st.next > f->stale_from) rewind_to(f, f->stale_from);
+        f->stale_from = SIZE_MAX;
+    }
     target = s->cdg ? packs_at(time, s->cdg->count) : 0;
     if (target < f->st.next) rewind_to(f, target);
     while (f->st.next < target) {

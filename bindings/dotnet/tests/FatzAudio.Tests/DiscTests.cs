@@ -81,6 +81,41 @@ public sealed class DiscTests : IDisposable
     }
 
     [Fact]
+    public void Image_CdgFromSubcode()
+    {
+        // A 400-sector track whose .sub carries CD+G packs: the screen cleared to
+        // colour 1, which is loaded as red.
+        const int sectors = 400;
+        File.WriteAllBytes(Path.Combine(_dir, "karaoke.bin"), new byte[sectors * 2352]);
+        var sub = new byte[sectors * 96];
+        for (int i = 0; i < 16; i++)
+        {
+            int p = i * 24;
+            sub[p] = 0x09; sub[p + 1] = 1; sub[p + 4] = 1; sub[p + 5] = (byte)i;   // memory preset
+        }
+        sub[16 * 24] = 0x09; sub[16 * 24 + 1] = 30; sub[16 * 24 + 6] = 0x3C;      // colour 1 = red
+        File.WriteAllBytes(Path.Combine(_dir, "karaoke.sub"), sub);
+        var cue = Path.Combine(_dir, "karaoke.cue");
+        File.WriteAllText(cue, "FILE \"karaoke.bin\" BINARY\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n");
+
+        using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true });
+        using var disc = Disc.Open(cue);
+        using var track = engine.OpenDisc(disc, 1, DecodeOnly);
+        using var surface = track.CreateCdgSurface();     // fine before the graphics are found
+        var buf = new float[2 * 4096];
+        while (track.Read(buf) > 0) { }
+        Assert.True(track.HasCdg);
+        var frame = surface.UpdateAt(TimeSpan.FromSeconds(1));
+        int at = frame.Height / 2 * frame.Stride + frame.Width / 2 * 4;
+        Assert.Equal(new byte[] { 0, 0, 255 }, frame.Pixels.Slice(at, 3).ToArray());   // B, G, R
+
+        using var plain = Disc.Open(cue, new DiscOptions { ReadCdg = false });
+        using var noGraphics = engine.OpenDisc(plain, 1, DecodeOnly);
+        while (noGraphics.Read(buf) > 0) { }
+        Assert.False(noGraphics.HasCdg);
+    }
+
+    [Fact]
     public void Errors()
     {
         using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true });

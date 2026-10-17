@@ -226,6 +226,9 @@ typedef struct fa_net_meta {
  * newly reached ICY blocks on the frame timeline. Returns the frame of the
  * earliest title that starts after `heard` (its seq in *out_seq), or INT64_MAX. */
 int64_t fa_net_meta_update(fa_net* n, int64_t frame_at_cursor, int64_t lag_bytes, int64_t heard, int64_t* out_seq);
+/* A title change at source frame `frame` that the audio itself announces (the
+ * comments of a chained Ogg stream's next song). */
+void fa_net_meta_add_frame(fa_net* n, int64_t frame, const char* title);
 /* The decoder is open: its sample rate turns bytes per frame into a byte rate. */
 void fa_net_set_sample_rate(fa_net* n, uint32_t rate);
 /* The metadata in effect at source frame `heard` (seq 0 = none yet). */
