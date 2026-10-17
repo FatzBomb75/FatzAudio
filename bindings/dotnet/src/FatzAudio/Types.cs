@@ -84,8 +84,28 @@ public enum StreamState
     Paused = 2,
     /// <summary>Waiting for data (network or push streams).</summary>
     Buffering = 3,
-    /// <summary>Playback reached the end of the source.</summary>
+    /// <summary>Playback reached the end of the source (or its cue-out, or a crossfade faded it out).</summary>
     Ended = 4,
+    /// <summary>
+    /// Waiting to start: <see cref="AudioStream.PlayAt"/>, <see cref="AudioStream.CrossfadeTo"/> or a queue
+    /// (<see cref="AudioStream.QueueNext"/>). <see cref="AudioStream.Started"/> is raised when it starts.
+    /// </summary>
+    Scheduled = 5,
+}
+
+/// <summary>The markers of a stream (see <see cref="StreamMarkers"/>).</summary>
+public enum MarkerKind
+{
+    /// <summary>Where playback starts.</summary>
+    CueIn = 0,
+    /// <summary>Where playback ends.</summary>
+    CueOut = 1,
+    /// <summary>Where the fade-in is complete.</summary>
+    FadeInEnd = 2,
+    /// <summary>Where the fade-out begins.</summary>
+    FadeOutStart = 3,
+    /// <summary>Where the queued next stream starts.</summary>
+    MixPoint = 4,
 }
 
 /// <summary>Parameters that can be set or ramped on a stream.</summary>

@@ -137,6 +137,33 @@ void fa_ring_reset(fa_ring* r);
  * curve whether the value goes up (sin) or down (1 - cos). */
 float fa_curve_eval(int curve, const float bezier[4], float t, int rising);
 
+/* A complete shape: a built-in curve, bezier control points, or a point list. */
+typedef struct fa_shape {
+    int curve;
+    float bezier[4];
+    int npoints;
+    float points[FA_CURVE_MAX_POINTS];
+} fa_shape;
+
+/* The same, readable by the audio thread while an API thread writes it. A torn
+ * read is possible only while it is being changed, and gives a valid shape. */
+typedef struct fa_shape_atomic {
+    fa_atomic32 curve;
+    fa_atomic32 bezier[4];
+    fa_atomic32 npoints;
+    fa_atomic32 points[FA_CURVE_MAX_POINTS];
+} fa_shape_atomic;
+
+float fa_shape_eval(const fa_shape* sh, float t, int rising);
+/* The shape played backwards and upside down: 1 - shape(1 - t). A falling value with
+ * this shape is the mirror image of a rising one (crossfade pairs). */
+float fa_shape_eval_mirror(const fa_shape* sh, float t);
+/* Validates `r` (NULL = `fallback` curve) into `out`. FA_ERROR_INVALID_ARG if bad. */
+fa_result fa_shape_from_ramp(const fa_ramp* r, int fallback, fa_shape* out);
+void fa_shape_to_ramp(const fa_shape* sh, fa_ramp* out);  /* points left NULL */
+void fa_shape_store(fa_shape_atomic* a, const fa_shape* sh);
+void fa_shape_load(fa_shape_atomic* a, fa_shape* out);
+
 /* ---- Loudness (loudness.c) ------------------------------------------------ */
 
 #define FA_TP_PHASES 4
@@ -247,12 +274,14 @@ void fa_limiter_process(fa_limiter* l, float* frames, uint32_t count, float ceil
 
 #define FA_EVENT_QUEUE_SIZE 1024 /* power of two */
 /* Per stream. The API empties the queues and spill slots right after publishing a
- * parameter command and before play, so between two collections the mixer raises at
- * most, for each of the 2 parameters, one RAMP_DONE for the ramp the new command
- * replaces and one for the new command itself (2 x 2), plus two ENDED (one from before a play that it had
- * not posted yet, one after). The spill slots alone always hold that much, so no
- * event is ever dropped, even with the device queue full. */
-#define FA_EVENT_SPILL 6
+ * parameter command and before starting or scheduling playback, so between two
+ * collections the mixer raises at most, for each of the 3 lanes (volume, pan,
+ * crossfade), one RAMP_DONE for the ramp the new command replaces and one for the
+ * new command itself (3 x 2), plus two ENDED and two STARTED (one from before a
+ * start that it had not posted yet, one after). Only those three types spill;
+ * markers are best effort and dropped when the device queue is full. So the spill
+ * slots always hold everything that must arrive, even with the device queue full. */
+#define FA_EVENT_SPILL 10
 
 /* An event plus its engine-wide sequence number. Events from the audio thread and
  * from API threads travel different paths; the event thread sorts each round by
@@ -296,6 +325,9 @@ void fa_event_rescue_stream(fa_engine* e, struct fa_stream* s);
 
 #define FA_MAX_WORKERS 8
 #define FA_MIX_PARAMS 2          /* VOLUME and PAN are applied by the mixer */
+#define FA_LANE_FADE 2           /* stream lane: crossfade gain (fa_crossfade, queues) */
+#define FA_STREAM_LANES 3
+#define FA_START_QUEUED INT64_MAX /* start_frame of a queued stream: set by its predecessor */
 
 struct fa_engine {
     fa_engine_config config;
@@ -340,12 +372,20 @@ typedef struct fa_voice_list {
     struct fa_stream* items[1];
 } fa_voice_list;
 
+typedef struct fa_bus_list {
+    uint32_t count;
+    struct fa_bus* items[1];
+} fa_bus_list;
+
 struct fa_device {
     fa_engine* engine;
     ma_device device;
     uint32_t rate;
     fa_mutex lock;               /* serializes voice list edits (API threads only) */
     fa_atomic_ptr voices;        /* fa_voice_list*, read by the audio callback */
+    fa_atomic_ptr buses;         /* fa_bus_list*, read by the audio callback */
+    fa_atomic64 clock;           /* frames mixed so far (start of the next callback) */
+    fa_atomic32 period;          /* frames of the last callback */
     fa_atomic64 epoch;           /* odd while the audio callback runs */
     fa_event_queue events;       /* audio callback -> event thread */
     fa_atomic32 spilled;         /* 1 = some stream on this device used its spill slots */
@@ -354,27 +394,37 @@ struct fa_device {
     struct fa_device* next;      /* engine->devices */
 };
 
-/* One parameter change, published to the audio thread through a 2-slot mailbox.
+/* ---- Parameter lanes (lane.c) --------------------------------------------
+ * One automatable value (stream volume, pan, crossfade gain; bus volume, pan).
+ * API threads post commands (a set, or a ramp with a shape and an optional start
+ * frame) through a 2-slot mailbox; the audio thread takes the newest one at the
+ * start of a callback and runs it sample-accurately.
  * `word` holds the sequence number of the newest command plus FA_CMD_CLAIMED once
  * the audio thread took it; a single atomic exchange/CAS on it decides who reports
  * a replaced ramp, so every ramp gets exactly one RAMP_DONE. */
 #define FA_CMD_CLAIMED 0x40000000
 
+enum {
+    FA_LANE_MIRROR = 1,     /* falling crossfade side: shape 1 - s(1 - t) */
+    FA_LANE_END_STREAM = 2  /* the stream ends when this ramp is done (crossfade out) */
+};
+
 typedef struct fa_param_slot {
     fa_atomic32 target;          /* float bits */
     fa_atomic64 frames_ns;       /* duration in ns */
-    fa_atomic32 curve;
-    fa_atomic32 bezier[4];       /* float bits */
+    fa_shape_atomic shape;
     fa_atomic64 tag;
     fa_atomic32 notify;          /* 1 = ramp (raise RAMP_DONE), 0 = plain set */
     fa_atomic32 has_start;       /* 1 = jump to `start` first: the value of a set this */
     fa_atomic32 start;           /*     command replaced before the mixer applied it */
+    fa_atomic64 at;              /* device frame where the ramp starts, -1 = at once */
+    fa_atomic32 flags;           /* FA_LANE_* */
 } fa_param_slot;
 
 typedef struct fa_param_mailbox {
     fa_atomic32 word;
     fa_param_slot slot[2];
-    /* API side, under api_lock: what the newest command was. */
+    /* API side, under the owner's lock: what the newest command was. */
     int last_notify;
     int64_t last_tag;
     float last_target;
@@ -382,17 +432,55 @@ typedef struct fa_param_mailbox {
     float last_start;
 } fa_param_mailbox;
 
-/* Audio-thread state of one parameter. */
+/* Audio-thread state of one lane. */
 typedef struct fa_param_voice {
     float value;
     int active;
     float start, target;
     int64_t total, done;         /* frames */
-    int curve;
-    float bezier[4];
+    int64_t at;                  /* device frame the ramp starts at; -1 = started */
+    fa_shape shape;
+    int flags;
     int notify;
     int64_t tag;
 } fa_param_voice;
+
+typedef struct fa_lane {
+    fa_param_mailbox mb;
+    fa_param_voice v;            /* audio thread only */
+    fa_atomic32 current;         /* float bits, published by the audio thread */
+} fa_lane;
+
+void fa_lane_init(fa_lane* l, float value);
+/* Posts a command; the caller holds the owner's lock. Returns 1 (and the tag) when
+ * an earlier ramp the audio thread never started was replaced: its RAMP_DONE is
+ * then the caller's to raise. */
+int fa_lane_post(fa_lane* l, float target, int64_t duration_ns, const fa_shape* shape, int64_t tag,
+                 int notify, int64_t at, int flags, int64_t* out_replaced_tag);
+/* The value as the API sees it (a set not yet applied reads back at once). Caller holds the lock. */
+float fa_lane_get(fa_lane* l);
+/* Audio thread: takes the newest command. `audible` = the owner was heard in the
+ * previous callback and is heard now (otherwise plain sets apply without a glide).
+ * Returns 1 (and the tag) when a running ramp that raises RAMP_DONE was replaced. */
+int fa_lane_take(fa_lane* l, int audible, uint32_t rate, int64_t* out_replaced_tag);
+/* Audio thread: value after `done` frames of the active ramp. */
+float fa_lane_ramp_value(const fa_param_voice* v, int64_t done);
+/* Audio thread: starts a ramp directly (queue transitions decided on the audio thread). */
+void fa_lane_start_ramp(fa_lane* l, float from, float target, int64_t frames, int64_t at,
+                        const fa_shape* shape, int flags);
+
+/* Value of a lane at device frame `frame` within the current callback, for lanes that
+ * run on the device clock (buses). `clock` is the frame at the callback start.
+ * At the frame a zero-length ramp starts, `from_here` picks the value from there
+ * on (the target; a block starting there) over the value up to it (a block ending there). */
+float fa_lane_value_at_frame(const fa_param_voice* v, int64_t clock, int64_t frame, int from_here);
+/* Advances a device-clock lane to clock + frames; returns 1 when its ramp finished. */
+int fa_lane_advance(fa_param_voice* v, int64_t clock, int64_t frames);
+
+struct fa_bus {
+    fa_device* device;
+    fa_lane lanes[FA_MIX_PARAMS];  /* VOLUME, PAN on the device clock */
+};
 
 struct fa_stream {
     fa_engine* engine;
@@ -408,10 +496,12 @@ struct fa_stream {
 
     fa_atomic32 state;           /* fa_stream_state */
     fa_atomic64 position;        /* source frames, when not attached */
-    fa_frames markers[FA_MARKER_COUNT];
+    fa_atomic64 markers[FA_MARKER_COUNT];  /* read by the worker and the audio thread */
+    fa_shape_atomic fade_shape[2];         /* FA_FADE_IN, FA_FADE_OUT */
 
     /* Decode-ahead, valid while attached. Worker-owned under decode_lock. */
     fa_device* device;           /* written under api_lock */
+    fa_atomic_ptr bus;           /* fa_bus*, NULL = master; read by the audio thread */
     uint32_t dev_rate;
     fa_ring ring;
     ma_data_converter converter;
@@ -430,6 +520,10 @@ struct fa_stream {
     int draining;                /* the source ended; in_buf holds silence that flushes the resampler */
     float* out_buf;
     fa_frames out_cap;
+    float* mat_buf;              /* matrix output, 2 channels */
+    float* matrix;               /* in x FA_DEVICE_CHANNELS weights, NULL = default; under
+                                    api_lock + decode_lock */
+    fa_frames src_pos;           /* source frame of the next decoder read (worker) */
     fa_atomic32 eof;             /* the worker has written the last frame */
     fa_atomic32 flushing;        /* 1 = the audio thread must not touch the ring */
     fa_atomic64 seek_base;       /* source frame at the start of the ring's data */
@@ -437,11 +531,15 @@ struct fa_stream {
     fa_atomic32 underruns;
 
     /* Parameters */
-    fa_param_mailbox mailbox[FA_MIX_PARAMS];
-    fa_param_voice voice[FA_MIX_PARAMS]; /* audio thread only */
+    fa_lane lanes[FA_STREAM_LANES];      /* VOLUME, PAN, crossfade gain */
     uint32_t voice_rate;                 /* device rate the ramp counters are in */
     int was_audible;                     /* audio thread only: mixed in the previous callback */
-    fa_atomic32 current[FA_MIX_PARAMS];  /* float bits, published by the audio thread */
+
+    /* Scheduling and queues */
+    fa_atomic64 start_frame;     /* FA_STATE_SCHEDULED: device frame to start at */
+    fa_atomic_ptr queued;        /* the stream to start at the mix point (fa_stream_set_next) */
+    fa_atomic64 xfade_ns;        /* queue crossfade length */
+    fa_shape_atomic xfade_shape;
 
     /* Normalization */
     char* path;                  /* for scans of path streams; NULL otherwise */
@@ -469,12 +567,25 @@ struct fa_stream {
 };
 
 /* device.c */
+/* One audio callback: queue transitions, buses, every voice, the limiter, the clock.
+ * The backend's callback calls it; white-box tests call it to play the audio thread. */
+void fa_device_render(fa_device* device, float* out, uint32_t frames);
 void fa_device_wait_quiescent(fa_device* device);
 fa_result fa_device_add_voice(fa_device* device, struct fa_stream* stream);
 void fa_device_remove_voice(fa_device* device, struct fa_stream* stream);
 
 /* stream.c */
 void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames); /* audio thread */
+/* Audio thread, before any voice is mixed: starts queued streams whose
+ * predecessor reaches its mix point within this callback. */
+/* Starts the queued stream when `s` reaches its mix point within this callback.
+ * Returns 1 when it scheduled one (which may have a mix point in this callback too). */
+int fa_stream_check_queue(struct fa_stream* s, fa_device* dev, uint32_t frames);
+/* Validates (and clamps pan) a value for a stream or bus parameter. */
+fa_result fa_param_check(fa_param param, float* value);
+/* Bus gains (left, right) at frame offset `off` of the current callback, for a
+ * block starting there (from_here 1) or ending there (0). */
+void fa_bus_gains_at(struct fa_bus* b, fa_device* dev, int64_t off, int from_here, float* gl, float* gr);
 int fa_stream_needs_work(struct fa_stream* s);
 void fa_stream_fill(struct fa_stream* s, int64_t max_frames);  /* caller holds decode_lock */
 fa_frames fa_stream_position_now(struct fa_stream* s);
@@ -484,6 +595,11 @@ float fa_stream_norm_target_db(struct fa_stream* s);          /* any thread */
 void fa_stream_start_analysis(struct fa_stream* s);           /* idempotent */
 /* From a scan thread: the final loudness of `s` (album_lufs NAN if unknown). */
 void fa_stream_loudness_ready(struct fa_stream* s, const fa_loudness* l, double album_lufs);
+
+/* bus.c (audio thread) */
+void fa_buses_begin(fa_device* dev);                  /* takes new bus commands */
+void fa_buses_end(fa_device* dev, uint32_t frames);   /* advances bus ramps */
+void fa_buses_free_all(fa_device* dev);               /* fa_device_close, no callbacks running */
 
 /* engine.c */
 void fa_engine_wake_workers(fa_engine* engine);

@@ -62,6 +62,9 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_device_get_latency(DeviceHandle device, out long latency);
 
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_device_get_time(DeviceHandle device, out long time);
+
     // ---- Opening streams ---------------------------------------------------
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial void fa_open_options_init(FaOpenOptions* options);
@@ -102,7 +105,7 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_stream_play(StreamHandle stream);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
-    public static partial int fa_stream_play_at(StreamHandle stream, long engineTime);
+    public static partial int fa_stream_play_at(StreamHandle stream, long deviceTime);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_pause(StreamHandle stream);
@@ -123,9 +126,6 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_stream_get_clock(StreamHandle stream, out long pts);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
-    public static partial int fa_engine_get_time(EngineHandle engine, out long time);
-
-    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_read(StreamHandle stream, void* buffer, long frames, out long framesRead);
 
     // ---- Parameters and envelopes -----------------------------------------
@@ -136,7 +136,7 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_stream_get_param(StreamHandle stream, int param, out float value);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
-    public static partial int fa_stream_ramp_param(StreamHandle stream, int param, float target, long duration, long engineTime, FaRamp* ramp);
+    public static partial int fa_stream_ramp_param(StreamHandle stream, int param, float target, long duration, long deviceTime, FaRamp* ramp);
 
     // ---- Markers and crossfade --------------------------------------------
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
@@ -146,7 +146,35 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_stream_get_marker(StreamHandle stream, int marker, out long frame);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_fade_curve(StreamHandle stream, int fade, FaRamp* shape);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_crossfade(StreamHandle from, StreamHandle to, long duration, FaRamp* ramp);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_next(StreamHandle stream, nint next, long crossfade, FaRamp* shape);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_next(StreamHandle stream, out nint next);
+
+    // ---- Mix buses and the channel matrix -----------------------------------
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_bus_create(DeviceHandle device, out nint bus);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_bus_destroy(nint bus);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_bus_set_param(BusHandle bus, int param, float value);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_bus_get_param(BusHandle bus, int param, out float value);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_bus_ramp_param(BusHandle bus, int param, float target, long duration, long deviceTime, FaRamp* ramp);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_matrix(StreamHandle stream, float* weights, uint inChannels, uint outChannels);
 
     // ---- Normalization -----------------------------------------------------
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

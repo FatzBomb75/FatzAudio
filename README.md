@@ -6,12 +6,14 @@ The current backend uses [miniaudio](https://github.com/mackron/miniaudio) (vend
 `third_party/miniaudio`) for device I/O, and its embedded dr_wav/dr_flac/dr_mp3 behind
 FatzAudio's own decoder registry.
 
-Status: core engine (phase 1) and loudness normalization (phase 2) done. Decoding runs ahead on worker threads into lock-free ring
+Status: core engine (phase 1), loudness normalization (phase 2) and crossfades (phase 3) done. Decoding runs ahead on worker threads into lock-free ring
 buffers; the audio callback only mixes. Implemented: engine (with a silent null output for tests),
 device enumeration/open/start/stop/volume/latency, streams from files, memory and custom I/O
 with format detection from content (WAV/AIFF/RF64/W64, FLAC, MP3), attach/detach/move between
 devices keeping position, play/pause/stop/seek/position/clock/state, volume and pan with
-ramps on six curves, ended and ramp-done events, markers, decode-only reads, and EBU R128
+ramps on seven curves (including your own points), sample-accurate scheduled starts on the device clock,
+crossfades, queues with gapless playback, cue/fade/mix-point markers, mix buses, a per-stream channel
+matrix, ended/ramp-done/marker/started events, decode-only reads, and EBU R128
 loudness normalization on every stream (tags, content-keyed cache, parallel audio-only background
 scans, gain that glides to the exact value, true-peak output limiter). Functions not implemented yet return `FA_ERROR_NOT_IMPLEMENTED`; the
 [docs index](docs/README.md) tracks the status of each feature.

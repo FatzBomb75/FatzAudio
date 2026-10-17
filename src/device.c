@@ -83,19 +83,39 @@ static int limiter_on(fa_engine* e)
     return mode == FA_LIMITER_ON || (mode == FA_LIMITER_AUTO && fa_load32(&e->norm_mode) != FA_NORMALIZE_OFF);
 }
 
+void fa_device_render(fa_device* dev, float* out, uint32_t frames)
+{
+    fa_voice_list* list;
+    uint32_t i;
+    memset(out, 0, (size_t)frames * FA_DEVICE_CHANNELS * sizeof(float));
+    fa_buses_begin(dev);
+    list = (fa_voice_list*)fa_load_ptr(&dev->voices);
+    if (list) {
+        /* Queue transitions first, so a stream that starts this callback starts on
+         * its exact frame whatever its place in the list. */
+        uint32_t pass;
+        int changed = 1;
+        /* Repeated while transitions are found: a stream started by one may reach
+         * its own mix point in this callback (a chain of very short streams). */
+        for (pass = 0; changed && pass <= list->count; pass++) {
+            changed = 0;
+            for (i = 0; i < list->count; i++) changed |= fa_stream_check_queue(list->items[i], dev, frames);
+        }
+        for (i = 0; i < list->count; i++) fa_stream_mix(list->items[i], dev, out, frames);
+    }
+    fa_buses_end(dev, frames);
+    fa_limiter_process(&dev->limiter, out, frames,
+                       powf(10.0f, fa_load_float(&dev->engine->limiter_ceiling) / 20.0f), limiter_on(dev->engine));
+    fa_store32(&dev->period, (int32_t)frames);
+    fa_fetch_add64(&dev->clock, frames);
+}
+
 static void data_callback(ma_device* d, void* output, const void* input, ma_uint32 frames)
 {
     fa_device* dev = (fa_device*)d->pUserData;
-    fa_voice_list* list;
-    uint32_t i;
     (void)input;
     fa_fetch_add64(&dev->epoch, 1);
-    memset(output, 0, (size_t)frames * FA_DEVICE_CHANNELS * sizeof(float));
-    list = (fa_voice_list*)fa_load_ptr(&dev->voices);
-    if (list)
-        for (i = 0; i < list->count; i++) fa_stream_mix(list->items[i], dev, (float*)output, frames);
-    fa_limiter_process(&dev->limiter, (float*)output, frames,
-                       powf(10.0f, fa_load_float(&dev->engine->limiter_ceiling) / 20.0f), limiter_on(dev->engine));
+    fa_device_render(dev, (float*)output, frames);
     fa_fetch_add64(&dev->epoch, 1);
 }
 
@@ -228,6 +248,7 @@ FA_API void FA_CALL fa_device_close(fa_device* device)
     fa_event_rescue_device(device->engine, device);
     fa_mutex_unlock(&device->engine->list_lock);
     fa_limiter_free(&device->limiter);
+    fa_buses_free_all(device);
     free(fa_load_ptr(&device->voices));
     fa_mutex_destroy(&device->lock);
     free(device);
@@ -275,5 +296,12 @@ FA_API fa_result FA_CALL fa_device_get_latency(fa_device* device, fa_time* out_l
     *out_latency = (fa_time)((double)device->device.playback.internalPeriodSizeInFrames *
                              (double)device->device.playback.internalPeriods * 1e9 / (double)rate);
     if (device->rate) *out_latency += (fa_time)((double)device->limiter.delay * 1e9 / (double)device->rate);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_device_get_time(fa_device* device, fa_time* out_time)
+{
+    if (!device || !out_time) return FA_ERROR_INVALID_ARG;
+    *out_time = (fa_time)((double)fa_load64(&device->clock) * 1e9 / (double)device->rate + 0.5);
     return FA_OK;
 }

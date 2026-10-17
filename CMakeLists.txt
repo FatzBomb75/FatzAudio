@@ -25,6 +25,8 @@ set(FA_SOURCES
     src/fa_platform.c
     src/ring.c
     src/curve.c
+    src/lane.c
+    src/bus.c
     src/event.c
     src/loudness.c
     src/tags.c

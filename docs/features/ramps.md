@@ -18,6 +18,9 @@ Volume and pan are applied in the mixer, per sample, with no zipper noise. A pla
 | `FA_CURVE_EXP` | slow start, fast finish | natural-sounding fade-outs |
 | `FA_CURVE_SCURVE` | smooth start and end | musical transitions |
 | `FA_CURVE_BEZIER` | CSS `cubic-bezier(x1, y1, x2, y2)` | anything custom (x1, x2 in 0..1) |
+| `FA_CURVE_POINTS` | your own values at evenly spaced times, joined by straight lines | shapes drawn in an editor (2 to `FA_CURVE_MAX_POINTS` = 64 values, normally 0 first and 1 last) |
+
+A point curve is set with `ramp.points` and `ramp.point_count`; the array is copied, so it only has to live for the call. In .NET: `Curve.Points(0f, 0.05f, 0.1f, 1f)`.
 
 ## C
 
@@ -63,4 +66,8 @@ song.Ramp(AudioParameter.Pan, 1f, TimeSpan.FromSeconds(1), Curve.Bezier(0.25f, 0
 - **Exactly one `FA_EVENT_RAMP_DONE` per ramp**, with `value` = the ramp's `tag`. It fires when the ramp reaches its target, or when a newer ramp or `set_param` on the same parameter replaces it (the value then continues from where the old ramp was). `RampAsync` completes on that event, and disposing the stream cancels it.
 - `fa_stream_get_param` returns the value being applied now, mid-ramp values included. A value you just set reads back at once.
 - A ramp starts from the current value. If you set a value and then ramp before any audio was mixed, the ramp starts from the value you set.
-- `engine_time` must be 0 (start now) for now. Scheduled, sample-accurate starts come with the crossfade phase.
+- **Scheduled starts.** `device_time` (.NET `startAt`) starts the ramp exactly on that frame of the device clock (`fa_device_get_time` / `OutputDevice.Time`); 0 or null means now. Until then the value holds where it is. See [crossfade](crossfade.md#ramps-at-an-exact-time).
+  ```csharp
+  song.Ramp(AudioParameter.Volume, 0f, TimeSpan.FromSeconds(3), Curve.EqualPower, startAt: output.Time + TimeSpan.FromSeconds(10));
+  ```
+- Volume ramps are separate from crossfades and marker fades, which have gains of their own ([crossfade](crossfade.md#how-the-gains-combine)). Buses take the same ramps ([buses](buses.md)).

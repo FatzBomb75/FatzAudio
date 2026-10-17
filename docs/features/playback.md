@@ -43,17 +43,20 @@ using var s = engine.OpenFile("track.flac", new StreamOptions { BufferLength = T
 | Call | What happens |
 |---|---|
 | `fa_stream_attach` | Builds the conversion chain for the device and decodes the first 100 ms before returning, so `play` is instant |
-| `fa_stream_play` | Starts mixing. After the end (`FA_STATE_ENDED`) it restarts from the beginning |
-| `fa_stream_pause` | Takes effect before it returns: no more audio of the stream is mixed, so the position read right after is final. The buffer stays full, so resuming is instant |
-| `fa_stream_stop` | Like pause, then rewinds to the start |
-| `fa_stream_seek` | Drops the buffer and decodes the first 100 ms at the new position before returning |
+| `fa_stream_play` | Starts mixing. A stopped or ended stream starts at its cue-in marker (0 when unset); a paused one continues |
+| `fa_stream_play_at` | Like play, but the first frame is heard exactly at a time on the device clock. `FA_STATE_SCHEDULED` until then, then `FA_EVENT_STARTED` ([crossfade](crossfade.md#the-device-clock)) |
+| `fa_stream_pause` | Takes effect before it returns: no more audio of the stream is mixed, so the position read right after is final. The buffer stays full, so resuming is instant. Cancels a scheduled or queued start |
+| `fa_stream_stop` | Like pause, then rewinds to the cue-in (or 0) |
+| `fa_stream_seek` | Drops the buffer and decodes the first 100 ms at the new position before returning. Seeking a stopped stream leaves it paused there |
 | `fa_stream_detach` / moving to another device | The position continues from what was actually heard, not from what had been decoded ahead |
-| `FA_OPEN_LOOP` | The worker jumps back to the start without a gap; the position wraps |
+| `FA_OPEN_LOOP` | The worker jumps back to the cue-in (or the start) at the cue-out (or the end) without a gap; the position wraps |
+| Cue-out marker | The stream ends exactly there ([markers](crossfade.md#markers)) |
 
 ## Position and clock
 
 - `fa_stream_get_position`: source frames handed to the device. Frames decoded ahead into the buffer don't count.
 - `fa_stream_get_clock`: the position in nanoseconds minus the device latency, which is what's leaving the speaker now. Sync video and lyrics to this.
+- `fa_device_get_time` (.NET `OutputDevice.Time`): the device clock, the audio the device has mixed since it opened. Scheduled starts and ramps use it ([crossfade](crossfade.md#the-device-clock)).
 
 ```c
 fa_frames pos; fa_time clock;
