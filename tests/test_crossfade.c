@@ -157,6 +157,7 @@ typedef struct recorder {
     int markers[FA_MARKER_COUNT];
     fa_frames marker_frame[FA_MARKER_COUNT];
     int64_t last_value[32];
+    int ready;
 } recorder;
 
 static void FA_CALL record(const fa_event* ev, void* user)
@@ -184,8 +185,33 @@ static int count_events(recorder* r, fa_event_type type, int wait_for)
     return n;
 }
 
-static void rec_init(recorder* r) { memset(r, 0, sizeof(*r)); fa_mutex_init(&r->lock); }
-static void rec_free(recorder* r) { fa_mutex_destroy(&r->lock); }
+/* Waits until marker `which` was reported `wait_for` times; returns the count. */
+static int count_markers(recorder* r, fa_marker which, int wait_for)
+{
+    int n = 0, tries;
+    for (tries = 0; tries < 200; tries++) {
+        fa_mutex_lock(&r->lock);
+        n = r->markers[which];
+        fa_mutex_unlock(&r->lock);
+        if (n >= wait_for) break;
+        fa_sleep_ms(5);
+    }
+    return n;
+}
+
+/* Recorders are static and never torn down: a test that fails and returns early
+ * leaves its streams open, and their callbacks may still write to them. */
+static void rec_init(recorder* r)
+{
+    if (!r->ready) { fa_mutex_init(&r->lock); r->ready = 1; }
+    fa_mutex_lock(&r->lock);
+    memset(r->by_type, 0, sizeof(r->by_type));
+    memset(r->markers, 0, sizeof(r->markers));
+    memset(r->marker_frame, 0, sizeof(r->marker_frame));
+    memset(r->last_value, 0, sizeof(r->last_value));
+    fa_mutex_unlock(&r->lock);
+}
+static void rec_free(recorder* r) { (void)r; }
 
 /* ---- tests ------------------------------------------------------------------ */
 
@@ -203,7 +229,7 @@ static void test_device_clock(void)
 static void test_play_at_is_sample_accurate(void)
 {
     fa_stream* s = open_wav(20000, 0, 0, 1);
-    recorder rec;
+    static recorder rec;
     fa_stream_state st;
     fa_time now;
     int64_t start;
@@ -249,7 +275,7 @@ static void test_scheduled_ramp(void)
 static void test_cue_in_and_cue_out(void)
 {
     fa_stream* s = open_wav(20000, 1, 0, 1);
-    recorder rec;
+    static recorder rec;
     fa_stream_state st;
     fa_frames pos, i;
     rec_init(&rec);
@@ -344,7 +370,7 @@ static void test_crossfade_equal_power(void)
 {
     fa_stream* a = open_wav(48000, 0, 0, 1);
     fa_stream* b = open_wav(48000, 0, 0, 0);       /* fa_crossfade attaches it */
-    recorder ra, rb;
+    static recorder ra, rb;
     fa_stream_state st;
     fa_ramp eq;
     int64_t start = -1, len = 4000, i;
@@ -402,7 +428,7 @@ static void test_queue_is_gapless(void)
     fa_stream* a = open_wav(3000, 1, 0, 1);
     fa_stream* b = open_wav(20000, 1, 0, 0);
     fa_stream* got = NULL;
-    recorder rb;
+    static recorder rb;
     int64_t i;
     rec_init(&rb);
     CHECK(a != NULL && b != NULL);
@@ -572,7 +598,7 @@ static void test_queue_after_end_starts(void)
 {
     fa_stream* a = open_wav(1000, 0, 0, 1);
     fa_stream* b = open_wav(20000, 2, 0, 1);
-    recorder rb;
+    static recorder rb;
     fa_stream_state st;
     rec_init(&rb);
     CHECK(a != NULL && b != NULL);
@@ -596,7 +622,7 @@ static void test_crossfade_out_ends_early(void)
 {
     fa_stream* a = open_wav(3000, 0, 0, 1);
     fa_stream* b = open_wav(48000, 0, 0, 1);
-    recorder ra;
+    static recorder ra;
     fa_ramp r;
     rec_init(&ra);
     CHECK(a != NULL && b != NULL);
@@ -656,8 +682,9 @@ static void test_loop_markers_and_queue(void)
 {
     fa_stream* s = open_wav(20000, 0, FA_OPEN_LOOP, 1);
     fa_stream* n = open_wav(20000, 2, 0, 1);
-    recorder rec;
-    fa_stream_state st;
+    static recorder rec;
+    fa_stream_state st, nst;
+    int cue_outs;
     rec_init(&rec);
     CHECK(s != NULL && n != NULL);
     CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
@@ -670,15 +697,15 @@ static void test_loop_markers_and_queue(void)
     CHECK_NEAR(L(995), 0.5, 1e-6);           /* full level up to the loop end */
     CHECK_NEAR(L(999), 0.5, 1e-6);
     CHECK_NEAR(L(1000), 0.0, 1e-6);          /* the fade-in again */
-    CHECK(count_events(&rec, FA_EVENT_MARKER, 3) >= 3);
-    CHECK(rec.markers[FA_MARKER_CUE_OUT] >= 2);
-    CHECK_EQ(fa_stream_get_state(s, &st), FA_OK);
-    CHECK_EQ(st, FA_STATE_PLAYING);          /* no MIX_POINT: the loop goes on */
-    CHECK_EQ(fa_stream_get_state(n, &st), FA_OK);
-    CHECK_EQ(st, FA_STATE_SCHEDULED);
+    cue_outs = count_markers(&rec, FA_MARKER_CUE_OUT, 3);   /* wrapped at 1000, 2000 and 3000 */
+    fa_stream_get_state(s, &st);
+    fa_stream_get_state(n, &nst);
     fa_stream_close(s);
     fa_stream_close(n);
     rec_free(&rec);
+    CHECK_EQ(cue_outs, 3);
+    CHECK_EQ(st, FA_STATE_PLAYING);          /* no MIX_POINT: the loop goes on */
+    CHECK_EQ(nst, FA_STATE_SCHEDULED);
 }
 
 /* A zero-length ramp is a jump on its exact frame, for streams and buses. */
