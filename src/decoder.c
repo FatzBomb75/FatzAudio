@@ -128,10 +128,12 @@ fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint
             return FA_OK;
         }
         /* Definite answers: the data is this format, but the track is missing, the
-         * codec needs FFmpeg (or a MIDI file a soundfont) or the layout needs
-         * seeking. Another format's guess would only be worse. */
+         * codec needs FFmpeg (or a MIDI file a soundfont), the layout needs
+         * seeking or the content is protected. Another format's guess would only
+         * be worse. */
         if (r == FA_ERROR_OUT_OF_MEMORY || r == FA_ERROR_IO || r == FA_ERROR_NOT_FOUND ||
-            r == FA_ERROR_PROVIDER_MISSING || r == FA_ERROR_NOT_SEEKABLE || r == FA_ERROR_NO_SOUNDFONT)
+            r == FA_ERROR_PROVIDER_MISSING || r == FA_ERROR_NOT_SEEKABLE || r == FA_ERROR_NO_SOUNDFONT ||
+            r == FA_ERROR_PROTECTED_CONTENT)
             return r;
         last = r;
     }

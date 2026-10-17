@@ -164,8 +164,8 @@ static void test_opus_file(void)
     CHECK_EQ(n, 96000);
     CHECK_NEAR(freq(full, 9600, 86400, 2, 0, 48000), 1000.0, 2.0);
     CHECK_NEAR(rms(full, 9600, 86400, 2, 1), 0.3536, 0.03);
-    /* Opus converges within its 80 ms pre-roll, not to the bit. */
-    CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), 0.05, &worst));
+    /* Opus converges within its pre-roll, not always to the bit. */
+    CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), 1e-4, &worst));
     printf("  Opus seek vs sequential: max difference %.2g\n", worst);
     free(full);
     fa_stream_close(s);
@@ -190,6 +190,33 @@ static void test_vorbis_file(void)
     CHECK_NEAR(rms(full, 4410, 61740, 1, 0), 0.3536, 0.03);
     /* Vorbis decodes the same samples after a seek. */
     CHECK(seek_matches(s, full, n, 1, targets, (int)(sizeof(targets) / sizeof(targets[0])), 1e-6, &worst));
+    free(full);
+    fa_stream_close(s);
+}
+
+/* Short pages: a seek skips the packets well before the target without decoding
+ * them, on its first page and on the pages after it. */
+static void test_seek_skips_packets(void)
+{
+    static const int64_t vorbis_at[] = { 0, 4410, 4411, 9000, 22050, 44100, 70000, 88200, 100000, 128000, 3 };
+    static const int64_t opus_at[] = { 0, 4800, 4801, 9600, 20000, 48000, 72000, 96001, 120000, 139000, 11 };
+    fa_stream* s;
+    fa_stream_info info;
+    float* full;
+    int64_t n;
+    double worst;
+    CHECK_EQ(open_file("pages.ogg", -1, &s, &info), FA_OK);
+    full = read_all(s, 1, &n);
+    CHECK_EQ(n, 132300);
+    CHECK(seek_matches(s, full, n, 1, vorbis_at, (int)(sizeof(vorbis_at) / sizeof(vorbis_at[0])), 1e-6, &worst));
+    free(full);
+    fa_stream_close(s);
+    CHECK_EQ(open_file("pages.opus", -1, &s, &info), FA_OK);
+    full = read_all(s, 2, &n);
+    CHECK_EQ(n, 144000);
+    /* 300 ms of pre-roll: within about -80 dB of the straight decode. */
+    CHECK(seek_matches(s, full, n, 2, opus_at, (int)(sizeof(opus_at) / sizeof(opus_at[0])), 1e-4, &worst));
+    printf("  Opus seek with short pages vs sequential: max difference %.2g\n", worst);
     free(full);
     fa_stream_close(s);
 }
@@ -562,6 +589,7 @@ int main(void)
 
     RUN(test_opus_file);
     RUN(test_vorbis_file);
+    RUN(test_seek_skips_packets);
     RUN(test_surround_order);
     RUN(test_two_audio_streams);
     RUN(test_chained_file);

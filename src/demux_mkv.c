@@ -45,6 +45,7 @@
 #define ID_CONTENTENCODINGS 0x6D80u
 #define ID_CONTENTENCODING 0x6240u
 #define ID_CONTENTENCODINGTYPE 0x5033u
+#define ID_CONTENTENCRYPTION 0x5035u
 #define ID_CONTENTCOMPRESSION 0x5034u
 #define ID_CONTENTCOMPALGO 0x4254u
 #define ID_CONTENTCOMPSETTINGS 0x4255u
@@ -306,7 +307,7 @@ typedef struct mkv_entry {
     double rate, out_rate;
     uint64_t channels, bits;
     int64_t codec_delay, seek_preroll;
-    int bad_encoding;
+    int bad_encoding, encrypted;
     ebml_el strip;
     int has_strip;
 } mkv_entry;
@@ -342,7 +343,8 @@ static void parse_entry(const ebml_el* te, mkv_entry* t)
             break;
         }
         case ID_CONTENTENCODINGS: {
-            /* Only header stripping is understood; zlib, bzip2, LZO or encryption is not. */
+            /* Only header stripping is understood; zlib, bzip2 or LZO is not, and
+             * encrypted tracks are reported as protected content. */
             const uint8_t* c2 = e.p;
             ebml_el enc;
             while (mem_next(&c2, e.p + e.len, &enc)) {
@@ -350,7 +352,9 @@ static void parse_entry(const ebml_el* te, mkv_entry* t)
                 ebml_el f;
                 if (enc.id != ID_CONTENTENCODING) continue;
                 while (mem_next(&c3, enc.p + enc.len, &f)) {
-                    if (f.id == ID_CONTENTENCODINGTYPE && el_uint(&f) != 0) t->bad_encoding = 1;
+                    if (f.id == ID_CONTENTENCODINGTYPE && el_uint(&f) == 1) t->encrypted = 1;
+                    else if (f.id == ID_CONTENTENCODINGTYPE && el_uint(&f) != 0) t->bad_encoding = 1;
+                    else if (f.id == ID_CONTENTENCRYPTION) t->encrypted = 1;
                     else if (f.id == ID_CONTENTCOMPRESSION) {
                         const uint8_t* c4 = f.p;
                         ebml_el g;
@@ -522,6 +526,7 @@ static fa_result parse_tracks(mkv* m, const uint8_t* p, size_t len, int32_t want
     if (n == 0) return FA_ERROR_UNSUPPORTED_FORMAT;
     if (want < 0) { chosen = have_def ? def : first; have = 1; }
     if (!have) return FA_ERROR_NOT_FOUND;
+    if (chosen.encrypted) return FA_ERROR_PROTECTED_CONTENT;
     if (chosen.bad_encoding) return FA_ERROR_UNSUPPORTED_FORMAT;
     m->track_num = chosen.number;
     m->codec_delay = chosen.codec_delay;
