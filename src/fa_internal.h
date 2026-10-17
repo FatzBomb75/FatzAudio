@@ -136,6 +136,10 @@ uint64_t fa_drmp3_read(void* impl, float* out, uint64_t frames);
 fa_result fa_drmp3_restart(void* impl);
 void fa_drmp3_lag(void* impl, int64_t* out_bytes, int64_t* out_frames);
 void fa_drmp3_close(void* impl);
+/* One FLAC stream held in memory ("fLaC", STREAMINFO, a frame), decoded into `out`
+ * (room for max_frames at up to 8 channels). Frames decoded, -1 if it is not FLAC. */
+int64_t fa_drflac_decode_memory(const void* data, size_t size, float* out, uint64_t max_frames,
+                                uint32_t* out_channels, uint32_t* out_rate);
 
 /* Bytes the decoder has read from its source but not decoded yet, and frames it has
  * decoded but not returned yet (0 when it does not know). Places ICY titles exactly. */
@@ -871,7 +875,7 @@ void fa_buses_free_all(fa_device* dev);               /* fa_device_close, no cal
 
 /* ---- Packet codecs (codec.c, ffmpeg.c) ----------------------------------------
  * Decode one compressed packet at a time into interleaved F32. Built-in codecs
- * (PCM, MP3, AC-3, Opus, Vorbis) come first; FFmpeg, loaded at runtime, does the rest. */
+ * (PCM, MP3, AC-3, Opus, Vorbis, FLAC) come first; FFmpeg, loaded at runtime, does the rest. */
 
 typedef struct fa_codec fa_codec;
 
@@ -934,6 +938,12 @@ fa_result fa_ffmpeg_open_codec(fa_codec* c, const fa_codec_params* p);
 /* Sets a decoder option (AVOption, searched in the decoder's own options too) on
  * a codec fa_ffmpeg_open_codec opened. */
 void fa_ffmpeg_codec_option(fa_codec* c, const char* name, const char* value);
+
+/* codec_flac.c: the built-in FLAC codec (dr_flac), one frame per packet.
+ * FA_ERROR_UNSUPPORTED_FORMAT without STREAMINFO or usable parameters. */
+fa_result fa_flac_codec_open(fa_codec* c, const fa_codec_params* p);
+/* Rate, channels and bit depth from a 34-byte FLAC STREAMINFO. */
+void fa_flac_streaminfo_format(const uint8_t* si, uint32_t* rate, uint32_t* channels, uint32_t* bits);
 
 /* codec_xiph.c: the built-in Opus and Vorbis codecs (libopus, libvorbis).
  * FA_ERROR_UNSUPPORTED_FORMAT for headers they cannot set up alone. */

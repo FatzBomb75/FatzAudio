@@ -9,7 +9,7 @@
 | An HLS playlist (`.m3u8`), on demand or live | The best audio variant, MPEG-TS, fMP4 or plain audio segments, AES-128 encryption. On-demand HLS is seekable to the frame |
 | A `.pls` or `.m3u` playlist (what radio sites usually link to) | Its first entry is played |
 
-The format is detected from the content, as for files ([streams](streams.md#how-detection-works)): WAV, FLAC, MP3, Ogg Opus, Ogg Vorbis, AAC, AC-3 and E-AC-3, also inside HLS segments (MPEG-TS, fMP4 or packed audio). AAC, which most HLS and many radio stations use, decodes through the FFmpeg your app already has ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)); without it an AAC station returns `FA_ERROR_PROVIDER_MISSING`.
+The format is detected from the content, as for files ([streams](streams.md#how-detection-works)): WAV, FLAC, MP3, Ogg Opus, Ogg Vorbis, Ogg FLAC, AAC, AC-3 and E-AC-3, also inside HLS segments (MPEG-TS, fMP4 or packed audio). AAC, which most HLS and many radio stations use, decodes through the FFmpeg your app already has ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)); without it an AAC station returns `FA_ERROR_PROVIDER_MISSING`.
 
 ## C
 

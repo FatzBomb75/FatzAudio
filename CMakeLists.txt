@@ -60,6 +60,7 @@ set(FA_SOURCES
     src/demux_mkv.c
     src/demux_ogg.c
     src/codec_xiph.c
+    src/codec_flac.c
     src/stubs.c
     src/miniaudio_impl.c
     src/net_url.c
@@ -148,7 +149,9 @@ if(MSVC)
     set(FA_WARNINGS /W3)
 else()
     target_compile_options(fatzaudio PRIVATE -Wall -Wextra)
-    set_source_files_properties(src/miniaudio_impl.c PROPERTIES COMPILE_OPTIONS "-w")
+    # -fwrapv: dr_flac's predictors overflow int on damaged files; wrapping is what
+    # they expect, and it keeps that defined behaviour.
+    set_source_files_properties(src/miniaudio_impl.c PROPERTIES COMPILE_OPTIONS "-w;-fwrapv")
     set(FA_WARNINGS -Wall -Wextra)
 endif()
 

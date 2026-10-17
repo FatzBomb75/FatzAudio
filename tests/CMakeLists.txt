@@ -39,7 +39,7 @@ if(MSVC)
     set_source_files_properties(${PROJECT_SOURCE_DIR}/src/miniaudio_impl.c ${PROJECT_SOURCE_DIR}/src/tinysoundfont_impl.c
         PROPERTIES COMPILE_OPTIONS "/W0")
 else()
-    set_source_files_properties(${PROJECT_SOURCE_DIR}/src/miniaudio_impl.c PROPERTIES COMPILE_OPTIONS "-w")
+    set_source_files_properties(${PROJECT_SOURCE_DIR}/src/miniaudio_impl.c PROPERTIES COMPILE_OPTIONS "-w;-fwrapv")
 endif()
 if(APPLE)
     set_source_files_properties(${PROJECT_SOURCE_DIR}/src/net_https_apple.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -210,10 +210,21 @@ if(UNIX)
 endif()
 add_test(NAME ogg COMMAND fa_test_ogg)
 
+add_executable(fa_test_flac test_flac.c ${FA_SOURCES})
+target_include_directories(fa_test_flac PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+target_compile_definitions(fa_test_flac PRIVATE FA_STATIC FA_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_compile_options(fa_test_flac PRIVATE ${FA_WARNINGS})
+target_link_libraries(fa_test_flac PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
+if(UNIX)
+    target_link_libraries(fa_test_flac PRIVATE m)
+endif()
+add_test(NAME flac COMMAND fa_test_flac)
+
 # The white-box tests build the library's sources themselves; the vendored codecs
 # come prebuilt.
 foreach(t fa_test_internal fa_test_loudness fa_test_crossfade fa_test_handoff fa_test_demux
           fa_test_dolby fa_test_net fa_test_cdg fa_test_disc fa_test_tempo fa_test_ogg
-          fa_test_encode fa_test_midi)
+          fa_test_encode fa_test_midi fa_test_flac)
     target_link_libraries(${t} PRIVATE fa_opus fa_vorbis)
 endforeach()

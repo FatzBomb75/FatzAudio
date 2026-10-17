@@ -7,16 +7,16 @@ A stream is anything that produces audio. You open it from a file, a memory bloc
 | Format | Containers / variants | Codec name in `fa_stream_info` |
 |---|---|---|
 | WAV | RIFF, RIFX, RF64, Wave64, AIFF, AIFF-C (PCM, float, ADPCM, A-law, µ-law) | `pcm` (container `wav` or `aiff`) |
-| FLAC | Native FLAC, with or without a leading ID3v2 tag | `flac` |
+| FLAC | Native FLAC, with or without a leading ID3v2 tag. Ogg FLAC and FLAC tracks in MP4 and Matroska decode with the same built-in decoder | `flac` |
 | MP3 | MPEG-1, 2 and 2.5 Layer III, with or without ID3v2 tags | `mp3` |
 | AAC (ADTS) | `.aac` files, AAC internet radio and AAC in HLS segments: AAC-LC, HE-AAC and HE-AAC v2 in ADTS frames, with or without ID3v2 tags | `aac` (container `adts`) |
-| Ogg Opus, Ogg Vorbis | `.opus`, `.ogg`, `.oga`, including chained files (one song after another) and Ogg files with several streams ([Ogg](#ogg-opus-and-ogg-vorbis)) | `opus` or `vorbis` (container `ogg`) |
+| Ogg Opus, Ogg Vorbis, Ogg FLAC | `.opus`, `.ogg`, `.oga`, including chained files (one song after another) and Ogg files with several streams ([Ogg](#ogg-opus-and-ogg-vorbis)) | `opus`, `vorbis` or `flac` (container `ogg`) |
 | MP4, M4A, MOV | ISO MP4 and QuickTime, including fragmented MP4. Audio tracks only: video is never read | the track's codec: `aac`, `mp3`, `ac3`, `eac3`, `opus`, `flac`, `alac`, `pcm_*`, ... (container `mp4` or `mov`) |
 | Matroska, WebM | MKV, MKA, WebM, including live layouts (unknown sizes, no Cues). Audio tracks only | `aac`, `mp3`, `ac3`, `eac3`, `opus`, `vorbis`, `flac`, `pcm_*`, ... (container `matroska` or `webm`) |
 | Dolby Digital, Dolby Digital Plus | Raw `.ac3` and `.ec3` streams, up to 7.1 ([Dolby Digital](dolby.md)) | `ac3` or `eac3` (container `ac3` or `ec3`) |
 | MIDI | Standard MIDI Files (format 0, 1, 2), karaoke `.kar`, RIFF `.rmi`; played with a SoundFont 2 you load ([MIDI](midi.md)) | `midi` (container `smf` or `rmid`) |
 
-Inside MP4 and Matroska, PCM, MP3, AC-3, E-AC-3, Opus and Vorbis tracks decode built in; every other codec (AAC, FLAC, ALAC, DTS, TrueHD) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`. The same goes for `.aac` files and AAC streams.
+Inside MP4 and Matroska, PCM, MP3, AC-3, E-AC-3, Opus, Vorbis and FLAC tracks decode built in; every other codec (AAC, ALAC, DTS, TrueHD) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`. The same goes for `.aac` files and AAC streams.
 
 An `.aac` file on disk or in memory is indexed when it opens (a quick pass over the frame headers, without decoding), so its length and seeks are exact. Over the network, and from your own read callbacks when they can seek, the length and seek positions are estimated from the frame sizes at the start, as for MP3 without a seek table. Junk between frames, such as a radio stream joined in the middle of a frame or ID3 tags between HLS segments, is skipped.
 
@@ -178,7 +178,7 @@ In .NET, `stream.PlayOn(device)` attaches (or moves) and plays, and `stream.Deta
 
 ## Ogg Opus and Ogg Vorbis
 
-Opus and Vorbis decode with libopus and libvorbis, compiled into the library: no FFmpeg, no extra DLL. The same decoders play Opus and Vorbis tracks in WebM, Matroska and MP4, and raw Opus packets pushed by your app ([FFmpeg hand-off](ffmpeg.md)), which replaces bassopus's `BASS_OPUS_StreamCreate` + `BASS_StreamPutData`.
+Opus and Vorbis decode with libopus and libvorbis, compiled into the library: no FFmpeg, no extra DLL. Ogg FLAC (`.oga`) uses the same FLAC decoder as `.flac` files and gives exactly the same samples. The same decoders play Opus and Vorbis tracks in WebM, Matroska and MP4, and raw Opus packets pushed by your app ([FFmpeg hand-off](ffmpeg.md)), which replaces bassopus's `BASS_OPUS_StreamCreate` + `BASS_StreamPutData`.
 
 ```c
 fa_stream* s;
@@ -195,7 +195,8 @@ using var s = engine.OpenFile("song.opus");
 - **Chained files** (songs joined one after another, each with its own headers) play straight through. The first song sets the stream's rate and channels; later songs with a different format are converted. On a seekable local file the length and seeking cover every song (the file's page headers are read once at open). A chained file over HTTP plays through but can't seek.
 - **Several streams in one file** (for example Ogg with video, or two audio languages): `audio_track` picks among the audio streams that start the file, as for MP4 and Matroska.
 - **Web radio:** Ogg Opus and Ogg Vorbis stations work, and each song's title comes from its comment header ([web streams](web-streams.md#song-titles-icy-metadata)).
-- Not supported: Ogg FLAC and Speex (FLAC follows with the FLAC work), and Ogg streams that start without their headers.
+- **Ogg FLAC** gets everything above: exact length and seeking, chained files, `audio_track`, loudness tags and radio titles from its comment block.
+- Not supported: Ogg Speex, and Ogg streams that start without their headers.
 
 ## Video files and audio tracks
 

@@ -120,7 +120,9 @@ static const codec_info codecs[] = {
     { "opus", 1, 0, 1 },
     /* TrueHD decodes from a major sync, at least every 128 access units. */
     { "truehd", 130, 0, 0 }, { "mlp", 130, 0, 0 },
-    { "flac", 0, 0, 1 }, { "alac", 0, 0, 1 },
+    /* Lossless frames stand alone, but a container's rounded timestamp (Matroska's
+     * milliseconds) can put the frame holding the target one packet later. */
+    { "flac", 1, 0, 1 }, { "alac", 1, 0, 1 },
 };
 
 static const codec_info* find_codec(const char* name)
@@ -178,6 +180,25 @@ static int64_t mpa_samples(const uint8_t* d, size_t n, uint32_t* rate)
     return version == 3 ? 1152 : 576;              /* Layer III */
 }
 
+/* The block size in a FLAC frame header; -1 = not a frame. */
+static int64_t flac_samples(const uint8_t* d, size_t n)
+{
+    unsigned code, ones = 0;
+    size_t at;
+    if (n < 6 || d[0] != 0xFF || (d[1] & 0xFE) != 0xF8) return -1;
+    code = d[2] >> 4;
+    if (code == 0) return -1;
+    if (code == 1) return 192;
+    if (code <= 5) return 576 << (code - 2);
+    if (code >= 8) return 256 << (code - 8);
+    /* 6 and 7: the size follows the UTF-8 style coded frame or sample number. */
+    while (ones < 8 && (d[4] & (0x80u >> ones))) ones++;
+    if (ones == 1 || ones > 7) return -1;
+    at = 4 + (ones ? ones : 1);
+    if (code == 6) return at < n ? (int64_t)d[at] + 1 : -1;
+    return at + 1 < n ? (((int64_t)d[at] << 8) | d[at + 1]) + 1 : -1;
+}
+
 int64_t fa_demux_packet_samples(const char* codec, uint32_t channels, uint32_t rate,
                                 const uint8_t* d, size_t n, uint32_t* out_rate)
 {
@@ -194,6 +215,10 @@ int64_t fa_demux_packet_samples(const char* codec, uint32_t channels, uint32_t r
     if (strcmp(codec, "mp3") == 0 || strcmp(codec, "mp2") == 0 || strcmp(codec, "mp1") == 0)
         return mpa_samples(d, n, out_rate);
     if (strcmp(codec, "ac3") == 0 || strcmp(codec, "eac3") == 0) return fa_ac3_packet_samples(d, n, out_rate);
+    if (strcmp(codec, "flac") == 0 && rate > 0) {
+        *out_rate = rate;
+        return flac_samples(d, n);
+    }
     return -1;
 }
 
@@ -373,6 +398,8 @@ static fa_result fill(fa_track* t)
                 if (r != FA_OK) return r;
                 continue;
             }
+            /* The odd-sized packet was the last one: the grid holds. */
+            if (t->grid_state == 2) t->grid_state = 1;
             t->eof = 1;
             break;
         }
