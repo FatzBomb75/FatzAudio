@@ -12,7 +12,7 @@ FatzAudio plays audio CDs from the computer's optical drive, and disc images (`.
 | Play a track | `fa_stream_open_disc(engine, disc, track, options, &stream)` |
 | Windows `D:\Track01.cda` files | `fa_stream_open_path` opens them as their track |
 | Tray, eject lock, read speed | `fa_disc_eject`, `fa_disc_load`, `fa_disc_set_locked`, `fa_disc_set_speed` |
-| CD+G from the disc | Next step of this feature (🗓️); CD+G from files is ✅ ([CD+G](cdg.md)) |
+| CD+G karaoke graphics | Read with the audio; draw them with a CD+G surface ([below](#cdg-karaoke-discs)) |
 
 ## C
 
@@ -123,6 +123,33 @@ Audio is read about 0.4 s at a time on the stream's decode worker, never on the 
 
 Normalization uses its running estimate for disc tracks (a disc isn't read twice for a loudness scan). If your app stores loudness per disc (by MusicBrainz id), give it back with `fa_stream_set_loudness`.
 
+## CD+G karaoke discs
+
+On CD+G discs the lyrics graphics are stored in the subcode, beside the audio of each sector. FatzAudio reads it in the same drive command as the audio and hands the graphics to the stream, so a disc track draws exactly like an MP3+G file: create a surface and update it from your render loop ([CD+G](cdg.md)). Pausing, seeking, crossfades and tempo changes stay in sync.
+
+```c
+fa_stream* song;
+fa_stream_open_disc(engine, disc, 3, NULL, &song);
+fa_cdg_surface* cdg;
+fa_cdg_surface_create(song, NULL, &cdg);   /* blank until the graphics are found */
+fa_stream_attach(song, device, NULL);
+fa_stream_play(song);
+/* render loop: fa_cdg_surface_update(cdg, &frame); upload frame.pixels when frame.changed */
+```
+
+```csharp
+using var song = engine.OpenDisc(disc, 3);
+using var cdg = song.CreateCdgSurface();
+song.PlayOn(output);
+// render loop: var frame = cdg.Update(); if (frame.Changed) CopyToBitmap(frame);
+```
+
+- **When the graphics appear.** Whether a track carries graphics is only known once its subcode is read, so `has_cdg` (`HasCdg`) turns 1 within the first second or so of play (karaoke tracks start with a screen clear). Create the surface right away: it stays blank until then. A track without graphics never gets them, and FatzAudio stops reading its subcode after 90 seconds of finding nothing.
+- **Seeking.** The graphics are read as the audio is. After a seek forward, the part skipped over is read when it plays; until then the picture shows what was drawn before it (the next full-screen redraw of the song puts it right).
+- **Drives.** Drives deliver the subcode in different layouts (raw and interleaved, or already sorted); FatzAudio tells them apart from the packs' parity and handles all of them. A drive that cannot read subcode with audio plays the audio without graphics. `FA_DISC_NO_CDG` (`DiscOptions.ReadCdg = false`) skips the subcode, for a drive that reads it slowly.
+- **Disc images.** A `.sub` file beside an image file (`album.bin` + `album.sub`, 96 bytes per sector, as CD+G rippers write it) supplies the subcode, with the 96 bytes as read from a drive or with the channels one after another.
+- **Timing.** `fa_stream_set_cdg_offset` works as for files, for a drive whose subcode runs early or late against its audio.
+
 ## Disc images
 
 `fa_disc_open("album.cue", ...)` opens an image like a drive: same TOC, ids, CD-Text and streams. Supported cue sheets:
@@ -132,6 +159,7 @@ Normalization uses its running estimate for disc tracks (a disc isn't read twice
 - `INDEX 00` / `INDEX 01`, `PREGAP` (silence that is not in the file), `FLAGS PRE DCP 4CH`.
 - `TITLE`, `PERFORMER`, `SONGWRITER`, `COMPOSER`, `ARRANGER`, `MESSAGE` (album or track), `REM GENRE`: returned as CD-Text.
 - `CATALOG` and `ISRC`: returned as codes.
+- A `.sub` file next to a `FILE` (same name, `.sub`): its subcode, so CD+G images show their graphics.
 - `REM SESSION 02` before a track starts a second session (Enhanced CD images).
 
 Images have no tray, lock or speed: those calls return `FA_ERROR_NOT_IMPLEMENTED`.

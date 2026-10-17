@@ -121,6 +121,8 @@ public sealed class DiscOptions
     public bool DeEmphasis { get; set; } = true;
     /// <summary>Ask the drive for C2 error pointers to find damaged sectors. Turn off for drives that report them wrongly. Default true.</summary>
     public bool UseC2 { get; set; } = true;
+    /// <summary>Read the subcode with the audio, so CD+G discs show their graphics (<see cref="AudioStream.HasCdg"/>). Turn off for drives that read it slowly. Default true.</summary>
+    public bool ReadCdg { get; set; } = true;
 }
 
 /// <summary>
@@ -184,7 +186,7 @@ public sealed class Disc : IDisposable
         {
             o.ReadOffset = options.ReadOffset;
             o.Retries = (uint)Math.Clamp(options.Retries, 0, 100);
-            o.Flags = (options.DeEmphasis ? 0u : 1u) | (options.UseC2 ? 0u : 2u);
+            o.Flags = (options.DeEmphasis ? 0u : 1u) | (options.UseC2 ? 0u : 2u) | (options.ReadCdg ? 0u : 4u);
         }
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_disc_open(driveId, &o, out nint native));
         var h = new DiscHandle();

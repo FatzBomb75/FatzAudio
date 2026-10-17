@@ -73,6 +73,7 @@ set(FA_SOURCES
     src/disc.c
     src/disc_mmc.c
     src/disc_image.c
+    src/disc_cdg.c
     src/tempo.h
     src/ac3.h
     src/mdct.h
