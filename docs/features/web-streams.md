@@ -136,6 +136,7 @@ A URL that isn't an absolute http or https URL throws `ArgumentException`. Other
 | `FA_ERROR_NETWORK` | The server can't be reached, refused the connection, or timed out |
 | `FA_ERROR_NOT_FOUND` | The server answered with an error (404, 403, 500, ...) |
 | `FA_ERROR_UNSUPPORTED_FORMAT` | What came back isn't audio FatzAudio can decode (a web page, say) |
+| `FA_ERROR_PROTECTED_CONTENT` | The stream is DRM-protected: HLS with `SAMPLE-AES` or another DRM key method, or an encrypted file |
 | `FA_ERROR_PROVIDER_MISSING` | `https://` on a Linux system without libcurl, or codecs that need FFmpeg (AAC on Linux) without it |
 
 ## Buffering, stalls and reconnects
@@ -168,7 +169,7 @@ Ogg radio (Opus or Vorbis) has no ICY titles: every song starts a new Ogg link w
 
 - **Variant choice:** the highest bandwidth up to `hls_max_bandwidth`, audio-only variants first. A playlist with a separate audio rendition (`EXT-X-MEDIA TYPE=AUDIO`) plays that rendition, the default one first.
 - **Live:** starts three segments from the end, as players usually do, and reloads the playlist every half target duration.
-- **Segments:** MPEG-TS (the audio track is taken out of the transport stream), fMP4 with `EXT-X-MAP`, and packed audio (ID3 timestamps skipped). `EXT-X-BYTERANGE` and `EXT-X-KEY METHOD=AES-128` (keys fetched once and cached) are supported; SAMPLE-AES (DRM) isn't.
+- **Segments:** MPEG-TS (the audio track is taken out of the transport stream), fMP4 with `EXT-X-MAP`, and packed audio (ID3 timestamps skipped). `EXT-X-BYTERANGE` and `EXT-X-KEY METHOD=AES-128` (keys fetched once and cached) are supported; SAMPLE-AES (DRM) isn't and returns `FA_ERROR_PROTECTED_CONTENT`.
 - `fa_stream_get_info` reports container `hls` and the codec of the segments. On-demand playlists have an exact length from the `EXTINF` durations.
 
 ## With the rest of the engine

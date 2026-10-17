@@ -37,6 +37,8 @@ Apps that demux files themselves (for example with FFmpeg, for the video) can pu
 
 If nothing matches, the open returns `FA_ERROR_UNSUPPORTED_FORMAT`.
 
+Protected content returns `FA_ERROR_PROTECTED_CONTENT` instead, so the app can tell the user the file is copy-protected rather than broken. That covers DRM-protected WMA/ASF, MP4/M4A with Common Encryption (`enca`) or iTunes FairPlay (`drms`), Matroska/WebM tracks with ContentEncryption, and HLS with `SAMPLE-AES` or another DRM key method. FatzAudio never decrypts these: the licences live with the platform's DRM components.
+
 Karaoke files: a ZIP archive opened with `fa_stream_open_path` or `fa_stream_open_memory` plays the audio file inside it, and `fa_stream_open_path` on an audio file also loads a `.cdg` of the same name next to it (turn that off with `FA_OPEN_NO_CDG`). See [CD+G](cdg.md).
 
 ## C
@@ -226,7 +228,7 @@ Details:
 - **Several audio streams** (several languages, or multiple-bitrate files): `audio_track` picks one, counting audio streams in the order of the header; -1 is the first. Video streams are skipped without being read.
 - **Web streams**: an ASF file on a web server plays with `fa_stream_open_url`, seekable when the server takes byte ranges, straight through when it doesn't. MMS (`mms://`) and Windows Media Server's HTTP streaming protocol are not supported: the servers that spoke them are gone.
 - **ReplayGain**: `REPLAYGAIN_TRACK_GAIN`, `REPLAYGAIN_ALBUM_GAIN` and the peaks (and `R128_*`) in a WMA file's attributes are used for [normalization](normalization.md), like ID3v2 and FLAC tags.
-- **DRM**: protected files (a Content Encryption object in the header, or an encrypted stream, as with old store purchases and subscription downloads) return `FA_ERROR_UNSUPPORTED_FORMAT`. Only Windows' own DRM components hold the licences to decrypt them.
+- **DRM**: protected files (a Content Encryption object in the header, or an encrypted stream, as with old store purchases and subscription downloads) return `FA_ERROR_PROTECTED_CONTENT`. Only Windows' own DRM components hold the licences to decrypt them.
 - **Not supported**: WMA encoding, and scrambled audio ("audio spread" with a span above 1) has not been tested against real files.
 
 ```c

@@ -31,6 +31,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 |---|---|---|---|
 | BASS_GetVersion | `fa_version` | `AudioEngine.NativeVersion` | ✅ |
 | BASS_ErrorGetCode | Return value of every call; `fa_result_string` | `FatzAudioException.ErrorCode` | ✅ |
+| BASS_ERROR_WMA_LICENSE (protected WMA) | `FA_ERROR_PROTECTED_CONTENT`, also for encrypted MP4/MKV and SAMPLE-AES HLS | `ErrorCode.ProtectedContent` | ✅ |
 | BASS_Init | `fa_engine_create` + `fa_device_open` | `AudioEngine.Create()` + `engine.OpenOutput()` | ✅ |
 | BASS_Init with device 0 ("no sound") | `FA_ENGINE_NULL_OUTPUT` in `fa_engine_config.flags`: a silent output that still runs in real time ([devices](../features/devices.md#silent-output-for-tests-and-servers)) | `new AudioEngineOptions { NullOutput = true }` | ✅ |
 | BASS_Free | `fa_device_close` + `fa_engine_destroy` | `Dispose()` | ✅ |
@@ -311,7 +312,7 @@ WMA plays through the ordinary open calls: a built-in ASF demuxer, decoded by Wi
 | BASS_WMA_StreamCreateFile (file or memory) | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ (FFmpeg outside Windows) |
 | BASS_WMA_StreamCreateFileUser | `fa_stream_open_io` (forward-only when `seek` is NULL) | `engine.OpenStream` | ✅ |
 | BASS_StreamCreateURL / BASS_WMA_StreamCreateFile on an `http://` WMA/ASF file | `fa_stream_open_url` | `engine.OpenUrl` | ✅ |
-| BASS_WMA_StreamCreateFileAuth (DRM licence) | Protected files return `FA_ERROR_UNSUPPORTED_FORMAT` | — | ➖ (only Windows' DRM components can decrypt them) |
+| BASS_WMA_StreamCreateFileAuth (DRM licence) | Protected files return `FA_ERROR_PROTECTED_CONTENT` | `ErrorCode.ProtectedContent` | ➖ (only Windows' DRM components can decrypt them) |
 | `mms://` URLs, Windows Media Server HTTP streaming (WMSP), BASS_CONFIG_WMA_PREBUF, BASS_CONFIG_WMA_NETSEEK | Not supported | — | ➖ (the protocol and its servers are retired) |
 | `audio_track`-style stream choice in multi-stream / multiple-bitrate files | `fa_open_options.audio_track`, `fa_stream_info.audio_track_count` | `StreamOptions.AudioTrack`, `Info.AudioTrackCount` | ✅ |
 | BASS_TAG_WMA_CODEC (via BASS_ChannelGetTags) | `fa_stream_info.codec` (`wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`) | `Info.Codec` | ✅ |

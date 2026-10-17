@@ -464,7 +464,7 @@ static uint8_t* insert_header_object(const uint8_t* d, size_t n, const uint8_t g
     return p;
 }
 
-/* DRM-protected files are refused with FA_ERROR_UNSUPPORTED_FORMAT. */
+/* DRM-protected files are refused with FA_ERROR_PROTECTED_CONTENT. */
 static void test_drm_refused(void)
 {
     static const uint8_t content_encryption[16] = { 0xFB, 0xB3, 0x11, 0x22, 0x23, 0xBD, 0xD2, 0x11,
@@ -483,10 +483,10 @@ static void test_drm_refused(void)
     fa_stream_close(s);
     free(p);
     p = insert_header_object(d, size, content_encryption, 16, &m);
-    CHECK_EQ(open_memory(p, m, -1, &s), FA_ERROR_UNSUPPORTED_FORMAT);
+    CHECK_EQ(open_memory(p, m, -1, &s), FA_ERROR_PROTECTED_CONTENT);
     free(p);
     p = insert_header_object(d, size, ext_content_encryption, 4, &m);
-    CHECK_EQ(open_memory(p, m, -1, &s), FA_ERROR_UNSUPPORTED_FORMAT);
+    CHECK_EQ(open_memory(p, m, -1, &s), FA_ERROR_PROTECTED_CONTENT);
     free(p);
     /* The Encrypted Content flag of the stream (Stream Properties, flags bit 15). */
     p = (uint8_t*)malloc(size);
@@ -496,7 +496,7 @@ static void test_drm_refused(void)
             p[i + 24 + 48 + 1] |= 0x80;
             break;
         }
-    CHECK_EQ(open_memory(p, size, -1, &s), FA_ERROR_UNSUPPORTED_FORMAT);
+    CHECK_EQ(open_memory(p, size, -1, &s), FA_ERROR_PROTECTED_CONTENT);
     free(p);
     free(d);
 }
