@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <WarningsAsErrors>$(WarningsAsErrors);CS1591</WarningsAsErrors>
+    <RootNamespace>FatzAudio</RootNamespace>
+    <!-- Must differ from the native "fatzaudio" library: Windows file names are case-insensitive, so FatzAudio.dll would collide with fatzaudio.dll. -->
+    <AssemblyName>FatzAudio.Net</AssemblyName>
+
+    <PackageId>FatzAudio</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>FatzAudio contributors</Authors>
+    <Description>.NET binding for the FatzAudio native audio engine: playback, decoding, crossfades, markers and more behind an idiomatic API.</Description>
+    <PackageTags>audio;playback;decoder;crossfade;dj;karaoke</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryType>git</RepositoryType>
+
+    <!--
+      Directory that contains the freshly built native win-x64 library (fatzaudio.dll).
+      Override with -p:FatzAudioNativeDir=... . Defaults to the CMake Release output of this repository.
+      Native binaries for other platforms are packed from runtimes/<rid>/native/ inside this project folder.
+    -->
+    <FatzAudioNativeDir Condition="'$(FatzAudioNativeDir)' == ''">$(MSBuildThisFileDirectory)..\..\..\..\build\bin\Release</FatzAudioNativeDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+    <!-- Native libraries staged under runtimes/<rid>/native in this project folder -->
+    <None Include="runtimes\**\native\*" Pack="true" PackagePath="runtimes\" />
+    <!-- win-x64 library from the CMake build -->
+    <None Include="$(FatzAudioNativeDir)\fatzaudio.dll"
+          Condition="Exists('$(FatzAudioNativeDir)\fatzaudio.dll')"
+          Pack="true" PackagePath="runtimes\win-x64\native\"
+          Link="runtimes\win-x64\native\fatzaudio.dll"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Where the native library was built (see ../../README.md). -->
+    <FatzAudioNativeDir Condition="'$(FatzAudioNativeDir)' == ''">$(MSBuildThisFileDirectory)..\..\..\..\build\bin\Release</FatzAudioNativeDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\FatzAudio\FatzAudio.csproj" />
+    <!-- Native library next to the test assembly -->
+    <None Include="$(FatzAudioNativeDir)\fatzaudio.dll" Link="fatzaudio.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(FatzAudioNativeDir)\fatzaudio.dll')" />
+  </ItemGroup>
+
+</Project>
