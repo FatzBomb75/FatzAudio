@@ -507,6 +507,11 @@ FA_API fa_result FA_CALL fa_stream_play(fa_stream* stream)
     if (!is_attached(stream)) r = FA_ERROR_INVALID_ARG;
     else {
         if (fa_load32(&stream->state) == FA_STATE_ENDED) seek_locked(stream, 0);
+        /* Empty the event queues before playback can raise another ENDED, which keeps
+         * this stream's spill slots from overflowing (see FA_EVENT_SPILL). */
+        fa_mutex_lock(&stream->engine->list_lock);
+        fa_event_collect_locked(stream->engine);
+        fa_mutex_unlock(&stream->engine->list_lock);
         fa_store32(&stream->state, FA_STATE_PLAYING);
     }
     fa_mutex_unlock(&stream->api_lock);
@@ -617,7 +622,9 @@ static fa_result post_param(struct fa_stream* s, fa_param param, float target, f
     /* Publish. If the audio thread never claimed the previous command, it never
      * started, so its RAMP_DONE is ours to raise (the audio thread will not). Its
      * sequence number is taken before the new command becomes visible, so it is
-     * delivered before anything the new command raises. */
+     * delivered before anything the new command raises. The event queues are
+     * then emptied: that bounds what the mixer can raise for this stream before the
+     * next collection, so its spill slots never overflow (see FA_EVENT_SPILL). */
     {
         int32_t prev, done_seq;
         fa_mutex_lock(&s->engine->list_lock);
@@ -626,6 +633,7 @@ static fa_result post_param(struct fa_stream* s, fa_param param, float target, f
             prev = fa_load32(&m->word);
             if (fa_cas32(&m->word, prev, seq)) break;
         }
+        fa_event_collect_locked(s->engine);
         if (!(prev & FA_CMD_CLAIMED) && m->last_notify) {
             fa_event ev;
             ev.type = FA_EVENT_RAMP_DONE;

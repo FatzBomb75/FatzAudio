@@ -714,6 +714,101 @@ static void test_publishing_audio_event_holds_later_ones(void)
     rec_free(&rec);
 }
 
+/* Fills the device queue; the caller holds list_lock, so nothing collects it until
+ * it lets go. Returns how many fillers it added. */
+static int fill_queue(fa_stream* s)
+{
+    fa_qevent filler;
+    int n = 0;
+    memset(&filler, 0, sizeof(filler));
+    filler.ev.type = FA_EVENT_STALLED;
+    filler.ev.stream = s;
+    for (;;) {
+        filler.seq = fa_fetch_add32(&g_engine->event_seq, 1);
+        if (!fa_event_queue_push(&g_dev->events, &filler)) return n;
+        n++;
+    }
+}
+
+/* The workers decode under list_lock's condition variable, so wait for the audio
+ * before taking the lock to render it. */
+static void wait_decoded(fa_stream* s, int64_t frames)
+{
+    int i;
+    for (i = 0; i < 2000; i++) {
+        if (fa_ring_readable(&s->ring) >= frames || fa_load32(&s->eof)) return;
+        fa_sleep_ms(1);
+    }
+}
+
+static int spill_used(fa_stream* s)
+{
+    int i, n = 0;
+    for (i = 0; i < FA_EVENT_SPILL; i++) n += fa_load32(&s->spill_full[i]) != 0;
+    return n;
+}
+
+#define DONE_TAGS 64
+static int g_done_tags[DONE_TAGS];
+static fa_atomic32 g_done_count;
+static void FA_CALL record_ramp_tags(const fa_event* ev, void* user)
+{
+    if (ev->type == FA_EVENT_RAMP_DONE) {
+        int i = fa_fetch_add32(&g_done_count, 1);
+        if (i < DONE_TAGS) g_done_tags[i] = (int)ev->value;
+    }
+    record(ev, user);
+}
+
+/* The device queue stays full and nothing but the API collects: ramp after ramp
+ * (some replaced before they start) and an end still lose no event, the spill
+ * slots never overflow, and completions arrive in the order they happened. */
+static void test_full_queue_never_drops(void)
+{
+    fa_stream* s = open_attached(g_dev->rate / 10, 0, 0);
+    recorder rec;
+    fa_ramp r;
+    float out[2 * 1024];
+    int i, fillers = 0, worst = 0, used, ended;
+    rec_init(&rec);
+    fa_store32(&g_done_count, 0);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(s, record_ramp_tags, &rec), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    memset(&r, 0, sizeof(r));
+    for (i = 0; i < 40; i++) {
+        r.tag = i;
+        CHECK_EQ(fa_stream_ramp_param(s, i & 2 ? FA_PARAM_PAN : FA_PARAM_VOLUME, 0.5f, 0, 0, &r), FA_OK);
+        /* A set replacing a ramp the mixer has not started: its RAMP_DONE comes from
+         * here, after the earlier ramp's, which the mixer raised. */
+        if (i % 4 == 3) CHECK_EQ(fa_stream_set_param(s, FA_PARAM_PAN, 0.0f), FA_OK);
+        wait_decoded(s, 32);
+        fa_mutex_lock(&g_engine->list_lock);         /* checks wait until it is released */
+        fillers += fill_queue(s);
+        render(s, out, 16);
+        render(s, out, 16);
+        used = spill_used(s);
+        fa_mutex_unlock(&g_engine->list_lock);
+        if (used > worst) worst = used;
+    }
+    for (i = 0, ended = 0; i < 50 && !ended; i++) { /* runs out with the queue full */
+        wait_decoded(s, 1024);
+        fa_mutex_lock(&g_engine->list_lock);
+        fillers += fill_queue(s);
+        render(s, out, 1024);
+        ended = fa_load32(&s->state) == FA_STATE_ENDED;
+        fa_mutex_unlock(&g_engine->list_lock);
+    }
+    CHECK(worst <= FA_EVENT_SPILL);
+    CHECK(ended);
+    CHECK_EQ(count_events(&rec, FA_EVENT_RAMP_DONE, 40), 40);
+    CHECK_EQ(count_events(&rec, FA_EVENT_ENDED, 1), 1);
+    CHECK_EQ(count_events(&rec, FA_EVENT_STALLED, fillers), fillers);
+    for (i = 0; i < 40; i++) CHECK_EQ(g_done_tags[i], i);
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
 static void test_counters_wrap(void)
 {
     fa_stream* s = open_attached(g_dev->rate, 0, 0);
@@ -777,6 +872,7 @@ int main(void)
     RUN(test_slow_callback_loses_nothing);
     RUN(test_publishing_audio_event_holds_later_ones);
     RUN(test_counters_wrap);
+    RUN(test_full_queue_never_drops);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

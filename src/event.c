@@ -50,8 +50,8 @@ void fa_audio_post_event(struct fa_device* d, struct fa_stream* s, fa_event_type
             fa_store32(&d->spilled, 1);
             break;
         }
-        /* All full: the device queue (1024) and this stream's slots filled up
-         * between two collections, which run every few milliseconds. */
+        /* Not reached: FA_EVENT_SPILL covers everything one stream can raise
+         * between two collections. */
     }
     fa_fetch_add32(&d->publishing, -1);
 }
