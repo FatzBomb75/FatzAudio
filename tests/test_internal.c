@@ -610,6 +610,8 @@ static int64_t FA_CALL fwd_read(void* u, void* dst, size_t bytes)
     return (int64_t)k;
 }
 
+/* A forward-only stream can't seek back, so detaching keeps the audio it decoded
+ * ahead and plays it first after the next attach: nothing is skipped, twice over. */
 static void test_forward_only_detach_position(void)
 {
     size_t n;
@@ -619,20 +621,25 @@ static void test_forward_only_detach_position(void)
     fa_stream* s = NULL;
     fa_frames pos = 0;
     float out[2 * 256];
-    uint32_t i;
+    uint32_t i, heard = 0, round;
     io_state.p = wav; io_state.n = n;
     CHECK_EQ(fa_stream_open_io(g_engine, &io, &io_state, NULL, &s), FA_OK);
     CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
     CHECK_EQ(fa_stream_play(s), FA_OK);
+    for (round = 0; round < 3; round++) {
+        uint32_t frames = round == 1 ? 100 : 256;
+        render(s, out, frames);
+        for (i = 0; i < frames; i++) CHECK(out[i * 2] == expected(1, heard + i));
+        heard += frames;
+        fa_sleep_ms(30);                              /* decoded well past what was heard */
+        CHECK_EQ(fa_stream_detach(s), FA_OK);
+        CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+        CHECK_EQ(pos, heard);                         /* where it was heard up to */
+        CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+        CHECK_EQ(fa_stream_play(s), FA_OK);
+    }
     render(s, out, 256);
-    fa_sleep_ms(30);                                  /* decoded well past what was heard */
-    CHECK_EQ(fa_stream_detach(s), FA_OK);
-    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
-    CHECK(pos > 256);                                 /* can't go back: it says where it really is */
-    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
-    CHECK_EQ(fa_stream_play(s), FA_OK);
-    render(s, out, 256);
-    for (i = 0; i < 256; i++) CHECK(out[i * 2] == expected(1, (uint32_t)pos + i));
+    for (i = 0; i < 256; i++) CHECK(out[i * 2] == expected(1, heard + i));
     fa_stream_close(s);
     free(wav);
 }
