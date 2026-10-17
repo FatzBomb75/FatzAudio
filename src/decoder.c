@@ -10,6 +10,7 @@ const fa_decoder_vtable* const fa_decoder_registry[] = {
     &fa_decoder_mp4,
     &fa_decoder_mkv,
     &fa_decoder_ac3,
+    &fa_decoder_adts,
 };
 const uint32_t fa_decoder_registry_count = (uint32_t)(sizeof(fa_decoder_registry) / sizeof(fa_decoder_registry[0]));
 
@@ -127,6 +128,13 @@ fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint
     }
     memset(dec, 0, sizeof(*dec));
     return last == FA_OK ? FA_ERROR_UNSUPPORTED_FORMAT : last;
+}
+
+void fa_decoder_lag(fa_decoder* dec, int64_t* out_bytes, int64_t* out_frames)
+{
+    *out_bytes = 0;
+    *out_frames = 0;
+    if (dec->vt && dec->vt->lag && dec->impl) dec->vt->lag(dec, out_bytes, out_frames);
 }
 
 fa_result fa_decoder_read(fa_decoder* dec, float* out, fa_frames frames, fa_frames* got)

@@ -73,6 +73,8 @@ typedef struct fa_decoder_vtable {
      * search), so the loudness scanner can split files into chunks. 0 if a seek
      * decodes from the start (MP3 without a seek table): scanned in one pass. */
     int fast_seek;
+    /* Optional (NULL = 0, 0): see fa_decoder_lag. */
+    void (*lag)(fa_decoder* dec, int64_t* out_bytes, int64_t* out_frames);
 } fa_decoder_vtable;
 
 struct fa_decoder {
@@ -141,6 +143,8 @@ extern const fa_decoder_vtable fa_decoder_mp4;
 extern const fa_decoder_vtable fa_decoder_mkv;
 /* Raw AC-3 / E-AC-3 streams (dec_ac3.c). */
 extern const fa_decoder_vtable fa_decoder_ac3;
+/* AAC in ADTS frames (demux_adts.c). */
+extern const fa_decoder_vtable fa_decoder_adts;
 
 /* Probing helpers (probe.c). */
 size_t fa_probe_id3v2_size(const uint8_t* data, size_t size);

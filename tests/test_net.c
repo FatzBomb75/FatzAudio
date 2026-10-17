@@ -52,6 +52,10 @@ static uint8_t* g_mp3;          /* tests/data/net/tone_cbr.mp3 */
 static size_t g_mp3_n;
 static uint8_t* g_mp3x;         /* tests/data/net/tone_xing.mp3 (Xing header, ID3 tag) */
 static size_t g_mp3x_n;
+static uint8_t* g_aac;          /* tests/data/net/tone.aac (ADTS, 131 frames at 44.1 kHz) */
+static size_t g_aac_n;
+static uint8_t* g_aac_tagged;   /* g_aac after a 30 KB ID3v2 tag (cover art) */
+static size_t g_aac_tagged_n;
 static uint8_t* g_wav;          /* 2 s of 16-bit stereo at 44100 Hz, generated */
 static size_t g_wav_n;
 #define WAV_FRAMES 88200
@@ -218,6 +222,34 @@ static void make_hls(void)
     (void)pos;
 }
 
+static size_t adts_frame_size(const uint8_t* h)
+{
+    if (h[0] != 0xFF || (h[1] & 0xF6) != 0xF0) return 0;
+    return ((size_t)(h[3] & 3) << 11) | ((size_t)h[4] << 3) | (h[5] >> 5);
+}
+
+/* HLS with AAC: g_aac cut at frame boundaries into HLS_SEGS TS segments. */
+static tsbuf g_aseg[HLS_SEGS];
+static double g_aseg_dur[HLS_SEGS];
+
+static void make_hls_aac(void)
+{
+    size_t p = 0, start = 0;
+    int f = 0, s = 0, per = 131 / HLS_SEGS + 1;
+    while (s < HLS_SEGS) {
+        size_t fs = p + 7 <= g_aac_n ? adts_frame_size(g_aac + p) : 0;
+        if (fs) { p += fs; f++; }
+        if (!fs || f == per * (s + 1)) {
+            g_aseg_dur[s] = (double)(f - per * s) * 1024.0 / 44100.0;
+            memset(&g_aseg[s], 0, sizeof(g_aseg[s]));
+            ts_mux_as(&g_aseg[s], g_aac + start, p - start, 0x0F, 0xC0);
+            start = p;
+            s++;
+            if (!fs) break;
+        }
+    }
+}
+
 /* HLS with AC-3 (stream type 0x81, private stream 1): tone.ac3 in two segments. */
 static uint8_t* g_ac3;
 static size_t g_ac3_n;
@@ -307,19 +339,19 @@ static void serve_chunked(sock_t s, const uint8_t* body, size_t n)
  * RADIO_METAINT audio bytes, and the second song from audio byte RADIO_SONG2. */
 #define RADIO_METAINT 8192
 #define RADIO_SONG2 32768
-static void serve_radio(sock_t s, const char* req)
+static void serve_radio(sock_t s, const char* req, const uint8_t* body, size_t n, const char* type, int kbps)
 {
     int icy = strstr(req, "\r\nIcy-MetaData: 1") != NULL;
     size_t audio = 0, at = 0;
     char head[512];
-    snprintf(head, sizeof(head), "ICY 200 OK\r\nContent-Type: audio/mpeg\r\nicy-name: Test FM\r\nicy-genre: Testing\r\n"
-             "icy-br: 128\r\n%s\r\n", icy ? "icy-metaint: 8192\r\n" : "");
+    snprintf(head, sizeof(head), "ICY 200 OK\r\nContent-Type: %s\r\nicy-name: Test FM\r\nicy-genre: Testing\r\n"
+             "icy-br: %d\r\n%s\r\n", type, kbps, icy ? "icy-metaint: 8192\r\n" : "");
     if (send_str(s, head)) return;
     while (!fa_load32(&g_stop)) {
         size_t k = RADIO_METAINT - audio % RADIO_METAINT;
-        if (k > g_mp3_n - at) k = g_mp3_n - at;
-        if (send_all(s, g_mp3 + at, k)) return;
-        at = (at + k) % g_mp3_n;
+        if (k > n - at) k = n - at;
+        if (send_all(s, body + at, k)) return;
+        at = (at + k) % n;
         audio += k;
         if (icy && audio % RADIO_METAINT == 0) {
             uint8_t block[1 + 16 * 16];
@@ -391,6 +423,19 @@ static void serve_hls(sock_t s, const char* req, const char* path)
     if (strcmp(path, "/hls/master.m3u8") == 0) {
         snprintf(text, sizeof(text), "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=900000,CODECS=\"avc1.4d401f,mp4a.40.2\"\n"
                  "video.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=130000,CODECS=\"mp4a.40.34\"\naudio.m3u8\n");
+    } else if (strcmp(path, "/hls/aac.m3u8") == 0) {
+        int n = snprintf(text, sizeof(text), "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n");
+        for (i = 0; i < HLS_SEGS; i++) n += snprintf(text + n, sizeof(text) - (size_t)n, "#EXTINF:%.5f,\naac%d.ts\n", g_aseg_dur[i], i);
+        snprintf(text + n, sizeof(text) - (size_t)n, "#EXT-X-ENDLIST\n");
+    } else if (strncmp(path, "/hls/aac", 8) == 0 && strstr(path, ".ts")) {
+        i = atoi(path + 8);
+        if (i >= 0 && i < HLS_SEGS) {
+            snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", g_aseg[i].n);
+            if (!send_str(s, head)) send_all(s, g_aseg[i].p, g_aseg[i].n);
+            return;
+        }
+        send_str(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
     } else if (strcmp(path, "/hls/audio.m3u8") == 0) {
         int n = snprintf(text, sizeof(text), "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n");
         for (i = 0; i < HLS_SEGS; i++) n += snprintf(text + n, sizeof(text) - (size_t)n, "#EXTINF:%.5f,\nseg%d.ts\n", g_seg_dur[i], i);
@@ -474,7 +519,10 @@ static void handle_request(sock_t s)
         snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: audio/x-scpls\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(body));
         if (!send_str(s, head)) send_str(s, body);
     }
-    else if (strcmp(path, "/radio") == 0) serve_radio(s, req);
+    else if (strcmp(path, "/radio") == 0) serve_radio(s, req, g_mp3, g_mp3_n, "audio/mpeg", 128);
+    else if (strcmp(path, "/radio.aac") == 0) serve_radio(s, req, g_aac, g_aac_n, "audio/aacp", 64);
+    else if (strcmp(path, "/tone.aac") == 0) serve_bytes(s, req, g_aac, g_aac_n, "audio/aac", 1, 0);
+    else if (strcmp(path, "/tagged.aac") == 0) serve_bytes(s, req, g_aac_tagged, g_aac_tagged_n, "audio/aac", 1, 0);
     else if (strncmp(path, "/hls/", 5) == 0) serve_hls(s, req, path);
     else send_str(s, "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found");
 }
@@ -1063,6 +1111,158 @@ static void test_icy_radio_decode_only(void)
     fa_mutex_destroy(&log.lock);
 }
 
+/* ---- AAC (ADTS) ------------------------------------------------------------------- */
+
+#define AAC_FRAMES (131 * 1024)
+
+/* An .aac file on a web server: length and seeks estimated from the frame sizes,
+ * every frame decoded. */
+static void test_aac_over_http(void)
+{
+    fa_result r;
+    fa_stream* s = open_url("/tone.aac", FA_OPEN_DECODE_ONLY, &r);
+    fa_stream_info info;
+    fa_frames n = 0, ref_n = 0, pos = 0, rd = 0;
+    float *got, *ref, buf[2048 * 2];
+    double err = 0;
+    int i;
+    if (r == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); return; }
+    CHECK_EQ(r, FA_OK);
+    if (!s) return;
+    fa_stream_get_info(s, &info);
+    CHECK_STR(info.container, "adts");
+    CHECK_STR(info.codec, "aac");
+    CHECK_EQ(info.format.sample_rate, 44100);
+    CHECK(info.seekable);
+    printf("  estimated length %lld frames (exact %d)\n", (long long)info.length_frames, AAC_FRAMES);
+    CHECK(llabs((long long)info.length_frames - AAC_FRAMES) < AAC_FRAMES / 10);
+    got = read_all(s, &n);
+    ref = read_all_memory(g_aac, g_aac_n, &ref_n);
+    CHECK_EQ(n, AAC_FRAMES);
+    CHECK_EQ(ref_n, AAC_FRAMES);
+    for (i = 0; i < AAC_FRAMES * 2 && i < n * 2; i++) err += fabs(got[i] - ref[i]);
+    CHECK(err < 1e-3);
+    /* A seek by estimated byte position: lands on a frame boundary near the target. */
+    CHECK_EQ(fa_stream_seek(s, 88200), FA_OK);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_EQ(pos, 88200);
+    CHECK_EQ(fa_stream_read(s, buf, 2048, &rd), FA_OK);
+    CHECK_EQ(rd, 2048);
+    {
+        /* The audio is the tone, from somewhere within a few frames of the target. */
+        double best = 1e9;
+        fa_frames at;
+        for (at = 88200 - 8192; at <= 88200 + 8192; at++) {
+            double e = 0;
+            for (i = 0; i < 1024 * 2 && e < best; i++) e += fabs(buf[2048 + i] - ref[(size_t)(at + 1024) * 2 + i]);
+            if (e < best) best = e;
+        }
+        printf("  after seek: summed difference %g\n", best);
+        CHECK(best < 0.05);
+    }
+    /* Into the last frames: the last one has no header after it. */
+    CHECK_EQ(fa_stream_seek(s, AAC_FRAMES - 1500), FA_OK);
+    rd = 0;
+    CHECK_EQ(fa_stream_read(s, buf, 2048, &rd), FA_OK);
+    CHECK(rd > 0);
+    free(got);
+    free(ref);
+    fa_stream_close(s);
+
+    /* Cover art in front: the frames after it still give the length and seeks. */
+    s = open_url("/tagged.aac", FA_OPEN_DECODE_ONLY, &r);
+    CHECK_EQ(r, FA_OK);
+    if (!s) return;
+    fa_stream_get_info(s, &info);
+    CHECK_STR(info.codec, "aac");
+    CHECK(info.seekable);
+    CHECK(llabs((long long)info.length_frames - AAC_FRAMES) < AAC_FRAMES / 10);
+    got = read_all(s, &n);
+    CHECK_EQ(n, AAC_FRAMES);
+    CHECK_EQ(fa_stream_seek(s, 44100), FA_OK);
+    rd = 0;
+    CHECK_EQ(fa_stream_read(s, buf, 2048, &rd), FA_OK);
+    CHECK_EQ(rd, 2048);
+    free(got);
+    fa_stream_close(s);
+}
+
+/* AAC internet radio (audio/aacp): song titles where the songs are heard. */
+static void test_aac_radio(void)
+{
+    fa_result r;
+    fa_stream* s = open_url("/radio.aac", FA_OPEN_DECODE_ONLY, &r);
+    fa_stream_info info;
+    fa_metadata md;
+    meta_log log;
+    float buf[4096 * 2];
+    fa_frames total = 0;
+    double song2_at = (double)RADIO_SONG2 / (double)g_aac_n * AAC_FRAMES;
+    if (r == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); return; }
+    CHECK_EQ(r, FA_OK);
+    if (!s) return;
+    memset(&log, 0, sizeof(log));
+    fa_mutex_init(&log.lock);
+    fa_stream_set_event_callback(s, on_event, &log);
+    fa_stream_get_info(s, &info);
+    CHECK_STR(info.codec, "aac");
+    CHECK(!info.seekable);
+    CHECK_EQ(info.length_frames, -1);
+    while (total < song2_at + 44100) { fa_frames got = 0; fa_stream_read(s, buf, 4096, &got); CHECK(got > 0); if (!got) break; total += got; }
+    CHECK_EQ(fa_stream_get_metadata(s, &md), FA_OK);
+    CHECK_STR(md.content_type, "audio/aacp");
+    CHECK_EQ(md.bitrate_kbps, 64);
+    CHECK_STR(md.stream_title, "Artist B - Song 2");
+    CHECK(wait_events(&log, 2) >= 2);
+    CHECK_EQ(log.seq[1], 2);
+    printf("  song 2 announced at frame %lld (starts near %.0f)\n", (long long)log.frame[1], song2_at);
+    CHECK(fabs((double)log.frame[1] - song2_at) < 0.25 * 44100);
+    fa_stream_close(s);
+    fa_mutex_destroy(&log.lock);
+}
+
+/* HLS with AAC in MPEG-TS segments. */
+static void test_hls_aac(void)
+{
+    fa_result r;
+    fa_stream* s = open_url("/hls/aac.m3u8", FA_OPEN_DECODE_ONLY, &r);
+    fa_stream_info info;
+    fa_frames n = 0, ref_n = 0, pos = 0, rd = 0;
+    float *got, *ref, buf[4096 * 2];
+    double err = 0;
+    int i;
+    if (r == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); return; }
+    CHECK_EQ(r, FA_OK);
+    if (!s) return;
+    fa_stream_get_info(s, &info);
+    CHECK_STR(info.container, "hls");
+    CHECK_STR(info.codec, "aac");
+    CHECK(info.seekable);
+    CHECK_EQ(info.length_frames, AAC_FRAMES);
+    got = read_all(s, &n);
+    ref = read_all_memory(g_aac, g_aac_n, &ref_n);
+    printf("  hls %lld frames, file %lld\n", (long long)n, (long long)ref_n);
+    CHECK_EQ(n, ref_n);
+    for (i = 0; i < 44100 * 2 && i < n * 2; i++) err += fabs(got[i] - ref[i]);
+    CHECK(err < 1e-3);
+    /* Into the last segment: the position is exact, the audio settles within a frame. */
+    {
+        fa_frames target = (fa_frames)((g_aseg_dur[0] + g_aseg_dur[1]) * 44100) + 3000;
+        double e2 = 0;
+        CHECK_EQ(fa_stream_seek(s, target), FA_OK);
+        CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+        CHECK_EQ(pos, target);
+        CHECK_EQ(fa_stream_read(s, buf, 4096, &rd), FA_OK);
+        CHECK_EQ(rd, 4096);
+        for (i = 2048 * 2; i < 4096 * 2; i++) e2 += fabs(buf[i] - ref[(size_t)target * 2 + i]);
+        printf("  after seek: mean error %f\n", e2 / (2048 * 2));
+        CHECK(e2 / (2048 * 2) < 0.01);
+    }
+    free(got);
+    free(ref);
+    fa_stream_close(s);
+}
+
 static void test_playlist_file_is_followed(void)
 {
     fa_result r;
@@ -1405,11 +1605,18 @@ int main(void)
 #endif
     g_mp3 = read_file(FA_TEST_DATA_DIR "/net/tone_cbr.mp3", &g_mp3_n);
     g_mp3x = read_file(FA_TEST_DATA_DIR "/net/tone_xing.mp3", &g_mp3x_n);
+    g_aac = read_file(FA_TEST_DATA_DIR "/net/tone.aac", &g_aac_n);
     g_ac3 = read_file(FA_TEST_DATA_DIR "/tone.ac3", &g_ac3_n);
-    if (!g_mp3 || !g_mp3x || !g_ac3) { fprintf(stderr, "missing test data in %s\n", FA_TEST_DATA_DIR "/net"); return 1; }
+    if (!g_mp3 || !g_mp3x || !g_aac || !g_ac3) { fprintf(stderr, "missing test data in %s\n", FA_TEST_DATA_DIR "/net"); return 1; }
     make_wav();
     make_hls();
+    make_hls_aac();
     make_hls_ac3();
+    g_aac_tagged_n = 30000 + g_aac_n;
+    g_aac_tagged = (uint8_t*)calloc(1, g_aac_tagged_n);
+    memcpy(g_aac_tagged, "ID3\x04\x00\x00", 6);   /* size 29990 (syncsafe), all padding */
+    g_aac_tagged[7] = (uint8_t)(29990 >> 14); g_aac_tagged[8] = (uint8_t)((29990 >> 7) & 127); g_aac_tagged[9] = (uint8_t)(29990 & 127);
+    memcpy(g_aac_tagged + 30000, g_aac, g_aac_n);
 
     fa_engine_config_init(&cfg);
     cfg.flags = FA_ENGINE_NULL_OUTPUT;
@@ -1437,6 +1644,9 @@ int main(void)
     RUN(test_hls_vod);
     RUN(test_hls_ac3);
     RUN(test_hls_retry_and_byteranges);
+    RUN(test_aac_over_http);
+    RUN(test_aac_radio);
+    RUN(test_hls_aac);
     RUN(test_seek_after_giving_up);
     RUN(test_long_user_agent);
     RUN(test_close_while_streaming);
@@ -1444,12 +1654,14 @@ int main(void)
 
     fa_engine_destroy(g_engine);
     server_stop();
-    for (i = 0; i < HLS_SEGS; i++) free(g_seg[i].p);
+    for (i = 0; i < HLS_SEGS; i++) { free(g_seg[i].p); free(g_aseg[i].p); }
     free(g_ac3_seg[0].p);
     free(g_ac3_seg[1].p);
     free(g_ac3);
     free(g_mp3);
     free(g_mp3x);
+    free(g_aac);
+    free(g_aac_tagged);
     free(g_wav);
     printf("%d request(s) served\n", fa_load32(&g_requests));
     if (g_failures) { printf("%d failure(s)\n", g_failures); return 1; }
