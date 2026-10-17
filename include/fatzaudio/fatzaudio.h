@@ -73,8 +73,10 @@ enum {
     FA_ERROR_PROVIDER_MISSING = -13, /* e.g. FFmpeg or LAME not found at runtime */
     FA_ERROR_NO_DISC = -14,          /* the CD drive has no disc, its tray is open, or the
                                         disc was changed under an open stream */
-    FA_ERROR_NO_SOUNDFONT = -15      /* a MIDI file needs a soundfont: fa_engine_set_soundfont
+    FA_ERROR_NO_SOUNDFONT = -15,     /* a MIDI file needs a soundfont: fa_engine_set_soundfont
                                         or fa_open_options.soundfont */
+    FA_ERROR_PROTECTED_CONTENT = -16 /* DRM-protected or encrypted content (WMA DRM,
+                                        FairPlay, encrypted MP4/MKV, SAMPLE-AES HLS) */
 };
 
 typedef struct fa_engine fa_engine;   /* one per process is typical */
@@ -378,7 +380,9 @@ FA_API fa_result FA_CALL fa_stream_get_buffered(fa_stream* stream, fa_time* out_
 
 /* ---- FFmpeg at runtime ------------------------------------------------------
  * FatzAudio never links or bundles FFmpeg. When a packet stream needs a codec it
- * has no decoder of its own for, it uses the libavcodec and libavutil of your app:
+ * has no decoder of its own for, and the system has none either (the system
+ * decodes AAC and ALAC on Windows, macOS, iOS and Android, and WMA on Windows),
+ * it uses the libavcodec and libavutil of your app:
  *   1. the ones already loaded in the process (your app's FFmpeg), else
  *   2. the ones the system loader finds (next to your executable, PATH, ...).
  * fa_ffmpeg_load(directory) loads them from a folder instead (call it first).

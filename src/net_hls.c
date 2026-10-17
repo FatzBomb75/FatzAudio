@@ -175,7 +175,7 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
                 has_iv = 0;
                 if (attr(tmp + 11, "METHOD", v, sizeof(v))) {
                     if (strcmp(v, "AES-128") == 0) key_method = 1;
-                    else if (strcmp(v, "NONE") != 0) { r = FA_ERROR_UNSUPPORTED_FORMAT; break; }  /* SAMPLE-AES, DRM */
+                    else if (strcmp(v, "NONE") != 0) { r = FA_ERROR_PROTECTED_CONTENT; break; }  /* SAMPLE-AES, DRM */
                 }
                 if (key_method && attr(tmp + 11, "URI", v, sizeof(v)) && fa_url_resolve(base, v, resolved, sizeof(resolved)) == FA_OK)
                     key_uri = dup_n(resolved, strlen(resolved));

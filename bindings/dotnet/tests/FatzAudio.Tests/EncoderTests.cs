@@ -172,7 +172,12 @@ public class EncoderTests
     [Fact]
     public void Mp3_WhenLameIsInstalled()
     {
-        if (!Lame.Load()) return;   // LAME is the app's to ship; CI machines may not have it
+        if (!Lame.Load())
+        {
+            // LAME is the app's to ship; CI installs it and sets FA_TEST_REQUIRE_LAME so it can't skip there
+            Assert.NotEqual("1", Environment.GetEnvironmentVariable("FA_TEST_REQUIRE_LAME"));
+            return;
+        }
         Assert.True(Lame.Info.IsLoaded);
         Assert.False(string.IsNullOrEmpty(Lame.Info.Version));
         var path = TempFile("mp3");

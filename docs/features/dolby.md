@@ -85,11 +85,15 @@ film.DynamicRange = DynamicRange.Night;
 
 ## Seeking and length
 
-Raw `.ac3` and `.ec3` files are indexed when they're opened (one hop per frame header, no decoding), so the length is exact and seeks land on the exact sample. Over HTTP the length is estimated from the bit rate and seeks jump by byte position to the nearest frame. In MP4 and Matroska the container's index is used.
+Raw `.ac3` and `.ec3` files have an exact length and seeks that land on the exact sample. Nearly every file has a constant bit rate (every frame the same size, one substream): the open then checks a few frames and works out every frame's position, so it takes well under a millisecond even for a film. Other files (variable bit rate, 7.1 with a dependent substream, junk inside) are indexed when they're opened, one hop per frame header without decoding. Over HTTP the length is estimated from the bit rate and seeks jump by byte position to the nearest frame. In MP4 and Matroska the container's index is used.
 
 ## Damaged data
 
 A frame that fails its checksum, or doesn't parse, plays as silence for its length (a few to 32 ms) and decoding goes on with the next one: a scratch in a broadcast recording is a short gap, not an error. Junk between frames (a damaged file, or a radio stream joined mid-frame) is skipped.
+
+## Speed and memory
+
+The decoder runs at about 400 times real time for 5.1 and 900 times for stereo on one core (the black-box comparison in `tools/bass-compare`, where bass_ac3 does about 350 and 820), and a stream uses about 50 KB for stereo and 150 KB for 5.1, including its read buffer and one access unit of output.
 
 ## Threads
 
