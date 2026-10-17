@@ -48,6 +48,16 @@ int fa_cdg_is_cdg_name(const char* name);
  * had; NULL removes the graphics). fa_stream_cdg_close, at fa_stream_close, frees
  * the data and detaches the surfaces (the app still destroys them). */
 void fa_stream_cdg_attach(struct fa_stream* s, fa_cdg_data* data);
+/* Graphics that arrive while the stream plays (audio CDs read the packs with the
+ * audio): fa_cdg_data_blank makes `count` zero packs (no-ops);
+ * fa_stream_cdg_attach_if_none attaches them unless the stream already has graphics
+ * (returns 0 and frees `data` then), and gives a token for fa_stream_cdg_write,
+ * which fills packs [first, first + n). Surfaces already past `first` go back to
+ * replay them. The write returns 0, writing nothing, once the stream's graphics were
+ * replaced (the app loaded others). */
+fa_result fa_cdg_data_blank(size_t count, fa_cdg_data** out);
+int fa_stream_cdg_attach_if_none(struct fa_stream* s, fa_cdg_data* data, uint32_t* out_token);
+int fa_stream_cdg_write(struct fa_stream* s, uint32_t token, size_t first, const uint8_t* packs, size_t n);
 void fa_stream_cdg_close(struct fa_stream* s);
 int fa_stream_cdg_present(struct fa_stream* s);
 /* Looks for "<path without extension>.cdg" next to an audio file. */

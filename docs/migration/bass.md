@@ -262,7 +262,7 @@ BASS has no CD+G decoder: apps read the `.cdg` themselves, time it from `BASS_Ch
 | Your own sync offset | `fa_stream_set_cdg_offset` | `song.CdgOffset` | ✅ |
 | Converting the 300x216 index buffer to a bitmap, scaling, borders | `fa_cdg_surface_config`: BGRA/RGBA/indexed, any size, sharp or smooth, with or without border, transparent background, premultiplied | `CdgSurfaceOptions` | ✅ |
 | Redrawing the whole bitmap each tick | Upload only `frame.dirty_*`, only when `frame.changed` | `frame.Changed`, `frame.Dirty` | ✅ |
-| CD+G from a disc via `BASS_CD_StreamCreate(..., BASS_CD_SUBCHANNEL)` | CD+G from disc playback (next step of [disc playback](../features/disc.md)) | | 🗓️ |
+| CD+G from a disc via `BASS_CD_StreamCreate(..., BASS_CD_SUBCHANNEL)`, then de-interleaving the subchannel and decoding it yourself | `fa_stream_open_disc`: the graphics are read with the audio and drawn by the same surfaces ([disc playback](../features/disc.md#cdg-karaoke-discs)) | `engine.OpenDisc(disc, n)`, then `CreateCdgSurface()` | ✅ |
 
 ### basscd (audio CDs)
 
@@ -288,7 +288,7 @@ basscd is an add-on DLL; FatzAudio reads CDs and `.cue` images itself, with one 
 | BASS_CD_SetOffset | `fa_disc_options.read_offset` (samples) | `DiscOptions.ReadOffset` | ✅ |
 | BASS_CD_StreamCreate | `fa_stream_open_disc(engine, disc, track, options, &stream)` (track numbers as on the disc, not 0-based) | `engine.OpenDisc(disc, track)` | ✅ |
 | BASS_CD_StreamCreateFile (`.cda`) | `fa_stream_open_path` (Windows) | `engine.OpenFile` | ✅ |
-| BASS_CD_StreamCreateEx / BASS_CD_SUBCHANNEL, BASS_CD_SUBCHANNEL_NOHW (subchannel callback) | CD+G from the disc, decoded and drawn by FatzAudio | | 🗓️ |
+| BASS_CD_StreamCreateEx / BASS_CD_SUBCHANNEL, BASS_CD_SUBCHANNEL_NOHW (subchannel callback) | Not needed for CD+G: `fa_stream_open_disc` reads, de-interleaves and decodes it; `FA_DISC_NO_CDG` skips the subcode. Raw subchannel access is not provided | `DiscOptions.ReadCdg` | ✅ CD+G, ➖ raw access |
 | BASS_CD_StreamGetTrack | Not needed: you opened the track, so you know its number | | ➖ |
 | BASS_CD_StreamSetTrack (switch track on the same stream) | Open the next track and `fa_stream_set_next` (gapless) or crossfade | `SetNext` | ✅ |
 | BASS_CD_Analog_* (drive's own DAC) | Not provided: modern drives have no analog output | | ➖ |
@@ -311,7 +311,7 @@ basscd is an add-on DLL; FatzAudio reads CDs and `.cue` images itself, with one 
 | basswma.dll | Decode via Media Foundation on Windows / FFmpeg bridge; encoding not provided | 🗓️ / ➖ |
 | bassmidi.dll | Built-in MIDI synth (SF2, later SFZ/SF3); soundfont via stream options | 🗓️ |
 | bass_fx.dll | Tempo/pitch/rate params on every stream ([tempo and pitch](../features/tempo-pitch.md)); reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | ✅ tempo/pitch/rate and level control, 🗓️ reverse and BPM |
-| basscd.dll | Built-in disc source: drives on Windows, macOS and Linux, `.cue` images, CD-Text, freedb and MusicBrainz ids ([disc playback](../features/disc.md)); analog playback not provided | ✅ disc; 🗓️ CD+G from disc; ✅ CD+G from files |
+| basscd.dll | Built-in disc source: drives on Windows, macOS and Linux, `.cue` images, CD-Text, freedb and MusicBrainz ids, CD+G graphics ([disc playback](../features/disc.md)); analog playback not provided | ✅ disc and CD+G discs |
 | Your own CD+G decoder and renderer (MP3+G, ZIP) | Built in: `fa_cdg_surface_*` draws the graphics in sync with the audio ([CD+G](../features/cdg.md)) | ✅ |
 
 ## 4. Common patterns

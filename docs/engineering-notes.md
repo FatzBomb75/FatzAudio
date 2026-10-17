@@ -9,6 +9,8 @@ was found (a PR, a review, or a thread).
 
 | Date | Area | Issue | Found in |
 |---|---|---|---|
+| 2026-10-17 | Disc CD+G | The subcode layout is detected with the CD+G P and Q parity, implemented from the published code (GF(64), x^6+x+1, roots a^0..a^3, either symbol order) and checked only against the test's own encoder. If real discs use another convention, detection falls back to counting instructions after 4 s and picks the usual interleave order on a tie. Worth checking with a real CD+G disc. Damaged packs are not corrected with the parity yet (they are applied as read). | Disc CD+G thread |
+| 2026-10-17 | Disc CD+G | A seek before the graphics are found throws away the subcode read so far, so a track played in short jumps can take longer to show its graphics. | Disc CD+G thread |
 | 2026-10-17 | Disc | Real drives have not been tested yet: the MMC layer, CD-Text, C2 retries and the Linux and Windows backends are covered by a simulated drive and `.cue` images in `tests/test_disc.c`. Worth a check with a real drive (and an Enhanced CD and a scratched disc) on Windows and Linux. | Disc playback thread |
 | 2026-10-17 | Disc | The macOS backend (`src/disc_mac.c`, DKIOCCD ioctls) only compiles in CI and has never run against a drive. It lists only drives with a disc in them, and cannot close the tray or lock it. | Disc playback thread |
 | 2026-10-17 | Disc | No jitter correction (cdparanoia-style overlap matching) for old drives without accurate stream; reads rely on C2 retries and the drive's own correction. Track pregaps (`BASS_CD_GetTrackPregap`) are not reported. | Disc playback thread |

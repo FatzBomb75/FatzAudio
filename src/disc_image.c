@@ -22,6 +22,7 @@ typedef struct img_file {
     int64_t sectors;
     int64_t bytes;             /* BINARY/MOTOROLA: file size, for the sector count */
     uint32_t sector_bytes;     /* 2352, or 2048 for MODE1/2048 data */
+    FILE* sub;                 /* "<name>.sub" beside it: 96 bytes of P-W subcode per sector */
     int swap;                  /* MOTOROLA: big-endian samples */
 } img_file;
 
@@ -50,6 +51,7 @@ typedef struct image {
     int sessions;
     char catalog[14];
     char* album[IMG_TEXT_FIELDS];
+    int has_sub;               /* some file has a .sub: subcode (CD+G) can be read */
     uint8_t* cdtext;           /* READ TOC format 5 response, NULL = none */
     uint32_t cdtext_len;
 } image;
@@ -77,7 +79,10 @@ static int64_t file_size(FILE* f)
 static void img_free(image* m)
 {
     int i, k;
-    for (i = 0; i < m->nfiles; i++) if (m->files[i].f) fclose(m->files[i].f);
+    for (i = 0; i < m->nfiles; i++) {
+        if (m->files[i].f) fclose(m->files[i].f);
+        if (m->files[i].sub) fclose(m->files[i].sub);
+    }
     for (i = 0; i < m->ntracks; i++) for (k = 0; k < IMG_TEXT_FIELDS; k++) free(m->tracks[i].text[k]);
     for (k = 0; k < IMG_TEXT_FIELDS; k++) free(m->album[k]);
     free(m->cdtext);
@@ -183,6 +188,21 @@ static fa_result open_file(image* m, const char* cue_path, const char* name, con
         f->sectors = size / FA_CD_SECTOR_BYTES;
     } else {
         return FA_ERROR_UNSUPPORTED_FORMAT;   /* MP3, AIFF, FLAC ... images */
+    }
+    {
+        /* Subcode beside the audio, as rippers that keep CD+G write it. */
+        char* dot = strrchr(path, '.');
+        char* sep = strrchr(path, '/');
+#ifdef _WIN32
+        char* bsep = strrchr(path, '\\');
+        if (!sep || (bsep && bsep > sep)) sep = bsep;
+#endif
+        if (dot && (!sep || dot > sep) && (size_t)(dot - path) + 5 <= sizeof(path)) {
+            memcpy(dot, ".sub", 5);
+            f->sub = fa_fopen_utf8(path, "rb");
+            if (!f->sub) { memcpy(dot, ".SUB", 5); f->sub = fa_fopen_utf8(path, "rb"); }
+            if (f->sub) m->has_sub = 1;
+        }
     }
     return FA_OK;
 }
@@ -563,7 +583,8 @@ static fa_result img_read_cd(void* h, int64_t lba, uint32_t count, uint32_t area
     image* m = (image*)h;
     uint32_t stride = FA_CD_SECTOR_BYTES + ((areas & FA_CD_AREA_C2) ? FA_CD_C2_BYTES : 0) +
                       ((areas & FA_CD_AREA_SUB) ? FA_CD_SUB_BYTES : 0);
-    uint32_t i;
+    uint32_t sub_at = FA_CD_SECTOR_BYTES + ((areas & FA_CD_AREA_C2) ? FA_CD_C2_BYTES : 0), i;
+    if ((areas & FA_CD_AREA_SUB) && !m->has_sub) return FA_ERROR_NOT_IMPLEMENTED;
     memset(buf, 0, (size_t)count * stride);
     for (i = 0; i < count; i++) {
         int64_t at = lba + i;
@@ -584,6 +605,11 @@ static fa_result img_read_cd(void* h, int64_t lba, uint32_t count, uint32_t area
                 int k;
                 for (k = 0; k < FA_CD_SECTOR_BYTES; k += 2) { uint8_t t = out[k]; out[k] = out[k + 1]; out[k + 1] = t; }
             }
+            /* A short or missing .sub leaves zeros: no graphics there. */
+            if ((areas & FA_CD_AREA_SUB) && f->sub &&
+                file_seek(f->sub, (g->file_sector + (at - g->lba)) * (int64_t)FA_CD_SUB_BYTES) == 0 &&
+                fread(out + sub_at, 1, FA_CD_SUB_BYTES, f->sub) != FA_CD_SUB_BYTES)
+                memset(out + sub_at, 0, FA_CD_SUB_BYTES);
             break;
         }
     }

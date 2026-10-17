@@ -105,6 +105,16 @@ int fa_disc_cda_track(const uint8_t* data, size_t size);
 /* CD-Text packs (18 bytes each) to per-track strings. Exposed for disc_image.c,
  * which builds packs for the CUE sheet's TITLE/PERFORMER/... lines. */
 uint16_t fa_cdtext_crc(const uint8_t* pack16);
+
+/* CD+G from the disc (disc_cdg.c): the subcode read with a track's audio, turned
+ * into the stream's CD+G packs. `feed` takes `count` sectors from `lba`, 96 raw
+ * P-W bytes each; sectors outside the track are ignored. `wanted` is 0 once the
+ * track is known to carry no graphics (stop reading its subcode). */
+typedef struct fa_disc_cdg fa_disc_cdg;
+fa_disc_cdg* fa_disc_cdg_create(struct fa_stream* stream, int64_t track_lba, int64_t track_sectors);
+void fa_disc_cdg_feed(fa_disc_cdg* c, int64_t lba, uint32_t count, const uint8_t* sub);
+int fa_disc_cdg_wanted(const fa_disc_cdg* c);
+void fa_disc_cdg_free(fa_disc_cdg* c);
 /* Trims trailing spaces and NULs of a fixed-width field into `out`. */
 void fa_disc_copy_trimmed(char* out, size_t cap, const uint8_t* in, size_t n);
 
