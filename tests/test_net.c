@@ -1142,7 +1142,7 @@ static void test_icy_radio_decode_only(void)
 
 /* ---- AAC (ADTS) ------------------------------------------------------------------- */
 
-#define AAC_FRAMES (131 * 1024)
+#define AAC_FRAMES (130 * 1024)   /* 131 frames less the priming */
 
 /* An .aac file on a web server: length and seeks estimated from the frame sizes,
  * every frame decoded. */

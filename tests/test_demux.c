@@ -505,10 +505,10 @@ static void test_adts_file(void)
     CHECK(strcmp(info.container, "adts") == 0);
     CHECK_EQ(info.format.sample_rate, 44100);
     CHECK_EQ(info.format.channels, 2);
-    CHECK_EQ(info.length_frames, ADTS_FRAMES * 1024);   /* every frame, from the index */
+    CHECK_EQ(info.length_frames, (ADTS_FRAMES - 1) * 1024);   /* every frame but the priming, from the index */
     CHECK_EQ(info.seekable, 1);
     full = read_all(s, 2, &n);
-    CHECK_EQ(n, ADTS_FRAMES * 1024);
+    CHECK_EQ(n, (ADTS_FRAMES - 1) * 1024);
     CHECK_NEAR(freq(full, 4410, 128000, 2, 44100), 440.0, 2.0);
     CHECK_NEAR(rms(full, 4410, 128000, 2), 0.0625, 0.01);
     CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), 1e-3, &worst));
@@ -566,9 +566,9 @@ static void test_adts_junk_and_tags(void)
     CHECK_EQ(r, FA_OK);
     CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
     CHECK(strcmp(info.container, "adts") == 0);
-    CHECK_EQ(info.length_frames, ADTS_FRAMES * 1024);   /* the tag between frames is skipped */
+    CHECK_EQ(info.length_frames, (ADTS_FRAMES - 1) * 1024);   /* the tag between frames is skipped */
     a = read_all(s, 2, &na);
-    CHECK_EQ(na, ADTS_FRAMES * 1024);
+    CHECK_EQ(na, (ADTS_FRAMES - 1) * 1024);
     fa_stream_close(s);
     /* The same from a forward-only source: found by sliding to the next header. */
     m.p = data;
@@ -600,7 +600,8 @@ static void test_adts_junk_and_format_change(void)
     fa_stream* s = NULL;
     fa_stream_info info;
     float *x, *y;
-    int64_t nx, ny, expect = ADTS_FRAMES * 1024 + 25 * 940;   /* 1024 frames at 48 kHz last 940 at 44.1 */
+    int64_t nx, ny, expect = (ADTS_FRAMES - 1) * 1024 + 25 * 940;   /* 1024 frames at 48 kHz last 940 at 44.1;
+                                                                     the priming is dropped once, at the start */
     mem_io m;
     fa_io_callbacks io = { io_read, NULL, NULL, io_close };
     fa_result r;
@@ -962,6 +963,25 @@ static double sine_lag(const float* p, int64_t from, int64_t to, uint32_t ch, ui
     return lag;
 }
 
+/* net/tone.aac starts on the first real sample: FFmpeg's encoder primes with 1024
+ * samples, which the ADTS reader drops, so the sine has no lag (bass_aac agrees). */
+static void test_adts_start(void)
+{
+    fa_stream* s;
+    float* full;
+    int64_t n;
+    double lag, period = 44100 / 440.0;
+    fa_result r = open_file("net/tone.aac", -1, &s);
+    SKIP_NO_FFMPEG(r);
+    CHECK_EQ(r, FA_OK);
+    full = read_all(s, 2, &n);
+    lag = sine_lag(full, 4410, 44100, 2, 44100);
+    printf("  ADTS start lag: %.2f frames\n", lag);
+    CHECK(lag < 1.0 || lag > period - 1.0);
+    free(full);
+    fa_stream_close(s);
+}
+
 static fa_result open_mp3(const char* name, uint32_t flags, fa_stream** s)
 {
     char path[512];
@@ -1084,6 +1104,7 @@ int main(void)
     RUN(test_webm_opus);
     RUN(test_forward_only_sources);
     RUN(test_adts_file);
+    RUN(test_adts_start);
     RUN(test_adts_junk_and_tags);
     RUN(test_adts_junk_and_format_change);
     RUN(test_mkv_lacing_and_live_layout);

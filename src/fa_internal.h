@@ -86,6 +86,9 @@ struct fa_decoder {
     void* impl;
     fa_audio_format format;  /* always FA_FORMAT_F32 interleaved */
     fa_frames length;        /* -1 = unknown */
+    /* Frames the decoder drops at the start of the data (ADTS priming): a duration
+     * that a playlist gives for the same data (HLS) is that much longer. */
+    fa_frames lead_trim;
     int seekable;
     char codec[32];
     char container[32];
