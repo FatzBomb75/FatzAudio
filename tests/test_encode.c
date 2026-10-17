@@ -522,8 +522,16 @@ static void test_device_closed_while_recording(void)
     CHECK_EQ(fa_encoder_attach_device(e, d), FA_OK);
     fa_device_render(d, out, 512);
     fa_device_close(d);
-    fa_sleep_ms(20);
-    CHECK_EQ(fa_encoder_get_status(e, &st), FA_OK);
+    /* The encoder thread takes the rendered audio in its own time (timed by the
+     * clock: sleeps overshoot a lot on busy CI machines). */
+    {
+        int64_t until = fa_monotonic_ns() + 5000000000LL;
+        do {
+            CHECK_EQ(fa_encoder_get_status(e, &st), FA_OK);
+            if (st.frames >= 512) break;
+            fa_sleep_ms(1);
+        } while (fa_monotonic_ns() < until);
+    }
     CHECK_EQ(st.frames, 512);
     CHECK_EQ(fa_encoder_close(e), FA_OK);
     remove("enc_gone.wav");
@@ -650,7 +658,6 @@ static void test_errors(void)
     fa_encoder_status st;
     float x[2048 * 2] = { 0 };
     fa_result r;
-    int i;
     fa_encoder_options_init(&o);
     o.bits_per_sample = 20;
     CHECK_EQ(fa_encoder_create_path("enc_bad.wav", &o, &e), FA_ERROR_INVALID_ARG);
@@ -664,9 +671,12 @@ static void test_errors(void)
     /* a failing output: reported by write (eventually), status and close */
     CHECK_EQ(fa_encoder_create_output(&bad, NULL, NULL, &e), FA_OK);
     r = FA_OK;
-    for (i = 0; i < 200 && r == FA_OK; i++) {
-        r = fa_encoder_write(e, x, 2048, 44100, 2);
-        fa_sleep_ms(1);
+    {
+        int64_t until = fa_monotonic_ns() + 5000000000LL;
+        while (r == FA_OK && fa_monotonic_ns() < until) {
+            r = fa_encoder_write(e, x, 2048, 44100, 2);
+            fa_sleep_ms(1);
+        }
     }
     CHECK_EQ(r, FA_ERROR_NETWORK);
     CHECK_EQ(fa_encoder_get_status(e, &st), FA_OK);
