@@ -508,14 +508,57 @@ public unsafe class AudioStream : IDisposable
     /// <summary>Stereo pan from -1 (left) to 1 (right).</summary>
     public float Pan { get => GetParam(AudioParameter.Pan); set => SetParam(AudioParameter.Pan, value); }
 
-    /// <summary>Playback rate multiplier; pitch follows.</summary>
+    /// <summary>Playback speed multiplier (0.1..10, clamped); pitch follows, like a turntable.</summary>
+    /// <exception cref="FatzAudioException">On a push or packet stream, which takes <see cref="Pitch"/> only (<see cref="ErrorCode.NotImplemented"/>).</exception>
     public float Rate { get => GetParam(AudioParameter.Rate); set => SetParam(AudioParameter.Rate, value); }
 
-    /// <summary>Tempo multiplier with pitch preserved.</summary>
+    /// <summary>Tempo multiplier (0.1..10, clamped) with pitch preserved.</summary>
+    /// <exception cref="FatzAudioException">On a push or packet stream, which takes <see cref="Pitch"/> only (<see cref="ErrorCode.NotImplemented"/>).</exception>
     public float Tempo { get => GetParam(AudioParameter.Tempo); set => SetParam(AudioParameter.Tempo, value); }
 
-    /// <summary>Pitch shift in semitones with tempo preserved.</summary>
+    /// <summary>Pitch shift in semitones (-36..36, clamped) with tempo preserved.</summary>
     public float Pitch { get => GetParam(AudioParameter.Pitch); set => SetParam(AudioParameter.Pitch, value); }
+
+    /// <summary>
+    /// How tempo, pitch and rate are processed. Setting it takes effect at once; a new quality restarts the
+    /// processing from the position being heard (on a stream that can't seek, after the next stop, seek or
+    /// attach). Null restores the defaults.
+    /// </summary>
+    /// <remarks>The latency is clamped to 50 ms .. the engine's buffer.</remarks>
+    /// <exception cref="ArgumentException">An unknown <see cref="StretchQuality"/>.</exception>
+    [System.Diagnostics.CodeAnalysis.AllowNull]
+    public TempoOptions TempoOptions
+    {
+        get
+        {
+            FaTempoOptions o;
+            NativeMethods.fa_tempo_options_init(&o);
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_tempo_options(Handle, &o));
+            return new TempoOptions
+            {
+                Quality = (StretchQuality)o.Quality,
+                KeepFormants = o.KeepFormants != 0,
+                Latency = TimeSpan.FromMilliseconds(o.LatencyMs),
+            };
+        }
+        set
+        {
+            if (value is null)
+            {
+                FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_tempo_options(Handle, null));
+                return;
+            }
+            FaTempoOptions o;
+            NativeMethods.fa_tempo_options_init(&o);
+            o.Quality = (int)value.Quality;
+            o.KeepFormants = value.KeepFormants ? 1 : 0;
+            o.LatencyMs = (uint)Math.Clamp(Math.Round(value.Latency.TotalMilliseconds), 1, 60000);
+            int rc = NativeMethods.fa_stream_set_tempo_options(Handle, &o);
+            if (rc == (int)ErrorCode.InvalidArgument)
+                throw new ArgumentException("Unknown stretch quality.", nameof(value));
+            FatzAudioException.ThrowIfFailed(rc);
+        }
+    }
 
     /// <summary>Gets any parameter by name.</summary>
     /// <param name="parameter">The parameter.</param>
