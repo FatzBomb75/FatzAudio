@@ -1,0 +1,202 @@
+#include "fa_internal.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Device ids: hex of the backend id bytes (trailing zeros trimmed). If that
+ * does not fit the 256-byte field, fall back to "#<index>" (not stable). */
+static void encode_id(const ma_device_id* id, uint32_t index, char* out, size_t cap)
+{
+    const unsigned char* b = (const unsigned char*)id;
+    size_t n = sizeof(ma_device_id);
+    size_t i;
+    while (n > 0 && b[n - 1] == 0) n--;
+    if (n * 2 + 1 > cap) { snprintf(out, cap, "#%u", (unsigned)index); return; }
+    for (i = 0; i < n; i++) snprintf(out + i * 2, 3, "%02x", b[i]);
+    out[n * 2] = '\0';
+}
+
+static int hexval(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* Lists devices into pointers valid until the next enumeration; caller holds engine->lock. */
+static ma_result list_devices(fa_engine* e, fa_device_type type, ma_device_info** infos, ma_uint32* count)
+{
+    ma_device_info* pb; ma_uint32 pbn; ma_device_info* cp; ma_uint32 cpn;
+    ma_result r = ma_context_get_devices(&e->context, &pb, &pbn, &cp, &cpn);
+    if (r != MA_SUCCESS) return r;
+    if (type == FA_DEVICE_CAPTURE) { *infos = cp; *count = cpn; } else { *infos = pb; *count = pbn; }
+    return MA_SUCCESS;
+}
+
+FA_API fa_result FA_CALL fa_device_count(fa_engine* engine, fa_device_type type, uint32_t* out_count)
+{
+    ma_device_info* infos; ma_uint32 n; ma_result r;
+    if (!engine || !out_count || (type != FA_DEVICE_PLAYBACK && type != FA_DEVICE_CAPTURE)) return FA_ERROR_INVALID_ARG;
+    ma_mutex_lock(&engine->lock);
+    r = list_devices(engine, type, &infos, &n);
+    ma_mutex_unlock(&engine->lock);
+    if (r != MA_SUCCESS) return FA_ERROR_DEVICE;
+    *out_count = n;
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_device_get_info(fa_engine* engine, fa_device_type type, uint32_t index, fa_device_info* out_info)
+{
+    ma_device_info* infos; ma_uint32 n; ma_result r;
+    ma_device_info detail;
+    if (!engine || !out_info || (type != FA_DEVICE_PLAYBACK && type != FA_DEVICE_CAPTURE)) return FA_ERROR_INVALID_ARG;
+    memset(out_info, 0, sizeof(*out_info));
+    ma_mutex_lock(&engine->lock);
+    r = list_devices(engine, type, &infos, &n);
+    if (r != MA_SUCCESS) { ma_mutex_unlock(&engine->lock); return FA_ERROR_DEVICE; }
+    if (index >= n) { ma_mutex_unlock(&engine->lock); return FA_ERROR_NOT_FOUND; }
+    encode_id(&infos[index].id, index, out_info->id, sizeof(out_info->id));
+    snprintf(out_info->name, sizeof(out_info->name), "%s", infos[index].name);
+    out_info->type = type;
+    out_info->is_default = infos[index].isDefault ? 1 : 0;
+    /* Native format needs a detailed query; best effort. */
+    if (ma_context_get_device_info(&engine->context,
+                                   type == FA_DEVICE_CAPTURE ? ma_device_type_capture : ma_device_type_playback,
+                                   &infos[index].id, &detail) == MA_SUCCESS && detail.nativeDataFormatCount > 0) {
+        out_info->native_sample_rate = detail.nativeDataFormats[0].sampleRate;
+        out_info->native_channels = detail.nativeDataFormats[0].channels;
+    }
+    ma_mutex_unlock(&engine->lock);
+    return FA_OK;
+}
+
+static void data_callback(ma_device* d, void* output, const void* input, ma_uint32 frames)
+{
+    fa_device* dev = (fa_device*)d->pUserData;
+    (void)input;
+    memset(output, 0, (size_t)frames * FA_DEVICE_CHANNELS * sizeof(float));
+    fa_device_mix(dev, (float*)output, frames);
+}
+
+/* TODO: replace the mutex around the stream list with a lock-free/RCU style list
+ * so the audio thread never blocks on API calls. */
+void fa_device_mix(fa_device* device, float* out, ma_uint32 frames)
+{
+    struct fa_stream* s;
+    ma_mutex_lock(&device->lock);
+    for (s = device->streams; s; s = s->next) fa_stream_mix_into(s, out, frames);
+    ma_mutex_unlock(&device->lock);
+}
+
+FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id, fa_device** out_device)
+{
+    fa_device* d;
+    ma_device_config cfg;
+    ma_device_id id;
+    ma_device_id* pid = NULL;
+
+    if (!engine || !out_device) return FA_ERROR_INVALID_ARG;
+    *out_device = NULL;
+
+    if (device_id && device_id[0]) {
+        if (device_id[0] == '#') {
+            ma_device_info* infos; ma_uint32 n; unsigned idx = (unsigned)atoi(device_id + 1);
+            ma_mutex_lock(&engine->lock);
+            if (list_devices(engine, FA_DEVICE_PLAYBACK, &infos, &n) != MA_SUCCESS || idx >= n) {
+                ma_mutex_unlock(&engine->lock);
+                return FA_ERROR_NOT_FOUND;
+            }
+            id = infos[idx].id;
+            ma_mutex_unlock(&engine->lock);
+        } else {
+            size_t len = strlen(device_id), i;
+            if ((len & 1) || len / 2 > sizeof(ma_device_id)) return FA_ERROR_INVALID_ARG;
+            memset(&id, 0, sizeof(id));
+            for (i = 0; i < len / 2; i++) {
+                int hi = hexval(device_id[i * 2]), lo = hexval(device_id[i * 2 + 1]);
+                if (hi < 0 || lo < 0) return FA_ERROR_INVALID_ARG;
+                ((unsigned char*)&id)[i] = (unsigned char)((hi << 4) | lo);
+            }
+        }
+        pid = &id;
+    }
+
+    d = (fa_device*)calloc(1, sizeof(*d));
+    if (!d) return FA_ERROR_OUT_OF_MEMORY;
+    d->engine = engine;
+    if (ma_mutex_init(&d->lock) != MA_SUCCESS) { free(d); return FA_ERROR_GENERIC; }
+
+    cfg = ma_device_config_init(ma_device_type_playback);
+    cfg.playback.pDeviceID = pid;
+    cfg.playback.format = ma_format_f32;
+    cfg.playback.channels = FA_DEVICE_CHANNELS;
+    cfg.sampleRate = engine->config.mix_sample_rate; /* 0 = native */
+    cfg.periodSizeInMilliseconds = engine->config.period_ms;
+    cfg.dataCallback = data_callback;
+    cfg.pUserData = d;
+
+    if (ma_device_init(&engine->context, &cfg, &d->device) != MA_SUCCESS) {
+        ma_mutex_uninit(&d->lock);
+        free(d);
+        return FA_ERROR_DEVICE;
+    }
+    *out_device = d;
+    return FA_OK;
+}
+
+FA_API void FA_CALL fa_device_close(fa_device* device)
+{
+    struct fa_stream* s;
+    if (!device) return;
+    ma_device_uninit(&device->device); /* stops the callback thread */
+    ma_mutex_lock(&device->lock);
+    for (s = device->streams; s; ) {
+        struct fa_stream* next = s->next;
+        ma_mutex_lock(&s->lock);
+        s->device = NULL;
+        s->next = NULL;
+        if (s->state == FA_STATE_PLAYING) s->state = FA_STATE_PAUSED;
+        ma_mutex_unlock(&s->lock);
+        s = next;
+    }
+    device->streams = NULL;
+    ma_mutex_unlock(&device->lock);
+    ma_mutex_uninit(&device->lock);
+    free(device);
+}
+
+FA_API fa_result FA_CALL fa_device_start(fa_device* device)
+{
+    if (!device) return FA_ERROR_INVALID_ARG;
+    return ma_device_start(&device->device) == MA_SUCCESS ? FA_OK : FA_ERROR_DEVICE;
+}
+
+FA_API fa_result FA_CALL fa_device_stop(fa_device* device)
+{
+    if (!device) return FA_ERROR_INVALID_ARG;
+    return ma_device_stop(&device->device) == MA_SUCCESS ? FA_OK : FA_ERROR_DEVICE;
+}
+
+FA_API fa_result FA_CALL fa_device_set_volume(fa_device* device, float volume)
+{
+    if (!device || volume < 0.0f) return FA_ERROR_INVALID_ARG;
+    return ma_device_set_master_volume(&device->device, volume) == MA_SUCCESS ? FA_OK : FA_ERROR_DEVICE;
+}
+
+FA_API fa_result FA_CALL fa_device_get_volume(fa_device* device, float* out_volume)
+{
+    if (!device || !out_volume) return FA_ERROR_INVALID_ARG;
+    return ma_device_get_master_volume(&device->device, out_volume) == MA_SUCCESS ? FA_OK : FA_ERROR_DEVICE;
+}
+
+FA_API fa_result FA_CALL fa_device_get_latency(fa_device* device, fa_time* out_latency)
+{
+    ma_uint32 rate;
+    if (!device || !out_latency) return FA_ERROR_INVALID_ARG;
+    rate = device->device.playback.internalSampleRate;
+    if (rate == 0) { *out_latency = 0; return FA_OK; }
+    *out_latency = (fa_time)((double)device->device.playback.internalPeriodSizeInFrames *
+                             (double)device->device.playback.internalPeriods * 1e9 / (double)rate);
+    return FA_OK;
+}

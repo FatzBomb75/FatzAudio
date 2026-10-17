@@ -1,0 +1,6 @@
+add_executable(fa_smoke smoke.c)
+target_link_libraries(fa_smoke PRIVATE fatzaudio)
+if(UNIX)
+    target_link_libraries(fa_smoke PRIVATE m)
+endif()
+add_test(NAME smoke COMMAND fa_smoke)
