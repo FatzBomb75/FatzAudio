@@ -71,15 +71,15 @@ public class EngineTests
         Assert.True(inputs.Count >= 0);
         Assert.All(outputs, d => Assert.Equal(DeviceKind.Playback, d.Kind));
         Assert.All(inputs, d => Assert.Equal(DeviceKind.Capture, d.Kind));
-        if (outputs.Count > 0)
-            Assert.Contains(outputs, d => d.IsDefault);
+        // At most one default. Headless CI machines may list only placeholder
+        // devices (such as ALSA's "null" PCM) with no default at all.
+        Assert.True(outputs.Count(d => d.IsDefault) <= 1);
     }
 
     [Fact]
     public void OpenOutput_Default_ControlsVolume()
     {
-        using var engine = AudioEngine.Create();
-        if (engine.OutputDevices.Count == 0) return; // headless machine
+        using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true });
         using var output = engine.OpenOutput();
         output.Volume = 0.5f;
         Assert.Equal(0.5f, output.Volume, 3);
@@ -164,8 +164,7 @@ public class EngineTests
     [Fact]
     public void Volume_RoundTrips_OnAttachedStream()
     {
-        using var engine = AudioEngine.Create();
-        if (engine.OutputDevices.Count == 0) return;
+        using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true });
         using var output = engine.OpenOutput();
         using var s = engine.OpenMemory(TestAudio.SineWav());
         s.PlayOn(output);
