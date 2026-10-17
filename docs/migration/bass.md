@@ -62,7 +62,7 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS_StreamCreateFile (path) | `fa_stream_open_path`; format detected from content ([streams](../features/streams.md)) | `engine.OpenFile(path)` | ✅ WAV/AIFF/MP3/FLAC so far |
 | BASS_StreamCreateFile (memory) | `fa_stream_open_memory` | `engine.OpenMemory(bytes)` | ✅ |
 | BASS_StreamCreateFileUser | `fa_stream_open_io`; `close` is called once by `fa_stream_close`, never on a failed open ([custom I/O](../features/streams.md#custom-io-your-own-reader)) | `engine.OpenStream(System.IO.Stream)` | ✅ |
-| BASS_StreamCreateURL | `fa_stream_open_url`: HTTP/HTTPS files with range seeking, Icecast/Shoutcast radio, HLS, `.pls`/`.m3u`; reconnects by itself ([web streams](../features/web-streams.md)) | `engine.OpenUrl(url)` | ✅ WAV/FLAC/MP3; AAC 🗓️ |
+| BASS_StreamCreateURL | `fa_stream_open_url`: HTTP/HTTPS files with range seeking, Icecast/Shoutcast radio, HLS, `.pls`/`.m3u`; reconnects by itself ([web streams](../features/web-streams.md)) | `engine.OpenUrl(url)` | ✅ (AAC through the app's FFmpeg) |
 | BASS_StreamCreateURL `DOWNLOADPROC` (raw bytes to save a station) | Planned | | 🗓️ |
 | BASS_StreamCreateURL `BASS_STREAM_BLOCK` | Not needed: memory per web stream is bounded (4 MB) and seeking still works | — | ➖ (by design) |
 | BASS_StreamCreateURL `BASS_STREAM_STATUS` (+ `BASS_TAG_HTTP` during connect) | `fa_stream_get_http_header` and `fa_stream_get_net_status` after the open | `GetHttpHeader`, `NetworkStatus` | ✅ |
@@ -214,10 +214,10 @@ The legacy app doesn't ship bassmix.dll, but mixer-style code built on `BASS_Cha
 
 | Legacy DLL | Replaced by | Status |
 |---|---|---|
-| bass_aac.dll | MP4/M4A/MOV files (built-in demuxer, any audio track) and AAC packets (`fa_stream_open_packets`), decoded through the app's FFmpeg; a built-in or OS AAC decoder and raw ADTS files | ✅ MP4 and packets via FFmpeg, 🗓️ built-in decoder |
+| bass_aac.dll | `BASS_AAC_StreamCreateFile`/`URL`/`User` → the normal open calls: MP4/M4A/MOV files (built-in demuxer, any audio track), `.aac` (ADTS) files and AAC radio, and AAC packets (`fa_stream_open_packets`), decoded through the app's FFmpeg; a built-in or OS AAC decoder | ✅ MP4, ADTS and packets via FFmpeg, 🗓️ built-in decoder |
 | bass_ac3.dll | AC-3 and E-AC-3 packets through the app's FFmpeg (`fa_stream_open_packets`); files through the OS codec, and passthrough | ✅ packets, 🗓️ files and passthrough |
 | bassflac.dll | Built-in | ✅ |
-| basshls.dll (if used) | Built-in: `fa_stream_open_url` plays `.m3u8` (MPEG-TS, fMP4, AES-128) | ✅ MP3 segments; AAC 🗓️ |
+| basshls.dll (if used) | Built-in: `fa_stream_open_url` plays `.m3u8` (MPEG-TS, fMP4, AES-128) | ✅ (AAC segments through the app's FFmpeg) |
 | bassopus.dll | Built-in (incl. raw packet push) | 🗓️ |
 | basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM and MP3 tracks built in, Opus, Vorbis, AAC and others through the app's FFmpeg ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ (built-in Opus/Vorbis decoders 🗓️) |
 | basswma.dll | Decode via Media Foundation on Windows / FFmpeg bridge; encoding not provided | 🗓️ / ➖ |

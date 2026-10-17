@@ -9,7 +9,7 @@
 | An HLS playlist (`.m3u8`), on demand or live | The best audio variant, MPEG-TS, fMP4 or plain audio segments, AES-128 encryption. On-demand HLS is seekable to the frame |
 | A `.pls` or `.m3u` playlist (what radio sites usually link to) | Its first entry is played |
 
-The format is detected from the content, as for files ([streams](streams.md#how-detection-works)). Today that means WAV, FLAC and MP3, including MP3 in MPEG-TS for HLS. AAC streams, which most HLS and many radio stations use, follow with the AAC decoder.
+The format is detected from the content, as for files ([streams](streams.md#how-detection-works)): WAV, FLAC, MP3 and AAC, also inside HLS segments (MPEG-TS, fMP4 or packed audio). AAC, which most HLS and many radio stations use, decodes through the FFmpeg your app already has ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)); without it an AAC station returns `FA_ERROR_PROVIDER_MISSING`.
 
 ## C
 
@@ -136,7 +136,7 @@ A URL that isn't an absolute http or https URL throws `ArgumentException`. Other
 | `FA_ERROR_NETWORK` | The server can't be reached, refused the connection, or timed out |
 | `FA_ERROR_NOT_FOUND` | The server answered with an error (404, 403, 500, ...) |
 | `FA_ERROR_UNSUPPORTED_FORMAT` | What came back isn't audio FatzAudio can decode (a web page, say) |
-| `FA_ERROR_PROVIDER_MISSING` | `https://` on a Linux system without libcurl |
+| `FA_ERROR_PROVIDER_MISSING` | `https://` on a Linux system without libcurl, or AAC (and other codecs that need it) without FFmpeg |
 
 ## Buffering, stalls and reconnects
 
@@ -154,7 +154,7 @@ A URL that isn't an absolute http or https URL throws `ArgumentException`. Other
 | Radio, live HLS | No |
 | On-demand HLS | Yes, to the exact frame: the download restarts at the segment, and decoding starts there |
 
-MP3 over the network seeks by estimated byte position, like most players do for MP3 without an index, and lands within a frame or two of the target. The reported position is the one you asked for. WAV and FLAC seek exactly.
+MP3 and AAC files over the network seek by estimated byte position, as most players do for files without an index, and land within a few frames of the target. The reported position is the one you asked for. WAV and FLAC seek exactly.
 
 ## Song titles (ICY metadata)
 
@@ -192,4 +192,3 @@ Plain `http://` uses FatzAudio's own small HTTP/1.1 client on every platform. It
 
 - A callback that receives the raw downloaded bytes (BASS's `DOWNLOADPROC`), for recording a station to a file.
 - Opening asynchronously with a cancel call (`BASS_StreamCancel`).
-- AAC radio and AAC HLS segments: they need the AAC decoder, which is on its way.

@@ -865,5 +865,5 @@ static int mp4_probe(const uint8_t* d, size_t n, size_t id3)
 const fa_decoder_vtable fa_decoder_mp4 = {
     "mp4", "MP4, M4A, MOV (audio tracks)", "mp4;m4a;m4b;m4v;mov;3gp",
     "audio/mp4;video/mp4;audio/x-m4a;video/quicktime",
-    mp4_probe, mp4_open, mp4_read, mp4_seek, mp4_close, 1
+    mp4_probe, mp4_open, mp4_read, mp4_seek, mp4_close, 1, NULL
 };

@@ -14,7 +14,7 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Buses (decks, groups) and the channel matrix | [buses.md](buses.md) | ✅ |
 | Tempo and pitch | tempo-pitch.md | 🗓️ |
 | FFmpeg hand-off and A/V sync (packets, frames, presentation clock) | [ffmpeg.md](ffmpeg.md) | ✅ |
-| Web streams and HLS (HTTP/HTTPS, radio titles, reconnects, HLS) | [web-streams.md](web-streams.md) | ✅ WAV/FLAC/MP3; AAC with the AAC decoder 🗓️ |
+| Web streams and HLS (HTTP/HTTPS, radio titles, reconnects, HLS) | [web-streams.md](web-streams.md) | ✅ |
 | CD+G | cdg.md | 🗓️ |
 | Disc playback | disc.md | 🗓️ |
 | Recording and encoding | recording-encoding.md | 🗓️ |

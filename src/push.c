@@ -434,5 +434,5 @@ static fa_result push_open(fa_decoder* dec) { (void)dec; return FA_ERROR_UNSUPPO
 
 const fa_decoder_vtable fa_decoder_push = {
     "push", "App-supplied PCM or packets", "", "",
-    push_probe, push_open, push_read, push_seek, push_close, 0
+    push_probe, push_open, push_read, push_seek, push_close, 0, NULL
 };
