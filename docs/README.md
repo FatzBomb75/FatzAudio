@@ -9,6 +9,7 @@
 | [Migrating from NAudio](migration/naudio.md) | Planned |
 | [Migrating from SoundTouch](migration/soundtouch.md) | Planned |
 | [Design](../fatzaudio-design.md) | Architecture and decisions |
+| [Engineering notes](engineering-notes.md) | Known issues and out-of-scope follow-ups |
 
 ## Status legend
 
