@@ -244,7 +244,8 @@ static void test_volume_and_pan(void)
     CHECK_NEAR(out[2047 * 2], 0.25, 1e-6);
     CHECK_NEAR(out[2047 * 2 + 1], 0.25, 1e-6);
     CHECK_EQ(fa_stream_set_param(s, FA_PARAM_VOLUME, -1.0f), FA_ERROR_INVALID_ARG);
-    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_TEMPO, 1.2f), FA_ERROR_NOT_IMPLEMENTED);
+    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_TEMPO, 0.0f), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_PITCH, NAN), FA_ERROR_INVALID_ARG);
     fa_stream_close(s);
 }
 

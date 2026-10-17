@@ -4,6 +4,7 @@
 #include "fatzaudio/fatzaudio.h"
 #include "miniaudio.h"
 #include "fa_platform.h"
+#include "tempo.h"
 #include <stdio.h>
 
 #define FA_DEVICE_CHANNELS 2
@@ -248,6 +249,61 @@ fa_result fa_shape_from_ramp(const fa_ramp* r, int fallback, fa_shape* out);
 void fa_shape_to_ramp(const fa_shape* sh, fa_ramp* out);  /* points left NULL */
 void fa_shape_store(fa_shape_atomic* a, const fa_shape* sh);
 void fa_shape_load(fa_shape_atomic* a, fa_shape* out);
+
+/* ---- Tempo, pitch and rate (tempo.c) ---------------------------------------
+ * The chain itself is in tempo.h. These parameters are applied where audio is
+ * decoded, not in the mixer: a value takes effect at the chain's output head (the
+ * end of the decode-ahead buffer), and ramps advance with the frames it makes. */
+
+#define FA_TEMPO_PARAMS 3            /* FA_PARAM_RATE, FA_PARAM_TEMPO, FA_PARAM_PITCH */
+#define FA_TPARAM_NOW INT64_MIN      /* a ramp start: wherever the chain is when it is first evaluated */
+
+typedef struct fa_tparam {
+    float value;                     /* in effect at the chain's head */
+    float from, target;
+    int64_t start;                   /* chain frame the ramp starts at (may be negative after a
+                                        timeline reset), or FA_TPARAM_NOW */
+    int64_t len;                     /* ramp length in chain frames */
+    fa_shape shape;
+    int64_t tag;
+    int active, notify;
+} fa_tparam;
+
+void fa_tparam_init(fa_tparam* p, float value);
+/* A plain set (len 0, notify 0) or a ramp; replaces what runs. Returns 1 when that
+ * was a ramp still owing its RAMP_DONE (tag in *old_tag). */
+int fa_tparam_post(fa_tparam* p, float target, int64_t len, const fa_shape* shape, int64_t tag, int notify,
+                   int64_t start, int64_t* old_tag);
+/* The value at chain frame `at`. Returns 1 when a ramp finished and owes its
+ * RAMP_DONE (tag in *done_tag). */
+int fa_tparam_eval(fa_tparam* p, int64_t at, float* out_value, int64_t* done_tag);
+/* The chain's frame count starts again from 0 at what was chain frame `base`:
+ * keeps a running or scheduled ramp on the same playback time. */
+void fa_tparam_rebase(fa_tparam* p, int64_t base);
+
+/* Played (ring) frames -> source positions, piecewise linear. The decode side adds
+ * a segment wherever the slope (source frames per ring frame) changes; before the
+ * first one, the base (seek_base, source rate / device rate) applies. The audio
+ * thread releases segments it has played past; any thread may look up. */
+#define FA_TMAP_SIZE 256
+#define FA_TMAP_SLACK 16             /* released segments kept readable for late lookups */
+
+typedef struct fa_tmap {
+    int64_t at[FA_TMAP_SIZE];
+    double src[FA_TMAP_SIZE];
+    double slope[FA_TMAP_SIZE];
+    fa_atomic64 write, read;
+} fa_tmap;
+
+void fa_tmap_reset(fa_tmap* m);
+int fa_tmap_full(fa_tmap* m);
+void fa_tmap_add(fa_tmap* m, int64_t at, double src, double slope);
+/* Source position at ring frame `at`; *out_slope and *out_next (where the segment
+ * ends, INT64_MAX = open) may be NULL. */
+double fa_tmap_pos(fa_tmap* m, int64_t at, double base_src, double base_slope, double* out_slope, int64_t* out_next);
+/* Ring frames from `at` until the source position reaches `target` (0 if it has). */
+int64_t fa_tmap_frames_to(fa_tmap* m, int64_t at, double target, double base_src, double base_slope);
+void fa_tmap_release(fa_tmap* m, int64_t at);   /* audio thread */
 
 /* ---- Loudness (loudness.c) ------------------------------------------------ */
 
@@ -674,6 +730,24 @@ struct fa_stream {
     fa_atomic64 meta_frame;      /* INT64_MAX = nothing armed */
     fa_atomic64 meta_seq_armed;
     fa_atomic64 meta_announced;
+
+    /* Tempo, pitch and rate (tempo.c). tparams and the options under tempo_lock;
+     * the chain and its staging under decode_lock. */
+    fa_mutex tempo_lock;
+    fa_tparam tparams[FA_TEMPO_PARAMS];
+    int tempo_fast, tempo_formants;
+    uint32_t tempo_latency_ms;
+    fa_tempo* tempo;             /* NULL until a parameter first leaves neutral */
+    int tempo_drained;           /* the chain gave back its tail at the end of the source */
+    int64_t tempo_frames;        /* chain output frames since the last restart */
+    fa_tmap tmap;
+    fa_atomic32 tempo_live;      /* the chain is engaged: decode-ahead is kept short */
+    /* Decode-only streams: chain output not yet read */
+    float* rd_in;
+    const float* rd_out;
+    int64_t rd_count, rd_off;
+    double rd_src0, rd_slope;
+    const float* chain_buf;      /* attached: the chain's output the converter reads, NULL = in_buf */
 
     /* CD+G graphics (cdg.c): the packs, the surfaces drawing them, and a generation
      * count that tells surfaces the graphics were replaced. Never touched by the

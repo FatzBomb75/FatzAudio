@@ -66,7 +66,7 @@ The clock is the audio actually heard:
 - It moves smoothly between audio callbacks, interpolated from the device's sample clock, so it can be read every video frame.
 - It is in **your** timeline: the packet pts you pushed, converted to nanoseconds. A stream whose first packet has pts 10 s starts its clock at 10 s.
 - It holds still while the stream is paused, buffering or ended, and continues when playback does. When the audio has a gap or a jump in its timestamps, the clock jumps with it at the moment that audio is heard. Jitter under 15 ms is ignored.
-- The clock is recorded as the audio is mixed, from the timestamps the mixed audio carries, so playback-rate and tempo changes (coming in the tempo and pitch phase) need nothing extra from your app.
+- The clock is recorded as the audio is mixed, from the timestamps the mixed audio carries, so pitch changes need nothing extra from your app. Push and packet streams take `FA_PARAM_PITCH` only; their speed is the app's ([tempo and pitch](tempo-pitch.md)).
 
 That's the whole sync loop. There's no drift to correct, because the video is never compared with a second clock.
 

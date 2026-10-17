@@ -115,12 +115,35 @@ public enum AudioParameter
     Volume = 0,
     /// <summary>Stereo pan from -1 (left) to 1 (right).</summary>
     Pan = 1,
-    /// <summary>Playback rate multiplier; pitch follows.</summary>
+    /// <summary>Playback speed multiplier (0.1..10); pitch follows, like a turntable.</summary>
     Rate = 2,
-    /// <summary>Tempo multiplier; pitch preserved.</summary>
+    /// <summary>Tempo multiplier (0.1..10); pitch preserved.</summary>
     Tempo = 3,
-    /// <summary>Pitch shift in semitones; tempo preserved.</summary>
+    /// <summary>Pitch shift in semitones (-36..36); tempo preserved.</summary>
     Pitch = 4,
+}
+
+/// <summary>How tempo and pitch are processed (see <see cref="TempoOptions"/>).</summary>
+public enum StretchQuality
+{
+    /// <summary>120 ms analysis blocks, the cleanest sound (the default).</summary>
+    Best = 0,
+    /// <summary>100 ms blocks, about a third less CPU, slightly less clean.</summary>
+    Fast = 1,
+}
+
+/// <summary>How a stream processes <see cref="AudioParameter.Tempo"/>, <see cref="AudioParameter.Pitch"/> and <see cref="AudioParameter.Rate"/>.</summary>
+public sealed record TempoOptions
+{
+    /// <summary>Stretcher quality (default <see cref="StretchQuality.Best"/>).</summary>
+    public StretchQuality Quality { get; init; } = StretchQuality.Best;
+    /// <summary>A pitch change keeps the character of voices: karaoke key changes without the "chipmunk" sound.</summary>
+    public bool KeepFormants { get; init; }
+    /// <summary>
+    /// How far ahead the stream is decoded while tempo, pitch or rate is in use, so how soon a change is heard
+    /// (50 ms up to the engine's buffer; default 150 ms).
+    /// </summary>
+    public TimeSpan Latency { get; init; } = TimeSpan.FromMilliseconds(150);
 }
 
 /// <summary>Loudness normalization mode of the engine (see <see cref="AudioEngine.SetNormalization"/>).</summary>

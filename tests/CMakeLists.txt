@@ -5,6 +5,14 @@ if(UNIX)
 endif()
 add_test(NAME smoke COMMAND fa_smoke)
 
+if(WIN32)
+    add_executable(fa_test_deps test_deps.c)
+    if(MSVC)
+        target_compile_definitions(fa_test_deps PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+    add_test(NAME deps COMMAND fa_test_deps $<TARGET_FILE:fatzaudio>)
+endif()
+
 add_executable(fa_test_core test_core.c)
 target_link_libraries(fa_test_core PRIVATE fatzaudio)
 if(UNIX)
@@ -15,6 +23,8 @@ add_test(NAME core COMMAND fa_test_core WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY
 # White-box tests: the library sources compiled straight into the test, so it can
 # drive the mixer by hand and check exact sample values.
 list(TRANSFORM FA_SOURCES PREPEND ${PROJECT_SOURCE_DIR}/)
+set_source_files_properties(${PROJECT_SOURCE_DIR}/src/stretch.cpp PROPERTIES
+    INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/third_party/signalsmith)
 add_executable(fa_test_internal test_internal.c ${FA_SOURCES})
 target_include_directories(fa_test_internal PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
@@ -116,3 +126,14 @@ if(UNIX)
     target_link_libraries(fa_test_cdg PRIVATE m)
 endif()
 add_test(NAME cdg COMMAND fa_test_cdg WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
+add_executable(fa_test_tempo test_tempo.c ${FA_SOURCES})
+target_include_directories(fa_test_tempo PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+target_compile_definitions(fa_test_tempo PRIVATE FA_STATIC)
+target_compile_options(fa_test_tempo PRIVATE ${FA_WARNINGS})
+target_link_libraries(fa_test_tempo PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
+if(UNIX)
+    target_link_libraries(fa_test_tempo PRIVATE m)
+endif()
+add_test(NAME tempo COMMAND fa_test_tempo)

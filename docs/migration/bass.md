@@ -94,7 +94,7 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 | BASS_ChannelGetPosition with BASS_POS_DECODE | Not needed: the position always counts what was played, never what was decoded ahead | — | ➖ (by design) |
 | BASS_ChannelBytes2Seconds / Seconds2Bytes | Not needed: frames ÷ sample rate, or use TimeSpan in .NET | — | ➖ (by design) |
 | BASS_ChannelSetAttribute VOL / PAN | `fa_stream_set_param` VOLUME / PAN, de-zippered over 5 ms ([ramps](../features/ramps.md)) | `Volume` / `Pan` | ✅ |
-| BASS_ChannelSetAttribute FREQ | `FA_PARAM_RATE` | `Rate` | 🧩 |
+| BASS_ChannelSetAttribute FREQ (playback speed and pitch together) | `FA_PARAM_RATE` as a multiplier: `new_freq / original_freq`, e.g. 1.02 for +2 %; sinc resampling, exact ([tempo and pitch](../features/tempo-pitch.md)) | `Rate` | ✅ (not on push streams) |
 | BASS_ChannelSetAttributeEx / GetAttributeEx | Typed functions per feature instead | | ➖ (by design) |
 | BASS_ChannelSlideAttribute | `fa_stream_ramp_param` with 7 curves and an optional exact start time ([ramps](../features/ramps.md)) | `Ramp(...)` / `await RampAsync(...)` | ✅ volume, pan |
 | BASS_ChannelIsSliding | `FA_EVENT_RAMP_DONE` (one per ramp, tagged) instead of polling | `RampAsync` task, `RampCompleted` event | ✅ |
@@ -210,6 +210,27 @@ The legacy app doesn't ship bassmix.dll, but mixer-style code built on `BASS_Cha
 | BASS_MIXER_CHAN_NORAMPIN | Not needed: starts are exact and fades are explicit | — | ➖ (by design) |
 | BASS_Split_* (one source to several outputs) | Not provided yet | | 🗓️ |
 
+### bass_fx tempo, pitch and rate
+
+bass_fx needs a decode stream wrapped in a separate tempo stream; FatzAudio puts three parameters on every stream ([tempo and pitch](../features/tempo-pitch.md)).
+
+| bass_fx | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| BASS_FX_TempoCreate(decode stream, BASS_FX_FREESOURCE) | Not needed: open the stream as usual and set the parameters on it | — | ➖ (by design) |
+| BASS_FX_TempoGetSource / BASS_FX_TempoGetRateRatio | Not needed: there is one stream; the speed heard is `TEMPO × RATE` | — | ➖ (by design) |
+| BASS_ATTRIB_TEMPO (percent, -95 … +5000) | `FA_PARAM_TEMPO` as a multiplier: `1 + percent / 100`, range 0.1 … 10 | `Tempo` | ✅ |
+| BASS_ATTRIB_TEMPO_PITCH (semitones) | `FA_PARAM_PITCH`, semitones -36 … 36, exact to the cent | `Pitch` | ✅ |
+| BASS_ATTRIB_TEMPO_FREQ (Hz) | `FA_PARAM_RATE` as a multiplier: `new_freq / original_freq` | `Rate` | ✅ |
+| BASS_ChannelSlideAttribute on TEMPO / TEMPO_PITCH / TEMPO_FREQ | `fa_stream_ramp_param` with any curve, optionally at an exact time | `Ramp`, `RampAsync` | ✅ |
+| BASS_ATTRIB_TEMPO_OPTION_USE_QUICKALGO | `fa_tempo_options.quality = FA_STRETCH_FAST` | `TempoOptions.Quality` | ✅ |
+| BASS_ATTRIB_TEMPO_OPTION_USE_AA_FILTER / AA_FILTER_LENGTH | Not needed: the resampler is always band-limited (windowed sinc, about -90 dB) | — | ➖ (by design) |
+| BASS_ATTRIB_TEMPO_OPTION_SEQUENCE_MS / SEEKWINDOW_MS / OVERLAP_MS / PREVENT_CLICK | Not needed: no splicing to tune. The stretcher is a phase vocoder; `quality` picks its block size | — | ➖ (by design) |
+| Formant-preserving pitch (not in bass_fx) | `fa_tempo_options.keep_formants = 1` | `TempoOptions.KeepFormants` | ✅ |
+| Keeping the buffer short so tempo changes respond quickly | `fa_tempo_options.latency_ms` (default 150) | `TempoOptions.Latency` | ✅ |
+| Converting positions back with BASS_FX_TempoGetRateRatio | Not needed: positions, markers, the clock and CD+G stay in song time | — | ➖ (by design) |
+| BASS_FX_ReverseCreate / BASS_ATTRIB_REVERSE_DIR | Reverse playback | | 🗓️ |
+| BASS_FX_BPM_* / BASS_FX_BPM_Beat* | BPM and beat detection | | 🗓️ |
+
 ### CD+G karaoke graphics
 
 BASS has no CD+G decoder: apps read the `.cdg` themselves, time it from `BASS_ChannelGetPosition` and draw it. basscd only gives raw subchannel data from discs (`BASS_CD_SUBCHANNEL`). FatzAudio decodes, times and draws CD+G itself ([CD+G](../features/cdg.md)).
@@ -238,7 +259,7 @@ BASS has no CD+G decoder: apps read the `.cdg` themselves, time it from `BASS_Ch
 | basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM and MP3 tracks built in, Opus, Vorbis, AAC and others through the app's FFmpeg ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ (built-in Opus/Vorbis decoders 🗓️) |
 | basswma.dll | Decode via Media Foundation on Windows / FFmpeg bridge; encoding not provided | 🗓️ / ➖ |
 | bassmidi.dll | Built-in MIDI synth (SF2, later SFZ/SF3); soundfont via stream options | 🗓️ |
-| bass_fx.dll | Tempo/pitch/rate params on every stream; reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | 🗓️ tempo/pitch, ✅ level control |
+| bass_fx.dll | Tempo/pitch/rate params on every stream ([tempo and pitch](../features/tempo-pitch.md)); reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | ✅ tempo/pitch/rate and level control, 🗓️ reverse and BPM |
 | basscd.dll | Disc source + CD+G; analog playback not provided | 🗓️ disc; ✅ CD+G from files |
 | Your own CD+G decoder and renderer (MP3+G, ZIP) | Built in: `fa_cdg_surface_*` draws the graphics in sync with the audio ([CD+G](../features/cdg.md)) | ✅ |
 
@@ -516,4 +537,37 @@ CompositionTarget.Rendering += (_, _) =>
 
 Pausing, seeking, crossfading to the next singer and tempo changes need no extra code: delete the timer, the position maths and the pack decoder.
 
-*More patterns (tempo) are added here as each feature lands.*
+### Tempo and key change (bass_fx)
+
+BASS:
+```c
+HSTREAM dec = BASS_StreamCreateFile(FALSE, path, 0, 0, BASS_STREAM_DECODE | BASS_STREAM_PRESCAN);
+HSTREAM h = BASS_FX_TempoCreate(dec, BASS_FX_FREESOURCE);
+BASS_ChannelSetAttribute(h, BASS_ATTRIB_TEMPO, -15);         /* percent */
+BASS_ChannelSetAttribute(h, BASS_ATTRIB_TEMPO_PITCH, -2);    /* semitones */
+BASS_ChannelPlay(h, FALSE);
+/* positions: BASS_ChannelGetPosition(dec, ...) on the source, not h */
+```
+
+FatzAudio:
+```c
+fa_stream_open_path(engine, path, NULL, &s);
+fa_stream_set_param(s, FA_PARAM_TEMPO, 0.85f);              /* multiplier: 1 - 15 / 100 */
+fa_stream_set_param(s, FA_PARAM_PITCH, -2.0f);
+fa_stream_attach(s, device, NULL);
+fa_stream_play(s);
+/* positions, markers and the clock are in song time already */
+```
+
+.NET:
+```csharp
+using var song = engine.OpenFile(path);
+song.Tempo = 0.85f;
+song.Pitch = -2f;
+song.TempoOptions = new TempoOptions { KeepFormants = true };   // natural voices on key changes
+song.PlayOn(output);
+```
+
+When porting, delete the tempo stream, the `BASS_FX_FREESOURCE` bookkeeping and any position conversion through `BASS_FX_TempoGetRateRatio`. bass_fx's tempo is in percent and its frequency in Hz; convert both to multipliers.
+
+*More patterns are added here as each feature lands.*

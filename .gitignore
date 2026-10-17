@@ -4,3 +4,4 @@ out/
 *.user
 legacy/
 build-*/
+__pycache__/

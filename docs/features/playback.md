@@ -71,5 +71,5 @@ TimeSpan clock = song.Clock;  // for video/lyrics sync
 
 ## Pitfalls
 
-- Resampling to the device rate currently uses miniaudio's linear resampler with a low-pass filter. The windowed-sinc resampler from the design (R12) replaces it in the tempo/pitch phase, in the same place in the chain.
+- Resampling to the device rate currently uses miniaudio's linear resampler with a low-pass filter. The windowed-sinc resampler (R12) now exists for rate and pitch ([tempo and pitch](tempo-pitch.md)); moving the device-rate conversion onto it is planned (see the engineering notes).
 - Decode-only streams (`FA_OPEN_DECODE_ONLY`) don't use workers or buffers: `fa_stream_read` decodes on your thread.
