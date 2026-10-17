@@ -1,10 +1,21 @@
 cmake_minimum_required(VERSION 3.21)
-project(fatzaudio VERSION 0.1.0 LANGUAGES C)
+project(fatzaudio VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
+# One C++ file (src/stretch.cpp, around the header-only Signalsmith Stretch).
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+# Sanitizer builds pass their flags in CMAKE_C_FLAGS; the C++ file (and the C++
+# link) need them too.
+if(CMAKE_C_FLAGS MATCHES "-fsanitize" AND NOT CMAKE_CXX_FLAGS MATCHES "-fsanitize")
+    string(APPEND CMAKE_CXX_FLAGS " ${CMAKE_C_FLAGS}")
+endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Keep the DLL next to test executables so Windows finds it without PATH tweaks.
@@ -13,6 +24,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 option(FA_BUILD_TESTS "Build FatzAudio tests" ON)
+option(FA_BUILD_TOOLS "Build the listening and comparison tools (tools/)" ON)
 
 set(FA_SOURCES
     src/engine.c
@@ -48,10 +60,14 @@ set(FA_SOURCES
     src/net_hls.c
     src/cdg.c
     src/zip.c
+    src/tempo.c
+    src/resample.c
+    src/stretch.cpp
     src/cdg.h
     src/disc.c
     src/disc_mmc.c
     src/disc_image.c
+    src/tempo.h
     src/fa_internal.h
     src/net.h
     src/disc.h
@@ -68,6 +84,15 @@ else()
 endif()
 
 add_library(fatzaudio SHARED ${FA_SOURCES})
+set_source_files_properties(src/stretch.cpp PROPERTIES
+    INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/signalsmith)
+# One self-contained binary: no compiler runtime DLLs next to fatzaudio.dll (the
+# C API hands no CRT objects across, so the app may use any runtime).
+if(MSVC)
+    set_property(TARGET fatzaudio PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+elseif(MINGW)
+    target_link_options(fatzaudio PRIVATE -static-libstdc++ -static-libgcc)
+endif()
 
 target_include_directories(fatzaudio
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -110,4 +135,8 @@ endif()
 if(FA_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+if(FA_BUILD_TOOLS)
+    add_subdirectory(tools)
 endif()

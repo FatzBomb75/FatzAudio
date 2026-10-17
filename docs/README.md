@@ -7,7 +7,7 @@
 | Feature guides (`features/`) | One page per feature: what it does, how to use it, options, pitfalls |
 | [Migrating from BASS](migration/bass.md) | Every BASS function and add-on mapped to FatzAudio |
 | [Migrating from NAudio](migration/naudio.md) | Planned |
-| [Migrating from SoundTouch](migration/soundtouch.md) | Planned |
+| [Migrating from SoundTouch](migration/soundtouch.md) | SoundTouch calls mapped to the tempo, pitch and rate parameters |
 | [Design](../fatzaudio-design.md) | Architecture and decisions |
 | [Engineering notes](engineering-notes.md) | Known issues and out-of-scope follow-ups |
 

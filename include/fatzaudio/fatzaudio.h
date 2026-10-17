@@ -724,9 +724,11 @@ FA_API fa_result FA_CALL fa_stream_read(fa_stream* stream, void* buffer, fa_fram
 typedef enum fa_param {
     FA_PARAM_VOLUME = 0, /* linear gain */
     FA_PARAM_PAN,        /* -1..1 */
-    FA_PARAM_RATE,       /* playback rate multiplier (pitch follows) */
-    FA_PARAM_TEMPO,      /* tempo multiplier, pitch preserved */
-    FA_PARAM_PITCH       /* semitones, tempo preserved */
+    FA_PARAM_RATE,       /* playback speed, pitch follows (varispeed, like a turntable):
+                            0.1..10, default 1 */
+    FA_PARAM_TEMPO,      /* speed with the pitch kept: 0.1..10, default 1 (1.25 = 25% faster) */
+    FA_PARAM_PITCH       /* key change with the speed kept, in semitones: -36..36,
+                            default 0 (fractions allowed: 0.5 = a quarter tone) */
 } fa_param;
 
 typedef enum fa_curve {
@@ -756,8 +758,21 @@ typedef struct fa_ramp {
 } fa_ramp;
 
 /* Volume (linear gain >= 0) and pan (-1..1) are applied in the mixer, sample-accurately
- * and without zipper noise (changes are smoothed over 5 ms). RATE, TEMPO and PITCH
- * return FA_ERROR_NOT_IMPLEMENTED until the tempo/pitch phase.
+ * and without zipper noise (changes are smoothed over 5 ms).
+ *
+ * RATE, TEMPO and PITCH change the audio itself, so they are applied where the
+ * stream is decoded, on a worker thread: a change is heard after the decode-ahead
+ * buffer, which is kept short while any of them is in use (fa_tempo_options
+ * latency_ms, 150 ms by default). They combine: the speed heard is TEMPO x RATE and
+ * the pitch PITCH semitones plus what RATE adds. Out-of-range values are clamped.
+ * They work on every stream, also decode-only ones (fa_stream_read returns the
+ * processed audio), except that push and packet streams (fa_stream_open_push,
+ * fa_stream_open_packets) take PITCH only: their timing is the app's, so TEMPO and
+ * RATE return FA_ERROR_NOT_IMPLEMENTED there. Positions, markers, the clock and
+ * CD+G graphics stay in source frames and follow the tempo by themselves.
+ * Buses have no RATE, TEMPO or PITCH (FA_ERROR_INVALID_ARG), and streams of more
+ * than 32 channels without a channel matrix return FA_ERROR_UNSUPPORTED_FORMAT.
+ *
  * fa_stream_get_param returns the value being applied right now (mid-ramp values
  * included); a value just set with fa_stream_set_param is returned immediately. */
 FA_API fa_result FA_CALL fa_stream_set_param(fa_stream* stream, fa_param param, float value);
@@ -774,6 +789,31 @@ FA_API fa_result FA_CALL fa_stream_get_param(fa_stream* stream, fa_param param, 
  * then. If the stream is not playing at that moment, the ramp starts as soon as it
  * plays. A scheduled ramp on a stream that is not attached: FA_ERROR_INVALID_ARG. */
 FA_API fa_result FA_CALL fa_stream_ramp_param(fa_stream* stream, fa_param param, float target, fa_time duration, fa_time device_time, const fa_ramp* ramp);
+
+/* How tempo and pitch are processed (see FA_PARAM_TEMPO). */
+typedef enum fa_stretch_quality {
+    FA_STRETCH_BEST = 0,   /* default: 120 ms analysis blocks, the cleanest sound */
+    FA_STRETCH_FAST        /* 100 ms blocks, about a third less CPU, slightly less clean */
+} fa_stretch_quality;
+
+typedef struct fa_tempo_options {
+    uint32_t struct_size;          /* set by fa_tempo_options_init */
+    fa_stretch_quality quality;
+    int32_t keep_formants;         /* 1 = a pitch change keeps the character of voices
+                                      (karaoke key changes without the "chipmunk" sound);
+                                      default 0 */
+    uint32_t latency_ms;           /* how far ahead the stream is decoded while RATE, TEMPO
+                                      or PITCH is in use, so how soon a change is heard:
+                                      50..buffer_ms, default 150 */
+} fa_tempo_options;
+
+FA_API void FA_CALL fa_tempo_options_init(fa_tempo_options* options);
+/* keep_formants and latency_ms take effect at once. A new quality restarts the
+ * processing from the position being heard (like a seek to it); on a stream that
+ * cannot seek (live web streams, push streams) it applies after the next stop, seek
+ * or attach. NULL restores the defaults. */
+FA_API fa_result FA_CALL fa_stream_set_tempo_options(fa_stream* stream, const fa_tempo_options* options);
+FA_API fa_result FA_CALL fa_stream_get_tempo_options(fa_stream* stream, fa_tempo_options* out_options);
 
 /* ---- Markers ---------------------------------------------------------- */
 

@@ -204,6 +204,15 @@ internal unsafe struct FaFfmpegInfo
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal struct FaTempoOptions
+{
+    public uint StructSize;
+    public int Quality;
+    public int KeepFormants;
+    public uint LatencyMs;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal struct FaCdgSurfaceConfig
 {
     public uint StructSize;
