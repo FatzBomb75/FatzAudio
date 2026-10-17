@@ -181,6 +181,12 @@ In .NET, `stream.PlayOn(device)` attaches (or moves) and plays, and `stream.Deta
 - Paths are UTF-8. On Windows FatzAudio converts them to UTF-16 internally, so non-ASCII file names work.
 - `audio_track` greater than 0 returns `FA_ERROR_NOT_FOUND` for single-track formats.
 
+## WAV and AIFF
+
+- 16, 24 and 32-bit integer and 32-bit float PCM in RIFF, RF64 and Wave64 is read straight into your buffer in one call and widened to float in place: about as fast as BASS (over 10000× real time for 16-bit stereo), with the same values (x / 2^(bits-1)).
+- Other variants (AIFF, RIFX, 8-bit, ADPCM, A-law, µ-law, 64-bit float) go through dr_wav's own conversion, a little slower.
+- A forward-only source (or a web stream) is read in order, so trailing chunks after the audio are never sought to.
+
 ## MP3
 
 MP3 files decode built in (minimp3, inside miniaudio), in 32-bit float: nothing is rounded to 16 bits, so the output matches a reference float decoder to about 124 dB.

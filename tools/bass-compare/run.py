@@ -712,8 +712,8 @@ def write_report(out, results, cases, args, tempo):
     L.append('\n## Speed and memory\n')
     L.append('Best of %d runs. Speed is times real time for the whole file (higher is better); open is '
              'the open call, first audio the time from the open call to the first decoded frames; '
-             'memory is what the process grew by while decoding one stream (after a warm-up decode, so '
-             'loading code and one-time setup are not counted). Bold marks the better one where the '
+             'memory is the most the process grew by while decoding one stream, from just before it '
+             'opens (after a warm-up decode, so loading code and one-time setup are not counted). Bold marks the better one where the '
              'gap is real: more than 10%% in speed, 1 ms in time, 256 KB and 25%% in memory.\n' % args.runs)
     L.append('| File | FatzAudio speed | BASS speed | FatzAudio open ms | BASS open ms | FatzAudio first audio ms | '
              'BASS first audio ms | FatzAudio memory KB | BASS memory KB |')

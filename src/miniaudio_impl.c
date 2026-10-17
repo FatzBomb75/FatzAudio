@@ -58,9 +58,54 @@ fa_result fa_drwav_open(fa_source* src, int sequential, void** out_impl,
     return FA_OK;
 }
 
+/* Little-endian 16, 24 and 32-bit integer or 32-bit float PCM on a little-endian
+ * host: the bytes are read in one go straight into the back of `out` and widened
+ * to float in place, front to back. dr_wav's own path reads 4 KB at a time (a
+ * system call each, on Windows) and widens 24-bit samples through double. */
+static uint64_t read_pcm_direct(ma_dr_wav* w, float* out, uint64_t frames, uint32_t bytes)
+{
+    enum { BLOCK = 512 };
+    size_t n, i, j, c;
+    uint64_t got;
+    uint8_t* raw = (uint8_t*)out + (size_t)frames * w->channels * (4 - bytes);
+    got = ma_dr_wav_read_pcm_frames(w, frames, raw);
+    n = (size_t)got * w->channels;
+    if (w->translatedFormatTag == MA_DR_WAVE_FORMAT_IEEE_FLOAT) return got;   /* already there */
+    /* A block is copied out before its floats are written: they end where the
+     * raw bytes still to read begin, at the earliest. */
+    for (i = 0; i < n; i += c) {
+        c = n - i < BLOCK ? n - i : BLOCK;
+        if (bytes == 2) {
+            ma_int16 x[BLOCK];
+            memcpy(x, raw + 2 * i, 2 * c);
+            ma_dr_wav_s16_to_f32(out + i, x, c);
+        } else if (bytes == 3) {
+            uint8_t x[3 * BLOCK];
+            memcpy(x, raw + 3 * i, 3 * c);
+            for (j = 0; j < c; j++) {
+                int32_t v = (int32_t)(((uint32_t)x[3 * j] << 8) | ((uint32_t)x[3 * j + 1] << 16) | ((uint32_t)x[3 * j + 2] << 24)) >> 8;
+                out[i + j] = (float)v * (1.0f / 8388608.0f);
+            }
+        } else {
+            ma_int32 x[BLOCK];
+            memcpy(x, raw + 4 * i, 4 * c);
+            ma_dr_wav_s32_to_f32(out + i, x, c);
+        }
+    }
+    return got;
+}
+
 uint64_t fa_drwav_read(void* impl, float* out, uint64_t frames)
 {
-    return ma_dr_wav_read_pcm_frames_f32((ma_dr_wav*)impl, frames, out);
+    ma_dr_wav* w = (ma_dr_wav*)impl;
+    uint32_t bpf = ma_dr_wav_get_bytes_per_pcm_frame(w), bytes = w->channels ? bpf / w->channels : 0;
+    int le = w->container == ma_dr_wav_container_riff || w->container == ma_dr_wav_container_rf64 ||
+             w->container == ma_dr_wav_container_w64;
+    int fmt_ok = (w->translatedFormatTag == MA_DR_WAVE_FORMAT_PCM && bytes >= 2 && bytes <= 4) ||
+                 (w->translatedFormatTag == MA_DR_WAVE_FORMAT_IEEE_FLOAT && bytes == 4);
+    if (ma_dr_wav__is_little_endian() && le && fmt_ok && bytes * w->channels == bpf)
+        return read_pcm_direct(w, out, frames, bytes);
+    return ma_dr_wav_read_pcm_frames_f32(w, frames, out);
 }
 
 int fa_drwav_seek(void* impl, uint64_t frame)

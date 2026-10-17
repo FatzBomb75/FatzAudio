@@ -249,6 +249,81 @@ static void check_decodes(buf media, const char* codec, const char* container, u
     fa_stream_close(s);
 }
 
+/* Sample value i of channel c in the tests below: walks every byte pattern. */
+static int32_t sample_value(uint32_t i, uint32_t c, int bits)
+{
+    uint32_t x = (i * 2654435761u) ^ (c * 0x9E3779B9u);
+    int32_t top = (int32_t)((1u << (bits - 1)) - 1);
+    if (i == 0) return c ? -top - 1 : top;                                   /* the extremes */
+    return (int32_t)(x << (32 - bits)) >> (32 - bits);
+}
+
+/* PCM WAV of 8, 16, 24, 32-bit integers or 32-bit floats, read back as
+ * x / 2^(bits-1) (8-bit is unsigned). RIFX is the big-endian variant. */
+static buf make_wav_bits(uint32_t channels, uint32_t frames, int bits, int is_float, int rifx)
+{
+    buf b = { 0 };
+    uint32_t i, c, bps = (uint32_t)bits / 8, data = frames * channels * bps;
+    void (*w16)(buf*, uint32_t) = rifx ? be16 : le16;
+    void (*w32)(buf*, uint32_t) = rifx ? be32 : le32;
+    put(&b, rifx ? "RIFX" : "RIFF", 4); w32(&b, 36 + data); put(&b, "WAVE", 4);
+    put(&b, "fmt ", 4); w32(&b, 16); w16(&b, is_float ? 3 : 1); w16(&b, channels);
+    w32(&b, 48000); w32(&b, 48000 * channels * bps); w16(&b, channels * bps); w16(&b, (uint32_t)bits);
+    put(&b, "data", 4); w32(&b, data);
+    for (i = 0; i < frames; i++)
+        for (c = 0; c < channels; c++) {
+            int32_t v = sample_value(i, c, bits);
+            uint32_t k;
+            if (is_float) { float f = (float)v / 2147483648.0f; uint32_t u; memcpy(&u, &f, 4); w32(&b, u); }
+            else if (bits == 8) put8(&b, (uint32_t)(v + 128));
+            else for (k = 0; k < bps; k++) put8(&b, (uint32_t)v >> (8 * (rifx ? bps - 1 - k : k)));
+        }
+    return b;
+}
+
+static void test_wav_sample_formats(void)
+{
+    /* 16 to 32-bit RIFF reads straight into the output; 8-bit and RIFX (k >= 5) go
+     * through dr_wav's own conversion. */
+    static const int bits[] = { 8, 16, 24, 32, 32, 16, 24 };
+    int k;
+    for (k = 0; k < 7; k++) {
+        const uint32_t ch = 3, frames = 5000;
+        int is_float = k == 4;
+        buf media = make_wav_bits(ch, frames, bits[k], is_float, k >= 5);
+        fa_open_options o = decode_only();
+        fa_stream* s = NULL;
+        float* out = (float*)malloc(sizeof(float) * frames * ch);
+        fa_frames n = 0;
+        uint32_t i;
+        CHECK_EQ(fa_stream_open_memory(g_engine, media.p, media.n, &o, &s), FA_OK);
+        while (n < (fa_frames)frames) {
+            fa_frames got = 0, want = (n / 7) % 3 == 0 ? 7 : 1000;    /* odd sizes too */
+            if (want > (fa_frames)frames - n) want = (fa_frames)frames - n;
+            if (fa_stream_read(s, out + n * ch, want, &got) != FA_OK || got == 0) break;
+            n += got;
+        }
+        CHECK_EQ(n, frames);
+        /* And after a seek, in the middle of a read block. */
+        CHECK_EQ(fa_stream_seek(s, 1234), FA_OK);
+        CHECK_EQ(fa_stream_read(s, out + 1234 * ch, 3000, &n), FA_OK);
+        CHECK_EQ(n, 3000);
+        for (i = 0; i < frames * ch; i++) {
+            int32_t v = sample_value(i / ch, i % ch, bits[k]);
+            float want = is_float ? (float)v / 2147483648.0f
+                       : (float)((double)v / (double)(1u << (bits[k] - 1)));
+            /* 8-bit goes through dr_wav's own mapping (255 is 1.0); the rest is exact. */
+            if (bits[k] == 8 ? fabs(out[i] - want) > 1.0 / 127 : out[i] != want) {
+                fprintf(stderr, "  %d-bit%s sample %u: %.9g, expected %.9g\n", bits[k], is_float ? " float" : "", i, out[i], want);
+                CHECK(0);
+            }
+        }
+        fa_stream_close(s);
+        free(out);
+        free(media.p);
+    }
+}
+
 static void test_detect_wav(void) { check_decodes(make_wav(48000, 2, 12345), "pcm", "wav", 48000, 2, 12345, 1); }
 static void test_detect_aiff(void) { check_decodes(make_aiff(44100, 1, 5000), "pcm", "aiff", 44100, 1, 5000, 1); }
 static void test_detect_flac(void) { check_decodes(make_flac(44100, 2, 10000, 0), "flac", "flac", 44100, 2, 10000, 1); }
@@ -625,6 +700,7 @@ int main(void)
 
     RUN(test_format_list);
     RUN(test_detect_wav);
+    RUN(test_wav_sample_formats);
     RUN(test_detect_aiff);
     RUN(test_detect_flac);
     RUN(test_detect_flac_with_id3);

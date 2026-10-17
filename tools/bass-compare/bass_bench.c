@@ -148,9 +148,9 @@ static int cmd_decode(const char* in, const char* outp, int prescan)
     DWORD h;
     FILE* out = bench_open_out(outp);
     float* buf;
-    long long total = 0;
+    long long total = 0, reads = 0;
     warm_up(in);
-    base = bench_current_kb();
+    base = bench_mem_start();
     t0 = bench_now_ms();
     h = open_stream(in, prescan, &open_ms, &info);
     buf = (float*)malloc(sizeof(float) * CHUNK * info.chans);
@@ -159,6 +159,7 @@ static int cmd_decode(const char* in, const char* outp, int prescan)
         if (got == (DWORD)-1 || got == 0) break;
         if (first_ms < 0) first_ms = bench_now_ms() - t0;
         if (out) fwrite(buf, 1, got, out);
+        if (reads++ % 16 == 0) bench_mem_sample();
         total += got / (4 * info.chans);
     }
     printf("{");
@@ -215,7 +216,7 @@ static int cmd_multi(const char* in, int n)
     long long total = 0;
     int i, left = n;
     warm_up(in);
-    base = bench_current_kb();
+    base = bench_mem_start();
     t0 = bench_now_ms();
     for (i = 0; i < n; i++) {
         double ms;
@@ -224,6 +225,7 @@ static int cmd_multi(const char* in, int n)
     }
     buf = (float*)malloc(sizeof(float) * CHUNK * info.chans);
     while (left > 0) {
+        bench_mem_sample();
         for (i = 0; i < n; i++) {
             DWORD got;
             if (done[i]) continue;

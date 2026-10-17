@@ -67,6 +67,7 @@ python3 tools/bass-compare/run.py --fa build-win/bin/fa_bench.exe --fa-wine \
 
 - The report opens with **where FatzAudio is worse than BASS**: every measurement where BASS won by more than the noise margin. Everything else is a tie or a FatzAudio win.
 - Accuracy is signal-to-error in dB; 200 means bit exact. Against FFmpeg it shows the decoder's own accuracy; against the original it shows what the codec allows. Above about 80 dB a difference cannot be heard.
+- Memory is the most the process grew by from just before the stream opened: on Windows the working set sampled every 16 reads while it decodes (the process's own peak would count the warm-up and loading the DLLs, and a buffer freed between two samples is missed), on Linux VmHWM reset through `/proc/self/clear_refs`.
 - Speed and memory under Wine are comparable between the two libraries (both are Windows code running the same way), but not with a native Windows run.
 - Bold marks the better result where the gap is larger than the margin given above each table.
 

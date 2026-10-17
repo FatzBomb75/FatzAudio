@@ -79,7 +79,7 @@ static int decode_all(fa_stream* s, const char* outp, double t0, double open_ms,
     double first_ms = -1;
     FILE* out = bench_open_out(outp);
     float* buf;
-    long long total = 0;
+    long long total = 0, reads = 0;
     fa_result r;
     fa_stream_get_info(s, &info);
     buf = (float*)malloc(sizeof(float) * CHUNK * info.format.channels);
@@ -88,6 +88,7 @@ static int decode_all(fa_stream* s, const char* outp, double t0, double open_ms,
         r = fa_stream_read(s, buf, CHUNK, &got);
         if (got > 0 && first_ms < 0) first_ms = bench_now_ms() - t0;
         if (got > 0 && out) fwrite(buf, sizeof(float) * info.format.channels, (size_t)got, out);
+        if (reads++ % 16 == 0) bench_mem_sample();
         total += got;
         if (r != FA_OK || got == 0) break;
     }
@@ -106,7 +107,7 @@ static int cmd_decode(const char* in, const char* outp, int prescan)
     double base, t0, open_ms;
     fa_stream* s;
     warm_up(in);
-    base = bench_current_kb();
+    base = bench_mem_start();
     t0 = bench_now_ms();
     s = open_stream(in, prescan, &open_ms);
     return decode_all(s, outp, t0, open_ms, base);
@@ -126,7 +127,7 @@ static int cmd_info(const char* in, int prescan)
 /* A track of a .cue image (or a drive), through fa_disc_open + fa_stream_open_disc. */
 static int cmd_disc(const char* cue, int track, const char* outp)
 {
-    double base = bench_current_kb(), t0 = bench_now_ms();
+    double base = bench_mem_start(), t0 = bench_now_ms();
     fa_open_options opts;
     fa_disc* disc = NULL;
     fa_stream* s = NULL;
@@ -197,7 +198,7 @@ static int cmd_multi(const char* in, int n)
     long long total = 0;
     int i, left = n;
     warm_up(in);
-    base = bench_current_kb();
+    base = bench_mem_start();
     t0 = bench_now_ms();
     for (i = 0; i < n; i++) {
         double ms;
@@ -207,6 +208,7 @@ static int cmd_multi(const char* in, int n)
     fa_stream_get_info(s[0], &info);
     buf = (float*)malloc(sizeof(float) * CHUNK * info.format.channels);
     while (left > 0) {
+        bench_mem_sample();
         for (i = 0; i < n; i++) {
             fa_frames got = 0;
             if (done[i]) continue;
@@ -237,7 +239,7 @@ static int cmd_loudness(const char* in)
     bench_num("lra", l.range_lu);
     printf(",");
     bench_num("true_peak", l.true_peak_dbtp);
-    printf(",\"total_ms\":%.3f,\"peak_kb\":%.0f}\n", bench_now_ms() - t0, bench_peak_kb());
+    printf(",\"total_ms\":%.3f,\"peak_kb\":%.0f}\n", bench_now_ms() - t0, bench_process_peak_kb());
     return 0;
 }
 
