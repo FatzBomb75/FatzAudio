@@ -9,7 +9,7 @@ A stream is anything that produces audio. You open it from a file, a memory bloc
 | WAV | RIFF, RIFX, RF64, Wave64, AIFF, AIFF-C (PCM, float, ADPCM, A-law, µ-law) | `pcm` (container `wav` or `aiff`) |
 | FLAC | Native FLAC, with or without a leading ID3v2 tag. Ogg FLAC and FLAC tracks in MP4 and Matroska decode with the same built-in decoder | `flac` |
 | MP3 | MPEG-1, 2 and 2.5 Layer III, with or without ID3v2 tags | `mp3` |
-| AAC (ADTS) | `.aac` files, AAC internet radio and AAC in HLS segments: AAC-LC, HE-AAC and HE-AAC v2 in ADTS frames, with or without ID3v2 tags | `aac` (container `adts`) |
+| AAC (ADTS) | `.aac` files, AAC internet radio and AAC in HLS segments: AAC-LC, HE-AAC, HE-AAC v2, AAC Main and AAC-LTP in ADTS frames, with or without ID3v2 tags ([AAC](#aac)) | `aac` (container `adts`) |
 | Ogg Opus, Ogg Vorbis, Ogg FLAC | `.opus`, `.ogg`, `.oga`, including chained files (one song after another) and Ogg files with several streams ([Ogg](#ogg-opus-and-ogg-vorbis)) | `opus`, `vorbis` or `flac` (container `ogg`) |
 | MP4, M4A, MOV | ISO MP4 and QuickTime, including fragmented MP4. Audio tracks only: video is never read | the track's codec: `aac`, `mp3`, `ac3`, `eac3`, `opus`, `flac`, `alac`, `pcm_*`, ... (container `mp4` or `mov`) |
 | Matroska, WebM | MKV, MKA, WebM, including live layouts (unknown sizes, no Cues). Audio tracks only | `aac`, `mp3`, `ac3`, `eac3`, `opus`, `vorbis`, `flac`, `pcm_*`, ... (container `matroska` or `webm`) |
@@ -17,11 +17,7 @@ A stream is anything that produces audio. You open it from a file, a memory bloc
 | WMA, ASF | `.wma`, `.asf` and `.wmv` files (Advanced Systems Format), local or over HTTP: Windows Media Audio 1, 2, 9 Professional, 9 Lossless and Voice, plus PCM, MP3 and AC-3 in ASF. Audio streams only ([WMA](#wma)) | `wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`, `pcm_*`, `mp3`, ... (container `asf`) |
 | MIDI | Standard MIDI Files (format 0, 1, 2), karaoke `.kar`, RIFF `.rmi`; played with a SoundFont 2 you load ([MIDI](midi.md)) | `midi` (container `smf` or `rmid`) |
 
-Inside MP4, Matroska and ASF, PCM, MP3, AC-3, E-AC-3, Opus, Vorbis, FLAC and ALAC tracks decode built in (ALAC to the bit, all channel layouts up to 7.1 and every bit depth). AAC (AAC-LC, HE-AAC, HE-AAC v2, and xHE-AAC where the system has it) decodes through the operating system's own decoders: Media Foundation on Windows, AudioToolbox on macOS and iOS, MediaCodec on Android. Every other codec (DTS, TrueHD, WMA outside Windows), AAC on Linux, and whatever a system's decoder turns down use the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`. The same goes for `.aac` files and AAC streams.
-
-The system AAC decoders give the same audio as FFmpeg's to within a decoder's rounding, not to the bit. HE-AAC plays at its full rate after SBR, so `format.sample_rate` can be twice the rate the container states; channels come out in the library's order ([channel order](dolby.md)) whichever decoder made them. ADTS frames cannot say whether they carry HE-AAC, nor can MP4 files that leave it implicit, so at 24 kHz and below AudioToolbox is told to expect it: a plain AAC-LC file at such a rate then plays at twice its rate (upsampled, and in stereo if it was mono), which sounds the same. When the ADTS headers of a stream change rate or channels (an HLS variant switch), the system decoder is set up again. The rare ADTS frames a system decoder cannot take (a channel layout in a program config element, several raw data blocks per frame) go to FFmpeg.
-
-An `.aac` file on disk or in memory is indexed when it opens (a quick pass over the frame headers, without decoding), so its length and seeks are exact. Over the network, and from your own read callbacks when they can seek, the length and seek positions are estimated from the frame sizes at the start, as for MP3 without a seek table. Junk between frames, such as a radio stream joined in the middle of a frame or ID3 tags between HLS segments, is skipped. ADTS has no field for the encoder delay, so the first 1024 samples (one frame: the encoder's priming in a file, half a frame's overlap when joining a radio stream) are dropped, as bass_aac does; the audio then starts on the first real sample of files from the usual encoders (FFmpeg, Apple, Fraunhofer), and the length is one frame shorter than the frames hold.
+Inside MP4, Matroska and ASF, PCM, MP3, AC-3, E-AC-3, Opus, Vorbis, FLAC and ALAC tracks decode built in (ALAC to the bit, all channel layouts up to 7.1 and every bit depth). AAC (AAC-LC, HE-AAC, HE-AAC v2, Main and LTP, up to 7.1) decodes built in as well, on every platform ([AAC](#aac)). Every other codec (DTS, TrueHD, WMA outside Windows, xHE-AAC where the system has no decoder for it) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`.
 
 More formats are added to the same registry (built-in or OS decoders for the codecs above follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
 
@@ -189,6 +185,42 @@ MP3 files decode built in (minimp3, inside miniaudio), in 32-bit float: nothing 
 - **Damaged files:** junk between frames is skipped, the same way when playing and when seeking; a frame that can't be decoded plays as silence so the timeline never shifts. A file cut off mid-frame plays up to its last whole frame.
 - **Over the network** the length comes from the Xing header (or the bitrate) and seeks jump to the estimated byte, as nothing past the playing position has been downloaded. Free-format files (no bitrate in the header) also use that decoder.
 - **Loudness scans** cut MP3 files into chunks on all cores like other formats ([normalization](normalization.md#why-the-scan-is-fast-even-on-large-video-files)).
+
+## AAC
+
+AAC decodes with FatzAudio's own decoder, the same on every platform, with no FFmpeg and no system codec. It plays `.aac` (ADTS) files, AAC radio and HLS, and AAC tracks in MP4/M4A/MOV, Matroska and video files, plus AAC packets you push ([FFmpeg hand-off](ffmpeg.md)).
+
+| Profile | Supported |
+|---|---|
+| AAC-LC | ✅ mono to 7.1, every sampling rate from 8 to 96 kHz, channel layouts from a program config element (PCE) |
+| HE-AAC (SBR) | ✅ mono to 7.1, signalled in the configuration or found in the stream (implicit) |
+| HE-AAC v2 (parametric stereo) | ✅ every PS mode: 10, 20 and 34 bands, fine and coarse IID, both mixing procedures, IPD/OPD phase |
+| AAC Main | ✅ with backward-adaptive prediction |
+| AAC-LTP | ✅ with long-term prediction |
+| xHE-AAC (USAC) | Through the system's decoder where there is one (Media Foundation, AudioToolbox, MediaCodec), otherwise the app's FFmpeg |
+| AAC SSR, low delay and the other error-resilient (ER) profiles, 960-sample frames | Not supported. MP4/MKV tracks with such a configuration go to the system's decoder or the app's FFmpeg; an `.aac` (ADTS) file of AAC SSR, the only one of these that ADTS can carry, returns `FA_ERROR_UNSUPPORTED_FORMAT` |
+
+The output matches FFmpeg's AAC decoder to float precision: about 136 dB SNR for AAC-LC, AAC Main and AAC-LTP and 90 to 130 dB for HE-AAC and HE-AAC v2 (measured on streams from Fraunhofer's encoder and FFmpeg's; the tests check every profile and PS mode). For PS phase data (IPD/OPD) the lowest QMF band differs slightly from FFmpeg, which conjugates the phase of its negative-frequency part only at the start of each interpolation; FatzAudio follows the standard there, as FAAD2 does.
+
+```c
+fa_stream* s;
+fa_stream_open_path(engine, "song.aac", NULL, &s);   /* or .m4a, .mp4, .mkv, an AAC radio URL */
+fa_stream_info info;
+fa_stream_get_info(s, &info);   /* info.codec "aac"; info.format.sample_rate is the rate after SBR */
+```
+
+```csharp
+using var s = engine.OpenFile("song.aac");
+Console.WriteLine($"{s.Info.Format.SampleRate} Hz, {s.Info.Format.Channels} channels");
+```
+
+- **Rate:** HE-AAC plays at its full rate after SBR, so `format.sample_rate` can be twice what the container or ADTS header states. A file that only signals HE-AAC inside its audio (implicit signalling, common in ADTS and in many MP4 files) is found from its first frame.
+- **Channels** come out in the standard speaker order ([channel order](dolby.md#channels)). Mono HE-AAC plays as stereo from the start unless its configuration rules parametric stereo out, because PS can switch on in any frame (the two channels are identical until it does). Quadraphonic sound plays as 5 channels with a silent centre.
+- **ADTS details:** frames with several raw data blocks, CRC-protected frames and layouts in a program config element all decode. When the headers change mid-stream (an HLS variant switch), the decoder follows them and the stream keeps its first format, converting the rest. Damaged frames play as silence of their length, so the timeline never shifts, and the stream carries on with the next good frame.
+- **Start and length:** ADTS has no field for the encoder delay, so the first 1024 samples (one frame: the encoder's priming in a file, half a frame's overlap when joining a radio stream) are dropped, as bass_aac does; the audio then starts on the first real sample of files from the usual encoders (FFmpeg, Apple, Fraunhofer), and the length is one frame shorter than the frames hold. MP4 files use their edit list, so they start on the first sample exactly.
+- **Indexing and seeking:** an `.aac` file on disk or in memory is indexed when it opens (a quick pass over the frame headers, without decoding), so its length and seeks are exact. Over the network, and from your own read callbacks when they can seek, the length and seek positions are estimated from the frame sizes at the start, as for MP3 without a seek table. Junk between frames, such as a radio stream joined in the middle of a frame or ID3 tags between HLS segments, is skipped.
+- **Pushed packets:** give AAC its AudioSpecificConfig as `extradata` (from MP4 or Matroska), or push whole ADTS frames (from MPEG-TS) with no `extradata` ([FFmpeg hand-off](ffmpeg.md)).
+- Not used: dynamic range control data in the stream (AAC's DRC, unlike Dolby's, is rarely sent), and coupling channel elements (a tool no current encoder writes).
 
 ## Ogg Opus and Ogg Vorbis
 

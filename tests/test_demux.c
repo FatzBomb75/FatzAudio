@@ -1,8 +1,7 @@
 /* White-box tests of the MP4 / MOV and Matroska / WebM demuxers, on the small
  * files in tests/data (make_demux_data.sh). Every audio track is a sine of its own
- * frequency and level, so the tests can tell which track came out. AAC tracks
- * need FFmpeg outside Windows, macOS, iOS and Android and are skipped when it is
- * not installed; the rest always run. */
+ * frequency and level, so the tests can tell which track came out. Every codec
+ * here is built in, so none of them needs FFmpeg. */
 #if !defined(_WIN32)
 #  define _POSIX_C_SOURCE 200809L
 #endif
@@ -213,7 +212,6 @@ static void test_mp4_info_and_tracks(void)
     CHECK(s == NULL);
 
     r = open_file("av_tracks.mp4", 2, &s);
-    SKIP_NO_FFMPEG(r);
     CHECK_EQ(r, FA_OK);
     CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
     CHECK(strcmp(info.codec, "aac") == 0);
@@ -263,7 +261,6 @@ static void test_m4a_aac(void)
     int64_t n;
     double worst;
     fa_result r = open_file("aac.m4a", -1, &s);
-    SKIP_NO_FFMPEG(r);
     CHECK_EQ(r, FA_OK);
     CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
     CHECK(strcmp(info.codec, "aac") == 0);
@@ -510,7 +507,6 @@ static void test_adts_file(void)
     int64_t n;
     double worst;
     fa_result r = open_file("net/tone.aac", -1, &s);
-    SKIP_NO_FFMPEG(r);
     CHECK_EQ(r, FA_OK);
     CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
     CHECK(strcmp(info.codec, "aac") == 0);
@@ -574,7 +570,6 @@ static void test_adts_junk_and_tags(void)
     fa_open_options_init(&o);
     o.flags = FA_OPEN_DECODE_ONLY;
     r = fa_stream_open_memory(g_engine, data, size, &o, &s);
-    SKIP_NO_FFMPEG(r);
     CHECK_EQ(r, FA_OK);
     CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
     CHECK(strcmp(info.container, "adts") == 0);
@@ -634,7 +629,6 @@ static void test_adts_junk_and_format_change(void)
     fa_open_options_init(&o);
     o.flags = FA_OPEN_DECODE_ONLY;
     r = fa_stream_open_memory(g_engine, buf, n, &o, &s);
-    if (r == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); free(a); free(b); free(buf); return; }
     CHECK_EQ(r, FA_OK);
     CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
     CHECK_EQ(info.format.sample_rate, 44100);
@@ -1203,7 +1197,6 @@ static void test_aac_51_channel_order(void)
     int64_t n;
     uint32_t k;
     fa_result r = open_file("aac51.m4a", -1, &s);
-    SKIP_NO_FFMPEG(r);
     CHECK_EQ(r, FA_OK);
     CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
     CHECK(strcmp(info.codec, "aac") == 0);
@@ -1249,7 +1242,6 @@ static void test_adts_start(void)
     int64_t n;
     double lag, period = 44100 / 440.0;
     fa_result r = open_file("net/tone.aac", -1, &s);
-    SKIP_NO_FFMPEG(r);
     CHECK_EQ(r, FA_OK);
     full = read_all(s, 2, &n);
     lag = sine_lag(full, 4410, 44100, 2, 44100);
@@ -1368,7 +1360,7 @@ int main(void)
     cfg.flags = FA_ENGINE_NULL_OUTPUT;
     cfg.worker_threads = 2;
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) { fprintf(stderr, "engine create failed\n"); return 1; }
-    printf("FFmpeg %s\n", fa_ffmpeg_load(NULL) == FA_OK ? "found" : "not found: AAC and Opus tracks are skipped");
+    printf("FFmpeg %s\n", fa_ffmpeg_load(NULL) == FA_OK ? "found" : "not found");
 
     RUN(test_aac_config_explicit_rates);
     RUN(test_os_codec_helpers);

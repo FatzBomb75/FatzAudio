@@ -1,4 +1,4 @@
-/* White-box tests of push streams, packet decoding (built-in and FFmpeg) and the
+/* White-box tests of push streams, packet decoding and the
  * presentation clock. As in test_crossfade.c the device is opened on the null
  * backend but never started: the test plays the audio thread, here with
  * fa_device_render_at and a made-up timeline, so the clock can be checked to the
@@ -777,7 +777,6 @@ static void decode_file(const char* file, const char* codec, uint32_t rate, uint
     fa_open_options_init(&o);
     o.flags = FA_OPEN_DECODE_ONLY;
     r = fa_stream_open_packets(g_engine, &p, &o, &s);
-    if (r == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); free(data); return; }
     CHECK_EQ(r, FA_OK);
     while (at < size) {
         fa_packet pk;
@@ -833,22 +832,29 @@ static void test_ac3_packets_cut_anywhere(void)
     decode_file("tone.eac3", "eac3", 48000, 2, cut_1000, 24576, 1600);
 }
 
-/* AAC packets (ADTS frames): the system's decoder on Windows, macOS, iOS and
- * Android, FFmpeg elsewhere (skipped when there is neither). */
-static void test_ffmpeg_aac(void)
+/* What FFmpeg the app has, when it has one (nothing here needs it). */
+static void test_ffmpeg_info(void)
 {
     fa_ffmpeg_info fi;
-    if (fa_ffmpeg_load(NULL) == FA_OK) {
-        CHECK_EQ(fa_ffmpeg_get_info(&fi), FA_OK);
-        CHECK_EQ(fi.loaded, 1);
-        CHECK(fi.avcodec_version >> 16 >= 58);
-        printf("  libavcodec %u.%u at %s\n", fi.avcodec_version >> 16, (fi.avcodec_version >> 8) & 255, fi.avcodec_path);
+    if (fa_ffmpeg_load(NULL) != FA_OK) {
+        printf("  (FFmpeg not found)\n");
+        return;
     }
+    CHECK_EQ(fa_ffmpeg_get_info(&fi), FA_OK);
+    CHECK_EQ(fi.loaded, 1);
+    CHECK(fi.avcodec_version >> 16 >= 58);
+    printf("  libavcodec %u.%u at %s\n", fi.avcodec_version >> 16, (fi.avcodec_version >> 8) & 255, fi.avcodec_path);
+}
+
+/* AAC packets (ADTS frames, as demuxers hand them over) decode natively. */
+static void test_aac_packets(void)
+{
     decode_file("tone.aac", "aac", 48000, 2, adts_len, 24000, 2200);
 }
 
 /* ADTS whose headers change mid-stream (an HLS variant switch): 48 kHz stereo,
- * then 32 kHz mono. The system's decoders are set up again for the second part. */
+ * then 32 kHz mono. The decoder follows the headers; the stream keeps its first
+ * format (the second part is converted to it). */
 static void test_aac_switch(void)
 {
     fa_codec_params p;
@@ -868,7 +874,6 @@ static void test_aac_switch(void)
     fa_open_options_init(&o);
     o.flags = FA_OPEN_DECODE_ONLY;
     r = fa_stream_open_packets(g_engine, &p, &o, &s);
-    if (r == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); free(data); return; }
     CHECK_EQ(r, FA_OK);
     while (at < size) {
         fa_packet pk;
@@ -990,7 +995,8 @@ int main(void)
     RUN(test_mp3_packets_cut_anywhere);
     RUN(test_ac3_eac3_packets);
     RUN(test_ac3_packets_cut_anywhere);
-    RUN(test_ffmpeg_aac);
+    RUN(test_ffmpeg_info);
+    RUN(test_aac_packets);
     RUN(test_aac_switch);
     RUN(test_packets_play_on_device);
     RUN(test_bad_arguments);

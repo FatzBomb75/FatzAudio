@@ -30,6 +30,7 @@ typedef struct adts_hdr {
     uint32_t channels;   /* 0: the layout is inside the frame (a program config element) */
     uint32_t samples;    /* 1024 per raw data block */
     uint8_t config;      /* sampling frequency index and channel configuration */
+    uint8_t profile;     /* 0 Main, 1 LC, 2 SSR, 3 LTP */
 } adts_hdr;
 
 typedef struct adts_frame {
@@ -84,6 +85,7 @@ static int adts_parse(const uint8_t* p, adts_hdr* out)
     out->channels = layout[cfg];
     out->samples = 1024u * ((p[6] & 3) + 1u);
     out->config = (uint8_t)((sfi << 3) | cfg);
+    out->profile = (uint8_t)(p[2] >> 6);
     return 1;
 }
 
@@ -373,7 +375,7 @@ static fa_result adts_open(fa_decoder* dec)
     /* The first frame (after any tag or junk), whose header sets the configuration. */
     a->may_seek = src->kind != FA_SOURCE_IO;
     r = adts_sync(a, &h);
-    if (r != FA_OK) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
+    if (r != FA_OK || h.profile == 2) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }   /* no decoder has AAC SSR */
     a->data_start = fa_br_tell(&a->br) - (int64_t)a->h_n;
     a->base_rate = h.rate;
 

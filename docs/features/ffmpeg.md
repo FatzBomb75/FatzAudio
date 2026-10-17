@@ -9,14 +9,14 @@ For apps that already read the file themselves, usually with FFmpeg because of t
 | Interleaved PCM | `fa_stream_push_pcm` (.NET `Push`) | Plays it |
 | A video renderer to keep in sync | `fa_stream_get_clock` (.NET `Clock`) | Reports the pts of the audio leaving the speaker right now, in your own timeline |
 
-FatzAudio never links or ships FFmpeg. Packet streams decode PCM, MP3, AC-3 and E-AC-3 (Dolby Digital and Dolby Digital Plus, see [Dolby Digital](dolby.md)), Opus, Vorbis, FLAC and ALAC themselves and use the FFmpeg your app already loaded for everything else: DTS, TrueHD and so on. Some codecs go to the operating system's own decoders first, so they play without FFmpeg, and FFmpeg is only the fallback when the system turns the stream down:
+FatzAudio never links or ships FFmpeg. Packet streams decode PCM, MP3, AAC (LC, HE-AAC, HE-AAC v2, Main and LTP, see [AAC](streams.md#aac)), AC-3 and E-AC-3 (Dolby Digital and Dolby Digital Plus, see [Dolby Digital](dolby.md)), Opus, Vorbis, FLAC and ALAC themselves and use the FFmpeg your app already loaded for everything else: DTS, TrueHD and so on. Some codecs go to the operating system's own decoders first, so they play without FFmpeg, and FFmpeg is only the fallback when the system turns the stream down:
 
 | Codec | Windows | macOS, iOS | Android | Linux |
 |---|---|---|---|---|
-| AAC (`aac`: LC, HE-AAC, HE-AAC v2) | Media Foundation | AudioToolbox (also xHE-AAC where the system has it) | MediaCodec | FFmpeg |
+| xHE-AAC (`aac` with a USAC configuration) | Media Foundation where the system has it | AudioToolbox where the system has it | MediaCodec where the system has it | FFmpeg |
 | WMA (`wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`) | Media Foundation | FFmpeg | FFmpeg | FFmpeg |
 
-Give AAC its AudioSpecificConfig as `extradata` (`codecpar->extradata` from MP4 or Matroska); ADTS packets (from MPEG-TS) need none, their headers are taken off. ALAC needs its 24-byte configuration or the `alac` box that holds it. WMA needs `extradata` (the bytes after the WAVEFORMATEX) and `block_align`. A system decoder's audio matches FFmpeg's to within a decoder's rounding, not to the bit; HE-AAC can come out at twice the rate the stream states, which the stream's format reports.
+Give AAC its AudioSpecificConfig as `extradata` (`codecpar->extradata` from MP4 or Matroska); whole ADTS frames (from MPEG-TS) need none. ALAC needs its 24-byte configuration or the `alac` box that holds it. WMA needs `extradata` (the bytes after the WAVEFORMATEX) and `block_align`. A system decoder's audio matches FFmpeg's to within a decoder's rounding, not to the bit. HE-AAC comes out at twice the rate the stream states, which the stream's format reports.
 
 FLAC packets (`codec = "flac"`) take FFmpeg's extradata as it is: the 34-byte STREAMINFO, with or without a `fLaC` marker and block header in front. Without extradata the frame headers and the `sample_rate`, `channels` and `bits_per_coded_sample` you give are enough.
 

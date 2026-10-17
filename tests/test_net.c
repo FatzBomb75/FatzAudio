@@ -1175,7 +1175,6 @@ static void test_aac_over_http(void)
     float *got, *ref, buf[2048 * 2];
     double err = 0;
     int i;
-    if (r == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); return; }
     CHECK_EQ(r, FA_OK);
     if (!s) return;
     fa_stream_get_info(s, &info);
@@ -1291,7 +1290,6 @@ static void test_aac_radio(void)
     float buf[4096 * 2];
     fa_frames total = 0;
     double song2_at = (double)RADIO_SONG2 / (double)g_aac_n * AAC_FRAMES;
-    if (r == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); return; }
     CHECK_EQ(r, FA_OK);
     if (!s) return;
     memset(&log, 0, sizeof(log));
@@ -1324,7 +1322,6 @@ static void test_hls_aac(void)
     float *got, *ref, buf[4096 * 2];
     double err = 0;
     int i;
-    if (r == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); return; }
     CHECK_EQ(r, FA_OK);
     if (!s) return;
     fa_stream_get_info(s, &info);
