@@ -9,6 +9,7 @@ was found (a PR, a review, or a thread).
 
 | Date | Area | Issue | Found in |
 |---|---|---|---|
+| 2026-10-17 | Tests | `test_reconnect_resumes` in tests/test_net.c can fail under heavy CPU load (`st.finished` still 0 right after the last frame is read): the download thread may not have recorded the end yet. Fails on main too; the check needs a short wait for `finished`. | Tempo and pitch thread |
 | 2026-10-17 | Tempo/pitch | A tempo, pitch or rate ramp raises `FA_EVENT_RAMP_DONE` when its end is applied on the decode side, up to `latency_ms` (150 ms) before that end is heard; volume and pan ramps report when it is heard. Queueing the event until the ring frame plays would make them match. Documented in the feature guide. | Tempo and pitch thread (/code-review) |
 | 2026-10-17 | Tempo/pitch | The phase vocoder leaves a faint pre-echo before sharp hits (about -25 dB, measured by `tools/tempo-compare`); bass_fx and SoundTouch have none but move the hits by 2 to 24 ms. A transient-preserving mode (or evaluating the Bungee stretcher) could remove it for drum-heavy material. | Tempo and pitch thread |
 | 2026-10-17 | Resampling | Device-rate conversion still uses miniaudio's linear resampler, while rate and pitch use the new windowed-sinc resampler (`src/resample.c`). Moving the device-rate converter onto the sinc resampler leaves one resampler and improves 44.1 to 48 kHz playback. | Tempo and pitch thread |

@@ -81,8 +81,11 @@ endif()
 add_library(fatzaudio SHARED ${FA_SOURCES})
 set_source_files_properties(src/stretch.cpp PROPERTIES
     INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/signalsmith)
-if(MINGW)
-    # No libstdc++/libgcc DLLs next to fatzaudio.dll.
+# One self-contained binary: no compiler runtime DLLs next to fatzaudio.dll (the
+# C API hands no CRT objects across, so the app may use any runtime).
+if(MSVC)
+    set_property(TARGET fatzaudio PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+elseif(MINGW)
     target_link_options(fatzaudio PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
