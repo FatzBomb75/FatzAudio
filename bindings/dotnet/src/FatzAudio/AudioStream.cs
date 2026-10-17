@@ -187,7 +187,9 @@ public unsafe class AudioStream : IDisposable
     /// </example>
     public void Detach()
     {
-        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_detach(Handle));
+        var h = Handle;
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_detach(h));
+        h.DetachDevice();
         _device = null;
     }
 
@@ -258,10 +260,10 @@ public unsafe class AudioStream : IDisposable
     }
 
     /// <summary>
-    /// Presentation time of the audio currently leaving the speaker, device latency included.
-    /// Video and lyric renderers should follow this clock.
+    /// Presentation time of the audio currently leaving the speaker: the position minus the device
+    /// latency. Video and lyric renderers should follow this clock.
     /// </summary>
-    /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
     public TimeSpan Clock
     {
         get
@@ -307,13 +309,17 @@ public unsafe class AudioStream : IDisposable
     /// <param name="value">The new value.</param>
     public void SetParameter(AudioParameter parameter, float value) => SetParam(parameter, value);
 
-    /// <summary>Ramps a parameter to a target value over time, starting now. Returns immediately.</summary>
+    /// <summary>
+    /// Ramps a parameter from its current value to a target over time and returns immediately.
+    /// Ramps advance with playback (they wait while the stream is paused or not playing yet), so
+    /// "ramp volume to 1, then play" is a fade-in. Use <see cref="RampAsync"/> to await the end.
+    /// </summary>
     /// <param name="parameter">The parameter to ramp.</param>
     /// <param name="target">Target value.</param>
     /// <param name="duration">Ramp length.</param>
     /// <param name="curve">Ramp shape; defaults to <see cref="Curve.Linear"/>.</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="duration"/> is negative.</exception>
-    /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
+    /// <exception cref="FatzAudioException">The parameter cannot be ramped yet (<see cref="ErrorCode.NotImplemented"/> for rate, tempo and pitch).</exception>
     /// <example>
     /// <code>
     /// song.Ramp(AudioParameter.Volume, 0f, TimeSpan.FromSeconds(3), Curve.EqualPower); // fade out
@@ -327,14 +333,19 @@ public unsafe class AudioStream : IDisposable
             Handle, (int)parameter, target, TimeConvert.ToNanoseconds(duration), 0, &ramp));
     }
 
-    /// <summary>Starts a ramp and completes when it has finished.</summary>
+    /// <summary>
+    /// Starts a ramp and completes when the engine reports it finished: when the parameter
+    /// reaches <paramref name="target"/>, or when a newer ramp or a direct set of the same parameter
+    /// replaces it. Ramps advance with playback, so on a paused stream the task completes after resuming.
+    /// </summary>
     /// <param name="parameter">The parameter to ramp.</param>
     /// <param name="target">Target value.</param>
     /// <param name="duration">Ramp length.</param>
     /// <param name="curve">Ramp shape; defaults to <see cref="Curve.Linear"/>.</param>
     /// <param name="cancellationToken">Cancels the wait (the native ramp continues).</param>
-    /// <returns>A task that completes after <paramref name="duration"/>.</returns>
-    /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
+    /// <returns>A task that completes when the ramp has finished.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="duration"/> is negative.</exception>
+    /// <exception cref="FatzAudioException">The parameter cannot be ramped yet (<see cref="ErrorCode.NotImplemented"/> for rate, tempo and pitch).</exception>
     /// <example>
     /// <code>
     /// await song.RampAsync(AudioParameter.Volume, 0f, TimeSpan.FromSeconds(2));
@@ -344,9 +355,41 @@ public unsafe class AudioStream : IDisposable
     public Task RampAsync(AudioParameter parameter, float target, TimeSpan duration, Curve? curve = null,
         CancellationToken cancellationToken = default)
     {
-        Ramp(parameter, target, duration, curve);
-        return Task.Delay(duration, cancellationToken);
+        if (duration < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(duration));
+        long tag = Interlocked.Increment(ref _nextRampTag);
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_ramps) _ramps[tag] = tcs;
+        try
+        {
+            var ramp = (curve ?? Curve.Linear).ToNative();
+            ramp.Tag = tag;
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_ramp_param(
+                Handle, (int)parameter, target, TimeConvert.ToNanoseconds(duration), 0, &ramp));
+        }
+        catch
+        {
+            lock (_ramps) _ramps.Remove(tag);
+            throw;
+        }
+        if (!cancellationToken.CanBeCanceled) return tcs.Task;
+        return tcs.Task.WaitAsync(cancellationToken);
     }
+
+    private readonly Dictionary<long, TaskCompletionSource> _ramps = new();
+    private long _nextRampTag;
+
+    private void CompleteRamp(long tag)
+    {
+        TaskCompletionSource? tcs;
+        lock (_ramps)
+        {
+            if (!_ramps.Remove(tag, out tcs)) return;
+        }
+        tcs.TrySetResult();
+    }
+
+    /// <summary>Raised when a ramp finished (reached its target or was replaced). Raised on the engine's event thread.</summary>
+    public event EventHandler<StreamEventArgs>? RampCompleted;
 
     /// <summary>Marker positions (cue in/out, fades, mix point).</summary>
     public StreamMarkers Markers { get; }
@@ -481,23 +524,23 @@ public unsafe class AudioStream : IDisposable
 
     // ---- Events ---------------------------------------------------------------
 
-    /// <summary>Raised when playback reaches the end of the source. Raised on a native engine thread; handlers must be quick.</summary>
+    /// <summary>Raised when playback reaches the end of the source. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? Ended;
-    /// <summary>Raised when tags or stream metadata (for example an ICY title) changed. Raised on a native engine thread; handlers must be quick.</summary>
+    /// <summary>Raised when tags or stream metadata (for example an ICY title) changed. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? MetadataChanged;
-    /// <summary>Raised when playback stalls waiting for data. Raised on a native engine thread; handlers must be quick.</summary>
+    /// <summary>Raised when playback stalls waiting for data. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? Stalled;
-    /// <summary>Raised when playback resumes after a stall. Raised on a native engine thread; handlers must be quick.</summary>
+    /// <summary>Raised when playback resumes after a stall. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? Resumed;
-    /// <summary>Raised when a recoverable decode error occurred (data skipped, playback continues). Raised on a native engine thread; handlers must be quick.</summary>
+    /// <summary>Raised when a recoverable decode error occurred (data skipped, playback continues). Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? DecodeError;
-    /// <summary>Raised when the loudness measurement is complete. Raised on a native engine thread; handlers must be quick.</summary>
+    /// <summary>Raised when the loudness measurement is complete. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? LoudnessFinal;
-    /// <summary>Raised when a position requested with <see cref="AddPositionEvent"/> is reached. Raised on a native engine thread; handlers must be quick.</summary>
+    /// <summary>Raised when a position requested with <see cref="AddPositionEvent"/> is reached. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler<StreamEventArgs>? PositionReached;
-    /// <summary>Raised when a marker is passed. Raised on a native engine thread; handlers must be quick.</summary>
+    /// <summary>Raised when a marker is passed. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler<StreamEventArgs>? MarkerReached;
-    /// <summary>Raised when the output device changed. Raised on a native engine thread; handlers must be quick.</summary>
+    /// <summary>Raised when the output device changed. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler<StreamEventArgs>? DeviceChanged;
 
     /// <summary>
@@ -559,6 +602,10 @@ public unsafe class AudioStream : IDisposable
                 case 6: DecodeError?.Invoke(this, EventArgs.Empty); break;
                 case 7: DeviceChanged?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
                 case 8: LoudnessFinal?.Invoke(this, EventArgs.Empty); break;
+                case 9:
+                    CompleteRamp(value);
+                    RampCompleted?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value));
+                    break;
             }
         }
         catch
@@ -580,7 +627,15 @@ public unsafe class AudioStream : IDisposable
     /// <param name="disposing">True when called from <see cref="Dispose()"/>.</param>
     protected virtual void Dispose(bool disposing)
     {
-        if (disposing) _handle.Dispose();
+        if (!disposing) return;
+        _handle.Dispose();
+        List<TaskCompletionSource> pending;
+        lock (_ramps)
+        {
+            pending = [.. _ramps.Values];
+            _ramps.Clear();
+        }
+        foreach (var t in pending) t.TrySetCanceled();
     }
 }
 

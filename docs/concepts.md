@@ -27,7 +27,7 @@ In .NET, errors become a `FatzAudioException` with an `ErrorCode`.
 
 - The **audio thread** only mixes buffers that are already prepared. It never decodes, waits for locks, allocates or does I/O.
 - **Worker threads** decode, stretch, resample and normalize each stream ahead of time into a ring buffer (about 500 ms by default).
-- Event and DSP **callbacks run on engine threads**. Keep them short and never call blocking APIs from them.
+- Event callbacks run on the engine's **event thread**, never on the audio thread, so they may call any FatzAudio function. DSP callbacks (planned) will run on worker threads.
 - All API functions are thread-safe unless their documentation says otherwise.
 
-> Current scaffold: decoding still happens in the device callback and stream lists use a mutex. The worker-thread pipeline above is the next step in the build order.
+Details, including the buffer length option and transport timing: [playback.md](features/playback.md). Event delivery: [events.md](features/events.md).
