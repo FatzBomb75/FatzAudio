@@ -712,6 +712,9 @@ static void test_mp3(void)
     uint8_t* bytes;
     int k;
     if (fa_lame_load(NULL) != FA_OK) {
+        /* CI installs LAME and sets this, so a missing LAME fails there instead of skipping */
+        const char* req = getenv("FA_TEST_REQUIRE_LAME");
+        CHECK(!(req && req[0] == '1'));
         printf("  LAME not installed: skipped\n");
         return;
     }
