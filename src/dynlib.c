@@ -65,7 +65,7 @@ void fa_lib_close(void* lib, int already_loaded_only)
 
 void fa_lib_where(void* lib, const char* symbol, char* out, size_t cap)
 {
-#  if defined(__GLIBC__) || defined(__APPLE__)
+#  if defined(__GLIBC__) || defined(__APPLE__) || defined(__ANDROID__)
     Dl_info info;
     void* f = dlsym(lib, symbol);
     if (f && dladdr(f, &info) && info.dli_fname) { snprintf(out, cap, "%s", info.dli_fname); return; }

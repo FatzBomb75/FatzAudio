@@ -9,6 +9,9 @@ was found (a PR, a review, or a thread).
 
 | Date | Area | Issue | Found in |
 |---|---|---|---|
+| 2026-10-17 | CI | No Android or iOS jobs in CI yet (still TODOs in `.github/workflows/build.yml`, waiting on a decision about runner minutes). Android was built and tested by hand with `tools/android-test/run.sh`; iOS has never been compiled. | Android and iOS thread |
+| 2026-10-17 | iOS | `tools/build-xcframework.sh` and the iOS settings in `CMakeLists.txt` (framework, miniaudio as Objective-C, system frameworks) have not run yet: no Mac here. Also untested: whether the .NET binding's `LibraryImport("fatzaudio")` finds `fatzaudio.framework` in a .NET for iOS app, or needs the `@rpath/fatzaudio.framework/fatzaudio` name there. | Android and iOS thread |
+| 2026-10-17 | Android | Audio output (AAudio, OpenSL ES) and the MediaCodec decoders have not run on a device or emulator: the Android test run uses a chroot without Android's system services, where tests use the silent output. Worth a check on a phone, including recording. | Android and iOS thread |
 | 2026-10-17 | MIDI | Not done yet: SF3 soundfonts (Ogg Vorbis compressed samples; needs the Vorbis decoder) and SFZ instruments. Both fail with `FA_ERROR_UNSUPPORTED_FORMAT` today. | MIDI thread |
 | 2026-10-17 | MIDI | Not done yet: MIDI input from devices (BASS_MIDI_In*), a real-time MIDI stream fed with events (BASS_MIDI_StreamCreate, BASS_MIDI_StreamEvent for notes, programs and controllers), and key/time signature and tempo marks. | MIDI thread |
 | 2026-10-17 | MIDI | No reverb or chorus (TinySoundFont has no effects): CC91/CC93 and the soundfonts' effect sends are ignored, so files sound drier than in BASSMIDI or FluidSynth. | MIDI thread |
@@ -62,4 +65,3 @@ was found (a PR, a review, or a thread).
 | 2026-10-17 | Web streams | MP4/MKV URLs and fMP4 HLS segments reach the MP4 and Matroska demuxers but are untested over the network so far. | Web streams thread, PR 8 merge |
 | 2026-10-17 | Web streams | Android has no HTTPS transport yet (HttpURLConnection through JNI); `https://` returns `FA_ERROR_PROVIDER_MISSING` there. | Web streams thread |
 | 2026-10-17 | Web streams | The macOS/iOS URLSession backend (`src/net_https_apple.m`) compiles in CI but has not been run against a real server; worth a radio and HLS check on a Mac. | Web streams thread |
-| 2026-10-17 | CI | Android and iOS build-only jobs are still TODOs in `.github/workflows/build.yml`. | CI trigger trim |
