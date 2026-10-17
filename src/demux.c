@@ -223,6 +223,19 @@ int64_t fa_demux_packet_samples(const char* codec, uint32_t channels, uint32_t r
         *out_rate = rate;
         return flac_samples(d, n);
     }
+    /* ALAC: only a partial frame (a file's last) says its size; a whole one holds
+     * the frame length of the codec's configuration. The first element's header:
+     * type (3 bits), tag (4), unused (12), partial (1), shift (2), verbatim (1),
+     * then the 32-bit count. */
+    if (strcmp(codec, "alac") == 0 && rate > 0 && n >= 7) {
+        uint32_t type = d[0] >> 5;
+        if ((type == 0 || type == 1 || type == 3) && (d[2] & 0x10)) {
+            uint64_t v = ((uint64_t)d[2] << 32) | ((uint64_t)d[3] << 24) | ((uint64_t)d[4] << 16) |
+                         ((uint64_t)d[5] << 8) | d[6];
+            *out_rate = rate;
+            return (int64_t)((v >> 1) & 0xFFFFFFFFu);
+        }
+    }
     return -1;
 }
 

@@ -1,4 +1,4 @@
-/* AAC and ALAC through Android's MediaCodec (the NDK's AMediaCodec): the
+/* AAC through Android's MediaCodec (the NDK's AMediaCodec): the
  * device's own decoders, one packet in, interleaved float out.
  *
  * libmediandk.so is loaded at run time (Android 5.0, API 21, and later), never
@@ -6,13 +6,10 @@
  * rather than taken from the NDK's headers. When anything is missing (the
  * library, a decoder for the type, the configuration), opening returns
  * FA_ERROR_UNSUPPORTED_FORMAT and codec.c tries the app's FFmpeg instead.
- *  - AAC: "audio/mp4a-latm" with the AudioSpecificConfig as "csd-0"; ADTS frames
- *    lose their header first (codec_os.c).
- *  - ALAC: "audio/alac" (Android 13 and later decode it) with the 24-byte
- *    ALACSpecificConfig as "csd-0".
+ * AAC is "audio/mp4a-latm" with the AudioSpecificConfig as "csd-0"; ADTS frames
+ * lose their header first (codec_os.c).
  * Float output is asked for (Android 7.0 and later honour "pcm-encoding"); 16-bit
- * output is converted. MediaCodec's channel order is WAVE's, the library's, for
- * AAC; ALAC of more than two channels goes to FFmpeg (see fa_mc_codec_open).
+ * output is converted. MediaCodec's channel order is WAVE's, the library's.
  * MediaCodec works asynchronously: output can trail input by a packet or more,
  * which the track decoder allows for (it anchors the audio on the first packet). */
 #if defined(__ANDROID__)
@@ -263,18 +260,6 @@ fa_result fa_mc_codec_open(fa_codec* c, const fa_codec_params* p)
         frames = 1024;
         ch = fa_aac_config_channels(info.channel_config);
         if (ch == 0) ch = p->channels;
-    } else if (strcmp(p->codec, "alac") == 0) {
-        fa_alac_info a;
-        mime = "audio/alac";
-        if (!fa_alac_parse_config((const uint8_t*)p->extradata, p->extradata_size, &a)) return FA_ERROR_UNSUPPORTED_FORMAT;
-        memcpy(csd, a.config, 24);
-        csd_n = 24;
-        rate = a.rate;
-        ch = a.channels;
-        frames = a.frame_length;
-        /* ALAC's own channel order (centre first) is not WAVE's, and what the
-         * system's decoder gives is not documented: FFmpeg reorders. */
-        if (ch > 2) return FA_ERROR_UNSUPPORTED_FORMAT;
     } else {
         return FA_ERROR_UNSUPPORTED_FORMAT;
     }

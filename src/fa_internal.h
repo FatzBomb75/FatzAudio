@@ -978,17 +978,17 @@ fa_result fa_ffmpeg_open_codec(fa_codec* c, const fa_codec_params* p);
 fa_result fa_mf_codec_open(fa_codec* c, const fa_codec_params* p);
 #endif
 #ifdef __APPLE__
-/* codec_at.c: AAC (LC, HE, HE v2, xHE where the system has it) and ALAC through
+/* codec_at.c: AAC (LC, HE, HE v2, xHE where the system has it) through
  * AudioToolbox's AudioConverter. FA_ERROR_UNSUPPORTED_FORMAT: FFmpeg next. */
 fa_result fa_at_codec_open(fa_codec* c, const fa_codec_params* p);
 #endif
 #ifdef __ANDROID__
-/* codec_mediacodec.c: AAC and ALAC through the NDK's AMediaCodec (libmediandk.so,
+/* codec_mediacodec.c: AAC through the NDK's AMediaCodec (libmediandk.so,
  * loaded at run time). FA_ERROR_UNSUPPORTED_FORMAT: FFmpeg next. */
 fa_result fa_mc_codec_open(fa_codec* c, const fa_codec_params* p);
 #endif
 
-/* codec_os.c: stream details for the operating systems' AAC and ALAC decoders. */
+/* codec_os.c: stream details for the operating systems' AAC decoders. */
 typedef struct fa_aac_asc_info {
     int object_type;            /* of the core: 2 = LC (after explicit SBR/PS signalling) */
     uint32_t rate;              /* core sampling rate */
@@ -1006,11 +1006,6 @@ size_t fa_aac_os_asc(const fa_codec_params* p, int he_guess, uint8_t* out, size_
 int fa_adts_strip(const uint8_t** data, size_t* size);
 /* An MPEG-4 ES descriptor holding the AudioSpecificConfig (an 'esds' box's contents). */
 size_t fa_aac_esds(const uint8_t* asc, size_t n, uint8_t* out, size_t cap);
-typedef struct fa_alac_info {
-    const uint8_t* config;      /* the 24-byte ALACSpecificConfig, within the extradata */
-    uint32_t frame_length, rate, channels, bit_depth;
-} fa_alac_info;
-int fa_alac_parse_config(const uint8_t* p, size_t n, fa_alac_info* out);   /* 1 if valid */
 /* From Core Audio channel labels to the library's channel order: src_of_dst[i] is the
  * decoder's channel for the library's channel i; 1 if it is not the identity. */
 int fa_os_channel_map(const uint32_t* labels, uint32_t n, uint32_t* src_of_dst);
@@ -1021,6 +1016,14 @@ void fa_ffmpeg_codec_option(fa_codec* c, const char* name, const char* value);
 /* codec_flac.c: the built-in FLAC codec (dr_flac), one frame per packet.
  * FA_ERROR_UNSUPPORTED_FORMAT without STREAMINFO or usable parameters. */
 fa_result fa_flac_codec_open(fa_codec* c, const fa_codec_params* p);
+/* codec_alac.c: the built-in ALAC decoder, from the ALACSpecificConfig (bare, in
+ * its 'alac' box, or after a 'frma' box) in the extradata. */
+fa_result fa_alac_codec_open(fa_codec* c, const fa_codec_params* p);
+typedef struct fa_alac_info {
+    const uint8_t* config;      /* the 24-byte ALACSpecificConfig, within the extradata */
+    uint32_t frame_length, rate, channels, bit_depth;
+} fa_alac_info;
+int fa_alac_parse_config(const uint8_t* p, size_t n, fa_alac_info* out);   /* 1 if valid */
 /* Rate, channels and bit depth from a 34-byte FLAC STREAMINFO. */
 void fa_flac_streaminfo_format(const uint8_t* si, uint32_t* rate, uint32_t* channels, uint32_t* bits);
 

@@ -1,8 +1,8 @@
 /* White-box tests of the MP4 / MOV and Matroska / WebM demuxers, on the small
  * files in tests/data (make_demux_data.sh). Every audio track is a sine of its own
- * frequency and level, so the tests can tell which track came out. Tracks that
- * need FFmpeg (AAC and ALAC, outside Windows, macOS, iOS and Android) are skipped
- * when it is not installed; MP3 and PCM tracks always run. */
+ * frequency and level, so the tests can tell which track came out. AAC tracks
+ * need FFmpeg outside Windows, macOS, iOS and Android and are skipped when it is
+ * not installed; the rest always run. */
 #if !defined(_WIN32)
 #  define _POSIX_C_SOURCE 200809L
 #endif
@@ -28,7 +28,7 @@ static int g_failures = 0;
 
 static fa_engine* g_engine;
 
-/* AAC and ALAC go to the system's decoders on Windows, macOS, iOS and Android
+/* AAC goes to the system's decoders on Windows, macOS, iOS and Android
  * (codec_mf.c, codec_at.c, codec_mediacodec.c), to FFmpeg elsewhere. Checks of
  * AAC audio hold for any decoder (tones, levels, lengths, positions); a seek
  * matches the full decode to the bit only where FFmpeg is known to be the one. */
@@ -876,7 +876,8 @@ static void exercise_memory(const uint8_t* data, size_t size, int32_t track)
 
 static void test_damaged_files_do_not_crash(void)
 {
-    static const char* names[] = { "av_tracks.mp4", "aac.m4a", "pcm.mov", "frag.mp4", "av_tracks.mkv", "opus.webm", "net/tone.aac" };
+    static const char* names[] = { "av_tracks.mp4", "aac.m4a", "pcm.mov", "frag.mp4", "av_tracks.mkv", "opus.webm", "net/tone.aac",
+                                   "alac/alac16.mkv", "alac/alac51_24.m4a" };
     size_t f;
     uint32_t seed = 12345;
     for (f = 0; f < sizeof(names) / sizeof(names[0]); f++) {
@@ -1116,7 +1117,7 @@ static void test_os_codec_helpers(void)
     }
 }
 
-/* ALAC is lossless: whichever decoder, the 16-bit sines come back exactly. */
+/* ALAC is lossless: the 16-bit sines come back exactly. */
 static void test_m4a_alac(void)
 {
     static const int64_t targets[] = { 0, 1, 4095, 4096, 4097, 9000, 3 };
@@ -1147,6 +1148,48 @@ static void test_m4a_alac(void)
     CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), 0.0, &worst));
     free(full);
     fa_stream_close(s);
+}
+
+/* The built-in ALAC decoder against FLAC copies of the same samples (lossless
+ * both, so equal to the bit): 5.1 at 24 bits (ALAC's centre-first order put in
+ * the library's, noise, silence, a sweep) in MP4, and 16-bit stereo in Matroska;
+ * the last frame of each is a partial one. */
+static void check_alac(const char* alac, const char* flac, uint32_t channels, uint32_t rate)
+{
+    static const int64_t targets[] = { 0, 1, 4095, 4096, 4097, 9000, 3, 15000 };
+    fa_stream *s, *f;
+    fa_stream_info info;
+    float *a, *b;
+    int64_t na, nb, i;
+    double worst = 0;
+    CHECK_EQ(open_file(alac, -1, &s), FA_OK);
+    CHECK_EQ(open_file(flac, -1, &f), FA_OK);
+    if (!s || !f) { fa_stream_close(s); fa_stream_close(f); return; }
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.codec, "alac") == 0);
+    CHECK_EQ(info.format.sample_rate, rate);
+    CHECK_EQ(info.format.channels, channels);
+    a = read_all(s, channels, &na);
+    b = read_all(f, channels, &nb);
+    CHECK_EQ(na, nb);
+    CHECK_EQ(info.length_frames, nb);
+    for (i = 0; i < na * (int64_t)channels && i < nb * (int64_t)channels; i++) {
+        double d = fabs((double)a[i] - (double)b[i]);
+        if (d > worst) worst = d;
+    }
+    printf("  %s: %lld frames, largest difference from FLAC %.3g\n", alac, (long long)na, worst);
+    CHECK(worst == 0.0);
+    CHECK(seek_matches(s, a, na, channels, targets, (int)(sizeof(targets) / sizeof(targets[0])), 0.0, &worst));
+    free(a);
+    free(b);
+    fa_stream_close(s);
+    fa_stream_close(f);
+}
+
+static void test_alac_against_flac(void)
+{
+    check_alac("alac/alac51_24.m4a", "alac/alac51_24.flac", 6, 48000);
+    check_alac("alac/alac16.mkv", "alac/alac16.flac", 2, 44100);
 }
 
 /* AAC 5.1: each channel's own frequency where the library's order puts it
@@ -1334,6 +1377,7 @@ int main(void)
     RUN(test_mp4_mp3_seek_is_exact);
     RUN(test_m4a_aac);
     RUN(test_m4a_alac);
+    RUN(test_alac_against_flac);
     RUN(test_aac_51_channel_order);
     RUN(test_mov_pcm);
     RUN(test_fragmented_mp4);

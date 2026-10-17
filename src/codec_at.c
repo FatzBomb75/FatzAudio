@@ -1,12 +1,11 @@
-/* AAC and ALAC through AudioToolbox (macOS and iOS): the system's decoders behind
+/* AAC through AudioToolbox (macOS and iOS): the system's decoders behind
  * an AudioConverter, one packet in, interleaved float out.
- *  - AAC: the AudioSpecificConfig goes in an MPEG-4 ES descriptor, the magic
+ * The AudioSpecificConfig goes in an MPEG-4 ES descriptor, the magic
  *    cookie Core Audio reads from an 'esds' box. kAudioFormatProperty_FormatList
  *    reads that cookie and names the richest format the system decodes it as
  *    (xHE-AAC, HE-AAC v2, HE-AAC or LC), with its rate after SBR. ADTS frames lose
  *    their header first; ADTS cannot say HE-AAC, so at 24 kHz and below SBR (and PS
  *    for mono) is signalled for it, as an HE decoder plays plain LC too.
- *  - ALAC: kAudioFormatAppleLossless with the 24-byte ALACSpecificConfig as cookie.
  * Core Audio's channel order is the stream's (AAC: centre first); the output
  * channel layout's labels map it to the library's (codec_os.c).
  * Nothing is linked beyond the AudioToolbox system framework. */
@@ -234,19 +233,6 @@ fa_result fa_at_codec_open(fa_codec* c, const fa_codec_params* p)
             in.mFramesPerPacket = info.sbr == 1 ? 2048 : 1024;
             if (info.object_type < 1 || info.object_type > 4) return FA_ERROR_UNSUPPORTED_FORMAT;
         }
-    } else if (strcmp(p->codec, "alac") == 0) {
-        fa_alac_info a;
-        if (!fa_alac_parse_config((const uint8_t*)p->extradata, p->extradata_size, &a)) return FA_ERROR_UNSUPPORTED_FORMAT;
-        ck = a.config;
-        ck_n = 24;
-        in.mFormatID = kAudioFormatAppleLossless;
-        in.mSampleRate = a.rate;
-        in.mChannelsPerFrame = a.channels;
-        in.mFramesPerPacket = a.frame_length;
-        in.mFormatFlags = a.bit_depth == 16 ? kAppleLosslessFormatFlag_16BitSourceData
-                        : a.bit_depth == 20 ? kAppleLosslessFormatFlag_20BitSourceData
-                        : a.bit_depth == 24 ? kAppleLosslessFormatFlag_24BitSourceData
-                                            : kAppleLosslessFormatFlag_32BitSourceData;
     } else {
         return FA_ERROR_UNSUPPORTED_FORMAT;
     }

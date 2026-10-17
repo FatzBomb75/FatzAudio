@@ -1,11 +1,11 @@
 /* Packet codecs: one compressed packet in, interleaved F32 out. The built-in ones
  * (PCM in all its byte layouts, MP3, AC-3 and E-AC-3 in dec_ac3.c, Opus and
- * Vorbis in codec_xiph.c, FLAC in codec_flac.c) need nothing else. The operating
- * system's decoders come next: Media Foundation on Windows for Windows Media
- * Audio, AAC and ALAC (codec_mf.c), AudioToolbox on macOS and iOS (codec_at.c) and
- * MediaCodec on Android (codec_mediacodec.c) for AAC and ALAC. Every other codec,
- * and these where the system cannot, goes to the app's FFmpeg, loaded at runtime
- * (ffmpeg.c). */
+ * Vorbis in codec_xiph.c, FLAC in codec_flac.c, ALAC in codec_alac.c) need nothing
+ * else. The operating system's decoders come next: Media Foundation on Windows for
+ * Windows Media Audio and AAC (codec_mf.c), AudioToolbox on macOS and iOS
+ * (codec_at.c) and MediaCodec on Android (codec_mediacodec.c) for AAC. Every other
+ * codec, and these where the system cannot, goes to the app's FFmpeg, loaded at
+ * runtime (ffmpeg.c). */
 #include "fa_internal.h"
 #include "demux.h"
 #include <stdio.h>
@@ -651,7 +651,8 @@ fa_result fa_codec_open(fa_codec* c, const fa_codec_params* p)
         memset(c, 0, sizeof(*c));
         snprintf(c->name, sizeof(c->name), "%s", p->codec);
     }
-    /* The system's own decoders first: Windows Media Audio, AAC and ALAC. What
+    if (strcmp(p->codec, "alac") == 0) return fa_alac_codec_open(c, p);
+    /* The system's own decoders first: Windows Media Audio and AAC. What
      * they do not take (or a system without them) goes to FFmpeg. */
 #if FA_OS_CODECS
     if (strcmp(p->codec, "aac") == 0 && p->extradata_size == 0) r = adts_open(c, p);

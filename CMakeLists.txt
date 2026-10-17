@@ -69,6 +69,7 @@ set(FA_SOURCES
     src/demux_ogg.c
     src/codec_xiph.c
     src/codec_flac.c
+    src/codec_alac.c
     src/codec_os.c
     src/demux_asf.c
     src/stubs.c

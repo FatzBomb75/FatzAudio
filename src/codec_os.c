@@ -1,10 +1,9 @@
-/* What the operating systems' AAC and ALAC decoders (codec_mf.c on Windows,
+/* What the operating systems' AAC decoders (codec_mf.c on Windows,
  * codec_at.c on macOS and iOS, codec_mediacodec.c on Android) need from the
  * stream, kept here in plain C so that every platform builds it and the tests
  * check it everywhere: the AudioSpecificConfig read, ADTS headers taken off
- * packets, the MPEG-4 ES descriptor AudioToolbox wants as its magic cookie, the
- * ALAC configuration out of the containers' 'alac' box, and the library's
- * channel order from Core Audio's channel labels. */
+ * packets, the MPEG-4 ES descriptor AudioToolbox wants as its magic cookie, and
+ * the library's channel order from Core Audio's channel labels. */
 #include "fa_internal.h"
 #include "demux.h"
 #include <string.h>
@@ -205,35 +204,6 @@ size_t fa_aac_esds(const uint8_t* asc, size_t n, uint8_t* out, size_t cap)
     at = put_desc(out, at, 0x06, 1);
     out[at++] = 0x02;               /* SLConfigDescriptor: predefined for MP4 */
     return at;
-}
-
-static uint32_t be32(const uint8_t* p)
-{
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
-}
-
-/* The 24-byte ALACSpecificConfig in the containers' extradata: the bare config,
- * the 'alac' box (MP4, and Matroska's A_ALAC as this library passes it), or a
- * Core Audio cookie with a 'frma' box in front. */
-int fa_alac_parse_config(const uint8_t* p, size_t n, fa_alac_info* out)
-{
-    const uint8_t* c = NULL;
-    memset(out, 0, sizeof(*out));
-    if (!p) return 0;
-    if (n == 24) c = p;
-    else if (n >= 36 && memcmp(p + 4, "alac", 4) == 0) c = p + 12;
-    else if (n >= 48 && memcmp(p + 4, "frma", 4) == 0 && memcmp(p + 16, "alac", 4) == 0) c = p + 24;
-    if (!c) return 0;
-    out->config = c;
-    out->frame_length = be32(c);
-    out->bit_depth = c[5];
-    out->channels = c[9];
-    out->rate = be32(c + 20);
-    if (c[4] != 0 || out->frame_length == 0 || out->frame_length > 65536 || out->channels == 0 || out->channels > 8 ||
-        out->rate == 0 || out->rate > 768000 ||
-        (out->bit_depth != 16 && out->bit_depth != 20 && out->bit_depth != 24 && out->bit_depth != 32))
-        return 0;
-    return 1;
 }
 
 /* Core Audio channel labels (CoreAudioTypes.h, kAudioChannelLabel_*). */
