@@ -41,4 +41,9 @@ ff -f lavfi -i "$(sine '0.5*sin(2*PI*1000*t)' 48000 0.2)" -c:a libopus -b:a 16k 
    -metadata R128_TRACK_GAIN=-1280 -fflags +bitexact r128.opus
 ff -f lavfi -i "$(sine '0.5*sin(2*PI*1000*t)' 44100 0.2)" -c:a libvorbis -q:a 0 \
    -metadata REPLAYGAIN_TRACK_GAIN="-6.50 dB" -metadata REPLAYGAIN_TRACK_PEAK=0.5 -fflags +bitexact rg.ogg
+# Pages of 100 ms (seeks start decoding inside a page and across page ends).
+ff -f lavfi -i "$(sine '0.5*sin(2*PI*440*t)*(0.6+0.4*sin(2*PI*3*t))' 44100 3)" -c:a libvorbis -q:a 0 \
+   -page_duration 100000 -map_metadata -1 -fflags +bitexact pages.ogg
+ff -f lavfi -i "$(sine '0.5*sin(2*PI*700*t)*(0.6+0.4*sin(2*PI*3*t))|0.4*sin(2*PI*500*t)' 48000 3)" -c:a libopus -b:a 24k \
+   -page_duration 100000 -map_metadata -1 -fflags +bitexact pages.opus
 ls -l *.opus *.ogg
