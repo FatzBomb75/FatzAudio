@@ -222,10 +222,14 @@ static void test_cache(void)
     fa_engine_config cfg;
     fa_engine* e;
     fa_loudness a, b;
+    char* dir = (char*)malloc(32);
     fa_engine_config_init(&cfg);
     cfg.flags = FA_ENGINE_NULL_OUTPUT;
-    cfg.cache_directory = "loudness-cache";
+    strcpy(dir, "loudness-cache");
+    cfg.cache_directory = dir;
     CHECK_EQ(fa_engine_create(&cfg, &e), FA_OK);
+    memset(dir, 'x', 31);                     /* the engine keeps its own copy */
+    free(dir);
     /* Start clean: a previous run may have left this entry. */
     {
         fa_loudness first;

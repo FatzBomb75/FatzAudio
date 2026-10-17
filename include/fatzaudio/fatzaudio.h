@@ -116,7 +116,8 @@ typedef struct fa_engine_config {
     uint32_t worker_threads;      /* decode worker threads, 0 = number of cores (max 8) */
     const char* cache_directory;  /* loudness scan cache (one small file per scanned
                                      file, keyed by content), NULL = disabled.
-                                     Created if missing (one level) */
+                                     Created if missing (one level).
+                                     The string is copied */
     uint32_t flags;               /* fa_engine_flags */
 } fa_engine_config;
 
