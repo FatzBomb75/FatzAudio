@@ -4,7 +4,7 @@
 |---|---|
 | [Concepts](concepts.md) | Engine, devices, streams, buses, the clock, threading, errors |
 | [Getting started](getting-started.md) | Play a file in C and in .NET |
-| Feature guides (`features/`) | One page per feature: what it does, how to use it, options, pitfalls |
+| [Feature guides](features/README.md) | One page per feature: what it does, how to use it, options, pitfalls; for example [MIDI and karaoke files](features/midi.md) |
 | [Migrating from BASS](migration/bass.md) | Every BASS function and add-on mapped to FatzAudio |
 | [Migrating from NAudio](migration/naudio.md) | Planned |
 | [Migrating from SoundTouch](migration/soundtouch.md) | SoundTouch calls mapped to the tempo, pitch and rate parameters |

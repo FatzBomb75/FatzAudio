@@ -25,13 +25,19 @@ add_test(NAME core COMMAND fa_test_core WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY
 list(TRANSFORM FA_SOURCES PREPEND ${PROJECT_SOURCE_DIR}/)
 set_source_files_properties(${PROJECT_SOURCE_DIR}/src/stretch.cpp PROPERTIES
     INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/third_party/signalsmith)
+# Every white-box test compiles the MIDI decoder, so its vendored headers are found
+# from the sources themselves.
+set_source_files_properties(${PROJECT_SOURCE_DIR}/src/dec_midi.c ${PROJECT_SOURCE_DIR}/src/tinysoundfont_impl.c PROPERTIES
+    INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
 add_executable(fa_test_internal test_internal.c ${FA_SOURCES})
 target_include_directories(fa_test_internal PRIVATE
-    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
 target_compile_definitions(fa_test_internal PRIVATE FA_STATIC)
 target_compile_options(fa_test_internal PRIVATE ${FA_WARNINGS})
 if(MSVC)
-    set_source_files_properties(${PROJECT_SOURCE_DIR}/src/miniaudio_impl.c PROPERTIES COMPILE_OPTIONS "/W0")
+    set_source_files_properties(${PROJECT_SOURCE_DIR}/src/miniaudio_impl.c ${PROJECT_SOURCE_DIR}/src/tinysoundfont_impl.c
+        PROPERTIES COMPILE_OPTIONS "/W0")
 else()
     set_source_files_properties(${PROJECT_SOURCE_DIR}/src/miniaudio_impl.c PROPERTIES COMPILE_OPTIONS "-w")
 endif()
@@ -46,7 +52,8 @@ add_test(NAME internal COMMAND fa_test_internal)
 
 add_executable(fa_test_loudness test_loudness.c ${FA_SOURCES})
 target_include_directories(fa_test_loudness PRIVATE
-    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
 target_compile_definitions(fa_test_loudness PRIVATE FA_STATIC)
 target_compile_options(fa_test_loudness PRIVATE ${FA_WARNINGS})
 target_link_libraries(fa_test_loudness PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
@@ -57,7 +64,8 @@ add_test(NAME loudness COMMAND fa_test_loudness WORKING_DIRECTORY ${CMAKE_CURREN
 
 add_executable(fa_test_crossfade test_crossfade.c ${FA_SOURCES})
 target_include_directories(fa_test_crossfade PRIVATE
-    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
 target_compile_definitions(fa_test_crossfade PRIVATE FA_STATIC)
 target_compile_options(fa_test_crossfade PRIVATE ${FA_WARNINGS})
 target_link_libraries(fa_test_crossfade PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
@@ -68,7 +76,8 @@ add_test(NAME crossfade COMMAND fa_test_crossfade)
 
 add_executable(fa_test_handoff test_handoff.c ${FA_SOURCES})
 target_include_directories(fa_test_handoff PRIVATE
-    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
 target_compile_definitions(fa_test_handoff PRIVATE FA_STATIC FA_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 target_compile_options(fa_test_handoff PRIVATE ${FA_WARNINGS})
 target_link_libraries(fa_test_handoff PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
@@ -79,7 +88,8 @@ add_test(NAME handoff COMMAND fa_test_handoff)
 
 add_executable(fa_test_demux test_demux.c ${FA_SOURCES})
 target_include_directories(fa_test_demux PRIVATE
-    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
 target_compile_definitions(fa_test_demux PRIVATE FA_STATIC FA_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 target_compile_options(fa_test_demux PRIVATE ${FA_WARNINGS})
 target_link_libraries(fa_test_demux PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
@@ -90,7 +100,8 @@ add_test(NAME demux COMMAND fa_test_demux)
 
 add_executable(fa_test_dolby test_dolby.c ${FA_SOURCES})
 target_include_directories(fa_test_dolby PRIVATE
-    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
 target_compile_definitions(fa_test_dolby PRIVATE FA_STATIC FA_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 target_compile_options(fa_test_dolby PRIVATE ${FA_WARNINGS})
 target_link_libraries(fa_test_dolby PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
@@ -118,7 +129,8 @@ endif()
 
 add_executable(fa_test_net test_net.c ${FA_SOURCES})
 target_include_directories(fa_test_net PRIVATE
-    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
 target_compile_definitions(fa_test_net PRIVATE FA_STATIC FA_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 target_compile_options(fa_test_net PRIVATE ${FA_WARNINGS})
 target_link_libraries(fa_test_net PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
@@ -129,7 +141,8 @@ add_test(NAME net COMMAND fa_test_net)
 
 add_executable(fa_test_cdg test_cdg.c ${FA_SOURCES})
 target_include_directories(fa_test_cdg PRIVATE
-    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
 target_compile_definitions(fa_test_cdg PRIVATE FA_STATIC)
 target_compile_options(fa_test_cdg PRIVATE ${FA_WARNINGS})
 target_link_libraries(fa_test_cdg PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
@@ -140,7 +153,8 @@ add_test(NAME cdg COMMAND fa_test_cdg WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_D
 
 add_executable(fa_test_disc test_disc.c ${FA_SOURCES})
 target_include_directories(fa_test_disc PRIVATE
-    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
 target_compile_definitions(fa_test_disc PRIVATE FA_STATIC)
 target_compile_options(fa_test_disc PRIVATE ${FA_WARNINGS})
 target_link_libraries(fa_test_disc PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
@@ -151,7 +165,8 @@ add_test(NAME disc COMMAND fa_test_disc WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY
 
 add_executable(fa_test_tempo test_tempo.c ${FA_SOURCES})
 target_include_directories(fa_test_tempo PRIVATE
-    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
 target_compile_definitions(fa_test_tempo PRIVATE FA_STATIC)
 target_compile_options(fa_test_tempo PRIVATE ${FA_WARNINGS})
 target_link_libraries(fa_test_tempo PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
@@ -171,9 +186,22 @@ if(UNIX)
 endif()
 add_test(NAME encode COMMAND fa_test_encode WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
+add_executable(fa_test_midi test_midi.c ${FA_SOURCES})
+target_include_directories(fa_test_midi PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
+target_compile_definitions(fa_test_midi PRIVATE FA_STATIC)
+target_compile_options(fa_test_midi PRIVATE ${FA_WARNINGS})
+target_link_libraries(fa_test_midi PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
+if(UNIX)
+    target_link_libraries(fa_test_midi PRIVATE m)
+endif()
+add_test(NAME midi COMMAND fa_test_midi WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
 add_executable(fa_test_ogg test_ogg.c ${FA_SOURCES})
 target_include_directories(fa_test_ogg PRIVATE
-    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
 target_compile_definitions(fa_test_ogg PRIVATE FA_STATIC FA_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 target_compile_options(fa_test_ogg PRIVATE ${FA_WARNINGS})
 target_link_libraries(fa_test_ogg PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
@@ -186,6 +214,6 @@ add_test(NAME ogg COMMAND fa_test_ogg)
 # come prebuilt.
 foreach(t fa_test_internal fa_test_loudness fa_test_crossfade fa_test_handoff fa_test_demux
           fa_test_dolby fa_test_net fa_test_cdg fa_test_disc fa_test_tempo fa_test_ogg
-          fa_test_encode)
+          fa_test_encode fa_test_midi)
     target_link_libraries(${t} PRIVATE fa_opus fa_vorbis)
 endforeach()

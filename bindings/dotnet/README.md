@@ -23,10 +23,11 @@ song.Ramp(AudioParameter.Volume, 0f, TimeSpan.FromSeconds(3), Curve.EqualPower);
 
 | Type | Purpose |
 | --- | --- |
-| `AudioEngine` | Entry point. `OutputDevices`, `InputDevices`, `OpenOutput`, `OpenFile`, `OpenMemory`, `OpenStream`, `OpenUrl`, `CreatePushStream`, `OpenPackets`. |
+| `AudioEngine` | Entry point. `OutputDevices`, `InputDevices`, `OpenOutput`, `OpenFile`, `OpenMemory`, `OpenStream`, `OpenUrl`, `CreatePushStream`, `OpenPackets`, `DefaultSoundFont`. |
 | `OutputDevice` | Opened playback device: `Volume`, `Latency`, `Time` (the device clock), `CreateBus()`, `Start()`, `Stop()`. |
 | `MixBus` | A group of streams with its own `Volume`, `Pan` and `Ramp`: decks, a DJ crossfader. |
-| `AudioStream` | Any playable / decodable source: `PlayOn`, `Pause`, `Stop`, `Position`, `Volume`, `Pan`, `Rate`, `Tempo`, `Pitch`, `Ramp`, `PlayAt`, `Markers`, `CrossfadeTo`, `QueueNext`, `SetMatrix`, `Read`, `GetLevels`, `Clock`, events. Web streams add `Metadata`, `NetworkStatus` and `GetHttpHeader`. Karaoke: `HasCdg`, `LoadCdg`, `CdgOffset`, `CreateCdgSurface`. |
+| `AudioStream` | Any playable / decodable source: `PlayOn`, `Pause`, `Stop`, `Position`, `Volume`, `Pan`, `Rate`, `Tempo`, `Pitch`, `Ramp`, `PlayAt`, `Markers`, `CrossfadeTo`, `QueueNext`, `SetMatrix`, `Read`, `GetLevels`, `Clock`, events. Web streams add `Metadata`, `NetworkStatus` and `GetHttpHeader`. Karaoke: `HasCdg`, `LoadCdg`, `CdgOffset`, `CreateCdgSurface`. MIDI: `MidiInfo`, `MidiTexts`, `MidiTextReached`, `MidiTranspose`, `SetMidiChannelMuted`. |
+| `SoundFont` | SoundFont 2 instruments for MIDI files: `FromFile`, `FromMemory`, `Info`. Set one as `AudioEngine.DefaultSoundFont` or per stream in `StreamOptions.SoundFont`. |
 | `CdgSurface` | Draws a stream's CD+G graphics in sync with the audio: `Update()` returns the pixels (BGRA, RGBA or indexed, any size) and the rectangle that changed, ready for a WPF bitmap or a texture. |
 | `PushAudioStream` | Stream you feed with PCM via `Push(...)`, or with decoded frames in any format via `PushFrame(...)`. `End`, `Flush`, `Buffered`. |
 | `PacketAudioStream` | Stream you feed with compressed packets from your demuxer (FFmpeg): `PushPacket(...)`. Decoded on worker threads; `Clock` follows your timestamps. |

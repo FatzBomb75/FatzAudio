@@ -12,6 +12,7 @@ const fa_decoder_vtable* const fa_decoder_registry[] = {
     &fa_decoder_ogg,
     &fa_decoder_ac3,
     &fa_decoder_adts,
+    &fa_decoder_midi,
 };
 const uint32_t fa_decoder_registry_count = (uint32_t)(sizeof(fa_decoder_registry) / sizeof(fa_decoder_registry[0]));
 
@@ -49,7 +50,7 @@ static const char* extension_of(const char* path)
 }
 
 fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint, const char* mime_hint,
-                          int32_t audio_track, fa_atomic32* dynamic_range)
+                          int32_t audio_track, const fa_decoder_env* env)
 {
     uint8_t after[FA_PROBE_BYTES];
     const uint8_t* head;
@@ -99,7 +100,13 @@ fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint
         tried[best] = 1;
 
         memset(dec, 0, sizeof(*dec));
-        dec->dynamic_range = dynamic_range;
+        if (env) {
+            dec->dynamic_range = env->dynamic_range;
+            dec->soundfont = env->soundfont;
+            dec->midi_rate = env->midi_rate ? env->midi_rate : FA_MIDI_DEFAULT_RATE;
+        } else {
+            dec->midi_rate = FA_MIDI_DEFAULT_RATE;
+        }
         dec->vt = fa_decoder_registry[best];
         dec->src = src;
         dec->length = -1;
@@ -120,10 +127,10 @@ fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint
             return FA_OK;
         }
         /* Definite answers: the data is this format, but the track is missing, the
-         * codec needs FFmpeg or the layout needs seeking. Another format's guess
-         * would only be worse. */
+         * codec needs FFmpeg (or a MIDI file a soundfont) or the layout needs
+         * seeking. Another format's guess would only be worse. */
         if (r == FA_ERROR_OUT_OF_MEMORY || r == FA_ERROR_IO || r == FA_ERROR_NOT_FOUND ||
-            r == FA_ERROR_PROVIDER_MISSING || r == FA_ERROR_NOT_SEEKABLE)
+            r == FA_ERROR_PROVIDER_MISSING || r == FA_ERROR_NOT_SEEKABLE || r == FA_ERROR_NO_SOUNDFONT)
             return r;
         last = r;
     }
