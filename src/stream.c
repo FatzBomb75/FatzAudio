@@ -11,6 +11,7 @@
  * (fa_device_wait_quiescent), then takes decode_lock so no worker runs either. */
 #include "net.h"
 #include "cdg.h"
+#include "disc.h"
 #include "encode.h"
 #include <math.h>
 #include <stddef.h>
@@ -130,6 +131,9 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
         if (s->buffer_ms > 10000) s->buffer_ms = 10000;
     }
     s->audio_track = options ? options->audio_track : -1;
+    if (options && options->struct_size >= offsetof(fa_open_options, dynamic_range) + sizeof(options->dynamic_range) &&
+        options->dynamic_range >= FA_DYNAMIC_RANGE_FULL && options->dynamic_range <= FA_DYNAMIC_RANGE_NIGHT)
+        fa_store32(&s->dynamic_range, options->dynamic_range);
     s->loud.integrated_lufs = s->loud.range_lu = s->loud.true_peak_dbtp = NAN;
     fa_store_float(&s->norm_track, NAN);
     fa_store_float(&s->norm_album, NAN);
@@ -153,7 +157,7 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
 static fa_result stream_open_decoder(struct fa_stream* s, const char* name_hint, const fa_open_options* options)
 {
     fa_result r = fa_decoder_open(&s->decoder, &s->source, name_hint, options ? options->mime_hint : NULL,
-                                  options ? options->audio_track : -1);
+                                  options ? options->audio_track : -1, &s->dynamic_range);
     if (r != FA_OK) return r;
     s->decoder_ready = 1;
     /* Running loudness estimate for playback; decode-only streams are never normalized. */
@@ -231,6 +235,45 @@ static fa_result open_zip(struct fa_stream* s, uint8_t* zip, size_t size, const 
     return r;
 }
 
+FA_API fa_result FA_CALL fa_stream_open_disc(fa_engine* engine, fa_disc* disc, int32_t track, const fa_open_options* options, fa_stream** out_stream)
+{
+    struct fa_stream* s; fa_result r;
+    if (out_stream) *out_stream = NULL;
+    if (!engine || !disc || !out_stream) return FA_ERROR_INVALID_ARG;
+    r = stream_create(engine, options, &s);
+    if (r != FA_OK) return r;
+    r = fa_disc_decoder_open(&s->decoder, &s->source, disc, track, s);
+    if (r != FA_OK) { stream_discard(s); return r; }
+    s->decoder_ready = 1;
+    if (!(s->flags & FA_OPEN_DECODE_ONLY) &&
+        fa_meter_init(&s->run_meter, s->decoder.format.sample_rate, s->decoder.format.channels, 0, FA_RUNNING_SUBS) == FA_OK)
+        s->run_meter_ready = 1;
+    stream_opened(s);
+    *out_stream = s;
+    return FA_OK;
+}
+
+/* A TrackNN.cda file: the drive is the path's drive letter (Windows only). */
+static fa_result open_cda(fa_engine* engine, const char* path, int track, const fa_open_options* options, fa_stream** out_stream)
+{
+#ifdef _WIN32
+    char drive[3];
+    fa_disc* disc;
+    fa_result r;
+    if (!((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) || path[1] != ':')
+        return FA_ERROR_UNSUPPORTED_FORMAT;
+    drive[0] = path[0]; drive[1] = ':'; drive[2] = 0;
+    r = fa_disc_open(drive, NULL, &disc);
+    if (r != FA_OK) return r;
+    r = fa_stream_open_disc(engine, disc, track, options, out_stream);
+    fa_disc_close(disc);   /* the stream keeps the drive open */
+    return r;
+#else
+    (void)engine; (void)path; (void)track; (void)options; (void)out_stream;
+    return FA_ERROR_UNSUPPORTED_FORMAT;
+#endif
+}
+
 FA_API fa_result FA_CALL fa_stream_open_path(fa_engine* engine, const char* path, const fa_open_options* options, fa_stream** out_stream)
 {
     struct fa_stream* s; fa_result r;
@@ -249,6 +292,14 @@ FA_API fa_result FA_CALL fa_stream_open_path(fa_engine* engine, const char* path
             r = open_zip(s, bytes, size, options);
         }
     } else if (r == FA_OK) {
+        const uint8_t* head;
+        size_t n = fa_source_peek(&s->source, &head);
+        int track = fa_disc_cda_track(head, n);
+        if (track > 0) {
+            /* D:\Track01.cda: the track it stands for, on the drive it is on. */
+            stream_discard(s);
+            return open_cda(engine, path, track, options, out_stream);
+        }
         r = stream_open_decoder(s, path, options);
     }
     /* Loudness scans reopen path streams by name; a ZIP is scanned from memory. */
@@ -534,6 +585,20 @@ FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* o
     out_info->seekable = d->seekable;
     out_info->audio_track_count = d->track_count > 0 ? d->track_count : 1;
     out_info->has_cdg = fa_stream_cdg_present(stream);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_set_dynamic_range(fa_stream* stream, fa_dynamic_range mode)
+{
+    if (!stream || mode < FA_DYNAMIC_RANGE_FULL || mode > FA_DYNAMIC_RANGE_NIGHT) return FA_ERROR_INVALID_ARG;
+    fa_store32(&stream->dynamic_range, (int32_t)mode);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_dynamic_range(fa_stream* stream, fa_dynamic_range* out_mode)
+{
+    if (!stream || !out_mode) return FA_ERROR_INVALID_ARG;
+    *out_mode = (fa_dynamic_range)fa_load32(&stream->dynamic_range);
     return FA_OK;
 }
 

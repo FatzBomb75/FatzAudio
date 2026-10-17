@@ -92,14 +92,18 @@ struct fa_decoder {
      * many audio tracks the file has (0 is read as 1). */
     int32_t audio_track;
     int32_t track_count;
+    /* The stream's fa_dynamic_range, for codecs that apply one (Dolby); given to
+     * fa_decoder_open. NULL = full range. */
+    fa_atomic32* dynamic_range;
 };
 
 /* Detects the format of `src` and opens the matching decoder. `name_hint` (a path
  * or NULL) and `mime_hint` only break ties when the content is ambiguous.
  * `audio_track`: 0-based among the audio tracks, -1 = default; FA_ERROR_NOT_FOUND
- * if the file has no such track. */
+ * if the file has no such track. `dynamic_range`: the stream's fa_dynamic_range
+ * (read while decoding), or NULL for full range. */
 fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint, const char* mime_hint,
-                          int32_t audio_track);
+                          int32_t audio_track, fa_atomic32* dynamic_range);
 fa_result fa_decoder_read(fa_decoder* dec, float* out, fa_frames frames, fa_frames* got);
 fa_result fa_decoder_seek(fa_decoder* dec, fa_frames frame);
 void fa_decoder_close(fa_decoder* dec);
@@ -135,6 +139,8 @@ extern const fa_decoder_vtable fa_decoder_mp3;
 /* Containers with packet codecs (demux_mp4.c, demux_mkv.c). */
 extern const fa_decoder_vtable fa_decoder_mp4;
 extern const fa_decoder_vtable fa_decoder_mkv;
+/* Raw AC-3 / E-AC-3 streams (dec_ac3.c). */
+extern const fa_decoder_vtable fa_decoder_ac3;
 
 /* Probing helpers (probe.c). */
 size_t fa_probe_id3v2_size(const uint8_t* data, size_t size);
@@ -640,6 +646,7 @@ struct fa_stream {
     fa_source source;
     fa_decoder decoder;
     int decoder_ready;
+    fa_atomic32 dynamic_range;   /* fa_dynamic_range, read by the codec on every packet */
 
     fa_atomic32 state;           /* fa_stream_state */
     fa_atomic64 position;        /* source frames, when not attached */
@@ -834,6 +841,9 @@ struct fa_codec {
     fa_frames out_frames, out_cap;
     uint32_t rate, channels;
     char name[32];
+    /* fa_dynamic_range of the stream, read on every packet (NULL = full range).
+     * Set by the owner after fa_codec_open. */
+    fa_atomic32* dynamic_range;
 };
 
 /* Opens a decoder for `p` (validated). FA_ERROR_PROVIDER_MISSING: needs FFmpeg,
@@ -871,6 +881,14 @@ int fa_sample_kind(fa_sample_format f, int* out_planar);
 
 /* ffmpeg.c */
 fa_result fa_ffmpeg_open_codec(fa_codec* c, const fa_codec_params* p);
+/* Sets a decoder option (AVOption, searched in the decoder's own options too) on
+ * a codec fa_ffmpeg_open_codec opened. */
+void fa_ffmpeg_codec_option(fa_codec* c, const char* name, const char* value);
+
+/* dec_ac3.c: the built-in Dolby Digital / Dolby Digital Plus codec, and the
+ * samples in an AC-3 or E-AC-3 packet from its frame headers (-1 if none). */
+fa_result fa_ac3_codec_open(fa_codec* c, const fa_codec_params* p);
+int64_t fa_ac3_packet_samples(const uint8_t* d, size_t n, uint32_t* out_rate);
 int fa_ffmpeg_available(void);   /* loads FFmpeg on first use; 1 if usable */
 
 /* ---- Push streams (push.c) ------------------------------------------------------ */

@@ -807,7 +807,20 @@ static void test_mp3_packets_cut_anywhere(void)
     decode_file("tone.mp3", "mp3", 44100, 1, cut_1000, 22050, 2400);
 }
 
-static void test_ffmpeg_aac_ac3_eac3(void)
+/* AC-3 and E-AC-3 decode natively, whole frames or cut anywhere. */
+static void test_ac3_eac3_packets(void)
+{
+    decode_file("tone.ac3", "ac3", 48000, 2, ac3_len, 24576, 1600);
+    decode_file("tone.eac3", "eac3", 48000, 2, eac3_len, 24576, 1600);
+}
+
+static void test_ac3_packets_cut_anywhere(void)
+{
+    decode_file("tone.ac3", "ac3", 48000, 2, cut_419, 24576, 1600);
+    decode_file("tone.eac3", "eac3", 48000, 2, cut_1000, 24576, 1600);
+}
+
+static void test_ffmpeg_aac(void)
 {
     fa_ffmpeg_info fi;
     if (fa_ffmpeg_load(NULL) != FA_OK) { printf("  (skipped: FFmpeg not found)\n"); return; }
@@ -816,11 +829,9 @@ static void test_ffmpeg_aac_ac3_eac3(void)
     CHECK(fi.avcodec_version >> 16 >= 58);
     printf("  libavcodec %u.%u at %s\n", fi.avcodec_version >> 16, (fi.avcodec_version >> 8) & 255, fi.avcodec_path);
     decode_file("tone.aac", "aac", 48000, 2, adts_len, 24000, 2200);
-    decode_file("tone.ac3", "ac3", 48000, 2, ac3_len, 24576, 1600);
-    decode_file("tone.eac3", "eac3", 48000, 2, eac3_len, 24576, 1600);
 }
 
-static void test_ffmpeg_packets_play_on_device(void)
+static void test_packets_play_on_device(void)
 {
     fa_codec_params p;
     fa_stream* s = NULL;
@@ -828,7 +839,6 @@ static void test_ffmpeg_packets_play_on_device(void)
     uint8_t* data;
     int64_t i;
     double acc = 0.0;
-    if (fa_ffmpeg_load(NULL) != FA_OK) { printf("  (skipped: FFmpeg not found)\n"); return; }
     data = load_file("tone.ac3", &size);
     CHECK(data != NULL);
     fa_codec_params_init(&p);
@@ -913,8 +923,10 @@ int main(void)
     RUN(test_pcm_packets_split_anywhere);
     RUN(test_mp3_packets);
     RUN(test_mp3_packets_cut_anywhere);
-    RUN(test_ffmpeg_aac_ac3_eac3);
-    RUN(test_ffmpeg_packets_play_on_device);
+    RUN(test_ac3_eac3_packets);
+    RUN(test_ac3_packets_cut_anywhere);
+    RUN(test_ffmpeg_aac);
+    RUN(test_packets_play_on_device);
     RUN(test_bad_arguments);
 
     fa_device_close(g_dev);

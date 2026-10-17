@@ -455,3 +455,10 @@ fa_result fa_ffmpeg_open_codec(fa_codec* c, const fa_codec_params* p)
     c->channels = p->channels;
     return FA_OK;
 }
+
+void fa_ffmpeg_codec_option(fa_codec* c, const char* name, const char* value)
+{
+    ff_codec* f = (ff_codec*)c->impl;
+    if (c->vt != &ff_vtable || !f || !f->ctx) return;
+    ff.av_opt_set(f->ctx, name, value, 1 /* AV_OPT_SEARCH_CHILDREN: the decoder's private options */);
+}
