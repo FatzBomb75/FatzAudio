@@ -18,7 +18,10 @@ static int g_failures = 0;
     fprintf(stderr, "  FAIL %s:%d: %s == %s (%lld vs %lld)\n", __FILE__, __LINE__, #a, #b, va_, vb_); g_failures++; return; } } while (0)
 #define CHECK_NEAR(a, b, tol) do { double va_ = (a), vb_ = (b); if (fabs(va_ - vb_) > (tol)) { \
     fprintf(stderr, "  FAIL %s:%d: %s ~ %s (%.6f vs %.6f)\n", __FILE__, __LINE__, #a, #b, va_, vb_); g_failures++; return; } } while (0)
-#define RUN(t) do { int before_ = g_failures; printf("%s\n", #t); t(); if (g_failures == before_) printf("  ok\n"); } while (0)
+/* FA_TEST=name runs one test only. */
+#define RUN(t) do { const char* only_ = getenv("FA_TEST"); int before_ = g_failures; \
+    if (only_ && strcmp(only_, #t) != 0) break; \
+    printf("%s\n", #t); t(); if (g_failures == before_) printf("  ok\n"); } while (0)
 
 #define PERIOD 512
 #define MAX_REC (1 << 17)
@@ -39,13 +42,12 @@ static int16_t sample_of(int kind, uint32_t i)
 }
 static float expected(int kind, uint32_t i) { return (float)sample_of(kind, i) / 32768.0f; }
 
-static fa_stream* open_wav(uint32_t frames, int kind, uint32_t flags, int attach)
+/* A WAV file in memory; free() it. */
+static uint8_t* make_wav(uint32_t frames, int kind, size_t* out_n)
 {
     size_t data = (size_t)frames * 2, n = 44 + data;
     uint8_t* b = (uint8_t*)malloc(n);
     uint32_t i, v, rate = g_dev->rate;
-    fa_open_options o;
-    fa_stream* s = NULL;
     memcpy(b, "RIFF", 4); v = (uint32_t)(n - 8); memcpy(b + 4, &v, 4); memcpy(b + 8, "WAVEfmt ", 8);
     v = 16; memcpy(b + 16, &v, 4);
     b[20] = 1; b[21] = 0; b[22] = 1; b[23] = 0;
@@ -53,11 +55,46 @@ static fa_stream* open_wav(uint32_t frames, int kind, uint32_t flags, int attach
     b[32] = 2; b[33] = 0; b[34] = 16; b[35] = 0;
     memcpy(b + 36, "data", 4); v = (uint32_t)data; memcpy(b + 40, &v, 4);
     for (i = 0; i < frames; i++) { int16_t sv = sample_of(kind, i); memcpy(b + 44 + (size_t)i * 2, &sv, 2); }
+    *out_n = n;
+    return b;
+}
+
+static fa_stream* open_wav(uint32_t frames, int kind, uint32_t flags, int attach)
+{
+    size_t n;
+    uint8_t* b = make_wav(frames, kind, &n);
+    fa_open_options o;
+    fa_stream* s = NULL;
     fa_open_options_init(&o);
     o.flags = flags;
     if (fa_stream_open_memory(g_engine, b, n, &o, &s) != FA_OK) s = NULL;
     free(b);
     if (s && attach && fa_stream_attach(s, g_dev, NULL) != FA_OK) { fa_stream_close(s); s = NULL; }
+    return s;
+}
+
+/* A forward-only source (no seek callback), like a pipe. */
+typedef struct mem_reader { uint8_t* data; size_t n, pos; } mem_reader;
+
+static int64_t FA_CALL mem_read(void* user, void* buffer, size_t bytes)
+{
+    mem_reader* m = (mem_reader*)user;
+    size_t k = m->n - m->pos < bytes ? m->n - m->pos : bytes;
+    memcpy(buffer, m->data + m->pos, k);
+    m->pos += k;
+    return (int64_t)k;
+}
+static int64_t FA_CALL mem_length(void* user) { return (int64_t)((mem_reader*)user)->n; }
+static void FA_CALL mem_close(void* user) { free(((mem_reader*)user)->data); free(user); }
+
+static fa_stream* open_forward_only(uint32_t frames, int kind)
+{
+    fa_io_callbacks io = { mem_read, NULL, mem_length, mem_close };
+    mem_reader* m = (mem_reader*)calloc(1, sizeof(*m));
+    fa_stream* s = NULL;
+    m->data = make_wav(frames, kind, &m->n);
+    if (fa_stream_open_io(g_engine, &io, m, NULL, &s) != FA_OK) { mem_close(m); return NULL; }
+    if (fa_stream_attach(s, g_dev, NULL) != FA_OK) { fa_stream_close(s); return NULL; }
     return s;
 }
 
@@ -530,6 +567,184 @@ static void test_point_curve(void)
     fa_stream_close(s);
 }
 
+/* Queueing behind a stream that has already ended starts it at once, with STARTED. */
+static void test_queue_after_end_starts(void)
+{
+    fa_stream* a = open_wav(1000, 0, 0, 1);
+    fa_stream* b = open_wav(20000, 2, 0, 1);
+    recorder rb;
+    fa_stream_state st;
+    rec_init(&rb);
+    CHECK(a != NULL && b != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(b, record, &rb), FA_OK);
+    CHECK_EQ(fa_stream_play(a), FA_OK);
+    render(2048);
+    CHECK_EQ(fa_stream_get_state(a, &st), FA_OK);
+    CHECK_EQ(st, FA_STATE_ENDED);
+    CHECK_EQ(fa_stream_set_next(a, b, 0, NULL), FA_OK);
+    rec_reset();
+    render(1024);
+    CHECK_NEAR(L(100), 0.25, 1e-6);
+    CHECK_EQ(count_events(&rb, FA_EVENT_STARTED, 1), 1);
+    fa_stream_close(a);
+    fa_stream_close(b);
+    rec_free(&rb);
+}
+
+/* A crossfade-out longer than what is left of the stream still completes. */
+static void test_crossfade_out_ends_early(void)
+{
+    fa_stream* a = open_wav(3000, 0, 0, 1);
+    fa_stream* b = open_wav(48000, 0, 0, 1);
+    recorder ra;
+    fa_ramp r;
+    rec_init(&ra);
+    CHECK(a != NULL && b != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(a, record, &ra), FA_OK);
+    CHECK_EQ(fa_stream_play(a), FA_OK);
+    render(512);
+    memset(&r, 0, sizeof(r));
+    r.tag = 5;
+    CHECK_EQ(fa_crossfade(a, b, frames_to_ns(20000), &r), FA_OK);
+    render(8192);
+    CHECK_EQ(count_events(&ra, FA_EVENT_ENDED, 1), 1);
+    CHECK_EQ(count_events(&ra, FA_EVENT_RAMP_DONE, 1), 1);
+    CHECK_EQ(ra.last_value[FA_EVENT_RAMP_DONE], 5);
+    fa_stream_close(a);
+    fa_stream_close(b);
+    rec_free(&ra);
+}
+
+/* A cue-out moved behind the playback position ends the stream at once. */
+static void test_cue_out_behind_position(void)
+{
+    fa_stream* s = open_wav(48000, 0, 0, 1);
+    fa_stream* f = open_forward_only(48000, 0);
+    fa_stream_state st;
+    CHECK(s != NULL && f != NULL);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    rec_reset();
+    render(4096);
+    CHECK_EQ(fa_stream_set_marker(s, FA_MARKER_CUE_OUT, 1000), FA_OK);
+    render(1024);
+    CHECK_EQ(fa_stream_get_state(s, &st), FA_OK);
+    CHECK_EQ(st, FA_STATE_ENDED);
+    CHECK_EQ(L(4096 + 100), 0);
+    fa_stream_close(s);
+
+    /* Forward-only: the audio already buffered past the new cue-out is not played. */
+    CHECK_EQ(fa_stream_play(f), FA_OK);
+    rec_reset();
+    render(1024);
+    CHECK_EQ(fa_stream_set_marker(f, FA_MARKER_CUE_OUT, 2000), FA_OK);
+    render(4096);
+    CHECK_NEAR(L(1500), 0.5, 1e-6);
+    CHECK_EQ(L(2000), 0);
+    CHECK_EQ(fa_stream_get_state(f, &st), FA_OK);
+    CHECK_EQ(st, FA_STATE_ENDED);
+    /* A matrix change would need a seek: refused, and playback is untouched. */
+    {
+        float w[2] = { 1.0f, 1.0f };
+        CHECK_EQ(fa_stream_set_matrix(f, w, 1, 2), FA_ERROR_NOT_SEEKABLE);
+    }
+    fa_stream_close(f);
+}
+
+/* Looping: CUE_OUT is reported, the fade at the loop end is not bent toward the
+ * next turn, and a queue with a crossfade does not end the loop without a MIX_POINT. */
+static void test_loop_markers_and_queue(void)
+{
+    fa_stream* s = open_wav(20000, 0, FA_OPEN_LOOP, 1);
+    fa_stream* n = open_wav(20000, 2, 0, 1);
+    recorder rec;
+    fa_stream_state st;
+    rec_init(&rec);
+    CHECK(s != NULL && n != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    CHECK_EQ(fa_stream_set_marker(s, FA_MARKER_CUE_OUT, 1000), FA_OK);
+    CHECK_EQ(fa_stream_set_marker(s, FA_MARKER_FADE_IN_END, 200), FA_OK);
+    CHECK_EQ(fa_stream_set_next(s, n, frames_to_ns(300), NULL), FA_OK);
+    rec_reset();
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(3500);
+    CHECK_NEAR(L(995), 0.5, 1e-6);           /* full level up to the loop end */
+    CHECK_NEAR(L(999), 0.5, 1e-6);
+    CHECK_NEAR(L(1000), 0.0, 1e-6);          /* the fade-in again */
+    CHECK(count_events(&rec, FA_EVENT_MARKER, 3) >= 3);
+    CHECK(rec.markers[FA_MARKER_CUE_OUT] >= 2);
+    CHECK_EQ(fa_stream_get_state(s, &st), FA_OK);
+    CHECK_EQ(st, FA_STATE_PLAYING);          /* no MIX_POINT: the loop goes on */
+    CHECK_EQ(fa_stream_get_state(n, &st), FA_OK);
+    CHECK_EQ(st, FA_STATE_SCHEDULED);
+    fa_stream_close(s);
+    fa_stream_close(n);
+    rec_free(&rec);
+}
+
+/* A zero-length ramp is a jump on its exact frame, for streams and buses. */
+static void test_zero_length_scheduled_ramp(void)
+{
+    fa_stream* s = open_wav(48000, 0, 0, 1);
+    fa_bus* bus = NULL;
+    fa_time now;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(1024);
+    rec_reset();
+    fa_device_get_time(g_dev, &now);
+    CHECK_EQ(fa_stream_ramp_param(s, FA_PARAM_VOLUME, 0.5f, 0, now + frames_to_ns(1003), NULL), FA_OK);
+    render(2048);
+    CHECK_NEAR(L(1002), 0.5, 1e-6);
+    CHECK_NEAR(L(1003), 0.25, 1e-6);
+    CHECK_EQ(fa_bus_create(g_dev, &bus), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, g_dev, bus), FA_OK);
+    rec_reset();
+    fa_device_get_time(g_dev, &now);
+    CHECK_EQ(fa_bus_ramp_param(bus, FA_PARAM_VOLUME, 0.5f, 0, now + frames_to_ns(1003), NULL), FA_OK);
+    render(2048);
+    CHECK_NEAR(L(1002), 0.25, 1e-6);
+    CHECK_NEAR(L(1003), 0.125, 1e-6);
+    fa_bus_destroy(bus);
+    fa_stream_close(s);
+}
+
+/* A mix point in the very first callback after play still crossfades, and a chain
+ * of streams shorter than a callback hands over to the end of the chain. */
+static void test_queue_in_first_callback(void)
+{
+    fa_stream* a = open_wav(1000, 0, 0, 1);
+    fa_stream* b = open_wav(20000, 0, 0, 1);
+    fa_stream* c = open_wav(200, 1, 0, 1);
+    fa_stream* d = open_wav(200, 1, 0, 1);
+    fa_stream* e = open_wav(20000, 2, 0, 1);
+    int64_t i;
+    CHECK(a && b && c && d && e);
+    CHECK_EQ(fa_stream_set_param(a, FA_PARAM_PAN, -1.0f), FA_OK);
+    CHECK_EQ(fa_stream_set_param(b, FA_PARAM_PAN, 1.0f), FA_OK);
+    CHECK_EQ(fa_stream_set_next(a, b, frames_to_ns(800), NULL), FA_OK);  /* mix point at 200 */
+    rec_reset();
+    CHECK_EQ(fa_stream_play(a), FA_OK);
+    render(2048);
+    CHECK_NEAR(L(100), 0.5, 1e-6);
+    CHECK_NEAR(L(600) / 0.5, cos(0.25 * 3.14159265358979), 2e-3);
+    CHECK_NEAR(R(600) / 0.5, sin(0.25 * 3.14159265358979), 2e-3);
+    fa_stream_close(a);
+    fa_stream_close(b);
+
+    /* e is queued behind d, which is queued behind c: all three within one callback. */
+    CHECK_EQ(fa_stream_set_next(d, e, 0, NULL), FA_OK);
+    CHECK_EQ(fa_stream_set_next(c, d, 0, NULL), FA_OK);
+    rec_reset();
+    CHECK_EQ(fa_stream_play(c), FA_OK);
+    render(1024);
+    for (i = 0; i < 400; i++) if (L(i) != expected(1, (uint32_t)(i % 200))) { CHECK_EQ(i, -1); }
+    CHECK_NEAR(L(400), 0.25, 1e-6);
+    CHECK_NEAR(L(900), 0.25, 1e-6);
+    fa_stream_close(c);
+    fa_stream_close(d);
+    fa_stream_close(e);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -554,6 +769,12 @@ int main(void)
     RUN(test_buses);
     RUN(test_matrix);
     RUN(test_point_curve);
+    RUN(test_queue_after_end_starts);
+    RUN(test_crossfade_out_ends_early);
+    RUN(test_cue_out_behind_position);
+    RUN(test_loop_markers_and_queue);
+    RUN(test_zero_length_scheduled_ramp);
+    RUN(test_queue_in_first_callback);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

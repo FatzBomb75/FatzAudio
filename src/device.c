@@ -93,7 +93,14 @@ void fa_device_render(fa_device* dev, float* out, uint32_t frames)
     if (list) {
         /* Queue transitions first, so a stream that starts this callback starts on
          * its exact frame whatever its place in the list. */
-        for (i = 0; i < list->count; i++) fa_stream_check_queue(list->items[i], dev, frames);
+        uint32_t pass;
+        int changed = 1;
+        /* Repeated while transitions are found: a stream started by one may reach
+         * its own mix point in this callback (a chain of very short streams). */
+        for (pass = 0; changed && pass <= list->count; pass++) {
+            changed = 0;
+            for (i = 0; i < list->count; i++) changed |= fa_stream_check_queue(list->items[i], dev, frames);
+        }
         for (i = 0; i < list->count; i++) fa_stream_mix(list->items[i], dev, out, frames);
     }
     fa_buses_end(dev, frames);

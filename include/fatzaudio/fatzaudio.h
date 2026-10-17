@@ -477,7 +477,8 @@ FA_API fa_result FA_CALL fa_bus_ramp_param(fa_bus* bus, fa_param param, float ta
  * out_channels the device's (2). Use it for custom downmixes, swapping or muting
  * channels, or sending one channel of a karaoke track to both speakers.
  * weights NULL restores the default mapping. Takes effect at once (an attached
- * stream re-buffers from where it is). */
+ * stream re-buffers from where it is). An attached forward-only source cannot
+ * re-buffer: FA_ERROR_NOT_SEEKABLE (set the matrix before attaching it). */
 FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* weights, uint32_t in_channels, uint32_t out_channels);
 
 /* ---- Normalization ---------------------------------------------------- */

@@ -463,8 +463,10 @@ void fa_lane_start_ramp(fa_lane* l, float from, float target, int64_t frames, in
                         const fa_shape* shape, int flags);
 
 /* Value of a lane at device frame `frame` within the current callback, for lanes that
- * run on the device clock (buses). `clock` is the frame at the callback start. */
-float fa_lane_value_at_frame(const fa_param_voice* v, int64_t clock, int64_t frame);
+ * run on the device clock (buses). `clock` is the frame at the callback start.
+ * At the frame a zero-length ramp starts, `from_here` picks the value from there
+ * on (the target; a block starting there) over the value up to it (a block ending there). */
+float fa_lane_value_at_frame(const fa_param_voice* v, int64_t clock, int64_t frame, int from_here);
 /* Advances a device-clock lane to clock + frames; returns 1 when its ramp finished. */
 int fa_lane_advance(fa_param_voice* v, int64_t clock, int64_t frames);
 
@@ -561,11 +563,14 @@ void fa_device_remove_voice(fa_device* device, struct fa_stream* stream);
 void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames); /* audio thread */
 /* Audio thread, before any voice is mixed: starts queued streams whose
  * predecessor reaches its mix point within this callback. */
-void fa_stream_check_queue(struct fa_stream* s, fa_device* dev, uint32_t frames);
+/* Starts the queued stream when `s` reaches its mix point within this callback.
+ * Returns 1 when it scheduled one (which may have a mix point in this callback too). */
+int fa_stream_check_queue(struct fa_stream* s, fa_device* dev, uint32_t frames);
 /* Validates (and clamps pan) a value for a stream or bus parameter. */
 fa_result fa_param_check(fa_param param, float* value);
-/* Bus gains (left, right) at frame offset `off` of the current callback. */
-void fa_bus_gains_at(struct fa_bus* b, fa_device* dev, int64_t off, float* gl, float* gr);
+/* Bus gains (left, right) at frame offset `off` of the current callback, for a
+ * block starting there (from_here 1) or ending there (0). */
+void fa_bus_gains_at(struct fa_bus* b, fa_device* dev, int64_t off, int from_here, float* gl, float* gr);
 int fa_stream_needs_work(struct fa_stream* s);
 void fa_stream_fill(struct fa_stream* s, int64_t max_frames);  /* caller holds decode_lock */
 fa_frames fa_stream_position_now(struct fa_stream* s);

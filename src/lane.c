@@ -145,12 +145,13 @@ void fa_lane_start_ramp(fa_lane* l, float from, float target, int64_t frames, in
     v->tag = 0;
 }
 
-float fa_lane_value_at_frame(const fa_param_voice* v, int64_t clock, int64_t frame)
+float fa_lane_value_at_frame(const fa_param_voice* v, int64_t clock, int64_t frame, int from_here)
 {
     int64_t begin;
     if (!v->active) return v->value;
     begin = v->at > clock ? v->at : clock;
-    if (frame <= begin) return v->value;
+    if (frame < begin) return v->value;
+    if (frame == begin && (!from_here || v->done < v->total)) return v->value;  /* a zero-length ramp jumps here */
     return fa_lane_ramp_value(v, v->done + (frame - begin));
 }
 

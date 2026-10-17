@@ -193,8 +193,10 @@ public unsafe class AudioStream : IDisposable
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_play(Handle));
     }
 
-    /// <summary>The bus this stream plays through, or null for the device's master mix.</summary>
-    public MixBus? Bus => _bus;
+    /// <summary>
+    /// The bus this stream plays through, or null for the device's master mix (also after the bus was disposed).
+    /// </summary>
+    public MixBus? Bus => _bus is { IsDisposed: false } b ? b : null;
 
     private MixBus? _bus;
 
@@ -202,8 +204,8 @@ public unsafe class AudioStream : IDisposable
     {
         var h = Handle;
         var dh = device.Handle;
-        if (ReferenceEquals(_device, device) && ReferenceEquals(_bus, bus)) return;
-        var bh = bus?.Handle;
+        var bh = bus?.Handle;   // throws for a disposed bus
+        if (ReferenceEquals(_device, device) && ReferenceEquals(Bus, bus)) return;
         bool added = false;
         try
         {
@@ -225,7 +227,7 @@ public unsafe class AudioStream : IDisposable
         if (_device is null || ReferenceEquals(other._device, _device)) return;
         other.Handle.AttachDevice(_device.Handle);
         other._device = _device;
-        other._bus = _bus;
+        other._bus = Bus;
     }
 
     /// <summary>
@@ -612,6 +614,7 @@ public unsafe class AudioStream : IDisposable
     /// <param name="weights">A [source channels, 2] array of gains.</param>
     /// <exception cref="ArgumentNullException"><paramref name="weights"/> is null.</exception>
     /// <exception cref="FatzAudioException">The array does not match the source's channel count and the device's 2 channels (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <exception cref="FatzAudioException">The stream is a playing forward-only source, which cannot re-buffer (<see cref="ErrorCode.NotSeekable"/>); set the matrix before <c>PlayOn</c>.</exception>
     /// <example>
     /// <code>
     /// // Karaoke: the guide vocal is on the right channel; play only the left (music) on both speakers.

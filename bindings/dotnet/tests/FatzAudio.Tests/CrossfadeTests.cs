@@ -147,7 +147,9 @@ public class CrossfadeTests
         Assert.Same(output, s.Device);
         bus.Dispose();
         Assert.Equal(StreamState.Playing, s.State);   // continues on the master mix
+        Assert.Null(s.Bus);                             // the disposed bus is no longer its route
         Assert.Throws<ObjectDisposedException>(() => bus.Volume = 1f);
+        Assert.Throws<ObjectDisposedException>(() => s.PlayOn(bus));
         s.PlayOn(output);
         Assert.Null(s.Bus);
     }

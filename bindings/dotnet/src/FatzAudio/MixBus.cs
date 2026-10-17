@@ -37,6 +37,9 @@ public sealed class MixBus : IDisposable
     /// <summary>The device this bus mixes into.</summary>
     public OutputDevice Device { get; }
 
+    // A disposed bus has moved its streams to the master mix.
+    internal bool IsDisposed => _handle.IsClosed;
+
     internal BusHandle Handle
     {
         get

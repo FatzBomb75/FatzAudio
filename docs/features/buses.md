@@ -81,4 +81,5 @@ song.ResetMatrix();
 
 - `in_channels` must be the source's channel count and `out_channels` the device's (2). A 5.1 source takes a 6 × 2 matrix, which is a custom downmix.
 - It takes effect at once. A playing stream re-buffers from where it is, so there's no jump in position.
+- A forward-only source (custom I/O without seek) can't re-buffer once attached: set its matrix before attaching it, otherwise the call returns `FA_ERROR_NOT_SEEKABLE`.
 - The matrix runs on the decode workers, before the resampler, so it costs the audio thread nothing.
