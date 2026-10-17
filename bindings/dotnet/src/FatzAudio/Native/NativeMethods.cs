@@ -286,4 +286,44 @@ internal static unsafe partial class NativeMethods
     // ---- Analysis ----------------------------------------------------------
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_levels(StreamHandle stream, long window, float* peak, float* rms, uint channels);
+
+    // ---- Encoding ----------------------------------------------------------
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_encoder_options_init(FaEncoderOptions* options);
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_encoder_create_path(string path, FaEncoderOptions* options, out nint encoder);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_encoder_create_output(FaEncoderOutput* output, void* user, FaEncoderOptions* options, out nint encoder);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_encoder_attach_device(EncoderHandle encoder, DeviceHandle device);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_encoder_attach_stream(EncoderHandle encoder, StreamHandle stream);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_encoder_encode_stream(EncoderHandle encoder, StreamHandle stream);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_encoder_write(EncoderHandle encoder, float* interleaved, long frames, uint sampleRate, uint channels);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_encoder_set_paused(EncoderHandle encoder, int paused);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_encoder_get_status(EncoderHandle encoder, out FaEncoderStatus status);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_encoder_wait(EncoderHandle encoder, long timeout);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_encoder_close(nint encoder);
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_lame_load(string? directory);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_lame_get_info(out FaLameInfo info);
 }

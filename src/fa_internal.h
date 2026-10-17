@@ -537,6 +537,7 @@ struct fa_device {
     fa_atomic32 spilled;         /* 1 = some stream on this device used its spill slots */
     fa_atomic32 publishing;      /* audio thread is between taking a sequence number and publishing */
     fa_limiter limiter;          /* audio thread only */
+    fa_atomic_ptr encoders;      /* fa_enc_list* recording the output (encode.c) */
     struct fa_device* next;      /* engine->devices */
 };
 
@@ -757,6 +758,12 @@ struct fa_stream {
     struct fa_cdg_surface* cdg_surfaces;
     uint32_t cdg_gen;
     fa_atomic64 cdg_offset;      /* fa_time */
+
+    /* Encoders (encode.c): taps recording what the stream plays (fa_enc_list*, read
+     * by the audio thread), and the one reading it as a decode-only stream. Both
+     * under api_lock. */
+    fa_atomic_ptr encoders;
+    struct fa_encoder* reader;
 
     struct fa_stream* next;      /* engine->streams or engine->graveyard */
 };

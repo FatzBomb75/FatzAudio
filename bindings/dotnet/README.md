@@ -31,6 +31,8 @@ song.Ramp(AudioParameter.Volume, 0f, TimeSpan.FromSeconds(3), Curve.EqualPower);
 | `PushAudioStream` | Stream you feed with PCM via `Push(...)`, or with decoded frames in any format via `PushFrame(...)`. `End`, `Flush`, `Buffered`. |
 | `PacketAudioStream` | Stream you feed with compressed packets from your demuxer (FFmpeg): `PushPacket(...)`. Decoded on worker threads; `Clock` follows your timestamps. |
 | `FFmpeg` | `Load(folder)`, `Info`, `ToSampleFormat(...)`: the FFmpeg your app already uses, loaded at runtime (never bundled). |
+| `AudioEncoder` | Writes WAV, FLAC or MP3 to a file or any `Stream` on its own thread: `Record(output)`, `Record(stream)`, `Encode(stream)`, `Write(...)`, `ConvertFile(...)`, `IsPaused`, `Status`, `Wait`, `Close`. |
+| `Lame` | `Load(folder)`, `Info`: the libmp3lame your app ships, loaded at runtime for MP3 (never bundled). |
 | `Curve` | `Linear`, `EqualPower`, `Logarithmic`, `Exponential`, `SCurve`, `Bezier(x1, y1, x2, y2)`, `Points(...)`. |
 | `FatzAudioException` | Thrown for every failed native call; `ErrorCode` mirrors the C `FA_ERROR_*` values. No "last error" polling. |
 

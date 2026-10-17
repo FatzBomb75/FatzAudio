@@ -1,4 +1,4 @@
-#include "fa_internal.h"
+#include "encode.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -132,6 +132,11 @@ void fa_device_render_at(fa_device* dev, float* out, uint32_t frames, int64_t no
     fa_buses_end(dev, frames);
     fa_limiter_process(&dev->limiter, out, frames,
                        powf(10.0f, fa_load_float(&dev->engine->limiter_ceiling) / 20.0f), limiter_on(dev->engine));
+    {
+        fa_enc_list* encs = (fa_enc_list*)fa_load_ptr(&dev->encoders);
+        if (encs)
+            for (i = 0; i < encs->count; i++) fa_encode_push(encs->items[i], out, frames, dev->rate);
+    }
     fa_store32(&dev->period, (int32_t)frames);
     fa_fetch_add64(&dev->clock, frames);
 }
@@ -260,6 +265,7 @@ FA_API void FA_CALL fa_device_close(fa_device* device)
     fa_device** pp;
     fa_voice_list* list;
     if (!device) return;
+    fa_encode_device_closing(device);
     ma_device_stop(&device->device);
     for (;;) {
         list = (fa_voice_list*)fa_load_ptr(&device->voices);

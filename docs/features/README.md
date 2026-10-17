@@ -17,4 +17,4 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Web streams and HLS (HTTP/HTTPS, radio titles, reconnects, HLS) | [web-streams.md](web-streams.md) | ✅ WAV/FLAC/MP3; AAC with the AAC decoder 🗓️ |
 | CD+G karaoke graphics (MP3+G, ZIP, surfaces for any renderer) | [cdg.md](cdg.md) | ✅ files; disc 🗓️ |
 | Disc playback | disc.md | 🗓️ |
-| Recording and encoding | recording-encoding.md | 🗓️ |
+| Recording and encoding (WAV, FLAC, MP3 via LAME; device, stream or file sources) | [recording-encoding.md](recording-encoding.md) | ✅ WAV/FLAC/MP3; Opus, AAC and casting 🗓️ |

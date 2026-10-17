@@ -63,7 +63,13 @@ set(FA_SOURCES
     src/tempo.c
     src/resample.c
     src/stretch.cpp
+    src/encode.c
+    src/enc_wav.c
+    src/enc_flac.c
+    src/enc_mp3.c
+    src/dynlib.c
     src/cdg.h
+    src/encode.h
     src/tempo.h
     src/fa_internal.h
     src/net.h

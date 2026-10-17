@@ -11,6 +11,7 @@
  * (fa_device_wait_quiescent), then takes decode_lock so no worker runs either. */
 #include "net.h"
 #include "cdg.h"
+#include "encode.h"
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -471,6 +472,7 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
     uintptr_t self;
     if (!stream) return;
     e = stream->engine;
+    fa_encode_stream_closing(stream);   /* encoders recording or reading it lose their source */
     /* A worker may be waiting in a network read while holding decode_lock: end
      * the download first so the read returns. */
     fa_net_interrupt(stream->net);
@@ -2443,7 +2445,10 @@ static void net_title_heard(struct fa_stream* s, fa_device* dev)
     if (seq > was && fa_cas64(&s->meta_announced, was, seq)) push_event(dev, s, FA_EVENT_METADATA, seq);
 }
 
-void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames)
+/* Mixes `s` into `out`; *mixed_off and *mixed_n say which frames of the callback
+ * carried its audio. */
+static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames, int64_t* mixed_off,
+                       int64_t* mixed_n)
 {
     int64_t avail, n, done = 0, clock, off = 0, played0;
     int p, playing, audible, ended = 0, at_cue_out = 0, looping;
@@ -2452,6 +2457,8 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
     float norm_target, norm_lin;
     mix_markers mk;
     struct fa_bus* bus;
+    *mixed_off = 0;
+    *mixed_n = 0;
     if (fa_load32(&s->flushing)) return;
     clock = fa_load64(&dev->clock);
 
@@ -2582,6 +2589,8 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
         }
     }
     for (p = 0; p < FA_STREAM_LANES; p++) fa_store_float(&s->lanes[p].current, s->lanes[p].v.value);
+    *mixed_off = off;
+    *mixed_n = done;
     if (done > 0) {
         record_clock(s, clock + off, played0, done);
         fa_fetch_add64(&s->played_audible, done);
@@ -2615,4 +2624,23 @@ void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t fra
         }
     }
     marker_events(s, dev, &mk, played0, played0 + done, 0);
+}
+
+void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames)
+{
+    fa_enc_list* encs = (fa_enc_list*)fa_load_ptr(&s->encoders);
+    int64_t off, n, i;
+    uint32_t k;
+    if (!encs || (int64_t)frames > encs->scratch_cap) {
+        stream_mix(s, dev, out, frames, &off, &n);
+        if (encs)
+            for (k = 0; k < encs->count; k++) fa_encode_drop(encs->items[k], n);
+        return;
+    }
+    /* Recorded: the stream's own mix first, then added to the output. */
+    memset(encs->scratch, 0, (size_t)frames * FA_DEVICE_CHANNELS * sizeof(float));
+    stream_mix(s, dev, encs->scratch, frames, &off, &n);
+    if (n <= 0) return;
+    for (i = off * FA_DEVICE_CHANNELS; i < (off + n) * FA_DEVICE_CHANNELS; i++) out[i] += encs->scratch[i];
+    for (k = 0; k < encs->count; k++) fa_encode_push(encs->items[k], encs->scratch + off * FA_DEVICE_CHANNELS, n, dev->rate);
 }

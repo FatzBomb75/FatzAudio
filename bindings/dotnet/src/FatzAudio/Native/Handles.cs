@@ -164,3 +164,32 @@ internal static class HandleRef
         return handle;
     }
 }
+
+/// <summary>
+/// Owns an <c>fa_encoder*</c> and the GC handle of its output callbacks. Releasing it completes the file
+/// (<c>fa_encoder_close</c>); the result is kept in <see cref="CloseResult"/>.
+/// </summary>
+internal sealed class EncoderHandle : SafeHandle
+{
+    private GCHandle _output;
+
+    public EncoderHandle() : base(0, true) { }
+    public override bool IsInvalid => handle == 0;
+
+    /// <summary>What <c>fa_encoder_close</c> returned, once released.</summary>
+    public int CloseResult { get; private set; }
+
+    public void Initialize(nint native, GCHandle output)
+    {
+        _output = output;
+        SetHandle(native);
+    }
+
+    protected override bool ReleaseHandle()
+    {
+        CloseResult = NativeMethods.fa_encoder_close(handle);
+        if (_output.IsAllocated) _output.Free();
+        return true;
+    }
+}
+

@@ -1,6 +1,6 @@
 # Migrating from BASS
 
-This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (bass_aac, bass_ac3, bass_fx, basscd, bassflac, bassmidi, bassopus, basswebm, basswma), to FatzAudio. It's updated as each feature lands. Status symbols are explained in the [docs index](../README.md#status-legend).
+This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (bass_aac, bass_ac3, bass_fx, basscd, bassflac, bassmidi, bassopus, basswebm, basswma), plus BASSenc for recording and encoding, to FatzAudio. It's updated as each feature lands. Status symbols are explained in the [docs index](../README.md#status-legend).
 
 **Goal:** after migration the app ships one native library per platform (`fatzaudio.dll`/`.dylib`/`.so`) and none of the BASS DLLs.
 
@@ -181,6 +181,35 @@ BASS has no normalization: apps measure each file themselves with a decode pass 
 | BASS_RecordInit / Free / SetDevice / GetDevice / GetInfo / Start | Capture devices as stream sources | 🗓️ |
 | BASS_RecordGetInput / SetInput / GetInputName | Not provided (old WinMM mixer lines) | ➖ |
 
+### Encoding and recording (BASSenc, BASSenc_MP3, BASSenc_FLAC)
+
+The legacy app ships no encoder DLLs; this is how BASSenc-style code maps. One encoder object replaces the encoder add-ons, and format conversion, threading and file headers are built in ([recording and encoding](../features/recording-encoding.md)).
+
+| BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| BASS_Encode_Start / BASS_Encode_StartUser on a playing channel | `fa_encoder_create_path` / `fa_encoder_create_output` + `fa_encoder_attach_stream` | `AudioEncoder.Create(path or Stream)` + `Record(stream)` | ✅ |
+| BASS_Encode_Start on a decoding channel, then a `BASS_ChannelGetData` loop | `fa_encoder_encode_stream`: the encoder's thread reads the stream to its end; `fa_encoder_wait` | `Encode(stream)` + `Wait`, or `AudioEncoder.ConvertFile` | ✅ |
+| Recording the final mix (a mixer or the device output) | `fa_encoder_attach_device` | `Record(output)` | ✅ |
+| BASS_Encode_Write (your own PCM) | `fa_encoder_write` (interleaved float, any rate and channel count) | `Write(span, rate, channels)` | ✅ |
+| BASS_Encode_MP3_Start / StartFile (bassenc_mp3, LAME built in) | `format = FA_ENCODE_MP3`; LAME is loaded at runtime from your app (`fa_lame_load`), never bundled | `EncodeFormat.Mp3`, `Lame.Load` | ✅ |
+| `--preset`, `-b`, `-V` LAME options | `bitrate_kbps` (CBR) or `quality` (VBR 0 … 9) | `BitrateKbps`, `Quality` | ✅ |
+| BASS_Encode_FLAC_Start / StartFile (bassenc_flac, libFLAC) | `format = FA_ENCODE_FLAC` (built in, levels 0 … 8, 16 or 24 bit) | `EncodeFormat.Flac` | ✅ |
+| BASS_ENCODE_PCM (WAV writer), BASS_ENCODE_FP_16BIT/24BIT/32BIT, BASS_ENCODE_RF64 | `format = FA_ENCODE_WAV`, `bits_per_sample` 16/24/32; RF64 is automatic past 4 GB | `EncodeFormat.Wav`, `BitsPerSample` | ✅ |
+| Tags via encoder command lines (`--tt`, `-T TITLE=`) | `title`, `artist`, `album`, `genre`, `date`, `comment`, `track_number` | `Title` … `TrackNumber` | ✅ |
+| BASS_Encode_SetPaused | `fa_encoder_set_paused` | `IsPaused` | ✅ |
+| BASS_Encode_IsActive | `fa_encoder_get_status` (state, error, frames, bytes, dropped) | `Status` | ✅ |
+| BASS_Encode_GetCount (BASS_ENCODE_COUNT_IN/OUT/QUEUE...) | `fa_encoder_status.frames`, `bytes`, `dropped_frames` | `Status.Frames`, `Bytes`, `DroppedFrames` | ✅ |
+| BASS_Encode_Stop / StopEx | `fa_encoder_close` (completes the file, returns the first error) | `Close()` / `Dispose()` | ✅ |
+| BASS_Encode_SetChannel / GetChannel | Create a new encoder (the file is completed when the old one closes) | | ➖ (by design) |
+| BASS_ENCODE_QUEUE, BASS_ENCODE_LIMIT, BASS_CONFIG_ENCODE_PRIORITY | Always queued on the encoder's own thread (`queue_ms`); the audio thread never waits | `QueueLength` | ✅ |
+| BASS_Encode_SetNotify (encoder died) | `FA_ENCODER_FAILED` in the status, the error from `fa_encoder_close` | `Status.State`, `Close()` throws | ✅ |
+| Sample rate / channel conversion with a resampling mixer in front of the encoder | `sample_rate` and `channels` in the options | `SampleRate`, `Channels` | ✅ |
+| BASS_Encode_OPUS_* (bassenc_opus), BASS_Encode_OGG_* (bassenc_ogg), BASS_Encode_AAC (bassenc_aac) | Opus and AAC encoding | | 🗓️ |
+| BASS_Encode_CastInit / CastSetTitle / CastGetStats (Icecast/Shoutcast) | Broadcasting through `fa_encoder_create_output` to a server connection | | 🗓️ |
+| BASS_Encode_ServerInit (built-in server) | Not provided | | ➖ |
+| BASS_Encode_StartCA / StartACM (OS codecs) | AAC through the OS encoders is planned; ACM is obsolete | | 🗓️ / ➖ |
+| BASS_WMA_Encode* (basswma) | Not provided (Windows-only, WMA is obsolete) | | ➖ |
+
 ### 3D and EAX
 
 | BASS | FatzAudio | Status |
@@ -257,7 +286,8 @@ BASS has no CD+G decoder: apps read the `.cdg` themselves, time it from `BASS_Ch
 | basshls.dll (if used) | Built-in: `fa_stream_open_url` plays `.m3u8` (MPEG-TS, fMP4, AES-128) | ✅ MP3 segments; AAC 🗓️ |
 | bassopus.dll | Built-in (incl. raw packet push) | 🗓️ |
 | basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM and MP3 tracks built in, Opus, Vorbis, AAC and others through the app's FFmpeg ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ (built-in Opus/Vorbis decoders 🗓️) |
-| basswma.dll | Decode via Media Foundation on Windows / FFmpeg bridge; encoding not provided | 🗓️ / ➖ |
+| basswma.dll | Decode via Media Foundation on Windows / FFmpeg bridge; WMA encoding not provided (record to MP3, FLAC or WAV with `fa_encoder_*` instead) | 🗓️ / ➖ |
+| bassenc.dll, bassenc_mp3.dll, bassenc_flac.dll (if added later) | Built in: `fa_encoder_*` writes WAV and FLAC itself and MP3 through the app's LAME ([recording and encoding](../features/recording-encoding.md)) | ✅ WAV/FLAC/MP3, 🗓️ Opus/AAC/casting |
 | bassmidi.dll | Built-in MIDI synth (SF2, later SFZ/SF3); soundfont via stream options | 🗓️ |
 | bass_fx.dll | Tempo/pitch/rate params on every stream ([tempo and pitch](../features/tempo-pitch.md)); reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | ✅ tempo/pitch/rate and level control, 🗓️ reverse and BPM |
 | basscd.dll | Disc source + CD+G; analog playback not provided | 🗓️ disc; ✅ CD+G from files |
@@ -569,5 +599,49 @@ song.PlayOn(output);
 ```
 
 When porting, delete the tempo stream, the `BASS_FX_FREESOURCE` bookkeeping and any position conversion through `BASS_FX_TempoGetRateRatio`. bass_fx's tempo is in percent and its frequency in Hz; convert both to multipliers.
+
+### Record the output to MP3 (BASSenc + BASSenc_MP3)
+
+BASS:
+```c
+HENCODE enc = BASS_Encode_MP3_StartFile(mixer, "-V 2 --tt \"Live\"", BASS_ENCODE_AUTOFREE | BASS_UNICODE, L"live.mp3");
+/* ... */
+BASS_Encode_Stop(enc);
+```
+
+FatzAudio:
+```c
+fa_encoder_options o;
+fa_encoder_options_init(&o);
+o.format = FA_ENCODE_MP3;      /* VBR quality 2 = -V 2 */
+o.title = "Live";
+fa_encoder* enc;
+fa_encoder_create_path("live.mp3", &o, &enc);
+fa_encoder_attach_device(enc, device);   /* or fa_encoder_attach_stream(enc, deck) */
+/* ... */
+fa_encoder_close(enc);         /* FA_OK = the file is complete */
+```
+
+.NET:
+```csharp
+using var enc = AudioEncoder.Create("live.mp3", new EncoderOptions { Format = EncodeFormat.Mp3, Title = "Live" });
+enc.Record(output);
+// ...
+enc.Close();
+```
+
+### Convert a file (decoding channel + encoder)
+
+BASS needs a decoding channel, an encoder on it and a `BASS_ChannelGetData` loop to drive it. FatzAudio's encoder reads the stream itself on its own thread:
+
+```c
+fa_encoder_encode_stream(enc, decode_only_stream);
+fa_encoder_wait(enc, -1);
+fa_encoder_close(enc);
+```
+
+```csharp
+AudioEncoder.ConvertFile(engine, "in.mp3", "out.flac", new EncoderOptions { Format = EncodeFormat.Flac });
+```
 
 *More patterns are added here as each feature lands.*

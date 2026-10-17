@@ -1012,6 +1012,166 @@ typedef void (FA_CALL *fa_event_callback)(const fa_event* event, void* user);
 FA_API fa_result FA_CALL fa_stream_set_event_callback(fa_stream* stream, fa_event_callback callback, void* user);
 FA_API fa_result FA_CALL fa_stream_add_position_event(fa_stream* stream, fa_frames frame);
 
+/* ---- Encoding and recording ------------------------------------------------
+ *
+ * An encoder writes audio to a file, or hands the bytes to your callbacks, in one
+ * of these formats:
+ *   FA_ENCODE_WAV   built in: 16 or 24-bit PCM, or 32-bit float; RF64 past 4 GB
+ *   FA_ENCODE_FLAC  built in: lossless, 16 or 24 bit, with an MD5 of the audio
+ *   FA_ENCODE_MP3   LAME, loaded at runtime (fa_lame_load); never bundled
+ *
+ * It takes audio from exactly one source, chosen after it is created:
+ *   fa_encoder_attach_device  everything a device plays (its master mix, after the
+ *                             limiter): recording the output
+ *   fa_encoder_attach_stream  one playing stream as it is heard (volume, pan, fades,
+ *                             normalization and its bus applied): recording a deck
+ *   fa_encoder_encode_stream  a stream that is not attached, read as fast as it
+ *                             decodes: converting a file
+ *   fa_encoder_write          your own PCM, from any thread
+ * Several encoders may share a device or a stream (an MP3 and a WAV of the same
+ * mix, say).
+ *
+ * Threads: each encoder has its own thread that converts, encodes and writes. The
+ * audio thread only copies into the encoder's queue (fa_encoder_options.queue_ms)
+ * and never waits; if the encoder falls that far behind real time (a stalled
+ * network write), the audio that does not fit is dropped and counted in
+ * fa_encoder_status.dropped_frames. Output callbacks run on the encoder's thread.
+ *
+ * Format conversion: the input is resampled (windowed sinc) and its channels mixed
+ * to the output's when they differ. 16-bit output is dithered (TPDF).
+ *
+ * fa_encoder_close stops the source, encodes what is still queued, completes the
+ * file (lengths, MD5, the MP3's LAME/Xing header) and returns the first error the
+ * encoder hit. Closing the device or stream an encoder records just ends its
+ * input; the encoder stays open until you close it. */
+
+typedef struct fa_encoder fa_encoder;
+
+typedef enum fa_encode_format {
+    FA_ENCODE_WAV = 1,
+    FA_ENCODE_FLAC = 2,
+    FA_ENCODE_MP3 = 3
+} fa_encode_format;
+
+typedef struct fa_encoder_options {
+    uint32_t struct_size;        /* sizeof(fa_encoder_options) */
+    fa_encode_format format;     /* default FA_ENCODE_WAV */
+    uint32_t sample_rate;        /* output rate, 0 = the input's. MP3 only has 8, 11.025,
+                                    12, 16, 22.05, 24, 32, 44.1 and 48 kHz: 0 picks the
+                                    input's when allowed, else the nearest of 44.1/48 kHz */
+    uint32_t channels;           /* output channels, 0 = the input's (MP3: at most 2, so
+                                    surround input is mixed down to stereo). Any count
+                                    can be mixed to any other */
+    uint32_t bits_per_sample;    /* WAV: 16, 24 or 32 (32 = float); FLAC: 16 or 24.
+                                    0 = 16. MP3 ignores it */
+    uint32_t bitrate_kbps;       /* MP3: constant bitrate, 8 to 320. 0 = variable bitrate at
+                                    `quality` */
+    int32_t quality;             /* -1 = default. MP3 VBR: 0 (best, ~245 kbps) to 9 (smallest),
+                                    default 2 (~190 kbps). FLAC: 0 (fastest) to 8 (smallest),
+                                    default 5. WAV ignores it */
+    uint32_t queue_ms;           /* input buffered ahead of the encoder thread, 0 = 2000 ms */
+    /* Tags (UTF-8, NULL = none): ID3v2.3 for MP3, Vorbis comments for FLAC, a
+     * LIST/INFO chunk for WAV. Copied when the encoder is created. */
+    const char* title;
+    const char* artist;
+    const char* album;
+    const char* genre;
+    const char* date;            /* "2026" or "2026-10-17" */
+    const char* comment;
+    uint32_t track_number;       /* 0 = none */
+} fa_encoder_options;
+
+FA_API void FA_CALL fa_encoder_options_init(fa_encoder_options* options);
+
+/* Where the bytes go when you take them yourself (a network upload, a pipe, memory).
+ * write  Required. Takes all `size` bytes and returns FA_OK, or an error, which
+ *        stops the encoder (the error is reported by status and close).
+ * seek   Optional. Moves the write position to `offset` bytes from the start, so the
+ *        encoder can complete its header at the end. NULL = forward only: WAV keeps
+ *        "length unknown" sizes, FLAC an unknown length and no MD5, MP3 no Xing header.
+ * close  Optional. Called exactly once, by fa_encoder_close, after the last write.
+ * `user` belongs to the encoder only when fa_encoder_create_output returns FA_OK.
+ * The struct is copied. */
+typedef struct fa_encoder_output {
+    fa_result (FA_CALL *write)(void* user, const void* data, size_t size);
+    fa_result (FA_CALL *seek)(void* user, int64_t offset);
+    void (FA_CALL *close)(void* user);
+} fa_encoder_output;
+
+/* options NULL = defaults (16-bit WAV at the input's format). The file is created
+ * (or replaced) right away; nothing is written until audio arrives. MP3 returns
+ * FA_ERROR_PROVIDER_MISSING when LAME cannot be loaded. */
+FA_API fa_result FA_CALL fa_encoder_create_path(const char* path, const fa_encoder_options* options, fa_encoder** out_encoder);
+FA_API fa_result FA_CALL fa_encoder_create_output(const fa_encoder_output* output, void* user,
+                                                  const fa_encoder_options* options, fa_encoder** out_encoder);
+
+/* The source. Each encoder takes one (FA_ERROR_BUSY once it has one). The input
+ * format is fixed then: a device's rate in stereo; for an attached stream, the
+ * rate of the device it plays on, in stereo (FA_ERROR_INVALID_ARG if it is not
+ * attached; while it plays on a device of another rate, nothing is recorded). */
+FA_API fa_result FA_CALL fa_encoder_attach_device(fa_encoder* encoder, fa_device* device);
+FA_API fa_result FA_CALL fa_encoder_attach_stream(fa_encoder* encoder, fa_stream* stream);
+/* Reads the stream from its current position to its end on the encoder's thread,
+ * at its own rate and channels, as fast as it decodes and encodes; tempo, pitch and
+ * rate apply as in fa_stream_read. The stream must not be attached (FA_ERROR_BUSY);
+ * leave it alone until the encoder finishes (fa_encoder_wait) or is closed. */
+FA_API fa_result FA_CALL fa_encoder_encode_stream(fa_encoder* encoder, fa_stream* stream);
+/* Your own interleaved float PCM. The first call fixes the input format; later
+ * calls must use the same (FA_ERROR_INVALID_ARG). Blocks while the queue is full,
+ * so it never drops audio. Calls must not overlap. */
+FA_API fa_result FA_CALL fa_encoder_write(fa_encoder* encoder, const float* interleaved, fa_frames frames,
+                                          uint32_t sample_rate, uint32_t channels);
+
+/* Paused: input from a device or stream is skipped (not queued), so the recording
+ * just continues where it left off when resumed. */
+FA_API fa_result FA_CALL fa_encoder_set_paused(fa_encoder* encoder, int32_t paused);
+
+typedef enum fa_encoder_state {
+    FA_ENCODER_IDLE = 0,         /* no source yet */
+    FA_ENCODER_RUNNING,
+    FA_ENCODER_FINISHED,         /* fa_encoder_encode_stream reached the end of the stream */
+    FA_ENCODER_FAILED            /* stopped by an error (fa_encoder_status.error) */
+} fa_encoder_state;
+
+typedef struct fa_encoder_status {
+    fa_encoder_state state;
+    fa_result error;             /* first error, FA_OK if none */
+    int32_t paused;
+    fa_frames frames;            /* output frames encoded so far */
+    fa_time duration;            /* `frames` as time */
+    int64_t bytes;               /* bytes written to the file or output */
+    fa_frames dropped_frames;    /* input lost because the queue was full */
+    fa_audio_format input;       /* fixed by the source; zeros while idle */
+    fa_audio_format output;      /* sample_format FA_FORMAT_S16, S24 or F32 for WAV/FLAC; F32 for MP3 */
+} fa_encoder_status;
+
+FA_API fa_result FA_CALL fa_encoder_get_status(fa_encoder* encoder, fa_encoder_status* out_status);
+/* Waits until the encoder is FINISHED or FAILED: FA_OK, or FA_ERROR_BUSY if it is
+ * still running after `timeout` (ns; negative = no limit). */
+FA_API fa_result FA_CALL fa_encoder_wait(fa_encoder* encoder, fa_time timeout);
+/* Stops the source, encodes what is queued, completes and closes the output, and
+ * frees the encoder. Returns the first error (FA_OK when the file is complete). */
+FA_API fa_result FA_CALL fa_encoder_close(fa_encoder* encoder);
+
+/* ---- LAME at runtime ---------------------------------------------------------
+ * MP3 encoding uses libmp3lame (LGPL) from your app, never bundled:
+ *   1. one already loaded in the process, else
+ *   2. one the system loader finds: libmp3lame.dll / libmp3lame-0.dll / lame_enc.dll
+ *      (Windows), libmp3lame.0.dylib (macOS, Homebrew and MacPorts folders too),
+ *      libmp3lame.so.0 (Linux, Android).
+ * fa_lame_load(directory) loads it from a folder instead (call it first). The first
+ * MP3 encoder loads it otherwise. Supported: LAME 3.98 and later. */
+typedef struct fa_lame_info {
+    int32_t loaded;              /* 1 when LAME is in use */
+    char version[32];            /* get_lame_version(), e.g. "3.100" */
+    char path[512];              /* where it was found (file name if unknown) */
+} fa_lame_info;
+
+/* FA_OK when LAME is (already) loaded, FA_ERROR_PROVIDER_MISSING if none was found.
+ * Once loaded it stays loaded for the life of the process. */
+FA_API fa_result FA_CALL fa_lame_load(const char* directory);
+FA_API fa_result FA_CALL fa_lame_get_info(fa_lame_info* out_info);
+
 /* ---- User DSP --------------------------------------------------------- */
 
 /* In-place processing of interleaved float frames in the stream's format. */
