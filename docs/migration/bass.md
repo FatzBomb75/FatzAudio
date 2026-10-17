@@ -59,7 +59,7 @@ This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (
 
 | BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
-| BASS_StreamCreateFile (path) | `fa_stream_open_path`; format detected from content ([streams](../features/streams.md)) | `engine.OpenFile(path)` | ✅ WAV/AIFF/MP3/FLAC/OGG/Opus so far |
+| BASS_StreamCreateFile (path) | `fa_stream_open_path`; format detected from content ([streams](../features/streams.md)) | `engine.OpenFile(path)` | ✅ WAV/AIFF/MP3/FLAC/OGG/Opus so far (and the add-on formats below: MP4, MKV, AAC, AC-3, WMA) |
 | BASS_StreamCreateFile (memory) | `fa_stream_open_memory` | `engine.OpenMemory(bytes)` | ✅ |
 | BASS_StreamCreateFileUser | `fa_stream_open_io`; `close` is called once by `fa_stream_close`, never on a failed open ([custom I/O](../features/streams.md#custom-io-your-own-reader)) | `engine.OpenStream(System.IO.Stream)` | ✅ |
 | BASS_StreamCreateURL | `fa_stream_open_url`: HTTP/HTTPS files with range seeking, Icecast/Shoutcast radio, HLS, `.pls`/`.m3u`; reconnects by itself ([web streams](../features/web-streams.md)) | `engine.OpenUrl(url)` | ✅ WAV/FLAC/MP3/OGG/Opus/AC-3 built in (AAC through the app's FFmpeg) |
@@ -299,6 +299,27 @@ FLAC is a built-in format wherever it appears: `.flac` files, Ogg FLAC, FLAC tra
 | BASS_ChannelGetTags(BASS_TAG_VENDOR / BASS_TAG_OGG on FLAC) | ReplayGain / R128 comments feed normalization automatically; a general tag reader is planned | | 🗓️ |
 | BASS_ChannelGetTags(BASS_TAG_FLAC_CUE / BASS_TAG_FLAC_PICTURE / BASS_TAG_FLAC_METADATA) | Planned with the general tag reader | | 🗓️ |
 
+### basswma (Windows Media Audio)
+
+WMA plays through the ordinary open calls: a built-in ASF demuxer, decoded by Windows' own Media Foundation decoders on Windows and by the app's FFmpeg elsewhere ([WMA](../features/streams.md#wma)). Only playback is replaced; basswma's encoder and its Windows Media server functions are not.
+
+| basswma | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| BASS_WMA_StreamCreateFile (file or memory) | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ (FFmpeg outside Windows) |
+| BASS_WMA_StreamCreateFileUser | `fa_stream_open_io` (forward-only when `seek` is NULL) | `engine.OpenStream` | ✅ |
+| BASS_StreamCreateURL / BASS_WMA_StreamCreateFile on an `http://` WMA/ASF file | `fa_stream_open_url` | `engine.OpenUrl` | ✅ |
+| BASS_WMA_StreamCreateFileAuth (DRM licence) | Protected files return `FA_ERROR_UNSUPPORTED_FORMAT` | — | ➖ (only Windows' DRM components can decrypt them) |
+| `mms://` URLs, Windows Media Server HTTP streaming (WMSP), BASS_CONFIG_WMA_PREBUF, BASS_CONFIG_WMA_NETSEEK | Not supported | — | ➖ (the protocol and its servers are retired) |
+| `audio_track`-style stream choice in multi-stream / multiple-bitrate files | `fa_open_options.audio_track`, `fa_stream_info.audio_track_count` | `StreamOptions.AudioTrack`, `Info.AudioTrackCount` | ✅ |
+| BASS_TAG_WMA_CODEC (via BASS_ChannelGetTags) | `fa_stream_info.codec` (`wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`) | `Info.Codec` | ✅ |
+| BASS_TAG_WMA / BASS_WMA_GetTags (title, author, attributes) | ReplayGain and R128 attributes feed normalization; title and other tags are not exposed yet (no file tag API) | — | 🗓️ |
+| BASS_TAG_WMA_META, BASS_SYNC_WMA_META, BASS_SYNC_WMA_CHANGE (broadcast script commands and stream changes) | Not supported | — | ➖ (Windows Media broadcasts) |
+| BASS_WMA_GetWMObject | No Windows Media Format SDK reader is used | — | ➖ (by design) |
+| BASS_CONFIG_WMA_BASSFILE, BASS_CONFIG_WMA_ASYNC, BASS_CONFIG_WMA_VIDEO | Not needed: FatzAudio reads every file through its own reader, decodes on its worker threads, and never reads video | — | ➖ (by design) |
+| BASS_WMA_EncodeOpen, EncodeOpenFile, EncodeWrite, EncodeClose, EncodeGetRates, EncodeSetTag, EncodeSetNotify | Not provided | — | ➖ (playback only: WMA is a legacy format nobody needs to create) |
+| BASS_WMA_EncodeOpenNetwork(Multi), EncodeOpenPublish(Multi), EncodeGetPort, EncodeGetClients | Not provided | — | ➖ (Windows Media Services broadcasting is retired) |
+| BASS_PluginLoad("basswma.dll") | Not needed: built in | — | ➖ (by design) |
+
 ### bass_fx tempo, pitch and rate
 
 bass_fx needs a decode stream wrapped in a separate tempo stream; FatzAudio puts three parameters on every stream ([tempo and pitch](../features/tempo-pitch.md)).
@@ -418,7 +439,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | bassopus.dll | Built-in: `.opus` files, Opus web radio, Opus in WebM/MKV/MP4, and raw packets through `fa_stream_open_packets` ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
 | basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM, MP3, AC-3, Opus and Vorbis tracks built in, AAC and others through the app's FFmpeg ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ |
 | OGG Vorbis in bass.dll | Built-in: `.ogg` files, chained files, Ogg radio with song titles ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
-| basswma.dll | Decode via Media Foundation on Windows / FFmpeg bridge; WMA encoding not provided (record to MP3, FLAC or WAV with `fa_encoder_*` instead) | 🗓️ / ➖ |
+| basswma.dll | Built-in ASF demuxer (`.wma`, `.asf`, `.wmv` audio; files, memory, your own reader, HTTP), decoded by Media Foundation on Windows and the app's FFmpeg elsewhere; ReplayGain attributes for normalization ([WMA](../features/streams.md#wma)) | ✅ playback; ➖ encoding (record to MP3, FLAC or WAV with `fa_encoder_*` instead), MMS, broadcasting and DRM |
 | bassenc.dll, bassenc_mp3.dll, bassenc_flac.dll (if added later) | Built in: `fa_encoder_*` writes WAV and FLAC itself and MP3 through the app's LAME ([recording and encoding](../features/recording-encoding.md)) | ✅ WAV/FLAC/MP3, 🗓️ Opus/AAC/casting |
 | bassmidi.dll | Built-in SoundFont 2 synthesizer for `.mid`, `.kar` and `.rmi`: engine-wide or per-stream soundfont, lyrics and text events, transpose and channel mute ([MIDI](../features/midi.md)) | ✅ (SF3, SFZ and MIDI input 🗓️) |
 | bass_fx.dll | Tempo/pitch/rate params on every stream ([tempo and pitch](../features/tempo-pitch.md)); reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | ✅ tempo/pitch/rate and level control, 🗓️ reverse and BPM |

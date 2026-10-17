@@ -123,6 +123,10 @@ static const codec_info codecs[] = {
     /* Lossless frames stand alone, but a container's rounded timestamp (Matroska's
      * milliseconds) can put the frame holding the target one packet later. */
     { "flac", 1, 0, 1 }, { "alac", 1, 0, 1 },
+    /* WMA 1 and 2: every block decodes to the same count; an ASF media object holds
+     * the same number of blocks. WMA Pro and Lossless frames may start in the packet
+     * before (a bit reservoir across packets). */
+    { "wmav1", 2, 0, 1 }, { "wmav2", 2, 0, 1 }, { "wmapro", 2, 0, 0 }, { "wmalossless", 2, 0, 0 },
 };
 
 static const codec_info* find_codec(const char* name)
@@ -361,6 +365,8 @@ static void codec_settings(fa_track* t, const fa_codec_params* p)
     t->packets_back = ci ? ci->packets_back : pcm_bytes(p->codec) > 0 ? 0 : 1;
     t->bytes_back = ci ? ci->bytes_back : 0;
     if (strcmp(p->codec, "opus") == 0 && t->p.seek_preroll_s <= 0) t->p.seek_preroll_s = 0.08;
+    /* FFmpeg's WMA 1 and 2 give their first audio a packet or two late. */
+    t->trails = strcmp(p->codec, "wmav1") == 0 || strcmp(p->codec, "wmav2") == 0;
 }
 
 /* A chained stream's next song: its own codec, set up from its own headers. */
@@ -412,12 +418,20 @@ static fa_result fill(fa_track* t)
         r = t->codec.vt->decode(&t->codec, pk.data, pk.size);
         if (r == FA_ERROR_OUT_OF_MEMORY) return r;
         if (r != FA_OK || t->codec.out_frames <= 0 || t->codec.rate == 0 || t->codec.channels == 0) {
+            if (r == FA_OK && t->place && t->trails && !t->quiet && pk.pts != FA_DEMUX_NO_PTS) {
+                t->quiet = 1;
+                t->quiet_pts = pk.pts;
+            }
             /* A corrupt packet is skipped. A codec that never makes a sound from
              * this track's first packets cannot decode it. */
             if (!t->format_known && ++silent > 256) return FA_ERROR_UNSUPPORTED_FORMAT;
             continue;
         }
         if (!t->format_known) learn_format(t);
+        /* A decoder whose output trails its input: this audio starts where the
+         * first packet fed since the flush does. */
+        if (t->quiet && t->place) pk.pts = t->quiet_pts;
+        t->quiet = 0;
         r = emit(t, &pk);
         if (r != FA_OK) return r;
     }
@@ -508,6 +522,7 @@ fa_result fa_track_seek(fa_track* t, fa_frames frame)
     fa_pcm_conv_reset(&t->conv);
     t->count = t->off = 0;
     t->eof = t->draining = 0;
+    t->quiet = 0;
     /* The packet holding `want`; a hair of slack keeps exact boundaries exact. */
     r = t->ops->seek(t->ctx, (int64_t)floor(at + 1e-6), t->packets_back, t->bytes_back);
     t->place = 1;

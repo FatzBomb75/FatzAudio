@@ -968,7 +968,7 @@ FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* we
  *
  * Where a stream's loudness comes from, best first:
  *   1. fa_stream_set_loudness (a value your app stored earlier),
- *   2. ReplayGain 2 / R128 tags in the file (ID3v2 TXXX, FLAC Vorbis comments, APEv2),
+ *   2. ReplayGain 2 / R128 tags in the file (ID3v2 TXXX, FLAC Vorbis comments, APEv2, WMA attributes),
  *   3. the scan cache (fa_engine_config.cache_directory), keyed by file content,
  *   4. a background scan: only the audio is decoded, the file is split into chunks
  *      scanned on all cores at once, and the result is written to the cache,

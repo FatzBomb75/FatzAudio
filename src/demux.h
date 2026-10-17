@@ -103,6 +103,9 @@ typedef struct fa_track {
     fa_frames next_pos;       /* position right after the last decoded packet */
     fa_frames drop_before;    /* frames before this position are not handed out */
     int place;                /* the next packet with audio fixes the position (open, seek) */
+    int trails;               /* the codec's output trails its input by a packet or more */
+    int quiet;                /* while placing: packets were fed that gave no audio yet, */
+    int64_t quiet_pts;        /* the first of them at this pts */
     int eof;
     int draining;             /* the packets ended; the codec gives back what it holds */
     int format_known;

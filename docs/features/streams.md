@@ -14,13 +14,14 @@ A stream is anything that produces audio. You open it from a file, a memory bloc
 | MP4, M4A, MOV | ISO MP4 and QuickTime, including fragmented MP4. Audio tracks only: video is never read | the track's codec: `aac`, `mp3`, `ac3`, `eac3`, `opus`, `flac`, `alac`, `pcm_*`, ... (container `mp4` or `mov`) |
 | Matroska, WebM | MKV, MKA, WebM, including live layouts (unknown sizes, no Cues). Audio tracks only | `aac`, `mp3`, `ac3`, `eac3`, `opus`, `vorbis`, `flac`, `pcm_*`, ... (container `matroska` or `webm`) |
 | Dolby Digital, Dolby Digital Plus | Raw `.ac3` and `.ec3` streams, up to 7.1 ([Dolby Digital](dolby.md)) | `ac3` or `eac3` (container `ac3` or `ec3`) |
+| WMA, ASF | `.wma`, `.asf` and `.wmv` files (Advanced Systems Format), local or over HTTP: Windows Media Audio 1, 2, 9 Professional, 9 Lossless and Voice, plus PCM, MP3 and AC-3 in ASF. Audio streams only ([WMA](#wma)) | `wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`, `pcm_*`, `mp3`, ... (container `asf`) |
 | MIDI | Standard MIDI Files (format 0, 1, 2), karaoke `.kar`, RIFF `.rmi`; played with a SoundFont 2 you load ([MIDI](midi.md)) | `midi` (container `smf` or `rmid`) |
 
-Inside MP4 and Matroska, PCM, MP3, AC-3, E-AC-3, Opus, Vorbis and FLAC tracks decode built in; every other codec (AAC, ALAC, DTS, TrueHD) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`. The same goes for `.aac` files and AAC streams.
+Inside MP4, Matroska and ASF, PCM, MP3, AC-3, E-AC-3, Opus, Vorbis and FLAC tracks decode built in; every other codec (AAC, ALAC, DTS, TrueHD, and WMA outside Windows) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`. The same goes for `.aac` files and AAC streams.
 
 An `.aac` file on disk or in memory is indexed when it opens (a quick pass over the frame headers, without decoding), so its length and seeks are exact. Over the network, and from your own read callbacks when they can seek, the length and seek positions are estimated from the frame sizes at the start, as for MP3 without a seek table. Junk between frames, such as a radio stream joined in the middle of a frame or ID3 tags between HLS segments, is skipped.
 
-More formats are added to the same registry (WMA, MIDI, and built-in or OS decoders for the codecs above follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
+More formats are added to the same registry (built-in or OS decoders for the codecs above follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
 
 Apps that demux files themselves (for example with FFmpeg, for the video) can push compressed packets or decoded frames instead of opening a file: see [FFmpeg hand-off and A/V sync](ffmpeg.md).
 
@@ -28,7 +29,7 @@ Apps that demux files themselves (for example with FFmpeg, for the video) can pu
 
 1. The first 8 KB of the source are read once and kept, so detection works even on sources that can't seek.
 2. A leading ID3v2 tag is skipped. If the tag is bigger than the 8 KB window (cover art often is), detection reads the 8 KB right after it instead. A forward-only source can't do that, so there the file name or `mime_hint` picks the decoder.
-3. Every decoder in the registry scores the data from 0 to 100: magic bytes for WAV/AIFF/FLAC/Ogg, two chained valid frame headers for MP3.
+3. Every decoder in the registry scores the data from 0 to 100: magic bytes for WAV/AIFF/FLAC/Ogg/ASF, two chained valid frame headers for MP3.
 4. The best-scoring decoder opens the stream. If it rejects the data, the next candidate gets a turn.
 5. The file extension and `mime_hint` only break ties. A FLAC file named `song.mp3` still opens as FLAC.
 
@@ -197,6 +198,35 @@ using var s = engine.OpenFile("song.opus");
 - **Web radio:** Ogg Opus and Ogg Vorbis stations work, and each song's title comes from its comment header ([web streams](web-streams.md#song-titles-icy-metadata)).
 - **Ogg FLAC** gets everything above: exact length and seeking, chained files, `audio_track`, loudness tags and radio titles from its comment block.
 - Not supported: Ogg Speex, and Ogg streams that start without their headers.
+
+## WMA
+
+`.wma` files (and `.asf`/`.wmv`, audio only) open with the ordinary calls; there is no plugin to load. FatzAudio reads the ASF container itself and hands each audio frame to a decoder:
+
+- **Windows**: the system's own Windows Media Audio decoders, through Media Foundation. Nothing to install or ship. On Windows N and KN editions without the Media Feature Pack (and on Server Core) Media Foundation is missing; then the app's FFmpeg is used, as elsewhere.
+- **macOS, Linux, Android, iOS**: the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it a WMA track returns `FA_ERROR_PROVIDER_MISSING`. PCM, MP3 and AC-3 inside ASF decode built in everywhere.
+
+Details:
+
+- **Length** comes from the file's play duration less its preroll. In files with several streams (video, other languages) the length is taken from the chosen track's own last frame instead.
+- **Seeking** needs a seekable source. A file's Simple Index (written for video) narrows the search when there is one; otherwise the packets' send times are searched. Seeks are sample exact for WMA 1 and 2 and for PCM (tested); other codecs restart a packet or two earlier the same way, but have no test files yet.
+- **Several audio streams** (several languages, or multiple-bitrate files): `audio_track` picks one, counting audio streams in the order of the header; -1 is the first. Video streams are skipped without being read.
+- **Web streams**: an ASF file on a web server plays with `fa_stream_open_url`, seekable when the server takes byte ranges, straight through when it doesn't. MMS (`mms://`) and Windows Media Server's HTTP streaming protocol are not supported: the servers that spoke them are gone.
+- **ReplayGain**: `REPLAYGAIN_TRACK_GAIN`, `REPLAYGAIN_ALBUM_GAIN` and the peaks (and `R128_*`) in a WMA file's attributes are used for [normalization](normalization.md), like ID3v2 and FLAC tags.
+- **DRM**: protected files (a Content Encryption object in the header, or an encrypted stream, as with old store purchases and subscription downloads) return `FA_ERROR_UNSUPPORTED_FORMAT`. Only Windows' own DRM components hold the licences to decrypt them.
+- **Not supported**: WMA encoding, and scrambled audio ("audio spread" with a span above 1) has not been tested against real files.
+
+```c
+fa_stream* s;
+fa_stream_open_path(engine, "song.wma", NULL, &s);
+fa_stream_info info;
+fa_stream_get_info(s, &info);          /* info.codec "wmav2", info.container "asf" */
+```
+
+```csharp
+using var s = engine.OpenFile("song.wma");
+Console.WriteLine($"{s.Info.Codec} in {s.Info.Container}");
+```
 
 ## Video files and audio tracks
 

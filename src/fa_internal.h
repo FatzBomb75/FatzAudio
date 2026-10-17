@@ -164,6 +164,8 @@ extern const fa_decoder_vtable fa_decoder_ac3;
 extern const fa_decoder_vtable fa_decoder_adts;
 /* Standard MIDI Files and RIFF MIDI, synthesized with a soundfont (dec_midi.c). */
 extern const fa_decoder_vtable fa_decoder_midi;
+/* ASF / Windows Media Audio (demux_asf.c). */
+extern const fa_decoder_vtable fa_decoder_asf;
 
 /* Probing helpers (probe.c). */
 size_t fa_probe_id3v2_size(const uint8_t* data, size_t size);
@@ -420,6 +422,19 @@ void fa_tags_read_loudness(fa_source* src, fa_tag_loudness* out);
 void fa_ogg_read_loudness(fa_source* src, fa_tag_loudness* out);
 /* A Vorbis comment block (FLAC, Ogg Vorbis/Opus): vendor, count, "KEY=value" items. */
 void fa_tags_parse_vorbis_comments(const uint8_t* data, size_t size, fa_tag_loudness* out);
+/* One "KEY" / "value" tag item: the loudness keys are taken, others ignored. */
+void fa_tags_handle(const char* key, const char* value, fa_tag_loudness* out);
+int fa_tags_key_is(const char* key, const char* name);   /* ASCII case-insensitive */
+
+/* ASF tags (demux_asf.c): Content Description, Extended Content Description and
+ * Metadata (Library) string items, as UTF-8. Returns 0 if `src` is not ASF.
+ * Moves the read position. */
+typedef struct fa_asf_tags {
+    char title[256];
+    char artist[256];               /* Author, else WM/AlbumArtist */
+    fa_tag_loudness loudness;       /* NAN = absent */
+} fa_asf_tags;
+int fa_asf_read_tags(fa_source* src, fa_asf_tags* out);
 
 /* ---- Loudness scans (scan.c) ----------------------------------------------- */
 
@@ -935,6 +950,12 @@ int fa_sample_kind(fa_sample_format f, int* out_planar);
 
 /* ffmpeg.c */
 fa_result fa_ffmpeg_open_codec(fa_codec* c, const fa_codec_params* p);
+#ifdef _WIN32
+/* codec_mf.c: Windows Media Audio (wmav1, wmav2, wmapro, wmalossless, wmavoice)
+ * through Media Foundation's decoders. FA_ERROR_UNSUPPORTED_FORMAT for any other
+ * codec or when Media Foundation is not there (Windows N): FFmpeg is tried next. */
+fa_result fa_mf_codec_open(fa_codec* c, const fa_codec_params* p);
+#endif
 /* Sets a decoder option (AVOption, searched in the decoder's own options too) on
  * a codec fa_ffmpeg_open_codec opened. */
 void fa_ffmpeg_codec_option(fa_codec* c, const char* name, const char* value);

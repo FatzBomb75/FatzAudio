@@ -58,6 +58,10 @@ static uint8_t* g_aac;          /* tests/data/net/tone.aac (ADTS, 131 frames at 
 static size_t g_aac_n;
 static uint8_t* g_aac_tagged;   /* g_aac after a 30 KB ID3v2 tag (cover art) */
 static size_t g_aac_tagged_n;
+static uint8_t* g_wma;          /* tests/data/asf/tone.wma (WMA 2, 2 s at 44.1 kHz) */
+static size_t g_wma_n;
+static uint8_t* g_asf_pcm;      /* tests/data/asf/pcm.asf (PCM in ASF, 10000 frames at 8 kHz) */
+static size_t g_asf_pcm_n;
 static uint8_t* g_wav;          /* 2 s of 16-bit stereo at 44100 Hz, generated */
 static size_t g_wav_n;
 #define WAV_FRAMES 88200
@@ -535,6 +539,10 @@ static void handle_request(sock_t s)
     else if (strcmp(path, "/radio.aac") == 0) serve_radio(s, req, g_aac, g_aac_n, "audio/aacp", 64);
     else if (strcmp(path, "/tone.aac") == 0) serve_bytes(s, req, g_aac, g_aac_n, "audio/aac", 1, 0);
     else if (strcmp(path, "/tagged.aac") == 0) serve_bytes(s, req, g_aac_tagged, g_aac_tagged_n, "audio/aac", 1, 0);
+    else if (strcmp(path, "/tone.wma") == 0) serve_bytes(s, req, g_wma, g_wma_n, "audio/x-ms-wma", 1, 0);
+    else if (strcmp(path, "/noranges.wma") == 0) serve_bytes(s, req, g_wma, g_wma_n, "audio/x-ms-wma", 0, 0);
+    else if (strcmp(path, "/pcm.asf") == 0) serve_bytes(s, req, g_asf_pcm, g_asf_pcm_n, "video/x-ms-asf", 1, 0);
+    else if (strcmp(path, "/chunked.asf") == 0) serve_chunked(s, g_asf_pcm, g_asf_pcm_n);
     else if (strncmp(path, "/hls/", 5) == 0) serve_hls(s, req, path);
     else send_str(s, "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found");
 }
@@ -1199,6 +1207,49 @@ static void test_aac_over_http(void)
     fa_stream_close(s);
 }
 
+/* ASF over HTTP: with byte ranges seekable (the packets are searched by send time
+ * over range requests), without them or chunked read straight through. */
+static void check_asf_url(const char* path, const uint8_t* file, size_t file_n, int seekable, fa_frames seek_to)
+{
+    fa_result r;
+    fa_stream* s = open_url(path, FA_OPEN_DECODE_ONLY, &r);
+    fa_stream_info info;
+    fa_frames n = 0, ref_n = 0, i, rd = 0;
+    float *got, *ref, buf[1024 * 2];
+    uint32_t ch;
+    if (r == FA_ERROR_PROVIDER_MISSING) { printf("  %s (skipped: FFmpeg not found)\n", path); return; }
+    CHECK_EQ(r, FA_OK);
+    if (!s) return;
+    fa_stream_get_info(s, &info);
+    ch = info.format.channels;
+    CHECK_STR(info.container, "asf");
+    CHECK_EQ(info.seekable, seekable);
+    got = read_all(s, &n);
+    ref = read_all_memory(file, file_n, &ref_n);
+    CHECK(ref != NULL);
+    CHECK_EQ(n, ref_n);
+    for (i = 0; i < n * (fa_frames)ch; i++) if (got[i] != ref[i]) { CHECK_EQ(i, -1); }
+    if (seekable) {
+        CHECK_EQ(fa_stream_seek(s, seek_to), FA_OK);
+        CHECK_EQ(fa_stream_read(s, buf, 1024, &rd), FA_OK);
+        CHECK_EQ(rd, 1024);
+        for (i = 0; i < 1024 * (fa_frames)ch; i++) if (buf[i] != ref[(size_t)seek_to * ch + (size_t)i]) { CHECK_EQ(i, -1); }
+    } else {
+        CHECK_EQ(fa_stream_seek(s, seek_to), FA_ERROR_NOT_SEEKABLE);
+    }
+    free(got);
+    free(ref);
+    fa_stream_close(s);
+}
+
+static void test_asf_over_http(void)
+{
+    check_asf_url("/pcm.asf", g_asf_pcm, g_asf_pcm_n, 1, 6543);
+    check_asf_url("/chunked.asf", g_asf_pcm, g_asf_pcm_n, 0, 6543);
+    check_asf_url("/tone.wma", g_wma, g_wma_n, 1, 44100);
+    check_asf_url("/noranges.wma", g_wma, g_wma_n, 0, 44100);
+}
+
 /* AAC internet radio (audio/aacp): song titles where the songs are heard. */
 static void test_aac_radio(void)
 {
@@ -1664,7 +1715,9 @@ int main(void)
     g_aac = read_file(FA_TEST_DATA_DIR "/net/tone.aac", &g_aac_n);
     g_ac3 = read_file(FA_TEST_DATA_DIR "/tone.ac3", &g_ac3_n);
     g_oggradio = read_file(FA_TEST_DATA_DIR "/ogg/radio.opus", &g_oggradio_n);
-    if (!g_mp3 || !g_mp3x || !g_aac || !g_ac3 || !g_oggradio) { fprintf(stderr, "missing test data in %s\n", FA_TEST_DATA_DIR "/net"); return 1; }
+    g_wma = read_file(FA_TEST_DATA_DIR "/asf/tone.wma", &g_wma_n);
+    g_asf_pcm = read_file(FA_TEST_DATA_DIR "/asf/pcm.asf", &g_asf_pcm_n);
+    if (!g_mp3 || !g_mp3x || !g_aac || !g_ac3 || !g_oggradio || !g_wma || !g_asf_pcm) { fprintf(stderr, "missing test data in %s\n", FA_TEST_DATA_DIR "/net"); return 1; }
     make_wav();
     make_hls();
     make_hls_aac();
@@ -1704,6 +1757,7 @@ int main(void)
     RUN(test_hls_retry_and_byteranges);
     RUN(test_aac_over_http);
     RUN(test_aac_radio);
+    RUN(test_asf_over_http);
     RUN(test_hls_aac);
     RUN(test_seek_after_giving_up);
     RUN(test_long_user_agent);
@@ -1721,6 +1775,8 @@ int main(void)
     free(g_mp3x);
     free(g_aac);
     free(g_aac_tagged);
+    free(g_wma);
+    free(g_asf_pcm);
     free(g_wav);
     printf("%d request(s) served\n", fa_load32(&g_requests));
     if (g_failures) { printf("%d failure(s)\n", g_failures); return 1; }
