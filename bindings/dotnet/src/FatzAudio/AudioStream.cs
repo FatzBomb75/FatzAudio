@@ -58,7 +58,7 @@ public delegate void DspProcessor(Span<float> samples, int channels);
 /// <para>
 /// <b>Events</b> (<see cref="Ended"/>, <see cref="Started"/>, <see cref="MetadataChanged"/>, <see cref="Stalled"/>, <see cref="Resumed"/>,
 /// <see cref="DecodeError"/>, <see cref="LoudnessFinal"/>, <see cref="PositionReached"/>, <see cref="MarkerReached"/>,
-/// <see cref="DeviceChanged"/>) are raised on a native engine thread, never on your UI thread. Handlers must return
+/// <see cref="DeviceChanged"/>, <see cref="MidiTextReached"/>) are raised on a native engine thread, never on your UI thread. Handlers must return
 /// quickly and must not block; marshal to your own context if needed. Exceptions thrown by handlers are swallowed.
 /// </para>
 /// <para>
@@ -502,6 +502,113 @@ public unsafe class AudioStream : IDisposable
                 throw new ArgumentException("Unknown dynamic range.", nameof(value));
             FatzAudioException.ThrowIfFailed(rc);
         }
+    }
+
+    // ---- MIDI -----------------------------------------------------------------
+
+    /// <summary>
+    /// Title, format and text counts of a MIDI stream (Standard MIDI File, .kar or .rmi); null for streams that are not MIDI.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public unsafe MidiInfo? MidiInfo
+    {
+        get
+        {
+            FaMidiInfo n;
+            int rc = NativeMethods.fa_stream_get_midi_info(Handle, &n);
+            if (rc == (int)ErrorCode.InvalidArgument) return null;
+            FatzAudioException.ThrowIfFailed(rc);
+            return new MidiInfo(Str(n.Title), Str(n.Artist), Str(n.Copyright), n.Format, (int)n.Tracks,
+                (int)n.TextCount, (int)n.LyricCount, n.Karaoke != 0);
+        }
+    }
+
+    /// <summary>
+    /// The lyrics and other text events of a MIDI stream in time order (empty for other streams). While the stream
+    /// plays, <see cref="MidiTextReached"/> is raised as each one is heard; a karaoke screen can also follow
+    /// <see cref="Clock"/> through this list.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// var line = new StringBuilder();
+    /// foreach (var t in song.MidiTexts.Where(t =&gt; t.Type == MidiTextType.Lyric))
+    /// {
+    ///     if (t.Flags.HasFlag(MidiTextFlags.NewLine)) { Console.WriteLine(line); line.Clear(); }
+    ///     line.Append(t.Text);
+    /// }
+    /// </code>
+    /// </example>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public IReadOnlyList<MidiText> MidiTexts
+    {
+        get
+        {
+            var info = MidiInfo;
+            if (info is null) return [];
+            var list = new List<MidiText>(info.TextCount);
+            for (int i = 0; i < info.TextCount; i++) list.Add(GetMidiText(i));
+            return list;
+        }
+    }
+
+    private unsafe MidiText GetMidiText(int index)
+    {
+        FaMidiText t;
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_midi_text(Handle, (uint)index, &t));
+        return new MidiText(index, (MidiTextType)t.Type, Str(t.Text), (MidiTextFlags)t.Flags,
+            TimeConvert.FromNanoseconds(t.Time), t.Frame, t.Track);
+    }
+
+    /// <summary>
+    /// MIDI streams: semitones (-48..48) added to every note but the drums, from the next note on. The soundfont
+    /// plays the transposed notes themselves, so a key change sounds as clean as the original (unlike
+    /// <see cref="Pitch"/>, which shifts the rendered audio). Heard after the decode-ahead buffer (150 ms by default
+    /// for MIDI streams).
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is outside -48..48.</exception>
+    /// <exception cref="FatzAudioException">The stream is not MIDI (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public int MidiTranspose
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_midi_transpose(Handle, out int v));
+            return v;
+        }
+        set
+        {
+            if (value is < -48 or > 48) throw new ArgumentOutOfRangeException(nameof(value));
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_midi_transpose(Handle, value));
+        }
+    }
+
+    /// <summary>
+    /// Mutes or unmutes a MIDI channel (0..15, MIDI channel 1..16): it goes silent at once and stays silent until
+    /// unmuted, for example to turn a karaoke file's guide melody off. Master volume is <see cref="Volume"/> and the
+    /// tempo is <see cref="Tempo"/>, as for every stream.
+    /// </summary>
+    /// <param name="channel">Channel 0..15.</param>
+    /// <param name="muted">True to mute.</param>
+    /// <exception cref="ArgumentOutOfRangeException">The channel is outside 0..15.</exception>
+    /// <exception cref="FatzAudioException">The stream is not MIDI (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public void SetMidiChannelMuted(int channel, bool muted)
+    {
+        if (channel is < 0 or > 15) throw new ArgumentOutOfRangeException(nameof(channel));
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_midi_channel_mute(Handle, (uint)channel, muted ? 1 : 0));
+    }
+
+    /// <summary>Whether a MIDI channel (0..15) is muted by <see cref="SetMidiChannelMuted"/>.</summary>
+    /// <param name="channel">Channel 0..15.</param>
+    /// <returns>True when muted.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">The channel is outside 0..15.</exception>
+    /// <exception cref="FatzAudioException">The stream is not MIDI (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public bool IsMidiChannelMuted(int channel)
+    {
+        if (channel is < 0 or > 15) throw new ArgumentOutOfRangeException(nameof(channel));
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_midi_channel_mute(Handle, (uint)channel, out int m));
+        return m != 0;
     }
 
     /// <summary>
@@ -986,6 +1093,14 @@ public unsafe class AudioStream : IDisposable
     public event EventHandler? Started;
     /// <summary>Raised when a marker is passed (<see cref="StreamEventArgs.Marker"/> says which). Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler<StreamEventArgs>? MarkerReached;
+    /// <summary>
+    /// Raised when a MIDI lyric or other text event is heard (streams playing on a device; decode-only streams list
+    /// them with <see cref="MidiTexts"/>). Best effort, like markers: under heavy load an event may be dropped, so a
+    /// karaoke screen that must never miss a syllable follows <see cref="Clock"/> through <see cref="MidiTexts"/>.
+    /// Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should
+    /// return quickly, since they delay later events.
+    /// </summary>
+    public event EventHandler<MidiTextEventArgs>? MidiTextReached;
     /// <summary>Raised when the output device changed. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler<StreamEventArgs>? DeviceChanged;
 
@@ -1061,6 +1176,9 @@ public unsafe class AudioStream : IDisposable
                     RampCompleted?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value));
                     break;
                 case 10: Started?.Invoke(this, EventArgs.Empty); break;
+                case 11:
+                    if (MidiTextReached is { } onText) onText(this, new MidiTextEventArgs(GetMidiText((int)value)));
+                    break;
             }
         }
         catch

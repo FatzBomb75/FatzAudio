@@ -97,15 +97,26 @@ struct fa_decoder {
     /* The stream's fa_dynamic_range, for codecs that apply one (Dolby); given to
      * fa_decoder_open. NULL = full range. */
     fa_atomic32* dynamic_range;
+    /* MIDI, from fa_decoder_open's env (wrapping decoders such as HLS pass both on). */
+    struct fa_soundfont* soundfont;   /* borrowed, NULL = none */
+    uint32_t midi_rate;               /* MIDI: output rate */
 };
+
+/* What a decoder may need from the stream that opens it. */
+typedef struct fa_decoder_env {
+    fa_atomic32* dynamic_range;       /* the stream's fa_dynamic_range (read while decoding),
+                                         NULL = full range */
+    struct fa_soundfont* soundfont;   /* MIDI: the instruments (the caller keeps it alive
+                                         while the decoder is open), NULL = none */
+    uint32_t midi_rate;               /* MIDI: output rate, 0 = FA_MIDI_DEFAULT_RATE */
+} fa_decoder_env;
 
 /* Detects the format of `src` and opens the matching decoder. `name_hint` (a path
  * or NULL) and `mime_hint` only break ties when the content is ambiguous.
  * `audio_track`: 0-based among the audio tracks, -1 = default; FA_ERROR_NOT_FOUND
- * if the file has no such track. `dynamic_range`: the stream's fa_dynamic_range
- * (read while decoding), or NULL for full range. */
+ * if the file has no such track. `env` may be NULL (defaults). */
 fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint, const char* mime_hint,
-                          int32_t audio_track, fa_atomic32* dynamic_range);
+                          int32_t audio_track, const fa_decoder_env* env);
 fa_result fa_decoder_read(fa_decoder* dec, float* out, fa_frames frames, fa_frames* got);
 fa_result fa_decoder_seek(fa_decoder* dec, fa_frames frame);
 void fa_decoder_close(fa_decoder* dec);
@@ -147,15 +158,40 @@ extern const fa_decoder_vtable fa_decoder_ogg;
 extern const fa_decoder_vtable fa_decoder_ac3;
 /* AAC in ADTS frames (demux_adts.c). */
 extern const fa_decoder_vtable fa_decoder_adts;
+/* Standard MIDI Files and RIFF MIDI, synthesized with a soundfont (dec_midi.c). */
+extern const fa_decoder_vtable fa_decoder_midi;
 
 /* Probing helpers (probe.c). */
 size_t fa_probe_id3v2_size(const uint8_t* data, size_t size);
 int fa_probe_wav(const uint8_t* data, size_t size, size_t id3_size);
 int fa_probe_flac(const uint8_t* data, size_t size, size_t id3_size);
 int fa_probe_mp3(const uint8_t* data, size_t size, size_t id3_size);
+int fa_probe_midi(const uint8_t* data, size_t size, size_t id3_size);
 /* First MPEG audio Layer III frame at or after `start`: bitrate (kbps), sample rate.
  * 0 if none is found in the window. */
 int fa_probe_mp3_header(const uint8_t* data, size_t size, size_t start, uint32_t* out_kbps, uint32_t* out_rate);
+
+/* ---- MIDI (dec_midi.c) ------------------------------------------------------ */
+
+#define FA_MIDI_DEFAULT_RATE 44100
+#define FA_MIDI_BUFFER_MS 150       /* default decode-ahead of MIDI streams (live controls) */
+
+/* Soundfont references: retain returns `f` (NULL-safe); the last release frees it. */
+struct fa_soundfont* fa_soundfont_retain(struct fa_soundfont* f);
+void fa_soundfont_release(struct fa_soundfont* f);
+/* A fingerprint of the soundfont's content, for the loudness cache. */
+uint64_t fa_soundfont_key(const struct fa_soundfont* f);
+uint64_t fa_fnv1a(uint64_t h, const uint8_t* p, size_t n);   /* scan.c */
+/* The engine's soundfont, retained (release it), or NULL. */
+struct fa_soundfont* fa_engine_soundfont(fa_engine* engine);
+/* The MIDI rate of streams of `engine`. */
+uint32_t fa_engine_midi_rate(const fa_engine* engine);
+
+/* The MIDI state of an open MIDI decoder, NULL for other decoders. */
+struct fa_midi* fa_midi_of(fa_decoder* dec);
+/* Frames of the text events, sorted, fixed while the decoder is open (read by the
+ * audio thread to raise FA_EVENT_MIDI_TEXT). */
+const fa_frames* fa_midi_text_frames(const struct fa_midi* m, uint32_t* out_count);
 
 /* ---- Ring buffer (ring.c): single producer (worker), single consumer (audio) */
 
@@ -520,6 +556,8 @@ struct fa_engine {
     fa_thread* scan_threads;
     uint32_t scan_thread_count;
     int scan_started;
+
+    struct fa_soundfont* soundfont; /* fa_engine_set_soundfont, under list_lock */
 };
 
 typedef struct fa_voice_list {
@@ -779,6 +817,10 @@ struct fa_stream {
      * under api_lock. */
     fa_atomic_ptr encoders;
     struct fa_encoder* reader;
+    /* MIDI: the soundfont the stream was opened with (a reference, NULL for other
+     * formats or none) and the decoder's MIDI state (live controls, texts). */
+    struct fa_soundfont* soundfont;
+    struct fa_midi* midi;
 
     struct fa_stream* next;      /* engine->streams or engine->graveyard */
 };

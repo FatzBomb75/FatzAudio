@@ -71,14 +71,17 @@ enum {
     FA_ERROR_END_OF_STREAM = -11,
     FA_ERROR_NOT_IMPLEMENTED = -12,
     FA_ERROR_PROVIDER_MISSING = -13, /* e.g. FFmpeg or LAME not found at runtime */
-    FA_ERROR_NO_DISC = -14           /* the CD drive has no disc, its tray is open, or the
+    FA_ERROR_NO_DISC = -14,          /* the CD drive has no disc, its tray is open, or the
                                         disc was changed under an open stream */
+    FA_ERROR_NO_SOUNDFONT = -15      /* a MIDI file needs a soundfont: fa_engine_set_soundfont
+                                        or fa_open_options.soundfont */
 };
 
 typedef struct fa_engine fa_engine;   /* one per process is typical */
 typedef struct fa_device fa_device;   /* an opened output device */
 typedef struct fa_stream fa_stream;   /* any playable/decodable source */
 typedef struct fa_bus fa_bus;         /* a mix bus (deck/group) */
+typedef struct fa_soundfont fa_soundfont; /* SoundFont 2 instruments for MIDI files */
 
 typedef enum fa_sample_format {
     FA_FORMAT_F32 = 0, /* interleaved float, the internal format */
@@ -243,6 +246,9 @@ typedef struct fa_open_options {
                                 NULL = defaults. Copied by the call */
     int32_t dynamic_range;   /* fa_dynamic_range for Dolby audio (default FULL); can be
                                 changed later with fa_stream_set_dynamic_range */
+    fa_soundfont* soundfont; /* MIDI files: the instruments to play them with, NULL = the
+                                engine's (fa_engine_set_soundfont). The stream keeps its
+                                own reference. Other formats ignore it */
 } fa_open_options;
 
 FA_API void FA_CALL fa_open_options_init(fa_open_options* options);
@@ -1142,6 +1148,118 @@ FA_API fa_result FA_CALL fa_cdg_surface_update(fa_cdg_surface* surface, fa_cdg_f
  * offset still applies): for your own clock, previews, or rendering to a video file. */
 FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_time time, fa_cdg_frame* out_frame);
 
+/* ---- MIDI ---------------------------------------------------------------
+ *
+ * Standard MIDI Files (.mid, .midi, format 0, 1 and 2), karaoke .kar files and RIFF
+ * MIDI (.rmi) open with the ordinary fa_stream_open_* calls, detected from the
+ * content like any other format, and are played by a built-in SoundFont 2
+ * synthesizer. They render to stereo F32 at the engine's mix_sample_rate, or
+ * 44100 Hz when that is 0 (device native).
+ *
+ * The instruments come from a soundfont you load once and share:
+ *
+ *     fa_soundfont* gm;
+ *     fa_soundfont_open_path("GeneralUser.sf2", &gm);
+ *     fa_engine_set_soundfont(engine, gm);   (every MIDI stream opened from now on)
+ *     fa_soundfont_close(gm);                (the engine keeps its own reference)
+ *
+ * fa_open_options.soundfont picks another one for a single stream. No soundfont
+ * is built in: opening a MIDI file without one returns FA_ERROR_NO_SOUNDFONT.
+ * A soundfont is reference-counted: the engine and every stream using it hold a
+ * reference, so it may be closed (or replaced on the engine) at any time and is
+ * freed when the last user is done. Its samples are kept in memory as 32-bit
+ * float (about twice the size of the .sf2 file).
+ *
+ * Seeking is sample-exact and fast: events up to the target are replayed without
+ * rendering audio. Programs, controllers and pitch bends are restored; notes held
+ * across the target are not restarted (they sound again from their next note-on).
+ * The length is the time of the last event plus one second, so the last notes
+ * ring out. Lyrics and other text events are listed by fa_stream_get_midi_text and
+ * raised as FA_EVENT_MIDI_TEXT when they are heard. */
+
+/* A SoundFont 2 (.sf2) file from a UTF-8 path, or from memory (copied). FA_ERROR_NOT_FOUND
+ * when the file is missing, FA_ERROR_UNSUPPORTED_FORMAT when it is not a usable
+ * SoundFont 2 file (SF3 and SFZ are not supported yet). */
+FA_API fa_result FA_CALL fa_soundfont_open_path(const char* path, fa_soundfont** out_font);
+FA_API fa_result FA_CALL fa_soundfont_open_memory(const void* data, size_t size, fa_soundfont** out_font);
+/* Releases your reference. Streams and engines using the soundfont keep theirs. */
+FA_API void FA_CALL fa_soundfont_close(fa_soundfont* font);
+
+typedef struct fa_soundfont_info {
+    char name[256];              /* the bank's name (INAM), "" if it has none */
+    uint32_t preset_count;       /* instruments and drum kits */
+    uint64_t sample_memory;      /* bytes of sample data held in memory */
+} fa_soundfont_info;
+
+FA_API fa_result FA_CALL fa_soundfont_get_info(fa_soundfont* font, fa_soundfont_info* out_info);
+
+/* The soundfont for MIDI streams opened from now on (streams already open keep
+ * theirs). The engine takes its own reference; NULL removes it. */
+FA_API fa_result FA_CALL fa_engine_set_soundfont(fa_engine* engine, fa_soundfont* font);
+
+typedef enum fa_midi_text_type {
+    FA_MIDI_LYRIC = 0,       /* a syllable to sing: lyric events, or the words of a .kar file */
+    FA_MIDI_TEXT,            /* any other text event (for .kar files, the "@" header lines) */
+    FA_MIDI_MARKER,          /* marker events: song sections ("Verse", "Chorus") */
+    FA_MIDI_CUE,             /* cue point events */
+    FA_MIDI_TRACK_NAME,
+    FA_MIDI_INSTRUMENT_NAME,
+    FA_MIDI_COPYRIGHT
+} fa_midi_text_type;
+
+typedef enum fa_midi_text_flags {
+    FA_MIDI_NEW_LINE = 1 << 0,       /* lyrics: a new line starts with this syllable */
+    FA_MIDI_NEW_PARAGRAPH = 1 << 1   /* lyrics: a new verse or page starts with it */
+} fa_midi_text_flags;
+
+/* One text event. Lyrics come cleaned up: the line and paragraph marks of .kar
+ * files ("/" and "\" before a syllable) and lyric events (CR and LF) are removed
+ * from `text` and given as `flags` on the syllable that starts the new line, so
+ * a karaoke screen joins the syllables of a line as they are and breaks before
+ * the flagged ones. Spaces between words are kept as the file has them. */
+typedef struct fa_midi_text {
+    fa_frames frame;             /* where it is heard (source frames) */
+    fa_time time;                /* the same, in nanoseconds */
+    int32_t type;                /* fa_midi_text_type */
+    uint32_t flags;              /* fa_midi_text_flags */
+    int32_t track;               /* MTrk chunk it came from, 0-based */
+    char text[256];              /* UTF-8 (Latin-1/Windows-1252 text is converted), truncated */
+} fa_midi_text;
+
+typedef struct fa_midi_info {
+    char title[256];             /* .kar @T line, else the name of the first track */
+    char artist[256];            /* the second .kar @T line, "" if none */
+    char copyright[256];         /* copyright event */
+    int32_t format;              /* Standard MIDI File format: 0, 1 or 2 */
+    uint32_t tracks;             /* MTrk chunks */
+    uint32_t text_count;         /* entries of fa_stream_get_midi_text (all types) */
+    uint32_t lyric_count;        /* of those, FA_MIDI_LYRIC */
+    int32_t karaoke;             /* 1 = a karaoke (.kar) file: "@K"/"@T" header lines or a
+                                    "Words" track. Its words are the lyrics */
+} fa_midi_info;
+
+/* FA_ERROR_INVALID_ARG for streams that are not MIDI. */
+FA_API fa_result FA_CALL fa_stream_get_midi_info(fa_stream* stream, fa_midi_info* out_info);
+/* Text events in time order, index 0 .. text_count - 1 (FA_ERROR_NOT_FOUND past it). */
+FA_API fa_result FA_CALL fa_stream_get_midi_text(fa_stream* stream, uint32_t index, fa_midi_text* out_text);
+
+/* Live controls. Like FA_PARAM_PITCH they change the audio where it is rendered,
+ * so a change is heard after the decode-ahead buffer: MIDI streams default to a
+ * 150 ms buffer (fa_open_options.buffer_ms) to keep that short.
+ *
+ * Transpose: semitones -48..48 added to every note but the drums (channel 10),
+ * from the next note on; held notes end at their own pitch. The soundfont plays
+ * the transposed notes themselves, so a key change sounds as clean as the
+ * original (unlike FA_PARAM_PITCH, which shifts the rendered audio).
+ * Mute: channel 0..15 (MIDI channel 1..16) goes silent at once and stays silent
+ * until unmuted: for a karaoke "guide melody off". Master volume is
+ * FA_PARAM_VOLUME and the tempo is FA_PARAM_TEMPO, as for every stream.
+ * FA_ERROR_INVALID_ARG for streams that are not MIDI or values out of range. */
+FA_API fa_result FA_CALL fa_stream_set_midi_transpose(fa_stream* stream, int32_t semitones);
+FA_API fa_result FA_CALL fa_stream_get_midi_transpose(fa_stream* stream, int32_t* out_semitones);
+FA_API fa_result FA_CALL fa_stream_set_midi_channel_mute(fa_stream* stream, uint32_t channel, int32_t muted);
+FA_API fa_result FA_CALL fa_stream_get_midi_channel_mute(fa_stream* stream, uint32_t channel, int32_t* out_muted);
+
 /* ---- Events ----------------------------------------------------------- */
 
 /* Meaning of fa_event.frame and fa_event.value per type. "Position" is the stream
@@ -1159,8 +1277,10 @@ FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_ti
  * FA_EVENT_LOUDNESS_FINAL  position               0
  * FA_EVENT_RAMP_DONE       position               fa_ramp.tag of the finished ramp
  * FA_EVENT_STARTED         position               0
+ * FA_EVENT_MIDI_TEXT       the text's frame       index for fa_stream_get_midi_text
  *
- * Delivered today: ENDED, MARKER, LOUDNESS_FINAL, RAMP_DONE and STARTED; METADATA from web
+ * Delivered today: ENDED, MARKER, LOUDNESS_FINAL, RAMP_DONE and STARTED; MIDI_TEXT from MIDI
+ * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); METADATA from web
  * streams; STALLED and RESUMED from push, packet and web streams; DECODE_ERROR from packet
  * and disc streams. The others are raised by the features that produce them as those land (see docs/features). */
 typedef enum fa_event_type {
@@ -1174,7 +1294,8 @@ typedef enum fa_event_type {
     FA_EVENT_DEVICE_CHANGED,
     FA_EVENT_LOUDNESS_FINAL,  /* the stream's final loudness is known (fa_stream_get_loudness) */
     FA_EVENT_RAMP_DONE,       /* a ramp reached its target or was replaced */
-    FA_EVENT_STARTED          /* a scheduled, crossfaded or queued start happened */
+    FA_EVENT_STARTED,         /* a scheduled, crossfaded or queued start happened */
+    FA_EVENT_MIDI_TEXT        /* a MIDI lyric or other text event is heard */
 } fa_event_type;
 
 typedef struct fa_event {

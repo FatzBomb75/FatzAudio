@@ -49,6 +49,8 @@ set(FA_SOURCES
     src/codec.c
     src/ac3.c
     src/dec_ac3.c
+    src/dec_midi.c
+    src/tinysoundfont_impl.c
     src/mdct.c
     src/ffmpeg.c
     src/push.c
@@ -114,7 +116,8 @@ endif()
 target_include_directories(fatzaudio
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
     PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniaudio)
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniaudio
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tinysoundfont)
 target_compile_definitions(fatzaudio PRIVATE FA_BUILDING)
 set_target_properties(fatzaudio PROPERTIES
     OUTPUT_NAME fatzaudio
@@ -141,7 +144,7 @@ endif()
 
 if(MSVC)
     target_compile_options(fatzaudio PRIVATE /W3)
-    set_source_files_properties(src/miniaudio_impl.c PROPERTIES COMPILE_OPTIONS "/W0")
+    set_source_files_properties(src/miniaudio_impl.c src/tinysoundfont_impl.c PROPERTIES COMPILE_OPTIONS "/W0")
     set(FA_WARNINGS /W3)
 else()
     target_compile_options(fatzaudio PRIVATE -Wall -Wextra)

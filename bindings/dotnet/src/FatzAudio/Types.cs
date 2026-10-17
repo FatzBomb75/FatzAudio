@@ -257,6 +257,11 @@ public sealed record StreamOptions
     /// <see cref="AudioStream.DynamicRange"/>.
     /// </summary>
     public DynamicRange DynamicRange { get; init; } = DynamicRange.Full;
+    /// <summary>
+    /// MIDI files: the instruments to play them with; null uses <see cref="AudioEngine.DefaultSoundFont"/>.
+    /// The stream keeps its own reference, so the soundfont may be disposed after the open call. Other formats ignore it.
+    /// </summary>
+    public SoundFont? SoundFont { get; init; }
 }
 
 /// <summary>

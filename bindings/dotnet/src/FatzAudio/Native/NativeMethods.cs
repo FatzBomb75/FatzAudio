@@ -275,6 +275,40 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_scan_loudness_path(EngineHandle engine, string path, out FaLoudness loudness);
 
+    // ---- MIDI --------------------------------------------------------------
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_soundfont_open_path(string path, out nint font);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_soundfont_open_memory(void* data, nuint size, out nint font);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_soundfont_close(nint font);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_soundfont_get_info(SoundFontHandle font, FaSoundFontInfo* info);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_engine_set_soundfont(EngineHandle engine, nint font);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_midi_info(StreamHandle stream, FaMidiInfo* info);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_midi_text(StreamHandle stream, uint index, FaMidiText* text);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_midi_transpose(StreamHandle stream, int semitones);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_midi_transpose(StreamHandle stream, out int semitones);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_midi_channel_mute(StreamHandle stream, uint channel, int muted);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_midi_channel_mute(StreamHandle stream, uint channel, out int muted);
+
     // ---- Events ------------------------------------------------------------
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_set_event_callback(StreamHandle stream, delegate* unmanaged[Cdecl]<FaEvent*, void*, void> callback, void* user);

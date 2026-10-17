@@ -432,6 +432,41 @@ public sealed class AudioEngine : IDisposable
         return Loudness.From(l);
     }
 
+    private SoundFont? _defaultSoundFont;
+
+    /// <summary>
+    /// The soundfont for MIDI streams opened from now on (streams already open keep theirs); null removes it.
+    /// The native engine keeps its own reference, so the <see cref="SoundFont"/> may be disposed after it is set
+    /// (the getter then returns the disposed object, which is still in use by the engine).
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// using var gm = SoundFont.FromFile("GeneralUser.sf2");
+    /// engine.DefaultSoundFont = gm;
+    /// using var song = engine.OpenFile("song.mid");
+    /// </code>
+    /// </example>
+    /// <exception cref="ObjectDisposedException">The engine, or the soundfont being set, was disposed.</exception>
+    public SoundFont? DefaultSoundFont
+    {
+        get => _defaultSoundFont;
+        set
+        {
+            var engine = Handle;
+            if (value is null)
+            {
+                FatzAudioException.ThrowIfFailed(NativeMethods.fa_engine_set_soundfont(engine, 0));
+            }
+            else
+            {
+                var font = Native.HandleRef.AddRef(value.Handle);
+                try { FatzAudioException.ThrowIfFailed(NativeMethods.fa_engine_set_soundfont(engine, font.DangerousGetHandle())); }
+                finally { font.DangerousRelease(); }
+            }
+            _defaultSoundFont = value;
+        }
+    }
+
     /// <summary>
     /// Releases the engine reference held by this object. The native engine is destroyed once all
     /// devices and streams created from it have been disposed as well.
@@ -446,6 +481,7 @@ internal unsafe ref struct NativeOptions
     private byte* _mime;
     private FaNetOptions* _net;
     private byte* _userAgent, _headers, _proxy;
+    private SoundFontHandle? _font;
 
     public readonly FaOpenOptions* Pointer => _ptr;
 
@@ -464,6 +500,12 @@ internal unsafe ref struct NativeOptions
         o._ptr->Flags = flags;
         o._ptr->AudioTrack = options.AudioTrack;
         o._ptr->DynamicRange = (int)options.DynamicRange;
+        if (options.SoundFont is { } font)
+        {
+            // Held until the open call returns; the native stream takes its own reference.
+            o._font = Native.HandleRef.AddRef(font.Handle);
+            o._ptr->SoundFont = o._font.DangerousGetHandle();
+        }
         if (options.BufferLength is { } buffer)
             o._ptr->BufferMs = (uint)Math.Clamp(buffer.TotalMilliseconds, 1, uint.MaxValue);
         if (options.MimeHint is { } mime)
@@ -508,6 +550,8 @@ internal unsafe ref struct NativeOptions
         if (_proxy != null) Marshal.FreeCoTaskMem((nint)_proxy);
         if (_net != null) NativeMemory.Free(_net);
         if (_ptr != null) NativeMemory.Free(_ptr);
+        _font?.DangerousRelease();
+        _font = null;
         _mime = _userAgent = _headers = _proxy = null;
         _net = null;
         _ptr = null;

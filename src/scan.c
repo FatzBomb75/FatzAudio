@@ -42,6 +42,8 @@ struct fa_scan_job {
     int32_t audio_track;
     int use_tags;
     fa_atomic32 cancel;
+    fa_decoder_env env;            /* MIDI: the soundfont (a reference) and rate; no dynamic
+                                      range compression: scans measure the full range */
 
     /* Under engine->scan_lock. */
     int prepare_taken, plan_ready, finished;
@@ -64,7 +66,8 @@ struct fa_scan_job {
 
 /* ---- Content key and cache --------------------------------------------------- */
 
-static uint64_t fnv1a(uint64_t h, const uint8_t* p, size_t n)
+/* FNV-1a, 64-bit: content keys here and soundfont keys (dec_midi.c). */
+uint64_t fa_fnv1a(uint64_t h, const uint8_t* p, size_t n)
 {
     size_t i;
     for (i = 0; i < n; i++) { h ^= p[i]; h *= 0x100000001b3ULL; }
@@ -84,7 +87,7 @@ static int content_key(fa_source* src, uint64_t* out)
     buf = (uint8_t*)malloc(FA_KEY_BLOCK);
     if (!buf) return 0;
     for (i = 0; i < 8; i++) lenb[i] = (uint8_t)((uint64_t)len >> (i * 8));
-    h = fnv1a(h, lenb, 8);
+    h = fa_fnv1a(h, lenb, 8);
     offs[0] = 0;
     offs[1] = len / 2 - FA_KEY_BLOCK / 2;
     offs[2] = len - FA_KEY_BLOCK;
@@ -94,11 +97,28 @@ static int content_key(fa_source* src, uint64_t* out)
         if (fa_source_seek(src, offs[i]) != FA_OK) { free(buf); return 0; }
         got = fa_source_read(src, buf, FA_KEY_BLOCK);
         if (got < 0) { free(buf); return 0; }
-        h = fnv1a(h, buf, (size_t)got);
+        h = fa_fnv1a(h, buf, (size_t)got);
     }
     free(buf);
     *out = h;
     return 1;
+}
+
+/* A MIDI file sounds as its soundfont and rate make it: both go into the key, so
+ * a scan with other instruments is not mistaken for this one. Other formats keep
+ * the key of their content alone. */
+static uint64_t midi_key(fa_source* src, const fa_decoder_env* env, uint64_t key)
+{
+    const uint8_t* head;
+    size_t n = fa_source_peek(src, &head);
+    uint8_t extra[12];
+    uint64_t sf;
+    int i;
+    if (!env->soundfont || !fa_probe_midi(head, n, 0)) return key;
+    sf = fa_soundfont_key(env->soundfont);
+    for (i = 0; i < 8; i++) extra[i] = (uint8_t)(sf >> (i * 8));
+    for (i = 0; i < 4; i++) extra[8 + i] = (uint8_t)(env->midi_rate >> (i * 8));
+    return fa_fnv1a(key, extra, sizeof(extra));
 }
 
 static void cache_path(const fa_scan_job* j, char* out, size_t cap)
@@ -212,6 +232,7 @@ static int run_prepare(fa_scan_job* j)
         }
     }
     if (j->engine->config.cache_directory && j->engine->config.cache_directory[0] && content_key(&src, &j->key)) {
+        j->key = midi_key(&src, &j->env, j->key);
         j->have_key = 1;
         j->key_size = src.length;
         if (cache_read(j, &j->result)) {
@@ -222,7 +243,7 @@ static int run_prepare(fa_scan_job* j)
     }
 
     fa_source_seek(&src, 0);
-    r = fa_decoder_open(&dec, &src, j->path, NULL, j->audio_track, NULL);   /* scans measure the full range */
+    r = fa_decoder_open(&dec, &src, j->path, NULL, j->audio_track, &j->env);
     if (r != FA_OK) { j->status = r; fa_source_close(&src); return 1; }
     j->rate = dec.format.sample_rate;
     j->channels = dec.format.channels;
@@ -263,7 +284,7 @@ static void run_chunk(fa_scan_job* j, int k)
     if (fa_load32(&j->cancel)) return;
     r = open_source(j, &src);
     if (r != FA_OK) { c->r = r; return; }
-    r = fa_decoder_open(&dec, &src, j->path, NULL, j->audio_track, NULL);   /* scans measure the full range */
+    r = fa_decoder_open(&dec, &src, j->path, NULL, j->audio_track, &j->env);
     if (r != FA_OK) { c->r = r; fa_source_close(&src); return; }
     if (dec.format.sample_rate != j->rate || dec.format.channels != j->channels) r = FA_ERROR_UNSUPPORTED_FORMAT;
     if (r == FA_OK && k > 0) {
@@ -432,6 +453,7 @@ static fa_scan_job* job_new(fa_engine* e)
     j->album_lufs = NAN;
     j->status = FA_ERROR_GENERIC;
     j->result.integrated_lufs = j->result.range_lu = j->result.true_peak_dbtp = NAN;
+    j->env.midi_rate = fa_engine_midi_rate(e);
     return j;
 }
 
@@ -442,6 +464,7 @@ static void job_free(fa_scan_job* j)
     if (j->chunks) for (k = 0; k < j->nchunks; k++) free(j->chunks[k].subs);
     free(j->chunks);
     free(j->path);
+    fa_soundfont_release(j->env.soundfont);
     free(j);
 }
 
@@ -462,6 +485,7 @@ fa_scan_job* fa_scan_start_stream(struct fa_stream* s, int use_tags)
     j->stream = s;
     j->use_tags = use_tags;
     j->audio_track = s->audio_track;
+    j->env.soundfont = fa_soundfont_retain(s->soundfont);
     if (s->path) {
         j->path = dup_string(s->path);
         if (!j->path) { job_free(j); return NULL; }
@@ -517,6 +541,7 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
     if (!j) return FA_ERROR_OUT_OF_MEMORY;
     j->path = dup_string(path);
     if (!j->path) { job_free(j); return FA_ERROR_OUT_OF_MEMORY; }
+    j->env.soundfont = fa_engine_soundfont(engine);
     enqueue(engine, j);
 
     /* The calling thread scans too, so a standalone scan uses every core. */
