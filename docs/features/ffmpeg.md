@@ -9,7 +9,9 @@ For apps that already read the file themselves, usually with FFmpeg because of t
 | Interleaved PCM | `fa_stream_push_pcm` (.NET `Push`) | Plays it |
 | A video renderer to keep in sync | `fa_stream_get_clock` (.NET `Clock`) | Reports the pts of the audio leaving the speaker right now, in your own timeline |
 
-FatzAudio never links or ships FFmpeg. Packet streams decode PCM, MP3, AC-3 and E-AC-3 (Dolby Digital and Dolby Digital Plus, see [Dolby Digital](dolby.md)), Opus and Vorbis themselves and use the FFmpeg your app already loaded for everything else: AAC, FLAC, DTS, TrueHD, WMA and so on.
+FatzAudio never links or ships FFmpeg. Packet streams decode PCM, MP3, AC-3 and E-AC-3 (Dolby Digital and Dolby Digital Plus, see [Dolby Digital](dolby.md)), Opus, Vorbis and FLAC themselves and use the FFmpeg your app already loaded for everything else: AAC, DTS, TrueHD, WMA and so on.
+
+FLAC packets (`codec = "flac"`) take FFmpeg's extradata as it is: the 34-byte STREAMINFO, with or without a `fLaC` marker and block header in front. Without extradata the frame headers and the `sample_rate`, `channels` and `bits_per_coded_sample` you give are enough.
 
 Raw Opus packets without a container (bassopus's `BASS_OPUS_StreamCreate`) need no FFmpeg either: give `codec = "opus"`, the rate (48000) and channels, and the 19-byte `OpusHead` as `extradata` when you have one (it carries the pre-skip and gain); without it, mono or stereo is assumed with no pre-skip.
 

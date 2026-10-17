@@ -193,3 +193,18 @@ void fa_drmp3_close(void* impl)
     if (((fa_drmp3*)impl)->live) ma_dr_mp3_uninit(&((fa_drmp3*)impl)->dr);
     free(impl);
 }
+
+/* ---- dr_flac glue for codec_flac.c ------------------------------------------ */
+
+int64_t fa_drflac_decode_memory(const void* data, size_t size, float* out, uint64_t max_frames,
+                                uint32_t* out_channels, uint32_t* out_rate)
+{
+    ma_dr_flac* f = ma_dr_flac_open_memory(data, size, NULL);
+    int64_t n;
+    if (!f) return -1;
+    *out_channels = f->channels;
+    *out_rate = f->sampleRate;
+    n = f->channels == 0 ? -1 : (int64_t)ma_dr_flac_read_pcm_frames_f32(f, max_frames, out);
+    ma_dr_flac_close(f);
+    return n;
+}

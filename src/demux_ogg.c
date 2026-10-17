@@ -1,10 +1,12 @@
-/* Ogg (RFC 3533) with Opus (RFC 7845) or Vorbis audio: .ogg, .oga, .opus files
- * and Ogg web radio. Pages are read and checked here; the packets go to the
- * built-in codecs (codec_xiph.c) through the shared track decoder (demux.c).
+/* Ogg (RFC 3533) with Opus (RFC 7845), Vorbis or FLAC audio: .ogg, .oga, .opus
+ * files and Ogg web radio. Pages are read and checked here; the packets go to the
+ * built-in codecs (codec_xiph.c, codec_flac.c) through the shared track decoder
+ * (demux.c).
  *
  * Timeline: a page's granule position is the end of the last packet that
  * completes on it. Packet times follow from packet durations (Opus: the TOC;
- * Vorbis: half of each pair of neighbouring block sizes), forward from the
+ * Vorbis: half of each pair of neighbouring block sizes; FLAC: the frame header's
+ * block size), forward from the
  * previous page's granule while reading on, backward from the page's own granule
  * after a jump. The first audible frame of each link is time 0 of that link, so
  * an Opus pre-skip lands before 0 (the codec drops it, like Matroska's
@@ -31,7 +33,12 @@
 #define OGG_MAX_QUEUE 256            /* packets completed on one page (at most 255) */
 #define OGG_NO_GRAN INT64_MIN
 
-enum { OGG_NONE = 0, OGG_OPUS, OGG_VORBIS };
+enum { OGG_NONE = 0, OGG_OPUS, OGG_VORBIS, OGG_FLAC };
+
+/* Ogg FLAC's first packet: 0x7F "FLAC", version 1.x, header count, "fLaC", then
+ * the STREAMINFO block (4-byte block header, 34 bytes). */
+#define OGG_FLAC_HEAD 51
+#define OGG_FLAC_SI 17
 
 typedef struct oggs_page {
     int64_t pos;            /* file offset */
@@ -278,6 +285,10 @@ static int64_t packet_duration(ogg* o, oggs_link* l, const uint8_t* d, size_t n)
         uint32_t rate = 0;
         int64_t s = fa_demux_packet_samples("opus", l->channels, 48000, d, n, &rate);
         return s < 0 ? 0 : s;       /* a corrupt packet decodes to nothing */
+    } else if (l->kind == OGG_FLAC) {
+        uint32_t rate = 0;
+        int64_t s = fa_demux_packet_samples("flac", l->channels, l->rate, d, n, &rate);
+        return s < 0 ? 0 : s;       /* metadata or a corrupt frame: no samples */
     } else {
         ogg_packet op;
         long bs;
@@ -371,6 +382,9 @@ static int kind_of(const uint8_t* p, size_t n)
 {
     if (n >= 19 && memcmp(p, "OpusHead", 8) == 0) return OGG_OPUS;
     if (n >= 30 && p[0] == 1 && memcmp(p + 1, "vorbis", 6) == 0) return OGG_VORBIS;
+    if (n >= OGG_FLAC_HEAD && p[0] == 0x7F && memcmp(p + 1, "FLAC", 4) == 0 && p[5] == 1 &&
+        memcmp(p + 9, "fLaC", 4) == 0 && (p[13] & 0x7F) == 0)
+        return OGG_FLAC;
     return OGG_NONE;
 }
 
@@ -412,7 +426,7 @@ static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_ta
     oggs_page pg;
     uint8_t* hdr[3] = { NULL, NULL, NULL };
     size_t hlen[3] = { 0, 0, 0 };
-    int nh = 0, need = 0, audio = 0, picked = 0, i;
+    int nh = 0, need = 0, audio = 0, picked = 0, i, flac_done = 0, flac_blocks = 0;
     char title[1024];
     fa_result r;
     memset(l, 0, sizeof(*l));
@@ -449,16 +463,44 @@ static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_ta
     if (out_audio) *out_audio = audio;
     if (!picked) { r = audio > 0 ? FA_ERROR_NOT_FOUND : FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
     need = l->kind == OGG_OPUS ? 2 : 3;
+    /* FLAC: metadata blocks, one per packet, up to the one marked last. */
+    if (l->kind == OGG_FLAC) flac_done = (hdr[0][13] & 0x80) != 0;
     /* The other headers of our stream (other streams' pages are skipped). */
     o->pend_len = 0;
     o->pend_valid = 1;
     o->have_seq = 0;
-    while (nh < need) {
+    while (l->kind == OGG_FLAC ? !flac_done : nh < need) {
         r = next_page(o, &pg, OGG_RESYNC_MAX);
         if (r != FA_OK) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
         if (pg.serial != l->serial) continue;
         r = page_packets(o, &pg);
         if (r != FA_OK) goto done;
+        if (l->kind == OGG_FLAC) {
+            for (i = 0; i < o->nq && !flac_done; i++) {
+                const uint8_t* d = o->qdata + o->q[i].off;
+                size_t len = o->q[i].len;
+                if (len == 0 || d[0] == 0xFF) { flac_done = 1; i--; break; }   /* audio: no last mark */
+                if (len < 4 || ++flac_blocks > 1024) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
+                flac_done = (d[0] & 0x80) != 0;
+                if ((d[0] & 0x7F) == 4 && !hdr[1]) {         /* VORBIS_COMMENT */
+                    hdr[1] = (uint8_t*)malloc(len);
+                    if (!hdr[1]) { r = FA_ERROR_OUT_OF_MEMORY; goto done; }
+                    memcpy(hdr[1], d, len);
+                    hlen[1] = len;
+                }
+            }
+            if (flac_done && i < o->nq) {
+                /* Audio on the page that ends the headers (against the mapping,
+                 * but written): the page is read again as the first data page,
+                 * where its metadata packets decode to nothing. */
+                o->held = pg;
+                o->has_held = 1;
+                o->pend_len = 0;
+                o->have_seq = 0;
+                l->data = pg.pos;
+            }
+            continue;
+        }
         for (i = 0; i < o->nq && nh < need; i++) {
             hdr[nh] = (uint8_t*)malloc(o->q[i].len ? o->q[i].len : 1);
             if (!hdr[nh]) { r = FA_ERROR_OUT_OF_MEMORY; goto done; }
@@ -467,7 +509,7 @@ static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_ta
         }
     }
     o->nq = o->iq = 0;
-    l->data = fa_br_tell(&o->br);
+    if (!o->has_held) l->data = fa_br_tell(&o->br);
     if (l->kind == OGG_OPUS) {
         const uint8_t* h = hdr[0];
         l->channels = h[9];
@@ -481,6 +523,19 @@ static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_ta
             if (tags) fa_tags_parse_vorbis_comments(hdr[1] + 8, hlen[1] - 8, tags);
         }
         l->params.codec = "opus";
+    } else if (l->kind == OGG_FLAC) {
+        const uint8_t* si = hdr[0] + OGG_FLAC_SI;
+        fa_flac_streaminfo_format(si, &l->rate, &l->channels, &l->params.bits_per_coded_sample);
+        if (l->rate == 0) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
+        l->extra = (uint8_t*)malloc(34);
+        if (!l->extra) { r = FA_ERROR_OUT_OF_MEMORY; goto done; }
+        memcpy(l->extra, si, 34);
+        l->extra_len = 34;
+        if (hlen[1] > 4) {
+            comment_title(hdr[1] + 4, hlen[1] - 4, title, sizeof(title));
+            if (tags) fa_tags_parse_vorbis_comments(hdr[1] + 4, hlen[1] - 4, tags);
+        }
+        l->params.codec = "flac";
     } else {
         size_t n = 1, k;
         uint8_t* e;
@@ -885,7 +940,7 @@ static int ogg_probe(const uint8_t* d, size_t n, size_t id3)
 }
 
 const fa_decoder_vtable fa_decoder_ogg = {
-    "ogg", "Ogg Opus and Ogg Vorbis", "ogg;oga;opus;ogv;ogx",
+    "ogg", "Ogg Opus, Ogg Vorbis and Ogg FLAC", "ogg;oga;opus;ogv;ogx",
     "audio/ogg;application/ogg;audio/opus;audio/vorbis;audio/x-vorbis+ogg;video/ogg",
     ogg_probe, ogg_open, ogg_read, ogg_dec_seek, ogg_close, 1, NULL
 };

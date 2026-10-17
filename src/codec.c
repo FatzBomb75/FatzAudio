@@ -1,6 +1,6 @@
 /* Packet codecs: one compressed packet in, interleaved F32 out. The built-in ones
  * (PCM in all its byte layouts, MP3, AC-3 and E-AC-3 in dec_ac3.c, Opus and
- * Vorbis in codec_xiph.c) need nothing else; every other codec goes to the app's FFmpeg, loaded at runtime (ffmpeg.c). */
+ * Vorbis in codec_xiph.c, FLAC in codec_flac.c) need nothing else; every other codec goes to the app's FFmpeg, loaded at runtime (ffmpeg.c). */
 #include "fa_internal.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -437,6 +437,13 @@ fa_result fa_codec_open(fa_codec* c, const fa_codec_params* p)
     }
     if (strcmp(p->codec, "mp3") == 0) return mp3_open(c, p);
     if (strcmp(p->codec, "ac3") == 0 || strcmp(p->codec, "eac3") == 0) return fa_ac3_codec_open(c, p);
+    if (strcmp(p->codec, "flac") == 0) {
+        /* Built in; without STREAMINFO or usable parameters it goes to FFmpeg. */
+        r = fa_flac_codec_open(c, p);
+        if (r != FA_ERROR_UNSUPPORTED_FORMAT) return r;
+        memset(c, 0, sizeof(*c));
+        snprintf(c->name, sizeof(c->name), "%s", p->codec);
+    }
     if (strcmp(p->codec, "opus") == 0 || strcmp(p->codec, "vorbis") == 0) {
         /* Built in; what libopus cannot set up alone (Opus projection) goes to FFmpeg. */
         r = fa_xiph_codec_open(c, p);
