@@ -193,6 +193,7 @@ int64_t fa_demux_packet_samples(const char* codec, uint32_t channels, uint32_t r
     }
     if (strcmp(codec, "mp3") == 0 || strcmp(codec, "mp2") == 0 || strcmp(codec, "mp1") == 0)
         return mpa_samples(d, n, out_rate);
+    if (strcmp(codec, "ac3") == 0 || strcmp(codec, "eac3") == 0) return fa_ac3_packet_samples(d, n, out_rate);
     return -1;
 }
 
@@ -334,18 +335,18 @@ static fa_result fill(fa_track* t)
         memset(&pk, 0, sizeof(pk));
         pk.pts = FA_DEMUX_NO_PTS;
         pk.duration = -1;
-        r = t->ops->next(t->ctx, &pk);
+        r = t->draining ? FA_ERROR_END_OF_STREAM : t->ops->next(t->ctx, &pk);
         if (r == FA_ERROR_END_OF_STREAM) {
-            t->eof = 1;
-            /* The codec gives back what it still holds (decoders with delayed output). */
+            /* The codec gives back what it still holds (decoders with delayed
+             * output), one block per call until it has nothing left. */
+            t->draining = 1;
             if (t->format_known && t->codec.vt->decode(&t->codec, NULL, 0) == FA_OK && t->codec.out_frames > 0 &&
                 t->codec.rate != 0 && t->codec.channels != 0) {
-                memset(&pk, 0, sizeof(pk));
-                pk.pts = FA_DEMUX_NO_PTS;
-                pk.duration = -1;
                 r = emit(t, &pk);
                 if (r != FA_OK) return r;
+                continue;
             }
+            t->eof = 1;
             break;
         }
         if (r != FA_OK) return r;
@@ -377,6 +378,7 @@ fa_result fa_track_open(fa_track* t, fa_decoder* dec, const fa_demux_ops* ops, v
     r = fa_codec_open(&t->codec, &p->codec);
     if (r != FA_OK) return r;
     t->codec_ready = 1;
+    t->codec.dynamic_range = dec->dynamic_range;
     /* The codec name is a static string; the extradata was only needed to open it. */
     t->p.codec.extradata = NULL;
     t->p.codec.extradata_size = 0;
@@ -451,7 +453,7 @@ fa_result fa_track_seek(fa_track* t, fa_frames frame)
     if (t->codec.vt->flush) t->codec.vt->flush(&t->codec);
     fa_pcm_conv_reset(&t->conv);
     t->count = t->off = 0;
-    t->eof = 0;
+    t->eof = t->draining = 0;
     /* The packet holding `want`; a hair of slack keeps exact boundaries exact. */
     r = t->ops->seek(t->ctx, (int64_t)floor(at + 1e-6), t->packets_back, t->bytes_back);
     t->place = 1;

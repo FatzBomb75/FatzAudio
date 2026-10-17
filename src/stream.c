@@ -129,6 +129,9 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
         if (s->buffer_ms > 10000) s->buffer_ms = 10000;
     }
     s->audio_track = options ? options->audio_track : -1;
+    if (options && options->struct_size >= offsetof(fa_open_options, dynamic_range) + sizeof(options->dynamic_range) &&
+        options->dynamic_range >= FA_DYNAMIC_RANGE_FULL && options->dynamic_range <= FA_DYNAMIC_RANGE_NIGHT)
+        fa_store32(&s->dynamic_range, options->dynamic_range);
     s->loud.integrated_lufs = s->loud.range_lu = s->loud.true_peak_dbtp = NAN;
     fa_store_float(&s->norm_track, NAN);
     fa_store_float(&s->norm_album, NAN);
@@ -152,7 +155,7 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
 static fa_result stream_open_decoder(struct fa_stream* s, const char* name_hint, const fa_open_options* options)
 {
     fa_result r = fa_decoder_open(&s->decoder, &s->source, name_hint, options ? options->mime_hint : NULL,
-                                  options ? options->audio_track : -1);
+                                  options ? options->audio_track : -1, &s->dynamic_range);
     if (r != FA_OK) return r;
     s->decoder_ready = 1;
     /* Running loudness estimate for playback; decode-only streams are never normalized. */
@@ -532,6 +535,20 @@ FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* o
     out_info->seekable = d->seekable;
     out_info->audio_track_count = d->track_count > 0 ? d->track_count : 1;
     out_info->has_cdg = fa_stream_cdg_present(stream);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_set_dynamic_range(fa_stream* stream, fa_dynamic_range mode)
+{
+    if (!stream || mode < FA_DYNAMIC_RANGE_FULL || mode > FA_DYNAMIC_RANGE_NIGHT) return FA_ERROR_INVALID_ARG;
+    fa_store32(&stream->dynamic_range, (int32_t)mode);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_dynamic_range(fa_stream* stream, fa_dynamic_range* out_mode)
+{
+    if (!stream || !out_mode) return FA_ERROR_INVALID_ARG;
+    *out_mode = (fa_dynamic_range)fa_load32(&stream->dynamic_range);
     return FA_OK;
 }
 

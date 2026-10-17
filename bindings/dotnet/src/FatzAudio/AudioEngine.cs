@@ -310,7 +310,7 @@ public sealed class AudioEngine : IDisposable
     /// <summary>
     /// Opens a stream for the compressed packets of one audio track, for apps that demux the file themselves
     /// (typically with FFmpeg, for the video). Push packets straight from <c>av_read_frame</c>; FatzAudio decodes
-    /// them on its worker threads (PCM and MP3 built in, other codecs through the FFmpeg your app loaded) and
+    /// them on its worker threads (PCM, MP3, AC-3 and E-AC-3 built in, other codecs through the FFmpeg your app loaded) and
     /// <see cref="AudioStream.Clock"/> reports their timestamps as they leave the speaker.
     /// </summary>
     /// <param name="parameters">The track: codec name, rate, channels, codec configuration and time base.</param>
@@ -438,6 +438,7 @@ internal unsafe ref struct NativeOptions
         if (options.NoCdg) flags |= 1u << 4;
         o._ptr->Flags = flags;
         o._ptr->AudioTrack = options.AudioTrack;
+        o._ptr->DynamicRange = (int)options.DynamicRange;
         if (options.BufferLength is { } buffer)
             o._ptr->BufferMs = (uint)Math.Clamp(buffer.TotalMilliseconds, 1, uint.MaxValue);
         if (options.MimeHint is { } mime)
