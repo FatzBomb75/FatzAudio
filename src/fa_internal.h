@@ -273,8 +273,15 @@ void fa_limiter_process(fa_limiter* l, float* frames, uint32_t count, float ceil
 /* ---- Events (event.c) ----------------------------------------------------- */
 
 #define FA_EVENT_QUEUE_SIZE 1024 /* power of two */
-#define FA_EVENT_SPILL 16         /* per stream: 3 lanes x (replaced + done) + ENDED + STARTED
-                                     + 5 markers, plus slack */
+/* Per stream. The API empties the queues and spill slots right after publishing a
+ * parameter command and before starting or scheduling playback, so between two
+ * collections the mixer raises at most, for each of the 3 lanes (volume, pan,
+ * crossfade), one RAMP_DONE for the ramp the new command replaces and one for the
+ * new command itself (3 x 2), plus two ENDED and two STARTED (one from before a
+ * start that it had not posted yet, one after). Only those three types spill;
+ * markers are best effort and dropped when the device queue is full. So the spill
+ * slots always hold everything that must arrive, even with the device queue full. */
+#define FA_EVENT_SPILL 10
 
 /* An event plus its engine-wide sequence number. Events from the audio thread and
  * from API threads travel different paths; the event thread sorts each round by
@@ -295,8 +302,8 @@ int fa_event_queue_push(fa_event_queue* q, const fa_qevent* ev); /* 0 if full */
 int fa_event_queue_pop(fa_event_queue* q, fa_qevent* out);
 
 /* From the audio thread: never blocks or allocates. If the device queue is full the
- * event goes to the stream's spill slots, which the event thread also drains, so
- * ENDED and RAMP_DONE are not lost (a RampAsync waits on them). */
+ * event goes to the stream's spill slots, which are sized so that ENDED and RAMP_DONE
+ * are never lost (a RampAsync waits on them; see FA_EVENT_SPILL). */
 void fa_audio_post_event(struct fa_device* d, struct fa_stream* s, fa_event_type type, int64_t frame, int64_t value);
 
 /* From any non-audio thread. The _locked form takes a sequence number the caller

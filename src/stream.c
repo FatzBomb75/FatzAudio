@@ -591,12 +591,17 @@ static void post_lane_locked(struct fa_stream* s, int lane, float target, int64_
 {
     int64_t replaced_tag = 0;
     int32_t done_seq;
+    int replaced;
     /* A replaced ramp that never started gets its RAMP_DONE from here. Its sequence
      * number is taken before the new command becomes visible, so it is delivered
-     * before anything the new command raises. */
+     * before anything the new command raises. The event queues are then emptied:
+     * that bounds what the mixer can raise for this stream before the next
+     * collection, so its spill slots never overflow (see FA_EVENT_SPILL). */
     fa_mutex_lock(&s->engine->list_lock);
     done_seq = fa_fetch_add32(&s->engine->event_seq, 1);
-    if (fa_lane_post(&s->lanes[lane], target, ns, shape, tag, notify, at, flags, &replaced_tag)) {
+    replaced = fa_lane_post(&s->lanes[lane], target, ns, shape, tag, notify, at, flags, &replaced_tag);
+    fa_event_collect_locked(s->engine);
+    if (replaced) {
         fa_event ev;
         ev.type = FA_EVENT_RAMP_DONE;
         ev.stream = s;
@@ -643,11 +648,21 @@ static void rewind_locked(struct fa_stream* s)
     post_lane_locked(s, FA_LANE_FADE, 1.0f, 0, NULL, 0, 0, -1, 0);
 }
 
+/* Empties the event queues before playback can raise another ENDED or STARTED,
+ * which keeps the stream's spill slots from overflowing (see FA_EVENT_SPILL). */
+static void collect_events(struct fa_stream* s)
+{
+    fa_mutex_lock(&s->engine->list_lock);
+    fa_event_collect_locked(s->engine);
+    fa_mutex_unlock(&s->engine->list_lock);
+}
+
 /* Caller holds api_lock; the stream is attached. */
 static void start_locked(struct fa_stream* s, int64_t at_frame)
 {
     int32_t st = fa_load32(&s->state);
     if (st == FA_STATE_ENDED || st == FA_STATE_STOPPED) rewind_locked(s);
+    collect_events(s);
     if (at_frame < 0) {
         fa_store32(&s->state, FA_STATE_PLAYING);
         return;
@@ -947,6 +962,7 @@ FA_API fa_result FA_CALL fa_crossfade(fa_stream* from, fa_stream* to, fa_time du
         at = fa_load64(&dev->clock) + fa_load32(&dev->period);
         if (st != FA_STATE_PLAYING) {
             if (st == FA_STATE_ENDED || st == FA_STATE_STOPPED) rewind_locked(to);  /* changed meanwhile */
+            collect_events(to);
             fa_store64(&to->start_frame, at);
             fa_store32(&to->state, FA_STATE_SCHEDULED);
             post_lane_locked(to, FA_LANE_FADE, 0.0f, 0, NULL, 0, 0, -1, 0);
@@ -986,6 +1002,7 @@ FA_API fa_result FA_CALL fa_stream_set_next(fa_stream* stream, fa_stream* next, 
     else {
         int32_t st = fa_load32(&next->state);
         if (st == FA_STATE_ENDED || st == FA_STATE_STOPPED) rewind_locked(next);
+        collect_events(next);
         fa_store64(&next->start_frame, FA_START_QUEUED);
         fa_store32(&next->state, FA_STATE_SCHEDULED);
     }

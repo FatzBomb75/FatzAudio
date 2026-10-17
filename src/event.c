@@ -42,7 +42,10 @@ void fa_audio_post_event(struct fa_device* d, struct fa_stream* s, fa_event_type
      * event visible; the event thread waits it out before delivering (see below). */
     fa_fetch_add32(&d->publishing, 1);
     q.seq = fa_fetch_add32(&d->engine->event_seq, 1);
-    if (!fa_event_queue_push(&d->events, &q)) {
+    /* Only events someone waits on spill (see FA_EVENT_SPILL); a marker is dropped
+     * when the device queue is full. */
+    if (!fa_event_queue_push(&d->events, &q) &&
+        (type == FA_EVENT_ENDED || type == FA_EVENT_RAMP_DONE || type == FA_EVENT_STARTED)) {
         for (i = 0; i < FA_EVENT_SPILL; i++) {
             if (fa_load32(&s->spill_full[i])) continue;
             s->spill[i] = q;
@@ -50,8 +53,8 @@ void fa_audio_post_event(struct fa_device* d, struct fa_stream* s, fa_event_type
             fa_store32(&d->spilled, 1);
             break;
         }
-        /* All full: the device queue (1024) and this stream's slots filled up
-         * between two collections, which run every few milliseconds. */
+        /* Not reached: FA_EVENT_SPILL covers everything one stream can raise
+         * between two collections. */
     }
     fa_fetch_add32(&d->publishing, -1);
 }
