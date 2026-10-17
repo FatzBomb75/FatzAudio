@@ -17,6 +17,7 @@ typedef struct fa_br {
     fa_source* src;
     uint8_t* buf;
     size_t cap;     /* allocated */
+    size_t max;     /* the most it reads ahead */
     size_t chunk;   /* next refill size */
     size_t len;     /* valid bytes in buf */
     size_t off;     /* read cursor in buf */
@@ -97,7 +98,10 @@ typedef struct fa_track {
     double fpt;               /* output frames per pts unit */
     fa_frames lead;           /* lead_s in frames */
     fa_frames length;         /* -1 = unknown */
-    /* Decoded, trimmed frames in the decoder's format, waiting to be read. */
+    /* Decoded, trimmed frames in the decoder's format, waiting to be read: view[]
+     * points into the codec's output (or the converted copy), or to buf when
+     * the audio needed silence in front. */
+    const float* view;
     float* buf;
     fa_frames buf_cap, count, off;
     fa_frames next_pos;       /* position right after the last decoded packet */

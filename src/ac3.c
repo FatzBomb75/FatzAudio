@@ -98,6 +98,8 @@ static const uint8_t def_spxbndstrc[17] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 
 
 /* Tables computed once (ac3_init_tables). */
 static uint8_t latab[256];        /* log-addition (Table 7.15) */
+static uint16_t crctab[256];       /* CRC-16 of each byte value */
+static float pow2tab[33];          /* 2^-i, exact */
 static uint8_t masktab[256];      /* bin -> band */
 static float kbd[AC3_BLOCK * 2];  /* Kaiser-Bessel derived window, alpha 5 */
 static float b1q[27][3], b2q[125][3], b4q[121][2], b3q[8], b5q[16];
@@ -126,6 +128,12 @@ static void ac3_init_tables(void)
         while (fa_load32(&tables_state) != 2) fa_sleep_ms(1);
         return;
     }
+    for (i = 0; i < 256; i++) {
+        uint32_t crc = (uint32_t)i << 8;
+        for (b = 0; b < 8; b++) crc = (crc & 0x8000) ? ((crc << 1) ^ 0x8005) & 0xFFFF : (crc << 1) & 0xFFFF;
+        crctab[i] = (uint16_t)crc;
+    }
+    for (i = 0; i < 33; i++) pow2tab[i] = ldexpf(1.0f, -i);
     /* Log-addition: the increase (in 1/128ths of 6 dB) when two powers that differ
      * by 2*i units are added. */
     for (i = 0; i < 256; i++) {
@@ -189,24 +197,44 @@ typedef struct bits {
     int overrun;
 } bits;
 
-static uint32_t gb(bits* b, int n)
+/* Near the end of the frame, or past it (overrun: 0, and the reader stays at the end). */
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+static uint32_t gb_tail(bits* b, int n)
 {
     uint32_t v = 0;
-    if (n == 0) return 0;
+    size_t byte = b->pos >> 3;
     if (b->pos + (size_t)n > b->end) {
         b->overrun = 1;
         b->pos = b->end;
         return 0;
     }
     while (n > 0) {
-        size_t byte = b->pos >> 3;
         int off = (int)(b->pos & 7), take = 8 - off;
         if (take > n) take = n;
         v = (v << take) | (((uint32_t)b->p[byte] >> (8 - off - take)) & ((1u << take) - 1));
         b->pos += (size_t)take;
+        byte = b->pos >> 3;
         n -= take;
     }
     return v;
+}
+
+/* n <= 16. Inline: four whole bytes hold the field (an offset of up to 7 plus 16
+ * bits) everywhere but in the last four bytes of the frame. */
+static inline uint32_t gb(bits* b, int n)
+{
+    size_t byte = b->pos >> 3;
+    if (n == 0) return 0;
+    if (byte + 4 <= b->end >> 3) {
+        const uint8_t* q = b->p + byte;
+        uint32_t w = (uint32_t)q[0] << 24 | (uint32_t)q[1] << 16 | (uint32_t)q[2] << 8 | q[3];
+        uint32_t v = (w << (b->pos & 7)) >> (32 - n);
+        b->pos += (size_t)n;
+        return v;
+    }
+    return gb_tail(b, n);
 }
 
 static int gb1(bits* b) { return (int)gb(b, 1); }
@@ -275,11 +303,7 @@ static uint16_t crc16(const uint8_t* p, size_t n)
 {
     uint32_t crc = 0;
     size_t i;
-    int b;
-    for (i = 0; i < n; i++) {
-        crc ^= (uint32_t)p[i] << 8;
-        for (b = 0; b < 8; b++) crc = (crc & 0x8000) ? ((crc << 1) ^ 0x8005) & 0xFFFF : (crc << 1) & 0xFFFF;
-    }
+    for (i = 0; i < n; i++) crc = ((crc << 8) ^ crctab[(crc >> 8) ^ p[i]]) & 0xFFFF;
     return (uint16_t)crc;
 }
 
@@ -297,6 +321,8 @@ typedef struct sub_state {
     uint32_t layout;             /* acmod, lfeon and chanmap the overlap belongs to */
     uint32_t locs;               /* the locations it wrote last (bit per LOC_) */
 } sub_state;
+
+#define BA_KEY 39
 
 /* Everything one syncframe needs while it is decoded. */
 typedef struct frame {
@@ -332,22 +358,27 @@ typedef struct frame {
     int ngrps[AC3_NCH];
     uint8_t exp[AC3_NCH][256];
     uint8_t bap[AC3_NCH][256];
-    int16_t psd[AC3_NCH][256], bndpsd[AC3_NCH][51], mask[AC3_NCH][50];
     int sdecay, fdecay, sgain, dbknee, floorv;
     int snroffset[AC3_NCH], fgain[AC3_NCH];
     int cplfleak, cplsleak;
     int deltbae[AC3_NCH], deltnseg[AC3_NCH];
     uint8_t deltoffst[AC3_NCH][8], deltlen[AC3_NCH][8], deltba[AC3_NCH][8];
     float coef[AC3_NCH][256];
+    /* The inputs of each channel's last bit allocation: blocks that reuse the
+     * exponents and parameters reuse its bap[] (most blocks after the first). */
+    int ba_key[AC3_NCH][BA_KEY];
+    uint8_t ba_exp[AC3_NCH][256];
+    int ba_ok[AC3_NCH];
 } frame;
 
 struct fa_ac3 {
     fa_mdct t256, t128;
-    sub_state sub[AC3_MAX_SUBSTREAMS];
+    sub_state* sub[AC3_MAX_SUBSTREAMS];   /* allocated when a substream first plays */
     frame f;
     float tmp[512], u[256];
     uint32_t rng;
-    /* Output of the substreams of one access unit, per speaker location. */
+    /* Output of the substreams of one access unit, per speaker location (allocated
+     * when a location is first written; NULL plays as silence). */
     float* loc[LOC_COUNT];
     int loc_used[LOC_COUNT];
     int last_used[LOC_COUNT];    /* the locations of the last good unit */
@@ -356,17 +387,12 @@ struct fa_ac3 {
 fa_ac3* fa_ac3_create(void)
 {
     fa_ac3* d;
-    int i;
     ac3_init_tables();
     d = (fa_ac3*)calloc(1, sizeof(*d));
     if (!d) return NULL;
     if (fa_imdct_init(&d->t256, 256) != FA_OK || fa_imdct_init(&d->t128, 128) != FA_OK) {
         fa_ac3_destroy(d);
         return NULL;
-    }
-    for (i = 0; i < LOC_COUNT; i++) {
-        d->loc[i] = (float*)calloc(AC3_BLOCK * AC3_MAX_BLOCKS, sizeof(float));
-        if (!d->loc[i]) { fa_ac3_destroy(d); return NULL; }
     }
     d->rng = 0x12345678u;
     return d;
@@ -379,12 +405,14 @@ void fa_ac3_destroy(fa_ac3* d)
     fa_imdct_free(&d->t256);
     fa_imdct_free(&d->t128);
     for (i = 0; i < LOC_COUNT; i++) free(d->loc[i]);
+    for (i = 0; i < AC3_MAX_SUBSTREAMS; i++) free(d->sub[i]);
     free(d);
 }
 
 void fa_ac3_reset(fa_ac3* d)
 {
-    memset(d->sub, 0, sizeof(d->sub));
+    int i;
+    for (i = 0; i < AC3_MAX_SUBSTREAMS; i++) if (d->sub[i]) memset(d->sub[i], 0, sizeof(*d->sub[i]));
 }
 
 /* Uniform in [-1, 1). */
@@ -424,19 +452,33 @@ static int imin(int a, int b) { return a < b ? a : b; }
 static int bit_alloc(frame* f, int ch)
 {
     int start = f->strtmant[ch], end = f->endmant[ch];
-    int16_t* psd = f->psd[ch];
-    int16_t* bndpsd = f->bndpsd[ch];
-    int16_t* mask = f->mask[ch];
+    int16_t psd[256], bndpsd[51], mask[50] = { 0 };
     uint8_t* bap = f->bap[ch];
     int excite[50];
     int bin, j, k, lastbin, bndstrt, bndend, begin, lowcomp = 0, fastleak = 0, slowleak = 0;
     int fgain = f->fgain[ch], snroffset = f->snroffset[ch], is_lfe = ch == AC3_LFE;
     int sdecay = f->sdecay, fdecay = f->fdecay, sgain = f->sgain;
 
+    int key[BA_KEY];
+
     if (end <= start) return 0;
+    key[0] = start; key[1] = end; key[2] = snroffset; key[3] = fgain; key[4] = sdecay;
+    key[5] = fdecay; key[6] = sgain; key[7] = f->dbknee; key[8] = f->floorv; key[9] = f->cplfleak;
+    key[10] = f->cplsleak; key[11] = f->fscod; key[12] = f->sr_shift; key[13] = f->deltbae[ch];
+    key[14] = f->deltbae[ch] <= 1 ? f->deltnseg[ch] : 0;
+    for (k = 0; k < 8; k++) {
+        int on = k < key[14];
+        key[15 + k] = on ? f->deltoffst[ch][k] : 0;
+        key[23 + k] = on ? f->deltlen[ch][k] : 0;
+        key[31 + k] = on ? f->deltba[ch][k] : 0;
+    }
+    if (f->ba_ok[ch] && memcmp(key, f->ba_key[ch], sizeof(key)) == 0 &&
+        memcmp(f->exp[ch] + start, f->ba_exp[ch] + start, (size_t)(end - start)) == 0)
+        return 0;
+    f->ba_ok[ch] = 0;
     if (snroffset == -960) {   /* csnroffst and fsnroffst both 0: no mantissas */
         memset(bap + start, 0, (size_t)(end - start));
-        return 0;
+        goto done;
     }
     for (bin = start; bin < end; bin++) psd[bin] = (int16_t)(3072 - (f->exp[ch][bin] << 7));
     /* Integration of the PSD over each band. */
@@ -515,6 +557,10 @@ static int bit_alloc(frame* f, int ch)
         }
         j++;
     } while (end > lastbin);
+done:
+    memcpy(f->ba_key[ch], key, sizeof(key));
+    memcpy(f->ba_exp[ch] + start, f->exp[ch] + start, (size_t)(end - start));
+    f->ba_ok[ch] = 1;
     return 0;
 }
 
@@ -791,7 +837,7 @@ static float read_mantissa(bits* b, mant_groups* g, int bap)
         int n = qbits[bap];
         uint32_t u = gb(b, n);
         int32_t s = (int32_t)(u << (32 - n)) >> (32 - n);
-        return ldexpf((float)s, 1 - n);
+        return (float)s * pow2tab[n - 1];
     }
     }
 }
@@ -811,7 +857,7 @@ static void read_mantissas(fa_ac3* d, bits* b, mant_groups* g, int ch, int dithe
         } else {
             m = read_mantissa(b, g, bap);
         }
-        f->coef[ch][bin] = ldexpf(m, -(int)f->exp[ch][bin]);
+        f->coef[ch][bin] = m * pow2tab[f->exp[ch][bin]];
     }
 }
 
@@ -828,7 +874,7 @@ static void decouple(fa_ac3* d)
             for (k = 0; k < f->cplbndsz[bnd]; k++, bin++) {
                 float c = f->coef[AC3_CPL][bin];
                 if (f->bap[AC3_CPL][bin] == 0)   /* dither, scaled like the rest of the band */
-                    c = f->dithflag[ch] ? ldexpf(rnd(d) * 0.707f, -(int)f->exp[AC3_CPL][bin]) : 0.0f;
+                    c = f->dithflag[ch] ? rnd(d) * 0.707f * pow2tab[f->exp[AC3_CPL][bin]] : 0.0f;
                 f->coef[ch][bin] = c * co;
             }
         }
@@ -1209,7 +1255,7 @@ static int parse_block(fa_ac3* d, bits* b, int blk)
     if (cplinu && f->phsflginu) STAT(ST_PHSFLG);
     if (f->dynrng[0] != 1.0f) STAT(ST_DYNRNG);
 
-    /* Bit allocation (redone every block: it is cheap next to the transform). */
+    /* Bit allocation (skipped for a channel whose inputs did not change). */
     if (cplinu && bit_alloc(f, AC3_CPL) < 0) return -1;
     for (ch = 0; ch < nfch; ch++) if (bit_alloc(f, ch) < 0) return -1;
     if (h->lfeon && bit_alloc(f, AC3_LFE) < 0) return -1;
@@ -1264,9 +1310,19 @@ static void synth(fa_ac3* d, const float* coef, int short_blocks, float gain, fl
 {
     float* z = d->tmp;
     int n;
+    gain *= -2.0f;   /* the inverse of the forward transform's -2/N scaling */
     if (!short_blocks) {
-        /* 512-point IMDCT. */
-        fa_imdct(&d->t256, coef, z);
+        /* 512-point IMDCT, unfolded from the DCT-IV u[] (see mdct.h) straight into
+         * the window: z[n] = u[n + 128], -u[383 - n], -u[n - 384] by quarter. */
+        const float* u = d->u;
+        fa_mdct_dct4(&d->t256, coef, d->u);
+        for (n = 0; n < 128; n++) {
+            out[n] = u[n + 128] * kbd[n] * gain + delay[n];
+            out[n + 128] = -u[255 - n] * kbd[n + 128] * gain + delay[n + 128];
+            delay[n] = -u[127 - n] * kbd[n + 256] * gain;
+            delay[n + 128] = -u[n] * kbd[n + 384] * gain;
+        }
+        return;
     } else {
         /* Two 256-point transforms of the even and odd coefficients. The first has
          * phase n0 = 1/2, so it is odd about its centre like the first half of a
@@ -1280,7 +1336,6 @@ static void synth(fa_ac3* d, const float* coef, int short_blocks, float gain, fl
         fa_mdct_dct4(&d->t128, in, u);
         for (n = 0; n < 128; n++) { z[256 + 127 - n] = -u[n]; z[384 + n] = -u[n]; }
     }
-    gain *= -2.0f;   /* the inverse of the forward transform's -2/N scaling */
     for (n = 0; n < AC3_BLOCK; n++) {
         out[n] = z[n] * kbd[n] * gain + delay[n];
         delay[n] = z[AC3_BLOCK + n] * kbd[AC3_BLOCK + n] * gain;
@@ -1308,16 +1363,16 @@ static const int8_t chanmap_loc[16][2] = {
     { LOC_LTS, LOC_RTS }, { LOC_LFE2, -1 }, { LOC_LFE, -1 } };
 
 /* Decodes one syncframe into the location buffers at block offset `at`.
- * Returns 0, 1 (unsupported feature) or -1 (damaged). */
+ * Returns 0, 1 (unsupported feature), -1 (damaged) or -2 (out of memory). */
 static int decode_frame(fa_ac3* d, const uint8_t* p, const fa_ac3_header* h, int state, int at, int drc,
                         int* wrote)
 {
     frame* f = &d->f;
-    sub_state* ss = &d->sub[state];
+    sub_state* ss = d->sub[state];
     bits b;
     int r, blk, ch, i;
     int8_t loc[6];
-    float pcm[6][AC3_BLOCK];
+    float scratch[AC3_BLOCK];
 
     memset(f, 0, offsetof(frame, exp));
     f->h = *h;
@@ -1348,6 +1403,11 @@ static int decode_frame(fa_ac3* d, const uint8_t* p, const fa_ac3_header* h, int
         for (ch = 0; ch < f->nfchans; ch++) loc[ch] = acmod_loc[h->acmod][ch];
         if (h->lfeon) loc[AC3_LFE] = LOC_LFE;
     }
+    for (ch = 0; ch < 6; ch++) {
+        if (loc[ch] < 0 || d->loc[loc[ch]]) continue;
+        d->loc[loc[ch]] = (float*)calloc(AC3_BLOCK * AC3_MAX_BLOCKS, sizeof(float));
+        if (!d->loc[loc[ch]]) return -2;
+    }
     {
         /* A new layout (or a substream that comes back) starts with a clean overlap. */
         uint32_t layout = (uint32_t)h->acmod | (uint32_t)h->lfeon << 3 | (f->chanmape ? f->chanmap << 4 : 0);
@@ -1361,20 +1421,21 @@ static int decode_frame(fa_ac3* d, const uint8_t* p, const fa_ac3_header* h, int
         r = parse_block(d, &b, blk);
         if (r != 0) return r;
         for (ch = 0; ch < 6; ch++) {
-            float gain;
+            float gain, *dst;
             int prog = h->acmod == 0 && ch == 1;
             if (ch < AC3_LFE ? ch >= f->nfchans : !h->lfeon) continue;
             gain = 1.0f;
             if (drc == FA_AC3_DRC_NIGHT && f->compre[prog]) gain = f->compr[prog];
             else if (drc != FA_AC3_DRC_OFF) gain = f->dynrng[prog];
-            synth(d, f->coef[ch], ch < AC3_LFE && f->blksw[ch], gain, ss->delay[ch], pcm[ch]);
-        }
-        for (ch = 0; ch < 6; ch++) {
-            float* dst;
-            if (loc[ch] < 0) continue;
-            dst = d->loc[loc[ch]] + (size_t)(at + blk) * AC3_BLOCK;
-            memcpy(dst, pcm[ch], sizeof(pcm[ch]));
-            wrote[loc[ch]] = 1;
+            /* Straight into the location's buffer (a channel without one still
+             * keeps its overlap going). */
+            if (loc[ch] >= 0) {
+                dst = d->loc[loc[ch]] + (size_t)(at + blk) * AC3_BLOCK;
+                wrote[loc[ch]] = 1;
+            } else {
+                dst = scratch;
+            }
+            synth(d, f->coef[ch], ch < AC3_LFE && f->blksw[ch], gain, ss->delay[ch], dst);
         }
     }
     ss->locs = 0;
@@ -1403,7 +1464,9 @@ static int mix_out(fa_ac3* d, int frames, float** pcm, size_t* cap, int* out_cha
     int has_lr = u[LOC_L] || u[LOC_R], has_back = u[LOC_LRS] || u[LOC_RRS];
     int has_surr = u[LOC_LS] || u[LOC_RS] || u[LOC_LSD] || u[LOC_RSD] || u[LOC_LTS] || u[LOC_RTS] || u[LOC_TS];
     int has_bc = u[LOC_S] || u[LOC_CS], has_lfe = u[LOC_LFE] || u[LOC_LFE2];
-    int nch, i, c, slot[OUT_N];
+    static const float zeros[AC3_BLOCK * AC3_MAX_BLOCKS];
+    struct { int ch, loc; float gain; } route[48];   /* one per ADD below at most */
+    int nch, i, c, slot[OUT_N], nroute = 0;
     float* dst;
     const float h = 0.70710678f;
     size_t need;
@@ -1426,10 +1489,10 @@ static int mix_out(fa_ac3* d, int frames, float** pcm, size_t* cap, int* out_cha
         *cap = need;
     }
     dst = *pcm;
-    memset(dst, 0, need * sizeof(float));
 
-#define ADD(out, l, g) do { if (u[l] && slot[out] >= 0) { const float* s_ = d->loc[l]; float* o_ = dst + slot[out]; \
-        for (i = 0; i < frames; i++) o_[(size_t)i * nch] += s_[i] * (g); } } while (0)
+    /* Which locations go to which channel, with what gain. */
+#define ADD(out, l, g) do { if (u[l] && slot[out] >= 0 && d->loc[l]) { \
+        route[nroute].ch = slot[out]; route[nroute].loc = (l); route[nroute].gain = (g); nroute++; } } while (0)
     if (nch == 1) {
         ADD(OUT_FC, LOC_C, 1.0f);
         ADD(OUT_FC, LOC_VHC, 1.0f);
@@ -1459,6 +1522,29 @@ static int mix_out(fa_ac3* d, int frames, float** pcm, size_t* cap, int* out_cha
         else { ADD(OUT_BL, LOC_S, h); ADD(OUT_BR, LOC_S, h); ADD(OUT_BL, LOC_CS, h); ADD(OUT_BR, LOC_CS, h); }
     }
 #undef ADD
+    {
+        /* Usually each channel has one location at full gain: interleave. */
+        const float* src[8];
+        int simple = 1, k;
+        for (c = 0; c < nch; c++) src[c] = NULL;
+        for (k = 0; k < nroute; k++) {
+            if (route[k].gain != 1.0f || src[route[k].ch]) simple = 0;
+            src[route[k].ch] = d->loc[route[k].loc];
+        }
+        if (simple) {
+            for (c = 0; c < nch; c++) if (!src[c]) src[c] = zeros;
+            for (i = 0; i < frames; i++, dst += nch)
+                for (c = 0; c < nch; c++) dst[c] = src[c][i];
+        } else {
+            memset(dst, 0, need * sizeof(float));
+            for (k = 0; k < nroute; k++) {
+                const float* s_ = d->loc[route[k].loc];
+                float* o_ = dst + route[k].ch;
+                float g = route[k].gain;
+                for (i = 0; i < frames; i++) o_[(size_t)i * nch] += s_[i] * g;
+            }
+        }
+    }
     *out_channels = nch;
     return 0;
 }
@@ -1471,7 +1557,7 @@ fa_result fa_ac3_decode(fa_ac3* d, const uint8_t* data, size_t size, int drc,
     uint32_t r = 0;
     *frames = 0;
     memset(d->loc_used, 0, sizeof(d->loc_used));
-    for (i = 0; i < AC3_MAX_SUBSTREAMS; i++) d->sub[i].seen = 0;
+    for (i = 0; i < AC3_MAX_SUBSTREAMS; i++) if (d->sub[i]) d->sub[i]->seen = 0;
     /* Frames in order: an independent frame of program 0 starts a new set of
      * blocks; its dependent frames cover the same blocks. Other programs are skipped. */
     while (pos + 8 <= size) {
@@ -1494,17 +1580,22 @@ fa_result fa_ac3_decode(fa_ac3* d, const uint8_t* data, size_t size, int drc,
             STAT(ST_DEP);
         }
         memset(wrote, 0, sizeof(wrote));
+        if (!d->sub[state]) {
+            d->sub[state] = (sub_state*)calloc(1, sizeof(sub_state));
+            if (!d->sub[state]) return FA_ERROR_OUT_OF_MEMORY;
+        }
         res = decode_frame(d, data + pos, &h, state, at, drc, wrote);
+        if (res == -2) return FA_ERROR_OUT_OF_MEMORY;
         if (res != 0) {
             int dependent = h.eac3 && h.strmtyp == 1, any = 0;
-            sub_state* ss = &d->sub[state];
+            sub_state* ss = d->sub[state];
             err = res;
             /* Silence for the frame, and a clean restart of its overlap. A damaged
              * dependent frame silences only its own channels, keeping the layout:
              * the bed, and what the bed has of the channels it replaces, stay. */
             for (i = 0; i < LOC_COUNT; i++) {
                 int stale = dependent && (ss->locs >> i & 1) && !d->loc_used[i];
-                if (!dependent || wrote[i] || stale)
+                if ((!dependent || wrote[i] || stale) && d->loc[i])
                     memset(d->loc[i] + (size_t)at * AC3_BLOCK, 0, (size_t)h.blocks * AC3_BLOCK * sizeof(float));
                 if (stale || (dependent && wrote[i])) d->loc_used[i] = 1;
             }
@@ -1524,7 +1615,7 @@ fa_result fa_ac3_decode(fa_ac3* d, const uint8_t* data, size_t size, int drc,
     if (mix_out(d, *frames, pcm, cap, channels) < 0) return FA_ERROR_OUT_OF_MEMORY;
     *rate = r;
     /* A dependent substream missing from this unit starts clean when it returns. */
-    for (i = 1; i < AC3_MAX_SUBSTREAMS; i++) if (!d->sub[i].seen) d->sub[i].used = 0;
+    for (i = 1; i < AC3_MAX_SUBSTREAMS; i++) if (d->sub[i] && !d->sub[i]->seen) d->sub[i]->used = 0;
     if (err == 0) memcpy(d->last_used, d->loc_used, sizeof(d->loc_used));
     if (err > 0) return FA_ERROR_UNSUPPORTED_FORMAT;
     if (err < 0) return FA_ERROR_GENERIC;

@@ -262,6 +262,61 @@ static void test_tones_in_containers(void)
     }
 }
 
+/* A raw constant-bit-rate file opens without an index (unit k is at k frames);
+ * the same data with junk in the middle is indexed instead. Both have the exact
+ * length, and seeks land on the frame (FFmpeg dithers, so only near a straight
+ * decode). */
+static void test_raw_cbr_and_index(void)
+{
+    static const int64_t targets[] = { 5000, 0, 1536, 9000, 777, 23000 };
+    size_t size = 0, k;
+    uint8_t* data = load_file("tone.ac3", &size);
+    uint8_t* junk;
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_stream_info info;
+    decoded d;
+    float* all;
+    int64_t n, i;
+    CHECK(data != NULL && size == 16 * 768);
+    CHECK(decode("tone.ac3", FA_DYNAMIC_RANGE_FULL, &d));
+    CHECK_EQ(d.frames, 16 * 1536);
+    CHECK_EQ(d.info.length_frames, d.frames);
+    CHECK(open_file("tone.ac3", FA_DYNAMIC_RANGE_FULL, &s) == FA_OK);
+    for (k = 0; k < sizeof(targets) / sizeof(targets[0]); k++) {
+        float buf[2 * 400];
+        fa_frames got = 0, pos = -1;
+        int64_t want = d.frames - targets[k] < 400 ? d.frames - targets[k] : 400;
+        CHECK_EQ(fa_stream_seek(s, targets[k]), FA_OK);
+        CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+        CHECK_EQ(pos, targets[k]);
+        CHECK_EQ(fa_stream_read(s, buf, (fa_frames)want, &got), FA_OK);
+        CHECK_EQ(got, want);
+        for (i = 0; i < want * 2; i++) CHECK_NEAR(buf[i], d.pcm[targets[k] * 2 + i], 1e-3);
+    }
+    fa_stream_close(s);
+
+    /* 100 bytes of junk after the fifth frame: still 16 frames, same audio. */
+    junk = (uint8_t*)malloc(size + 100);
+    memcpy(junk, data, 5 * 768);
+    memset(junk + 5 * 768, 0x55, 100);
+    memcpy(junk + 5 * 768 + 100, data + 5 * 768, size - 5 * 768);
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    o.dynamic_range = FA_DYNAMIC_RANGE_FULL;
+    CHECK_EQ(fa_stream_open_memory(g_engine, junk, size + 100, &o, &s), FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK_EQ(info.length_frames, d.frames);
+    all = read_all(s, 2, &n);
+    CHECK_EQ(n, d.frames);
+    for (i = 0; i < n * 2 && i < d.frames * 2; i++) CHECK_NEAR(all[i], d.pcm[i], 0.0);
+    fa_stream_close(s);
+    free(all);
+    free(junk);
+    free(data);
+    free(d.pcm);
+}
+
 /* A damaged frame decodes as silence of its own length; the frames after it are
  * intact once the overlap has settled (one block), and a cut-off last frame is
  * dropped. */
@@ -514,6 +569,7 @@ int main(void)
     RUN(test_dynamic_range_modes);
     RUN(test_seek_is_exact);
     RUN(test_tones_in_containers);
+    RUN(test_raw_cbr_and_index);
     RUN(test_damaged_frames);
     RUN(test_damaged_dependent_frame);
     RUN(test_dependent_frames_in_separate_packets);
