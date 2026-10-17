@@ -657,7 +657,7 @@ static fa_result disc_dec_open(fa_decoder* dec) { (void)dec; return FA_ERROR_UNS
 /* Not in the registry: only fa_stream_open_disc creates it. */
 static const fa_decoder_vtable disc_decoder = {
     "cdda", "Audio CD track", "cda", "", disc_dec_probe, disc_dec_open,
-    disc_dec_read, disc_dec_seek, disc_dec_close, 1
+    disc_dec_read, disc_dec_seek, disc_dec_close, 1, NULL
 };
 
 fa_result fa_disc_decoder_open(fa_decoder* dec, fa_source* src, fa_disc* d, int32_t track, struct fa_stream* stream)
