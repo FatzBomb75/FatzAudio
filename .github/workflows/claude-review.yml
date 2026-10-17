@@ -1,0 +1,23 @@
+
+name: Claude PR Review
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  review:
+    if: >
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/claude-review')
+
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+
+    uses: YOUR_USERNAME/github-automation/.github/workflows/claude-review.yml@main
+
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
