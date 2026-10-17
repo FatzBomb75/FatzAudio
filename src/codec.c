@@ -54,8 +54,10 @@ static float sample_at(const uint8_t* p, int kind, int swap)
     case FA_SAMPLE_S24: {
         /* Packed 3 bytes: little endian unless the data is big endian. */
         int big = swap ? !native_big_endian() : native_big_endian();
-        int32_t v = big ? ((int32_t)p[0] << 24) | ((int32_t)p[1] << 16) | ((int32_t)p[2] << 8)
-                        : ((int32_t)p[2] << 24) | ((int32_t)p[1] << 16) | ((int32_t)p[0] << 8);
+        /* Assembled unsigned: shifting a byte into a signed int's sign bit is undefined. */
+        uint32_t u = big ? ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8)
+                         : ((uint32_t)p[2] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[0] << 8);
+        int32_t v = (int32_t)u;
         return (float)(v >> 8) * (1.0f / 8388608.0f);
     }
     case FA_SAMPLE_S32: { int32_t v; memcpy(&v, p, 4); return (float)((double)v * (1.0 / 2147483648.0)); }

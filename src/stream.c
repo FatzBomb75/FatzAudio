@@ -118,10 +118,10 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
 /* On failure the source is NOT closed here, so open_io can hand ownership back. */
 static fa_result stream_open_decoder(struct fa_stream* s, const char* name_hint, const fa_open_options* options)
 {
-    fa_result r = fa_decoder_open(&s->decoder, &s->source, name_hint, options ? options->mime_hint : NULL);
+    fa_result r = fa_decoder_open(&s->decoder, &s->source, name_hint, options ? options->mime_hint : NULL,
+                                  options ? options->audio_track : -1);
     if (r != FA_OK) return r;
     s->decoder_ready = 1;
-    if (options && options->audio_track > 0) return FA_ERROR_NOT_FOUND; /* single-track formats only so far */
     /* Running loudness estimate for playback; decode-only streams are never normalized. */
     if (!(s->flags & FA_OPEN_DECODE_ONLY) &&
         fa_meter_init(&s->run_meter, s->decoder.format.sample_rate, s->decoder.format.channels, 0, FA_RUNNING_SUBS) == FA_OK)
@@ -305,7 +305,7 @@ FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* o
     out_info->duration = (d->length >= 0 && d->format.sample_rate > 0)
         ? (fa_time)((double)d->length * 1e9 / (double)d->format.sample_rate + 0.5) : -1;
     out_info->seekable = d->seekable;
-    out_info->audio_track_count = 1;
+    out_info->audio_track_count = d->track_count > 0 ? d->track_count : 1;
     out_info->has_cdg = 0;
     return FA_OK;
 }

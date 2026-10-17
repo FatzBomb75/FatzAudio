@@ -37,6 +37,9 @@ set(FA_SOURCES
     src/codec.c
     src/ffmpeg.c
     src/push.c
+    src/demux.c
+    src/demux_mp4.c
+    src/demux_mkv.c
     src/stubs.c
     src/miniaudio_impl.c
     src/fa_internal.h
