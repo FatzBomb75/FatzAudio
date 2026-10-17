@@ -850,10 +850,9 @@ Stored positions (cue points, mix points, lyrics or CD+G offsets saved by your a
 | Format | BASS | FatzAudio | Shift a stored BASS position by |
 |---|---|---|---|
 | AAC in MP4/M4A (and video files) | Plays the encoder's priming (1024 frames) and ignores the edit list, so it is 1024 frames long too | Starts on the first real sample, exact length | −1024 frames (about −23 ms at 44.1 kHz) |
-| AAC in `.aac` (ADTS) files and AAC radio | Drops the first 1024 frames | Keeps them, as FFmpeg does (ADTS has no delay field) | +1024 frames |
-| WAV, FLAC, MP3 (with or without a LAME header), AC-3 | Same frame | Same frame | none |
+| WAV, FLAC, MP3 (with or without a LAME header), AC-3, AAC in `.aac` (ADTS) files and AAC radio | Same frame | Same frame | none |
 
 ### Where BASS is still ahead
 
-The comparison report opens with every measurement where BASS won; the ones to fix are in the [engineering notes](../engineering-notes.md) (area "bass-compare"). In short: the AC-3 decoder is about 2.5 times slower and uses more memory per stream, and WMA has not been compared yet (basswma does not run under Wine). MP3 now seeks exactly in about 0.3 ms (BASS lands off target unless it prescans), decodes as accurately as BASS, and its loudness scan runs faster than BASS decodes the file. Ogg Opus and Ogg Vorbis match bassopus and BASS's Vorbis decoder.
+The comparison report opens with every measurement where BASS won; the ones to fix are in the [engineering notes](../engineering-notes.md) (area "bass-compare"). In short: the AC-3 decoder is about 2.5 times slower and uses more memory per stream, and WMA has not been compared yet (basswma does not run under Wine). MP3 now seeks exactly in about 0.3 ms (BASS lands off target unless it prescans), decodes as accurately as BASS, and its loudness scan runs faster than BASS decodes the file. `.aac` files and AAC radio start on the same frame as in bass_aac. Ogg Opus and Ogg Vorbis match bassopus and BASS's Vorbis decoder.
 

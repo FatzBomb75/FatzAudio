@@ -912,7 +912,8 @@ static fa_result hls_open(fa_decoder* dec)
     duration = h->net->hls_duration;
     fa_mutex_unlock(&h->net->lock);
     dec->seekable = duration >= 0;
-    dec->length = duration >= 0 ? (fa_frames)(duration * dec->format.sample_rate + 0.5) : -1;
+    dec->length = duration >= 0 ? (fa_frames)(duration * dec->format.sample_rate + 0.5) - h->inner.lead_trim : -1;
+    if (duration >= 0 && dec->length < 0) dec->length = 0;
     snprintf(dec->codec, sizeof(dec->codec), "%s", h->inner.codec);
     snprintf(dec->container, sizeof(dec->container), "hls");
     return FA_OK;

@@ -15,12 +15,14 @@
  * joined mid-frame, a damaged frame, ID3 tags between HLS segments) is skipped by
  * sliding to the next valid header. */
 #include "demux.h"
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define ADTS_HEADER 7
 #define ADTS_RESYNC 65536            /* junk bytes skipped looking for a header */
 #define ADTS_MAX_FRAMES (1 << 24)    /* index limit: 97 hours at 48 kHz */
+#define ADTS_PRIMING 1024            /* samples dropped at the start */
 
 typedef struct adts_hdr {
     size_t len;          /* whole frame, header included */
@@ -395,7 +397,10 @@ static fa_result adts_open(fa_decoder* dec)
     tp.codec.sample_rate = h.rate;
     tp.codec.channels = h.channels ? h.channels : 2;
     tp.time_base = 1.0 / h.rate;
-    tp.start = 0;
+    /* ADTS has no field for the encoder delay. Every AAC encoder primes with at
+     * least one frame (1024 samples), and a decoder's first frame is half an
+     * overlap anyway, also when joining a radio stream: start after it. */
+    tp.start = ADTS_PRIMING;
     tp.end = end != FA_DEMUX_NO_PTS ? end : a->est_samples > 0 ? a->est_samples : FA_DEMUX_NO_PTS;
     tp.clip_to_end = a->index != NULL;
     tp.exact_durations = 0;
@@ -405,6 +410,7 @@ static fa_result adts_open(fa_decoder* dec)
     if (r != FA_OK) goto fail;
     dec->impl = a;
     dec->seekable = a->index != NULL || (src->seekable && a->bytes_per_sample > 0);
+    dec->lead_trim = (fa_frames)llround(ADTS_PRIMING * a->track.fpt);
     snprintf(dec->container, sizeof(dec->container), "adts");
     return FA_OK;
 fail:
