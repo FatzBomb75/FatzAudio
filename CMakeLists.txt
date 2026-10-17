@@ -46,6 +46,9 @@ set(FA_SOURCES
     src/net_http.c
     src/net_source.c
     src/net_hls.c
+    src/cdg.c
+    src/zip.c
+    src/cdg.h
     src/fa_internal.h
     src/net.h
 )
