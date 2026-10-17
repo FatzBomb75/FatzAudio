@@ -18,4 +18,4 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | CD+G karaoke graphics (MP3+G, ZIP, CD+G discs, surfaces for any renderer) | [cdg.md](cdg.md) | ✅ |
 | Dolby Digital and Dolby Digital Plus (AC-3, E-AC-3, up to 7.1, dynamic range) | [dolby.md](dolby.md) | ✅ (passthrough 🗓️) |
 | Disc playback (audio CDs, CD+G discs and `.cue` images) | [disc.md](disc.md) | ✅ |
-| Recording and encoding | recording-encoding.md | 🗓️ |
+| Recording and encoding (WAV, FLAC, MP3 via LAME; device, stream or file sources) | [recording-encoding.md](recording-encoding.md) | ✅ WAV/FLAC/MP3; Opus, AAC and casting 🗓️ |

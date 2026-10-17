@@ -294,3 +294,53 @@ internal unsafe struct FaDiscToc
     // fa_disc_track tracks[99]; 56 bytes each, 8-byte aligned at offset 1096.
     public fixed byte Tracks[MaxTracks * 56];
 }
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaEncoderOptions
+{
+    public uint StructSize;
+    public int Format;
+    public uint SampleRate;
+    public uint Channels;
+    public uint BitsPerSample;
+    public uint BitrateKbps;
+    public int Quality;
+    public uint QueueMs;
+    public byte* Title;
+    public byte* Artist;
+    public byte* Album;
+    public byte* Genre;
+    public byte* Date;
+    public byte* Comment;
+    public uint TrackNumber;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaEncoderOutput
+{
+    public delegate* unmanaged[Cdecl]<void*, void*, nuint, int> Write;
+    public delegate* unmanaged[Cdecl]<void*, long, int> Seek;
+    public delegate* unmanaged[Cdecl]<void*, void> Close;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaEncoderStatus
+{
+    public int State;
+    public int Error;
+    public int Paused;
+    public long Frames;
+    public long Duration;
+    public long Bytes;
+    public long DroppedFrames;
+    public FaAudioFormat Input;
+    public FaAudioFormat Output;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaLameInfo
+{
+    public int Loaded;
+    public fixed byte Version[32];
+    public fixed byte Path[512];
+}

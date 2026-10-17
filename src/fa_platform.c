@@ -247,3 +247,18 @@ FILE* fa_fopen_utf8(const char* path, const char* mode) { return fopen(path, mod
 int fa_mkdir_utf8(const char* path) { return (mkdir(path, 0777) == 0 || errno == EEXIST) ? 0 : -1; }
 int fa_replace_file(const char* from, const char* to) { return rename(from, to) == 0 ? 0 : -1; }
 #endif
+
+void fa_lazy_mutex_lock(fa_lazy_mutex* l)
+{
+    if (fa_load32(&l->state) != 2) {
+        if (fa_cas32(&l->state, 0, 1)) {
+            while (fa_mutex_init(&l->m) != 0) fa_sleep_ms(1);
+            fa_store32(&l->state, 2);
+        } else {
+            while (fa_load32(&l->state) != 2) fa_sleep_ms(1);
+        }
+    }
+    fa_mutex_lock(&l->m);
+}
+
+void fa_lazy_mutex_unlock(fa_lazy_mutex* l) { fa_mutex_unlock(&l->m); }

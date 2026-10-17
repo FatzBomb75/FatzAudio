@@ -160,6 +160,17 @@ if(UNIX)
 endif()
 add_test(NAME tempo COMMAND fa_test_tempo)
 
+add_executable(fa_test_encode test_encode.c ${FA_SOURCES})
+target_include_directories(fa_test_encode PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+target_compile_definitions(fa_test_encode PRIVATE FA_STATIC)
+target_compile_options(fa_test_encode PRIVATE ${FA_WARNINGS})
+target_link_libraries(fa_test_encode PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
+if(UNIX)
+    target_link_libraries(fa_test_encode PRIVATE m)
+endif()
+add_test(NAME encode COMMAND fa_test_encode WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
 add_executable(fa_test_ogg test_ogg.c ${FA_SOURCES})
 target_include_directories(fa_test_ogg PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
@@ -174,6 +185,7 @@ add_test(NAME ogg COMMAND fa_test_ogg)
 # The white-box tests build the library's sources themselves; the vendored codecs
 # come prebuilt.
 foreach(t fa_test_internal fa_test_loudness fa_test_crossfade fa_test_handoff fa_test_demux
-          fa_test_dolby fa_test_net fa_test_cdg fa_test_disc fa_test_tempo fa_test_ogg)
+          fa_test_dolby fa_test_net fa_test_cdg fa_test_disc fa_test_tempo fa_test_ogg
+          fa_test_encode)
     target_link_libraries(${t} PRIVATE fa_opus fa_vorbis)
 endforeach()

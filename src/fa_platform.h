@@ -115,4 +115,21 @@ int fa_replace_file(const char* from, const char* to);   /* rename over an exist
 uint32_t fa_cpu_count(void);
 int64_t fa_monotonic_ns(void);
 
+/* A mutex for static data, created on first use (process-wide singletons). */
+typedef struct fa_lazy_mutex { fa_atomic32 state; fa_mutex m; } fa_lazy_mutex;
+void fa_lazy_mutex_lock(fa_lazy_mutex* l);
+void fa_lazy_mutex_unlock(fa_lazy_mutex* l);
+
+/* Shared libraries of the app loaded at runtime (FFmpeg, LAME); dynlib.c.
+ * `already_loaded_only`: only a library already in the process (pinned there on
+ * Windows, as LoadLibrary would). A path with a folder loads from that folder. */
+void* fa_lib_open(const char* path, int already_loaded_only);
+void* fa_lib_sym(void* lib, const char* name);
+/* Gives back a library opened with fa_lib_open (same `already_loaded_only`) that
+ * turned out unusable. */
+void fa_lib_close(void* lib, int already_loaded_only);
+/* Where `lib` was loaded from (found through `symbol`, one of its functions); ""
+ * when the platform cannot tell. */
+void fa_lib_where(void* lib, const char* symbol, char* out, size_t cap);
+
 #endif

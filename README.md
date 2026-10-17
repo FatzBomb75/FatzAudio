@@ -20,7 +20,8 @@ ramps on seven curves (including your own points), sample-accurate scheduled sta
 crossfades, queues with gapless playback, cue/fade/mix-point markers, mix buses, a per-stream channel
 matrix, ended/ramp-done/marker/started events, decode-only reads, and EBU R128
 loudness normalization on every stream (tags, content-keyed cache, parallel audio-only background
-scans, gain that glides to the exact value, true-peak output limiter), and tempo, pitch and rate on every stream. Functions not implemented yet return `FA_ERROR_NOT_IMPLEMENTED`; the
+scans, gain that glides to the exact value, true-peak output limiter), tempo, pitch and rate on every stream, and recording and encoding to WAV, FLAC (both built in) and MP3 (LAME
+loaded at runtime) from a device, a playing stream, a file or your own samples. Functions not implemented yet return `FA_ERROR_NOT_IMPLEMENTED`; the
 [docs index](docs/README.md) tracks the status of each feature.
 
 ## Build

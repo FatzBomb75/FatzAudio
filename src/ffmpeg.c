@@ -10,22 +10,11 @@
  *   AVCodecDescriptor  id
  * Everything else (rate, channels, block align, ...) goes through AVOptions, which
  * are looked up by name and so do not depend on struct layouts either. */
-#if !defined(_WIN32) && !defined(_GNU_SOURCE)
-#  define _GNU_SOURCE   /* dladdr */
-#endif
 #include "fa_internal.h"
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <windows.h>
-#else
-#  include <dlfcn.h>
-#endif
 
 /* ---- the struct prefixes ---------------------------------------------------- */
 
@@ -103,58 +92,12 @@ typedef struct ff_api {
 } ff_api;
 
 static ff_api ff;
-static fa_mutex* ff_lock_ptr;
 static int ff_state;               /* 0 = not tried, 1 = loaded, -1 = tried and failed */
 static char ff_path[512];
 
 /* ---- loading --------------------------------------------------------------------- */
 
 typedef struct ff_libs { void* avcodec; void* avutil; } ff_libs;
-
-#ifdef _WIN32
-static void* lib_open(const char* path, int already_loaded_only)
-{
-    wchar_t w[600];
-    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 600)) return NULL;
-    if (already_loaded_only) {
-        HMODULE h = GetModuleHandleW(w);
-        if (h) {
-            HMODULE pinned = NULL;  /* keep it loaded for good, like LoadLibrary would */
-            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN, w, &pinned);
-        }
-        return (void*)h;
-    }
-    return (void*)LoadLibraryExW(w, NULL, (strchr(path, '\\') || strchr(path, '/')) ? LOAD_WITH_ALTERED_SEARCH_PATH : 0);
-}
-static void* lib_sym(void* lib, const char* name) { return (void*)GetProcAddress((HMODULE)lib, name); }
-static void lib_where(void* lib, char* out, size_t cap)
-{
-    wchar_t w[512];
-    DWORD n = GetModuleFileNameW((HMODULE)lib, w, 512);
-    if (n == 0 || n >= 512 || !WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)cap, NULL, NULL)) out[0] = '\0';
-}
-#else
-static void* lib_open(const char* path, int already_loaded_only)
-{
-#  ifdef RTLD_NOLOAD
-    if (already_loaded_only) return dlopen(path, RTLD_NOW | RTLD_NOLOAD);
-#  else
-    if (already_loaded_only) return NULL;
-#  endif
-    return dlopen(path, RTLD_NOW | RTLD_LOCAL);
-}
-static void* lib_sym(void* lib, const char* name) { return dlsym(lib, name); }
-static void lib_where(void* lib, char* out, size_t cap)
-{
-#  if defined(__GLIBC__) || defined(__APPLE__)
-    Dl_info info;
-    void* f = dlsym(lib, "avcodec_version");
-    if (f && dladdr(f, &info) && info.dli_fname) { snprintf(out, cap, "%s", info.dli_fname); return; }
-#  endif
-    (void)lib;
-    out[0] = '\0';
-}
-#endif
 
 /* File names of libavcodec major `m` and its libavutil (major m - 2). */
 static void lib_names(int m, char* codec, char* util, size_t cap)
@@ -197,9 +140,9 @@ static int find_libs(int mode, const char* dir, ff_libs* out)
             snprintf(pu, sizeof(pu), "%s", util);
         }
         /* libavutil first: libavcodec depends on it (on Windows, from its folder). */
-        lu = lib_open(pu, mode == 0);
+        lu = fa_lib_open(pu, mode == 0);
         if (!lu) continue;
-        lc = lib_open(pc, mode == 0);
+        lc = fa_lib_open(pc, mode == 0);
         if (!lc) continue;
         out->avcodec = lc;
         out->avutil = lu;
@@ -212,8 +155,8 @@ static int bind_api(const ff_libs* l)
 {
     ff_api a;
     memset(&a, 0, sizeof(a));
-#define C(name) (*(void**)&a.name = lib_sym(l->avcodec, #name))
-#define U(name) (*(void**)&a.name = lib_sym(l->avutil, #name))
+#define C(name) (*(void**)&a.name = fa_lib_sym(l->avcodec, #name))
+#define U(name) (*(void**)&a.name = fa_lib_sym(l->avutil, #name))
     C(avcodec_version); C(avcodec_descriptor_get_by_name); C(avcodec_find_decoder);
     C(avcodec_alloc_context3); C(avcodec_free_context); C(avcodec_parameters_alloc);
     C(avcodec_parameters_free); C(avcodec_parameters_to_context); C(avcodec_open2);
@@ -241,26 +184,11 @@ static int bind_api(const ff_libs* l)
     return 1;
 }
 
-/* One lock for the whole library: created on first use. Loading happens rarely
- * (once), so a simple spin on a static flag guards the lock's creation. */
-static fa_atomic32 ff_lock_init;
-static fa_mutex ff_lock_storage;
+/* One lock for the whole library. */
+static fa_lazy_mutex ff_lock_storage;
 
-static void ff_lock(void)
-{
-    if (fa_load32(&ff_lock_init) != 2) {
-        if (fa_cas32(&ff_lock_init, 0, 1)) {
-            fa_mutex_init(&ff_lock_storage);
-            ff_lock_ptr = &ff_lock_storage;
-            fa_store32(&ff_lock_init, 2);
-        } else {
-            while (fa_load32(&ff_lock_init) != 2) fa_sleep_ms(1);
-        }
-    }
-    fa_mutex_lock(ff_lock_ptr);
-}
-
-static void ff_unlock(void) { fa_mutex_unlock(ff_lock_ptr); }
+static void ff_lock(void) { fa_lazy_mutex_lock(&ff_lock_storage); }
+static void ff_unlock(void) { fa_lazy_mutex_unlock(&ff_lock_storage); }
 
 /* Caller holds the lock. */
 static int try_load(int mode, const char* dir)
@@ -268,7 +196,7 @@ static int try_load(int mode, const char* dir)
     ff_libs l;
     if (!find_libs(mode, dir, &l)) return 0;
     if (!bind_api(&l)) return 0;
-    lib_where(l.avcodec, ff_path, sizeof(ff_path));
+    fa_lib_where(l.avcodec, "avcodec_version", ff_path, sizeof(ff_path));
     if (!ff_path[0]) {
         char codec[64], util[64];
         lib_names((int)(ff.avcodec_version() >> 16), codec, util, sizeof(codec));
