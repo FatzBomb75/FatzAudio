@@ -11,7 +11,7 @@
 #ifdef _WIN32
 #  include <windows.h>
 #  include <psapi.h>
-static double bench_now_ms(void)
+static inline double bench_now_ms(void)
 {
     static LARGE_INTEGER freq;
     LARGE_INTEGER t;
@@ -20,7 +20,7 @@ static double bench_now_ms(void)
     return (double)t.QuadPart * 1000.0 / (double)freq.QuadPart;
 }
 /* Current working set, in KB: the baseline before the first stream is opened. */
-static double bench_current_kb(void)
+static inline double bench_current_kb(void)
 {
     PROCESS_MEMORY_COUNTERS pmc;
     pmc.cb = sizeof(pmc);
@@ -28,10 +28,7 @@ static double bench_current_kb(void)
     return (double)pmc.WorkingSetSize / 1024.0;
 }
 /* The process's peak working set since it started (fa_bench's loudness scan). */
-#if defined(__GNUC__)
-__attribute__((unused))
-#endif
-static double bench_process_peak_kb(void)
+static inline double bench_process_peak_kb(void)
 {
     PROCESS_MEMORY_COUNTERS pmc;
     pmc.cb = sizeof(pmc);
@@ -43,20 +40,20 @@ static double bench_process_peak_kb(void)
  * sampling the working set while the streams run (bench_mem_sample, every 16
  * reads: a buffer allocated and freed between two samples is not seen). */
 static double bench_peak_seen = -1;
-static double bench_mem_start(void) { return bench_peak_seen = bench_current_kb(); }
-static void bench_mem_sample(void)
+static inline double bench_mem_start(void) { return bench_peak_seen = bench_current_kb(); }
+static inline void bench_mem_sample(void)
 {
     double kb = bench_current_kb();
     if (kb > bench_peak_seen) bench_peak_seen = kb;
 }
-static double bench_peak_kb(void)
+static inline double bench_peak_kb(void)
 {
     bench_mem_sample();
     return bench_peak_seen;
 }
 #else
 #  include <time.h>
-static double bench_now_ms(void)
+static inline double bench_now_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -64,7 +61,7 @@ static double bench_now_ms(void)
 }
 /* Linux: VmHWM (peak) and VmRSS (current) from /proc/self/status, in KB; -1
  * elsewhere (macOS has no cheap equivalent of both, and memory is then left out). */
-static double bench_status_kb(const char* key)
+static inline double bench_status_kb(const char* key)
 {
     char line[256];
     double v = -1;
@@ -76,28 +73,28 @@ static double bench_status_kb(const char* key)
     fclose(f);
     return v;
 }
-static double bench_current_kb(void) { return bench_status_kb("VmRSS:"); }
-static double bench_process_peak_kb(void) { return bench_status_kb("VmHWM:"); }
+static inline double bench_current_kb(void) { return bench_status_kb("VmRSS:"); }
+static inline double bench_process_peak_kb(void) { return bench_status_kb("VmHWM:"); }
 /* VmHWM counts everything since the process started; writing 5 to clear_refs
  * resets it to the current size, so the peak is the run's own. Where that is
  * refused, the size is sampled as on Windows. */
 static double bench_peak_seen = -1;
 static int bench_hwm_reset = 0;
-static double bench_mem_start(void)
+static inline double bench_mem_start(void)
 {
     FILE* f = fopen("/proc/self/clear_refs", "w");
     bench_hwm_reset = f && fputs("5", f) >= 0;
     if (f && fclose(f) != 0) bench_hwm_reset = 0;
     return bench_peak_seen = bench_current_kb();
 }
-static void bench_mem_sample(void)
+static inline void bench_mem_sample(void)
 {
     double kb;
     if (bench_hwm_reset) return;
     kb = bench_current_kb();
     if (kb > bench_peak_seen) bench_peak_seen = kb;
 }
-static double bench_peak_kb(void)
+static inline double bench_peak_kb(void)
 {
     if (bench_hwm_reset) return bench_process_peak_kb();
     bench_mem_sample();
@@ -107,7 +104,7 @@ static double bench_peak_kb(void)
 
 /* Raw output: interleaved float32, no header (run.py knows rate and channels from
  * the JSON line). "-" discards the audio, for speed runs. */
-static FILE* bench_open_out(const char* path)
+static inline FILE* bench_open_out(const char* path)
 {
     FILE* f;
     if (!strcmp(path, "-")) return NULL;
@@ -123,16 +120,44 @@ static inline void bench_num(const char* key, double v)
     else printf("\"%s\":%.4f", key, v);
 }
 
+/* Waits `ms` milliseconds (the play commands keep time with it). */
+static inline void bench_sleep_ms(double ms)
+{
+#ifdef _WIN32
+    if (ms > 0) Sleep((DWORD)(ms + 0.5));
+#else
+    struct timespec ts;
+    if (ms <= 0) return;
+    ts.tv_sec = (time_t)(ms / 1000.0);
+    ts.tv_nsec = (long)((ms - (double)ts.tv_sec * 1000.0) * 1e6);
+    nanosleep(&ts, NULL);
+#endif
+}
+
+/* The play commands print the time of every call they make on bench_now_ms's
+ * clock, which loop_rec stamps its recording with too. */
+static inline void bench_print_times(const char* key, const double* t, int n)
+{
+    int i;
+    printf("\"%s\":[", key);
+    for (i = 0; i < n; i++) printf("%s%.3f", i ? "," : "", t[i]);
+    printf("]");
+}
+
 /* `extra` lists a tool's own commands (NULL for none). */
-static void bench_usage(const char* tool, const char* lib_arg, const char* extra)
+static inline void bench_usage(const char* tool, const char* lib_arg, const char* extra)
 {
     fprintf(stderr,
             "usage: %s %sdecode <in> <out.f32|-> [--prescan]\n"
             "       %s %sinfo <in> [--prescan]\n"
             "       %s %sseek <in> <out.f32> [--prescan] <frames per seek> <frame> [<frame> ...]\n"
-            "       %s %smulti <in> <streams>\n%s"
+            "       %s %smulti <in> <streams>\n"
+            "       %s %splay-latency <click.wav> <trials> <gap ms>\n"
+            "       %s %splay-crossfade <a.wav> <b.wav> <fade ms> <start after ms> [linear|equal]\n"
+            "       %s %splay-gapless <a.wav> <b.wav> [mixtime|normal]\n%s"
             "Prints one JSON line with the result; audio is raw interleaved float32.\n",
-            tool, lib_arg, tool, lib_arg, tool, lib_arg, tool, lib_arg, extra ? extra : "");
+            tool, lib_arg, tool, lib_arg, tool, lib_arg, tool, lib_arg, tool, lib_arg, tool, lib_arg, tool, lib_arg,
+            extra ? extra : "");
 }
 
 #endif

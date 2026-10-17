@@ -7,12 +7,25 @@
  *   bass_bench <bass folder> info <in> [--prescan]
  *   bass_bench <bass folder> seek <in> <out.f32> [--prescan] <frames> <frame> ...
  *   bass_bench <bass folder> multi <in> <streams>
+ *   bass_bench <bass folder> play-latency <click.wav> <trials> <gap ms>
+ *   bass_bench <bass folder> play-crossfade <a.wav> <b.wav> <fade ms> <start after ms> [linear]
+ *   bass_bench <bass folder> play-gapless <a.wav> <b.wav> [mixtime|normal]
  *
  * Streams are opened the way an app decodes with BASS: BASS_StreamCreateFile with
  * BASS_STREAM_DECODE | BASS_SAMPLE_FLOAT (and BASS_STREAM_PRESCAN with --prescan),
  * on device 0 ("no sound"), with every add-on in the folder loaded through
  * BASS_PluginLoad, as an app does at startup. Positions are in bytes of float
- * audio (BASS_POS_BYTE), so frame * channels * 4. */
+ * audio (BASS_POS_BYTE), so frame * channels * 4.
+ *
+ * The play commands use the default output device (BASS_Init(-1, 48000,
+ * BASS_DEVICE_LATENCY), BASS's default buffer settings) and do what an app does
+ * with plain BASS:
+ * play-latency    BASS_ChannelPlay(restart) of the click, <trials> times.
+ * play-crossfade  BASS_ChannelSlideAttribute on BASS_ATTRIB_VOL: the new stream
+ *                 starts at volume 0 and slides to 1 while the old one slides to 0.
+ *                 Slides are linear; BASS has no equal-power slide.
+ * play-gapless    a BASS_SYNC_END sync on the first stream starts the second with
+ *                 BASS_ChannelPlay; "mixtime" (default) adds BASS_SYNC_MIXTIME. */
 #include "bench_common.h"
 
 /* From the BASS documentation (bass.h). */
@@ -21,6 +34,11 @@
 #define BASS_STREAM_DECODE 0x200000
 #define BASS_UNICODE 0x80000000u
 #define BASS_POS_BYTE 0
+#define BASS_DEVICE_LATENCY 0x100
+#define BASS_ATTRIB_VOL 2
+#define BASS_SYNC_END 2
+#define BASS_SYNC_MIXTIME 0x40000000u
+#define BASS_ACTIVE_STOPPED 0
 
 typedef unsigned long long QWORD;
 typedef struct {
@@ -28,6 +46,12 @@ typedef struct {
     DWORD plugin, sample;
     const char* filename;
 } BASS_CHANNELINFO;
+typedef struct {
+    DWORD flags, hwsize, hwfree, freesam, free3d, minrate, maxrate;
+    BOOL eax;
+    DWORD minbuf, dsver, latency, initflags, speakers, freq;
+} BASS_INFO;
+typedef void (CALLBACK SYNCPROC)(DWORD handle, DWORD channel, DWORD data, void* user);
 
 static BOOL (WINAPI *BASS_Init)(int, DWORD, DWORD, HWND, const void*);
 static BOOL (WINAPI *BASS_Free)(void);
@@ -40,6 +64,13 @@ static BOOL (WINAPI *BASS_ChannelGetInfo)(DWORD, BASS_CHANNELINFO*);
 static QWORD (WINAPI *BASS_ChannelGetLength)(DWORD, DWORD);
 static BOOL (WINAPI *BASS_ChannelSetPosition)(DWORD, QWORD, DWORD);
 static DWORD (WINAPI *BASS_ChannelGetData)(DWORD, void*, DWORD);
+static BOOL (WINAPI *BASS_GetInfo)(BASS_INFO*);
+static BOOL (WINAPI *BASS_ChannelPlay)(DWORD, BOOL);
+static BOOL (WINAPI *BASS_ChannelStop)(DWORD);
+static DWORD (WINAPI *BASS_ChannelIsActive)(DWORD);
+static BOOL (WINAPI *BASS_ChannelSetAttribute)(DWORD, DWORD, float);
+static BOOL (WINAPI *BASS_ChannelSlideAttribute)(DWORD, DWORD, float, DWORD);
+static DWORD (WINAPI *BASS_ChannelSetSync)(DWORD, DWORD, QWORD, SYNCPROC*, void*);
 
 #define CHUNK 4096
 
@@ -58,7 +89,8 @@ static any_fn need(HMODULE m, const char* name)
 
 static char plugins[512];
 
-static void load_bass(const char* dir)
+/* play: open the default output device instead of "no sound". */
+static void load_bass(const char* dir, int play)
 {
     static const char* addons[] = { "bass_aac.dll", "bass_ac3.dll", "bassflac.dll", "bassopus.dll", "basswma.dll" };
     char path[MAX_PATH * 2];
@@ -78,7 +110,14 @@ static void load_bass(const char* dir)
     LOAD(BASS_ChannelGetLength);
     LOAD(BASS_ChannelSetPosition);
     LOAD(BASS_ChannelGetData);
-    if (!BASS_Init(0, 48000, 0, NULL, NULL)) { fprintf(stderr, "BASS_Init: error %d\n", BASS_ErrorGetCode()); exit(1); }
+    LOAD(BASS_GetInfo);
+    LOAD(BASS_ChannelPlay);
+    LOAD(BASS_ChannelStop);
+    LOAD(BASS_ChannelIsActive);
+    LOAD(BASS_ChannelSetAttribute);
+    LOAD(BASS_ChannelSlideAttribute);
+    LOAD(BASS_ChannelSetSync);
+    if (!BASS_Init(play ? -1 : 0, 48000, play ? BASS_DEVICE_LATENCY : 0, NULL, NULL)) { fprintf(stderr, "BASS_Init: error %d\n", BASS_ErrorGetCode()); exit(1); }
     for (i = 0; i < sizeof(addons) / sizeof(addons[0]); i++) {
         snprintf(path, sizeof(path), "%s\\%s", dir, addons[i]);
         if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
@@ -245,6 +284,114 @@ static int cmd_multi(const char* in, int n)
     return 0;
 }
 
+/* ---- Playback on the default device (the play commands) ----------------- */
+
+static DWORD open_playing(const char* path)
+{
+    wchar_t w[MAX_PATH * 2];
+    DWORD h;
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, w, MAX_PATH * 2);
+    h = BASS_StreamCreateFile(FALSE, w, 0, 0, BASS_SAMPLE_FLOAT | BASS_UNICODE);
+    if (!h) {
+        printf("{\"lib\":\"bass\",\"error\":\"%s: BASS error %d\"}\n", path, BASS_ErrorGetCode());
+        exit(1);
+    }
+    return h;
+}
+
+static void print_device(void)
+{
+    BASS_INFO bi;
+    memset(&bi, 0, sizeof(bi));
+    BASS_GetInfo(&bi);
+    printf("\"lib\":\"bass\",\"version\":\"%08lx\",\"reported_latency_ms\":%lu,\"minbuf_ms\":%lu,",
+           (unsigned long)BASS_GetVersion(), (unsigned long)bi.latency, (unsigned long)bi.minbuf);
+}
+
+static double length_ms(DWORD h)
+{
+    BASS_CHANNELINFO info;
+    QWORD len = BASS_ChannelGetLength(h, BASS_POS_BYTE);
+    BASS_ChannelGetInfo(h, &info);
+    return len == (QWORD)-1 ? 0 : (double)len * 1000.0 / (4.0 * info.chans * info.freq);
+}
+
+static int cmd_play_latency(const char* click, int trials, double gap_ms)
+{
+    double* t = (double*)calloc((size_t)trials, sizeof(double));
+    DWORD h = open_playing(click);
+    int i;
+    bench_sleep_ms(300);  /* let the device settle */
+    for (i = 0; i < trials; i++) {
+        double t0 = bench_now_ms();
+        t[i] = t0;
+        BASS_ChannelPlay(h, TRUE);
+        bench_sleep_ms(gap_ms - (bench_now_ms() - t0) - 20);
+        BASS_ChannelStop(h);
+        bench_sleep_ms(gap_ms - (bench_now_ms() - t0));
+    }
+    printf("{");
+    print_device();
+    bench_print_times("calls", t, trials);
+    printf("}\n");
+    BASS_StreamFree(h);
+    free(t);
+    return 0;
+}
+
+static int cmd_play_crossfade(const char* a, const char* b, double fade_ms, double after_ms)
+{
+    DWORD ha = open_playing(a), hb = open_playing(b);
+    double t_play, t_fade;
+    BOOL ok;
+    bench_sleep_ms(300);
+    t_play = bench_now_ms();
+    BASS_ChannelPlay(ha, FALSE);
+    bench_sleep_ms(after_ms);
+    t_fade = bench_now_ms();
+    BASS_ChannelSetAttribute(hb, BASS_ATTRIB_VOL, 0);
+    ok = BASS_ChannelPlay(hb, FALSE);
+    ok = ok && BASS_ChannelSlideAttribute(ha, BASS_ATTRIB_VOL, 0, (DWORD)fade_ms);
+    ok = ok && BASS_ChannelSlideAttribute(hb, BASS_ATTRIB_VOL, 1, (DWORD)fade_ms);
+    bench_sleep_ms(fade_ms + 1000);
+    printf("{");
+    print_device();
+    printf("\"curve\":\"linear\",\"play\":%.3f,\"fade\":%.3f,\"result\":\"%s\"}\n", t_play, t_fade,
+           ok ? "ok" : "failed");
+    BASS_StreamFree(ha);
+    BASS_StreamFree(hb);
+    return 0;
+}
+
+static void CALLBACK start_next(DWORD sync, DWORD channel, DWORD data, void* user)
+{
+    (void)sync;
+    (void)channel;
+    (void)data;
+    BASS_ChannelPlay((DWORD)(size_t)user, FALSE);
+}
+
+static int cmd_play_gapless(const char* a, const char* b, int mixtime)
+{
+    DWORD ha = open_playing(a), hb = open_playing(b);
+    double t_play, t_end;
+    DWORD sync = BASS_ChannelSetSync(ha, BASS_SYNC_END | (mixtime ? BASS_SYNC_MIXTIME : 0), 0, start_next, (void*)(size_t)hb);
+    bench_sleep_ms(300);
+    t_play = bench_now_ms();
+    BASS_ChannelPlay(ha, FALSE);
+    t_end = t_play + length_ms(ha) + length_ms(hb) + 3000;
+    bench_sleep_ms(length_ms(ha) + 200);
+    while (bench_now_ms() < t_end && BASS_ChannelIsActive(hb) != BASS_ACTIVE_STOPPED) bench_sleep_ms(5);
+    bench_sleep_ms(300);
+    printf("{");
+    print_device();
+    printf("\"sync\":\"%s\",\"play\":%.3f,\"result\":\"%s\"}\n", mixtime ? "mixtime" : "normal", t_play,
+           sync ? "ok" : "failed");
+    BASS_StreamFree(ha);
+    BASS_StreamFree(hb);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     int prescan = 0, rc, i;
@@ -257,12 +404,22 @@ int main(int argc, char** argv)
             argc--;
             i--;
         }
-    load_bass(argv[1]);
     cmd = argv[2];
+    load_bass(argv[1], !strncmp(cmd, "play-", 5));
     if (!strcmp(cmd, "info")) rc = cmd_info(argv[3], prescan);
     else if (!strcmp(cmd, "decode") && argc > 4) rc = cmd_decode(argv[3], argv[4], prescan);
     else if (!strcmp(cmd, "seek") && argc > 6) rc = cmd_seek(argv[3], argv[4], prescan, atoll(argv[5]), argv + 6, argc - 6);
     else if (!strcmp(cmd, "multi") && argc > 4) rc = cmd_multi(argv[3], atoi(argv[4]));
+    else if (!strcmp(cmd, "play-latency") && argc > 5) rc = cmd_play_latency(argv[3], atoi(argv[4]), atof(argv[5]));
+    else if (!strcmp(cmd, "play-crossfade") && argc > 6) {
+        if (argc > 7 && strcmp(argv[7], "linear")) {
+            printf("{\"lib\":\"bass\",\"error\":\"BASS slides are linear only\"}\n");
+            rc = 1;
+        } else {
+            rc = cmd_play_crossfade(argv[3], argv[4], atof(argv[5]), atof(argv[6]));
+        }
+    }
+    else if (!strcmp(cmd, "play-gapless") && argc > 4) rc = cmd_play_gapless(argv[3], argv[4], argc <= 5 || strcmp(argv[5], "normal"));
     else { bench_usage(argv[0], "<bass folder> ", NULL); rc = 2; }
     BASS_Free();
     return rc;
