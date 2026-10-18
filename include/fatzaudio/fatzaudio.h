@@ -872,6 +872,17 @@ FA_API fa_result FA_CALL fa_stream_get_state(fa_stream* stream, fa_stream_state*
  * the start"). Seeking an attached stream drops the decode-ahead buffer and refills the first
  * ~100 ms on the calling thread before returning, so playback resumes at once. */
 FA_API fa_result FA_CALL fa_stream_seek(fa_stream* stream, fa_frames frame);
+/* Like fa_stream_seek, but returns at once: an engine worker drops the buffer and
+ * refills from `frame`, while the stream is silent. Until then the position and
+ * the clock already report `frame`. A newer call replaces a target not reached
+ * yet, so dragging a seek bar costs one seek per worker pass, not one per call.
+ * Use it from a UI thread, and for web streams, whose seek waits for the network.
+ * Any other call that moves the stream (fa_stream_seek, play from stopped, a
+ * detach) carries out or replaces it. If the seek fails (a web server refusing
+ * the range), playback goes on where it was and FA_EVENT_SEEK_FAILED is raised
+ * (frame = the target, value = the error). Streams that are not attached seek at
+ * once, as with fa_stream_seek. */
+FA_API fa_result FA_CALL fa_stream_seek_async(fa_stream* stream, fa_frames frame);
 /* Source frames already handed to the device (or read, for decode-only streams).
  * Frames decoded ahead into the buffer are not counted. */
 FA_API fa_result FA_CALL fa_stream_get_position(fa_stream* stream, fa_frames* out_frame);
@@ -967,11 +978,11 @@ typedef struct fa_ramp {
  * buffer, which is kept short while any of them is in use (fa_tempo_options
  * latency_ms, 150 ms by default). They combine: the speed heard is TEMPO x RATE and
  * the pitch PITCH semitones plus what RATE adds. Out-of-range values are clamped.
- * They work on every stream, also decode-only ones (fa_stream_read returns the
- * processed audio), except that push and packet streams (fa_stream_open_push,
- * fa_stream_open_packets) take PITCH only: their timing is the app's, so TEMPO and
- * RATE return FA_ERROR_NOT_IMPLEMENTED there. Positions, markers, the clock and
- * CD+G graphics stay in source frames and follow the tempo by themselves.
+ * They work on every stream, also decode-only and push and packet ones
+ * (fa_stream_read returns the processed audio). Positions, markers, the clock and
+ * CD+G graphics stay in source frames and follow the tempo by themselves; on push
+ * and packet streams the clock keeps the app's timestamps and runs at the speed
+ * heard, so video following it stays in sync.
  * Buses have no RATE, TEMPO or PITCH (FA_ERROR_INVALID_ARG), and streams of more
  * than 32 channels without a channel matrix return FA_ERROR_UNSUPPORTED_FORMAT.
  *
@@ -1553,7 +1564,8 @@ typedef enum fa_event_type {
     FA_EVENT_RAMP_DONE,       /* a ramp reached its target or was replaced */
     FA_EVENT_STARTED,         /* a scheduled, crossfaded or queued start happened */
     FA_EVENT_MIDI_TEXT,       /* a MIDI lyric or other text event is heard */
-    FA_EVENT_LOOPED           /* a looping stream jumped back to its loop start */
+    FA_EVENT_LOOPED,          /* a looping stream jumped back to its loop start */
+    FA_EVENT_SEEK_FAILED      /* fa_stream_seek_async could not reach `frame` (value = the fa_result) */
 } fa_event_type;
 
 typedef struct fa_event {

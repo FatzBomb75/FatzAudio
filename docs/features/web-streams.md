@@ -155,6 +155,8 @@ A URL that isn't an absolute http or https URL throws `ArgumentException`. Other
 | Radio, live HLS | No |
 | On-demand HLS | Yes, to the exact frame: the download restarts at the segment, and decoding starts there |
 
+A seek outside what's downloaded waits for a network round trip. From a UI thread or a seek bar, use `fa_stream_seek_async` (.NET `RequestSeek`), which returns at once and lets a decode worker wait for the server instead ([what a seek costs](playback.md#what-a-seek-costs)).
+
 MP3 and AAC files over the network seek by estimated byte position, as most players do for files without an index, and land within a few frames of the target. The reported position is the one you asked for. WAV and FLAC seek exactly.
 
 ## Song titles (ICY metadata)

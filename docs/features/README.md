@@ -12,7 +12,7 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Loudness normalization (R128 scans, tags, cache, limiter) | [normalization.md](normalization.md) | ✅ |
 | Crossfades, markers, queues and gapless, scheduled starts | [crossfade.md](crossfade.md) | ✅ |
 | Buses (decks, groups) and the channel matrix | [buses.md](buses.md) | ✅ |
-| Tempo, pitch and rate (time-stretch, key change, varispeed, formants) | [tempo-pitch.md](tempo-pitch.md) | ✅ (tempo and rate on push streams 🗓️) |
+| Tempo, pitch and rate (time-stretch, key change, varispeed, formants) | [tempo-pitch.md](tempo-pitch.md) | ✅ |
 | FFmpeg hand-off and A/V sync (packets, frames, presentation clock) | [ffmpeg.md](ffmpeg.md) | ✅ |
 | Web streams and HLS (HTTP/HTTPS, radio titles, reconnects, HLS) | [web-streams.md](web-streams.md) | ✅ |
 | CD+G karaoke graphics (MP3+G, ZIP, CD+G discs, surfaces for any renderer) | [cdg.md](cdg.md) | ✅ |

@@ -138,6 +138,7 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
     s->flags = options ? options->flags : 0;
     fa_store32(&s->loop, (s->flags & FA_OPEN_LOOP) ? 1 : 0);
     s->mute_next = -1;               /* nothing mixed yet: the mute starts as set */
+    fa_store64(&s->seek_pending, -1);
     fa_eq_shared_init(&s->eq_shared);
     fa_eq_reset(&s->eq);
     s->buffer_ms = FA_DEFAULT_BUFFER_MS;
@@ -943,15 +944,31 @@ static void tempo_chunk(struct fa_stream* s, const float** buf, fa_frames* n, ui
     *n = got;
 }
 
-/* Source frames per chain run while it is engaged: about FA_TEMPO_CHUNK frames of
- * output, so ramps step evenly in time and the position map (one segment per run
- * while values change) covers the decode-ahead buffer even at high speeds. */
-static fa_frames tempo_step(struct fa_stream* s)
+/* TEMPO x RATE as set now (the target of a ramp in progress is not reached yet). */
+static double current_speed(struct fa_stream* s)
 {
     double speed;
     fa_mutex_lock(&s->tempo_lock);
     speed = (double)s->tparams[tempo_slot(FA_PARAM_TEMPO)].value * (double)s->tparams[tempo_slot(FA_PARAM_RATE)].value;
     fa_mutex_unlock(&s->tempo_lock);
+    return speed > 0.0 ? speed : 1.0;
+}
+
+/* TEMPO x RATE in effect at chain frame `at` (mid-ramp included), or 1 while the
+ * chain plays the audio unchanged (neither `engaged` nor wanted). */
+static double speed_now(struct fa_stream* s, int64_t at, int engaged)
+{
+    double tempo, pitch, rate;
+    int wanted = tempo_values(s, at, &tempo, &pitch, &rate);
+    return (engaged || wanted) && tempo * rate > 0.0 ? tempo * rate : 1.0;
+}
+
+/* Source frames per chain run while it is engaged: about FA_TEMPO_CHUNK frames of
+ * output, so ramps step evenly in time and the position map (one segment per run
+ * while values change) covers the decode-ahead buffer even at high speeds. */
+static fa_frames tempo_step(struct fa_stream* s)
+{
+    double speed = current_speed(s);
     return speed > 1.0 ? (fa_frames)(FA_TEMPO_CHUNK * speed) : FA_TEMPO_CHUNK;
 }
 
@@ -971,6 +988,7 @@ static int64_t fill_target(struct fa_stream* s)
 
 int fa_stream_needs_work(struct fa_stream* s)
 {
+    if (s->ring.data && fa_load64(&s->seek_pending) >= 0) return 1;
     if (!s->ring.data || fa_load32(&s->eof) || fa_load32(&s->flushing)) return 0;
     if (s->push && !fa_push_has_input(s->push) && !fa_load32(&s->staged)) return 0;   /* nothing pushed yet */
     if (fa_ring_readable(&s->ring) > fill_target(s) * 3 / 4) return 0;
@@ -1139,8 +1157,11 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                  * (what the resampler still holds comes out first), and at which
                  * source frame for a later attach. */
                 int64_t at = fa_load64(&s->ring.write), lat = (int64_t)ma_data_converter_get_output_latency(&s->converter);
-                /* (Only pitch applies to push streams, so chain frames are source frames.) */
-                if (s->tempo) lat += (int64_t)(fa_tempo_held(s->tempo) * (double)s->dev_rate / (double)s->decoder.format.sample_rate + 0.5);
+                /* What the chain holds comes out at the speed now in use. */
+                if (s->tempo) {
+                    double speed = speed_now(s, s->tempo_frames, fa_tempo_engaged(s->tempo));
+                    lat += (int64_t)(fa_tempo_held(s->tempo) / speed * (double)s->dev_rate / (double)s->decoder.format.sample_rate + 0.5);
+                }
                 /* The ring's very first frames are the resampler's start-up, ahead of
                  * this chunk: they start the timeline too (at its pts, never at 0 or
                  * before the clock's hold). */
@@ -1261,9 +1282,24 @@ fa_frames fa_stream_position_now(struct fa_stream* s)
     return s->dev_rate ? attached_position(s) : fa_load64(&s->position);
 }
 
+/* Where the stream is going: a pending fa_stream_seek_async target, else the
+ * position heard. What restarts and the public getters use. */
+static fa_frames target_position(struct fa_stream* s)
+{
+    int64_t pending = fa_load64(&s->seek_pending);
+    return pending >= 0 ? pending : fa_stream_position_now(s);
+}
+
+/* After a restart: the mixer may play again, unless a newer async target came
+ * in meanwhile (a worker carries that out next). */
+static void unflush(struct fa_stream* s)
+{
+    fa_store32(&s->flushing, fa_load64(&s->seek_pending) >= 0);
+}
+
 /* Drops buffered audio and restarts decoding at `frame`. Caller holds api_lock and
  * decode_lock, and the audio thread is kept out (flushing set, or not attached). */
-static fa_result restart_at_locked(struct fa_stream* s, fa_frames frame)
+static fa_result restart_expecting_locked(struct fa_stream* s, fa_frames frame, int64_t pending)
 {
     fa_result r = FA_OK;
     int64_t hold = 0;
@@ -1297,7 +1333,13 @@ static fa_result restart_at_locked(struct fa_stream* s, fa_frames frame)
         /* Prefill so playback resumes without waiting for a worker. */
         fa_stream_fill(s, (int64_t)s->dev_rate * FA_PREFILL_MS / 1000);
     }
+    fa_cas64(&s->seek_pending, pending, -1);   /* done or replaced, unless a newer one came meanwhile */
     return FA_OK;
+}
+
+static fa_result restart_at_locked(struct fa_stream* s, fa_frames frame)
+{
+    return restart_expecting_locked(s, frame, fa_load64(&s->seek_pending));
 }
 
 /* ---- attach / detach ---------------------------------------------------- */
@@ -1378,7 +1420,8 @@ static void detach_locked(struct fa_stream* s)
     fa_device_remove_voice(dev, s);          /* waits until the audio thread let go */
     fa_engine_track_stream(s->engine, s, 0);
     fa_mutex_lock(&s->decode_lock);          /* waits for a worker still filling it */
-    pos = attached_position(s);
+    pos = target_position(s);                /* a pending fa_stream_seek_async included */
+    fa_store64(&s->seek_pending, -1);
     s->dev_rate = 0;
     s->device = NULL;
     fa_exchange_ptr(&s->bus, NULL);
@@ -1435,6 +1478,7 @@ static int64_t carry_timeline(struct fa_stream* s, uint32_t dev_rate)
     double ratio = (double)dev_rate / (double)s->decoder.format.sample_rate;
     int64_t pos = s->src_pos, end = pos + s->carry_count, k, lo, first;
     if (s->carry_count <= 0) return fa_push_next_pts(s->push);
+    ratio /= speed_now(s, 0, 0);   /* the chain plays it at that speed */
     first = carry_first_pts(s);
     fa_ptsmap_add(&s->ptsmap, 0, first);
     lo = s->anchors > FA_SRC_ANCHORS ? s->anchors - FA_SRC_ANCHORS : 0;
@@ -1588,13 +1632,13 @@ static fa_result seek_loop_locked(struct fa_stream* s, fa_frames frame, int loop
     }
     fa_mutex_lock(&s->decode_lock);
     if (loop >= 0) {
-        frame = fa_stream_position_now(s);   /* wrapped by the old setting */
+        frame = target_position(s);          /* wrapped by the old setting */
         fa_store32(&s->loop, loop);
     }
     r = restart_at_locked(s, frame);
     if (r != FA_OK && loop >= 0) fa_store32(&s->loop, old_loop);
     fa_mutex_unlock(&s->decode_lock);
-    fa_store32(&s->flushing, 0);
+    unflush(s);
     return r;
 }
 
@@ -1768,6 +1812,8 @@ FA_API fa_result FA_CALL fa_stream_get_mute(fa_stream* stream, int32_t* out_mute
 FA_API fa_result FA_CALL fa_stream_get_position(fa_stream* stream, fa_frames* out_frame)
 {
     if (!stream || !out_frame) return FA_ERROR_INVALID_ARG;
+    /* A pending seek's target, without waiting for the worker carrying it out. */
+    if ((*out_frame = fa_load64(&stream->seek_pending)) >= 0) return FA_OK;
     fa_mutex_lock(&stream->api_lock);
     *out_frame = fa_stream_position_now(stream);
     fa_mutex_unlock(&stream->api_lock);
@@ -1785,8 +1831,17 @@ static int64_t clock_of_position(struct fa_stream* s)
     return (int64_t)((double)fa_load64(&s->position) * 1e9 / (double)s->decoder.format.sample_rate + 0.5);
 }
 
+/* The time of a pending fa_stream_seek_async, or -1. */
+static int64_t pending_clock(struct fa_stream* s)
+{
+    int64_t pending = fa_load64(&s->seek_pending);
+    return pending < 0 ? -1 : (int64_t)((double)pending * 1e9 / (double)s->decoder.format.sample_rate + 0.5);
+}
+
 int64_t fa_stream_clock_at(struct fa_stream* s, int64_t now_ns)
 {
+    int64_t pending = pending_clock(s);
+    if (pending >= 0) return pending;
     if (s->device) return clock_on_device(s, s->device, now_ns);
     if (s->push) {
         /* Detached: audio decoded but never heard waits in carry, and is heard next. */
@@ -1803,6 +1858,7 @@ FA_API fa_result FA_CALL fa_stream_get_clock(fa_stream* stream, fa_time* out_pts
 {
     fa_device* dev;
     if (!stream || !out_pts) return FA_ERROR_INVALID_ARG;
+    if ((*out_pts = pending_clock(stream)) >= 0) return FA_OK;
     fa_fetch_add32(&stream->clock_readers, 1);
     dev = (fa_device*)fa_load_ptr(&stream->clock_device);
     if (dev) *out_pts = clock_on_device(stream, dev, fa_monotonic_ns());
@@ -1941,7 +1997,6 @@ static fa_result post_tempo_locked(struct fa_stream* s, fa_param param, float ta
     double sr = (double)s->decoder.format.sample_rate;
     int64_t len = (int64_t)((double)duration * sr / 1e9 + 0.5), start = FA_TPARAM_NOW, old_tag = 0;
     int replaced, wanted, held;
-    if (s->push && param != FA_PARAM_PITCH) return FA_ERROR_NOT_IMPLEMENTED;
     if (s->decoder.format.channels > FA_TEMPO_MAX_CHANNELS && !s->matrix &&
         (notify || len > 0 || target != (param == FA_PARAM_PITCH ? 0.0f : 1.0f)))
         return FA_ERROR_UNSUPPORTED_FORMAT;   /* more channels than the chain takes */
@@ -1969,9 +2024,9 @@ static fa_result post_tempo_locked(struct fa_stream* s, fa_param param, float ta
             fa_frames pos;
             fa_store32(&s->flushing, 1);
             fa_device_wait_quiescent(s->device);   /* the mixer now skips this stream */
-            pos = fa_stream_position_now(s);       /* after the mixer let go: nothing more is consumed */
+            pos = target_position(s);              /* after the mixer let go: nothing more is consumed */
             restart_at_locked(s, pos);
-            fa_store32(&s->flushing, 0);
+            unflush(s);
         }
     }
     if (held) fa_mutex_unlock(&s->decode_lock);
@@ -2317,7 +2372,7 @@ FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* we
         fa_frames pos;
         fa_store32(&stream->flushing, 1);
         fa_device_wait_quiescent(stream->device);
-        pos = fa_stream_position_now(stream);  /* after the mixer let go: nothing more is consumed */
+        pos = target_position(stream);         /* after the mixer let go: nothing more is consumed */
         fa_engine_track_stream(stream->engine, stream, 0);  /* workers look at the ring we replace */
         fa_mutex_lock(&stream->decode_lock);
         free(stream->matrix);
@@ -2333,7 +2388,7 @@ FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* we
         }
         fa_mutex_unlock(&stream->decode_lock);
         fa_engine_track_stream(stream->engine, stream, 1);
-        if (r == FA_OK) fa_store32(&stream->flushing, 0);
+        if (r == FA_OK) unflush(stream);
         /* On failure the stream stays silent (flushing) until the next attach. */
     } else {
         fa_mutex_lock(&stream->decode_lock);
@@ -2772,8 +2827,19 @@ static int64_t pts_at_played(struct fa_stream* s, int64_t played, int64_t* out_n
     double pos, lin, slope;
     fa_frames end;
     if (s->push) {
-        *out_ns = 1e9 / dr;
-        return fa_ptsmap_pts(&s->ptsmap, played, 1e9 / dr, out_next);
+        /* The app's timestamp at the last timeline restart, plus the source audio
+         * heard since then (tempo and rate included, from the position map). */
+        fa_ptsmap* m = &s->ptsmap;
+        double base = (double)fa_load64(&s->seek_base);
+        int64_t anchor = fa_ptsmap_pts(m, played, 0.0, out_next), next;
+        if (!m->cur_src_ok) {
+            m->cur_src = fa_tmap_pos(&s->tmap, m->cur_idx, base, sr / dr, NULL, NULL);
+            m->cur_src_ok = 1;
+        }
+        lin = fa_tmap_pos(&s->tmap, played, base, sr / dr, &slope, &next);
+        if (next < *out_next) *out_next = next;
+        *out_ns = slope * 1e9 / sr;
+        return anchor + (int64_t)((lin - m->cur_src) * 1e9 / sr + 0.5);
     }
     lin = fa_tmap_pos(&s->tmap, played, (double)fa_load64(&s->seek_base), sr / dr, &slope, out_next);
     *out_ns = slope * 1e9 / sr;
@@ -3116,4 +3182,73 @@ FA_API fa_result FA_CALL fa_stream_remove_dsp(fa_stream* stream, uint32_t dsp_id
     replace_dsps_locked(stream, next);
     fa_mutex_unlock(&stream->api_lock);
     return FA_OK;
+}
+
+/* ---- seeking without waiting ------------------------------------------------- */
+
+/* Attached streams: notes the target and returns; a worker drops the buffers and
+ * refills from there. A newer target replaces one not carried out yet, so dragging
+ * a slider costs one seek per worker pass, not one per call. */
+FA_API fa_result FA_CALL fa_stream_seek_async(fa_stream* stream, fa_frames frame)
+{
+    fa_result r = FA_OK;
+    int64_t old;
+    if (!stream || frame < 0) return FA_ERROR_INVALID_ARG;
+    /* While a target is pending, a newer one only replaces it, without the API lock:
+     * a worker holds that lock while it seeks, which can take a network round trip. */
+    old = fa_load64(&stream->seek_pending);
+    if (old >= 0 && frame <= fa_load64(&stream->seek_max) && fa_cas64(&stream->seek_pending, old, frame)) {
+        fa_store32(&stream->flushing, 1);
+        return FA_OK;
+    }
+    fa_mutex_lock(&stream->api_lock);
+    if (!stream->decoder.seekable) r = FA_ERROR_NOT_SEEKABLE;
+    else if (stream->decoder.length >= 0 && frame > stream->decoder.length) r = FA_ERROR_INVALID_ARG;
+    else if (!is_attached(stream)) r = seek_locked(stream, frame);   /* nothing plays: no wait to save */
+    else {
+        fa_store64(&stream->seek_max, stream->decoder.length >= 0 ? stream->decoder.length : INT64_MAX);
+        fa_store32(&stream->flushing, 1);   /* the mixer stops at its next callback */
+        fa_store64(&stream->seek_pending, frame);
+        fa_mutex_lock(&stream->engine->list_lock);
+        fa_cond_broadcast(&stream->engine->work_cond);
+        fa_mutex_unlock(&stream->engine->list_lock);
+    }
+    if (r == FA_OK) {
+        fa_cas32(&stream->state, FA_STATE_ENDED, FA_STATE_PAUSED);
+        fa_cas32(&stream->state, FA_STATE_STOPPED, FA_STATE_PAUSED);
+    }
+    fa_mutex_unlock(&stream->api_lock);
+    return r;
+}
+
+/* api_lock is taken second here (API threads take it first), so only tried: an API
+ * call in progress finishes, and the seek runs on a later pass. */
+int fa_stream_work(struct fa_stream* s, int64_t max_frames)
+{
+    if (fa_load64(&s->seek_pending) >= 0) {
+        int64_t frame = -1;
+        fa_result r = FA_OK;
+        if (!fa_mutex_trylock(&s->api_lock)) return 0;
+        if (is_attached(s)) {
+            fa_store32(&s->flushing, 1);
+            fa_device_wait_quiescent(s->device);   /* the mixer now skips this stream */
+            /* Read after the wait: a newer target may have replaced it meanwhile. */
+            frame = fa_load64(&s->seek_pending);
+            if (frame >= 0 && (r = restart_expecting_locked(s, frame, frame)) != FA_OK)
+                fa_cas64(&s->seek_pending, frame, -1);  /* playback goes on where it was */
+            unflush(s);
+        }
+        fa_mutex_unlock(&s->api_lock);
+        if (frame >= 0 && r != FA_OK) {
+            fa_event ev;
+            ev.type = FA_EVENT_SEEK_FAILED;
+            ev.stream = s;
+            ev.frame = frame;
+            ev.value = r;
+            fa_engine_post_event(s->engine, &ev);
+        }
+        return 1;
+    }
+    fa_stream_fill(s, max_frames);
+    return 1;
 }
