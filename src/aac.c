@@ -96,7 +96,6 @@ typedef struct aac_pred {
 typedef struct aac_chan {
     aac_ics ics;
     aac_tns tns;
-    int q[1024];                   /* quantized values */
     float spec[1024];
     float overlap[1024];
     int prev_shape;
@@ -119,6 +118,17 @@ typedef struct aac_elem {
     int order;                     /* position among the block's elements of its type */
 } aac_elem;
 
+/* Which decoded element goes to which speakers: plan_mix sorts them, render_mix
+ * mixes them into the output. */
+typedef struct mix_layout {
+    aac_elem* fronts_c[MAX_ELEM];
+    aac_elem* fronts_pair[MAX_ELEM];
+    aac_elem* pairs[2 * MAX_ELEM];
+    aac_elem* backs_c[MAX_ELEM];
+    aac_elem* lfes[MAX_ELEM];
+    int nfc, nfp, np, nbc, nlfe, nside, nch;
+} mix_layout;
+
 struct fa_aac {
     /* configuration */
     int configured;                /* from an AudioSpecificConfig or an ADTS header */
@@ -137,11 +147,10 @@ struct fa_aac {
     uint32_t seed;
     fa_mdct mdct_long, mdct_short;
     fa_aac_qmf* qmf;               /* SBR transform tables, made with the first SBR element */
-    float sine_long[1024], sine_short[128], kbd_long[1024], kbd_short[128];
-    float iq[256];                 /* |q|^(4/3) */
     float buf[2048];               /* windowing */
-    float ltp_time[2048], ltp_spec[1024];   /* AAC LTP's prediction */
-    float mix[2 * FA_AAC_FRAME * FA_AAC_MAX_OUT];   /* one block's output */
+    int q[1024];                   /* the channel being read: quantized values */
+    float* ltp_work;               /* AAC LTP's prediction: 2048 time samples, 1024 spectral
+                                      values; allocated on first use */
     uint8_t* pkt;                  /* a padded copy of the packet */
     size_t pkt_cap;
     int out_channels;              /* of the last block decoded, 0 before */
@@ -192,10 +201,9 @@ static double bessel_i0(double x)
 /* The rising half (n samples) of the Kaiser-Bessel derived window of length 2n. */
 static void kbd_window(float* w, int n, double alpha)
 {
-    double* k = (double*)malloc(sizeof(double) * (size_t)(n + 1));
+    double k[1024 + 1];                /* n is 1024 or 128 */
     double sum = 0.0, acc = 0.0;
     int i;
-    if (!k) return;
     for (i = 0; i <= n; i++) {
         double r = (double)(i - n / 2) / (n / 2);
         k[i] = bessel_i0(M_PI * alpha * sqrt(1.0 - r * r));
@@ -205,7 +213,31 @@ static void kbd_window(float* w, int n, double alpha)
         acc += k[i];
         w[i] = (float)sqrt(acc / sum);
     }
-    free(k);
+}
+
+/* The windows and |q|^(4/3) are the same for every decoder: the first one to open
+ * builds them. */
+static struct {
+    fa_atomic32 state;             /* 0 not built, 1 being built, 2 built */
+    float sine_long[1024], sine_short[128], kbd_long[1024], kbd_short[128];
+    float iq[256];                 /* |q|^(4/3) */
+} shared;
+
+static void build_shared(void)
+{
+    while (fa_load32(&shared.state) != 2) {
+        if (fa_cas32(&shared.state, 0, 1)) {
+            int i;
+            for (i = 0; i < 1024; i++) shared.sine_long[i] = (float)sin(M_PI / 2048.0 * (i + 0.5));
+            for (i = 0; i < 128; i++) shared.sine_short[i] = (float)sin(M_PI / 256.0 * (i + 0.5));
+            kbd_window(shared.kbd_long, 1024, 4.0);
+            kbd_window(shared.kbd_short, 128, 6.0);
+            for (i = 0; i < 256; i++) shared.iq[i] = (float)pow((double)i, 4.0 / 3.0);
+            fa_store32(&shared.state, 2);
+        } else {
+            fa_sleep_ms(1);
+        }
+    }
 }
 
 /* ---- configuration ---------------------------------------------------------------------- */
@@ -556,8 +588,44 @@ static int read_tns(fa_aac_bits* b, const aac_ics* ics, aac_tns* t, int max_orde
     return fa_aac_left(b) >= 0;
 }
 
-/* Spectral data of one channel into ch->q. */
-static int read_spectral(fa_aac_bits* b, aac_chan* ch)
+static float inv_quant(int q)
+{
+    int a = q < 0 ? -q : q;
+    float v = a < 256 ? shared.iq[a] : (float)a * cbrtf((float)a);
+    return q < 0 ? -v : v;
+}
+
+/* 2^(0.25 (sf - 100)) times the filterbank's scaling (2/N, and 1/32768 for
+ * floats): spectra are kept ready for the inverse transform. */
+static float sf_gain(int sf, int shortw)
+{
+    static const float frac[4] = { 1.0f, 1.18920711500272f, 1.41421356237310f, 1.68179283050743f };
+    return ldexpf(frac[sf & 3], (sf >> 2) - 25 - (shortw ? 22 : 25));
+}
+
+static void dequantize(aac_chan* ch, const int* q)
+{
+    const aac_ics* ics = &ch->ics;
+    int g, sfb, w0 = 0, shortw = ics->window_sequence == EIGHT_SHORT;
+    memset(ch->spec, 0, sizeof(ch->spec));
+    for (g = 0; g < ics->num_groups; g++) {
+        for (sfb = 0; sfb < ics->max_sfb; sfb++) {
+            int cb = ics->cb[g][sfb], w, k;
+            float gain;
+            if (cb == ZERO_HCB || cb > ESC_HCB) continue;
+            gain = sf_gain(ics->sf[g][sfb], shortw);
+            for (w = 0; w < ics->group_len[g]; w++) {
+                int base = (w0 + w) * 128;
+                for (k = ics->swb[sfb]; k < ics->swb[sfb + 1]; k++)
+                    ch->spec[base + k] = inv_quant(q[base + k]) * gain;
+            }
+        }
+        w0 += ics->group_len[g];
+    }
+}
+
+/* Spectral data of one channel into q. */
+static int read_spectral(fa_aac_bits* b, const aac_chan* ch, int* qv)
 {
     static const uint16_t* const books[11] = { fa_aac_hcb1, fa_aac_hcb2, fa_aac_hcb3, fa_aac_hcb4, fa_aac_hcb5,
                                                fa_aac_hcb6, fa_aac_hcb7, fa_aac_hcb8, fa_aac_hcb9, fa_aac_hcb10,
@@ -565,7 +633,7 @@ static int read_spectral(fa_aac_bits* b, aac_chan* ch)
     static const int mods[11] = { 3, 3, 3, 3, 9, 9, 8, 8, 13, 13, 17 };
     const aac_ics* ics = &ch->ics;
     int g, sfb, w0 = 0;
-    memset(ch->q, 0, sizeof(ch->q));
+    memset(qv, 0, sizeof(int) * 1024);
     for (g = 0; g < ics->num_groups; g++) {
         for (sfb = 0; sfb < ics->max_sfb; sfb++) {
             int cb = ics->cb[g][sfb], w, start = ics->swb[sfb], end = ics->swb[sfb + 1];
@@ -575,7 +643,7 @@ static int read_spectral(fa_aac_bits* b, aac_chan* ch)
             book = books[cb - 1];
             mod = mods[cb - 1];
             for (w = 0; w < ics->group_len[g]; w++) {
-                int* q = ch->q + (w0 + w) * 128;
+                int* q = qv + (w0 + w) * 128;
                 int k;
                 if (cb <= 4) {
                     for (k = start; k < end; k += 4) {
@@ -661,57 +729,23 @@ static int read_ics(fa_aac* d, fa_aac_bits* b, aac_chan* ch, int common, int lfe
         ch->tns.present = (int)fa_aac_get(b, 1);
         if (ch->tns.present && !read_tns(b, ics, &ch->tns, d->object_type == AOT_MAIN ? 20 : 12)) return 0;
         if (fa_aac_get(b, 1)) return -1;          /* gain_control_data_present: SSR */
-        if (!read_spectral(b, ch)) return 0;
+        if (!read_spectral(b, ch, d->q)) return 0;
         if (pulse) {
             int k = ics->swb[pulse_start];
             for (i = 0; i < pulse_n; i++) {
                 k += pulse_off[i];
                 if (k >= 1024) return 0;
-                if (ch->q[k] >= 0) ch->q[k] += pulse_amp[i];
-                else ch->q[k] -= pulse_amp[i];
+                if (d->q[k] >= 0) d->q[k] += pulse_amp[i];
+                else d->q[k] -= pulse_amp[i];
             }
         }
     }
+    dequantize(ch, d->q);
     return 1;
 }
 
 /* ---- spectral reconstruction ------------------------------------------------------------- */
 
-static float iq(const fa_aac* d, int q)
-{
-    int a = q < 0 ? -q : q;
-    float v = a < 256 ? d->iq[a] : (float)a * cbrtf((float)a);
-    return q < 0 ? -v : v;
-}
-
-/* 2^(0.25 (sf - 100)) times the filterbank's scaling (2/N, and 1/32768 for
- * floats): spectra are kept ready for the inverse transform. */
-static float sf_gain(int sf, int shortw)
-{
-    static const float frac[4] = { 1.0f, 1.18920711500272f, 1.41421356237310f, 1.68179283050743f };
-    return ldexpf(frac[sf & 3], (sf >> 2) - 25 - (shortw ? 22 : 25));
-}
-
-static void dequantize(fa_aac* d, aac_chan* ch)
-{
-    const aac_ics* ics = &ch->ics;
-    int g, sfb, w0 = 0, shortw = ics->window_sequence == EIGHT_SHORT;
-    memset(ch->spec, 0, sizeof(ch->spec));
-    for (g = 0; g < ics->num_groups; g++) {
-        for (sfb = 0; sfb < ics->max_sfb; sfb++) {
-            int cb = ics->cb[g][sfb], w, k;
-            float gain;
-            if (cb == ZERO_HCB || cb > ESC_HCB) continue;
-            gain = sf_gain(ics->sf[g][sfb], shortw);
-            for (w = 0; w < ics->group_len[g]; w++) {
-                int base = (w0 + w) * 128;
-                for (k = ics->swb[sfb]; k < ics->swb[sfb + 1]; k++)
-                    ch->spec[base + k] = iq(d, ch->q[base + k]) * gain;
-            }
-        }
-        w0 += ics->group_len[g];
-    }
-}
 
 static float noise_value(fa_aac* d)
 {
@@ -969,12 +1003,12 @@ static void mdct_forward(const fa_mdct* t, const float* x, float* out)
 static void apply_ltp(fa_aac* d, aac_chan* ch)
 {
     const aac_ics* ics = &ch->ics;
-    const float* lprev = ch->prev_shape ? d->kbd_long : d->sine_long;
-    const float* lcur = ics->window_shape ? d->kbd_long : d->sine_long;
-    const float* sprev = ch->prev_shape ? d->kbd_short : d->sine_short;
-    const float* scur = ics->window_shape ? d->kbd_short : d->sine_short;
-    float* x = d->ltp_time;
-    float* est = d->ltp_spec;
+    const float* lprev = ch->prev_shape ? shared.kbd_long : shared.sine_long;
+    const float* lcur = ics->window_shape ? shared.kbd_long : shared.sine_long;
+    const float* sprev = ch->prev_shape ? shared.kbd_short : shared.sine_short;
+    const float* scur = ics->window_shape ? shared.kbd_short : shared.sine_short;
+    float* x = d->ltp_work;
+    float* est = d->ltp_work + 2048;
     int i, sfb, n, top;
     if (ics->window_sequence == EIGHT_SHORT || !ics->ltp_present) return;
     n = ics->ltp_lag < 1024 ? ics->ltp_lag + 1024 : 2048;
@@ -1026,10 +1060,10 @@ static void imdct(const fa_mdct* t, const float* in, float* out, float* u)
 static void imdct_block(fa_aac* d, aac_chan* ch)
 {
     const aac_ics* ics = &ch->ics;
-    const float* lprev = ch->prev_shape ? d->kbd_long : d->sine_long;
-    const float* lcur = ics->window_shape ? d->kbd_long : d->sine_long;
-    const float* sprev = ch->prev_shape ? d->kbd_short : d->sine_short;
-    const float* scur = ics->window_shape ? d->kbd_short : d->sine_short;
+    const float* lprev = ch->prev_shape ? shared.kbd_long : shared.sine_long;
+    const float* lcur = ics->window_shape ? shared.kbd_long : shared.sine_long;
+    const float* sprev = ch->prev_shape ? shared.kbd_short : shared.sine_short;
+    const float* scur = ics->window_shape ? shared.kbd_short : shared.sine_short;
     float* z = d->buf;
     int n, w;
     if (ics->window_sequence == EIGHT_SHORT) {
@@ -1228,8 +1262,8 @@ static int element_area(const fa_aac* d, const aac_elem* e, int* known)
     return 0;
 }
 
-/* Mixes the decoded block into interleaved output. Returns the channel count. */
-static int mix_out(fa_aac* d, float* out, int frames)
+/* Sorts the decoded elements by speaker area. Returns the channel count. */
+static int plan_mix(fa_aac* d, mix_layout* L)
 {
     aac_elem* fronts_c[MAX_ELEM];
     aac_elem* fronts_pair[MAX_ELEM];
@@ -1275,6 +1309,25 @@ static int mix_out(fa_aac* d, float* out, int frames)
     else if (nfp && nfc) nch = 3;
     else if (nfp) nch = 2;
     else nch = 1;
+    memcpy(L->fronts_c, fronts_c, sizeof(fronts_c[0]) * (size_t)nfc);
+    memcpy(L->fronts_pair, fronts_pair, sizeof(fronts_pair[0]) * (size_t)nfp);
+    memcpy(L->pairs, pairs, sizeof(pairs[0]) * (size_t)np);
+    memcpy(L->backs_c, backs_c, sizeof(backs_c[0]) * (size_t)nbc);
+    memcpy(L->lfes, lfes, sizeof(lfes[0]) * (size_t)nlfe);
+    L->nfc = nfc; L->nfp = nfp; L->np = np; L->nbc = nbc; L->nlfe = nlfe; L->nside = nside; L->nch = nch;
+    return nch;
+}
+
+/* Mixes the elements of a plan into `out` (frames x L->nch, interleaved). */
+static void render_mix(const mix_layout* L, float* out, int frames)
+{
+    aac_elem* const* fronts_c = L->fronts_c;
+    aac_elem* const* fronts_pair = L->fronts_pair;
+    aac_elem* const* pairs = L->pairs;
+    aac_elem* const* backs_c = L->backs_c;
+    aac_elem* const* lfes = L->lfes;
+    const int nfc = L->nfc, nfp = L->nfp, np = L->np, nbc = L->nbc, nlfe = L->nlfe, nside = L->nside, nch = L->nch;
+    int i;
     memset(out, 0, sizeof(float) * (size_t)frames * (size_t)nch);
 #define ADD(src, sp, g) do { \
         int o_ = speakers_layout(nch, sp), n_; \
@@ -1287,7 +1340,7 @@ static int mix_out(fa_aac* d, float* out, int frames)
             ADD(fronts_c[i]->ch[0]->out, SP_L, 0.70710678f);
             ADD(fronts_c[i]->ch[0]->out, SP_R, 0.70710678f);
         }
-        return nch;
+        return;
     }
     for (i = 0; i < nfc; i++) {
         if (nch == 2 || (nch == 1 && i > 0)) {
@@ -1336,13 +1389,12 @@ static int mix_out(fa_aac* d, float* out, int frames)
     }
     for (i = 0; i < nlfe; i++) ADD(lfes[i]->ch[0]->out, SP_LFE, i == 0 ? 1.0f : 0.70710678f);
 #undef ADD
-    return nch;
 }
 
-/* One raw_data_block(): decodes it into the elements' out buffers and mixes them
- * into `out` (room for 2048 frames of 8 channels). Returns 1 and sets *frames,
- * *nch; 0 if damaged; -1 if it uses an unsupported feature. */
-static int decode_block(fa_aac* d, fa_aac_bits* b, float* out, int* frames, int* nch)
+/* One raw_data_block(): decodes it into the elements' out buffers and plans their
+ * mix (*layout). Returns 1 and sets *frames, *nch; 0 if damaged; -1 if it uses an
+ * unsupported feature; -2 out of memory. */
+static int decode_block(fa_aac* d, fa_aac_bits* b, int* frames, int* nch, mix_layout* layout)
 {
     aac_elem* prev = NULL;
     int counts[4] = { 0, 0, 0, 0 }, i, any = 0, r, n;
@@ -1409,10 +1461,7 @@ static int decode_block(fa_aac* d, fa_aac_bits* b, float* out, int* frames, int*
         aac_elem* e = d->elem[i];
         int c;
         if (!e->present) continue;
-        for (c = 0; c < e->nch; c++) {
-            dequantize(d, e->ch[c]);
-            apply_pns(d, e, c);
-        }
+        for (c = 0; c < e->nch; c++) apply_pns(d, e, c);   /* dequantized when read */
         if (e->nch == 2 && e->ms_mask_present) apply_ms(e);
         if (d->object_type == AOT_MAIN)
             for (c = 0; c < e->nch; c++)
@@ -1420,7 +1469,8 @@ static int decode_block(fa_aac* d, fa_aac_bits* b, float* out, int* frames, int*
         if (e->nch == 2) apply_is(e);
         if (d->object_type == AOT_LTP)
             for (c = 0; c < e->nch; c++)
-                if (!e->ch[c]->ltp && !(e->ch[c]->ltp = (float*)calloc(3072, sizeof(float)))) return 0;
+                if (!e->ch[c]->ltp && !(e->ch[c]->ltp = (float*)calloc(3072, sizeof(float)))) return -2;
+        if (d->object_type == AOT_LTP && !d->ltp_work && !(d->ltp_work = (float*)malloc(sizeof(float) * 3072))) return -2;
         for (c = 0; c < e->nch; c++) {
             if (d->object_type == AOT_LTP) apply_ltp(d, e->ch[c]);
             apply_tns(d, e->ch[c], e->ch[c]->spec, 0);
@@ -1466,7 +1516,7 @@ static int decode_block(fa_aac* d, fa_aac_bits* b, float* out, int* frames, int*
         n = 2 * FA_AAC_FRAME;
     }
     *frames = n;
-    *nch = mix_out(d, out, n);
+    *nch = plan_mix(d, layout);
     return 1;
 }
 
@@ -1494,17 +1544,12 @@ static int parse_adts(const uint8_t* p, size_t n, adts_header* h)
 fa_aac* fa_aac_create(void)
 {
     fa_aac* d = (fa_aac*)calloc(1, sizeof(*d));
-    int i;
     if (!d) return NULL;
     if (fa_imdct_init(&d->mdct_long, 1024) != FA_OK || fa_imdct_init(&d->mdct_short, 128) != FA_OK) {
         fa_aac_destroy(d);
         return NULL;
     }
-    for (i = 0; i < 1024; i++) d->sine_long[i] = (float)sin(M_PI / 2048.0 * (i + 0.5));
-    for (i = 0; i < 128; i++) d->sine_short[i] = (float)sin(M_PI / 256.0 * (i + 0.5));
-    kbd_window(d->kbd_long, 1024, 4.0);
-    kbd_window(d->kbd_short, 128, 6.0);
-    for (i = 0; i < 256; i++) d->iq[i] = (float)pow((double)i, 4.0 / 3.0);
+    build_shared();
     d->seed = 0x1F2E3D4C;
     d->sbr_signalled = -1;
     d->ps_signalled = -1;
@@ -1518,6 +1563,7 @@ void fa_aac_destroy(fa_aac* d)
     for (i = 0; i < d->nelem; i++) free_elem(d->elem[i]);
     fa_imdct_free(&d->mdct_long);
     fa_imdct_free(&d->mdct_short);
+    free(d->ltp_work);
     fa_aac_qmf_destroy(d->qmf);
     free(d->pkt);
     free(d);
@@ -1599,10 +1645,12 @@ fa_result fa_aac_decode(fa_aac* d, const uint8_t* data, size_t size, float** pcm
     b.pos = payload * 8;
     b.end = size * 8;
     for (blk = 0; blk < blocks; blk++) {
-        float* buf = d->mix;
         int n = 0, c = 0, r;
         size_t need;
-        r = damaged || unsupported ? 0 : decode_block(d, &b, buf, &n, &c);
+        float* dst;
+        mix_layout layout;
+        r = damaged || unsupported ? 0 : decode_block(d, &b, &n, &c, &layout);
+        if (r == -2) return FA_ERROR_OUT_OF_MEMORY;
         if (r < 0) unsupported = 1;
         if (r <= 0) {
             /* The rest of the frame can't be found: silence of the block's length,
@@ -1612,7 +1660,6 @@ fa_result fa_aac_decode(fa_aac* d, const uint8_t* data, size_t size, float** pcm
             if (!d->out_channels) continue;
             n = d->sbr_on ? 2 * FA_AAC_FRAME : FA_AAC_FRAME;
             c = d->out_channels;
-            memset(buf, 0, sizeof(float) * (size_t)n * (size_t)c);
         }
         if (nch && c != nch) break;          /* the layout changed inside one frame: keep the first part */
         nch = c;
@@ -1626,7 +1673,10 @@ fa_result fa_aac_decode(fa_aac* d, const uint8_t* data, size_t size, float** pcm
             *pcm = p;
             *cap = nc;
         }
-        memcpy(*pcm + (size_t)total * c, buf, sizeof(float) * (size_t)n * (size_t)c);
+        /* Mixed straight into the output. */
+        dst = *pcm + (size_t)total * c;
+        if (r > 0) render_mix(&layout, dst, n);
+        else memset(dst, 0, sizeof(float) * (size_t)n * (size_t)c);
         total += n;
         if (h.crc && blocks > 1) fa_aac_skip(&b, 16);   /* the block's CRC */
         if (r > 0) {

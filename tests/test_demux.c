@@ -574,6 +574,13 @@ static void test_adts_junk_and_tags(void)
     CHECK_EQ(info.length_frames, (ADTS_FRAMES - 1) * 1024);   /* the tag between frames is skipped */
     a = read_all(s, 2, &na);
     CHECK_EQ(na, (ADTS_FRAMES - 1) * 1024);
+    {
+        /* The index keeps every 16th frame and the frame after the tag (frame 41);
+         * seeks hop from header to header, and land exactly on either side of it. */
+        static const int64_t targets[] = { 39 * 1024 + 5, 40 * 1024 - 1, 40 * 1024, 40 * 1024 + 700, 46 * 1024 + 3, 47 * 1024 + 1000, 100, 20000 };
+        double worst;
+        CHECK(seek_matches(s, a, na, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), AAC_SEEK_TOL, &worst));
+    }
     fa_stream_close(s);
     /* The same from a forward-only source: found by sliding to the next header. */
     m.p = data;

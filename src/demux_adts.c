@@ -23,6 +23,7 @@
 #define ADTS_RESYNC 65536            /* junk bytes skipped looking for a header */
 #define ADTS_MAX_FRAMES (1 << 24)    /* index limit: 97 hours at 48 kHz */
 #define ADTS_PRIMING 1024            /* samples dropped at the start */
+#define ADTS_INDEX_STEP 16           /* frames per index entry (as MP3) */
 
 typedef struct adts_hdr {
     size_t len;          /* whole frame, header included */
@@ -33,9 +34,12 @@ typedef struct adts_hdr {
     uint8_t profile;     /* 0 Main, 1 LC, 2 SSR, 3 LTP */
 } adts_hdr;
 
+/* Frame `frame` is at `off`, starting at `pts`; the frames after it up to the next
+ * entry follow one another with nothing between them. */
 typedef struct adts_frame {
     int64_t off;
     int64_t pts;
+    int64_t frame;
 } adts_frame;
 
 typedef struct adts {
@@ -52,8 +56,10 @@ typedef struct adts {
     int config_set;
     int in_flow;         /* the next byte is where the last frame ended */
     int may_seek;        /* look ahead by seeking: local sources, or after a network seek */
-    adts_frame* index;   /* every frame (local files) */
+    adts_frame* index;   /* every ADTS_INDEX_STEP-th frame, and every frame after junk
+                            (local files) */
     size_t nindex;
+    int64_t nframes;     /* frames indexed */
     double bytes_per_sample;  /* network files: seek estimate */
     int64_t est_samples;
 } adts;
@@ -232,22 +238,57 @@ static fa_result adts_next(void* ctx, fa_demux_packet* out)
     return FA_OK;
 }
 
+/* Hops from index entry e from header to header: n frames on (n >= 0), or to the
+ * last frame that starts at or before t (n < 0), stopping at the next entry or at a
+ * header that can't be read. Returns the frames hopped; *off and *pts are the
+ * frame's. */
+static int64_t hop_frames(adts* a, const adts_frame* e, int64_t t, int64_t n, int64_t* off, int64_t* pts)
+{
+    const adts_frame* next = e + 1 < a->index + a->nindex ? e + 1 : NULL;
+    int64_t k = 0, end = next ? next->frame - e->frame : a->nframes - e->frame;
+    *off = e->off;
+    *pts = e->pts;
+    while (k + 1 < end && (n < 0 || k < n)) {
+        adts_hdr h;
+        int64_t d;
+        if (fa_br_seek(&a->br, *off) != FA_OK) break;
+        a->h_n = 0;
+        if (!fill_h(a, ADTS_HEADER) || !adts_parse(a->h, &h)) break;
+        d = frame_time(a, &h);
+        if (n < 0 && *pts + d > t) break;
+        *off += (int64_t)h.len;
+        *pts += d;
+        k++;
+    }
+    return k;
+}
+
 static fa_result adts_seek_packets(void* ctx, int64_t t, int packets_back, size_t bytes_back)
 {
     adts* a = (adts*)ctx;
-    int64_t off, pts;
+    int64_t off, pts, was = fa_br_tell(&a->br) - (int64_t)a->h_n;
     fa_result r;
     (void)bytes_back;
     if (a->index) {
-        size_t lo = 0, hi = a->nindex;
-        while (hi - lo > 1) {
-            size_t mid = lo + (hi - lo) / 2;
-            if (a->index[mid].pts <= t) lo = mid;
+        /* The frame that holds t, then the one packets_back before it. The hops
+         * move the reader: where it was, for a seek that fails. */
+        int64_t f;
+        size_t k = 0, hi = a->nindex;
+        while (hi - k > 1) {
+            size_t mid = k + (hi - k) / 2;
+            if (a->index[mid].pts <= t) k = mid;
             else hi = mid;
         }
-        lo = lo >= (size_t)packets_back ? lo - (size_t)packets_back : 0;
-        off = a->index[lo].off;
-        pts = a->index[lo].pts;
+        f = a->index[k].frame + hop_frames(a, &a->index[k], t, -1, &off, &pts);
+        f = f >= packets_back ? f - packets_back : 0;
+        hi = a->nindex;
+        k = 0;
+        while (hi - k > 1) {
+            size_t mid = k + (hi - k) / 2;
+            if (a->index[mid].frame <= f) k = mid;
+            else hi = mid;
+        }
+        hop_frames(a, &a->index[k], INT64_MAX, f - a->index[k].frame, &off, &pts);
     } else {
         if (!a->br.src->seekable || a->bytes_per_sample <= 0) return FA_ERROR_NOT_SEEKABLE;
         pts = t - (int64_t)packets_back * 1024;
@@ -256,7 +297,10 @@ static fa_result adts_seek_packets(void* ctx, int64_t t, int packets_back, size_
         if (a->br.src->length > 0 && off >= a->br.src->length) off = a->br.src->length - 1;
     }
     r = fa_br_seek(&a->br, off);
-    if (r != FA_OK) return r;
+    if (r != FA_OK) {
+        if (a->index && fa_br_seek(&a->br, was) == FA_OK) a->h_n = 0;
+        return r;
+    }
     a->h_n = 0;
     a->pts = pts;
     a->in_flow = a->index != NULL;   /* an estimated position is in the middle of a frame */
@@ -282,7 +326,7 @@ static int frame_at(adts* a, int64_t pos, adts_hdr* h)
 static fa_result build_index(adts* a, int64_t* out_end)
 {
     size_t cap = 0;
-    int64_t pos = a->data_start, pts = 0, len = a->br.src->length;
+    int64_t pos = a->data_start, pts = 0, len = a->br.src->length, expect = -1;
     fa_result r = FA_OK;
     for (;;) {
         adts_hdr hd;
@@ -302,34 +346,46 @@ static fa_result build_index(adts* a, int64_t* out_end)
             pos = p;
         }
         if (len > 0 && pos + (int64_t)hd.len > len) break;   /* cut short */
-        if (a->nindex == cap) {
-            adts_frame* f;
-            if (cap >= ADTS_MAX_FRAMES) {
-                a->bytes_per_sample = (double)(pos - a->data_start) / (double)pts;
-                free(a->index);
-                a->index = NULL;
-                a->nindex = 0;
-                *out_end = FA_DEMUX_NO_PTS;
-                return FA_OK;
-            }
-            cap = cap ? cap * 2 : 1024;
-            f = (adts_frame*)realloc(a->index, cap * sizeof(*f));
-            if (!f) { r = FA_ERROR_OUT_OF_MEMORY; break; }
-            a->index = f;
+        if (a->nframes >= ADTS_MAX_FRAMES) {
+            a->bytes_per_sample = (double)(pos - a->data_start) / (double)pts;
+            free(a->index);
+            a->index = NULL;
+            a->nindex = 0;
+            a->nframes = 0;
+            *out_end = FA_DEMUX_NO_PTS;
+            return FA_OK;
         }
-        a->index[a->nindex].off = pos;
-        a->index[a->nindex].pts = pts;
-        a->nindex++;
+        if (a->nframes % ADTS_INDEX_STEP == 0 || pos != expect) {
+            if (a->nindex == cap) {
+                adts_frame* f;
+                cap = cap ? cap * 2 : 64;
+                f = (adts_frame*)realloc(a->index, cap * sizeof(*f));
+                if (!f) { r = FA_ERROR_OUT_OF_MEMORY; break; }
+                a->index = f;
+            }
+            a->index[a->nindex].off = pos;
+            a->index[a->nindex].pts = pts;
+            a->index[a->nindex].frame = a->nframes;
+            a->nindex++;
+        }
+        a->nframes++;
         a->config = hd.config;
         pos += (int64_t)hd.len;
+        expect = pos;
         pts += frame_time(a, &hd);
     }
     *out_end = pts;
     if (r == FA_OK && a->nindex == 0) r = FA_ERROR_UNSUPPORTED_FORMAT;
+    if (r == FA_OK && a->nindex < cap) {
+        /* No room kept for more: up to half the index otherwise. */
+        adts_frame* f = (adts_frame*)realloc(a->index, a->nindex * sizeof(*f));
+        if (f) a->index = f;
+    }
     if (r != FA_OK) {
         free(a->index);
         a->index = NULL;
         a->nindex = 0;
+        a->nframes = 0;
     }
     return r;
 }
