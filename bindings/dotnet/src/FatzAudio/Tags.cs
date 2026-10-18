@@ -38,6 +38,8 @@ public enum TagFormat
     Matroska = 9,
     /// <summary>A MIDI file's title, artist and copyright.</summary>
     Midi = 10,
+    /// <summary>A tracker module's title, artist and song message (from <see cref="AudioStream.GetTags"/>).</summary>
+    Tracker = 11,
 }
 
 /// <summary>What a picture shows: the ID3v2 / FLAC picture types.</summary>

@@ -99,6 +99,7 @@ static void stream_discard(struct fa_stream* s)
     free(s->path);
     free(s->matrix);
     s->midi = NULL;
+    s->tracker = NULL;
     if (s->decoder_ready) fa_decoder_close(&s->decoder);
     fa_soundfont_release(s->soundfont);
     fa_push_free(s->push);
@@ -199,15 +200,16 @@ static fa_result stream_open_decoder(struct fa_stream* s, const char* name_hint,
     s->decoder_ready = 1;
     fa_source_drop_prefix(&s->source);
     s->midi = fa_midi_of(&s->decoder);
+    s->tracker = fa_tracker_of(&s->decoder);
     if (!s->midi) {
         /* Only MIDI streams use the soundfont: don't keep a replaced bank alive. */
         s->decoder.soundfont = NULL;
         fa_soundfont_release(s->soundfont);
         s->soundfont = NULL;
     }
-    /* MIDI's live controls are heard after the decode-ahead: keep it short unless
+    /* MIDI and tracker live controls are heard after the decode-ahead: keep it short unless
      * the app chose its own. */
-    if (s->midi && !(options && options->struct_size >= offsetof(fa_open_options, buffer_ms) + sizeof(options->buffer_ms) &&
+    if ((s->midi || s->tracker) && !(options && options->struct_size >= offsetof(fa_open_options, buffer_ms) + sizeof(options->buffer_ms) &&
                      options->buffer_ms))
         s->buffer_ms = FA_MIDI_BUFFER_MS;
     /* Running loudness estimate for playback; decode-only streams are never normalized. */
@@ -704,6 +706,7 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
     fa_mutex_lock(&stream->decode_lock);
     release_chain(stream);
     stream->midi = NULL;
+    stream->tracker = NULL;
     if (stream->decoder_ready) { fa_decoder_close(&stream->decoder); stream->decoder_ready = 0; }
     fa_soundfont_release(stream->soundfont);
     stream->soundfont = NULL;

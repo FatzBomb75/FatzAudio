@@ -561,6 +561,177 @@ public unsafe class AudioStream : IDisposable
     public Tags GetTags(TagReadOptions options = TagReadOptions.None) => Tags.FromStream(Handle, options);
 
     /// <summary>
+    /// Format, names and counts of a tracker module (MOD, S3M, XM, IT, ...); null for streams that are not modules.
+    /// </summary>
+    /// <remarks>Read once and kept: a module's names do not change while the stream is open.</remarks>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public TrackerInfo? TrackerInfo
+    {
+        get
+        {
+            if (!_trackerInfoRead)
+            {
+                _trackerInfo = ReadTrackerInfo();
+                _trackerInfoRead = true;
+            }
+            return _trackerInfo;
+        }
+    }
+
+    private TrackerInfo? _trackerInfo;
+    private bool _trackerInfoRead;
+
+    private unsafe TrackerInfo? ReadTrackerInfo()
+    {
+        {
+            FaTrackerInfo n = default;
+            n.StructSize = (uint)sizeof(FaTrackerInfo);
+            int rc = NativeMethods.fa_stream_get_tracker_info(Handle, &n);
+            if (rc == (int)ErrorCode.InvalidArgument) return null;
+            FatzAudioException.ThrowIfFailed(rc);
+            return new TrackerInfo(Str(n.Type), Str(n.TypeName), Str(n.Tracker), Str(n.Title), Str(n.Artist),
+                TrackerText(0, 0), (int)n.Channels, (int)n.Orders, (int)n.Patterns, n.RestartOrder, n.RestartRow,
+                TimeSpan.FromSeconds(n.Duration), TrackerTexts(1, n.Instruments), TrackerTexts(2, n.Samples),
+                TrackerTexts(3, n.Channels), TrackerTexts(4, n.Patterns), TrackerTexts(5, n.Subsongs));
+        }
+    }
+
+    private unsafe string TrackerText(int type, uint index)
+    {
+        nuint len = 0;
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_tracker_text(Handle, type, index, null, 0, &len));
+        if (len == 0) return "";
+        var bytes = new byte[(int)len + 1];
+        fixed (byte* p = bytes)
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_tracker_text(Handle, type, index, p, (nuint)bytes.Length, &len));
+        return System.Text.Encoding.UTF8.GetString(bytes, 0, (int)len);
+    }
+
+    private string[] TrackerTexts(int type, uint count)
+    {
+        var list = new string[count];
+        for (uint i = 0; i < count; i++) list[i] = TrackerText(type, i);
+        return list;
+    }
+
+    /// <summary>
+    /// Where a tracker module first plays a row: the time from the start, or null when the song never plays it (a skipped
+    /// order, or a row past the end of that order's pattern).
+    /// </summary>
+    /// <param name="order">Entry of the order list, 0-based.</param>
+    /// <param name="row">Row of that order's pattern, 0-based.</param>
+    /// <exception cref="ArgumentOutOfRangeException">A negative order or row.</exception>
+    /// <exception cref="FatzAudioException">The stream is not a module (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public TimeSpan? GetTrackerTime(int order, int row)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(order);
+        ArgumentOutOfRangeException.ThrowIfNegative(row);
+        int rc = NativeMethods.fa_stream_get_tracker_time(Handle, (uint)order, (uint)row, out double s);
+        if (rc == (int)ErrorCode.NotFound) return null;
+        FatzAudioException.ThrowIfFailed(rc);
+        return TimeSpan.FromSeconds(s);
+    }
+
+    /// <summary>Seeks a tracker module to where it first plays a row (see <see cref="GetTrackerTime"/>).</summary>
+    /// <param name="order">Entry of the order list, 0-based.</param>
+    /// <param name="row">Row of that order's pattern, 0-based.</param>
+    /// <exception cref="ArgumentOutOfRangeException">A negative order or row.</exception>
+    /// <exception cref="FatzAudioException">The song never plays that row (<see cref="ErrorCode.NotFound"/>), or the stream is not a module.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public void SeekTracker(int order, int row)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(order);
+        ArgumentOutOfRangeException.ThrowIfNegative(row);
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_seek_tracker(Handle, (uint)order, (uint)row));
+    }
+
+    private int GetTrackerParam(int param)
+    {
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_tracker_param(Handle, param, out int v));
+        return v;
+    }
+
+    private void SetTrackerParam(int param, int value) =>
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_tracker_param(Handle, param, value));
+
+    /// <summary>Tracker modules: how samples are resampled. Live, heard after the decode-ahead buffer.</summary>
+    /// <exception cref="FatzAudioException">The stream is not a module, or the value is not one of the enum's.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public TrackerInterpolation TrackerInterpolation
+    {
+        get => (TrackerInterpolation)GetTrackerParam(0);
+        set => SetTrackerParam(0, (int)value);
+    }
+
+    /// <summary>Tracker modules: stereo separation in percent, 0 (mono) to 200; 100 by default. Live.</summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is outside 0..200.</exception>
+    /// <exception cref="FatzAudioException">The stream is not a module.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public int TrackerStereoSeparation
+    {
+        get => GetTrackerParam(1);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(value, 200);
+            SetTrackerParam(1, value);
+        }
+    }
+
+    /// <summary>
+    /// Tracker modules: volume ramping, -1 (default), 0 off (may click), 1..10 softer ramps (<c>BASS_MUSIC_RAMP</c>). Live.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is outside -1..10.</exception>
+    /// <exception cref="FatzAudioException">The stream is not a module.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public int TrackerVolumeRamping
+    {
+        get => GetTrackerParam(2);
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThan(value, -1);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(value, 10);
+            SetTrackerParam(2, value);
+        }
+    }
+
+    /// <summary>
+    /// Tracker modules: Amiga MOD files sound as on an Amiga's Paula chip (true, the default) or with the ordinary
+    /// resampler. Live.
+    /// </summary>
+    /// <exception cref="FatzAudioException">The stream is not a module.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public bool TrackerAmigaResampler
+    {
+        get => GetTrackerParam(3) != 0;
+        set => SetTrackerParam(3, value ? 1 : 0);
+    }
+
+    /// <summary>Mutes or unmutes a tracker module's channel (0-based, the first 64), live.</summary>
+    /// <param name="channel">Channel 0..Channels-1.</param>
+    /// <param name="muted">True to mute.</param>
+    /// <exception cref="FatzAudioException">The stream is not a module or the channel is out of range (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public void SetTrackerChannelMuted(int channel, bool muted)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(channel);
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_tracker_channel_mute(Handle, (uint)channel, muted ? 1 : 0));
+    }
+
+    /// <summary>Whether a tracker module's channel is muted by <see cref="SetTrackerChannelMuted"/>.</summary>
+    /// <param name="channel">Channel 0..Channels-1.</param>
+    /// <returns>True when muted.</returns>
+    /// <exception cref="FatzAudioException">The stream is not a module or the channel is out of range.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public bool IsTrackerChannelMuted(int channel)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(channel);
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_tracker_channel_mute(Handle, (uint)channel, out int m));
+        return m != 0;
+    }
+
+    /// <summary>
     /// Title, format and text counts of a MIDI stream (Standard MIDI File, .kar or .rmi); null for streams that are not MIDI.
     /// </summary>
     /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>

@@ -374,7 +374,9 @@ static const field_map field_maps[] = {
     { FA_TAG_FORMAT_MATROSKA, "INFO/TITLE", FA_TAG_TITLE },
 
     { FA_TAG_FORMAT_MIDI, "TITLE", FA_TAG_TITLE }, { FA_TAG_FORMAT_MIDI, "ARTIST", FA_TAG_ARTIST },
-    { FA_TAG_FORMAT_MIDI, "COPYRIGHT", FA_TAG_COPYRIGHT }
+    { FA_TAG_FORMAT_MIDI, "COPYRIGHT", FA_TAG_COPYRIGHT },
+    { FA_TAG_FORMAT_TRACKER, "TITLE", FA_TAG_TITLE }, { FA_TAG_FORMAT_TRACKER, "ARTIST", FA_TAG_ARTIST },
+    { FA_TAG_FORMAT_TRACKER, "COMMENT", FA_TAG_COMMENT }
 };
 
 static char* dup_n(const char* s, size_t n)
@@ -655,6 +657,21 @@ FA_API fa_result FA_CALL fa_stream_get_tags(fa_stream* stream, uint32_t flags, f
             collect_text(&t->sink, FA_TAG_FORMAT_MIDI, "TITLE", mi.title);
             collect_text(&t->sink, FA_TAG_FORMAT_MIDI, "ARTIST", mi.artist);
             collect_text(&t->sink, FA_TAG_FORMAT_MIDI, "COPYRIGHT", mi.copyright);
+        }
+    }
+    if (stream->tracker) {
+        fa_tracker_info ti;
+        size_t n = 0;
+        ti.struct_size = sizeof(ti);
+        if (fa_stream_get_tracker_info(stream, &ti) == FA_OK) {
+            collect_text(&t->sink, FA_TAG_FORMAT_TRACKER, "TITLE", ti.title);
+            collect_text(&t->sink, FA_TAG_FORMAT_TRACKER, "ARTIST", ti.artist);
+        }
+        if (fa_stream_get_tracker_text(stream, FA_TRACKER_TEXT_MESSAGE, 0, NULL, 0, &n) == FA_OK && n > 0) {
+            char* msg = (char*)malloc(n + 1);
+            if (msg && fa_stream_get_tracker_text(stream, FA_TRACKER_TEXT_MESSAGE, 0, msg, n + 1, NULL) == FA_OK)
+                collect_text(&t->sink, FA_TAG_FORMAT_TRACKER, "COMMENT", msg);
+            free(msg);
         }
     }
     if (!(flags & FA_TAGS_NO_INFO) && fa_stream_get_info(stream, &t->info) == FA_OK) t->have_info = 1;

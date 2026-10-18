@@ -14,6 +14,22 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Additions (new functions, new enum values at the end, new fields at the end of a struct that has a
   `struct_size`) are not breaking.
 
+## Unreleased
+
+### Added
+
+- Tracker modules: MOD, XM, S3M, IT, MPTM and the other formats libopenmpt reads (MTM, UMX, 669, AMF, DBM, MED,
+  PSM and more) open with the ordinary `fa_stream_open_*` calls and play once (loop with the stream's loop
+  toggle). libopenmpt 0.8.9 is built in (`third_party/libopenmpt`, BSD-3-Clause), so a C++17 compiler is
+  now required to build and the Linux `.so` grows by about 2 MiB. See [docs/features/trackers.md](docs/features/trackers.md).
+- Module information and names (`fa_stream_get_tracker_info`, `fa_stream_get_tracker_text`; .NET `TrackerInfo`),
+  the time of an order and row and seeking to it (`fa_stream_get_tracker_time`, `fa_stream_seek_tracker`; .NET
+  `GetTrackerTime`, `SeekTracker`), live interpolation, stereo separation, volume ramping and Amiga resampler
+  settings (`fa_stream_set_tracker_param`; .NET `TrackerInterpolation`, `TrackerStereoSeparation`,
+  `TrackerVolumeRamping`, `TrackerAmigaResampler`) and channel mute (`fa_stream_set_tracker_channel_mute`;
+  .NET `SetTrackerChannelMuted`).
+- Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
+
 ## 0.2.0 (2026-10-18)
 
 The first packaged version (NuGet `FatzAudio` with `win-x64` and `linux-x64` natives).

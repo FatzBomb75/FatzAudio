@@ -424,6 +424,20 @@ internal unsafe struct FaMidiMark
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaTrackerInfo
+{
+    public uint StructSize;
+    public fixed byte Type[16];
+    public fixed byte TypeName[64];
+    public fixed byte Tracker[64];
+    public fixed byte Title[128];
+    public fixed byte Artist[128];
+    public uint Channels, Orders, Patterns, Instruments, Samples, Subsongs;
+    public int RestartOrder, RestartRow;
+    public double Duration;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal unsafe struct FaMidiInfo
 {
     public fixed byte Title[256];

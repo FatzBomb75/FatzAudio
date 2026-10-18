@@ -727,7 +727,8 @@ FA_API fa_result FA_CALL fa_stream_get_dynamic_range(fa_stream* stream, fa_dynam
  * fa_tags_close, and it may be read from any thread.
  *
  * Web streams have no file tags: their titles come from fa_stream_get_metadata.
- * MIDI streams return the title, artist and copyright of fa_stream_get_midi_info. */
+ * MIDI streams return the title, artist and copyright of fa_stream_get_midi_info,
+ * tracker modules their title, artist and song message (COMMENT). */
 
 typedef enum fa_tag_field {
     FA_TAG_TITLE = 0,
@@ -760,7 +761,8 @@ typedef enum fa_tag_format {
     FA_TAG_FORMAT_RIFF,      /* WAV LIST/INFO */
     FA_TAG_FORMAT_AIFF,      /* NAME, AUTH, (c), ANNO */
     FA_TAG_FORMAT_MATROSKA,
-    FA_TAG_FORMAT_MIDI
+    FA_TAG_FORMAT_MIDI,
+    FA_TAG_FORMAT_TRACKER    /* a tracker module's title, artist and song message */
 } fa_tag_format;
 
 typedef enum fa_tags_flags {
@@ -1592,6 +1594,83 @@ FA_API fa_result FA_CALL fa_stream_get_midi_channel_mute(fa_stream* stream, uint
  * the controls above. */
 FA_API fa_result FA_CALL fa_stream_set_midi_effects(fa_stream* stream, int32_t enabled);
 FA_API fa_result FA_CALL fa_stream_get_midi_effects(fa_stream* stream, int32_t* out_enabled);
+
+/* ---- Tracker modules ------------------------------------------------------
+ *
+ * MOD, S3M, XM, IT, MPTM, MTM, UMX (Unreal music) and the other formats
+ * libopenmpt reads (669, AMF, AMS, DBM, DIGI, DMF, DSM, FAR, GDM, IMF, J2B, MDL,
+ * MED, MT2, OKT, PLM, PSM, PTM, STM, ULT and more) open with the ordinary
+ * fa_stream_open_* calls, detected from the content. They render to stereo F32
+ * at the engine's mix_sample_rate, or 44100 Hz when that is 0 (device native),
+ * like MIDI. libopenmpt is built in: no add-on library.
+ *
+ * The length is the song played once (the module's own loop back to its restart
+ * position is not followed: fa_stream_set_loop loops the whole song, from the
+ * start). Seeking lands on the exact frame: libopenmpt restores the state at the
+ * row that holds the target, which is very close to playing through but not
+ * always identical (an effect that depends on everything before it, such as a
+ * long pitch slide, may sound slightly different for a moment).
+ *
+ * MO3 files whose samples are MP3 or Ogg Vorbis compressed are not supported
+ * (FA_ERROR_UNSUPPORTED_FORMAT); MO3 files with plain samples play. */
+
+typedef struct fa_tracker_info {
+    uint32_t struct_size;        /* set to sizeof(fa_tracker_info) before the call */
+    char type[16];               /* the format's usual extension: "mod", "xm", "it", "s3m", ... */
+    char type_name[64];          /* "ProTracker MOD", "Impulse Tracker", ... */
+    char tracker[64];            /* the program that saved it, when known */
+    char title[128];             /* UTF-8, "" when it has none */
+    char artist[128];
+    uint32_t channels, orders, patterns, instruments, samples, subsongs;
+    int32_t restart_order, restart_row;   /* where the song's own loop goes back to */
+    double duration;             /* seconds, played once */
+} fa_tracker_info;
+
+FA_API fa_result FA_CALL fa_stream_get_tracker_info(fa_stream* stream, fa_tracker_info* out_info);
+
+typedef enum fa_tracker_text_type {
+    FA_TRACKER_TEXT_MESSAGE = 0,     /* the song message (index 0), "" when it has none */
+    FA_TRACKER_TEXT_INSTRUMENT = 1,  /* index 0..instruments-1 */
+    FA_TRACKER_TEXT_SAMPLE = 2,      /* index 0..samples-1 */
+    FA_TRACKER_TEXT_CHANNEL = 3,     /* index 0..channels-1 */
+    FA_TRACKER_TEXT_PATTERN = 4,     /* index 0..patterns-1 */
+    FA_TRACKER_TEXT_SUBSONG = 5      /* index 0..subsongs-1 */
+} fa_tracker_text_type;
+
+/* A text of the module in UTF-8: up to capacity - 1 bytes and a terminating 0
+ * (cut at a character boundary); *out_length (optional) is its full length in
+ * bytes, so a call with capacity 0 asks for the size. FA_ERROR_NOT_FOUND for an
+ * index out of range; FA_ERROR_INVALID_ARG for streams that are not modules. */
+FA_API fa_result FA_CALL fa_stream_get_tracker_text(fa_stream* stream, fa_tracker_text_type type, uint32_t index,
+                                                    char* buffer, size_t capacity, size_t* out_length);
+
+/* Order and row: the time (seconds from the start) where the song plays that row
+ * first, and a seek there (fa_stream_seek of that frame). FA_ERROR_NOT_FOUND
+ * when the song never plays it (a skipped order, a row past the pattern, or an
+ * order of a later subsong: the stream plays the first subsong). */
+FA_API fa_result FA_CALL fa_stream_get_tracker_time(fa_stream* stream, uint32_t order, uint32_t row, double* out_seconds);
+FA_API fa_result FA_CALL fa_stream_seek_tracker(fa_stream* stream, uint32_t order, uint32_t row);
+
+/* Render settings, live (heard after the decode-ahead buffer, 150 ms by default
+ * for modules as for MIDI):
+ * FA_TRACKER_INTERPOLATION       0 libopenmpt's default (8-tap sinc), 1 none, 2 linear, 4 cubic, 8 sinc
+ * FA_TRACKER_STEREO_SEPARATION   percent, 0 (mono) .. 200; 100 by default
+ * FA_TRACKER_VOLUME_RAMPING      -1 default, 0 off (may click), 1..10 softer
+ * FA_TRACKER_AMIGA_RESAMPLER     1 (default): Amiga MOD files sound as on an Amiga's Paula chip; 0 off
+ * FA_ERROR_INVALID_ARG for other values and for streams that are not modules. */
+typedef enum fa_tracker_param {
+    FA_TRACKER_INTERPOLATION = 0,
+    FA_TRACKER_STEREO_SEPARATION = 1,
+    FA_TRACKER_VOLUME_RAMPING = 2,
+    FA_TRACKER_AMIGA_RESAMPLER = 3
+} fa_tracker_param;
+FA_API fa_result FA_CALL fa_stream_set_tracker_param(fa_stream* stream, fa_tracker_param param, int32_t value);
+FA_API fa_result FA_CALL fa_stream_get_tracker_param(fa_stream* stream, fa_tracker_param param, int32_t* out_value);
+
+/* Mutes or unmutes channel 0..channels-1 (the first 64), live.
+ * FA_ERROR_NOT_IMPLEMENTED if libopenmpt offers no channel control for the module. */
+FA_API fa_result FA_CALL fa_stream_set_tracker_channel_mute(fa_stream* stream, uint32_t channel, int32_t muted);
+FA_API fa_result FA_CALL fa_stream_get_tracker_channel_mute(fa_stream* stream, uint32_t channel, int32_t* out_muted);
 
 /* ---- Events ----------------------------------------------------------- */
 

@@ -13,11 +13,13 @@ Opus and Vorbis decode with [libopus](https://opus-codec.org/) 1.5.2 and
 MIDI is synthesized with [TinySoundFont](https://github.com/schellingb/TinySoundFont)
 (TinySoundFont MIT, TinyMidiLoader zlib, vendored with hardening patches in
 `third_party/tinysoundfont`). No SoundFont is bundled: the application loads its own.
+Tracker modules (MOD, XM, S3M, IT, MPTM and more) play through [libopenmpt](https://lib.openmpt.org) 0.8.9
+(BSD-3-Clause, vendored in `third_party/libopenmpt`, see `third_party/libopenmpt.cmake`), statically linked.
 
 Status: core engine (phase 1), loudness normalization (phase 2) and crossfades (phase 3) done. Decoding runs ahead on worker threads into lock-free ring
 buffers; the audio callback only mixes. Implemented: engine (with a silent null output for tests),
 device enumeration/open/start/stop/volume/latency, streams from files, memory and custom I/O
-with format detection from content (WAV/AIFF/RF64/W64, FLAC, MP3, Ogg Opus/Vorbis/FLAC, AC-3/E-AC-3, MIDI with a SoundFont), attach/detach/move between
+with format detection from content (WAV/AIFF/RF64/W64, FLAC, MP3, Ogg Opus/Vorbis/FLAC, AC-3/E-AC-3, MIDI with a SoundFont, tracker modules), attach/detach/move between
 devices keeping position, play/pause/stop/seek/position/clock/state, volume and pan with
 ramps on seven curves (including your own points), sample-accurate scheduled starts on the device clock,
 crossfades, queues with gapless playback, cue/fade/mix-point markers, mix buses, a per-stream channel
@@ -29,7 +31,7 @@ loaded at runtime) from a device, a playing stream, a file or your own samples. 
 
 ## Build
 
-Requires CMake 3.21+ and a C11 and C++11 compiler.
+Requires CMake 3.21+ and a C11 and C++17 compiler (libopenmpt needs C++17).
 
 ```
 cmake -S . -B build
