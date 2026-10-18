@@ -832,18 +832,28 @@ static void test_ac3_packets_cut_anywhere(void)
     decode_file("tone.eac3", "eac3", 48000, 2, cut_1000, 24576, 1600);
 }
 
-/* What FFmpeg the app has, when it has one (nothing here needs it). */
-static void test_ffmpeg_info(void)
+/* Codecs the library does not decode are unsupported, even with FFmpeg in the
+ * process (Linux CI has it): the app decodes those itself and pushes frames. */
+static void test_unsupported_codecs(void)
 {
-    fa_ffmpeg_info fi;
-    if (fa_ffmpeg_load(NULL) != FA_OK) {
-        printf("  (FFmpeg not found)\n");
-        return;
+    static const char* names[] = { "dts", "truehd", "mlp", "wmav2", "nonsense" };
+    size_t i;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        fa_codec_params p;
+        fa_stream* s = NULL;
+        fa_result r;
+#ifdef _WIN32
+        if (strcmp(names[i], "wmav2") == 0) continue;   /* Media Foundation decodes it */
+#endif
+        fa_codec_params_init(&p);
+        p.codec = names[i];
+        p.sample_rate = 48000;
+        p.channels = 2;
+        p.block_align = 4096;
+        r = fa_stream_open_packets(g_engine, &p, NULL, &s);
+        CHECK_EQ(r, FA_ERROR_UNSUPPORTED_FORMAT);
+        CHECK(s == NULL);
     }
-    CHECK_EQ(fa_ffmpeg_get_info(&fi), FA_OK);
-    CHECK_EQ(fi.loaded, 1);
-    CHECK(fi.avcodec_version >> 16 >= 58);
-    printf("  libavcodec %u.%u at %s\n", fi.avcodec_version >> 16, (fi.avcodec_version >> 8) & 255, fi.avcodec_path);
 }
 
 /* AAC packets (ADTS frames, as demuxers hand them over) decode natively. */
@@ -995,7 +1005,7 @@ int main(void)
     RUN(test_mp3_packets_cut_anywhere);
     RUN(test_ac3_eac3_packets);
     RUN(test_ac3_packets_cut_anywhere);
-    RUN(test_ffmpeg_info);
+    RUN(test_unsupported_codecs);
     RUN(test_aac_packets);
     RUN(test_aac_switch);
     RUN(test_packets_play_on_device);

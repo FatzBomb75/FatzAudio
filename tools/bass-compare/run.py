@@ -501,11 +501,6 @@ def ms_of(frames, rate):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--fa', required=True, help='fa_bench executable')
-    ap.add_argument('--fa-ffmpeg', help='optional: fa_bench to retry formats FatzAudio cannot decode '
-                    'natively yet, with the system FFmpeg (rows marked FFmpeg-assisted); e.g. a native '
-                    'Linux build next to a Wine one')
-    ap.add_argument('--ffmpeg-dir', help='optional: FFmpeg DLLs for fa_bench, for the same FFmpeg-assisted '
-                    'rows on Windows (FatzAudio itself never needs FFmpeg)')
     ap.add_argument('--bass', required=True, help='bass_bench.exe')
     ap.add_argument('--bass-dir', required=True, help='folder with bass.dll and its add-ons')
     ap.add_argument('--wine', help='run the Windows tools through this (e.g. wine64)')
@@ -530,15 +525,8 @@ def main():
     work = os.path.join(out, 'work')
     inputs = os.path.join(out, 'inputs')
     os.makedirs(work, exist_ok=True)
-    # FatzAudio runs without FFmpeg. Only a file it cannot open is retried with one
-    # (fa_ff), and that row is marked FFmpeg-assisted.
     fa_wine = args.wine if args.fa_wine else None
     fa = Tool('fatzaudio', args.fa, fa_wine)
-    fa_ff = None
-    if args.fa_ffmpeg:
-        fa_ff = Tool('fatzaudio', args.fa_ffmpeg, None, ['--ffmpeg', 'system'])
-    elif args.ffmpeg_dir:
-        fa_ff = Tool('fatzaudio', args.fa, fa_wine, ['--ffmpeg', args.ffmpeg_dir])
     bass = Tool('bass', args.bass, args.wine, [args.bass_dir])
 
     rec = None
@@ -575,13 +563,9 @@ def main():
         for tool in (fa, bass):
             print('decode %-12s %s' % (name, tool.name), flush=True)
             res = decode_case(tool, c, work, args.runs)
-            if tool is fa and 'error' in res['decode'] and fa_ff:
-                res = decode_case(fa_ff, c, work, args.runs)
-                res['via'] = 'ffmpeg-native'
             if 'own' in res:
-                t = fa_ff if res.get('via') else tool
-                res['seek'] = seek_case(t, c, res['own'], work, False)
-                res['seek_prescan'] = seek_case(t, c, res['own'], work, True)
+                res['seek'] = seek_case(tool, c, res['own'], work, False)
+                res['seek_prescan'] = seek_case(tool, c, res['own'], work, True)
                 del res['own']
             row[tool.name] = res
         results['cases'][name] = row
@@ -677,12 +661,6 @@ def write_report(results, cases, args, tempo):
              'through decode-only streams.%s\n' % (
                  time.strftime('%Y-%m-%d'), bass_ver, sample.get('plugins', 'no add-ons').replace(',', ', '),
                  ' Both run as Windows builds under Wine (%s).' % args.wine if args.wine and args.fa_wine else ''))
-    if args.fa_ffmpeg or args.ffmpeg_dir:
-        L.append('Rows marked † are **FFmpeg-assisted**: FatzAudio cannot decode them natively yet, so they '
-                 'ran with an FFmpeg loaded at run time (`--ffmpeg`). FatzAudio itself has no FFmpeg '
-                 'dependency; these rows are only a stand-in until its own decoder for the format lands.%s\n'
-                 % (' No Windows FFmpeg was available here, so they ran in a native build with the system '
-                    'FFmpeg; their accuracy is comparable, their speed and memory less so.' if args.fa_ffmpeg else ''))
 
     # Decoding accuracy.
     L.append('## Decoding accuracy\n')
@@ -699,7 +677,6 @@ def write_report(results, cases, args, tempo):
     for name, row in results['cases'].items():
         c = cases[name]
         f, b = row['fatzaudio'], row['bass']
-        dag = ' †' if f.get('via') else ''
         cells = []
 
         def get(res, key, sub):
@@ -732,7 +709,7 @@ def write_report(results, cases, args, tempo):
             cells.append('–' if d is None else ('exact' if d == 0 else '%+d' % d))
         if lens[0] is not None and lens[1] is not None and abs(lens[0]) > abs(lens[1]):
             worse.append('%s: length off by %d frames (BASS %d)' % (c['what'], lens[0], lens[1]))
-        cells = [c['what'] + dag] + cells
+        cells = [c['what']] + cells
         for key in ('fatzaudio', 'bass'):
             e = row[key]['decode'].get('error')
             if e:
@@ -781,16 +758,16 @@ def write_report(results, cases, args, tempo):
         bx = dur / b['total_ms'] if b.get('total_ms') else None
         w = winner(fx, bx, True, 0.1 * (bx or 0))
         cells = list(bold((fmt(fx, '%.0f×'), fmt(bx, '%.0f×')), w))
-        if w == 'bass' and fx is not None and not f.get('via'):
+        if w == 'bass' and fx is not None:
             worse.append('%s: decodes at %.0f× real time, BASS %.0f×' % (c['what'], fx, bx))
         for key, spec, marg in (('open_ms', '%.2f', 1.0), ('first_ms', '%.2f', 1.0), ('mem_kb', '%.0f', 256)):
             fv, bv = f.get(key), b.get(key)
             w = winner(fv, bv, False, max(marg, 0.25 * (bv or 0)))
             cells += bold((fmt(fv, spec), fmt(bv, spec)), w)
-            if w == 'bass' and fv is not None and not f.get('via'):
+            if w == 'bass' and fv is not None:
                 worse.append('%s: %s %s, BASS %s' % (c['what'], {'open_ms': 'opening takes (ms)', 'first_ms': 'first audio after (ms)',
                                                                 'mem_kb': 'one stream uses (KB)'}[key], spec % fv, spec % bv))
-        L.append('| %s%s | %s |' % (c['what'], ' †' if f.get('via') else '', ' | '.join(cells)))
+        L.append('| %s | %s |' % (c['what'], ' | '.join(cells)))
 
     # Seeking.
     L.append('\n## Seeking\n')
@@ -830,7 +807,7 @@ def write_report(results, cases, args, tempo):
             fm, bm = fs.get('worst_ms'), bs.get('worst_ms')
             w = winner(fm, bm, False, max(1.0, 0.25 * (bm or 0)))
             cells += bold((fmt(fm, '%.2f'), fmt(bm, '%.2f')), w)
-            if w == 'bass' and fm is not None and not row['fatzaudio'].get('via'):
+            if w == 'bass' and fm is not None:
                 worse.append('%s: slowest seek%s %.1f ms, BASS %.1f ms' % (c['what'], ' with a prescan' if key != 'seek' else '', fm, bm))
             L.append('| %s | %s |' % (c['what'], ' | '.join(cells)))
         L.append('')

@@ -17,7 +17,7 @@ A stream is anything that produces audio. You open it from a file, a memory bloc
 | WMA, ASF | `.wma`, `.asf` and `.wmv` files (Advanced Systems Format), local or over HTTP: Windows Media Audio 1, 2, 9 Professional, 9 Lossless and Voice, plus PCM, MP3 and AC-3 in ASF. Audio streams only ([WMA](#wma)) | `wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`, `pcm_*`, `mp3`, ... (container `asf`) |
 | MIDI | Standard MIDI Files (format 0, 1, 2), karaoke `.kar`, RIFF `.rmi`; played with a SoundFont 2 you load ([MIDI](midi.md)) | `midi` (container `smf` or `rmid`) |
 
-Inside MP4, Matroska and ASF, PCM, MP3, AC-3, E-AC-3, Opus, Vorbis, FLAC and ALAC tracks decode built in (ALAC to the bit, all channel layouts up to 7.1 and every bit depth). AAC (AAC-LC, HE-AAC, HE-AAC v2, Main and LTP, up to 7.1) decodes built in as well, on every platform ([AAC](#aac)). Every other codec (DTS, TrueHD, WMA outside Windows) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`.
+Inside MP4, Matroska and ASF, PCM, MP3, AC-3, E-AC-3, Opus, Vorbis, FLAC and ALAC tracks decode built in (ALAC to the bit, all channel layouts up to 7.1 and every bit depth). AAC (AAC-LC, HE-AAC, HE-AAC v2, Main and LTP, up to 7.1) decodes built in as well, on every platform ([AAC](#aac)). WMA decodes on Windows (Media Foundation). Every other codec (DTS, TrueHD, WMA outside Windows, ...) is not supported and returns `FA_ERROR_UNSUPPORTED_FORMAT`; FatzAudio never uses FFmpeg. If your app needs one of those, we recommend you decode it with your own FFmpeg and hand FatzAudio the decoded frames ([FFmpeg hand-off](ffmpeg.md#decoded-frames-instead-c)).
 
 More formats are added to the same registry (built-in or OS decoders for the codecs above follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
 
@@ -250,7 +250,7 @@ using var s = engine.OpenFile("song.opus");
 
 - **Length and seeking** are sample exact. The length comes from the last page's granule position, Opus pre-skip is dropped, and the end is trimmed where the encoder padded it. Opus restarts 300 ms before a seek target (the format asks for at least 80 ms, which can leave the first audio after a seek only 30 dB from a straight decode; 300 ms brings it within about 80 dB). A seek decodes only the packets it needs: the rest of the page it lands on is skipped, so a seek takes about a millisecond.
 - **Output gain** in the Opus header is applied, and ReplayGain / R128 tags in the comment header (`R128_TRACK_GAIN` in OpusTags, `REPLAYGAIN_*` in Vorbis comments) feed normalization like any other tags ([normalization](normalization.md)).
-- **Channels:** up to 8 channels come out in the standard speaker order (see [Dolby Digital](dolby.md#channels)), not Ogg's own order. Quadraphonic sound plays as 5 channels with a silent centre. Opus ambisonics (mapping family 2) plays its channels as they are; family 3 needs FFmpeg.
+- **Channels:** up to 8 channels come out in the standard speaker order (see [Dolby Digital](dolby.md#channels)), not Ogg's own order. Quadraphonic sound plays as 5 channels with a silent centre. Opus ambisonics (mapping family 2) plays its channels as they are; family 3 is not supported (`FA_ERROR_UNSUPPORTED_FORMAT`).
 - **Chained files** (songs joined one after another, each with its own headers) play straight through. The first song sets the stream's rate and channels; later songs with a different format are converted. On a seekable local file the length and seeking cover every song (the file's page headers are read once at open). A chained file over HTTP plays through but can't seek.
 - **Several streams in one file** (for example Ogg with video, or two audio languages): `audio_track` picks among the audio streams that start the file, as for MP4 and Matroska.
 - **Web radio:** Ogg Opus and Ogg Vorbis stations work, and each song's title comes from its comment header ([web streams](web-streams.md#song-titles-icy-metadata)).
@@ -261,8 +261,8 @@ using var s = engine.OpenFile("song.opus");
 
 `.wma` files (and `.asf`/`.wmv`, audio only) open with the ordinary calls; there is no plugin to load. FatzAudio reads the ASF container itself and hands each audio frame to a decoder:
 
-- **Windows**: the system's own Windows Media Audio decoders, through Media Foundation. Nothing to install or ship. On Windows N and KN editions without the Media Feature Pack (and on Server Core) Media Foundation is missing; then the app's FFmpeg is used, as elsewhere.
-- **macOS, Linux, Android, iOS**: the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it a WMA track returns `FA_ERROR_PROVIDER_MISSING`. PCM, MP3 and AC-3 inside ASF decode built in everywhere.
+- **Windows**: the system's own Windows Media Audio decoders, through Media Foundation. Nothing to install or ship. On Windows N and KN editions without the Media Feature Pack (and on Server Core) Media Foundation is missing; WMA then returns `FA_ERROR_UNSUPPORTED_FORMAT`.
+- **macOS, Linux, Android, iOS**: not supported; a WMA track returns `FA_ERROR_UNSUPPORTED_FORMAT`. These systems have no WMA decoder and there is no public WMA specification. An app that must play WMA there can decode it with your own FFmpeg and hand FatzAudio the decoded frames ([FFmpeg hand-off](ffmpeg.md#decoded-frames-instead-c)). PCM, MP3 and AC-3 inside ASF decode built in everywhere.
 
 Details:
 

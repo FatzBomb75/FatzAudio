@@ -64,7 +64,6 @@ set(FA_SOURCES
     src/dec_midi.c
     src/tinysoundfont_impl.c
     src/mdct.c
-    src/ffmpeg.c
     src/push.c
     src/demux.c
     src/demux_mp4.c

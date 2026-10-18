@@ -1,13 +1,13 @@
 /* fa_bench: FatzAudio's side of the BASS comparison (tools/bass-compare/README.md).
  * Uses only the public API, on decode-only streams, and prints one JSON line.
- * Without --ffmpeg it uses no FFmpeg at all; `--ffmpeg system` loads the system's.
+ * It uses no FFmpeg.
  *
- *   fa_bench [--ffmpeg <dir>|system] decode <in> <out.f32|-> [--prescan]
- *   fa_bench [--ffmpeg <dir>|system] info <in> [--prescan]
- *   fa_bench [--ffmpeg <dir>|system] seek <in> <out.f32> [--prescan] <frames> <frame> ...
- *   fa_bench [--ffmpeg <dir>|system] multi <in> <streams>
- *   fa_bench [--ffmpeg <dir>|system] loudness <in>
- *   fa_bench [--ffmpeg <dir>|system] disc <image.cue> <track> <out.f32|->
+ *   fa_bench decode <in> <out.f32|-> [--prescan]
+ *   fa_bench info <in> [--prescan]
+ *   fa_bench seek <in> <out.f32> [--prescan] <frames> <frame> ...
+ *   fa_bench multi <in> <streams>
+ *   fa_bench loudness <in>
+ *   fa_bench disc <image.cue> <track> <out.f32|->
  *
  * decode   the whole file: reported length, decoded frames, time to open, time to
  *          the first audio, total time, memory.
@@ -34,8 +34,8 @@
 #include "bench_common.h"
 
 #define CHUNK 4096
-#define FA_USAGE "       fa_bench [--ffmpeg <dir>|system] loudness <in>\n" \
-                 "       fa_bench [--ffmpeg <dir>|system] disc <image.cue> <track> <out.f32|->\n"
+#define FA_USAGE "       fa_bench loudness <in>\n" \
+                 "       fa_bench disc <image.cue> <track> <out.f32|->\n"
 
 static fa_engine* engine;
 
@@ -391,14 +391,7 @@ int main(int argc, char** argv)
     fa_engine_config cfg;
     int a = 1, prescan = 0, rc, i;
     const char* cmd;
-    /* FatzAudio needs no FFmpeg. --ffmpeg loads one anyway, for the rows the report
-     * marks "FFmpeg-assisted": formats FatzAudio cannot decode natively yet. */
-    if (a + 1 < argc && !strcmp(argv[a], "--ffmpeg")) {
-        const char* dir = strcmp(argv[a + 1], "system") ? argv[a + 1] : NULL;
-        if (fa_ffmpeg_load(dir) != FA_OK) fprintf(stderr, "no FFmpeg in %s\n", argv[a + 1]);
-        a += 2;
-    }
-    if (a + 1 >= argc) { bench_usage(argv[0], "[--ffmpeg <dir>|system] ", FA_USAGE); return 2; }
+    if (a + 1 >= argc) { bench_usage(argv[0], "", FA_USAGE); return 2; }
     cmd = argv[a];
     for (i = a; i < argc; i++)
         if (!strcmp(argv[i], "--prescan")) {
@@ -420,7 +413,7 @@ int main(int argc, char** argv)
     else if (!strcmp(cmd, "play-crossfade") && a + 4 < argc)
         rc = cmd_play_crossfade(argv[a + 1], argv[a + 2], atof(argv[a + 3]), atof(argv[a + 4]), a + 5 < argc && !strcmp(argv[a + 5], "equal"));
     else if (!strcmp(cmd, "play-gapless") && a + 2 < argc) rc = cmd_play_gapless(argv[a + 1], argv[a + 2]);
-    else { bench_usage(argv[0], "[--ffmpeg <dir>|system] ", FA_USAGE); rc = 2; }
+    else { bench_usage(argv[0], "", FA_USAGE); rc = 2; }
     fa_engine_destroy(engine);
     return rc;
 }

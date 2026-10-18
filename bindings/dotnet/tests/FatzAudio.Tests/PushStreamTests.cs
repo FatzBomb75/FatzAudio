@@ -89,19 +89,6 @@ public class PushStreamTests
     }
 
     [Fact]
-    public void FFmpeg_InfoMatchesLoad()
-    {
-        bool loaded = FFmpeg.Load();
-        var info = FFmpeg.Info;
-        Assert.Equal(loaded, info.IsLoaded);
-        if (loaded)
-        {
-            Assert.True(info.AvcodecVersion!.Major >= 58);
-            Assert.False(string.IsNullOrEmpty(info.AvcodecPath));
-        }
-    }
-
-    [Fact]
     public void OpenPackets_PcmPacketsSplitAnywhere()
     {
         using var engine = AudioEngine.Create();

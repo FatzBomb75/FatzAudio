@@ -70,7 +70,7 @@ enum {
     FA_ERROR_BUSY = -10,
     FA_ERROR_END_OF_STREAM = -11,
     FA_ERROR_NOT_IMPLEMENTED = -12,
-    FA_ERROR_PROVIDER_MISSING = -13, /* e.g. FFmpeg or LAME not found at runtime */
+    FA_ERROR_PROVIDER_MISSING = -13, /* e.g. LAME or libcurl not found at runtime */
     FA_ERROR_NO_DISC = -14,          /* the CD drive has no disc, its tray is open, or the
                                         disc was changed under an open stream */
     FA_ERROR_NO_SOUNDFONT = -15,     /* a MIDI file needs a soundfont: fa_engine_set_soundfont
@@ -275,12 +275,12 @@ FA_API fa_result FA_CALL fa_stream_open_url(fa_engine* engine, const char* url, 
  *
  *   compressed packets   fa_stream_open_packets + fa_stream_push_packet: straight
  *                        from av_read_frame, no audio decoding in the app at all.
- *                        FatzAudio decodes them on its worker threads: PCM, MP3,
- *                        AC-3 and E-AC-3 built in, everything else (AAC, Opus, ...)
- *                        through the FFmpeg your app already loaded (never bundled).
+ *                        FatzAudio decodes them on its worker threads (the codecs
+ *                        at fa_stream_open_packets). It never uses FFmpeg itself.
  *   decoded frames       fa_stream_open_push + fa_stream_push_frame: AVFrame data
  *                        as it is (planar or interleaved, any sample format, any
- *                        rate), no swresample step.
+ *                        rate), no swresample step. The way to play codecs FatzAudio
+ *                        does not decode (DTS, TrueHD, ...) with your own FFmpeg.
  *
  * Both take FatzAudio's own small structs, so FFmpeg can be upgraded without
  * rebuilding FatzAudio. fatzaudio_ffmpeg.h fills them from AVCodecParameters,
@@ -356,9 +356,10 @@ FA_API fa_result FA_CALL fa_stream_push_pcm(fa_stream* stream, const void* const
 /* PCM in its own format (decoded AVFrames). Push streams only. */
 FA_API fa_result FA_CALL fa_stream_push_frame(fa_stream* stream, const fa_audio_frame* frame);
 
-/* A push stream for compressed packets of one audio track. Returns
- * FA_ERROR_PROVIDER_MISSING when the codec needs FFmpeg and none could be loaded
- * (see fa_ffmpeg_load), FA_ERROR_UNSUPPORTED_FORMAT when FFmpeg has no decoder for it.
+/* A push stream for compressed packets of one audio track, decoded by the library:
+ * PCM, MP3, AAC, AC-3, E-AC-3, Opus, Vorbis, FLAC, ALAC, and WMA on Windows.
+ * FA_ERROR_UNSUPPORTED_FORMAT for any other codec (DTS, TrueHD, ...): decode those
+ * with your own decoder and push the frames (fa_stream_open_push).
  * The stream's format is the track's rate and channel count. */
 FA_API fa_result FA_CALL fa_stream_open_packets(fa_engine* engine, const fa_codec_params* params, const fa_open_options* options, fa_stream** out_stream);
 /* Queues a packet. A packet that fails to decode is skipped (FA_EVENT_DECODE_ERROR)
@@ -377,28 +378,6 @@ FA_API fa_result FA_CALL fa_stream_push_flush(fa_stream* stream);
  * jump in the timeline adds nothing. A queued packet without a duration counts
  * like the one before it until it is decoded. */
 FA_API fa_result FA_CALL fa_stream_get_buffered(fa_stream* stream, fa_time* out_duration);
-
-/* ---- FFmpeg at runtime ------------------------------------------------------
- * FatzAudio never links or bundles FFmpeg. When a packet stream needs a codec it
- * has no decoder of its own for, and the system has none either (the system
- * decodes AAC and ALAC on Windows, macOS, iOS and Android, and WMA on Windows),
- * it uses the libavcodec and libavutil of your app:
- *   1. the ones already loaded in the process (your app's FFmpeg), else
- *   2. the ones the system loader finds (next to your executable, PATH, ...).
- * fa_ffmpeg_load(directory) loads them from a folder instead (call it first).
- * Supported: FFmpeg 4.0 to 8.x (libavcodec 58 to 62). */
-typedef struct fa_ffmpeg_info {
-    int32_t loaded;                /* 1 when FFmpeg is in use */
-    uint32_t avcodec_version;      /* (major << 16) | (minor << 8) | micro, 0 if not loaded */
-    uint32_t avutil_version;
-    char avcodec_path[512];        /* where libavcodec was found (file name if unknown) */
-} fa_ffmpeg_info;
-
-/* directory NULL = steps 1 and 2 above. Returns FA_OK when FFmpeg is (already)
- * loaded, FA_ERROR_PROVIDER_MISSING if no usable libavcodec was found. Once
- * loaded, FFmpeg stays loaded for the life of the process. */
-FA_API fa_result FA_CALL fa_ffmpeg_load(const char* directory);
-FA_API fa_result FA_CALL fa_ffmpeg_get_info(fa_ffmpeg_info* out_info);
 
 FA_API void FA_CALL fa_stream_close(fa_stream* stream);
 
