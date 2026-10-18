@@ -34,7 +34,40 @@ public sealed record CdgSurfaceOptions
     public bool Premultiplied { get; init; }
     /// <summary>Bilinear scaling instead of sharp pixels. Ignored for <see cref="CdgPixelFormat.Indexed8"/>.</summary>
     public bool Smooth { get; init; }
+    /// <summary>
+    /// Like <see cref="Transparent"/>, but only the background colour is transparent: the disc's transparent-colour
+    /// packs are ignored (some discs set them in ways that punch holes in the lyrics). Wins over <see cref="Transparent"/>.
+    /// </summary>
+    public bool TransparentBackgroundOnly { get; init; }
+    /// <summary>Every colour is fully transparent until the first screen clear, so a picture or video underneath
+    /// shows instead of a black screen.</summary>
+    public bool HideUntilPreset { get; init; }
+    /// <summary>Replaces the background colour, alpha included; null keeps the disc's colour.</summary>
+    public CdgColor? BackgroundColor { get; init; }
+    /// <summary>How opaque the background is, 0..100 % (of 255, or of <see cref="BackgroundColor"/>'s alpha),
+    /// whatever <see cref="Transparent"/> makes it; null leaves it to the other options.</summary>
+    public int? BackgroundOpacity { get; init; }
 }
+
+/// <summary>Where a stream's CD+G graphics come from.</summary>
+public enum CdgSource
+{
+    /// <summary>The stream has no graphics (a disc track until its graphics are found).</summary>
+    None = 0,
+    /// <summary>A <c>.cdg</c> file, a ZIP entry or bytes loaded with <see cref="AudioStream.LoadCdg(ReadOnlySpan{byte})"/>.</summary>
+    File = 1,
+    /// <summary>A CD+G disc's subcode, read while the track plays.</summary>
+    Disc = 2,
+}
+
+/// <summary>A stream's CD+G graphics: see <see cref="AudioStream.CdgInfo"/>.</summary>
+/// <param name="Source">Where they come from.</param>
+/// <param name="PackCount">Packs, 300 per second (a disc track's whole length).</param>
+/// <param name="CheckpointInterval">A seek replays at most this much (10 s, longer for graphics over 30 minutes).</param>
+/// <param name="CheckpointCount">Checkpoints built so far: all of them at load for files, as the packs arrive for discs.</param>
+/// <param name="DiscParity">Discs: true when the packs' parity chose the subcode layout, false when instruction counts
+/// did (drives that zero the parity). Either way the packs are applied as read. Null for other sources.</param>
+public readonly record struct CdgInfo(CdgSource Source, long PackCount, TimeSpan CheckpointInterval, int CheckpointCount, bool? DiscParity);
 
 /// <summary>A palette colour of a CD+G picture, straight (not premultiplied) alpha.</summary>
 /// <param name="R">Red, 0..255.</param>
@@ -63,7 +96,7 @@ public readonly unsafe ref struct CdgFrame
 {
     private readonly byte* _pixels;
 
-    internal CdgFrame(FaCdgFrame f, ReadOnlySpan<CdgColor> palette)
+    internal CdgFrame(FaCdgFrame f, ReadOnlySpan<CdgColor> palette, ReadOnlySpan<byte> transparency)
     {
         _pixels = (byte*)f.Pixels;
         Width = (int)f.Width;
@@ -75,6 +108,12 @@ public readonly unsafe ref struct CdgFrame
         Dirty = new CdgRect((int)f.DirtyX, (int)f.DirtyY, (int)f.DirtyWidth, (int)f.DirtyHeight);
         Palette = palette;
         Time = TimeConvert.FromNanoseconds(f.Time);
+        BackgroundIndex = f.BackgroundIndex;
+        BorderIndex = f.BorderIndex;
+        Transparency = transparency;
+        Background = new CdgColor(f.Background[0], f.Background[1], f.Background[2], f.Background[3]);
+        Revision = f.Revision;
+        PaletteRevision = f.PaletteRevision;
     }
 
     /// <summary>All pixels, <see cref="Height"/> rows of <see cref="Stride"/> bytes.</summary>
@@ -100,6 +139,22 @@ public readonly unsafe ref struct CdgFrame
     public ReadOnlySpan<CdgColor> Palette { get; }
     /// <summary>Position on the graphics timeline that is shown (the audio clock minus <see cref="AudioStream.CdgOffset"/>).</summary>
     public TimeSpan Time { get; }
+    /// <summary>Colour index of the last screen clear (memory preset); -1 before the first one, or without graphics.
+    /// For apps that apply their own transparency to <see cref="CdgPixelFormat.Indexed8"/> pixels.</summary>
+    public int BackgroundIndex { get; }
+    /// <summary>Colour index of the last border preset; -1 before one.</summary>
+    public int BorderIndex { get; }
+    /// <summary>The disc's transparent-colour values for colours 0..15: 0 opaque .. 63 invisible, whatever the options.</summary>
+    public ReadOnlySpan<byte> Transparency { get; }
+    /// <summary>The colour the background is drawn with (after <see cref="CdgSurfaceOptions.BackgroundColor"/>), to fill
+    /// the area around a scaled picture. All zero while <see cref="BackgroundIndex"/> is -1 and no colour is set.</summary>
+    public CdgColor Background { get; }
+    /// <summary>Goes up by one whenever an update changes a pixel. Each render target compares it with the revision it
+    /// last uploaded, so one surface can feed several targets.</summary>
+    public ulong Revision { get; }
+    /// <summary>Goes up whenever <see cref="Palette"/>, <see cref="BackgroundIndex"/>, <see cref="BorderIndex"/> or
+    /// <see cref="Transparency"/> change.</summary>
+    public ulong PaletteRevision { get; }
 }
 
 /// <summary>
@@ -113,8 +168,9 @@ public readonly unsafe ref struct CdgFrame
 /// <see cref="AudioStream.Clock"/>. A stream without graphics gives a blank picture until graphics are loaded.
 /// </para>
 /// <para>
-/// One surface is updated from one thread at a time; different surfaces may be used from different threads. Disposing
-/// the stream frees its surfaces: <see cref="Update"/> then throws <see cref="ObjectDisposedException"/>.
+/// One surface is updated from one thread at a time; different surfaces may be used from different threads. An update
+/// never waits for the device or decode threads, and one with nothing new copies no pixels. Disposing the stream frees
+/// its surfaces: <see cref="Update"/> then throws <see cref="ObjectDisposedException"/>.
 /// </para>
 /// </remarks>
 /// <example>
@@ -137,6 +193,7 @@ public sealed unsafe class CdgSurface : IDisposable
     private readonly AudioStream _stream;
     private readonly object _lock = new();
     private readonly CdgColor[] _palette = new CdgColor[16];
+    private readonly byte[] _transparency = new byte[16];
     private nint _native;
 
     internal CdgSurface(AudioStream stream, CdgSurfaceOptions options)
@@ -151,7 +208,20 @@ public sealed unsafe class CdgSurface : IDisposable
         c.Width = (uint)options.Width;
         c.Height = (uint)options.Height;
         c.Flags = (options.HideBorder ? 1u : 0) | (options.Transparent ? 2u : 0) |
-                  (options.Premultiplied ? 4u : 0) | (options.Smooth ? 8u : 0);
+                  (options.Premultiplied ? 4u : 0) | (options.Smooth ? 8u : 0) |
+                  (options.TransparentBackgroundOnly ? 16u : 0) | (options.HideUntilPreset ? 32u : 0);
+        if (options.BackgroundColor is { } bg)
+        {
+            c.Flags |= 64u;
+            c.BackgroundColor = ((uint)bg.A << 24) | ((uint)bg.R << 16) | ((uint)bg.G << 8) | bg.B;
+        }
+        if (options.BackgroundOpacity is { } opacity)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(opacity, nameof(options));
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(opacity, 100, nameof(options));
+            c.Flags |= 128u;
+            c.BackgroundOpacity = (uint)opacity;
+        }
         var handle = stream.Handle;
         int rc = NativeMethods.fa_cdg_surface_create(handle, &c, out _native);
         if (rc == (int)ErrorCode.InvalidArgument)
@@ -183,7 +253,8 @@ public sealed unsafe class CdgSurface : IDisposable
     public CdgFrame Update() => Render(null);
 
     /// <summary>Draws the picture at a position you choose on the stream's timeline (your own clock, a preview, or
-    /// rendering to a video file). <see cref="AudioStream.CdgOffset"/> still applies.</summary>
+    /// rendering to a video file). <see cref="AudioStream.CdgOffset"/> still applies. The picture shows packs
+    /// [0, ceil(t × 300)) for t = <paramref name="time"/> minus the offset, in seconds: pack n counts once its slot starts.</summary>
     /// <param name="time">Position from the start of the stream.</param>
     /// <exception cref="ObjectDisposedException">The surface or its stream was disposed.</exception>
     public CdgFrame UpdateAt(TimeSpan time) => Render(TimeConvert.ToNanoseconds(time));
@@ -206,8 +277,11 @@ public sealed unsafe class CdgSurface : IDisposable
                 FatzAudioException.ThrowIfFailed(rc);
             }
             for (int i = 0; i < 16; i++)
+            {
                 _palette[i] = new CdgColor(f.Palette[i * 4], f.Palette[i * 4 + 1], f.Palette[i * 4 + 2], f.Palette[i * 4 + 3]);
-            return new CdgFrame(f, _palette);
+                _transparency[i] = f.Transparency[i];
+            }
+            return new CdgFrame(f, _palette, _transparency);
         }
         finally
         {

@@ -109,6 +109,13 @@ static void scroll(buf* b, int copy, int color, int hcmd, int hoff, int vcmd, in
     pack(b, copy ? 24 : 20, d);
 }
 
+static void transparent(buf* b, int color, int value)
+{
+    uint8_t d[16] = { 0 };
+    d[color] = (uint8_t)value;
+    pack(b, 28, d);
+}
+
 /* Palette: 0 black, 1 red, 2 green, 3 blue, 4 white, 5 grey. */
 static const uint8_t k_low[8][3] = { { 0, 0, 0 }, { 15, 0, 0 }, { 0, 15, 0 }, { 0, 0, 15 },
                                      { 15, 15, 15 }, { 8, 8, 8 }, { 0, 0, 0 }, { 0, 0, 0 } };
@@ -1111,9 +1118,13 @@ static void test_replay_speed(void)
         if (i % 3000 == 0) preset(&c, (int)(i / 3000) % 6, 0);
         else tile(&c, (int)(i & 1), 1, 4, (int)(i % 18), (int)(i % 50), (uint8_t)i);
     }
+    t0 = fa_monotonic_ns();
     CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    printf("  loading a 5 minute song, checkpoints included: %.2f ms\n", (fa_monotonic_ns() - t0) / 1e6);
     CHECK_EQ(fa_cdg_surface_create(s, NULL, &surf), FA_OK);
+    t0 = fa_monotonic_ns();
     CHECK_EQ(fa_cdg_surface_update_at(surf, 300LL * 1000000000, &fr), FA_OK);
+    printf("  first jump to the end: %.2f ms\n", (fa_monotonic_ns() - t0) / 1e6);
     for (round = 0; round < 3; round++) {
         /* Back by a few seconds, as a seek or scrub does: replays from a checkpoint */
         t0 = fa_monotonic_ns();
@@ -1135,6 +1146,306 @@ static void test_replay_speed(void)
         fa_cdg_surface_destroy(fresh);
     }
     fa_cdg_surface_destroy(surf);
+    fa_stream_close(s);
+    free(c.p);
+}
+
+
+/* The decoder's own state in the frame, and the transparency options built on it. */
+static void test_frame_state(void)
+{
+    buf c = { 0 };
+    fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface *ix = NULL, *tr = NULL, *bg_only = NULL, *hide = NULL, *opts = NULL;
+    fa_cdg_surface_config cfg;
+    fa_cdg_frame fr;
+    int i;
+    colors(&c, 0, k_low);          /* pack 0 */
+    transparent(&c, 1, 63);        /* 1: red invisible */
+    border(&c, 3);                 /* 2: blue border */
+    preset(&c, 2, 0);              /* 3: green screen */
+    tile(&c, 0, 2, 1, 5, 5, 0x3F); /* 4: a red tile */
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    fa_cdg_surface_config_init(&cfg);
+    cfg.pixel_format = FA_CDG_PIXELS_INDEXED8;
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &ix), FA_OK);
+    cfg.pixel_format = FA_CDG_PIXELS_BGRA32;
+    cfg.flags = FA_CDG_TRANSPARENT;
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &tr), FA_OK);
+    cfg.flags = FA_CDG_TRANSPARENT_BACKGROUND_ONLY;
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &bg_only), FA_OK);
+    cfg.flags = FA_CDG_HIDE_UNTIL_PRESET;
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &hide), FA_OK);
+    cfg.flags = FA_CDG_BACKGROUND_COLOR | FA_CDG_BACKGROUND_OPACITY;
+    cfg.background_color = 0x80112233u;
+    cfg.background_opacity = 50;
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &opts), FA_OK);
+
+    /* Before any preset: no background, no border */
+    CHECK_EQ(fa_cdg_surface_update_at(ix, t_packs(2), &fr), FA_OK);
+    CHECK_EQ(fr.background_index, -1);
+    CHECK_EQ(fr.border_index, -1);
+    CHECK_EQ(fr.transparency[1], 63);
+    CHECK_EQ(fr.transparency[0], 0);
+    for (i = 0; i < 4; i++) CHECK_EQ(fr.background[i], 0);
+    for (i = 0; i < 16; i++) CHECK_EQ(fr.palette[i][3], 255);  /* no flag: alpha untouched */
+    CHECK_EQ(fa_cdg_surface_update_at(hide, t_packs(3), &fr), FA_OK);
+    CHECK_EQ(fr.border_index, 3);
+    CHECK_EQ(px(&fr, 0, 0)[3], 0);                 /* hidden, border included */
+    CHECK_EQ(px(&fr, 150, 100)[3], 0);
+    CHECK_EQ(fa_cdg_surface_update_at(opts, t_packs(3), &fr), FA_OK);
+    CHECK(fr.background[0] == 0x11 && fr.background[1] == 0x22 && fr.background[2] == 0x33 && fr.background[3] == 64);
+
+    /* After the preset */
+    CHECK_EQ(fa_cdg_surface_update_at(ix, t_packs(5), &fr), FA_OK);
+    CHECK_EQ(fr.background_index, 2);
+    CHECK_EQ(fr.border_index, 3);
+    CHECK(fr.background[0] == 0 && fr.background[1] == 255 && fr.background[2] == 0 && fr.background[3] == 255);
+    for (i = 0; i < 16; i++) CHECK_EQ(fr.palette[i][3], 255);
+    CHECK_EQ(fa_cdg_surface_update_at(tr, t_packs(5), &fr), FA_OK);
+    CHECK_EQ(fr.palette[2][3], 0);                 /* background */
+    CHECK_EQ(fr.palette[1][3], 0);                 /* transparent-colour pack */
+    CHECK_EQ(fr.palette[1][0], 255);               /* RGB without alpha folded in */
+    CHECK_EQ(fr.background[3], 0);
+    CHECK_EQ(fa_cdg_surface_update_at(bg_only, t_packs(5), &fr), FA_OK);
+    CHECK_EQ(fr.palette[2][3], 0);
+    CHECK_EQ(fr.palette[1][3], 255);               /* the pack is ignored */
+    CHECK_EQ(fr.transparency[1], 63);              /* but still reported */
+    CHECK_EQ(px(&fr, 5 * 6 + 2, 5 * 12 + 2)[3], 255);  /* the red tile shows */
+    CHECK_EQ(px(&fr, 150, 150)[3], 0);
+    CHECK_EQ(fa_cdg_surface_update_at(hide, t_packs(5), &fr), FA_OK);
+    CHECK(is_bgra(px(&fr, 150, 150), 0, 15, 0));   /* shown from the preset on */
+    CHECK(is_bgra(px(&fr, 0, 0), 0, 15, 0));      /* the preset covers the border too */
+    CHECK_EQ(fa_cdg_surface_update_at(opts, t_packs(5), &fr), FA_OK);
+    CHECK(fr.palette[2][0] == 0x11 && fr.palette[2][1] == 0x22 && fr.palette[2][2] == 0x33 && fr.palette[2][3] == 64);
+    CHECK(memcmp(fr.background, fr.palette[2], 4) == 0);
+    CHECK_EQ(px(&fr, 150, 150)[3], 64);
+    CHECK_EQ(px(&fr, 150, 150)[2], 0x11);          /* straight alpha: R in byte 2 */
+    /* Seeking back before the preset brings -1 back */
+    CHECK_EQ(fa_cdg_surface_update_at(ix, t_packs(3), &fr), FA_OK);
+    CHECK_EQ(fr.background_index, -1);
+
+    /* Bad or old configurations */
+    {
+        fa_cdg_surface* bad = NULL;
+        cfg.background_opacity = 101;
+        CHECK_EQ(fa_cdg_surface_create(s, &cfg, &bad), FA_ERROR_INVALID_ARG);
+        cfg.flags = FA_CDG_TRANSPARENT;
+        CHECK_EQ(fa_cdg_surface_create(s, &cfg, &bad), FA_OK);   /* ignored without its flag */
+        fa_cdg_surface_destroy(bad);
+        cfg.struct_size = 20;                                    /* built before the new fields */
+        cfg.flags = FA_CDG_BACKGROUND_OPACITY;
+        CHECK_EQ(fa_cdg_surface_create(s, &cfg, &bad), FA_OK);
+        CHECK_EQ(fa_cdg_surface_update_at(bad, t_packs(5), &fr), FA_OK);
+        CHECK_EQ(fr.palette[2][3], 0);                           /* opacity read as 0, not 101 */
+        fa_cdg_surface_destroy(bad);
+    }
+    fa_cdg_surface_destroy(ix);
+    fa_cdg_surface_destroy(tr);
+    fa_cdg_surface_destroy(bg_only);
+    fa_cdg_surface_destroy(hide);
+    fa_cdg_surface_destroy(opts);
+    /* Without graphics: -1 */
+    CHECK_EQ(fa_stream_load_cdg_path(s, NULL), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &ix), FA_OK);
+    CHECK_EQ(fa_cdg_surface_update_at(ix, t_packs(5), &fr), FA_OK);
+    CHECK_EQ(fr.background_index, -1);
+    fa_cdg_surface_destroy(ix);
+    fa_stream_close(s);
+    free(c.p);
+}
+
+/* Revisions: monotonic, pixels apart from colours, unchanged by updates that change nothing. */
+static void test_revisions(void)
+{
+    buf c = { 0 };
+    fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface* ix = NULL;
+    fa_cdg_surface_config cfg;
+    fa_cdg_frame fr;
+    uint64_t rev, prev;
+    static const uint8_t other[8][3] = { { 1, 1, 1 } };
+    colors(&c, 0, k_low);          /* 0 */
+    preset(&c, 0, 0);              /* 1 */
+    tile(&c, 0, 0, 1, 2, 2, 0x3F); /* 2 */
+    colors(&c, 0, other);          /* 3 */
+    transparent(&c, 4, 10);        /* 4 */
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    fa_cdg_surface_config_init(&cfg);
+    cfg.pixel_format = FA_CDG_PIXELS_INDEXED8;
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &ix), FA_OK);
+    CHECK_EQ(fa_cdg_surface_update_at(ix, t_packs(2), &fr), FA_OK);
+    CHECK_EQ(fr.revision, 1);
+    CHECK_EQ(fr.palette_revision, 1);
+    CHECK_EQ(fa_cdg_surface_update_at(ix, t_packs(2), &fr), FA_OK);   /* nothing new */
+    CHECK_EQ(fr.revision, 1);
+    CHECK_EQ(fr.palette_revision, 1);
+    CHECK_EQ(fr.changed, 0);
+    CHECK_EQ(fa_cdg_surface_update_at(ix, t_packs(3), &fr), FA_OK);   /* a tile */
+    CHECK_EQ(fr.revision, 2);
+    CHECK_EQ(fr.palette_revision, 1);
+    CHECK_EQ(fa_cdg_surface_update_at(ix, t_packs(4), &fr), FA_OK);   /* colours only */
+    CHECK_EQ(fr.revision, 2);
+    CHECK_EQ(fr.palette_revision, 2);
+    CHECK_EQ(fa_cdg_surface_update_at(ix, t_packs(5), &fr), FA_OK);   /* transparency only */
+    CHECK_EQ(fr.revision, 2);
+    CHECK_EQ(fr.palette_revision, 3);
+    /* A seek back never lowers them */
+    prev = fr.palette_revision;
+    CHECK_EQ(fa_cdg_surface_update_at(ix, t_packs(2), &fr), FA_OK);
+    CHECK_EQ(fr.revision, 3);                     /* the tile went away */
+    CHECK(fr.palette_revision > prev);
+    rev = fr.revision;
+    CHECK_EQ(fa_cdg_surface_update_at(ix, t_packs(1), &fr), FA_OK);   /* colours, no preset yet */
+    CHECK_EQ(fr.revision, rev);                    /* screen still all 0 */
+    CHECK_EQ(fr.background_index, -1);
+    fa_cdg_surface_destroy(ix);
+    fa_stream_close(s);
+    free(c.p);
+}
+
+/* Song-length graphics: checkpoints at load, so the first far jump replays at most
+ * 10 s, and the picture equals decoding from the start. */
+static void test_checkpoints(void)
+{
+    buf c = { 0 };
+    fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface *jump = NULL, *walk = NULL;
+    fa_cdg_info ci;
+    fa_cdg_frame fr, fr2;
+    int64_t i, t;
+    CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
+    CHECK_EQ(ci.source, FA_CDG_SOURCE_NONE);
+    CHECK_EQ(ci.disc_parity, -1);
+    colors(&c, 0, k_low);
+    for (i = 1; i < 300 * 120; i++) {   /* 2 minutes */
+        if (i % 2000 == 0) preset(&c, (int)(i / 2000) % 6, 0);
+        else if (i % 7 == 0) scroll(&c, (int)(i / 7) & 1, 2, (int)(i % 3), (int)(i % 6), (int)(i % 3), (int)(i % 12));
+        else tile(&c, (int)(i & 1), 1, 4, (int)(i % 18), (int)(i % 50), (uint8_t)i);
+    }
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
+    CHECK_EQ(ci.source, FA_CDG_SOURCE_FILE);
+    CHECK_EQ(ci.pack_count, 300 * 120);
+    CHECK_EQ(ci.checkpoint_interval, 10000000000LL);
+    CHECK_EQ(ci.checkpoint_count, 12);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &jump), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &walk), FA_OK);
+    /* Jumps all over, compared with a surface that only walks forward from the start */
+    for (t = 0; t < 12; t++) {
+        fa_time at = (fa_time)((t * 7919) % 119 + 1) * 1000000000 + t_packs(t);
+        fa_time step;
+        CHECK_EQ(fa_cdg_surface_update_at(jump, at, &fr), FA_OK);
+        CHECK_EQ(fa_cdg_surface_update_at(walk, 0, &fr2), FA_OK);
+        for (step = 0; step < at; step += 3000000000LL)
+            CHECK_EQ(fa_cdg_surface_update_at(walk, step, &fr2), FA_OK);
+        CHECK_EQ(fa_cdg_surface_update_at(walk, at, &fr2), FA_OK);
+        CHECK(memcmp(fr.pixels, fr2.pixels, (size_t)fr.stride * fr.height) == 0);
+        CHECK(memcmp(fr.palette, fr2.palette, sizeof(fr.palette)) == 0);
+    }
+    fa_cdg_surface_destroy(jump);
+    fa_cdg_surface_destroy(walk);
+    free(c.p);
+
+    /* Graphics over 30 minutes space their checkpoints further apart */
+    c.p = NULL; c.n = c.cap = 0;
+    empty_packs_to(&c, (size_t)300 * 60 * 31);
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
+    CHECK_EQ(ci.checkpoint_interval, 20000000000LL);
+    CHECK_EQ(ci.checkpoint_count, 93);
+    fa_stream_close(s);
+    free(c.p);
+}
+
+/* Disc-style graphics written while they play: checkpoints follow the writes and are
+ * redone when a part already covered is rewritten with different packs. */
+static void test_checkpoints_streamed(void)
+{
+    buf c = { 0 };
+    fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface *surf = NULL, *ref = NULL;
+    fa_cdg_data* blank = NULL;
+    fa_cdg_info ci;
+    fa_cdg_frame fr, fr2;
+    uint32_t token = 0;
+    size_t i, n = 300 * 40;
+    fa_stream* r = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    colors(&c, 0, k_low);
+    for (i = 1; i < n; i++) {
+        if (i % 2500 == 0) preset(&c, (int)(i / 2500) % 6, 0);
+        else tile(&c, 0, 1, 4, (int)(i % 18), (int)(i % 50), (uint8_t)i);
+    }
+    CHECK_EQ(fa_cdg_data_blank(n, &blank), FA_OK);
+    blank->from_disc = 1;
+    CHECK(fa_stream_cdg_attach_if_none(s, blank, &token));
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &surf), FA_OK);
+    for (i = 0; i < n / 2; i += 64)      /* the first 20 s arrive */
+        CHECK(fa_stream_cdg_write(s, token, i, c.p + i * FA_CDG_PACK_BYTES, i + 64 <= n ? 64 : n - i));
+    CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
+    CHECK_EQ(ci.source, FA_CDG_SOURCE_DISC);
+    CHECK_EQ(ci.checkpoint_count, 2);
+    CHECK_EQ(ci.disc_parity, 0);
+    /* A seek: 30..40 s arrive, then the gap is filled in */
+    for (i = 300 * 30; i < n; i += 64)
+        CHECK(fa_stream_cdg_write(s, token, i, c.p + i * FA_CDG_PACK_BYTES, i + 64 <= n ? 64 : n - i));
+    CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
+    CHECK_EQ(ci.checkpoint_count, 4);           /* taken over the blank gap for now */
+    CHECK_EQ(fa_cdg_surface_update_at(surf, 35000000000LL, &fr), FA_OK);
+    for (i = n / 2; i < 300 * 30; i += 64)
+        CHECK(fa_stream_cdg_write(s, token, i, c.p + i * FA_CDG_PACK_BYTES, 64));
+    CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
+    CHECK_EQ(ci.checkpoint_count, 4);           /* redone with the real packs */
+    /* Re-reading identical packs changes nothing */
+    CHECK(fa_stream_cdg_write(s, token, 0, c.p, 64));
+    CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
+    CHECK_EQ(ci.checkpoint_count, 4);
+    /* Same pictures as the whole file loaded at once */
+    CHECK_EQ(fa_stream_load_cdg_memory(r, c.p, n * FA_CDG_PACK_BYTES), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(r, NULL, &ref), FA_OK);
+    for (i = 0; i < 5; i++) {
+        fa_time at = (fa_time)(39 - i * 8) * 1000000000 + 12345;
+        CHECK_EQ(fa_cdg_surface_update_at(surf, at, &fr), FA_OK);
+        CHECK_EQ(fa_cdg_surface_update_at(ref, at, &fr2), FA_OK);
+        CHECK(memcmp(fr.pixels, fr2.pixels, (size_t)fr.stride * fr.height) == 0);
+    }
+    fa_cdg_surface_destroy(surf);
+    fa_cdg_surface_destroy(ref);
+    fa_stream_close(s);
+    fa_stream_close(r);
+    free(c.p);
+}
+
+/* The documented timing rule: packs [0, ceil(t * 300)) at t. */
+static void test_timing_rule(void)
+{
+    buf c = { 0 };
+    fa_stream* s = open_wav_stream(2, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface* ix = NULL;
+    fa_cdg_surface_config cfg;
+    fa_cdg_frame fr;
+    colors(&c, 0, k_low);
+    empty_packs_to(&c, 299);
+    preset(&c, 1, 0);              /* pack 299 */
+    preset(&c, 2, 0);              /* pack 300 */
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    fa_cdg_surface_config_init(&cfg);
+    cfg.pixel_format = FA_CDG_PIXELS_INDEXED8;
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &ix), FA_OK);
+    CHECK_EQ(fa_cdg_surface_update_at(ix, 1000000000LL - 3333334, &fr), FA_OK);
+    CHECK_EQ(fr.background_index, -1);             /* pack 299 starts at 0.99666.. s */
+    CHECK_EQ(fa_cdg_surface_update_at(ix, 1000000000LL - 3333333, &fr), FA_OK);
+    CHECK_EQ(fr.background_index, 1);
+    CHECK_EQ(fa_cdg_surface_update_at(ix, 1000000000LL, &fr), FA_OK);
+    CHECK_EQ(fr.background_index, 1);              /* 1 s: packs 0..299 */
+    CHECK_EQ(fa_cdg_surface_update_at(ix, 1000000001LL, &fr), FA_OK);
+    CHECK_EQ(fr.background_index, 2);              /* 1 s + 1 ns: pack 300 too */
+    /* The offset shifts the timeline */
+    CHECK_EQ(fa_stream_set_cdg_offset(s, 500000000), FA_OK);
+    CHECK_EQ(fa_cdg_surface_update_at(ix, 1500000000LL, &fr), FA_OK);
+    CHECK_EQ(fr.background_index, 1);
+    CHECK_EQ(fr.time, 1000000000LL);
+    fa_cdg_surface_destroy(ix);
     fa_stream_close(s);
     free(c.p);
 }
@@ -1207,6 +1518,11 @@ int main(void)
     RUN(test_sibling_file);
     RUN(test_replay_speed);
     RUN(test_follows_audio_clock);
+    RUN(test_frame_state);
+    RUN(test_revisions);
+    RUN(test_checkpoints);
+    RUN(test_checkpoints_streamed);
+    RUN(test_timing_rule);
     fa_engine_destroy(g_engine);
     remove("cdg_pair.zip");
     remove("cdg_sibling.wav");

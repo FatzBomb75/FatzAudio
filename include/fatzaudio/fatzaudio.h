@@ -1260,8 +1260,20 @@ typedef enum fa_cdg_flags {
                                        transparent are too: for lyrics over video */
     FA_CDG_PREMULTIPLIED = 1 << 2,  /* colour multiplied by alpha (WPF Pbgra32, Direct2D,
                                        most compositors). Without it alpha is straight */
-    FA_CDG_SMOOTH        = 1 << 3   /* bilinear scaling instead of sharp (nearest) pixels;
+    FA_CDG_SMOOTH        = 1 << 3,  /* bilinear scaling instead of sharp (nearest) pixels;
                                        ignored for INDEXED8 */
+    FA_CDG_TRANSPARENT_BACKGROUND_ONLY = 1 << 4, /* like FA_CDG_TRANSPARENT, but only the
+                                       background colour is transparent: transparent-colour
+                                       packs are ignored (some discs set them in ways that
+                                       punch holes in the lyrics). Wins over FA_CDG_TRANSPARENT */
+    FA_CDG_HIDE_UNTIL_PRESET = 1 << 5, /* every colour is fully transparent until the first
+                                       screen clear (memory preset), so a picture or video
+                                       underneath shows instead of a black screen */
+    FA_CDG_BACKGROUND_COLOR = 1 << 6, /* fa_cdg_surface_config.background_color replaces the
+                                       background colour, alpha included */
+    FA_CDG_BACKGROUND_OPACITY = 1 << 7 /* fa_cdg_surface_config.background_opacity sets how
+                                       opaque the background colour is, whatever the flags
+                                       above make it */
 } fa_cdg_flags;
 
 typedef struct fa_cdg_surface_config {
@@ -1270,6 +1282,10 @@ typedef struct fa_cdg_surface_config {
     uint32_t width, height;            /* output size in pixels; 0 = native (300x216, or
                                           288x192 with FA_CDG_NO_BORDER); max 8192 */
     uint32_t flags;                    /* fa_cdg_flags */
+    uint32_t background_color;         /* 0xAARRGGBB, with FA_CDG_BACKGROUND_COLOR */
+    uint32_t background_opacity;       /* 0..100 %, with FA_CDG_BACKGROUND_OPACITY: the
+                                          background's alpha is this share of 255 (or of
+                                          background_color's alpha) */
 } fa_cdg_surface_config;
 
 FA_API void FA_CALL fa_cdg_surface_config_init(fa_cdg_surface_config* config);
@@ -1289,9 +1305,48 @@ typedef struct fa_cdg_frame {
     uint32_t dirty_x, dirty_y;         /* the pixels that changed, in output pixels; upload just
                                           this rectangle. All 0 when no pixel changed */
     uint32_t dirty_width, dirty_height;
-    uint8_t palette[16][4];            /* R, G, B, A of colours 0..15 (straight alpha) */
+    uint8_t palette[16][4];            /* R, G, B, A of colours 0..15 (straight alpha). A is
+                                          255 unless a transparency or background flag or
+                                          option is set; RGB never has alpha folded in */
     fa_time time;                      /* position on the graphics timeline that is shown */
+    /* The decoder's own state, for apps that apply their own transparency policy: */
+    int32_t background_index;          /* colour of the last memory preset (screen clear);
+                                          -1 before the first one, or without graphics */
+    int32_t border_index;              /* colour of the last border preset; -1 before one */
+    uint8_t transparency[16];          /* from transparent-colour packs: 0 opaque .. 63
+                                          invisible, whatever the surface's flags */
+    uint8_t background[4];             /* R, G, B, A the background is drawn with (palette
+                                          entry background_index, or background_color with
+                                          FA_CDG_BACKGROUND_COLOR): to fill the area around
+                                          a scaled picture. All 0 while background_index is -1
+                                          and there is no FA_CDG_BACKGROUND_COLOR */
+    uint64_t revision;                 /* goes up by one whenever an update changes a pixel
+                                          (1 after the first update): compare it with the one
+                                          a render target last uploaded */
+    uint64_t palette_revision;         /* goes up whenever palette, background_index,
+                                          border_index or transparency change */
 } fa_cdg_frame;
+
+/* What a stream's graphics are and where they come from. */
+typedef enum fa_cdg_source {
+    FA_CDG_SOURCE_NONE = 0,            /* no graphics */
+    FA_CDG_SOURCE_FILE,                /* a .cdg file, a ZIP entry or a memory block */
+    FA_CDG_SOURCE_DISC                 /* a CD+G disc's subcode, read while the track plays */
+} fa_cdg_source;
+
+typedef struct fa_cdg_info {
+    fa_cdg_source source;
+    uint64_t pack_count;               /* 300 per second (a disc track's whole length) */
+    fa_time checkpoint_interval;       /* seeks replay at most this much (10 s, longer for
+                                          files over 30 minutes) */
+    uint32_t checkpoint_count;         /* built so far: all of them for files, at load; as
+                                          the packs arrive for discs */
+    int32_t disc_parity;               /* discs: 1 = the subcode layout was chosen by the
+                                          packs' P/Q parity, 0 = by counting instructions
+                                          (drives that zero the parity). Either way the packs
+                                          are applied as read, without correction. -1 for
+                                          other sources */
+} fa_cdg_info;
 
 /* Attaches graphics to any stream, replacing what it had. The file or block is read
  * in full (memory is copied); path NULL removes the graphics. FA_ERROR_NOT_FOUND if
@@ -1302,19 +1357,35 @@ FA_API fa_result FA_CALL fa_stream_load_cdg_memory(fa_stream* stream, const void
  * For files that are out of sync; default 0. */
 FA_API fa_result FA_CALL fa_stream_set_cdg_offset(fa_stream* stream, fa_time offset);
 FA_API fa_result FA_CALL fa_stream_get_cdg_offset(fa_stream* stream, fa_time* out_offset);
+/* Never blocks on a load. A disc track reports FA_CDG_SOURCE_NONE until its graphics
+ * are found. */
+FA_API fa_result FA_CALL fa_stream_get_cdg_info(fa_stream* stream, fa_cdg_info* out_info);
 
 /* config NULL = BGRA32, native size. A stream without graphics gives a blank
  * (black) picture until graphics are loaded. Destroy every surface you create, before
  * or after closing its stream (not while fa_stream_close runs): once the stream is
- * closed, updates return FA_ERROR_INVALID_ARG. One surface is updated from one
- * thread at a time; different surfaces may be updated from different threads. */
+ * closed, updates return FA_ERROR_INVALID_ARG.
+ *
+ * Threads: one surface is updated from one thread at a time; different surfaces may
+ * be updated from different threads. An update runs on the caller's thread and never
+ * waits for the device or decode threads: it shares one short lock per stream with
+ * graphics loads, disc pack writes and the stream's other surfaces. An update with
+ * nothing new compares the palette and returns; it copies no pixels. */
 FA_API fa_result FA_CALL fa_cdg_surface_create(fa_stream* stream, const fa_cdg_surface_config* config, fa_cdg_surface** out_surface);
 FA_API void FA_CALL fa_cdg_surface_destroy(fa_cdg_surface* surface);
-/* Draws the picture for the audio heard right now. Cheap when nothing changed: call
- * it every frame and upload only when out_frame->changed. */
+/* Draws the picture for the audio heard right now (fa_stream_get_clock). Cheap when
+ * nothing changed: call it every frame and upload only when out_frame->changed. */
 FA_API fa_result FA_CALL fa_cdg_surface_update(fa_cdg_surface* surface, fa_cdg_frame* out_frame);
-/* Same, at a position you choose on the stream's timeline (ns from its start, the
- * offset still applies): for your own clock, previews, or rendering to a video file. */
+/* Same, at a position you choose on the stream's timeline: for your own clock,
+ * previews, or rendering to a video file.
+ *
+ * Timing, exactly: with g = time - the stream's CD+G offset (fa_stream_set_cdg_offset),
+ * the picture shows packs [0, ceil(g * 300 / 1e9)) applied, g in ns. Pack n occupies
+ * [n/300 s, (n+1)/300 s) and counts as soon as its slot starts: at g = 1 s exactly
+ * packs 0..299 are applied, at 1 s + 1 ns packs 0..300. g <= 0 shows no pack.
+ *
+ * Seeking anywhere replays at most fa_cdg_info.checkpoint_interval of packs from a
+ * checkpoint, even the first time and in parts never played. */
 FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_time time, fa_cdg_frame* out_frame);
 
 /* ---- MIDI ---------------------------------------------------------------
