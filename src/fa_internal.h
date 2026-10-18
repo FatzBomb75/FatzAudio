@@ -315,6 +315,8 @@ typedef struct fa_ptsmap {
     int64_t pts[FA_PTSMAP_SIZE];
     fa_atomic64 write, read;
     int64_t cur_idx, cur_pts;     /* audio thread: the anchor in effect */
+    double cur_src;               /* audio thread: source position heard at cur_idx */
+    int cur_src_ok;               /* 0 = not looked up yet for this anchor */
 } fa_ptsmap;
 
 void fa_ptsmap_reset(fa_ptsmap* m);                           /* both sides kept out */
@@ -937,6 +939,8 @@ struct fa_stream {
     fa_frames src_pos;           /* source frame of the next decoder read (worker) */
     fa_atomic32 eof;             /* the worker has written the last frame */
     fa_atomic32 flushing;        /* 1 = the audio thread must not touch the ring */
+    fa_atomic64 seek_pending;    /* fa_stream_seek_async target a worker carries out; -1 = none */
+    fa_atomic64 seek_max;        /* the last frame a pending target may be replaced with, lock-free */
     fa_atomic64 seek_base;       /* source frame at the start of the ring's data */
     fa_atomic64 played;          /* device frames consumed since seek_base (audio thread) */
     fa_atomic32 underruns;
@@ -1087,6 +1091,9 @@ fa_result fa_param_check(fa_param param, float* value);
 void fa_bus_gains_at(struct fa_bus* b, fa_device* dev, int64_t off, int from_here, float* gl, float* gr);
 int fa_stream_needs_work(struct fa_stream* s);
 void fa_stream_fill(struct fa_stream* s, int64_t max_frames);  /* caller holds decode_lock */
+/* Workers: a pending fa_stream_seek_async, then fa_stream_fill. Caller holds decode_lock.
+ * Returns 0 when nothing could be done yet (the API lock was busy). */
+int fa_stream_work(struct fa_stream* s, int64_t max_frames);
 fa_frames fa_stream_position_now(struct fa_stream* s);
 void fa_stream_free_memory(struct fa_stream* s);               /* event thread, from the graveyard */
 

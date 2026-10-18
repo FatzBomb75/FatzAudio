@@ -163,6 +163,9 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_stream_seek(StreamHandle stream, long frame);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_seek_async(StreamHandle stream, long frame);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_position(StreamHandle stream, out long frame);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

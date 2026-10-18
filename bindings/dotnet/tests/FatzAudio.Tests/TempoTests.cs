@@ -57,4 +57,15 @@ public class TempoTests
         Assert.Equal(new TempoOptions(), s.TempoOptions);
         Assert.Throws<ArgumentException>(() => s.TempoOptions = new TempoOptions { Quality = (StretchQuality)7 });
     }
+
+    [Fact]
+    public void PushStreams_TakeTempoAndRate()
+    {
+        using var engine = CreateHeadless();
+        using var s = engine.CreatePushStream(AudioFormat.Float32(48000, 2));
+        s.Tempo = 1.25f;
+        s.Rate = 0.9f;
+        Assert.Equal(1.25f, s.Tempo, 3);
+        Assert.Equal(0.9f, s.Rate, 3);
+    }
 }

@@ -297,6 +297,94 @@ static void test_device_lost_reopens_default(void)
     rec_free(&rec);
 }
 
+/* Waits for a worker to carry out a pending fa_stream_seek_async. */
+static int wait_seek_done(fa_stream* s)
+{
+    int i;
+    for (i = 0; i < 2000; i++) {
+        if (fa_load64(&s->seek_pending) < 0 && !fa_load32(&s->flushing)) return 1;
+        fa_sleep_ms(1);
+    }
+    return 0;
+}
+
+static void test_seek_async(void)
+{
+    fa_stream* s = open_attached(g_dev->rate * 4, 1, 0);
+    fa_stream* d = NULL;
+    float out[2 * 512];
+    uint32_t i;
+    fa_frames pos = 0;
+    fa_time clock = 0;
+    int k;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(s, out, 512);
+    /* A drag: only the last target matters, and the call never waits. */
+    for (k = 1; k <= 10; k++) CHECK_EQ(fa_stream_seek_async(s, k * 15000), FA_OK);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_EQ(pos, 150000);
+    CHECK_EQ(fa_stream_get_clock(s, &clock), FA_OK);
+    CHECK_NEAR((double)clock, 150000.0 * 1e9 / g_dev->rate, 1000.0);
+    CHECK(wait_seek_done(s));
+    render(s, out, 512);
+    for (i = 0; i < 512; i++) CHECK(out[i * 2] == expected(1, 150000 + i));
+    /* While one is pending, a newer target never waits for the API lock (a worker
+     * holds it while it seeks a web stream). */
+    fa_mutex_lock(&s->api_lock);       /* as a worker seeking holds it: pending 10000 */
+    fa_store64(&s->seek_max, INT64_MAX);
+    fa_store32(&s->flushing, 1);
+    fa_store64(&s->seek_pending, 10000);
+    CHECK_EQ(fa_stream_seek_async(s, 20000), FA_OK);
+    CHECK_EQ(fa_load64(&s->seek_pending), 20000);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);   /* nor does reading the position */
+    CHECK_EQ(pos, 20000);
+    fa_mutex_unlock(&s->api_lock);
+    CHECK(wait_seek_done(s));
+    render(s, out, 512);
+    for (i = 0; i < 512; i++) CHECK(out[i * 2] == expected(1, 20000 + i));
+    /* A blocking seek replaces one not carried out yet. */
+    CHECK_EQ(fa_stream_seek_async(s, 50000), FA_OK);
+    CHECK_EQ(fa_stream_seek(s, 80000), FA_OK);
+    CHECK_EQ(fa_load64(&s->seek_pending), -1);
+    CHECK(wait_seek_done(s));
+    render(s, out, 512);
+    for (i = 0; i < 512; i++) CHECK(out[i * 2] == expected(1, 80000 + i));
+    /* Out of range and not seekable are refused at once. */
+    CHECK_EQ(fa_stream_seek_async(s, (fa_frames)g_dev->rate * 5), FA_ERROR_INVALID_ARG);
+    fa_stream_close(s);
+    /* Not attached: seeks at once. */
+    {
+        size_t n;
+        uint8_t* wav = make_wav(g_dev->rate, g_dev->rate, 1, &n);
+        CHECK_EQ(fa_stream_open_memory(g_engine, wav, n, NULL, &d), FA_OK);
+        free(wav);
+        CHECK_EQ(fa_stream_seek_async(d, 1234), FA_OK);
+        CHECK_EQ(fa_stream_get_position(d, &pos), FA_OK);
+        CHECK_EQ(pos, 1234);
+        CHECK_EQ(fa_load64(&d->seek_pending), -1);
+        fa_stream_close(d);
+    }
+}
+
+/* Detaching with a seek pending continues from its target. */
+static void test_seek_async_then_detach(void)
+{
+    fa_stream* s = open_attached(g_dev->rate * 4, 1, 0);
+    fa_frames pos = 0;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    fa_mutex_lock(&s->decode_lock);    /* no worker can carry it out */
+    fa_store32(&s->flushing, 1);
+    fa_store64(&s->seek_pending, 70000);
+    fa_mutex_unlock(&s->decode_lock);
+    CHECK_EQ(fa_stream_detach(s), FA_OK);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_EQ(pos, 70000);
+    CHECK_EQ(fa_load64(&s->seek_pending), -1);
+    fa_stream_close(s);
+}
+
 static void test_detach_resumes_at_heard_position(void)
 {
     fa_stream* s = open_attached(g_dev->rate * 3, 1, 0);
@@ -1557,6 +1645,8 @@ int main(void)
     RUN(test_seek_while_attached);
     RUN(test_device_rerouted_event);
     RUN(test_device_lost_reopens_default);
+    RUN(test_seek_async);
+    RUN(test_seek_async_then_detach);
     RUN(test_detach_resumes_at_heard_position);
     RUN(test_volume_and_pan);
     RUN(test_ramp_shape_and_done_event);

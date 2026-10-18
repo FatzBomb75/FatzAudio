@@ -407,6 +407,38 @@ public unsafe class AudioStream : IDisposable
     }
 
     /// <summary>
+    /// Seeks without waiting: an engine worker drops the buffer and refills from <paramref name="position"/>,
+    /// while the stream is silent. <see cref="Position"/> and <see cref="Clock"/> report the target at once. A newer
+    /// call replaces a target not reached yet, so call it on every move of a seek bar. Use it from a UI thread and
+    /// for web streams, whose seek waits for the network. Setting <see cref="Position"/>, playing from stopped
+    /// or detaching carries out or replaces it; if the seek fails, playback goes on where it was and
+    /// <see cref="SeekFailed"/> is raised. A stream that is not attached seeks at once, like setting
+    /// <see cref="Position"/>.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// seekBar.ValueChanged += (_, e) => song.RequestSeek(TimeSpan.FromSeconds(e.NewValue));
+    /// </code>
+    /// </example>
+    /// <exception cref="ArgumentOutOfRangeException">The position is negative.</exception>
+    /// <exception cref="FatzAudioException">The stream cannot seek (<see cref="ErrorCode.NotSeekable"/>) or the
+    /// position is past the end (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    public void RequestSeek(TimeSpan position)
+    {
+        if (position < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(position));
+        RequestSeekFrames(TimeToFrames(position));
+    }
+
+    /// <summary>Like <see cref="RequestSeek(TimeSpan)"/>, in frames (sample exact).</summary>
+    /// <exception cref="ArgumentOutOfRangeException">The frame is negative.</exception>
+    /// <exception cref="FatzAudioException">The stream cannot seek or the frame is past the end.</exception>
+    public void RequestSeekFrames(long frame)
+    {
+        if (frame < 0) throw new ArgumentOutOfRangeException(nameof(frame));
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_seek_async(Handle, frame));
+    }
+
+    /// <summary>
     /// The presentation clock: the timestamp of the audio leaving the speaker right now. Follow it with your video,
     /// CD+G or lyric renderer (show the frame whose timestamp is closest) and the picture stays in sync by itself.
     /// </summary>
@@ -746,12 +778,16 @@ public unsafe class AudioStream : IDisposable
     /// <summary>Stereo pan from -1 (left) to 1 (right).</summary>
     public float Pan { get => GetParam(AudioParameter.Pan); set => SetParam(AudioParameter.Pan, value); }
 
-    /// <summary>Playback speed multiplier (0.1..10, clamped); pitch follows, like a turntable.</summary>
-    /// <exception cref="FatzAudioException">On a push or packet stream, which takes <see cref="Pitch"/> only (<see cref="ErrorCode.NotImplemented"/>).</exception>
+    /// <summary>
+    /// Playback speed multiplier (0.1..10, clamped); pitch follows, like a turntable. Push and packet streams take it
+    /// too: their <see cref="Clock"/> keeps reporting your timestamps and runs at this speed.
+    /// </summary>
     public float Rate { get => GetParam(AudioParameter.Rate); set => SetParam(AudioParameter.Rate, value); }
 
-    /// <summary>Tempo multiplier (0.1..10, clamped) with pitch preserved.</summary>
-    /// <exception cref="FatzAudioException">On a push or packet stream, which takes <see cref="Pitch"/> only (<see cref="ErrorCode.NotImplemented"/>).</exception>
+    /// <summary>
+    /// Tempo multiplier (0.1..10, clamped) with pitch preserved. Push and packet streams take it too: their
+    /// <see cref="Clock"/> keeps reporting your timestamps and runs at this tempo.
+    /// </summary>
     public float Tempo { get => GetParam(AudioParameter.Tempo); set => SetParam(AudioParameter.Tempo, value); }
 
     /// <summary>Pitch shift in semitones (-36..36, clamped) with tempo preserved.</summary>
@@ -1296,6 +1332,14 @@ public unsafe class AudioStream : IDisposable
     private readonly object _cdgEventLock = new();
 
     /// <summary>
+    /// Raised when a <see cref="RequestSeek(TimeSpan)"/> could not be carried out (for example a web server refusing
+    /// the range); playback goes on where it was. <see cref="StreamEventArgs.Position"/> is the target and
+    /// <see cref="StreamEventArgs.Value"/> the <see cref="ErrorCode"/>. Raised on the engine's event thread (never the
+    /// audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.
+    /// </summary>
+    public event EventHandler<StreamEventArgs>? SeekFailed;
+
+    /// <summary>
     /// Raised when the stream's output changed: <see cref="StreamEventArgs.Value"/> 0 when the system moved it to the
     /// new default device (a headset plugged in), 1 when the device went away (unplugged) and the output was reopened
     /// on the default. The stream stays attached and plays on. Raised on the engine's event thread (never the audio
@@ -1384,6 +1428,7 @@ public unsafe class AudioStream : IDisposable
                         new CdgRect((int)(value & 0xFFF), (int)((value >> 12) & 0xFFF), (int)((value >> 24) & 0xFFF), (int)((value >> 36) & 0xFFF)),
                         ((value >> 48) & 1) != 0, frame));
                     break;
+                case 14: SeekFailed?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
             }
         }
         catch

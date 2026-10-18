@@ -40,6 +40,8 @@ The first packaged version (NuGet `FatzAudio` with `win-x64` and `linux-x64` nat
 - Device changes: an unplugged device is reopened on the default with its streams playing on, and
   `FA_EVENT_DEVICE_CHANGED` (.NET `DeviceChanged`) is raised for reroutes and reopens.
 - `fa_stream_get_clock` is lock-free for streams on a device and file streams, safe from a render loop.
+- Tempo and rate on push and packet streams; the clock keeps the app's timestamps and runs at the speed heard.
+- Seeking without waiting: `fa_stream_seek_async` (.NET `RequestSeek`), for seek bars and web streams.
 - Tag reader with cover art and file properties (`fa_tags_*`; .NET `Tags`); bitrate, file size and audio
   size in `fa_stream_info`.
 - MIDI: DLS soundfonts and the operating system's own soundfont as the default.

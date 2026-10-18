@@ -107,6 +107,25 @@ public class CoreEngineTests
     }
 
     [Fact]
+    public async Task RequestSeek_ReportsTargetAtOnceAndPlaysFromIt()
+    {
+        using var engine = CreateHeadless();
+        using var output = engine.OpenOutput();
+        using var s = engine.OpenMemory(TestAudio.SineWav(seconds: 10));
+        s.PlayOn(output);
+        for (int i = 1; i <= 8; i++) s.RequestSeek(TimeSpan.FromSeconds(i * 0.5));   // a drag
+        Assert.Equal(TimeSpan.FromSeconds(4), s.Position);
+        Assert.InRange(s.Clock.TotalSeconds, 3.999, 4.001);
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(3);
+        while (s.Position < TimeSpan.FromSeconds(4.1) && DateTime.UtcNow < deadline) await Task.Delay(10);
+        Assert.InRange(s.Position.TotalSeconds, 4.1, 6.0);   // playing on from the target
+        Assert.Throws<ArgumentOutOfRangeException>(() => s.RequestSeek(TimeSpan.FromSeconds(-1)));
+        var ex = Assert.Throws<FatzAudioException>(() => s.RequestSeek(TimeSpan.FromSeconds(60)));
+        Assert.Equal(ErrorCode.InvalidArgument, ex.ErrorCode);
+    }
+
+    [Fact]
     public async Task Playback_ReachesEnd()
     {
         using var engine = CreateHeadless();

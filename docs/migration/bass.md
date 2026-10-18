@@ -77,6 +77,8 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_StreamPutData of PCM converted from another format (swresample first) | `fa_stream_push_frame`: any sample format, planar or interleaved, any rate; converted on a worker thread | `PushFrame(format, (nint)frame->extended_data, ...)` | ✅ |
 | BASS_StreamPutData(h, NULL, 0) to read the queued amount | `fa_stream_get_buffered` (queued + decoded ahead + device buffer, as a duration) | `Buffered` | ✅ |
 | BASS_StreamPutData with BASS_STREAMPROC_END | `fa_stream_push_end` | `End()` | ✅ |
+| BASS_ATTRIB_TEMPO / FREQ on a push stream (BASS_FX_TempoCreate over STREAMPROC_PUSH) | `FA_PARAM_TEMPO` / `FA_PARAM_RATE` on the push or packet stream itself; the clock keeps your pts and runs at that speed, so the video follows ([tempo and pitch](../features/tempo-pitch.md)) | `Tempo`, `Rate` | ✅ |
+| BASS_ChannelSetPosition from a seek bar (BASS blocks until the decoder has seeked) | `fa_stream_seek_async`: returns at once, a worker seeks; position and clock report the target at once; a drag costs one seek per worker pass ([seek cost](../features/playback.md#what-a-seek-costs)) | `RequestSeek(time)` | ✅ |
 | BASS_ChannelSetPosition(h, 0, ...) to clear a push stream after the app seeks | `fa_stream_push_flush`: drops everything queued at once; the clock holds until the new audio plays | `Flush()` | ✅ |
 | Decode compressed audio yourself (FFmpeg) and push PCM | `fa_stream_open_packets` + `fa_stream_push_packet`: packets straight from `av_read_frame`; PCM, MP3, AAC, AC-3, E-AC-3, Opus, Vorbis, FLAC, ALAC (and WMA on Windows) built in; for other codecs decode with your FFmpeg and push frames (`fa_stream_push_frame`) | `engine.OpenPackets(params)`, `PushPacket(...)` | ✅ |
 | BASS_StreamCreate (STREAMPROC callback) | Planned pull-callback source | | 🗓️ |
@@ -103,7 +105,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_ChannelGetPosition with BASS_POS_DECODE | Not needed: the position always counts what was played, never what was decoded ahead | — | ➖ (by design) |
 | BASS_ChannelBytes2Seconds / Seconds2Bytes | Not needed: frames ÷ sample rate, or use TimeSpan in .NET | — | ➖ (by design) |
 | BASS_ChannelSetAttribute VOL / PAN | `fa_stream_set_param` VOLUME / PAN, de-zippered over 5 ms ([ramps](../features/ramps.md)) | `Volume` / `Pan` | ✅ |
-| BASS_ChannelSetAttribute FREQ (playback speed and pitch together) | `FA_PARAM_RATE` as a multiplier: `new_freq / original_freq`, e.g. 1.02 for +2 %; sinc resampling, exact ([tempo and pitch](../features/tempo-pitch.md)) | `Rate` | ✅ (not on push streams) |
+| BASS_ChannelSetAttribute FREQ (playback speed and pitch together) | `FA_PARAM_RATE` as a multiplier: `new_freq / original_freq`, e.g. 1.02 for +2 %; sinc resampling, exact ([tempo and pitch](../features/tempo-pitch.md)) | `Rate` | ✅ |
 | BASS_ChannelSetAttributeEx / GetAttributeEx | Typed functions per feature instead | | ➖ (by design) |
 | BASS_ChannelSlideAttribute | `fa_stream_ramp_param` with 7 curves and an optional exact start time ([ramps](../features/ramps.md)) | `Ramp(...)` / `await RampAsync(...)` | ✅ volume, pan |
 | BASS_ChannelIsSliding | `FA_EVENT_RAMP_DONE` (one per ramp, tagged) instead of polling | `RampAsync` task, `RampCompleted` event | ✅ |
@@ -538,6 +540,8 @@ FatzAudio: open with `FA_OPEN_DECODE_ONLY`, then loop `fa_stream_read(s, buf, fr
 BASS: `BASS_ChannelSetPosition(h, BASS_ChannelSeconds2Bytes(h, 30.0), BASS_POS_BYTE);`
 
 FatzAudio: `fa_stream_seek(s, 30 * info.format.sample_rate);` or in .NET `song.Position = TimeSpan.FromSeconds(30);`
+
+From a seek bar or a UI thread, use `fa_stream_seek_async` (.NET `song.RequestSeek(TimeSpan.FromSeconds(30))`): it returns at once, a worker seeks, and a drag collapses to the newest target ([what a seek costs](../features/playback.md#what-a-seek-costs)).
 
 ### Read from your own stream (BASS_StreamCreateFileUser)
 
