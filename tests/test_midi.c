@@ -66,7 +66,7 @@ static void gen(buf* b, unsigned oper, unsigned amount) { put16le(b, oper); put1
 /* Preset 0 bank 0 ("Sine") and preset 0 bank 128 ("Kit"): the same looped 440 Hz
  * sine, root key 69, 125 ms release. `atten` (centibels) is the Sine zone's
  * initialAttenuation; 0 leaves it out. */
-static buf make_sf2_ex(unsigned atten, int kit_coarse)
+static buf make_sf2_ex3(unsigned atten, int kit_coarse, unsigned reverb)
 {
     buf sf = { 0 }, riff = { 0 }, info = { 0 }, sdta = { 0 }, pdta = { 0 }, c = { 0 };
     int i;
@@ -102,7 +102,7 @@ static buf make_sf2_ex(unsigned atten, int kit_coarse)
     putstr(&c, "EOI", 20); put16le(&c, 2);
     chunk(&pdta, "inst", &c);
     {
-        unsigned first = atten ? 4 : 3;
+        unsigned first = 3 + (atten != 0) + (reverb != 0);
         c.n = 0; put16le(&c, 0); put16le(&c, 0); put16le(&c, first); put16le(&c, 0); put16le(&c, first + 3 + (kit_coarse != 0)); put16le(&c, 0);
     }
     chunk(&pdta, "ibag", &c);
@@ -112,6 +112,7 @@ static buf make_sf2_ex(unsigned atten, int kit_coarse)
     gen(&c, 54, 1);                          /* sampleModes: loop */
     gen(&c, 38, (unsigned)(uint16_t)-3600);  /* releaseVolEnv: 2^-3 s */
     if (atten) gen(&c, 48, atten);           /* initialAttenuation */
+    if (reverb) gen(&c, 16, reverb);         /* reverbEffectsSend, 0.1% */
     gen(&c, 53, 0);                          /* sampleID */
     gen(&c, 54, 1); gen(&c, 38, (unsigned)(uint16_t)-3600);
     if (kit_coarse) gen(&c, 51, (unsigned)(uint16_t)(int16_t)kit_coarse);   /* coarseTune */
@@ -129,6 +130,7 @@ static buf make_sf2_ex(unsigned atten, int kit_coarse)
     return sf;
 }
 
+static buf make_sf2_ex(unsigned atten, int kit_coarse) { return make_sf2_ex3(atten, kit_coarse, 0); }
 static buf make_sf2_atten(unsigned atten) { return make_sf2_ex(atten, 0); }
 static buf make_sf2(void) { return make_sf2_ex(0, 0); }
 
@@ -318,6 +320,8 @@ static void test_render_and_seek_exact(void)
     static const fa_frames targets[] = { RATE, RATE + 17, 0, 66150, 30001, 2 * RATE + RATE / 2 + 3 };
     size_t t;
     CHECK(s);
+    /* Dry: a seek clears the reverb tail (test_effects seeks with effects on). */
+    fa_stream_set_midi_effects(s, 0);
     got = read_all(s, all, len, 1000);
     CHECK_EQ(got, len);
     /* Sound where the notes are, silence in the gap and the tail. */
@@ -487,6 +491,7 @@ static void test_channel_mute(void)
     fa_stream* s = open_bytes(&melody, FA_OPEN_DECODE_ONLY, NULL, NULL);
     int32_t m = 0;
     CHECK(s);
+    fa_stream_set_midi_effects(s, 0);   /* the reverb of what was heard rings on after a mute */
     CHECK_EQ(fa_stream_set_midi_channel_mute(s, 16, 1), FA_ERROR_INVALID_ARG);
     /* Muted while playing: silent within one block and the 10 ms release. */
     CHECK_EQ(read_all(s, x, RATE / 4, 512), RATE / 4);
@@ -865,12 +870,155 @@ static void test_sf3(void)
             if (fa_soundfont_open_memory(sf3.d, cut, &font) == FA_OK) fa_soundfont_close(font);
         }
     }
+    /* A codec SF3 doesn't define (sampleType 0x20): not a bank we can play. */
+    {
+        size_t k;
+        for (k = 0; k + 8 + 46 < sf3.n; k++)
+            if (memcmp(sf3.d + k, "shdr", 4) == 0) { sf3.d[k + 8 + 44] = 0x21; break; }
+        font = NULL;
+        CHECK_EQ(fa_soundfont_open_memory(sf3.d, sf3.n, &font), FA_ERROR_UNSUPPORTED_FORMAT);
+    }
     free(x); free(ogg.d); free(sf3.d); free(melody.d); free(drums.d);
 }
 
 /* Format 2: the tracks are patterns played one after another. Also: a .kar
  * header with lyric events is still karaoke, and invalid UTF-8 (an overlong
  * form) is read as Windows-1252. */
+/* One note (key 69, channel 0) from 0 to 0.5 s with CC91 / CC93 set first (-1:
+ * left at the default), and a second one at `second` seconds (0: none). */
+static buf make_fx_song(int cc91, int cc93, int second)
+{
+    buf f = { 0 }, t = { 0 };
+    mthd(&f, 0, 1, 480);
+    if (cc91 >= 0) ev3(&t, 0, 0xB0, 91, (unsigned)cc91);
+    if (cc93 >= 0) ev3(&t, 0, 0xB0, 93, (unsigned)cc93);
+    ev3(&t, 0, 0x90, 69, 127);
+    ev3(&t, 480, 0x80, 69, 0);
+    if (second) {
+        ev3(&t, (uint32_t)(second * 960 - 480), 0x90, 69, 127);
+        ev3(&t, 480, 0x80, 69, 0);
+    }
+    eot(&t, 0);
+    mtrk(&f, &t);
+    free(t.d);
+    return f;
+}
+
+/* Renders `len` frames of `song` with effects on or off. */
+static fa_frames render_fx(const buf* song, fa_soundfont* font, int effects, float* out, fa_frames len, fa_frames chunk)
+{
+    fa_stream* s = open_bytes(song, FA_OPEN_DECODE_ONLY, font, NULL);
+    fa_frames got;
+    int32_t on = -1;
+    if (!s) return 0;
+    /* On by default. */
+    if (fa_stream_get_midi_effects(s, &on) != FA_OK || on != 1) { fa_stream_close(s); return 0; }
+    if (!effects) fa_stream_set_midi_effects(s, 0);
+    got = read_all(s, out, len, chunk);
+    fa_stream_close(s);
+    return got;
+}
+
+/* Reverb and chorus follow CC91 / CC93 and the soundfont's sends, are the same
+ * whatever the read size, and a seek past the tail equals reading through. */
+static void test_effects(void)
+{
+    const fa_frames len = (fa_frames)(1.5 * RATE), note_end = RATE / 2, dry_end = RATE / 2 + RATE / 4;
+    size_t bytes = (size_t)len * 2 * sizeof(float);
+    float* dry = (float*)calloc((size_t)len * 2, sizeof(float));
+    float* wet = (float*)calloc((size_t)len * 2, sizeof(float));
+    float* other = (float*)calloc((size_t)len * 2, sizeof(float));
+    buf def = make_fx_song(-1, -1, 0), none = make_fx_song(0, 0, 0), chorus = make_fx_song(0, 127, 0);
+    buf loud = make_fx_song(127, -1, 0);
+    fa_soundfont* sendfont = NULL;
+    fa_stream* s;
+    fa_result r;
+    int32_t on;
+
+    /* Off: the dry synth, silent once the note's release is over. */
+    CHECK_EQ(render_fx(&def, g_font, 0, dry, len, 1000), len);
+    CHECK(rms(dry, 1000, note_end) > 0.1);
+    CHECK(rms(dry, dry_end, len) == 0.0);
+    /* Default (CC91 40): a reverb tail after the dry sound has ended. */
+    CHECK_EQ(render_fx(&def, g_font, 1, wet, len, 1000), len);
+    CHECK(rms(wet, dry_end, dry_end + RATE / 10) > 1e-4);
+    CHECK(rms(wet, dry_end, dry_end + RATE / 10) < 0.05);
+    /* More send, more reverb. */
+    CHECK_EQ(render_fx(&loud, g_font, 1, other, len, 1000), len);
+    CHECK(rms(other, dry_end, dry_end + RATE / 10) > 2.0 * rms(wet, dry_end, dry_end + RATE / 10));
+    /* Read size changes nothing. */
+    CHECK_EQ(render_fx(&def, g_font, 1, other, len, 4093), len);
+    CHECK(memcmp(wet, other, bytes) == 0);
+    /* CC91 and CC93 0: exactly the dry sound. */
+    CHECK_EQ(render_fx(&none, g_font, 1, other, len, 777), len);
+    CHECK(memcmp(dry, other, bytes) == 0);
+    /* Chorus: changes the sound while the note plays, gone 20 ms after the dry. */
+    CHECK_EQ(render_fx(&chorus, g_font, 1, other, len, 1000), len);
+    {
+        double diff = 0;
+        fa_frames i;
+        for (i = 2000; i < note_end; i++) diff += fabs((double)other[i * 2] - dry[i * 2]);
+        CHECK(diff / (double)(note_end - 2000) > 1e-3);
+    }
+    CHECK(rms(other, dry_end + RATE / 50, len) == 0.0);
+    /* The soundfont's own reverb send (50%) with CC91 0. */
+    {
+        buf sf = make_sf2_ex3(0, 0, 500);
+        CHECK_EQ(fa_soundfont_open_memory(sf.d, sf.n, &sendfont), FA_OK);
+        free(sf.d);
+        CHECK_EQ(render_fx(&none, sendfont, 1, other, len, 1000), len);
+        CHECK(rms(other, dry_end, dry_end + RATE / 10) > 1e-4);
+    }
+    /* A sound much shorter than the reverb's first echo still leaves a tail:
+     * muted after 512 frames (it ends within 10 ms). */
+    s = open_bytes(&loud, FA_OPEN_DECODE_ONLY, g_font, &r);
+    CHECK(s);
+    if (s) {
+        CHECK_EQ(read_all(s, other, 512, 512), 512);
+        CHECK_EQ(fa_stream_set_midi_channel_mute(s, 0, 1), FA_OK);
+        CHECK_EQ(read_all(s, other, RATE / 2, 512), RATE / 2);
+        CHECK(rms(other, RATE / 20, RATE / 5) > 1e-5);
+        fa_stream_close(s);
+    }
+    /* Off while the tail rings: it stops at once (by the next block). */
+    s = open_bytes(&def, FA_OPEN_DECODE_ONLY, g_font, &r);
+    CHECK(s);
+    if (s) {
+        CHECK_EQ(read_all(s, other, dry_end, 1000), dry_end);
+        CHECK_EQ(fa_stream_set_midi_effects(s, 0), FA_OK);
+        CHECK_EQ(fa_stream_get_midi_effects(s, &on), FA_OK);
+        CHECK_EQ(on, 0);
+        CHECK_EQ(read_all(s, other, len - dry_end, 1000), len - dry_end);
+        CHECK(rms(other, 64, len - dry_end) == 0.0);
+        fa_stream_close(s);
+    }
+    free(dry); free(wet); free(other);
+    /* A seek past the tail (the second note at 5 s) equals reading through. */
+    {
+        buf two = make_fx_song(127, 127, 5);
+        fa_frames total = (fa_frames)(6.5 * RATE), at = 4 * RATE + RATE / 2 + 4321;
+        float* all = (float*)calloc((size_t)total * 2, sizeof(float));
+        float* part = (float*)calloc((size_t)total * 2, sizeof(float));
+        s = open_bytes(&two, FA_OPEN_DECODE_ONLY, g_font, &r);
+        CHECK(s);
+        if (s) {
+            CHECK_EQ(read_all(s, all, total, 1000), total);
+            CHECK(rms(all, 4 * RATE, 5 * RATE) == 0.0);   /* the tail has died away */
+            CHECK(rms(all, 5 * RATE + 1000, 5 * RATE + RATE / 2) > 0.1);
+            CHECK_EQ(fa_stream_seek(s, at), FA_OK);
+            CHECK_EQ(read_all(s, part, total - at, 999), total - at);
+            CHECK(memcmp(all + at * 2, part, (size_t)(total - at) * 2 * sizeof(float)) == 0);
+            fa_stream_close(s);
+        }
+        /* Not a MIDI stream, or no stream. */
+        CHECK_EQ(fa_stream_set_midi_effects(NULL, 1), FA_ERROR_INVALID_ARG);
+        CHECK_EQ(fa_stream_get_midi_effects(NULL, &on), FA_ERROR_INVALID_ARG);
+        free(all); free(part); free(two.d);
+    }
+    fa_soundfont_close(sendfont);
+    free(def.d); free(none.d); free(chorus.d); free(loud.d);
+}
+
 static void test_format2(void)
 {
     buf f = { 0 }, t = { 0 };
@@ -1306,7 +1454,11 @@ static fa_frames render_note(fa_soundfont* font, int ch, int prog, int key, floa
     buf song = make_prog_note(ch, prog, key);
     fa_stream* s = open_bytes(&song, FA_OPEN_DECODE_ONLY, font, NULL);
     fa_frames got = 0;
-    if (s) { got = read_all(s, x, 2 * RATE, 4096); fa_stream_close(s); }
+    if (s) {
+        fa_stream_set_midi_effects(s, 0);   /* the instrument alone */
+        got = read_all(s, x, 2 * RATE, 4096);
+        fa_stream_close(s);
+    }
     free(song.d);
     return got;
 }
@@ -1450,6 +1602,7 @@ int main(void)
     RUN(test_seek_restarts_held_notes);
     RUN(test_tempo_and_signature_marks);
     RUN(test_sf3);
+    RUN(test_effects);
     RUN(test_format2);
     RUN(test_not_midi);
     RUN(test_soundfont_lifetime);

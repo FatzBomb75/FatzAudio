@@ -20,6 +20,8 @@
 #define SF3_CODEC_MASK 0x30                 /* sampleType bits: compressed */
 #define SF3_ROM 0x8000
 #define SF3_MAX_SAMPLE_FRAMES (1u << 26)    /* about 25 minutes at 44.1 kHz */
+#define SF3_VORBIS 0x10
+#define SF3_MAX_SMPL_BYTES ((size_t)1 << 30)  /* decoded samples, like the largest SF2 accepted */
 
 static uint16_t rd16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t rd32(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
@@ -109,13 +111,14 @@ static int find_parts(const uint8_t* d, size_t n, sf3_parts* p)
     top.pos = 0;
     while (riff_next(&top, &id, &data, &size)) {
         if (memcmp(id, "LIST", 4) != 0 || size < 4) continue;
-        if (memcmp(data, "INFO", 4) == 0) { p->info = data + 4; p->info_size = size - 4; }
-        if (memcmp(data, "sdta", 4) == 0) {
+        /* The first of each list, as the SF2 loader reads it. */
+        if (memcmp(data, "INFO", 4) == 0 && !p->info) { p->info = data + 4; p->info_size = size - 4; }
+        if (memcmp(data, "sdta", 4) == 0 && !p->smpl) {
             sub.p = data + 4; sub.n = size - 4; sub.pos = 0;
             while (riff_next(&sub, &sid, &sdata, &ssize))
                 if (memcmp(sid, "smpl", 4) == 0 && !p->smpl) { p->smpl = sdata; p->smpl_size = ssize; }
         }
-        if (memcmp(data, "pdta", 4) == 0) {
+        if (memcmp(data, "pdta", 4) == 0 && !p->pdta) {
             p->pdta = data + 4; p->pdta_size = size - 4;
             sub.p = p->pdta; sub.n = p->pdta_size; sub.pos = 0;
             while (riff_next(&sub, &sid, &sdata, &ssize))
@@ -150,7 +153,7 @@ static uint32_t decode_vorbis(const uint8_t* p, size_t n, obuf* out)
     if (strcmp(dec.codec, "vorbis") == 0 && dec.format.channels >= 1 && dec.format.channels <= 8) {
         uint32_t ch = dec.format.channels;
         fa_frames want = (fa_frames)(sizeof(buf) / sizeof(buf[0]) / ch), got = 0, i;
-        while (frames < SF3_MAX_SAMPLE_FRAMES && fa_decoder_read(&dec, buf, want, &got) == FA_OK && got > 0) {
+        while (frames < SF3_MAX_SAMPLE_FRAMES && out->n < SF3_MAX_SMPL_BYTES && fa_decoder_read(&dec, buf, want, &got) == FA_OK && got > 0) {
             uint8_t* at = ob_room(out, (size_t)got * 2);
             if (!at) break;
             for (i = 0; i < got; i++) {
@@ -191,6 +194,8 @@ fa_result fa_sf3_to_sf2(const uint8_t* d, size_t n, uint8_t** out, size_t* out_n
         if (type & SF3_ROM) {
             /* ROM samples (of a sound card) have no data in the file. */
         } else if (type & SF3_CODEC_MASK) {
+            /* Vorbis is the only codec SF3 defines. */
+            if ((type & SF3_CODEC_MASK) != SF3_VORBIS) { free(smpl.d); free(shdr.d); return FA_ERROR_UNSUPPORTED_FORMAT; }
             if (start < end && end <= p.smpl_size) frames = decode_vorbis(p.smpl + start, end - start, &smpl);
             /* Loops are relative to the sample's start in SF3. */
             sl = sl < frames ? sl : frames;
@@ -213,7 +218,9 @@ fa_result fa_sf3_to_sf2(const uint8_t* d, size_t n, uint8_t** out, size_t* out_n
             sl = 0;
             el = 1;
         }
-        if ((size_t)at + frames + SF2_PAD > 0x7FFFFFFFu) { free(smpl.d); free(shdr.d); return FA_ERROR_UNSUPPORTED_FORMAT; }
+        /* Many samples that decode to a lot (long silences compress to almost
+         * nothing) would make a small file a huge bank. */
+        if ((size_t)at + frames + SF2_PAD > 0x7FFFFFFFu || smpl.n >= SF3_MAX_SMPL_BYTES) { free(smpl.d); free(shdr.d); return FA_ERROR_UNSUPPORTED_FORMAT; }
         ob_put(&smpl, NULL, SF2_PAD * 2);
         wr32(rec + 20, at);
         wr32(rec + 24, at + frames);

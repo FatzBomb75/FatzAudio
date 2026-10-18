@@ -165,6 +165,7 @@ public class MidiTests
         Assert.Equal(Rate, info.Format.SampleRate);
         Assert.Equal(2, info.Format.Channels);
         Assert.Equal(3L * Rate, info.LengthFrames); // last event at 2 s, plus 1 s to ring out
+        s.MidiEffects = false; // dry: silence in the gap, and a seek clears the reverb tail
         var all = ReadAll(s, 3L * Rate);
         Assert.True(Rms(all, 1000, 20000) > 0.1);
         Assert.True(Rms(all, 30000, 65000) < 1e-6);
@@ -229,6 +230,9 @@ public class MidiTests
         s.MidiTranspose = -12;
         Assert.Equal(-12, s.MidiTranspose);
         Assert.Throws<ArgumentOutOfRangeException>(() => s.MidiTranspose = 49);
+        Assert.True(s.MidiEffects);
+        s.MidiEffects = false;
+        Assert.False(s.MidiEffects);
         s.SetMidiChannelMuted(0, true);
         Assert.True(s.IsMidiChannelMuted(0));
         Assert.False(s.IsMidiChannelMuted(1));
@@ -305,6 +309,7 @@ public class MidiTests
         Assert.Equal("Test DLS", font.Info.Name);
         Assert.Equal(1, font.Info.PresetCount);
         using var s = engine.OpenMemory(Song(), DecodeOnly with { SoundFont = font });
+        s.MidiEffects = false;
         var all = ReadAll(s, 3L * Rate);
         Assert.True(Rms(all, 1000, 20000) > 0.1);
         Assert.True(Rms(all, 30000, 65000) < 1e-3);
