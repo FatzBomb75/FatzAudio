@@ -174,6 +174,7 @@ static fa_result stream_open_decoder(struct fa_stream* s, const char* name_hint,
     if (r != FA_OK) return r;
     if ((s->flags & FA_OPEN_PRESCAN) && s->decoder.vt->prescan) s->decoder.vt->prescan(&s->decoder);
     s->decoder_ready = 1;
+    fa_source_drop_prefix(&s->source);
     s->midi = fa_midi_of(&s->decoder);
     if (!s->midi) {
         /* Only MIDI streams use the soundfont: don't keep a replaced bank alive. */

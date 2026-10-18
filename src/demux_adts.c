@@ -149,7 +149,7 @@ static int chained(adts* a, int64_t at, const adts_hdr* h)
 {
     fa_source* src = a->br.src;
     const uint8_t* d;
-    size_t n = fa_source_peek(src, &d);
+    size_t n = fa_source_peek_held(src, &d);
     int64_t next = at + (int64_t)h->len;
     adts_hdr h2;
     if (src->length > 0 && next == src->length) return 1;

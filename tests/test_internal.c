@@ -929,6 +929,59 @@ static void test_counters_wrap(void)
     rec_free(&rec);
 }
 
+/* A file's first bytes are kept only while the format is found: the open stream
+ * lets them go, and a later look reads them again without moving the reader.
+ * App callbacks keep them (they may not seek back to replay them). */
+static void test_source_prefix_dropped(void)
+{
+    const char* path = "fa_test_source_prefix.wav";
+    size_t n, k;
+    uint8_t* wav = make_wav(44100, 9000, 1, &n);
+    const uint8_t* head;
+    uint8_t got[100];
+    fa_source src;
+    fa_stream* s = NULL;
+    FILE* f = fopen(path, "wb");
+    CHECK(f != NULL);
+    CHECK_EQ(fwrite(wav, 1, n, f), n);
+    fclose(f);
+
+    CHECK_EQ(fa_source_open_path(&src, path), FA_OK);
+    CHECK_EQ(fa_source_peek(&src, &head), FA_PROBE_BYTES);
+    CHECK(memcmp(head, wav, FA_PROBE_BYTES) == 0);
+    CHECK_EQ(fa_source_seek(&src, 5000), FA_OK);
+    fa_source_drop_prefix(&src);
+    CHECK_EQ(fa_source_peek_held(&src, &head), 0);
+    CHECK_EQ(fa_source_peek(&src, &head), FA_PROBE_BYTES);
+    CHECK(memcmp(head, wav, FA_PROBE_BYTES) == 0);
+    CHECK_EQ(fa_source_peek_held(&src, &head), FA_PROBE_BYTES);
+    CHECK_EQ(fa_source_read(&src, got, sizeof(got)), sizeof(got));
+    CHECK(memcmp(got, wav + 5000, sizeof(got)) == 0);
+    fa_source_close(&src);
+
+    /* A memory block is looked at in place. */
+    CHECK_EQ(fa_source_open_memory_ref(&src, wav, n), FA_OK);
+    CHECK_EQ(fa_source_peek(&src, &head), FA_PROBE_BYTES);
+    CHECK(head == wav);
+    fa_source_close(&src);
+
+    CHECK_EQ(fa_stream_open_path(g_engine, path, NULL, &s), FA_OK);
+    CHECK(s->source.prefix_buf == NULL);
+    CHECK_EQ(fa_source_peek_held(&s->source, &head), 0);
+    for (k = 0; k < 3; k++) {
+        float out[64];
+        fa_frames frames = 0;
+        uint32_t i;
+        CHECK_EQ(fa_stream_seek(s, k * 3000), FA_OK);
+        CHECK_EQ(fa_stream_read(s, out, 64, &frames), FA_OK);
+        CHECK_EQ(frames, 64);
+        for (i = 0; i < 64; i++) CHECK(out[i] == expected(1, (uint32_t)(k * 3000 + i)));     /* mono */
+    }
+    fa_stream_close(s);
+    remove(path);
+    free(wav);
+}
+
 /* libvorbis's inverse MDCT through FatzAudio's (third_party/XIPH.md), in place:
  * x[0..n/2) coefficients in, x[0..n) = sum_k c[k] cos(2 pi/n (j + 1/2 + n/4)(k + 1/2))
  * out, for every Vorbis block size; two transforms of a size share their tables. */
@@ -1009,6 +1062,7 @@ int main(void)
     RUN(test_counters_wrap);
     RUN(test_full_queue_never_drops);
     RUN(test_vorbis_imdct);
+    RUN(test_source_prefix_dropped);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

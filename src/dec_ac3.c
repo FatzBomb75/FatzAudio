@@ -308,7 +308,7 @@ static int followed(ac3_raw* a, int64_t at, const fa_ac3_header* h)
 {
     fa_source* src = a->br.src;
     const uint8_t* d;
-    size_t n = fa_source_peek(src, &d);
+    size_t n = fa_source_peek_held(src, &d);
     int64_t next = at + (int64_t)h->frame_size;
     fa_ac3_header h2;
     if (src->length > 0 && next == src->length) return 1;
@@ -365,7 +365,7 @@ static fa_result read_frame(ac3_raw* a, const fa_ac3_header* h, size_t at)
 {
     size_t have;
     if (at + h->frame_size > a->data_cap) {
-        size_t c = a->data_cap ? a->data_cap : 8192;
+        size_t c = a->data_cap ? a->data_cap : 4096;    /* an AC-3 or E-AC-3 frame is at most 4096 bytes */
         uint8_t* p;
         while (c < at + h->frame_size) c *= 2;
         p = (uint8_t*)realloc(a->data, c);
