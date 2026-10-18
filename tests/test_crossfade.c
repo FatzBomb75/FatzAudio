@@ -391,7 +391,7 @@ static void test_crossfade_equal_power(void)
     CHECK_EQ(st, FA_STATE_SCHEDULED);
     render(len + 4096);
     for (i = 0; i < g_rec_frames; i++) if (R(i) != 0.0f) { start = i; break; }
-    CHECK(start > 1024);
+    CHECK_EQ(start, 1024 + g_dev->limiter.delay + 1);        /* the next callback (b is silent on its first frame) */
     CHECK_NEAR(L(start - 1), 0.5, 1e-6);                     /* a untouched before */
     for (i = 0; i <= len; i += 500) {
         double t = (double)i / (double)len;
@@ -421,6 +421,47 @@ static void test_crossfade_equal_power(void)
     fa_stream_close(a);
     fa_stream_close(b);
     rec_free(&ra); rec_free(&rb);
+}
+
+/* A callback that starts while fa_crossfade is posting (it holds the device's
+ * xf_lock) leaves every start and command due by its first frame for the next
+ * callback, which takes them together; a start later in the callback is still
+ * exact. */
+static void test_crossfade_posting_defers(void)
+{
+    fa_stream* a = open_wav(48000, 0, 0, 1);
+    fa_stream* b = open_wav(48000, 0, 0, 1);
+    fa_stream* c = open_wav(48000, 0, 0, 1);
+    int64_t clock, d = g_dev->limiter.delay, k0 = 1024 + d, k1 = k0 + PERIOD + d;
+    CHECK(a != NULL && b != NULL && c != NULL);
+    CHECK_EQ(fa_stream_set_param(a, FA_PARAM_PAN, -1.0f), FA_OK);
+    CHECK_EQ(fa_stream_set_param(b, FA_PARAM_PAN, 1.0f), FA_OK);
+    CHECK_EQ(fa_stream_set_param(c, FA_PARAM_PAN, 1.0f), FA_OK);
+    CHECK_EQ(fa_stream_play(a), FA_OK);
+    rec_reset();
+    render(1024);
+    /* What fa_crossfade does, stopped halfway: b scheduled for the next callback
+     * and a's fade posted, the lock still held. c is scheduled 100 frames later. */
+    fa_mutex_lock(&g_dev->xf_lock);
+    clock = fa_load64(&g_dev->clock);
+    CHECK_EQ(clock, g_rec_base + k0);
+    fa_store64(&b->start_frame, clock);
+    fa_store32(&b->state, FA_STATE_SCHEDULED);
+    CHECK_EQ(fa_stream_set_param(a, FA_PARAM_VOLUME, 0.0f), FA_OK);
+    fa_store64(&c->start_frame, clock + 100);
+    fa_store32(&c->state, FA_STATE_SCHEDULED);
+    render(PERIOD);                                /* mix frames k0 to k1 (callbacks of PERIOD and d) */
+    fa_mutex_unlock(&g_dev->xf_lock);
+    CHECK_EQ(fa_stream_stop(c), FA_OK);
+    render(4096);
+    CHECK(R(k0 + 99) == 0.0f && R(k0 + 100) > 0.0f);  /* c on its frame */
+    CHECK_NEAR(L(k1 - 1), 0.5, 1e-6);              /* a untouched */
+    CHECK_NEAR(R(k1 - 1), 0.5, 1e-6);              /* c only, no b */
+    CHECK_NEAR(R(k1), 0.5, 1e-6);                  /* b from the first frame of the next callback */
+    CHECK_NEAR(L(k1 + 4000), 0.0, 1e-6);           /* and a's command taken then too */
+    fa_stream_close(a);
+    fa_stream_close(b);
+    fa_stream_close(c);
 }
 
 static void test_queue_is_gapless(void)
@@ -790,6 +831,7 @@ int main(void)
     RUN(test_loop_between_cues);
     RUN(test_marker_fades);
     RUN(test_crossfade_equal_power);
+    RUN(test_crossfade_posting_defers);
     RUN(test_queue_is_gapless);
     RUN(test_queue_crossfade_and_mix_point);
     RUN(test_queue_rejects_playing_next);

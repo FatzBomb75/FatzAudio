@@ -42,7 +42,7 @@ await current.CrossfadeTo(next, TimeSpan.FromSeconds(5));   // equal power by de
 current.Dispose();
 ```
 
-- `next` starts from its cue-in (or where it is, if paused) and fades in while `current` fades out. Both fades start on the same frame, one device period (about 10 ms) from the call.
+- `next` starts from its cue-in (or where it is, if paused) and fades in while `current` fades out. Both fades start on the same frame: the first frame of the next audio callback, within one device period (usually 10 ms) of the call, or rarely the callback after it.
 - The outgoing side plays the curve backwards, so the pair is symmetric. With equal power, out² + in² = 1 at every frame: no dip and no bump in loudness.
 - When its fade is done, `current` ends (`FA_STATE_ENDED`, `FA_EVENT_ENDED`). `fa_stream_play` would start it again from its cue-in.
 - `next` joins `current`'s device and bus if it isn't attached yet.

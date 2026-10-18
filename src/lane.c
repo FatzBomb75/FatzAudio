@@ -75,6 +75,11 @@ float fa_lane_get(fa_lane* l)
 
 int fa_lane_take(fa_lane* l, int audible, uint32_t rate, int64_t* out_replaced_tag)
 {
+    return fa_lane_take_after(l, INT64_MIN, audible, rate, out_replaced_tag);
+}
+
+int fa_lane_take_after(fa_lane* l, int64_t hold_upto, int audible, uint32_t rate, int64_t* out_replaced_tag)
+{
     fa_param_mailbox* m = &l->mb;
     fa_param_voice* v = &l->v;
     fa_param_slot* slot;
@@ -94,6 +99,7 @@ int fa_lane_take(fa_lane* l, int audible, uint32_t rate, int64_t* out_replaced_t
     start = fa_load_float(&slot->start);
     at = fa_load64(&slot->at);
     flags = fa_load32(&slot->flags);
+    if (hold_upto != INT64_MIN && at <= hold_upto) return 0;   /* at < 0: at once */
     if (!fa_cas32(&m->word, w, w | FA_CMD_CLAIMED)) return 0; /* replaced meanwhile; take it next time */
     if (has_start) v->value = start;
 
