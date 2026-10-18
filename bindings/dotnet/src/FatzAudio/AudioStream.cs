@@ -1225,6 +1225,39 @@ public unsafe class AudioStream : IDisposable
     /// but should return quickly, since they delay later events.
     /// </summary>
     public event EventHandler<StreamEventArgs>? Looped;
+    /// <summary>
+    /// Raised when the CD+G picture heard now changes: lyrics being coloured in, a screen clear, a colour change, a
+    /// seek, new graphics. Call <see cref="CdgSurface.Update"/> on your surfaces then, instead of every frame. The
+    /// first event after subscribing covers the whole screen. Subscribing turns the native events on; removing the
+    /// last handler turns them off. Raised on the engine's event thread (never the audio thread), at most once per
+    /// few milliseconds; handlers may call any FatzAudio method but should return quickly.
+    /// </summary>
+    public event EventHandler<CdgChangedEventArgs>? CdgChanged
+    {
+        add
+        {
+            lock (_cdgEventLock)
+            {
+                bool first = _cdgChanged == null;
+                _cdgChanged += value;
+                if (first && _cdgChanged != null)
+                    FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_cdg_events(Handle, 1));
+            }
+        }
+        remove
+        {
+            lock (_cdgEventLock)
+            {
+                _cdgChanged -= value;
+                if (_cdgChanged != null || _handle.IsClosed) return;
+                try { NativeMethods.fa_stream_set_cdg_events(_handle, 0); }
+                catch (ObjectDisposedException) { /* closed meanwhile: its events stopped with it */ }
+            }
+        }
+    }
+    private EventHandler<CdgChangedEventArgs>? _cdgChanged;
+    private readonly object _cdgEventLock = new();
+
     /// <summary>Raised when the output device changed. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler<StreamEventArgs>? DeviceChanged;
 
@@ -1304,6 +1337,11 @@ public unsafe class AudioStream : IDisposable
                     if (MidiTextReached is { } onText) onText(this, new MidiTextEventArgs(GetMidiText((int)value)));
                     break;
                 case 12: Looped?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
+                case 13:
+                    _cdgChanged?.Invoke(this, new CdgChangedEventArgs(
+                        new CdgRect((int)(value & 0xFFF), (int)((value >> 12) & 0xFFF), (int)((value >> 24) & 0xFFF), (int)((value >> 36) & 0xFFF)),
+                        ((value >> 48) & 1) != 0, frame));
+                    break;
             }
         }
         catch

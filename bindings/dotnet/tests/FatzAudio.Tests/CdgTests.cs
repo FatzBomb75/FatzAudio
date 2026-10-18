@@ -107,6 +107,22 @@ public class CdgTests
     }
 
     [Fact]
+    public void CdgChanged_RaisedWithTheWholeScreenFirst()
+    {
+        using var engine = CreateHeadless();
+        using var song = engine.OpenMemory(TestAudio.SineWav(), DecodeOnly);
+        song.LoadCdg(SimpleCdg());
+        using var got = new ManualResetEventSlim();
+        CdgChangedEventArgs? first = null;
+        EventHandler<CdgChangedEventArgs> handler = (_, e) => { first ??= e; got.Set(); };
+        song.CdgChanged += handler;
+        Assert.True(got.Wait(TimeSpan.FromSeconds(5)));
+        Assert.Equal(new CdgRect(0, 0, 300, 216), first!.Area);
+        Assert.True(first.PaletteChanged);
+        song.CdgChanged -= handler;
+    }
+
+    [Fact]
     public void SurfaceOptions_ScaleCropAndTransparency()
     {
         using var engine = CreateHeadless();

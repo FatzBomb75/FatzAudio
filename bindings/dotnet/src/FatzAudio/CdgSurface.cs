@@ -70,6 +70,25 @@ public enum CdgSource
 /// did (drives that zero the parity). Either way the packs are applied as read. Null for other sources.</param>
 public readonly record struct CdgInfo(CdgSource Source, long PackCount, TimeSpan CheckpointInterval, int CheckpointCount, bool? DiscParity);
 
+/// <summary>What changed in the CD+G picture: see <see cref="AudioStream.CdgChanged"/>.</summary>
+public sealed class CdgChangedEventArgs : EventArgs
+{
+    internal CdgChangedEventArgs(CdgRect area, bool paletteChanged, long packs)
+    {
+        Area = area;
+        PaletteChanged = paletteChanged;
+        Packs = packs;
+    }
+
+    /// <summary>The changed area in native 300x216 screen pixels (a surface's <see cref="CdgFrame.Dirty"/> is in its
+    /// own pixels). Empty when only colours changed.</summary>
+    public CdgRect Area { get; }
+    /// <summary>True when colours or transparency changed.</summary>
+    public bool PaletteChanged { get; }
+    /// <summary>The number of CD+G packs now shown (300 per second).</summary>
+    public long Packs { get; }
+}
+
 /// <summary>A palette colour of a CD+G picture, straight (not premultiplied) alpha.</summary>
 /// <param name="R">Red, 0..255.</param>
 /// <param name="G">Green, 0..255.</param>

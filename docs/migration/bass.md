@@ -392,6 +392,7 @@ BASS has no CD+G decoder: apps read the `.cdg` themselves, time it from `BASS_Ch
 | Your own sync offset | `fa_stream_set_cdg_offset` | `song.CdgOffset` | ✅ |
 | Converting the 300x216 index buffer to a bitmap, scaling, borders | `fa_cdg_surface_config`: BGRA/RGBA/indexed, any size, sharp or smooth, with or without border, transparent background, premultiplied | `CdgSurfaceOptions` | ✅ |
 | Your own transparency policy (background index only, ignoring transparent-colour packs), background opacity or colour | `FA_CDG_TRANSPARENT_BACKGROUND_ONLY`, `FA_CDG_HIDE_UNTIL_PRESET`, `FA_CDG_BACKGROUND_COLOR`, `FA_CDG_BACKGROUND_OPACITY`; or INDEXED8 with `fa_cdg_frame.background_index`, `border_index`, `transparency` | `CdgSurfaceOptions.TransparentBackgroundOnly`, `HideUntilPreset`, `BackgroundColor`, `BackgroundOpacity`; `CdgFrame.BackgroundIndex` | ✅ |
+| A timer that polls the position to find out whether the lyrics changed | `fa_stream_set_cdg_events` + `FA_EVENT_CDG_CHANGED` with the changed area | `song.CdgChanged` | ✅ |
 | Tracking which render targets need a re-upload | `fa_cdg_frame.revision` / `palette_revision` | `CdgFrame.Revision` / `PaletteRevision` | ✅ |
 | Your own seek checkpoints so scrubbing doesn't replay the whole `.cdg` | Built in: checkpoints every 10 s, at load for files and as packs arrive for discs | Built in | ✅ |
 | Redrawing the whole bitmap each tick | Upload only `frame.dirty_*`, only when `frame.changed` | `frame.Changed`, `frame.Dirty` | ✅ |

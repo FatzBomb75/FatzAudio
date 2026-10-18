@@ -624,6 +624,7 @@ struct fa_engine {
     struct fa_stream* streams;   /* attached streams the workers keep filled */
     struct fa_device* devices;
     struct fa_stream* graveyard; /* closed streams, freed by the event thread */
+    struct fa_stream* cdg_watched; /* streams with CD+G change events (cdg.c), via cdg_watch_link */
     fa_qevent* pending;          /* events posted by API/worker threads */
     uint32_t pending_count, pending_cap;
 
@@ -997,6 +998,15 @@ struct fa_stream {
     struct fa_cdg_surface* cdg_surfaces;
     uint32_t cdg_gen;
     fa_atomic64 cdg_offset;      /* fa_time */
+    /* FA_EVENT_CDG_CHANGED (fa_stream_set_cdg_events): the event thread follows the
+     * clock over the packs. cdg_events is read without the lock; the rest under it. */
+    fa_atomic32 cdg_events;
+    struct fa_stream* cdg_watch_link; /* engine->cdg_watched, under list_lock */
+    int cdg_watch_listed;        /* under list_lock */
+    size_t cdg_watch_next;       /* packs the app was last told about */
+    uint32_t cdg_watch_gen;
+    int cdg_watch_dirty;         /* report the whole screen next (enabled, packs rewritten) */
+    int cdg_watch_shifted;       /* smooth-scroll offsets are not 0: tiles move */
 
     /* Encoders (encode.c): taps recording what the stream plays (fa_enc_list*, read
      * by the audio thread), and the one reading it as a decode-only stream. Both

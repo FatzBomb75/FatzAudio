@@ -175,6 +175,29 @@ for (each render target t) {
 
 The revisions let one surface feed several render targets (a main window and a projector window, each with its own textures): each target compares them with what it last uploaded. `changed` and the dirty rectangle are relative to the previous update and suit a single target.
 
+### Change events (push model)
+
+Apps that would rather be told than call update every frame turn on `fa_stream_set_cdg_events(song, 1)`. The engine's event thread then follows the stream's clock over the packs and raises `FA_EVENT_CDG_CHANGED` on the stream's event callback whenever the picture heard changes: lyrics being coloured in, a screen clear, a colour change, a seek, new graphics (a disc's included). Packs that change nothing raise nothing, a paused stream raises nothing, and one event covers all packs since the last (at most one every few milliseconds). The first event after turning it on covers the whole screen.
+
+On the event, update your surfaces (in the callback, or by waking your render thread) and upload what they report. Surfaces stay yours: the engine never draws into them, so their threading rules above don't change.
+
+| Event field | Meaning |
+|---|---|
+| `frame` | Packs now shown |
+| `FA_CDG_CHANGE_X/Y/WIDTH/HEIGHT(value)` | The changed area in native 300x216 screen pixels (a surface's dirty rectangle is in its own pixels). Width 0 when only colours changed |
+| `FA_CDG_CHANGE_PALETTE(value)` | 1 when colours or transparency changed |
+
+```c
+static void FA_CALL on_event(const fa_event* ev, void* user)
+{
+    if (ev->type == FA_EVENT_CDG_CHANGED) wake_render_thread(user);   /* it calls fa_cdg_surface_update */
+}
+fa_stream_set_event_callback(song, on_event, app);
+fa_stream_set_cdg_events(song, 1);
+```
+
+In .NET, subscribing to `song.CdgChanged` turns the events on (`CdgChangedEventArgs.Area`, `PaletteChanged`, `Packs`), and removing the last handler turns them off.
+
 ### Graphics info
 
 `fa_stream_get_cdg_info` says where a stream's graphics come from (`FA_CDG_SOURCE_FILE` for a `.cdg`, ZIP entry or memory block, `FA_CDG_SOURCE_DISC` for a disc's subcode), how many packs there are, and how far apart the seek checkpoints are. For a disc track, `disc_parity` is 1 when the subcode layout was chosen by the packs' P/Q parity and 0 when it was chosen by counting instructions (drives that return the parity zeroed). Either way the packs are applied as read: there is no error correction. In .NET this is `song.CdgInfo`.
@@ -249,5 +272,4 @@ Every instruction of the CD+G "TV graphics" mode is implemented: memory preset (
 ## Not provided yet
 
 - CD+EG extended graphics.
-- A push model (the engine updating a surface and raising an event when the picture changed). Update from your render loop instead.
 - Ready-made helpers for specific renderers (a D3D11 texture updater, a CVPixelBuffer on Apple). The pixel buffer above covers them all today.
