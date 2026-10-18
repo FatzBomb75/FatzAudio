@@ -871,6 +871,40 @@ static void test_levels_and_spectrum(void)
     fa_stream_close(s);
 }
 
+/* Cue output: a stream previewed on a second device is not in the first one's
+ * mix, and moving it to the first keeps its position. */
+static void test_cue_on_second_device(void)
+{
+    fa_device* cue = NULL;
+    fa_stream* room = open_wav(48000, 0, 0, 1);
+    fa_stream* preview = open_wav(48000, 1, 0, 0);
+    float out[PERIOD * 2];
+    fa_frames pos = 0;
+    int i, k;
+    CHECK(room != NULL && preview != NULL);
+    CHECK_EQ(fa_device_open(g_engine, NULL, &cue), FA_OK);
+    CHECK_EQ(fa_stream_attach(preview, cue, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(room), FA_OK);
+    CHECK_EQ(fa_stream_play(preview), FA_OK);
+    rec_reset();
+    render(2048);
+    CHECK_NEAR(L(1000), 0.5, 1e-6);                  /* the room hears only its song */
+    /* The cue device mixes the preview (its own callbacks; here called by hand). */
+    for (k = 0; k < 2000 && fa_ring_readable(&preview->ring) < PERIOD; k++) fa_sleep_ms(1);
+    fa_fetch_add64(&cue->epoch, 1);
+    fa_device_render(cue, out, PERIOD);
+    fa_fetch_add64(&cue->epoch, 1);
+    for (i = (int)cue->limiter.delay; i < PERIOD; i++)
+        if (fabsf(out[i * 2] - expected(1, (uint32_t)(i - (int)cue->limiter.delay))) > 1e-6f) { CHECK_EQ(i, -1); }
+    /* On air: the preview moves to the room from where it was. */
+    CHECK_EQ(fa_stream_attach(preview, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_get_position(preview, &pos), FA_OK);
+    CHECK(pos > 0 && pos <= PERIOD);
+    fa_stream_close(preview);
+    fa_stream_close(room);
+    fa_device_close(cue);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -903,6 +937,7 @@ int main(void)
     RUN(test_zero_length_scheduled_ramp);
     RUN(test_queue_in_first_callback);
     RUN(test_levels_and_spectrum);
+    RUN(test_cue_on_second_device);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);
