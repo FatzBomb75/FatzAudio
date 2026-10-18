@@ -64,8 +64,9 @@ static void chunk(buf* b, const char* id, const buf* body)
 static void gen(buf* b, unsigned oper, unsigned amount) { put16le(b, oper); put16le(b, amount); }
 
 /* Preset 0 bank 0 ("Sine") and preset 0 bank 128 ("Kit"): the same looped 440 Hz
- * sine, root key 69, 125 ms release. */
-static buf make_sf2(void)
+ * sine, root key 69, 125 ms release. `atten` (centibels) is the Sine zone's
+ * initialAttenuation; 0 leaves it out. */
+static buf make_sf2_atten(unsigned atten)
 {
     buf sf = { 0 }, riff = { 0 }, info = { 0 }, sdta = { 0 }, pdta = { 0 }, c = { 0 };
     int i;
@@ -100,13 +101,17 @@ static buf make_sf2(void)
     putstr(&c, "KitInst", 20); put16le(&c, 1);
     putstr(&c, "EOI", 20); put16le(&c, 2);
     chunk(&pdta, "inst", &c);
-    c.n = 0; put16le(&c, 0); put16le(&c, 0); put16le(&c, 3); put16le(&c, 0); put16le(&c, 6); put16le(&c, 0);
+    {
+        unsigned first = atten ? 4 : 3;
+        c.n = 0; put16le(&c, 0); put16le(&c, 0); put16le(&c, first); put16le(&c, 0); put16le(&c, first + 3); put16le(&c, 0);
+    }
     chunk(&pdta, "ibag", &c);
     c.n = 0; for (i = 0; i < 10; i++) put8(&c, 0);
     chunk(&pdta, "imod", &c);
     c.n = 0;
     gen(&c, 54, 1);                          /* sampleModes: loop */
     gen(&c, 38, (unsigned)(uint16_t)-3600);  /* releaseVolEnv: 2^-3 s */
+    if (atten) gen(&c, 48, atten);           /* initialAttenuation */
     gen(&c, 53, 0);                          /* sampleID */
     gen(&c, 54, 1); gen(&c, 38, (unsigned)(uint16_t)-3600); gen(&c, 53, 0);
     gen(&c, 0, 0);
@@ -121,6 +126,8 @@ static buf make_sf2(void)
     free(riff.d); free(info.d); free(sdta.d); free(pdta.d); free(c.d);
     return sf;
 }
+
+static buf make_sf2(void) { return make_sf2_atten(0); }
 
 /* ---- MIDI files -------------------------------------------------------------------- */
 
@@ -940,6 +947,23 @@ static fa_frames render_note(fa_soundfont* font, int ch, int prog, int key, floa
     return got;
 }
 
+/* initialAttenuation is in centibels: 200 is 20 dB down, as the SF2 spec has it. */
+static void test_sf2_attenuation(void)
+{
+    float* x = (float*)malloc(sizeof(float) * 2 * 2 * RATE);
+    float* ref = (float*)malloc(sizeof(float) * 2 * 2 * RATE);
+    buf sf = make_sf2_atten(200);
+    fa_soundfont* f = NULL;
+    CHECK_EQ(fa_soundfont_open_memory(sf.d, sf.n, &f), FA_OK);
+    free(sf.d);
+    CHECK_EQ(render_note(g_font, 0, 0, 69, ref), 2 * RATE);
+    CHECK_EQ(render_note(f, 0, 0, 69, x), 2 * RATE);
+    CHECK_NEAR(20.0 * log10(rms(x, RATE / 2, RATE * 9 / 10) / rms(ref, RATE / 2, RATE * 9 / 10)), -20.0, 0.5);
+    fa_soundfont_release(f);
+    free(x);
+    free(ref);
+}
+
 static void test_dls_bank(void)
 {
     int with_type;
@@ -1066,6 +1090,7 @@ int main(void)
     RUN(test_loudness_scan);
     RUN(test_malformed_midi);
     RUN(test_malformed_soundfont);
+    RUN(test_sf2_attenuation);
     RUN(test_dls_bank);
     RUN(test_malformed_dls);
     RUN(test_system_soundfont);

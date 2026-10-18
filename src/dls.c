@@ -26,10 +26,6 @@
 #define SF2_PAD 46                    /* zero samples after each sample block */
 #define SF2_MAX_RECORDS 0xFFFF        /* SF2 indexes zones, generators and samples in 16 bits */
 #define HDR_HASH_SIZE 131072u         /* power of two, over twice SF2_MAX_RECORDS */
-/* TinySoundFont applies initialAttenuation at a tenth of the SF2 scale (0.01 dB per
- * unit, at most 14.4 dB): DLS gains are written ten times over so they are heard
- * as the bank states them. */
-#define TSF_ATTENUATION_SCALE 10.0
 
 static uint16_t rd16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 static uint32_t rd32(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
@@ -576,9 +572,8 @@ static uint32_t write_gens(obuf* b, const gens* g, uint32_t sample)
         if (v < -32768) v = -32768;
         if (v > 32767) v = 32767;
         if (id == G_ATTENUATION) {
-            v = lround(g->v[id] * TSF_ATTENUATION_SCALE);
             if (v < 0) v = 0;
-            if (v > 14400) v = 14400;
+            if (v > 1440) v = 1440;     /* 144 dB, the SF2 range */
         }
         if (v == lround(defaults[id])) continue;
         ob_u16(b, (unsigned)id);
