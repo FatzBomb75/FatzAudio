@@ -82,7 +82,8 @@ static void worker_main(void* arg)
         for (s = e->streams; s; s = s->next) {
             double fill;
             if (!fa_stream_needs_work(s)) continue;
-            fill = (double)fa_ring_readable(&s->ring) / (double)s->ring.capacity;
+            /* A pending seek first: its buffer is stale, however full. */
+            fill = fa_load64(&s->seek_pending) >= 0 ? -1.0 : (double)fa_ring_readable(&s->ring) / (double)s->ring.capacity;
             if (fill >= best || !fa_mutex_trylock(&s->decode_lock)) continue;
             if (pick) fa_mutex_unlock(&pick->decode_lock);
             best = fill;
@@ -92,9 +93,11 @@ static void worker_main(void* arg)
             fa_mutex_unlock(&e->list_lock);
             /* Top up to full, in turns of at most half a buffer so one stream
              * cannot starve the others. */
-            fa_stream_fill(pick, pick->ring.capacity / 2);
+            int busy = !fa_stream_work(pick, pick->ring.capacity / 2);
             fa_mutex_unlock(&pick->decode_lock);
             fa_mutex_lock(&e->list_lock);
+            /* A seek waiting for an API call to finish: try again shortly. */
+            if (busy) fa_cond_wait_ms(&e->work_cond, &e->list_lock, 1);
             continue;
         }
         fa_cond_wait_ms(&e->work_cond, &e->list_lock, 5);

@@ -623,18 +623,103 @@ static void test_loop_with_tempo_wraps(void)
     free(out);
 }
 
-static void test_push_streams_take_pitch_only(void)
+/* A push stream of `seconds` of 440 Hz stereo float, timestamps from `pts0`. */
+static fa_stream* open_pushed_sine(double seconds, int64_t pts0)
 {
     fa_audio_format f;
     fa_stream* s = NULL;
+    int64_t n = (int64_t)(seconds * RATE), i, chunk = 4800;
+    float* buf = (float*)malloc((size_t)chunk * 2 * sizeof(float));
+    memset(&f, 0, sizeof(f));
+    f.sample_format = FA_FORMAT_F32;
+    f.sample_rate = RATE;
+    f.channels = 2;
+    if (!buf || fa_stream_open_push(g_engine, &f, NULL, &s) != FA_OK) { free(buf); return NULL; }
+    for (i = 0; i < n; i += chunk) {
+        const void* planes[1];
+        int64_t k;
+        for (k = 0; k < chunk; k++) buf[k * 2] = buf[k * 2 + 1] = (float)(0.5 * sin(2.0 * PI * 440.0 * (double)(i + k) / RATE));
+        planes[0] = buf;
+        fa_stream_push_pcm(s, planes, chunk, pts0 + (int64_t)((double)i * 1e9 / RATE + 0.5));
+    }
+    free(buf);
+    return s;
+}
+
+/* Renders about `ms` of the device, as the audio thread would, from device time `*now`. */
+static void render_for(fa_stream* s, int ms, int64_t* now)
+{
+    float out[512 * 2];
+    int i, blocks = (int)((double)ms * g_dev->rate / 1000.0 / 512.0 + 0.5);
+    for (i = 0; i < blocks; i++) {
+        int k;
+        for (k = 0; k < 2000 && fa_ring_readable(&s->ring) < 512; k++) fa_sleep_ms(1);
+        fa_fetch_add64(&g_dev->epoch, 1);
+        fa_device_render_at(g_dev, out, 512, *now);
+        fa_fetch_add64(&g_dev->epoch, 1);
+        *now += (int64_t)(512 * 1e9 / g_dev->rate + 0.5);
+    }
+}
+
+/* Push streams (an app's FFmpeg audio) take TEMPO and RATE too: the clock still
+ * reports the app's timestamps and runs at the speed heard. */
+static void test_push_stream_tempo_clock(void)
+{
+    static const float speeds[2] = { 2.0f, 0.75f };
+    int k;
+    for (k = 0; k < 2; k++) {
+        fa_stream* s = open_pushed_sine(4.0, 5000000000LL);
+        int64_t now = 1000000000, t, c0, c1;
+        fa_param param = k == 0 ? FA_PARAM_TEMPO : FA_PARAM_RATE;
+        CHECK(s != NULL);
+        CHECK_EQ(fa_stream_set_param(s, param, speeds[k]), FA_OK);
+        CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+        CHECK_EQ(fa_stream_play(s), FA_OK);
+        render_for(s, 1000, &now);
+        t = now - 20000000;
+        fa_mutex_lock(&s->api_lock);
+        c0 = fa_stream_clock_at(s, t);
+        c1 = fa_stream_clock_at(s, t + 10000000);
+        fa_mutex_unlock(&s->api_lock);
+        printf("  %s %.2f: 10 ms heard = %.3f ms of the app's timeline; clock %.1f ms\n",
+               k == 0 ? "tempo" : "rate", speeds[k], (c1 - c0) / 1e6, c1 / 1e6);
+        CHECK_NEAR((double)(c1 - c0), 10000000.0 * speeds[k], 100000.0);
+        /* About 1 s of device time played (less the latency): 5 s + that x speed. */
+        CHECK(c1 > 5000000000LL + (int64_t)(0.7e9 * speeds[k]) && c1 < 5000000000LL + (int64_t)(1.05e9 * speeds[k]));
+        fa_stream_close(s);
+    }
+}
+
+/* A jump in the app's timestamps is kept while a tempo is applied: the clock
+ * moves to the new timeline when its audio is heard, then runs at tempo again. */
+static void test_push_stream_tempo_timeline_jump(void)
+{
+    fa_audio_format f;
+    fa_stream* s = NULL;
+    float buf[4800 * 2];
+    const void* planes[1] = { buf };
+    int64_t now = 1000000000, c0, c1;
+    int i;
+    memset(buf, 0, sizeof(buf));
+    for (i = 0; i < 4800; i++) buf[i * 2] = buf[i * 2 + 1] = (float)(0.3 * sin(2.0 * PI * 440.0 * i / RATE));
     memset(&f, 0, sizeof(f));
     f.sample_format = FA_FORMAT_F32;
     f.sample_rate = RATE;
     f.channels = 2;
     CHECK_EQ(fa_stream_open_push(g_engine, &f, NULL, &s), FA_OK);
-    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_TEMPO, 1.2f), FA_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_RATE, 1.2f), FA_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_PITCH, -2.0f), FA_OK);
+    for (i = 0; i < 5; i++) fa_stream_push_pcm(s, planes, 4800, (int64_t)i * 4800 * 1000000000LL / RATE);
+    for (i = 0; i < 40; i++) fa_stream_push_pcm(s, planes, 4800, 60000000000LL + (int64_t)i * 4800 * 1000000000LL / RATE);
+    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_TEMPO, 1.5f), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render_for(s, 1500, &now);   /* 0.5 s of the first part plays in 0.33 s */
+    fa_mutex_lock(&s->api_lock);
+    c0 = fa_stream_clock_at(s, now - 30000000);
+    c1 = fa_stream_clock_at(s, now - 20000000);
+    fa_mutex_unlock(&s->api_lock);
+    printf("  after the jump: clock %.1f ms, 10 ms heard = %.3f ms\n", c1 / 1e6, (c1 - c0) / 1e6);
+    CHECK(c0 > 60000000000LL && c1 < 62000000000LL);
+    CHECK_NEAR((double)(c1 - c0), 15000000.0, 150000.0);
     fa_stream_close(s);
 }
 
@@ -723,7 +808,8 @@ int main(void)
     RUN(test_scheduled_ramp_as_first_change);
     RUN(test_engaging_mid_play_is_smooth);
     RUN(test_loop_with_tempo_wraps);
-    RUN(test_push_streams_take_pitch_only);
+    RUN(test_push_stream_tempo_clock);
+    RUN(test_push_stream_tempo_timeline_jump);
     RUN(test_params_and_options_api);
     RUN(test_fast_and_formants);
 

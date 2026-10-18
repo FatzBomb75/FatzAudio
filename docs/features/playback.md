@@ -47,11 +47,30 @@ using var s = engine.OpenFile("track.flac", new StreamOptions { BufferLength = T
 | `fa_stream_play_at` | Like play, but the first frame is heard exactly at a time on the device clock. `FA_STATE_SCHEDULED` until then, then `FA_EVENT_STARTED` ([crossfade](crossfade.md#the-device-clock)) |
 | `fa_stream_pause` | Takes effect before it returns: no more audio of the stream is mixed, so the position read right after is final. The buffer stays full, so resuming is instant. Cancels a scheduled or queued start |
 | `fa_stream_stop` | Like pause, then rewinds to the cue-in (or 0) |
-| `fa_stream_seek` | Drops the buffer and decodes the first 100 ms at the new position before returning. Seeking a stopped stream leaves it paused there |
+| `fa_stream_seek` | Drops the buffer and decodes the first 100 ms at the new position before returning. Seeking a stopped stream leaves it paused there. Costs below |
+| `fa_stream_seek_async` | Returns at once (.NET `RequestSeek`): a decode worker seeks and refills while the stream is silent, and the position and clock report the target straight away. A newer call replaces a target not reached yet, so a dragged seek bar costs one seek per worker pass. Use it from a UI thread, and for web streams |
 | `fa_stream_detach` / moving to another device | The position continues from what was actually heard, not from what had been decoded ahead |
 | `FA_OPEN_LOOP` / `fa_stream_set_loop` | The worker jumps back to the cue-in (or the start) at the cue-out (or the end) without a gap; the position wraps and `FA_EVENT_LOOPED` is raised for each jump (as it is mixed, one device latency before it is heard, like markers). `fa_stream_set_loop` turns it on or off at any time, also while playing; turned off, the stream plays on to the cue-out and ends. Seekable streams only |
 | `fa_stream_set_mute` / `fa_device_set_mute` | Silence without touching the volume: glides over 5 ms, fades and ramps keep running, and unmuting brings the volume back. The device mute silences everything it plays |
 | Cue-out marker | The stream ends exactly there ([markers](crossfade.md#markers)) |
+
+## What a seek costs
+
+`fa_stream_seek` returns once the decoder has seeked and the first 100 ms at the new position are decoded. These are measured on 10-minute 44.1 kHz stereo files, 40 random seeks each, on one core of a Linux x64 machine:
+
+| Source | Median | Worst |
+|---|---|---|
+| WAV | 0.13 ms | 2.0 ms |
+| FLAC | 0.20 ms | 5.0 ms |
+| MP3 (192 kbit/s) | 0.21 ms | 61 ms, on the first jump far into a file without a seek table, which is scanned once |
+| AAC in MP4 | 0.27 ms | 3.4 ms |
+| Ogg Vorbis | 0.33 ms | 10 ms |
+| Opus | 1.1 ms (it decodes 300 ms ahead of the target, for exact audio) | 7.3 ms |
+| AC-3 | 0.22 ms | 1.1 ms |
+| Web stream | One HTTP range request: a network round trip plus the first bytes, often 50 to 500 ms | Whatever the server takes |
+| Push and packet streams | Not seekable: seek your demuxer and call `fa_stream_push_flush`, which returns at once | |
+
+The call also waits for the audio callback in progress to finish, at most one device period. `fa_stream_seek_async` returns in about 25 µs. Only when a worker is already carrying out an earlier target and holds the stream's lock does it wait for that seek; while a target is pending, a newer one replaces it without any lock. A volume ramp is never affected: ramps run on the mix side.
 
 ## Position and clock
 

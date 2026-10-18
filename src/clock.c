@@ -135,6 +135,7 @@ void fa_ptsmap_reset(fa_ptsmap* m)
     fa_store64(&m->read, 0);
     m->cur_idx = 0;
     m->cur_pts = 0;
+    m->cur_src_ok = 0;
 }
 
 void fa_ptsmap_add(fa_ptsmap* m, int64_t idx, int64_t pts)
@@ -152,6 +153,7 @@ int64_t fa_ptsmap_pts(fa_ptsmap* m, int64_t idx, double ns_per_frame, int64_t* o
     while (r < w && m->idx[r % FA_PTSMAP_SIZE] <= idx) {
         m->cur_idx = m->idx[r % FA_PTSMAP_SIZE];
         m->cur_pts = m->pts[r % FA_PTSMAP_SIZE];
+        m->cur_src_ok = 0;
         r++;
     }
     fa_store64(&m->read, r);
