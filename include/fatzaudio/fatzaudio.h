@@ -1707,7 +1707,8 @@ FA_API fa_result FA_CALL fa_stream_get_tracker_channel_mute(fa_stream* stream, u
  * FA_EVENT_TRACKER_ROW     the row's first frame  order << 16 | row (FA_TRACKER_ROW_EVENTS)
  *
  * Delivered today: ENDED, MARKER, LOOPED, CDG_CHANGED (when asked for), LOUDNESS_FINAL, RAMP_DONE, STARTED, SEEK_FAILED and DEVICE_CHANGED; MIDI_TEXT from MIDI
- * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); METADATA from web
+ * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); TRACKER_ROW from
+ * tracker modules played on a device (when asked for); METADATA from web
  * streams; STALLED and RESUMED from push, packet and web streams; DECODE_ERROR from packet
  * and disc streams. The others are raised by the features that produce them as those land (see docs/features). */
 typedef enum fa_event_type {

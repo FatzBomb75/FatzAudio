@@ -28,6 +28,17 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   settings (`fa_stream_set_tracker_param`; .NET `TrackerInterpolation`, `TrackerStereoSeparation`,
   `TrackerVolumeRamping`, `TrackerAmigaResampler`) and channel mute (`fa_stream_set_tracker_channel_mute`;
   .NET `SetTrackerChannelMuted`).
+- Tracker subsongs: a module's subsongs are the stream's audio tracks. `fa_open_options.audio_track` (.NET
+  `StreamOptions.AudioTrack`) plays subsong n, `fa_stream_info.audio_track_count` is the count, a subsong past the
+  last gives `FA_ERROR_NOT_FOUND`; `fa_tracker_info.subsong` (at the end, older shorter structs are still filled up
+  to `duration`; .NET `TrackerInfo.Subsong`). The restart position and duration are the playing subsong's, and
+  `fa_stream_get_tracker_time` / `fa_stream_seek_tracker` return `FA_ERROR_NOT_FOUND` for rows of another subsong.
+  This needed a second local libopenmpt patch (`third_party/libopenmpt/README.md`).
+- `fa_stream_get_tracker_position`: the order and row heard now, within about 2 ms of the row start, lock-free
+  (.NET `AudioStream.TrackerPosition`).
+- Tracker row events: `FA_TRACKER_ROW_EVENTS` (0 off, 1 every row, 2 first row of each order) raises
+  `FA_EVENT_TRACKER_ROW` (value = order << 16 | row), best effort like markers (.NET `TrackerRowEvents`,
+  `TrackerRowReached`).
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
 ## 0.2.0 (2026-10-18)
