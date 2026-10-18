@@ -155,7 +155,8 @@ public class PushStreamTests
         await WaitFor(() => s.State == StreamState.Buffering); // nothing pushed yet
 
         s.Push(Constant(14400, 2, 0.1f), TimeSpan.FromSeconds(10)); // 300 ms in the app's timeline
-        await WaitFor(() => s.State == StreamState.Playing);
+        // Wait for the clock, not for State == Playing: that lasts only until the 300 ms run out, and the
+        // null output plays them in one go when a busy runner gives the test the CPU back.
         await WaitFor(() => s.Clock > TimeSpan.FromSeconds(10.05));
         Assert.True(s.Buffered < TimeSpan.FromMilliseconds(350));
 
@@ -178,9 +179,9 @@ public class PushStreamTests
         using var output = engine.OpenOutput();
         using var s = engine.CreatePushStream(AudioFormat.Float32(48000, 2));
         s.Push(Constant(48000 * 2, 2, 0.1f), TimeSpan.Zero);
+        Assert.True(s.Buffered > TimeSpan.FromSeconds(1)); // before playing, so nothing has drained yet
         s.PlayOn(output);
-        await WaitFor(() => s.State == StreamState.Playing);
-        Assert.True(s.Buffered > TimeSpan.FromSeconds(1));
+        await WaitFor(() => s.Clock > TimeSpan.FromMilliseconds(50)); // playing (the clock moves)
         s.Flush();
         Assert.True(s.Buffered < TimeSpan.FromMilliseconds(200));
         s.Push(Constant(24000, 2, 0.1f), TimeSpan.FromSeconds(30)); // the app seeked to 0:30
