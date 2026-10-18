@@ -37,6 +37,9 @@ struct fa_scan_job {
     fa_engine* engine;
     struct fa_stream* stream;      /* NULL for fa_scan_loudness_path */
     char* path;                    /* the source: a file ... */
+    int64_t path_offset, path_length; /* ... or these bytes of it (a stored ZIP entry) ... */
+    const char* name_hint;         /* path, or the ZIP entry's name; NULL for memory */
+    char entry_name[260];
     const uint8_t* mem;            /* ... or the memory of a memory stream */
     size_t mem_size;
     int32_t audio_track;
@@ -195,7 +198,8 @@ static void cache_write(const fa_scan_job* j, const fa_loudness* l)
 
 static fa_result open_source(const fa_scan_job* j, fa_source* src)
 {
-    return j->path ? fa_source_open_path(src, j->path) : fa_source_open_memory_ref(src, j->mem, j->mem_size);
+    if (!j->path) return fa_source_open_memory_ref(src, j->mem, j->mem_size);
+    return fa_source_open_path_window(src, j->path, j->path_offset, j->path_length);
 }
 
 static void set_result(fa_scan_job* j, double lufs, double range, double peak, fa_loudness_source source)
@@ -243,7 +247,7 @@ static int run_prepare(fa_scan_job* j)
     }
 
     fa_source_seek(&src, 0);
-    r = fa_decoder_open(&dec, &src, j->path, NULL, j->audio_track, &j->env);
+    r = fa_decoder_open(&dec, &src, j->name_hint, NULL, j->audio_track, &j->env);
     if (r != FA_OK) { j->status = r; fa_source_close(&src); return 1; }
     j->rate = dec.format.sample_rate;
     j->channels = dec.format.channels;
@@ -284,7 +288,7 @@ static void run_chunk(fa_scan_job* j, int k)
     if (fa_load32(&j->cancel)) return;
     r = open_source(j, &src);
     if (r != FA_OK) { c->r = r; return; }
-    r = fa_decoder_open(&dec, &src, j->path, NULL, j->audio_track, &j->env);
+    r = fa_decoder_open(&dec, &src, j->name_hint, NULL, j->audio_track, &j->env);
     if (r != FA_OK) { c->r = r; fa_source_close(&src); return; }
     if (dec.format.sample_rate != j->rate || dec.format.channels != j->channels) r = FA_ERROR_UNSUPPORTED_FORMAT;
     if (r == FA_OK && k > 0) {
@@ -489,6 +493,10 @@ fa_scan_job* fa_scan_start_stream(struct fa_stream* s, int use_tags)
     if (s->path) {
         j->path = dup_string(s->path);
         if (!j->path) { job_free(j); return NULL; }
+        j->path_offset = s->path_offset;
+        j->path_length = s->path_length;
+        memcpy(j->entry_name, s->path_name, sizeof(j->entry_name));
+        j->name_hint = s->path_length > 0 ? j->entry_name : j->path;
     } else {
         j->mem = s->source.mem;
         j->mem_size = s->source.mem_size;
@@ -541,6 +549,7 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
     if (!j) return FA_ERROR_OUT_OF_MEMORY;
     j->path = dup_string(path);
     if (!j->path) { job_free(j); return FA_ERROR_OUT_OF_MEMORY; }
+    j->name_hint = j->path;
     j->env.soundfont = fa_engine_soundfont(engine);
     if (!j->env.soundfont) {
         /* A MIDI file and no soundfont from the app: the OS's own instruments, as a stream would play it. */

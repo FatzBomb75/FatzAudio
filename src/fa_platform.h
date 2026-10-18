@@ -121,6 +121,12 @@ int fa_replace_file(const char* from, const char* to);   /* rename over an exist
 /* Where the OS keeps its MIDI instruments (gm.dls, gs_instruments.dls, a GM .sf2),
  * in the order to try: the `index`th path in UTF-8, 0 past the last one. */
 int fa_system_soundfont_path(int index, char* out, size_t cap);
+
+/* A new file in `folder` ("w+b") that the system deletes when it is closed, also
+ * if the process dies; NULL on failure. */
+FILE* fa_temp_file_create(const char* folder);
+/* Deletes files fa_temp_file_create left behind (a power cut, a crash). */
+void fa_temp_folder_sweep(const char* folder);
 uint32_t fa_cpu_count(void);
 int64_t fa_monotonic_ns(void);
 

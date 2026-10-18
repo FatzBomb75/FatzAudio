@@ -75,8 +75,11 @@ enum {
                                         disc was changed under an open stream */
     FA_ERROR_NO_SOUNDFONT = -15,     /* a MIDI file needs a soundfont: fa_engine_set_soundfont
                                         or fa_open_options.soundfont */
-    FA_ERROR_PROTECTED_CONTENT = -16 /* DRM-protected or encrypted content (WMA DRM,
+    FA_ERROR_PROTECTED_CONTENT = -16, /* DRM-protected or encrypted content (WMA DRM,
                                         FairPlay, encrypted MP4/MKV, SAMPLE-AES HLS) */
+    FA_ERROR_TOO_LARGE = -17         /* a compressed ZIP entry is bigger than
+                                        fa_engine_config.zip_memory_limit_mb and no
+                                        temp_directory is set: extract it first */
 };
 
 typedef struct fa_engine fa_engine;   /* one per process is typical */
@@ -130,6 +133,15 @@ typedef struct fa_engine_config {
                                      Created if missing (one level).
                                      The string is copied */
     uint32_t flags;               /* fa_engine_flags */
+    /* ZIP archives (MP3+G). Stored entries always play straight from the archive.
+     * Compressed ones are unpacked into memory up to zip_memory_limit_mb (0 = 256).
+     * A bigger one is unpacked into temp_directory when it is set (a "fatzaudio-tmp"
+     * folder inside it, created if missing; the file is deleted when the stream
+     * closes, also if the app crashes), else the open fails with FA_ERROR_TOO_LARGE.
+     * The directory is created if missing (one level); FA_ERROR_IO when a song needs
+     * it and it cannot be written. The string is copied. */
+    const char* temp_directory;   /* NULL = never write temp files */
+    uint32_t zip_memory_limit_mb;
 } fa_engine_config;
 
 FA_API void FA_CALL fa_engine_config_init(fa_engine_config* config);
@@ -199,6 +211,8 @@ FA_API fa_result FA_CALL fa_device_get_time(fa_device* device, fa_time* out_time
  *        NULL means the source can only be read forwards: the stream still opens
  *        (the first few KB are buffered for format detection) but cannot seek.
  * length Optional. Total size in bytes, or a negative value / NULL if unknown.
+ *        A ZIP archive (MP3+G) needs both seek and length: its directory is at
+ *        the end (FA_ERROR_NOT_SEEKABLE otherwise).
  * close  Optional. Called exactly once, when the stream is closed with
  *        fa_stream_close, after the last read/seek/length call. Release `user` here.
  *

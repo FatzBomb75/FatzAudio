@@ -27,6 +27,7 @@ FA_API const char* FA_CALL fa_result_string(fa_result result)
     case FA_ERROR_NO_DISC: return "no disc";
     case FA_ERROR_NO_SOUNDFONT: return "no soundfont for MIDI";
     case FA_ERROR_PROTECTED_CONTENT: return "protected content";
+    case FA_ERROR_TOO_LARGE: return "too large to unpack in memory";
     default: return "unknown result";
     }
 }
@@ -103,6 +104,37 @@ static void worker_main(void* arg)
 
 void fa_event_thread_main(void* arg);
 
+static char* copy_string(const char* s)
+{
+    size_t len = strlen(s) + 1;
+    char* d = (char*)malloc(len);
+    if (d) memcpy(d, s, len);
+    return d;
+}
+
+/* The app's temp directory gets a folder of FatzAudio's own, so the sweep never
+ * touches the app's files. One that cannot be made now is tried again when a song
+ * needs it (FA_ERROR_IO then). */
+static fa_result temp_folder_prepare(fa_engine* e)
+{
+    const char* dir = e->config.temp_directory;
+    size_t n = strlen(dir);
+    int sep = dir[n - 1] == '/' || dir[n - 1] == '\\';
+    char* folder = (char*)malloc(n + 16);
+    if (!folder) return FA_ERROR_OUT_OF_MEMORY;
+    snprintf(folder, n + 16, "%s%sfatzaudio-tmp", dir, sep ? "" : "/");
+    if (fa_mkdir_utf8(dir) == 0 && fa_mkdir_utf8(folder) == 0) fa_temp_folder_sweep(folder);
+    e->temp_folder = folder;
+    return FA_OK;
+}
+
+static void free_strings(fa_engine* e)
+{
+    free((char*)e->config.cache_directory);
+    free((char*)e->config.temp_directory);
+    free(e->temp_folder);
+}
+
 FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_engine** out_engine)
 {
     fa_engine* e;
@@ -122,19 +154,22 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
         memcpy(&e->config, config, sz);
         e->config.struct_size = (uint32_t)sizeof(e->config);
     }
-    /* Keep our own copy: the caller's string (a marshalled one, in .NET) may not outlive this call. */
+    /* Keep our own copies: the caller's strings (marshalled ones, in .NET) may not outlive this call. */
     if (e->config.cache_directory) {
-        size_t len = strlen(e->config.cache_directory) + 1;
-        char* dir = (char*)malloc(len);
-        if (!dir) { free(e); return FA_ERROR_OUT_OF_MEMORY; }
-        memcpy(dir, e->config.cache_directory, len);
-        e->config.cache_directory = dir;
+        e->config.cache_directory = copy_string(e->config.cache_directory);
+        if (!e->config.cache_directory) { free(e); return FA_ERROR_OUT_OF_MEMORY; }
+    }
+    if (e->config.temp_directory && e->config.temp_directory[0]) {
+        e->config.temp_directory = copy_string(e->config.temp_directory);
+        if (!e->config.temp_directory || temp_folder_prepare(e) != FA_OK) { free_strings(e); free(e); return FA_ERROR_OUT_OF_MEMORY; }
+    } else {
+        e->config.temp_directory = NULL;
     }
 
-    if (ma_mutex_init(&e->lock) != MA_SUCCESS) { free((char*)e->config.cache_directory); free(e); return FA_ERROR_GENERIC; }
-    if (fa_mutex_init(&e->scan_lock) != 0) { ma_mutex_uninit(&e->lock); free((char*)e->config.cache_directory); free(e); return FA_ERROR_GENERIC; }
+    if (ma_mutex_init(&e->lock) != MA_SUCCESS) { free_strings(e); free(e); return FA_ERROR_GENERIC; }
+    if (fa_mutex_init(&e->scan_lock) != 0) { ma_mutex_uninit(&e->lock); free_strings(e); free(e); return FA_ERROR_GENERIC; }
     if (fa_cond_init(&e->scan_cond) != 0) {
-        fa_mutex_destroy(&e->scan_lock); ma_mutex_uninit(&e->lock); free((char*)e->config.cache_directory); free(e);
+        fa_mutex_destroy(&e->scan_lock); ma_mutex_uninit(&e->lock); free_strings(e); free(e);
         return FA_ERROR_GENERIC;
     }
     fa_store32(&e->norm_mode, FA_NORMALIZE_OFF);
@@ -147,7 +182,7 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
         fa_mutex_destroy(&e->system_soundfont_lock);
         fa_cond_destroy(&e->scan_cond); fa_mutex_destroy(&e->scan_lock);
         ma_mutex_uninit(&e->lock);
-        free((char*)e->config.cache_directory); free(e);
+        free_strings(e); free(e);
         return FA_ERROR_GENERIC;
     }
     if (e->config.flags & FA_ENGINE_NULL_OUTPUT) {
@@ -161,7 +196,7 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
         fa_mutex_destroy(&e->system_soundfont_lock);
         fa_cond_destroy(&e->scan_cond); fa_mutex_destroy(&e->scan_lock);
         ma_mutex_uninit(&e->lock);
-        free((char*)e->config.cache_directory); free(e);
+        free_strings(e); free(e);
         return FA_ERROR_DEVICE;
     }
 
@@ -191,7 +226,7 @@ void fa_engine_free(fa_engine* e)
     fa_mutex_destroy(&e->list_lock);
     fa_mutex_destroy(&e->system_soundfont_lock);
     free(e->pending);
-    free((char*)e->config.cache_directory);
+    free_strings(e);
     fa_soundfont_release(e->soundfont);
     fa_soundfont_release(e->system_soundfont);
     free(e);

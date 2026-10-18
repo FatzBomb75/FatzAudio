@@ -130,6 +130,41 @@ public class CdgTests
     }
 
     [Fact]
+    public void OpenFile_BigCompressedZip_NeedsATempDirectory()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "fa-cdg-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            byte[] wav = TestAudio.SineWav(20);
+            Assert.True(wav.Length > 1 << 20);
+            string zip = Path.Combine(dir, "Big.zip");
+            using (var z = ZipFile.Open(zip, ZipArchiveMode.Create))
+            {
+                using (var e = z.CreateEntry("Big.cdg", CompressionLevel.Optimal).Open()) e.Write(SimpleCdg());
+                using (var e = z.CreateEntry("Big.wav", CompressionLevel.Optimal).Open()) e.Write(wav);
+            }
+
+            using (var inMemory = AudioEngine.Create(new AudioEngineOptions { NullOutput = true, ZipMemoryLimitMb = 1 }))
+                Assert.Equal(ErrorCode.TooLarge, Assert.Throws<FatzAudioException>(() => inMemory.OpenFile(zip, DecodeOnly)).ErrorCode);
+
+            string temp = Path.Combine(dir, "temp");
+            using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true, ZipMemoryLimitMb = 1, TempDirectory = temp });
+            using (var song = engine.OpenFile(zip, DecodeOnly))
+            {
+                Assert.True(song.HasCdg);
+                Assert.Equal(20 * 44100, TestAudio.ReadAll(song));
+            }
+            // Deleted with the stream (Windows: delete-on-close; elsewhere the name is gone at once).
+            Assert.Empty(Directory.GetFiles(Path.Combine(temp, "fatzaudio-tmp")));
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
     public void Surface_FollowsTheAudioClock()
     {
         using var engine = CreateHeadless();

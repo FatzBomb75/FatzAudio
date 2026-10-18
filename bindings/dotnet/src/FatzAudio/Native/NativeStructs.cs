@@ -20,6 +20,8 @@ internal unsafe struct FaEngineConfig
     public uint WorkerThreads;
     public byte* CacheDirectory;
     public uint Flags;
+    public byte* TempDirectory;
+    public uint ZipMemoryLimitMb;
 }
 
 [StructLayout(LayoutKind.Sequential)]

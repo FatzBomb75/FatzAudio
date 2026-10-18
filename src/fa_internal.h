@@ -25,7 +25,10 @@ typedef struct fa_source {
     void* io_user;
     int64_t pos;       /* logical read position */
     int64_t raw_pos;   /* position of the app's callbacks (FA_SOURCE_IO) */
-    int64_t length;    /* bytes, -1 = unknown */
+    int64_t length;    /* bytes, -1 = unknown (of the window, when there is one) */
+    int64_t base;      /* fa_source_set_window: where the window starts in the file, block or callbacks */
+    int64_t whole_length; /* the length before the first window */
+    int windowed;
     int seekable;
     fa_result error;   /* first read failure of the app's callbacks or the file, else FA_OK */
     int remote;        /* bytes come over the network (fa_stream_open_url): decoders avoid
@@ -41,6 +44,15 @@ fa_result fa_source_open_memory(fa_source* src, const void* data, size_t size);
 /* Like fa_source_open_memory but without a copy: `data` must outlive the source. */
 fa_result fa_source_open_memory_ref(fa_source* src, const void* data, size_t size);
 fa_result fa_source_open_io(fa_source* src, const fa_io_callbacks* io, void* user);
+/* Makes the source read only `size` bytes from `base` of the file, block or callbacks
+ * underneath (a stored ZIP entry), as if they were the whole source; position 0,
+ * first bytes read again. `base` counts from the start of the whole source, so a
+ * later call moves or undoes the window. Needs a known length; app callbacks must
+ * seek. */
+fa_result fa_source_set_window(fa_source* src, int64_t base, int64_t size);
+/* fa_source_open_path, then the window `offset`, `length` (none when length is 0):
+ * how scans and tags reopen a stream's stored ZIP entry. */
+fa_result fa_source_open_path_window(fa_source* src, const char* path, int64_t offset, int64_t length);
 /* Returns the first bytes of the source (up to FA_PROBE_BYTES) without moving the read position. */
 size_t fa_source_peek(fa_source* src, const uint8_t** out_data);
 /* Frees the copy of a file's first bytes once the format is known (other sources
@@ -602,6 +614,7 @@ void fa_event_rescue_stream(fa_engine* e, struct fa_stream* s);
 
 struct fa_engine {
     fa_engine_config config;
+    char* temp_folder;           /* config.temp_directory + "/fatzaudio-tmp", NULL = none */
     ma_context context;
     ma_mutex lock;               /* guards device enumeration scratch (ma_context device lists) */
 
@@ -850,6 +863,9 @@ struct fa_stream {
 
     /* Normalization */
     char* path;                  /* for scans of path streams; NULL otherwise */
+    int64_t path_offset;         /* the audio is path_length bytes from here in `path` */
+    int64_t path_length;         /* (a stored ZIP entry); 0 = all of it */
+    char path_name[260];         /* that entry's name, the decoder's hint; "" = none */
     int64_t zip_size;            /* bytes of the ZIP the audio came from, 0 = not a ZIP */
     int32_t audio_track;
     fa_mutex norm_lock;          /* scan_job, loud, loud_source */

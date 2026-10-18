@@ -46,7 +46,7 @@ public sealed class AudioEngine : IDisposable
 
         FaEngineConfig config = default;
         NativeMethods.fa_engine_config_init(&config);
-        nint cachePtr = 0;
+        nint cachePtr = 0, tempPtr = 0;
         try
         {
             if (options is not null)
@@ -61,6 +61,12 @@ public sealed class AudioEngine : IDisposable
                     cachePtr = Marshal.StringToCoTaskMemUTF8(dir);
                     config.CacheDirectory = (byte*)cachePtr;
                 }
+                if (options.TempDirectory is { } temp)
+                {
+                    tempPtr = Marshal.StringToCoTaskMemUTF8(temp);
+                    config.TempDirectory = (byte*)tempPtr;
+                }
+                config.ZipMemoryLimitMb = (uint)Math.Max(0, options.ZipMemoryLimitMb);
             }
 
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_engine_create(&config, out var native));
@@ -71,6 +77,7 @@ public sealed class AudioEngine : IDisposable
         finally
         {
             if (cachePtr != 0) Marshal.FreeCoTaskMem(cachePtr);
+            if (tempPtr != 0) Marshal.FreeCoTaskMem(tempPtr);
         }
     }
 
