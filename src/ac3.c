@@ -429,6 +429,7 @@ struct fa_ac3 {
      * when a location is first written; NULL plays as silence). */
     float* loc[LOC_COUNT];
     int loc_used[LOC_COUNT];
+    float blk[6][AC3_BLOCK];     /* one block per channel, for units mixed directly */
     int last_used[LOC_COUNT];    /* the locations of the last good unit */
 };
 
@@ -1576,10 +1577,144 @@ static const int8_t chanmap_loc[16][2] = {
     { LOC_LSD, LOC_RSD }, { LOC_LW, LOC_RW }, { LOC_VHL, LOC_VHR }, { LOC_VHC, -1 },
     { LOC_LTS, LOC_RTS }, { LOC_LFE2, -1 }, { LOC_LFE, -1 } };
 
-/* Decodes one syncframe into the location buffers at block offset `at`.
- * Returns 0, -1 (damaged) or -2 (out of memory). */
+/* Output layouts (see the top of the file): which locations go to which channel,
+ * with fold-downs for locations a layout lacks. */
+enum { OUT_FL, OUT_FR, OUT_FC, OUT_LFE, OUT_BC, OUT_SL, OUT_SR, OUT_BL, OUT_BR, OUT_N };
+
+typedef struct mix_plan {
+    int nch;
+    int simple;                                     /* each channel one location at full gain */
+    int nroute;
+    struct { int ch, loc; float gain; } route[48];  /* one per ADD below at most */
+    int src_loc[8];                                 /* simple: each channel's location, or -1 */
+} mix_plan;
+
+/* The output channels for the locations in use (u), and which of the locations
+ * that have audio (src[loc] not NULL) go to which channel, with what gain. */
+static void plan_mix(const int* u, float* const* src, mix_plan* m)
+{
+    static const int8_t layouts[9][8] = {
+        { -1 },
+        { OUT_FC, -1 },
+        { OUT_FL, OUT_FR, -1 },
+        { OUT_FL, OUT_FR, OUT_FC, -1 },
+        { OUT_FL, OUT_FR, OUT_FC, OUT_BC, -1 },
+        { OUT_FL, OUT_FR, OUT_FC, OUT_BL, OUT_BR, -1 },
+        { OUT_FL, OUT_FR, OUT_FC, OUT_LFE, OUT_SL, OUT_SR, -1 },
+        { OUT_FL, OUT_FR, OUT_FC, OUT_LFE, OUT_BC, OUT_SL, OUT_SR, -1 },
+        { OUT_FL, OUT_FR, OUT_FC, OUT_LFE, OUT_BL, OUT_BR, OUT_SL, OUT_SR } };
+    int has_lr = u[LOC_L] || u[LOC_R], has_back = u[LOC_LRS] || u[LOC_RRS];
+    int has_surr = u[LOC_LS] || u[LOC_RS] || u[LOC_LSD] || u[LOC_RSD] || u[LOC_LTS] || u[LOC_RTS] || u[LOC_TS];
+    int has_bc = u[LOC_S] || u[LOC_CS], has_lfe = u[LOC_LFE] || u[LOC_LFE2];
+    int nch, i, c, k, slot[OUT_N], nroute = 0;
+    const float h = 0.70710678f;
+
+    if (has_back) nch = 8;
+    else if (has_lfe) nch = has_bc ? 7 : 6;
+    else if (has_surr) nch = has_bc ? 7 : 5;
+    else if (has_bc) nch = 4;
+    else if (u[LOC_C] && (has_lr || u[LOC_LC] || u[LOC_RC] || u[LOC_LW] || u[LOC_RW] || u[LOC_VHL] || u[LOC_VHR])) nch = 3;
+    else if (u[LOC_C] && !u[LOC_VHC]) nch = 1;
+    else nch = 2;
+    for (i = 0; i < OUT_N; i++) slot[i] = -1;
+    for (c = 0; c < nch; c++) slot[layouts[nch][c]] = c;
+
+#define ADD(out, l, g) do { if (u[l] && slot[out] >= 0 && src[l]) { \
+        m->route[nroute].ch = slot[out]; m->route[nroute].loc = (l); m->route[nroute].gain = (g); nroute++; } } while (0)
+    if (nch == 1) {
+        ADD(OUT_FC, LOC_C, 1.0f);
+        ADD(OUT_FC, LOC_VHC, 1.0f);
+    } else {
+        ADD(OUT_FL, LOC_L, 1.0f);  ADD(OUT_FR, LOC_R, 1.0f);
+        ADD(OUT_FL, LOC_LC, 1.0f); ADD(OUT_FR, LOC_RC, 1.0f);
+        ADD(OUT_FL, LOC_LW, 1.0f); ADD(OUT_FR, LOC_RW, 1.0f);
+        ADD(OUT_FL, LOC_VHL, 1.0f); ADD(OUT_FR, LOC_VHR, 1.0f);
+        if (slot[OUT_FC] >= 0) { ADD(OUT_FC, LOC_C, 1.0f); ADD(OUT_FC, LOC_VHC, 1.0f); }
+        else { ADD(OUT_FL, LOC_C, h); ADD(OUT_FR, LOC_C, h); ADD(OUT_FL, LOC_VHC, h); ADD(OUT_FR, LOC_VHC, h); }
+        ADD(OUT_LFE, LOC_LFE, 1.0f);
+        ADD(OUT_LFE, LOC_LFE2, 1.0f);
+        /* Surround pair: side channels in 6..8-channel layouts, back ones in 5. */
+        if (nch == 5) {
+            ADD(OUT_BL, LOC_LS, 1.0f); ADD(OUT_BR, LOC_RS, 1.0f);
+            ADD(OUT_BL, LOC_LSD, 1.0f); ADD(OUT_BR, LOC_RSD, 1.0f);
+            ADD(OUT_BL, LOC_LTS, 1.0f); ADD(OUT_BR, LOC_RTS, 1.0f);
+            ADD(OUT_BL, LOC_TS, h); ADD(OUT_BR, LOC_TS, h);
+        } else {
+            ADD(OUT_SL, LOC_LS, 1.0f); ADD(OUT_SR, LOC_RS, 1.0f);
+            ADD(OUT_SL, LOC_LSD, 1.0f); ADD(OUT_SR, LOC_RSD, 1.0f);
+            ADD(OUT_SL, LOC_LTS, 1.0f); ADD(OUT_SR, LOC_RTS, 1.0f);
+            ADD(OUT_SL, LOC_TS, h); ADD(OUT_SR, LOC_TS, h);
+        }
+        ADD(OUT_BL, LOC_LRS, 1.0f); ADD(OUT_BR, LOC_RRS, 1.0f);
+        if (slot[OUT_BC] >= 0) { ADD(OUT_BC, LOC_S, 1.0f); ADD(OUT_BC, LOC_CS, 1.0f); }
+        else { ADD(OUT_BL, LOC_S, h); ADD(OUT_BR, LOC_S, h); ADD(OUT_BL, LOC_CS, h); ADD(OUT_BR, LOC_CS, h); }
+    }
+#undef ADD
+    m->nch = nch;
+    m->nroute = nroute;
+    /* Usually each channel has one location at full gain: then it is a plain interleave. */
+    m->simple = 1;
+    for (c = 0; c < nch; c++) m->src_loc[c] = -1;
+    for (k = 0; k < nroute; k++) {
+        if (m->route[k].gain != 1.0f || m->src_loc[m->route[k].ch] >= 0) m->simple = 0;
+        m->src_loc[m->route[k].ch] = m->route[k].loc;
+    }
+}
+
+/* Mixes `frames` samples of each location, from src[loc] + off, into dst (interleaved). */
+static void render_mix(const mix_plan* m, float* const* src, size_t off, float* dst, int frames)
+{
+    static const float zeros[AC3_BLOCK * AC3_MAX_BLOCKS];
+    int nch = m->nch, i, c, k;
+    if (m->simple) {
+        const float* s[8];
+        for (c = 0; c < nch; c++) s[c] = m->src_loc[c] >= 0 ? src[m->src_loc[c]] + off : zeros;
+        for (i = 0; i < frames; i++, dst += nch)
+            for (c = 0; c < nch; c++) dst[c] = s[c][i];
+    } else {
+        memset(dst, 0, (size_t)frames * nch * sizeof(float));
+        for (k = 0; k < m->nroute; k++) {
+            const float* s_ = src[m->route[k].loc] + off;
+            float* o_ = dst + m->route[k].ch;
+            float g = m->route[k].gain;
+            for (i = 0; i < frames; i++) o_[(size_t)i * nch] += s_[i] * g;
+        }
+    }
+}
+
+static int reserve_out(float** pcm, size_t* cap, size_t need)
+{
+    if (need > *cap) {
+        float* p = (float*)realloc(*pcm, need * sizeof(float));
+        if (!p) return -1;
+        *pcm = p;
+        *cap = need;
+    }
+    return 0;
+}
+
+static int mix_out(fa_ac3* d, int frames, float** pcm, size_t* cap, int* out_channels)
+{
+    mix_plan m;
+    plan_mix(d->loc_used, d->loc, &m);
+    if (reserve_out(pcm, cap, (size_t)frames * m.nch) < 0) return -1;
+    render_mix(&m, d->loc, 0, *pcm, frames);
+    *out_channels = m.nch;
+    return 0;
+}
+
+/* A unit of one syncframe is mixed block by block straight into the output, without
+ * the location buffers (which hold a whole unit, for dependent substreams to add to). */
+typedef struct direct_out {
+    float** pcm;
+    size_t* cap;
+    int channels;
+} direct_out;
+
+/* Decodes one syncframe into the location buffers at block offset `at`, or with
+ * `direct`, into the output. Returns 0, -1 (damaged) or -2 (out of memory). */
 static int decode_frame(fa_ac3* d, const uint8_t* p, const fa_ac3_header* h, int state, int at, int drc,
-                        int* wrote)
+                        int* wrote, direct_out* direct)
 {
     frame* f = &d->f;
     sub_state* ss = d->sub[state];
@@ -1587,6 +1722,8 @@ static int decode_frame(fa_ac3* d, const uint8_t* p, const fa_ac3_header* h, int
     int r, blk, ch, i;
     int8_t loc[6];
     float scratch[AC3_BLOCK];
+    float* src[LOC_COUNT];
+    mix_plan plan;
 
     memset(f, 0, offsetof(frame, exp));
     f->h = *h;
@@ -1621,10 +1758,20 @@ static int decode_frame(fa_ac3* d, const uint8_t* p, const fa_ac3_header* h, int
         for (ch = 0; ch < f->nfchans; ch++) loc[ch] = acmod_loc[h->acmod][ch];
         if (h->lfeon) loc[AC3_LFE] = LOC_LFE;
     }
-    for (ch = 0; ch < 6; ch++) {
-        if (loc[ch] < 0 || d->loc[loc[ch]]) continue;
-        d->loc[loc[ch]] = (float*)calloc(AC3_BLOCK * AC3_MAX_BLOCKS, sizeof(float));
-        if (!d->loc[loc[ch]]) return -2;
+    if (direct) {
+        int used[LOC_COUNT];
+        memset(used, 0, sizeof(used));
+        memset(src, 0, sizeof(src));
+        for (ch = 0; ch < 6; ch++) if (loc[ch] >= 0) { used[loc[ch]] = 1; src[loc[ch]] = d->blk[ch]; }
+        plan_mix(used, src, &plan);
+        if (reserve_out(direct->pcm, direct->cap, (size_t)h->blocks * AC3_BLOCK * plan.nch) < 0) return -2;
+        direct->channels = plan.nch;
+    } else {
+        for (ch = 0; ch < 6; ch++) {
+            if (loc[ch] < 0 || d->loc[loc[ch]]) continue;
+            d->loc[loc[ch]] = (float*)calloc(AC3_BLOCK * AC3_MAX_BLOCKS, sizeof(float));
+            if (!d->loc[loc[ch]]) return -2;
+        }
     }
     {
         /* A new layout (or a substream that comes back) starts with a clean overlap. */
@@ -1647,14 +1794,17 @@ static int decode_frame(fa_ac3* d, const uint8_t* p, const fa_ac3_header* h, int
             else if (drc != FA_AC3_DRC_OFF) gain = f->dynrng[prog];
             /* Straight into the location's buffer (a channel without one still
              * keeps its overlap going). */
-            if (loc[ch] >= 0) {
+            if (loc[ch] < 0) {
+                dst = scratch;
+            } else if (direct) {
+                dst = d->blk[ch];
+            } else {
                 dst = d->loc[loc[ch]] + (size_t)(at + blk) * AC3_BLOCK;
                 wrote[loc[ch]] = 1;
-            } else {
-                dst = scratch;
             }
             synth(d, f->coef[ch], ch < AC3_LFE && f->blksw[ch], gain, ss->delay[ch], dst);
         }
+        if (direct) render_mix(&plan, src, 0, *direct->pcm + (size_t)blk * AC3_BLOCK * plan.nch, AC3_BLOCK);
     }
     /* The blocks must leave room for the error check (crcrsv and crc2): a
      * stream read past that was not read the way it was written. */
@@ -1665,109 +1815,48 @@ static int decode_frame(fa_ac3* d, const uint8_t* p, const fa_ac3_header* h, int
     return 0;
 }
 
-/* Output layouts (see the top of the file): which locations go to which channel,
- * with fold-downs for locations a layout lacks. */
-enum { OUT_FL, OUT_FR, OUT_FC, OUT_LFE, OUT_BC, OUT_SL, OUT_SR, OUT_BL, OUT_BR, OUT_N };
-
-static int mix_out(fa_ac3* d, int frames, float** pcm, size_t* cap, int* out_channels)
+/* A damaged unit with no channels of its own: the last good layout, so the
+ * silence has the stream's shape (stereo before any). */
+static void keep_last_layout(fa_ac3* d)
 {
-    static const int8_t layouts[9][8] = {
-        { -1 },
-        { OUT_FC, -1 },
-        { OUT_FL, OUT_FR, -1 },
-        { OUT_FL, OUT_FR, OUT_FC, -1 },
-        { OUT_FL, OUT_FR, OUT_FC, OUT_BC, -1 },
-        { OUT_FL, OUT_FR, OUT_FC, OUT_BL, OUT_BR, -1 },
-        { OUT_FL, OUT_FR, OUT_FC, OUT_LFE, OUT_SL, OUT_SR, -1 },
-        { OUT_FL, OUT_FR, OUT_FC, OUT_LFE, OUT_BC, OUT_SL, OUT_SR, -1 },
-        { OUT_FL, OUT_FR, OUT_FC, OUT_LFE, OUT_BL, OUT_BR, OUT_SL, OUT_SR } };
-    const int* u = d->loc_used;
-    int has_lr = u[LOC_L] || u[LOC_R], has_back = u[LOC_LRS] || u[LOC_RRS];
-    int has_surr = u[LOC_LS] || u[LOC_RS] || u[LOC_LSD] || u[LOC_RSD] || u[LOC_LTS] || u[LOC_RTS] || u[LOC_TS];
-    int has_bc = u[LOC_S] || u[LOC_CS], has_lfe = u[LOC_LFE] || u[LOC_LFE2];
-    static const float zeros[AC3_BLOCK * AC3_MAX_BLOCKS];
-    struct { int ch, loc; float gain; } route[48];   /* one per ADD below at most */
-    int nch, i, c, slot[OUT_N], nroute = 0;
-    float* dst;
-    const float h = 0.70710678f;
-    size_t need;
+    int i, any = 0;
+    for (i = 0; i < LOC_COUNT; i++) { d->loc_used[i] = d->last_used[i]; any |= d->last_used[i]; }
+    if (!any) d->loc_used[LOC_L] = d->loc_used[LOC_R] = 1;
+}
 
-    if (has_back) nch = 8;
-    else if (has_lfe) nch = has_bc ? 7 : 6;
-    else if (has_surr) nch = has_bc ? 7 : 5;
-    else if (has_bc) nch = 4;
-    else if (u[LOC_C] && (has_lr || u[LOC_LC] || u[LOC_RC] || u[LOC_LW] || u[LOC_RW] || u[LOC_VHL] || u[LOC_VHR])) nch = 3;
-    else if (u[LOC_C] && !u[LOC_VHC]) nch = 1;
-    else nch = 2;
-    for (i = 0; i < OUT_N; i++) slot[i] = -1;
-    for (c = 0; c < nch; c++) slot[layouts[nch][c]] = c;
-
-    need = (size_t)frames * nch;
-    if (need > *cap) {
-        float* p = (float*)realloc(*pcm, need * sizeof(float));
-        if (!p) return -1;
-        *pcm = p;
-        *cap = need;
+static fa_result decode_single(fa_ac3* d, const uint8_t* data, const fa_ac3_header* h, int drc,
+                               float** pcm, size_t* cap, int* frames, int* channels, uint32_t* rate)
+{
+    direct_out out;
+    int wrote[LOC_COUNT], res, i;
+    out.pcm = pcm;
+    out.cap = cap;
+    out.channels = 0;
+    memset(wrote, 0, sizeof(wrote));
+    if (!d->sub[0]) {
+        d->sub[0] = (sub_state*)calloc(1, sizeof(sub_state));
+        if (!d->sub[0]) return FA_ERROR_OUT_OF_MEMORY;
     }
-    dst = *pcm;
-
-    /* Which locations go to which channel, with what gain. */
-#define ADD(out, l, g) do { if (u[l] && slot[out] >= 0 && d->loc[l]) { \
-        route[nroute].ch = slot[out]; route[nroute].loc = (l); route[nroute].gain = (g); nroute++; } } while (0)
-    if (nch == 1) {
-        ADD(OUT_FC, LOC_C, 1.0f);
-        ADD(OUT_FC, LOC_VHC, 1.0f);
-    } else {
-        ADD(OUT_FL, LOC_L, 1.0f);  ADD(OUT_FR, LOC_R, 1.0f);
-        ADD(OUT_FL, LOC_LC, 1.0f); ADD(OUT_FR, LOC_RC, 1.0f);
-        ADD(OUT_FL, LOC_LW, 1.0f); ADD(OUT_FR, LOC_RW, 1.0f);
-        ADD(OUT_FL, LOC_VHL, 1.0f); ADD(OUT_FR, LOC_VHR, 1.0f);
-        if (slot[OUT_FC] >= 0) { ADD(OUT_FC, LOC_C, 1.0f); ADD(OUT_FC, LOC_VHC, 1.0f); }
-        else { ADD(OUT_FL, LOC_C, h); ADD(OUT_FR, LOC_C, h); ADD(OUT_FL, LOC_VHC, h); ADD(OUT_FR, LOC_VHC, h); }
-        ADD(OUT_LFE, LOC_LFE, 1.0f);
-        ADD(OUT_LFE, LOC_LFE2, 1.0f);
-        /* Surround pair: side channels in 6..8-channel layouts, back ones in 5. */
-        if (nch == 5) {
-            ADD(OUT_BL, LOC_LS, 1.0f); ADD(OUT_BR, LOC_RS, 1.0f);
-            ADD(OUT_BL, LOC_LSD, 1.0f); ADD(OUT_BR, LOC_RSD, 1.0f);
-            ADD(OUT_BL, LOC_LTS, 1.0f); ADD(OUT_BR, LOC_RTS, 1.0f);
-            ADD(OUT_BL, LOC_TS, h); ADD(OUT_BR, LOC_TS, h);
-        } else {
-            ADD(OUT_SL, LOC_LS, 1.0f); ADD(OUT_SR, LOC_RS, 1.0f);
-            ADD(OUT_SL, LOC_LSD, 1.0f); ADD(OUT_SR, LOC_RSD, 1.0f);
-            ADD(OUT_SL, LOC_LTS, 1.0f); ADD(OUT_SR, LOC_RTS, 1.0f);
-            ADD(OUT_SL, LOC_TS, h); ADD(OUT_SR, LOC_TS, h);
-        }
-        ADD(OUT_BL, LOC_LRS, 1.0f); ADD(OUT_BR, LOC_RRS, 1.0f);
-        if (slot[OUT_BC] >= 0) { ADD(OUT_BC, LOC_S, 1.0f); ADD(OUT_BC, LOC_CS, 1.0f); }
-        else { ADD(OUT_BL, LOC_S, h); ADD(OUT_BR, LOC_S, h); ADD(OUT_BL, LOC_CS, h); ADD(OUT_BR, LOC_CS, h); }
+    res = decode_frame(d, data, h, 0, 0, drc, wrote, &out);
+    if (res == -2) return FA_ERROR_OUT_OF_MEMORY;
+    *frames = h->blocks * AC3_BLOCK;
+    *rate = h->rate;
+    for (i = 1; i < AC3_MAX_SUBSTREAMS; i++) if (d->sub[i]) d->sub[i]->used = 0;
+    if (res != 0) {
+        /* Silence in the last good layout, and a clean restart of the overlap. */
+        float* none[LOC_COUNT] = { 0 };
+        mix_plan m;
+        memset(d->sub[0]->delay, 0, sizeof(d->sub[0]->delay));
+        keep_last_layout(d);
+        plan_mix(d->loc_used, none, &m);
+        if (reserve_out(pcm, cap, (size_t)*frames * m.nch) < 0) return FA_ERROR_OUT_OF_MEMORY;
+        render_mix(&m, none, 0, *pcm, *frames);
+        *channels = m.nch;
+        return FA_ERROR_GENERIC;
     }
-#undef ADD
-    {
-        /* Usually each channel has one location at full gain: interleave. */
-        const float* src[8];
-        int simple = 1, k;
-        for (c = 0; c < nch; c++) src[c] = NULL;
-        for (k = 0; k < nroute; k++) {
-            if (route[k].gain != 1.0f || src[route[k].ch]) simple = 0;
-            src[route[k].ch] = d->loc[route[k].loc];
-        }
-        if (simple) {
-            for (c = 0; c < nch; c++) if (!src[c]) src[c] = zeros;
-            for (i = 0; i < frames; i++, dst += nch)
-                for (c = 0; c < nch; c++) dst[c] = src[c][i];
-        } else {
-            memset(dst, 0, need * sizeof(float));
-            for (k = 0; k < nroute; k++) {
-                const float* s_ = d->loc[route[k].loc];
-                float* o_ = dst + route[k].ch;
-                float g = route[k].gain;
-                for (i = 0; i < frames; i++) o_[(size_t)i * nch] += s_[i] * g;
-            }
-        }
-    }
-    *out_channels = nch;
-    return 0;
+    *channels = out.channels;
+    memcpy(d->last_used, d->loc_used, sizeof(d->loc_used));
+    return FA_OK;
 }
 
 fa_result fa_ac3_decode(fa_ac3* d, const uint8_t* data, size_t size, int drc,
@@ -1779,6 +1868,13 @@ fa_result fa_ac3_decode(fa_ac3* d, const uint8_t* data, size_t size, int drc,
     *frames = 0;
     memset(d->loc_used, 0, sizeof(d->loc_used));
     for (i = 0; i < AC3_MAX_SUBSTREAMS; i++) if (d->sub[i]) d->sub[i]->seen = 0;
+    {
+        /* The usual unit, one AC-3 frame or one E-AC-3 frame of program 0 alone:
+         * straight into the output. */
+        fa_ac3_header h;
+        if (fa_ac3_parse_header(data, size, &h) && h.frame_size == size && fa_ac3_starts_unit(&h))
+            return decode_single(d, data, &h, drc, pcm, cap, frames, channels, rate);
+    }
     /* Frames in order: an independent frame of program 0 starts a new set of
      * blocks; its dependent frames cover the same blocks. Other programs are skipped. */
     while (pos + 8 <= size) {
@@ -1805,7 +1901,7 @@ fa_result fa_ac3_decode(fa_ac3* d, const uint8_t* data, size_t size, int drc,
             d->sub[state] = (sub_state*)calloc(1, sizeof(sub_state));
             if (!d->sub[state]) return FA_ERROR_OUT_OF_MEMORY;
         }
-        res = decode_frame(d, data + pos, &h, state, at, drc, wrote);
+        res = decode_frame(d, data + pos, &h, state, at, drc, wrote, NULL);
         if (res == -2) return FA_ERROR_OUT_OF_MEMORY;
         if (res != 0) {
             int dependent = h.eac3 && h.strmtyp == 1, any = 0;
@@ -1823,11 +1919,7 @@ fa_result fa_ac3_decode(fa_ac3* d, const uint8_t* data, size_t size, int drc,
             memset(ss->delay, 0, sizeof(ss->delay));
             if (dependent) { ss->seen = ss->used; pos += h.frame_size; continue; }
             for (i = 0; i < LOC_COUNT; i++) any |= d->loc_used[i];
-            if (!any) {
-                /* Keep the last good layout so the silence has the stream's shape. */
-                for (i = 0; i < LOC_COUNT; i++) { d->loc_used[i] = d->last_used[i]; any |= d->last_used[i]; }
-                if (!any) d->loc_used[LOC_L] = d->loc_used[LOC_R] = 1;
-            }
+            if (!any) keep_last_layout(d);
         }
         pos += h.frame_size;
     }

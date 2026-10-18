@@ -24,6 +24,12 @@ typedef struct fa_ac3_header {
 /* Parses the header at p (n bytes, 8 are enough). 0 if it is not a syncframe. */
 int fa_ac3_parse_header(const uint8_t* p, size_t n, fa_ac3_header* out);
 
+/* An access unit starts at an AC-3 frame or an E-AC-3 independent frame of program 0. */
+static inline int fa_ac3_starts_unit(const fa_ac3_header* h)
+{
+    return !h->eac3 || (h->strmtyp != 1 && h->substreamid == 0);
+}
+
 typedef struct fa_ac3 fa_ac3;
 
 fa_ac3* fa_ac3_create(void);
