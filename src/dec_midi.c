@@ -110,6 +110,17 @@ static fa_result soundfont_from_memory(const uint8_t* data, size_t size, fa_soun
     }
     if (size < 12 || size > FA_MIDI_MAX_SOUNDFONT || memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "sfbk", 4) != 0)
         return FA_ERROR_UNSUPPORTED_FORMAT;
+    if (fa_sf3_probe(data, size)) {
+        /* SF3 (Ogg Vorbis samples, MuseScore's banks): as SoundFont 2. */
+        uint8_t* sf2 = NULL;
+        size_t sf2_size = 0;
+        fa_result r = fa_sf3_to_sf2(data, size, &sf2, &sf2_size);
+        if (r != FA_OK) return r;
+        r = sf2_size <= FA_MIDI_MAX_SOUNDFONT && !fa_sf3_probe(sf2, sf2_size) ? soundfont_from_memory(sf2, sf2_size, out)
+                                                                              : FA_ERROR_UNSUPPORTED_FORMAT;
+        free(sf2);
+        return r;
+    }
     f = (fa_soundfont*)calloc(1, sizeof(*f));
     if (!f) return FA_ERROR_OUT_OF_MEMORY;
     if (fa_mutex_init(&f->lock) != 0) { free(f); return FA_ERROR_GENERIC; }

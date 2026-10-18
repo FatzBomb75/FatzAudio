@@ -739,6 +739,135 @@ static void test_tempo_and_signature_marks(void)
     free(f.d); free(t.d);
 }
 
+/* ---- SF3 ------------------------------------------------------------------------ */
+
+static buf read_file(const char* path)
+{
+    buf b = { 0 };
+    FILE* f = fopen(path, "rb");
+    uint8_t tmp[4096];
+    size_t n;
+    if (!f) return b;
+    while ((n = fread(tmp, 1, sizeof(tmp), f)) > 0) put(&b, tmp, n);
+    fclose(f);
+    return b;
+}
+
+/* An SF3 bank: preset 0 plays tests/data/ogg/tone.ogg (440 Hz, 1.5 s, Vorbis) at
+ * root key 69, no loop; a second sample is plain PCM (the sine) for bank 128. */
+static buf make_sf3(const buf* ogg)
+{
+    buf sf = { 0 }, riff = { 0 }, info = { 0 }, sdta = { 0 }, pdta = { 0 }, c = { 0 };
+    uint32_t pcm_at;
+    int i;
+    put(&riff, "sfbk", 4);
+    put(&info, "INFO", 4);
+    c.n = 0; put16le(&c, 3); put16le(&c, 1); chunk(&info, "ifil", &c);
+    c.n = 0; putstr(&c, "Test SF3", 10); chunk(&info, "INAM", &c);
+    chunk(&riff, "LIST", &info);
+    put(&sdta, "sdta", 4);
+    c.n = 0;
+    put(&c, ogg->d, ogg->n);
+    if (c.n & 1) put8(&c, 0);
+    pcm_at = (uint32_t)(c.n / 2);   /* the PCM sample, in samples */
+    for (i = 0; i < SINE_LEN; i++) put16le(&c, (unsigned)(uint16_t)(int16_t)lrint(sin(2.0 * PI * 440.0 * i / RATE) * 32000.0));
+    for (i = 0; i < 46; i++) put16le(&c, 0);
+    chunk(&sdta, "smpl", &c);
+    chunk(&riff, "LIST", &sdta);
+    put(&pdta, "pdta", 4);
+    c.n = 0;
+    putstr(&c, "Tone", 20); put16le(&c, 0); put16le(&c, 0); put16le(&c, 0); put32le(&c, 0); put32le(&c, 0); put32le(&c, 0);
+    putstr(&c, "Kit", 20); put16le(&c, 0); put16le(&c, 128); put16le(&c, 1); put32le(&c, 0); put32le(&c, 0); put32le(&c, 0);
+    putstr(&c, "EOP", 20); put16le(&c, 0); put16le(&c, 0); put16le(&c, 2); put32le(&c, 0); put32le(&c, 0); put32le(&c, 0);
+    chunk(&pdta, "phdr", &c);
+    c.n = 0; put16le(&c, 0); put16le(&c, 0); put16le(&c, 1); put16le(&c, 0); put16le(&c, 2); put16le(&c, 0);
+    chunk(&pdta, "pbag", &c);
+    c.n = 0; for (i = 0; i < 10; i++) put8(&c, 0);
+    chunk(&pdta, "pmod", &c);
+    c.n = 0; gen(&c, 41, 0); gen(&c, 41, 1); gen(&c, 0, 0);
+    chunk(&pdta, "pgen", &c);
+    c.n = 0;
+    putstr(&c, "ToneInst", 20); put16le(&c, 0);
+    putstr(&c, "KitInst", 20); put16le(&c, 1);
+    putstr(&c, "EOI", 20); put16le(&c, 2);
+    chunk(&pdta, "inst", &c);
+    c.n = 0; put16le(&c, 0); put16le(&c, 0); put16le(&c, 2); put16le(&c, 0); put16le(&c, 5); put16le(&c, 0);
+    chunk(&pdta, "ibag", &c);
+    c.n = 0; for (i = 0; i < 10; i++) put8(&c, 0);
+    chunk(&pdta, "imod", &c);
+    c.n = 0;
+    gen(&c, 38, (unsigned)(uint16_t)-3600); gen(&c, 53, 0);                  /* tone: no loop */
+    gen(&c, 54, 1); gen(&c, 38, (unsigned)(uint16_t)-3600); gen(&c, 53, 1);  /* kit: the looped PCM sine */
+    gen(&c, 0, 0);
+    chunk(&pdta, "igen", &c);
+    c.n = 0;
+    /* SF3: byte offsets of the Ogg stream, loops relative to it, type 1 | Vorbis. */
+    putstr(&c, "Tone", 20); put32le(&c, 0); put32le(&c, (uint32_t)ogg->n); put32le(&c, 0); put32le(&c, 1000);
+    put32le(&c, RATE); put8(&c, 69); put8(&c, 0); put16le(&c, 0); put16le(&c, 1 | 0x10);
+    putstr(&c, "Sine", 20); put32le(&c, pcm_at); put32le(&c, pcm_at + SINE_LEN); put32le(&c, pcm_at); put32le(&c, pcm_at + SINE_LEN);
+    put32le(&c, RATE); put8(&c, 69); put8(&c, 0); put16le(&c, 0); put16le(&c, 1);
+    putstr(&c, "EOS", 20); for (i = 0; i < 26; i++) put8(&c, 0);
+    chunk(&pdta, "shdr", &c);
+    chunk(&riff, "LIST", &pdta);
+    chunk(&sf, "RIFF", &riff);
+    free(riff.d); free(info.d); free(sdta.d); free(pdta.d); free(c.d);
+    return sf;
+}
+
+static void test_sf3(void)
+{
+    buf ogg = read_file(FA_TEST_DATA_DIR "/ogg/tone.ogg"), sf3, melody = make_note(0), drums = make_note(9);
+    fa_soundfont* font = NULL;
+    fa_soundfont_info fi;
+    fa_stream* s;
+    float* x = (float*)calloc((size_t)RATE * 2, sizeof(float));
+    CHECK(ogg.n > 1000);
+    sf3 = make_sf3(&ogg);
+    CHECK_EQ(fa_soundfont_open_memory(sf3.d, sf3.n, &font), FA_OK);
+    CHECK_EQ(fa_soundfont_get_info(font, &fi), FA_OK);
+    CHECK(strcmp(fi.name, "Test SF3") == 0);
+    CHECK_EQ(fi.preset_count, 2);
+    /* 1.5 s of decoded tone plus the PCM sine, each padded, as floats. */
+    CHECK(fi.sample_memory >= (uint64_t)(RATE * 3 / 2 + SINE_LEN) * sizeof(float));
+    /* The Vorbis sample plays at its pitch. */
+    s = open_bytes(&melody, FA_OPEN_DECODE_ONLY, font, NULL);
+    CHECK(s);
+    CHECK_EQ(read_all(s, x, RATE, 512), RATE);
+    CHECK(rms(x, 2000, RATE - 2000) > 0.1);
+    CHECK_NEAR(frequency(x, 2000, RATE - 2000), 440.0, 3.0);
+    fa_stream_close(s);
+    /* The PCM sample next to it still plays. */
+    s = open_bytes(&drums, FA_OPEN_DECODE_ONLY, font, NULL);
+    CHECK(s);
+    CHECK_EQ(read_all(s, x, RATE, 512), RATE);
+    CHECK(rms(x, 2000, RATE - 2000) > 0.1);
+    CHECK_NEAR(frequency(x, 2000, RATE - 2000), 440.0, 3.0);
+    fa_stream_close(s);
+    fa_soundfont_close(font);
+    /* A damaged Ogg stream: the bank still loads, that sample is silent. */
+    {
+        size_t k;
+        for (k = 0; k + 4 < sf3.n; k++) if (memcmp(sf3.d + k, "OggS", 4) == 0) { memset(sf3.d + k, 0x55, ogg.n); break; }
+    }
+    font = NULL;
+    CHECK_EQ(fa_soundfont_open_memory(sf3.d, sf3.n, &font), FA_OK);
+    s = open_bytes(&melody, FA_OPEN_DECODE_ONLY, font, NULL);
+    CHECK(s);
+    CHECK_EQ(read_all(s, x, RATE, 512), RATE);
+    CHECK(rms(x, 0, RATE) < 1e-6);
+    fa_stream_close(s);
+    fa_soundfont_close(font);
+    /* Truncated anywhere: never a crash. */
+    {
+        size_t cut;
+        for (cut = 12; cut < sf3.n; cut += sf3.n / 37 + 1) {
+            font = NULL;
+            if (fa_soundfont_open_memory(sf3.d, cut, &font) == FA_OK) fa_soundfont_close(font);
+        }
+    }
+    free(x); free(ogg.d); free(sf3.d); free(melody.d); free(drums.d);
+}
+
 /* Format 2: the tracks are patterns played one after another. Also: a .kar
  * header with lyric events is still karaoke, and invalid UTF-8 (an overlong
  * form) is read as Windows-1252. */
@@ -1320,6 +1449,7 @@ int main(void)
     RUN(test_sysex);
     RUN(test_seek_restarts_held_notes);
     RUN(test_tempo_and_signature_marks);
+    RUN(test_sf3);
     RUN(test_format2);
     RUN(test_not_midi);
     RUN(test_soundfont_lifetime);
