@@ -58,6 +58,12 @@ Resolved through the normal `runtimes/<rid>/native` layout, with a fallback to t
 When packing, the `win-x64` library is taken from `$(FatzAudioNativeDir)\fatzaudio.dll`
 (default: `build\bin\Release` of the repository; override with `-p:FatzAudioNativeDir=...`).
 Binaries for other platforms placed in `src/FatzAudio/runtimes/<rid>/native/` are packed too.
+CI packs `win-x64` and `linux-x64` and publishes the package ([building](../../docs/building.md#nuget-package-and-versions)).
+
+The binding and the native library share one version. The first call into the library throws
+`InvalidOperationException` when the native library is another major.minor version
+(`AudioEngine.NativeVersion` vs `AudioEngine.BindingVersion`), since before 1.0 a minor
+version may change the ABI ([CHANGELOG.md](../../CHANGELOG.md)).
 
 ## Status
 

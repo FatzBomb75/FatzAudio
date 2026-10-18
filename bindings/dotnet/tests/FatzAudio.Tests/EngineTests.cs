@@ -49,9 +49,21 @@ public class EngineTests
     {
         var engine = AudioEngine.Create();
         Assert.True(AudioEngine.NativeVersion >= new Version(0, 1, 0));
+        Assert.Equal(AudioEngine.BindingVersion.Major, AudioEngine.NativeVersion.Major);
+        Assert.Equal(AudioEngine.BindingVersion.Minor, AudioEngine.NativeVersion.Minor);
+        Assert.NotEqual(new Version(0, 0, 0), AudioEngine.BindingVersion);
         engine.Dispose();
         engine.Dispose(); // idempotent
         Assert.Throws<ObjectDisposedException>(() => engine.OutputDevices);
+    }
+
+    [Fact]
+    public void Version_OnlyPatchMayDiffer()
+    {
+        Assert.Null(FatzAudio.Native.NativeLoader.VersionMismatch(new Version(0, 2, 7), new Version(0, 2, 0)));
+        Assert.Contains("0.1.4", FatzAudio.Native.NativeLoader.VersionMismatch(new Version(0, 1, 4), new Version(0, 2, 0)));
+        Assert.NotNull(FatzAudio.Native.NativeLoader.VersionMismatch(new Version(1, 2, 0), new Version(0, 2, 0)));
+        Assert.Equal(new Version(0, 2, 3), FatzAudio.Native.NativeLoader.Unpack(0x000203));
     }
 
     [Fact]

@@ -11,13 +11,19 @@ on:
       - 'docs/**'
       - '**/*.md'
   workflow_dispatch:
+    inputs:
+      release:
+        description: 'Publish the NuGet as the stable version from the header (run on main)'
+        type: boolean
+        default: false
 
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        # Linux builds on 22.04 so the packaged libfatzaudio.so needs only glibc 2.35.
+        os: [windows-latest, macos-latest, ubuntu-22.04]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -47,6 +53,25 @@ jobs:
         env:
           FA_TEST_REQUIRE_LAME: '1'
         run: ctest --test-dir build -C Release --output-on-failure
+      # The win-x64 and linux-x64 libraries go into the NuGet package (job "package");
+      # the .NET tests below run against these staged copies.
+      - name: Stage the native library for the NuGet package
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          mkdir -p native
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp build/bin/Release/fatzaudio.dll native/
+          else
+            cp -L build/bin/libfatzaudio.so native/
+            strip --strip-unneeded native/libfatzaudio.so
+          fi
+      - uses: actions/upload-artifact@v4
+        if: runner.os != 'macOS'
+        with:
+          name: native-${{ runner.os }}
+          path: native/
+          retention-days: 7
 
       - uses: actions/setup-dotnet@v4
         with:
@@ -58,9 +83,61 @@ jobs:
         env:
           FA_TEST_REQUIRE_LAME: '1'
         run: |
-          native="$GITHUB_WORKSPACE/build/bin"
-          if [ "$RUNNER_OS" = "Windows" ]; then native="$native/Release"; fi
+          native="$GITHUB_WORKSPACE/native"
+          if [ "$RUNNER_OS" = "macOS" ]; then native="$GITHUB_WORKSPACE/build/bin"; fi
           dotnet test bindings/dotnet/tests/FatzAudio.Tests -c Release -p:FatzAudioNativeDir="$native"
+
+  # NuGet "FatzAudio" with the natives the build job just tested. The version is
+  # FA_VERSION_* from the header. Every run keeps the .nupkg as an artifact, as a
+  # prerelease (0.2.0-ci.<run>); pushes to main publish that prerelease to GitHub
+  # Packages, and a manual run on main with "release" publishes the stable 0.2.0.
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-Windows
+          path: bindings/dotnet/src/FatzAudio/runtimes/win-x64/native
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-Linux
+          path: bindings/dotnet/src/FatzAudio/runtimes/linux-x64/native
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+      - name: Pack
+        shell: bash
+        run: |
+          suffix="ci.${{ github.run_number }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.release }}" = "true" ]; then
+            test "${{ github.ref }}" = "refs/heads/main"
+            suffix=""
+          fi
+          dotnet pack bindings/dotnet/src/FatzAudio -c Release -o nupkg -p:VersionSuffix="$suffix"
+      - name: Check the package carries both natives
+        run: |
+          unzip -l nupkg/*.nupkg | tee contents.txt
+          grep -q 'runtimes/win-x64/native/fatzaudio.dll' contents.txt
+          grep -q 'runtimes/linux-x64/native/libfatzaudio.so' contents.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nuget
+          path: nupkg/*.nupkg
+          retention-days: 14
+      - name: Publish to GitHub Packages
+        if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.release)
+        # No --skip-duplicate: publishing a stable version twice fails, so bump FA_VERSION_* first.
+        run: >
+          dotnet nuget push nupkg/*.nupkg
+          --source https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
+          --api-key ${{ secrets.GITHUB_TOKEN }}
 
   sanitizers:
     runs-on: ubuntu-latest

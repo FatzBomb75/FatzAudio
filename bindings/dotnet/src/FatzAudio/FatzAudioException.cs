@@ -76,7 +76,7 @@ public class FatzAudioException : Exception
     {
         try
         {
-            NativeLoader.EnsureInitialized();
+            NativeLoader.EnsureLoaded();
             var p = NativeMethods.fa_result_string((int)code);
             var s = p == 0 ? null : Marshal.PtrToStringUTF8(p);
             if (!string.IsNullOrEmpty(s)) return $"{s} ({code})";
