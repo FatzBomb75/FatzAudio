@@ -40,6 +40,7 @@ public sealed class AudioEngine : IDisposable
     /// <returns>A new engine that must be disposed.</returns>
     /// <exception cref="FatzAudioException">The native engine could not be created.</exception>
     /// <exception cref="DllNotFoundException">The native <c>fatzaudio</c> library could not be located.</exception>
+    /// <exception cref="InvalidOperationException">The native library is another major.minor version than this binding (see <see cref="BindingVersion"/>).</exception>
     public static unsafe AudioEngine Create(AudioEngineOptions? options = null)
     {
         NativeLoader.EnsureInitialized();
@@ -81,14 +82,20 @@ public sealed class AudioEngine : IDisposable
         }
     }
 
+    /// <summary>
+    /// The version of the native library this binding was built for (major.minor.patch). Every call
+    /// into the library throws <see cref="InvalidOperationException"/> when <see cref="NativeVersion"/>
+    /// has another major.minor.
+    /// </summary>
+    public static Version BindingVersion => NativeLoader.BindingVersion;
+
     /// <summary>Version of the loaded native library.</summary>
     public static Version NativeVersion
     {
         get
         {
-            NativeLoader.EnsureInitialized();
-            uint v = NativeMethods.fa_version();
-            return new Version((int)(v >> 16), (int)((v >> 8) & 0xFF), (int)(v & 0xFF));
+            NativeLoader.EnsureLoaded(); // no version check, so a mismatch can be reported
+            return NativeLoader.Unpack(NativeMethods.fa_version());
         }
     }
 

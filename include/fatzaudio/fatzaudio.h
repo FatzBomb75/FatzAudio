@@ -46,8 +46,10 @@ extern "C" {
 #  define FA_CALL
 #endif
 
+/* The one version number of the library, CMake project and .NET package (see
+ * CHANGELOG.md: before 1.0 a minor bump may break the API). */
 #define FA_VERSION_MAJOR 0
-#define FA_VERSION_MINOR 1
+#define FA_VERSION_MINOR 2
 #define FA_VERSION_PATCH 0
 
 /* ---- Basic types -------------------------------------------------------- */

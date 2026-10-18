@@ -29,7 +29,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 
 | BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
-| BASS_GetVersion | `fa_version` | `AudioEngine.NativeVersion` | ✅ |
+| BASS_GetVersion | `fa_version` | `AudioEngine.NativeVersion` (and `AudioEngine.BindingVersion`; `AudioEngine.Create` throws if their major.minor differ, see [CHANGELOG](../../CHANGELOG.md)) | ✅ |
 | BASS_ErrorGetCode | Return value of every call; `fa_result_string` | `FatzAudioException.ErrorCode` | ✅ |
 | BASS_ERROR_WMA_LICENSE (protected WMA) | `FA_ERROR_PROTECTED_CONTENT`, also for encrypted MP4/MKV and SAMPLE-AES HLS | `ErrorCode.ProtectedContent` | ✅ |
 | BASS_Init | `fa_engine_create` + `fa_device_open` | `AudioEngine.Create()` + `engine.OpenOutput()` | ✅ |

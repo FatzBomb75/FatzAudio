@@ -13,7 +13,11 @@
     <AssemblyName>FatzAudio.Net</AssemblyName>
 
     <PackageId>FatzAudio</PackageId>
-    <Version>0.1.0</Version>
+    <!-- The version comes from FA_VERSION_* in the C header, the one place it is set (see CHANGELOG.md). -->
+    <FatzAudioHeader>$(MSBuildThisFileDirectory)../../../../include/fatzaudio/fatzaudio.h</FatzAudioHeader>
+    <VersionPrefix>$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText('$(FatzAudioHeader)')), '(?m)^#define FA_VERSION_MAJOR (\d+)').Groups[1].Value).$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText('$(FatzAudioHeader)')), '(?m)^#define FA_VERSION_MINOR (\d+)').Groups[1].Value).$([System.Text.RegularExpressions.Regex]::Match($([System.IO.File]::ReadAllText('$(FatzAudioHeader)')), '(?m)^#define FA_VERSION_PATCH (\d+)').Groups[1].Value)</VersionPrefix>
+    <PackageReleaseNotes>See CHANGELOG.md in the repository.</PackageReleaseNotes>
+    <RepositoryUrl>https://github.com/FatzBomb75/FatzAudio</RepositoryUrl>
     <Authors>FatzAudio contributors</Authors>
     <Description>.NET binding for the FatzAudio native audio engine: playback, decoding, crossfades, markers and more behind an idiomatic API.</Description>
     <PackageTags>audio;playback;decoder;crossfade;dj;karaoke</PackageTags>
@@ -28,6 +32,10 @@
     -->
     <FatzAudioNativeDir Condition="'$(FatzAudioNativeDir)' == ''">$(MSBuildThisFileDirectory)..\..\..\..\build\bin\Release</FatzAudioNativeDir>
   </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="FatzAudio.Tests" />
+  </ItemGroup>
 
   <ItemGroup>
     <None Include="..\..\README.md" Pack="true" PackagePath="\" />
