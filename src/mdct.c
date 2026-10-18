@@ -1,6 +1,7 @@
 /* Inverse MDCT of any power-of-two size through a complex FFT of a quarter of the
  * output length (the usual DCT-IV folding). Shared by the built-in transform
- * codecs (ac3.c); written from the transform's definition. */
+ * codecs (ac3.c, aac.c, and libvorbis through fa_vorbis_imdct); written from the
+ * transform's definition. */
 #include "mdct.h"
 #include <math.h>
 #include <stdlib.h>
@@ -17,32 +18,44 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-fa_result fa_imdct_init(fa_mdct* t, int m)
+/* One set of tables per size 2^bits of m (m up to 2^20). */
+typedef struct mdct_tables {
+    fa_atomic32 state;     /* 0 not built, 1 being built, 2 built */
+    float* twiddle;
+    float* post;
+    float* fft_tw;
+    int* rev;
+} mdct_tables;
+
+static mdct_tables shared_tables[21];
+
+static int build_tables(mdct_tables* s, int m)
 {
     int q = m / 2, i, bits = 0;
-    memset(t, 0, sizeof(*t));
-    if (m < 4 || (m & (m - 1))) return FA_ERROR_INVALID_ARG;
     while ((1 << bits) < q) bits++;
-    t->m = m;
-    t->twiddle = (float*)malloc(sizeof(float) * (size_t)q * 2);
-    t->post = (float*)malloc(sizeof(float) * (size_t)q * 2);
+    s->twiddle = (float*)malloc(sizeof(float) * (size_t)q * 2);
+    s->post = (float*)malloc(sizeof(float) * (size_t)q * 2);
     /* Radix-4 passes: 12 floats per butterfly (see fft), under 4q in all. */
-    t->fft_tw = (float*)malloc(sizeof(float) * (size_t)q * 4);
-    t->rev = (int*)malloc(sizeof(int) * (size_t)q);
-    t->work = (float*)malloc(sizeof(float) * (size_t)q * 2);
-    if (!t->twiddle || !t->post || !t->fft_tw || !t->rev || !t->work) {
-        fa_imdct_free(t);
-        return FA_ERROR_OUT_OF_MEMORY;
+    s->fft_tw = (float*)malloc(sizeof(float) * (size_t)q * 4);
+    s->rev = (int*)malloc(sizeof(int) * (size_t)q);
+    if (!s->twiddle || !s->post || !s->fft_tw || !s->rev) {
+        free(s->twiddle);
+        free(s->post);
+        free(s->fft_tw);
+        free(s->rev);
+        s->twiddle = s->post = s->fft_tw = NULL;
+        s->rev = NULL;
+        return 0;
     }
     for (i = 0; i < q; i++) {
         double a = M_PI * (4.0 * i + 1.0) / (4.0 * m);
         int r = 0, b;
-        t->twiddle[2 * i] = (float)cos(a);
-        t->twiddle[2 * i + 1] = (float)-sin(a);
-        t->post[2 * i] = (float)cos(M_PI * i / m);
-        t->post[2 * i + 1] = (float)-sin(M_PI * i / m);
+        s->twiddle[2 * i] = (float)cos(a);
+        s->twiddle[2 * i + 1] = (float)-sin(a);
+        s->post[2 * i] = (float)cos(M_PI * i / m);
+        s->post[2 * i + 1] = (float)-sin(M_PI * i / m);
         for (b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b);
-        t->rev[i] = r;
+        s->rev[i] = r;
     }
     /* Roots of the radix-4 passes with h >= 2 (the h = 1 pass only multiplies by
      * 1). With W = e^(-2 pi i / 4h), per pair of butterflies k, k + 1 and per
@@ -51,7 +64,7 @@ fa_result fa_imdct_init(fa_mdct* t, int m)
      * vector complex multiply wants. */
     {
         int h, k, r;
-        float* w = t->fft_tw;
+        float* w = s->fft_tw;
         for (h = (bits & 1) ? 2 : 4; 4 * h <= q; h *= 4) {
             for (k = 0; k < h; k += 2) {
                 for (r = 1; r <= 3; r++, w += 8) {
@@ -66,15 +79,43 @@ fa_result fa_imdct_init(fa_mdct* t, int m)
             }
         }
     }
+    return 1;
+}
+
+fa_result fa_imdct_init(fa_mdct* t, int m)
+{
+    int bits = 0;
+    mdct_tables* s;
+    memset(t, 0, sizeof(*t));
+    if (m < 4 || (m & (m - 1))) return FA_ERROR_INVALID_ARG;
+    while ((1 << bits) < m) bits++;
+    if (bits >= (int)(sizeof(shared_tables) / sizeof(shared_tables[0]))) return FA_ERROR_INVALID_ARG;
+    s = &shared_tables[bits];
+    while (fa_load32(&s->state) != 2) {
+        if (fa_cas32(&s->state, 0, 1)) {
+            /* Out of memory leaves them unbuilt, for a later try. */
+            int ok = build_tables(s, m);
+            fa_store32(&s->state, ok ? 2 : 0);
+            if (!ok) return FA_ERROR_OUT_OF_MEMORY;
+        } else {
+            fa_sleep_ms(1);
+        }
+    }
+    t->m = m;
+    t->twiddle = s->twiddle;
+    t->post = s->post;
+    t->fft_tw = s->fft_tw;
+    t->rev = s->rev;
+    t->work = (float*)malloc(sizeof(float) * (size_t)m);
+    if (!t->work) {
+        memset(t, 0, sizeof(*t));
+        return FA_ERROR_OUT_OF_MEMORY;
+    }
     return FA_OK;
 }
 
 void fa_imdct_free(fa_mdct* t)
 {
-    free(t->twiddle);
-    free(t->post);
-    free(t->fft_tw);
-    free(t->rev);
     free(t->work);
     memset(t, 0, sizeof(*t));
 }
@@ -199,4 +240,41 @@ void fa_mdct_dct4(const fa_mdct* t, const float* in, float* u)
         u[2 * k] = yr;
         u[m - 1 - 2 * k] = -yi;
     }
+}
+
+/* libvorbis's inverse MDCT goes through this one (see third_party/XIPH.md): n
+ * samples from the n/2 coefficients at the start of x, in place. The DCT-IV
+ * lands in the second half, u = x + m, and unfolds from there in an order that
+ * reads each value of u before it is overwritten. */
+void* fa_vorbis_imdct_create(int n)
+{
+    fa_mdct* t = (fa_mdct*)malloc(sizeof(*t));
+    if (t && fa_imdct_init(t, n / 2) != FA_OK) {
+        free(t);
+        t = NULL;
+    }
+    return t;
+}
+
+void fa_vorbis_imdct(void* p, float* x)
+{
+    const fa_mdct* t = (const fa_mdct*)p;
+    int m = t->m, h = m / 2, i;
+    float* u = x + m;
+    fa_mdct_dct4(t, x, u);
+    for (i = 0; i < h; i++) x[i] = u[i + h];
+    for (i = h; i < m; i++) x[i] = -u[m + h - 1 - i];
+    for (i = 0; i < h; i++) x[m + h + i] = -u[i];
+    for (i = 0; i < h / 2; i++) {
+        float a = u[i], b = u[h - 1 - i];
+        u[i] = -b;
+        u[h - 1 - i] = -a;
+    }
+}
+
+void fa_vorbis_imdct_free(void* p)
+{
+    if (!p) return;
+    fa_imdct_free((fa_mdct*)p);
+    free(p);
 }

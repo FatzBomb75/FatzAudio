@@ -45,17 +45,35 @@
 #include "os.h"
 #include "misc.h"
 
+/* FatzAudio patch (see third_party/XIPH.md): decoding uses FatzAudio's
+   inverse MDCT, the one its AC-3 and AAC decoders use, which is 2 to 3
+   times faster than the one below. The tables below are only built for
+   mdct_forward (the encoder's), the first time it runs; upstream's
+   mdct_backward below is left in place but no longer runs. */
+#include "fa_vorbis_imdct.h"
+
+static void mdct_tables(mdct_lookup *lookup);
+
+void mdct_init(mdct_lookup *lookup,int n){
+  lookup->n=n;
+  lookup->log2n=rint(log((float)n)/log(2.f));
+  lookup->scale=FLOAT_CONV(4.f/n);
+  lookup->trig=NULL;
+  lookup->bitrev=NULL;
+  lookup->fa=fa_vorbis_imdct_create(n);
+}
+
 /* build lookups for trig functions; also pre-figure scaling and
    some window function algebra. */
 
-void mdct_init(mdct_lookup *lookup,int n){
+static void mdct_tables(mdct_lookup *lookup){
+  int n=lookup->n;
   int   *bitrev=_ogg_malloc(sizeof(*bitrev)*(n/4));
   DATA_TYPE *T=_ogg_malloc(sizeof(*T)*(n+n/4));
 
   int i;
   int n2=n>>1;
-  int log2n=lookup->log2n=rint(log((float)n)/log(2.f));
-  lookup->n=n;
+  int log2n=lookup->log2n;
   lookup->trig=T;
   lookup->bitrev=bitrev;
 
@@ -86,7 +104,6 @@ void mdct_init(mdct_lookup *lookup,int n){
 
     }
   }
-  lookup->scale=FLOAT_CONV(4.f/n);
 }
 
 /* 8 point butterfly (in place, 4 register) */
@@ -339,6 +356,7 @@ void mdct_clear(mdct_lookup *l){
   if(l){
     if(l->trig)_ogg_free(l->trig);
     if(l->bitrev)_ogg_free(l->bitrev);
+    fa_vorbis_imdct_free(l->fa);
     memset(l,0,sizeof(*l));
   }
 }
@@ -397,6 +415,15 @@ void mdct_backward(mdct_lookup *init, DATA_TYPE *in, DATA_TYPE *out){
   int n=init->n;
   int n2=n>>1;
   int n4=n>>2;
+
+  if(!init->fa)init->fa=fa_vorbis_imdct_create(n);
+  if(!init->fa){
+    memset(out,0,n*sizeof(*out));   /* out of memory: a block of silence */
+    return;
+  }
+  if(in!=out)memcpy(out,in,n2*sizeof(*out));
+  fa_vorbis_imdct(init->fa,out);
+  return;
 
   /* rotate */
 
@@ -496,6 +523,8 @@ void mdct_forward(mdct_lookup *init, DATA_TYPE *in, DATA_TYPE *out){
   int n8=n>>3;
   DATA_TYPE *w=alloca(n*sizeof(*w)); /* forward needs working space */
   DATA_TYPE *w2=w+n2;
+
+  if(!init->trig)mdct_tables(init);
 
   /* rotate */
 

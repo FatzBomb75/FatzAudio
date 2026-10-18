@@ -47,7 +47,8 @@ add_library(fa_vorbis STATIC
 target_include_directories(fa_vorbis PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/vorbis/lib
     ${CMAKE_CURRENT_LIST_DIR}/vorbis/include
-    ${CMAKE_CURRENT_LIST_DIR}/ogg/include)
+    ${CMAKE_CURRENT_LIST_DIR}/ogg/include
+    ${CMAKE_CURRENT_LIST_DIR}/../src)   # fa_vorbis_imdct.h (XIPH.md)
 if(MSVC)
     target_compile_definitions(fa_vorbis PRIVATE _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS)
 elseif(NOT WIN32)

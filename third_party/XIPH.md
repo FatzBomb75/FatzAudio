@@ -10,8 +10,17 @@ library needs are copied; nothing is changed except where noted.
 | libvorbis | 1.3.7 plus the fixes on master up to c2aa86b0 (2025-12-05: undefined shifts, a psy bounds check) | `vorbis/lib`: libvorbis itself (no vorbisfile, no vorbisenc), `vorbis/include/vorbis/codec.h` | https://github.com/xiph/vorbis |
 | libogg | 1.3.6 (tag v1.3.6, be05b13e) | `ogg/src/bitwise.c`, `framing.c`, `crctable.h`, `ogg/include/ogg` | https://github.com/xiph/ogg |
 
-Changes: `ogg/include/ogg/config_types.h` is written by hand (upstream generates
-it from `config_types.h.in`) and uses `<stdint.h>`.
+Changes:
+- `ogg/include/ogg/config_types.h` is written by hand (upstream generates it
+  from `config_types.h.in`) and uses `<stdint.h>`.
+- `vorbis/lib/mdct.c` and `mdct.h` (marked "FatzAudio patch"): `mdct_backward`
+  calls FatzAudio's inverse MDCT (`fa_vorbis_imdct` in `src/mdct.c`), which is 2
+  to 3 times faster, so decoding takes about a quarter less time. `mdct_init`
+  no longer builds upstream's tables; `mdct_forward` (the encoder's) builds them
+  the first time it runs. Out of memory, a block decodes as silence. Output
+  differs from upstream's by float rounding only (about 133 dB below the
+  signal). The patched file includes `src/fa_vorbis_imdct.h`, which is why
+  `xiph.cmake` adds `src` to libvorbis's include path.
 
 FatzAudio reads Ogg pages itself (`src/demux_ogg.c`); libogg is here for the bit
 reader libvorbis uses. The libopus encoder is compiled in too, for the encoding

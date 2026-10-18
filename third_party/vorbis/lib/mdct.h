@@ -60,6 +60,8 @@ typedef struct {
   int       *bitrev;
 
   DATA_TYPE scale;
+
+  void *fa;   /* FatzAudio patch: its own inverse transform (src/mdct.c) */
 } mdct_lookup;
 
 extern void mdct_init(mdct_lookup *lookup,int n);
