@@ -119,7 +119,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_SYNC_POS used to end playback early (trim) | `FA_MARKER_CUE_OUT` (exact end) and `FA_MARKER_CUE_IN` | `Markers.CueOut`, `Markers.CueIn` | ✅ |
 | `FA_EVENT_MARKER` has no BASS equivalent | Raised when playback passes a marker | `MarkerReached` | ✅ |
 | BASS_SYNC_MIXTIME | Not needed: callbacks never run on the audio thread, so any call is safe in them. Sample-accurate actions are scheduled instead: `fa_stream_play_at`, ramps with a start time, and queues (`fa_stream_set_next`) that start the next track on the exact frame | — | ➖ (by design) |
-| BASS_ChannelSetDSP (+Ex) / RemoveDSP | `fa_stream_add_dsp` / `fa_stream_remove_dsp` | | 🧩 |
+| BASS_ChannelSetDSP (+Ex) / RemoveDSP | `fa_stream_add_dsp` / `fa_stream_remove_dsp`: same idea (in place, priority-ordered, higher first), plus the sample rate in the callback. Runs on a worker as the stream is decoded ahead, never the audio thread ([equalizer and DSP](../features/equalizer.md#user-dsp)) | `stream.AddDsp(...)` (dispose to remove) | ✅ |
 | BASS_ChannelGetLevel (+Ex) | `fa_stream_get_levels` | `GetLevels()` | 🧩 |
 | BASS_ChannelGetData (FFT) | Planned `fa_stream_get_spectrum` | | 🗓️ |
 | BASS_ChannelGetTags | `fa_stream_get_tags` for an open stream, or `fa_tags_read_path`/`_memory` without one: one reader for every format, common fields with `fa_tags_get(tags, FA_TAG_ARTIST)`, every item with `fa_tags_get_item` ([tags](../features/tags.md)) | `stream.GetTags()`, `Tags.Read(path)`: `tags.Artist`, `tags.Title`, ... | ✅ |
@@ -155,9 +155,14 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 
 ### Effects
 
-| BASS | FatzAudio | Status |
+| BASS | FatzAudio (C; .NET: `SetEqualizer`, `SetEqualizerGain`, `EqualizerEnabled`, `Equalizer.GetPreset`) | Status |
 |---|---|---|
-| BASS_ChannelSetFX / RemoveFX, BASS_FXSetParameters / GetParameters / Reset / SetPriority / SetBypass / Free | One effects chain per stream (EQ, compressor, reverb, echo, chorus, flanger, distortion) | 🗓️ |
+| BASS_ChannelSetFX(BASS_FX_DX8_PARAMEQ) per band, or bass_fx `BASS_FX_BFX_PEAKEQ` with `lBand` per band + BASS_FXSetParameters | `fa_stream_set_eq` with up to 16 peak or shelf bands; `fa_stream_set_eq_gain` for one slider. No FX handles: one equalizer per stream, before volume and normalization, gliding without clicks, free when flat ([equalizer](../features/equalizer.md)) | ✅ |
+| `BASS_BFX_PEAKEQ.fCenter` / `fBandwidth` (octaves) / `fQ` / `fGain` | `fa_eq_band.frequency_hz` / `q` (one octave = 1.41) / `gain_db` | ✅ |
+| BASS_FXSetParameters to switch a whole EQ preset | `fa_eq_get_preset` + `fa_stream_set_eq` (13 presets) | ✅ |
+| BASS_FXSetBypass on the EQ | `fa_stream_set_eq_enabled(s, 0)`: glides to flat, keeps the bands | ✅ |
+| BASS_FXReset (clear the EQ's filter memory after a seek) | Not needed: cleared by itself on a seek, a flush and a restart | ➖ |
+| Other BASS_FX / bass_fx effects (compressor, reverb, echo, chorus, flanger, distortion, phaser, auto-wah, ...) | Not built in: a player rarely needs them, and `fa_stream_add_dsp` takes your own | ➖ (by design) |
 
 ### Loudness and normalization
 

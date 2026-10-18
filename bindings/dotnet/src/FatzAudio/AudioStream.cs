@@ -44,10 +44,11 @@ public sealed class MetadataChangedEventArgs : EventArgs
     public long Frame { get; }
 }
 
-/// <summary>Callback for in-place DSP on interleaved float frames.</summary>
+/// <summary>Callback for in-place DSP on interleaved float frames (<see cref="AudioStream.AddDsp"/>).</summary>
 /// <param name="samples">Interleaved samples (frames x channels); modify in place.</param>
-/// <param name="channels">Channel count.</param>
-public delegate void DspProcessor(Span<float> samples, int channels);
+/// <param name="channels">Channel count: 2 on a device; the stream's own for decode-only streams.</param>
+/// <param name="sampleRate">Sample rate: the device's on a device; the stream's own for decode-only streams.</param>
+public delegate void DspProcessor(Span<float> samples, int channels, int sampleRate);
 
 /// <summary>
 /// A playable or decodable audio source. Create one with <see cref="AudioEngine.OpenFile"/>,
@@ -638,6 +639,59 @@ public unsafe class AudioStream : IDisposable
     private void SetParam(AudioParameter p, float v) =>
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_param(Handle, (int)p, v));
 
+    // ---- Equalizer ----------------------------------------------------------------
+
+    /// <summary>
+    /// Sets the stream's equalizer: up to 16 peak or shelf bands, applied in the mixer before volume, fades and
+    /// normalization, so a change is heard at once and glides without clicks. An empty list turns it off. Flat bands
+    /// cost nothing. Not applied to decode-only streams.
+    /// </summary>
+    /// <example><code>
+    /// song.SetEqualizer(Equalizer.GetPreset(EqualizerPreset.Rock));
+    /// song.SetEqualizerGain(0, 6f);   // the 31 Hz slider
+    /// </code></example>
+    /// <exception cref="ArgumentException">More than 16 bands.</exception>
+    public unsafe void SetEqualizer(IReadOnlyList<EqualizerBand> bands)
+    {
+        ArgumentNullException.ThrowIfNull(bands);
+        if (bands.Count > 16) throw new ArgumentException("At most 16 bands.", nameof(bands));
+        var native = stackalloc FaEqBand[16];
+        for (int i = 0; i < bands.Count; i++) native[i] = new FaEqBand(bands[i]);
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_eq(Handle, native, (uint)bands.Count));
+    }
+
+    /// <summary>Sets the equalizer to a built-in preset (ten octave bands).</summary>
+    public void SetEqualizer(EqualizerPreset preset) => SetEqualizer(Equalizer.GetPreset(preset));
+
+    /// <summary>The equalizer's bands as set (after clamping to the ranges; the frequency is also capped at just under half the device rate while playing).</summary>
+    public unsafe EqualizerBand[] GetEqualizer()
+    {
+        var native = stackalloc FaEqBand[16];
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_eq(Handle, native, 16, out uint n));
+        var result = new EqualizerBand[n];
+        for (int i = 0; i < n; i++) result[i] = native[i].ToBand();
+        return result;
+    }
+
+    /// <summary>Changes one band's gain, for a slider; glides while playing.</summary>
+    /// <exception cref="FatzAudioException">No such band (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    public void SetEqualizerGain(int band, float gainDb)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(band);
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_eq_gain(Handle, (uint)band, gainDb));
+    }
+
+    /// <summary>Bypass without losing the bands: false glides to flat, true back to the bands. True by default.</summary>
+    public bool EqualizerEnabled
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_eq_enabled(Handle, out int on));
+            return on != 0;
+        }
+        set => FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_eq_enabled(Handle, value ? 1 : 0));
+    }
+
     /// <summary>Linear gain of this stream (1 = unity).</summary>
     public float Volume { get => GetParam(AudioParameter.Volume); set => SetParam(AudioParameter.Volume, value); }
 
@@ -1062,11 +1116,18 @@ public unsafe class AudioStream : IDisposable
     public void AddPositionEvent(TimeSpan position) =>
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_add_position_event(Handle, TimeToFrames(position)));
 
-    /// <summary>Adds a user DSP processor that runs in place on interleaved float frames on the audio thread.</summary>
-    /// <param name="processor">The processor. It runs on the real-time audio thread: do not block or allocate.</param>
-    /// <param name="priority">Order among processors; lower runs first.</param>
+    /// <summary>
+    /// Adds a user DSP processor that changes the audio in place, after rate, tempo and pitch and before the
+    /// equalizer, volume, fades and normalization. It runs where the stream is decoded, never on the audio thread, so
+    /// a change is heard after the decode-ahead buffer: normally an engine worker, but the first 100 ms after a seek or
+    /// <see cref="PlayOn"/> are decoded on the calling thread, and decode-only streams decode inside <see cref="Read"/>.
+    /// Safe to add and remove while playing; once the handle is disposed it is never called again. It runs with the
+    /// stream's locks held: don't use this stream (not even <see cref="Position"/>) from inside the processor, and
+    /// don't wait there for a thread that might.
+    /// </summary>
+    /// <param name="processor">The processor.</param>
+    /// <param name="priority">Order among processors: higher runs first; equal ones in the order added.</param>
     /// <returns>A handle; dispose it to remove the processor.</returns>
-    /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
     public IDisposable AddDsp(DspProcessor processor, int priority = 0)
     {
         ArgumentNullException.ThrowIfNull(processor);
@@ -1082,12 +1143,12 @@ public unsafe class AudioStream : IDisposable
     }
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
-    private static void DspTrampoline(float* frames, long count, uint channels, void* user)
+    private static void DspTrampoline(float* frames, long count, uint channels, uint sampleRate, void* user)
     {
         try
         {
             if (GCHandle.FromIntPtr((nint)user).Target is DspProcessor p)
-                p(new Span<float>(frames, checked((int)(count * channels))), (int)channels);
+                p(new Span<float>(frames, checked((int)(count * channels))), (int)channels, (int)sampleRate);
         }
         catch
         {

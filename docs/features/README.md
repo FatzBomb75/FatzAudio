@@ -20,4 +20,5 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Disc playback (audio CDs, CD+G discs and `.cue` images) | [disc.md](disc.md) | ✅ |
 | MIDI and karaoke files (SoundFont 2 and DLS, the OS's gm.dls by default, lyrics, transpose, channel mute) | [midi.md](midi.md) | ✅ (SF3, SFZ and MIDI input 🗓️) |
 | Recording and encoding (WAV, FLAC, MP3 via LAME; device, stream or file sources) | [recording-encoding.md](recording-encoding.md) | ✅ WAV/FLAC/MP3; Opus, AAC and casting 🗓️ |
+| Equalizer, presets and user DSP (parametric/graphic EQ, 13 presets, `fa_stream_add_dsp`) | [equalizer.md](equalizer.md) | ✅ |
 | Tags, cover art and file properties (ID3v1/v2, APEv2, Vorbis comments, MP4, ASF, RIFF, AIFF, Matroska; bitrate, sizes) | [tags.md](tags.md) | ✅ |
