@@ -40,6 +40,11 @@ public enum ErrorCode
     NoSoundFont = -15,
     /// <summary>The file or stream is DRM-protected or encrypted (protected WMA, FairPlay or Common Encryption MP4, encrypted Matroska, SAMPLE-AES HLS) and cannot be played.</summary>
     ProtectedContent = -16,
+    /// <summary>
+    /// A compressed song in a ZIP archive is bigger than <see cref="AudioEngineOptions.ZipMemoryLimitMb"/> and no
+    /// <see cref="AudioEngineOptions.TempDirectory"/> is set: extract the archive first, or set one.
+    /// </summary>
+    TooLarge = -17,
 }
 
 /// <summary>

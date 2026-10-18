@@ -9,6 +9,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifndef _WIN32
+#  include <dirent.h>
+#  include <utime.h>
+#endif
 
 static int g_failures = 0;
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); g_failures++; return; } } while (0)
@@ -344,6 +349,7 @@ static void test_zip_edge_cases(void)
     /* A deflate entry that claims to unpack to 3 GB is refused before allocating */
     {
         fa_zip_entry e;
+        fa_source zs;
         uint8_t* out = NULL;
         buf body = stored_deflate(&wav);
         memset(&e, 0, sizeof(e));
@@ -353,12 +359,376 @@ static void test_zip_edge_cases(void)
         files[0].name = "a.wav"; files[0].data = &wav; files[0].deflate = 1;
         zip = make_zip(files, 1);
         e.header_offset = 0;
-        CHECK_EQ(fa_zip_extract(zip.p, zip.n, &e, &out), FA_ERROR_UNSUPPORTED_FORMAT);
+        fa_source_open_memory_ref(&zs, zip.p, zip.n);
+        CHECK_EQ(fa_zip_extract(&zs, &e, UINT64_MAX, &out), FA_ERROR_UNSUPPORTED_FORMAT);
+        CHECK(out == NULL);
+        /* Past the caller's limit: too large, also before allocating */
+        e.size = 2000;
+        CHECK_EQ(fa_zip_extract(&zs, &e, 1000, &out), FA_ERROR_TOO_LARGE);
         CHECK(out == NULL);
         free(zip.p);
         free(body.p);
     }
     free(wav.p); free(cdg.p);
+}
+
+/* ---- Lean archive reading -------------------------------------------------------------- */
+
+/* A real compressor for the tests: greedy LZ77 with fixed Huffman codes, so the
+ * inflater meets matches and literals across its 1 MB output chunks. */
+typedef struct bitw { buf b; uint32_t acc; int n; } bitw;
+static void bw_put(bitw* w, uint32_t v, int bits)
+{
+    w->acc |= v << w->n;
+    w->n += bits;
+    while (w->n >= 8) { put8(&w->b, w->acc & 0xFF); w->acc >>= 8; w->n -= 8; }
+}
+static void bw_code(bitw* w, uint32_t code, int bits) /* Huffman codes go most significant bit first */
+{
+    uint32_t r = 0;
+    int i;
+    for (i = 0; i < bits; i++) r |= ((code >> i) & 1u) << (bits - 1 - i);
+    bw_put(w, r, bits);
+}
+static void bw_sym(bitw* w, uint32_t v)
+{
+    if (v < 144) bw_code(w, 0x30 + v, 8);
+    else if (v < 256) bw_code(w, 0x190 + v - 144, 9);
+    else if (v < 280) bw_code(w, v - 256, 7);
+    else bw_code(w, 0xC0 + v - 280, 8);
+}
+static buf lz_deflate(const buf* d)
+{
+    static const uint16_t lb[29] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+                                     35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
+    static const uint8_t le[29] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
+    static const uint16_t db[30] = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769,
+                                     1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
+    static const uint8_t de[30] = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
+    bitw w;
+    int64_t* head = (int64_t*)malloc(sizeof(int64_t) << 15);
+    size_t pos = 0, i;
+    memset(&w, 0, sizeof(w));
+    for (i = 0; i < ((size_t)1 << 15); i++) head[i] = -1;
+    bw_put(&w, 1, 1);  /* final block */
+    bw_put(&w, 1, 2);  /* fixed codes */
+    while (pos < d->n) {
+        size_t len = 0, dist = 0;
+        if (d->n - pos >= 3) {
+            uint32_t h = ((uint32_t)d->p[pos] * 2654435761u ^ (uint32_t)d->p[pos + 1] * 40503u ^ d->p[pos + 2]) & 0x7FFF;
+            int64_t c = head[h];
+            head[h] = (int64_t)pos;
+            if (c >= 0 && pos - (size_t)c <= 32768) {
+                while (len < 258 && pos + len < d->n && d->p[(size_t)c + len] == d->p[pos + len]) len++;
+                dist = pos - (size_t)c;
+            }
+        }
+        if (len >= 3) {
+            int k = 28, j = 30;
+            while (lb[k] > len) k--;
+            bw_sym(&w, 257 + (uint32_t)k);
+            bw_put(&w, (uint32_t)(len - lb[k]), le[k]);
+            while (db[j - 1] > dist) j--;
+            bw_code(&w, (uint32_t)(j - 1), 5);
+            bw_put(&w, (uint32_t)(dist - db[j - 1]), de[j - 1]);
+            pos += len;
+        } else {
+            bw_sym(&w, d->p[pos++]);
+        }
+    }
+    bw_sym(&w, 256);
+    if (w.n) put8(&w.b, w.acc & 0xFF);
+    free(head);
+    return w.b;
+}
+
+/* A mono 16-bit WAV of `frames`: a periodic tone (long matches) with a stretch of
+ * noise in the middle (literals). */
+static buf make_long_wav(uint32_t frames)
+{
+    buf b = { 0 };
+    uint32_t i, data = frames * 2, seed = 12345;
+    put(&b, "RIFF", 4); le32(&b, 36 + data); put(&b, "WAVE", 4);
+    put(&b, "fmt ", 4); le32(&b, 16); le16(&b, 1); le16(&b, 1);
+    le32(&b, 44100); le32(&b, 88200); le16(&b, 2); le16(&b, 16);
+    put(&b, "data", 4); le32(&b, data);
+    for (i = 0; i < frames; i++) {
+        int v = (int)(sin(i * 6.283185307 / 160.0) * 8000.0);
+        if (i > frames / 3 && i < frames / 3 + 40000) { seed = seed * 1103515245u + 12345u; v = (int)(seed >> 16) - 32768; }
+        le16(&b, (uint16_t)(int16_t)v);
+    }
+    return b;
+}
+
+/* make_zip with a real compressor for the deflate entries. */
+static buf make_zip_lz(const zip_file* files, int count)
+{
+    buf out = { 0 }, cd = { 0 };
+    uint32_t offsets[8];
+    int i;
+    for (i = 0; i < count; i++) {
+        buf body = files[i].deflate ? lz_deflate(files[i].data) : *files[i].data;
+        uint32_t crc = fa_crc32(files[i].data->p, files[i].data->n) ^ files[i].crc_xor;
+        uint32_t name_len = (uint32_t)strlen(files[i].name);
+        offsets[i] = (uint32_t)out.n;
+        le32(&out, 0x04034b50); le16(&out, 20); le16(&out, 0); le16(&out, files[i].deflate ? 8 : 0);
+        le16(&out, 0); le16(&out, 0); le32(&out, crc); le32(&out, (uint32_t)body.n); le32(&out, (uint32_t)files[i].data->n);
+        le16(&out, name_len); le16(&out, 0);
+        put(&out, files[i].name, name_len);
+        put(&out, body.p, body.n);
+        le32(&cd, 0x02014b50); le16(&cd, 20); le16(&cd, 20); le16(&cd, 0); le16(&cd, files[i].deflate ? 8 : 0);
+        le16(&cd, 0); le16(&cd, 0); le32(&cd, crc); le32(&cd, (uint32_t)body.n); le32(&cd, (uint32_t)files[i].data->n);
+        le16(&cd, name_len); le16(&cd, 0); le16(&cd, 0); le16(&cd, 0); le16(&cd, 0); le32(&cd, 0);
+        le32(&cd, offsets[i]);
+        put(&cd, files[i].name, name_len);
+        if (files[i].deflate) free(body.p);
+    }
+    {
+        uint32_t cd_offset = (uint32_t)out.n;
+        put(&out, cd.p, cd.n);
+        le32(&out, 0x06054b50); le16(&out, 0); le16(&out, 0); le16(&out, (uint32_t)count); le16(&out, (uint32_t)count);
+        le32(&out, (uint32_t)cd.n); le32(&out, cd_offset); le16(&out, 0);
+    }
+    free(cd.p);
+    return out;
+}
+
+/* Decodes the whole stream: frames, or -1 on an error. */
+static int64_t decode_all(fa_stream* s)
+{
+    float pcm[4096];
+    int64_t total = 0;
+    for (;;) {
+        fa_frames got = 0;
+        fa_result r = fa_stream_read(s, pcm, 2048, &got);
+        if (r == FA_ERROR_END_OF_STREAM || (r == FA_OK && got == 0)) return total;
+        if (r != FA_OK) return -1;
+        total += got;
+    }
+}
+
+static void test_inflate_streaming(void)
+{
+    buf wav = make_long_wav(1500000), z = lz_deflate(&wav), zip;   /* 3 MB, 3 output chunks */
+    zip_file f;
+    fa_source zs;
+    fa_zip_entry* e = NULL;
+    uint32_t count = 0;
+    uint8_t* out = NULL;
+    FILE* tmp;
+    CHECK(z.n < wav.n / 4);
+    /* Into memory, one buffer */
+    out = (uint8_t*)malloc(wav.n);
+    CHECK_EQ(fa_inflate(z.p, z.n, out, wav.n), FA_OK);
+    CHECK(memcmp(out, wav.p, wav.n) == 0);
+    free(out);
+    /* Into a file, through the 1 MB window, input pulled from a file source */
+    f.name = "big.wav"; f.data = &wav; f.deflate = 1; f.crc_xor = 0;
+    zip = make_zip_lz(&f, 1);
+    write_file("cdg_stream.zip", &zip);
+    CHECK_EQ(fa_source_open_path(&zs, "cdg_stream.zip"), FA_OK);
+    CHECK_EQ(fa_zip_list(&zs, &e, &count), FA_OK);
+    CHECK_EQ(count, 1);
+    tmp = tmpfile();
+    CHECK(tmp != NULL);
+    CHECK_EQ(fa_zip_extract_file(&zs, &e[0], tmp), FA_OK);
+    CHECK_EQ(ftell(tmp), (long)wav.n);
+    rewind(tmp);
+    out = (uint8_t*)malloc(wav.n);
+    CHECK_EQ(fread(out, 1, wav.n, tmp), wav.n);
+    CHECK(memcmp(out, wav.p, wav.n) == 0);
+    free(out);
+    out = NULL;
+    /* And into memory from the file source */
+    CHECK_EQ(fa_zip_extract(&zs, &e[0], wav.n, &out), FA_OK);
+    CHECK(memcmp(out, wav.p, wav.n) == 0);
+    free(out);
+    fclose(tmp);
+    fa_source_close(&zs);
+    free(e);
+    /* A flipped byte in the middle: an error, never a crash (ASan) */
+    zip.p[zip.n / 2] ^= 0x5A;
+    fa_source_open_memory_ref(&zs, zip.p, zip.n);
+    CHECK_EQ(fa_zip_list(&zs, &e, &count), FA_OK);
+    out = NULL;
+    CHECK(fa_zip_extract(&zs, &e[0], wav.n, &out) != FA_OK);
+    CHECK(out == NULL);
+    free(e);
+    free(zip.p); free(z.p); free(wav.p);
+    remove("cdg_stream.zip");
+}
+
+/* App callbacks over a memory block, counting closes. */
+typedef struct mem_io { const buf* b; int64_t pos; int closes; int seekable; } mem_io;
+static int64_t FA_CALL mio_read(void* u, void* dst, size_t n)
+{
+    mem_io* m = (mem_io*)u;
+    size_t left = (size_t)((int64_t)m->b->n - m->pos);
+    if (n > left) n = left;
+    memcpy(dst, m->b->p + m->pos, n);
+    m->pos += (int64_t)n;
+    return (int64_t)n;
+}
+static fa_result FA_CALL mio_seek(void* u, int64_t off)
+{
+    mem_io* m = (mem_io*)u;
+    if (!m->seekable || off < 0 || off > (int64_t)m->b->n) return FA_ERROR_IO;
+    m->pos = off;
+    return FA_OK;
+}
+static int64_t FA_CALL mio_length(void* u) { return (int64_t)((mem_io*)u)->b->n; }
+static void FA_CALL mio_close(void* u) { ((mem_io*)u)->closes++; }
+
+static void test_zip_lean(void)
+{
+    buf wav = make_wav(8000, 8000), cdg = small_cdg(), zip;
+    zip_file files[2];
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_stream_info info;
+    fa_io_callbacks io;
+    mem_io m;
+    int deflate;
+    files[0].name = "Song.cdg"; files[0].data = &cdg; files[0].deflate = 0; files[0].crc_xor = 0;
+    files[1].name = "Song.wav"; files[1].data = &wav; files[1].crc_xor = 0;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    memset(&io, 0, sizeof(io));
+    io.read = mio_read; io.seek = mio_seek; io.length = mio_length; io.close = mio_close;
+    for (deflate = 0; deflate < 2; deflate++) {
+        files[1].deflate = deflate;
+        zip = make_zip_lz(files, 2);
+        write_file("cdg_lean.zip", &zip);
+        /* A path: stored audio plays in place, deflated from memory */
+        CHECK_EQ(fa_stream_open_path(g_engine, "cdg_lean.zip", &o, &s), FA_OK);
+        CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+        CHECK_EQ(info.has_cdg, 1);
+        CHECK_EQ(info.length_frames, 8000);
+        CHECK_EQ(info.file_size, (int64_t)zip.n);
+        CHECK_EQ(decode_all(s), 8000);
+        CHECK_EQ(fa_stream_seek(s, 4000), FA_OK);
+        CHECK_EQ(decode_all(s), 4000);
+        {
+            fa_tags* t = NULL;  /* the tags reader finds the entry again */
+            CHECK_EQ(fa_stream_get_tags(s, 0, &t), FA_OK);
+            fa_tags_close(t);
+        }
+        fa_stream_close(s);
+        /* Memory */
+        CHECK_EQ(fa_stream_open_memory(g_engine, zip.p, zip.n, &o, &s), FA_OK);
+        CHECK_EQ(decode_all(s), 8000);
+        fa_stream_close(s);
+        /* App callbacks: closed once, with the stream */
+        memset(&m, 0, sizeof(m));
+        m.b = &zip; m.seekable = 1;
+        CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_OK);
+        CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+        CHECK_EQ(info.has_cdg, 1);
+        CHECK_EQ(decode_all(s), 8000);
+        CHECK_EQ(m.closes, 0);
+        fa_stream_close(s);
+        CHECK_EQ(m.closes, 1);
+        /* Callbacks that cannot seek: the directory is at the end */
+        memset(&m, 0, sizeof(m));
+        m.b = &zip;
+        io.seek = NULL;
+        CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_ERROR_NOT_SEEKABLE);
+        CHECK(s == NULL);
+        CHECK_EQ(m.closes, 0);   /* a failed open leaves them to the app */
+        io.seek = mio_seek;
+        /* Cut archives fail cleanly from a path and from callbacks */
+        {
+            size_t cut;
+            for (cut = 4; cut < zip.n; cut += zip.n / 13 + 1) {
+                buf part = zip;
+                part.n = cut;
+                write_file("cdg_lean.zip", &part);
+                if (fa_stream_open_path(g_engine, "cdg_lean.zip", &o, &s) == FA_OK) { fa_stream_close(s); s = NULL; }
+                memset(&m, 0, sizeof(m));
+                m.b = &part; m.seekable = 1;
+                if (fa_stream_open_io(g_engine, &io, &m, &o, &s) == FA_OK) { fa_stream_close(s); s = NULL; CHECK_EQ(m.closes, 1); }
+                else CHECK_EQ(m.closes, 0);
+            }
+        }
+        free(zip.p);
+    }
+    remove("cdg_lean.zip");
+    free(wav.p); free(cdg.p);
+}
+
+/* Compressed audio past the memory limit: an error without a temp directory, a
+ * temp file (gone when the stream closes) with one. */
+static void test_zip_over_limit(void)
+{
+    buf wav = make_long_wav(1500000), cdg = small_cdg(), zip;
+    zip_file files[2];
+    fa_engine_config cfg;
+    fa_engine* e = NULL;
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_stream_info info;
+    files[0].name = "Big.cdg"; files[0].data = &cdg; files[0].deflate = 1; files[0].crc_xor = 0;
+    files[1].name = "Big.wav"; files[1].data = &wav; files[1].deflate = 1; files[1].crc_xor = 0;
+    zip = make_zip_lz(files, 2);
+    write_file("cdg_big.zip", &zip);
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+
+    fa_engine_config_init(&cfg);
+    cfg.flags = FA_ENGINE_NULL_OUTPUT;
+    cfg.zip_memory_limit_mb = 1;
+    CHECK_EQ(fa_engine_create(&cfg, &e), FA_OK);
+    CHECK_EQ(fa_stream_open_path(e, "cdg_big.zip", &o, &s), FA_ERROR_TOO_LARGE);
+    CHECK(s == NULL);
+    CHECK_EQ(fa_stream_open_memory(e, zip.p, zip.n, &o, &s), FA_ERROR_TOO_LARGE);
+    fa_engine_destroy(e);
+    e = NULL;
+
+#ifndef _WIN32
+    {
+        /* A leftover from a crash, old enough to be nobody's */
+        FILE* stale;
+        struct utimbuf old;
+        fa_mkdir_utf8("cdg_tmp");
+        fa_mkdir_utf8("cdg_tmp/fatzaudio-tmp");
+        stale = fopen("cdg_tmp/fatzaudio-tmp/fa-abc123", "wb");
+        CHECK(stale != NULL);
+        fclose(stale);
+        old.actime = old.modtime = time(NULL) - 3600;
+        utime("cdg_tmp/fatzaudio-tmp/fa-abc123", &old);
+    }
+#endif
+    cfg.temp_directory = "cdg_tmp";
+    CHECK_EQ(fa_engine_create(&cfg, &e), FA_OK);
+#ifndef _WIN32
+    {
+        FILE* gone = fopen("cdg_tmp/fatzaudio-tmp/fa-abc123", "rb");
+        CHECK(gone == NULL);   /* swept at engine start */
+    }
+#endif
+    CHECK_EQ(fa_stream_open_path(e, "cdg_big.zip", &o, &s), FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK_EQ(info.has_cdg, 1);
+    CHECK_EQ(info.length_frames, 1500000);
+    CHECK_EQ(info.file_size, (int64_t)zip.n);
+    CHECK_EQ(decode_all(s), 1500000);
+    CHECK_EQ(fa_stream_seek(s, 1000000), FA_OK);
+    CHECK_EQ(decode_all(s), 500000);
+#ifndef _WIN32
+    {
+        DIR* d = opendir("cdg_tmp/fatzaudio-tmp");
+        struct dirent* ent;
+        int files_left = 0;
+        CHECK(d != NULL);
+        while ((ent = readdir(d)) != NULL) if (ent->d_name[0] != '.') files_left++;
+        closedir(d);
+        CHECK_EQ(files_left, 0);   /* the name went right after it was created */
+    }
+#endif
+    fa_stream_close(s);
+    fa_engine_destroy(e);
+    remove("cdg_big.zip");
+    free(zip.p); free(wav.p); free(cdg.p);
 }
 
 /* ---- the decoder and surfaces ---------------------------------------------------------- */
@@ -824,6 +1194,9 @@ int main(void)
     RUN(test_zip_pair);
     RUN(test_zip_damaged);
     RUN(test_zip_edge_cases);
+    RUN(test_inflate_streaming);
+    RUN(test_zip_lean);
+    RUN(test_zip_over_limit);
     RUN(test_decoder_basics);
     RUN(test_xor_and_repeats);
     RUN(test_scrolling);

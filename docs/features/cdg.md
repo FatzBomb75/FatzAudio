@@ -152,7 +152,35 @@ Drawing runs on the thread that calls update, not on the audio thread, and costs
 
 ## ZIP archives
 
-`fa_stream_open_path` and `fa_stream_open_memory` recognise a ZIP by its content. Inside, the first `.cdg` is the graphics, and the audio is the entry with the same name (`Song.mp3` next to `Song.cdg`), else the first other entry FatzAudio can decode. Stored and deflate-compressed entries are read (the decompressor is built in) and every entry's CRC is checked. A damaged `.cdg` entry leaves a playable song without graphics. ZIP64, encrypted and multi-part archives are not supported (`FA_ERROR_UNSUPPORTED_FORMAT`); karaoke downloads never use them. Archives up to 1 GB are read into memory.
+`fa_stream_open_path`, `fa_stream_open_memory` and `fa_stream_open_io` recognise a ZIP by its content. Inside, the first `.cdg` is the graphics, and the audio is the entry with the same name (`Song.mp3` next to `Song.cdg`), else the first other entry FatzAudio can decode. Stored and deflate-compressed entries are read (the decompressor is built in). A damaged `.cdg` entry leaves a playable song without graphics. ZIP64, encrypted and multi-part archives are not supported (`FA_ERROR_UNSUPPORTED_FORMAT`); karaoke downloads never use them.
+
+Only what is needed is read: the archive's directory at the end of the file, then the entries used. The whole file is never loaded.
+
+| Audio entry | How it plays | Memory |
+|---|---|---|
+| Stored (uncompressed, the usual case) | Straight from the archive, like a plain file | None beyond a plain file's |
+| Compressed, up to the memory limit (256 MB unless `fa_engine_config.zip_memory_limit_mb` says otherwise) | Unpacked into memory at open, CRC checked | The song's unpacked size |
+| Compressed, bigger than the limit (or memory ran out), with `fa_engine_config.temp_directory` set | Unpacked into a temp file at open, CRC checked, then played from it | About 1 MB while unpacking |
+| Compressed, bigger than the limit, no temp directory | Not opened: `FA_ERROR_TOO_LARGE` (.NET `ErrorCode.TooLarge`). Tell the user to extract the archive, or set a temp directory | None |
+
+The `.cdg` is always unpacked into memory (a song's graphics are a few MB).
+
+A stored entry played in place is not CRC checked at open, since that would read the whole song first. A damaged byte then plays like a damaged byte in an unzipped MP3: a short glitch, never a crash. Compressed entries are always checked while they are unpacked.
+
+The temp directory is off by default, so FatzAudio never writes to disk unless the app asks. When it is set, FatzAudio works in a `fatzaudio-tmp` folder inside it and never touches anything else there. The directory and that folder are created if missing (not the directory's parents); if they cannot be written when a song needs them, the open fails with `FA_ERROR_IO`. Each unpacked song is deleted when its stream closes, and also if the app crashes: Windows opens the file with delete-on-close, and Linux, macOS, iOS and Android remove its name as soon as it exists. Files left by a power cut are deleted the next time an engine is created with that directory. On Android and iOS, pass the app's cache directory.
+
+```c
+fa_engine_config cfg;
+fa_engine_config_init(&cfg);
+cfg.temp_directory = "C:\\Users\\me\\AppData\\Local\\MyPlayer";   /* opt in */
+fa_engine_create(&cfg, &engine);
+```
+
+```csharp
+using var engine = AudioEngine.Create(new AudioEngineOptions { TempDirectory = Path.GetTempPath() });
+```
+
+`fa_stream_open_io` needs `seek` and `length` callbacks for a ZIP, because its directory is at the end (`FA_ERROR_NOT_SEEKABLE` without them). When the audio was unpacked, the archive is no longer read, but `close` is still called once, when the stream closes. Loudness scans and `fa_stream_get_tags` read a stored entry again from the archive file or block; a song unpacked into a temp file gets the running loudness estimate instead of a scan (as with app callbacks).
 
 ## The CD+G format
 

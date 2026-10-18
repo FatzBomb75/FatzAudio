@@ -121,11 +121,15 @@ size_t fa_source_peek(fa_source* src, const uint8_t** out_data)
                 src->prefix_filled = 0;  /* out of memory: fa_decoder_open says so */
                 got = 0;
             } else if (src->kind == FA_SOURCE_FILE) {
-                file_seek(src->file, 0, SEEK_SET);
-                got = (int64_t)fread(src->prefix_buf, 1, FA_PROBE_BYTES, src->file);
-                file_seek(src->file, src->pos, SEEK_SET);
+                size_t want = FA_PROBE_BYTES;
+                if (src->windowed && src->length < (int64_t)want) want = (size_t)src->length;
+                file_seek(src->file, src->base, SEEK_SET);
+                got = (int64_t)fread(src->prefix_buf, 1, want, src->file);
+                file_seek(src->file, src->base + src->pos, SEEK_SET);
             } else {
-                got = io_read_raw(src, src->prefix_buf, FA_PROBE_BYTES);
+                size_t want = FA_PROBE_BYTES;
+                if (src->windowed && src->length < (int64_t)want) want = (size_t)src->length;
+                got = io_read_raw(src, src->prefix_buf, want);
                 if (got < 0) got = 0;
             }
         }
@@ -168,6 +172,12 @@ int64_t fa_source_read(fa_source* src, void* buf, size_t n)
         src->pos += (int64_t)n;
         return (int64_t)n;
     }
+    /* A window ends before the file or the app's data does. */
+    if (src->windowed) {
+        int64_t left = src->length - src->pos;
+        if (left <= 0) return 0;
+        if ((uint64_t)n > (uint64_t)left) n = (size_t)left;
+    }
     if (src->kind == FA_SOURCE_FILE) {
         size_t got = fread(out, 1, n, src->file);
         src->pos += (int64_t)got;
@@ -189,7 +199,7 @@ int64_t fa_source_read(fa_source* src, void* buf, size_t n)
     }
     if (src->raw_pos != src->pos) {
         if (!src->seekable) return done > 0 ? (int64_t)done : FA_ERROR_NOT_SEEKABLE;
-        if (src->io.seek(src->io_user, src->pos) != FA_OK) {
+        if (src->io.seek(src->io_user, src->base + src->pos) != FA_OK) {
             if (src->error == FA_OK) src->error = FA_ERROR_IO;
             return done > 0 ? (int64_t)done : FA_ERROR_IO;
         }
@@ -212,12 +222,12 @@ fa_result fa_source_seek(fa_source* src, int64_t offset)
         if (offset > (int64_t)src->mem_size) return FA_ERROR_INVALID_ARG;
         break;
     case FA_SOURCE_FILE:
-        if (file_seek(src->file, offset, SEEK_SET) != 0) return FA_ERROR_IO;
+        if (file_seek(src->file, src->base + offset, SEEK_SET) != 0) return FA_ERROR_IO;
         break;
     default:
         if (src->seekable && offset >= (int64_t)src->prefix_len) {
             /* Ask the app now, so a seek it rejects fails here rather than on a later read. */
-            if (src->io.seek(src->io_user, offset) != FA_OK) return FA_ERROR_IO;
+            if (src->io.seek(src->io_user, src->base + offset) != FA_OK) return FA_ERROR_IO;
             src->raw_pos = offset;
             break;
         }
@@ -266,10 +276,46 @@ fa_result fa_source_read_all(fa_source* src, size_t max_size, uint8_t** out_data
     return FA_OK;
 }
 
+fa_result fa_source_set_window(fa_source* src, int64_t base, int64_t size)
+{
+    int64_t whole = src->windowed ? src->whole_length : src->length;
+    if (whole < 0 || base < 0 || size < 0 || base > whole || size > whole - base) return FA_ERROR_INVALID_ARG;
+    if (src->kind == FA_SOURCE_IO && !src->seekable) return FA_ERROR_NOT_SEEKABLE;
+    if (src->kind == FA_SOURCE_IO && src->io.seek(src->io_user, base) != FA_OK) return FA_ERROR_IO;
+    if (src->kind == FA_SOURCE_FILE && file_seek(src->file, base, SEEK_SET) != 0) return FA_ERROR_IO;
+    if (src->kind == FA_SOURCE_MEMORY) {
+        src->mem = src->mem - src->base + base;
+        src->mem_size = (size_t)size;
+    }
+    free(src->prefix_buf);
+    src->prefix_buf = NULL;
+    src->prefix = NULL;
+    src->prefix_len = 0;
+    src->prefix_filled = 0;
+    src->whole_length = whole;
+    src->windowed = 1;
+    src->base = base;
+    src->length = size;
+    src->pos = 0;
+    src->raw_pos = 0;
+    src->error = FA_OK;
+    return FA_OK;
+}
+
+fa_result fa_source_open_path_window(fa_source* src, const char* path, int64_t offset, int64_t length)
+{
+    fa_result r = fa_source_open_path(src, path);
+    if (r != FA_OK || length <= 0) return r;
+    r = fa_source_set_window(src, offset, length);
+    if (r != FA_OK) fa_source_close(src);
+    return r;
+}
+
 void fa_source_close(fa_source* src)
 {
     if (src->kind == FA_SOURCE_FILE && src->file) fclose(src->file);
-    if (src->kind == FA_SOURCE_IO && src->io.close) src->io.close(src->io_user);
+    /* Any kind: a ZIP entry unpacked from app callbacks keeps their close (stream.c). */
+    if (src->io.close) src->io.close(src->io_user);
     free(src->owned);
     free(src->prefix_buf);
     memset(src, 0, sizeof(*src));

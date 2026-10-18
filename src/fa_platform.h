@@ -118,6 +118,11 @@ void fa_sleep_ms(uint32_t ms);
 FILE* fa_fopen_utf8(const char* path, const char* mode);
 int fa_mkdir_utf8(const char* path);                     /* 0 if created or already there */
 int fa_replace_file(const char* from, const char* to);   /* rename over an existing file; 0 on success */
+/* A new file in `folder` ("w+b") that the system deletes when it is closed, also
+ * if the process dies; NULL on failure. */
+FILE* fa_temp_file_create(const char* folder);
+/* Deletes files fa_temp_file_create left behind (a power cut, a crash). */
+void fa_temp_folder_sweep(const char* folder);
 uint32_t fa_cpu_count(void);
 int64_t fa_monotonic_ns(void);
 

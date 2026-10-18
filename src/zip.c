@@ -1,6 +1,7 @@
 /* ZIP archives, for karaoke downloads that pack the audio and the .cdg together.
  * Written from the PKWARE APPNOTE (central directory, stored and deflate entries)
- * and RFC 1951 (DEFLATE). Archives are read from memory: karaoke ZIPs are a few MB. */
+ * and RFC 1951 (DEFLATE). Archives are read through a source: only the directory
+ * and the entries asked for are read, never the whole file. */
 #include "cdg.h"
 #include <stdlib.h>
 #include <string.h>
@@ -11,25 +12,30 @@
 #define ZIP_END_SIZE 22
 #define ZIP_CENTRAL_SIZE 46
 #define ZIP_LOCAL_SIZE 30
+#define ZIP_MAX_DIRECTORY ((size_t)16 << 20)
 
 static uint32_t rd16(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
 static uint32_t rd32(const uint8_t* p) { return rd16(p) | (rd16(p + 2) << 16); }
 
 /* ---- CRC-32 (IEEE 802.3, reflected) ---------------------------------------- */
 
-uint32_t fa_crc32(const uint8_t* data, size_t size)
+/* `crc` is the CRC of the bytes before `data` (0 to start). */
+static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t size)
 {
-    uint32_t table[256], crc = 0xFFFFFFFFu, n, k, c;
+    uint32_t table[256], n, k, c;
     size_t i;
-    /* Built per call: one call per extracted file, and no shared state. */
+    /* Built per call: a few calls per extracted file, and no shared state. */
     for (n = 0; n < 256; n++) {
         c = n;
         for (k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
         table[n] = c;
     }
+    crc ^= 0xFFFFFFFFu;
     for (i = 0; i < size; i++) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
     return crc ^ 0xFFFFFFFFu;
 }
+
+uint32_t fa_crc32(const uint8_t* data, size_t size) { return crc32_update(0, data, size); }
 
 /* ---- DEFLATE ------------------------------------------------------------------ */
 
@@ -42,21 +48,69 @@ typedef struct inf_huff {
     uint16_t symbol[INF_MAX_LITLEN];    /* symbols ordered by code */
 } inf_huff;
 
+#define INF_WINDOW 32768                 /* the farthest a match reaches back */
+#define INF_IN_CHUNK 65536               /* input read from a source at a time */
+#define INF_OUT_CHUNK (1u << 20)         /* output kept before writing to a file */
+
+/* Input comes from memory or is pulled from a source; output goes to one buffer
+ * of the whole size, or through a 1 MB buffer into a file, keeping the last 32 KB
+ * for matches to copy from. */
 typedef struct inf_state {
     const uint8_t* in;
-    size_t in_size, in_pos;
+    size_t in_size, in_pos;             /* the input chunk at hand */
+    fa_source* src;                     /* NULL: `in` is all of it */
+    uint64_t src_left;                  /* compressed bytes not read from src yet */
+    uint8_t* in_buf;
     uint32_t bitbuf;
     int bitcnt;
     uint8_t* out;
-    size_t out_size, out_pos;
+    size_t out_cap, out_pos;
+    uint64_t flushed;                   /* bytes written to `sink` before out[0] */
+    uint64_t total;                     /* the size the output must have */
+    FILE* sink;
+    uint32_t crc;                       /* of the flushed bytes */
     int error;                          /* ran past the input */
+    int io_error;                       /* the source or the file failed */
 } inf_state;
+
+static int inf_refill(inf_state* s)
+{
+    int64_t got;
+    size_t want;
+    if (!s->src || s->src_left == 0) return 0;
+    want = s->src_left < INF_IN_CHUNK ? (size_t)s->src_left : INF_IN_CHUNK;
+    got = fa_source_read(s->src, s->in_buf, want);
+    if (got <= 0) { s->io_error = got < 0; return 0; }
+    s->src_left -= (uint64_t)got;
+    s->in = s->in_buf;
+    s->in_size = (size_t)got;
+    s->in_pos = 0;
+    return 1;
+}
+
+/* Room for one more output byte: writes out all but the last 32 KB when full. */
+static int inf_room(inf_state* s)
+{
+    size_t keep, n;
+    if (s->out_pos < s->out_cap) return 0;
+    if (!s->sink) return -1;
+    keep = INF_WINDOW;
+    n = s->out_pos - keep;
+    if (fwrite(s->out, 1, n, s->sink) != n) { s->io_error = 1; return -1; }
+    s->crc = crc32_update(s->crc, s->out, n);
+    memmove(s->out, s->out + n, keep);
+    s->flushed += n;
+    s->out_pos = keep;
+    return 0;
+}
+
+static uint64_t inf_left(const inf_state* s) { return s->total - s->flushed - s->out_pos; }
 
 static uint32_t inf_bits(inf_state* s, int need)
 {
     uint32_t v;
     while (s->bitcnt < need) {
-        if (s->in_pos >= s->in_size) { s->error = 1; return 0; }
+        if (s->in_pos >= s->in_size && !inf_refill(s)) { s->error = 1; return 0; }
         s->bitbuf |= (uint32_t)s->in[s->in_pos++] << s->bitcnt;
         s->bitcnt += 8;
     }
@@ -122,7 +176,7 @@ static int inf_codes(inf_state* s, const inf_huff* lit, const inf_huff* dist)
         int sym = inf_decode(s, lit);
         if (sym < 0) return -1;
         if (sym < 256) {
-            if (s->out_pos >= s->out_size) return -1;
+            if (inf_left(s) == 0 || inf_room(s)) return -1;
             s->out[s->out_pos++] = (uint8_t)sym;
         } else if (sym == 256) {
             return 0;
@@ -135,28 +189,48 @@ static int inf_codes(inf_state* s, const inf_huff* lit, const inf_huff* dist)
             d = inf_decode(s, dist);
             if (d < 0 || d >= 30) return -1;
             distance = dist_base[d] + inf_bits(s, dist_extra[d]);
-            if (s->error || distance > s->out_pos || length > s->out_size - s->out_pos) return -1;
-            /* Byte by byte: the copy may overlap what it writes (runs). */
-            while (length--) { s->out[s->out_pos] = s->out[s->out_pos - distance]; s->out_pos++; }
+            /* After a flush out_pos is at least INF_WINDOW, as far as a match reaches. */
+            if (s->error || distance > s->out_pos || length > inf_left(s)) return -1;
+            while (length) {
+                size_t n;
+                if (inf_room(s)) return -1;
+                n = s->out_cap - s->out_pos;
+                if (n > length) n = length;
+                length -= n;
+                /* Byte by byte: the copy may overlap what it writes (runs). */
+                while (n--) { s->out[s->out_pos] = s->out[s->out_pos - distance]; s->out_pos++; }
+            }
         }
     }
+}
+
+/* Copies `len` input bytes to the output as they are (stored blocks and entries). */
+static int inf_copy(inf_state* s, uint64_t len)
+{
+    while (len) {
+        size_t n;
+        if (s->in_pos >= s->in_size && !inf_refill(s)) return -1;
+        if (inf_room(s)) return -1;
+        n = s->in_size - s->in_pos;
+        if (n > len) n = (size_t)len;
+        if (n > s->out_cap - s->out_pos) n = s->out_cap - s->out_pos;
+        memcpy(s->out + s->out_pos, s->in + s->in_pos, n);
+        s->in_pos += n;
+        s->out_pos += n;
+        len -= n;
+    }
+    return 0;
 }
 
 static int inf_stored(inf_state* s)
 {
     uint32_t len, nlen;
-    s->bitbuf = 0;   /* skip to the byte boundary */
+    s->bitbuf = 0;   /* skip to the byte boundary (fewer than 8 bits are held) */
     s->bitcnt = 0;
-    if (s->in_size - s->in_pos < 4) return -1;
-    len = rd16(s->in + s->in_pos);
-    nlen = rd16(s->in + s->in_pos + 2);
-    s->in_pos += 4;
-    if (len != (~nlen & 0xFFFFu)) return -1;
-    if (s->in_size - s->in_pos < len || s->out_size - s->out_pos < len) return -1;
-    memcpy(s->out + s->out_pos, s->in + s->in_pos, len);
-    s->in_pos += len;
-    s->out_pos += len;
-    return 0;
+    len = inf_bits(s, 16);
+    nlen = inf_bits(s, 16);
+    if (s->error || len != (~nlen & 0xFFFFu) || len > inf_left(s)) return -1;
+    return inf_copy(s, len);
 }
 
 static int inf_fixed(inf_state* s)
@@ -210,25 +284,32 @@ static int inf_dynamic(inf_state* s)
     return inf_codes(s, &lit, &dist);
 }
 
+static fa_result inf_run(inf_state* s)
+{
+    int last;
+    do {
+        int type, r;
+        last = (int)inf_bits(s, 1);
+        type = (int)inf_bits(s, 2);
+        if (s->error) break;
+        if (type == 0) r = inf_stored(s);
+        else if (type == 1) r = inf_fixed(s);
+        else if (type == 2) r = inf_dynamic(s);
+        else r = -1;
+        if (r != 0 || s->error) { s->error = 1; break; }
+    } while (!last);
+    if (s->io_error) return FA_ERROR_IO;
+    return !s->error && inf_left(s) == 0 ? FA_OK : FA_ERROR_UNSUPPORTED_FORMAT;
+}
+
 fa_result fa_inflate(const uint8_t* in, size_t in_size, uint8_t* out, size_t out_size)
 {
     inf_state s;
-    int last;
     memset(&s, 0, sizeof(s));
     s.in = in; s.in_size = in_size;
-    s.out = out; s.out_size = out_size;
-    do {
-        int type, r;
-        last = (int)inf_bits(&s, 1);
-        type = (int)inf_bits(&s, 2);
-        if (s.error) return FA_ERROR_UNSUPPORTED_FORMAT;
-        if (type == 0) r = inf_stored(&s);
-        else if (type == 1) r = inf_fixed(&s);
-        else if (type == 2) r = inf_dynamic(&s);
-        else r = -1;
-        if (r != 0 || s.error) return FA_ERROR_UNSUPPORTED_FORMAT;
-    } while (!last);
-    return s.out_pos == out_size ? FA_OK : FA_ERROR_UNSUPPORTED_FORMAT;
+    s.out = out; s.out_cap = out_size;
+    s.total = out_size;
+    return inf_run(&s);
 }
 
 /* ---- Archives ------------------------------------------------------------------ */
@@ -238,41 +319,74 @@ int fa_zip_probe(const uint8_t* data, size_t size)
     return size >= 4 && rd32(data) == ZIP_LOCAL_SIG;
 }
 
-fa_result fa_zip_list(const uint8_t* zip, size_t zip_size, fa_zip_entry** out_entries, uint32_t* out_count)
+/* Exactly n bytes at `offset`; a short read is a damaged (cut) archive. */
+static fa_result read_at(fa_source* src, int64_t offset, void* buf, size_t n)
 {
-    size_t end, pos, cd_end, scan_from;
+    size_t done = 0;
+    if (fa_source_seek(src, offset) != FA_OK) return FA_ERROR_IO;
+    while (done < n) {
+        int64_t got = fa_source_read(src, (uint8_t*)buf + done, n - done);
+        if (got < 0) return FA_ERROR_IO;
+        if (got == 0) return FA_ERROR_UNSUPPORTED_FORMAT;
+        done += (size_t)got;
+    }
+    return FA_OK;
+}
+
+fa_result fa_zip_list(fa_source* src, fa_zip_entry** out_entries, uint32_t* out_count)
+{
+    uint8_t* tail = NULL;
+    uint8_t* cd = NULL;
+    size_t tail_len, end, scan_from, pos, cd_size;
+    int64_t len = src->length, tail_at, cd_at;
     uint32_t total, i, n = 0;
-    fa_zip_entry* entries;
+    fa_zip_entry* entries = NULL;
+    fa_result r;
     *out_entries = NULL;
     *out_count = 0;
-    if (zip_size < ZIP_END_SIZE) return FA_ERROR_UNSUPPORTED_FORMAT;
+    if (len < 0 || !src->seekable) return FA_ERROR_NOT_SEEKABLE;
+    if (len < ZIP_END_SIZE) return FA_ERROR_UNSUPPORTED_FORMAT;
     /* The end record is the last thing in the file, followed only by a comment of
-     * at most 64 KB. */
-    end = zip_size - ZIP_END_SIZE;
-    scan_from = zip_size - ZIP_END_SIZE > 0xFFFF ? zip_size - ZIP_END_SIZE - 0xFFFF : 0;
+     * at most 64 KB: only that much of the end is read. */
+    tail_len = len > ZIP_END_SIZE + 0xFFFF ? ZIP_END_SIZE + 0xFFFF : (size_t)len;
+    tail_at = len - (int64_t)tail_len;
+    tail = (uint8_t*)malloc(tail_len);
+    if (!tail) return FA_ERROR_OUT_OF_MEMORY;
+    r = read_at(src, tail_at, tail, tail_len);
+    if (r != FA_OK) goto done;
+    r = FA_ERROR_UNSUPPORTED_FORMAT;
+    end = tail_len - ZIP_END_SIZE;
+    scan_from = 0;
     for (;;) {
-        if (rd32(zip + end) == ZIP_END_SIG && end + ZIP_END_SIZE + rd16(zip + end + 20) == zip_size) break;
-        if (end == scan_from) return FA_ERROR_UNSUPPORTED_FORMAT;
+        if (rd32(tail + end) == ZIP_END_SIG && end + ZIP_END_SIZE + rd16(tail + end + 20) == tail_len) break;
+        if (end == scan_from) goto done;
         end--;
     }
-    total = rd16(zip + end + 10);
-    pos = rd32(zip + end + 16);
-    cd_end = pos + (size_t)rd32(zip + end + 12);
+    total = rd16(tail + end + 10);
+    cd_at = (int64_t)rd32(tail + end + 16);
+    cd_size = rd32(tail + end + 12);
     /* 0xFFFF / 0xFFFFFFFF mean ZIP64; multi-disk archives have disk numbers. */
-    if (total == 0xFFFF || rd32(zip + end + 16) == 0xFFFFFFFFu || rd16(zip + end + 4) != 0 ||
-        cd_end > end || pos > cd_end)
-        return FA_ERROR_UNSUPPORTED_FORMAT;
+    if (total == 0xFFFF || rd32(tail + end + 16) == 0xFFFFFFFFu || rd16(tail + end + 4) != 0 ||
+        cd_at + (int64_t)cd_size > tail_at + (int64_t)end)
+        goto done;
+    /* A real directory holds every entry it counts; karaoke ones are a few hundred bytes. */
+    if (total > cd_size / ZIP_CENTRAL_SIZE || cd_size > ZIP_MAX_DIRECTORY) goto done;
+    cd = (uint8_t*)malloc(cd_size ? cd_size : 1);
     entries = (fa_zip_entry*)calloc(total ? total : 1, sizeof(*entries));
-    if (!entries) return FA_ERROR_OUT_OF_MEMORY;
+    if (!cd || !entries) { r = FA_ERROR_OUT_OF_MEMORY; goto done; }
+    r = read_at(src, cd_at, cd, cd_size);
+    if (r != FA_OK) goto done;
+    r = FA_ERROR_UNSUPPORTED_FORMAT;
+    pos = 0;
     for (i = 0; i < total; i++) {
-        const uint8_t* h = zip + pos;
+        const uint8_t* h = cd + pos;
         uint32_t flags, name_len, skip;
         fa_zip_entry* e = &entries[n];
-        if (cd_end - pos < ZIP_CENTRAL_SIZE || rd32(h) != ZIP_CENTRAL_SIG) { free(entries); return FA_ERROR_UNSUPPORTED_FORMAT; }
+        if (cd_size - pos < ZIP_CENTRAL_SIZE || rd32(h) != ZIP_CENTRAL_SIG) goto done;
         flags = rd16(h + 8);
         name_len = rd16(h + 28);
         skip = ZIP_CENTRAL_SIZE + name_len + rd16(h + 30) + rd16(h + 32);
-        if (cd_end - pos < skip) { free(entries); return FA_ERROR_UNSUPPORTED_FORMAT; }
+        if (cd_size - pos < skip) goto done;
         e->method = rd16(h + 10);
         e->crc32 = rd32(h + 16);
         e->compressed_size = rd32(h + 20);
@@ -282,46 +396,99 @@ fa_result fa_zip_list(const uint8_t* zip, size_t zip_size, fa_zip_entry** out_en
         memcpy(e->name, h + ZIP_CENTRAL_SIZE, name_len);
         e->name[name_len] = '\0';
         pos += skip;
-        if (e->compressed_size == 0xFFFFFFFFu || e->size == 0xFFFFFFFFu || e->header_offset == 0xFFFFFFFFu) {
-            free(entries);
-            return FA_ERROR_UNSUPPORTED_FORMAT;
-        }
+        if (e->compressed_size == 0xFFFFFFFFu || e->size == 0xFFFFFFFFu || e->header_offset == 0xFFFFFFFFu) goto done;
         /* Directories and encrypted entries are left out. */
         if (name_len == 0 || e->name[name_len - 1] == '/' || (flags & 1)) continue;
         n++;
     }
     *out_entries = entries;
     *out_count = n;
-    return FA_OK;
+    entries = NULL;
+    r = FA_OK;
+done:
+    free(entries);
+    free(cd);
+    free(tail);
+    return r;
 }
 
-fa_result fa_zip_extract(const uint8_t* zip, size_t zip_size, const fa_zip_entry* e, uint8_t** out_data)
+fa_result fa_zip_entry_offset(fa_source* src, const fa_zip_entry* e, int64_t* out_offset)
 {
-    const uint8_t* h;
-    size_t data_pos;
-    uint8_t* out;
+    uint8_t h[ZIP_LOCAL_SIZE];
+    uint64_t data_pos, len = (uint64_t)src->length;
     fa_result r;
-    *out_data = NULL;
-    if (e->header_offset > zip_size || zip_size - e->header_offset < ZIP_LOCAL_SIZE) return FA_ERROR_UNSUPPORTED_FORMAT;
-    h = zip + e->header_offset;
+    *out_offset = 0;
+    if (src->length < 0 || e->header_offset > len || len - e->header_offset < ZIP_LOCAL_SIZE) return FA_ERROR_UNSUPPORTED_FORMAT;
+    r = read_at(src, (int64_t)e->header_offset, h, sizeof(h));
+    if (r != FA_OK) return r;
     if (rd32(h) != ZIP_LOCAL_SIG) return FA_ERROR_UNSUPPORTED_FORMAT;
-    data_pos = (size_t)e->header_offset + ZIP_LOCAL_SIZE + rd16(h + 26) + rd16(h + 28);
-    if (data_pos > zip_size || zip_size - data_pos < e->compressed_size) return FA_ERROR_UNSUPPORTED_FORMAT;
+    data_pos = e->header_offset + ZIP_LOCAL_SIZE + rd16(h + 26) + rd16(h + 28);
+    if (data_pos > len || len - data_pos < e->compressed_size) return FA_ERROR_UNSUPPORTED_FORMAT;
     if (e->method != 0 && e->method != 8) return FA_ERROR_UNSUPPORTED_FORMAT;
     if (e->method == 0 && e->compressed_size != e->size) return FA_ERROR_UNSUPPORTED_FORMAT;
     /* DEFLATE expands at most 1032:1 (258-byte matches in about two bits each), so a
      * larger declared size is a lie: refuse it before allocating. */
     if (e->method == 8 && e->size > e->compressed_size * 1032 + 1024) return FA_ERROR_UNSUPPORTED_FORMAT;
+    *out_offset = (int64_t)data_pos;
+    return FA_OK;
+}
+
+/* Unpacks entry `e` into `out` (out_cap bytes; the whole entry, or INF_OUT_CHUNK
+ * when writing to `sink`), CRC checked. */
+static fa_result unpack(fa_source* src, const fa_zip_entry* e, uint8_t* out, size_t out_cap, FILE* sink)
+{
+    inf_state s;
+    int64_t data_pos;
+    fa_result r = fa_zip_entry_offset(src, e, &data_pos);
+    if (r != FA_OK) return r;
+    if (fa_source_seek(src, data_pos) != FA_OK) return FA_ERROR_IO;
+    memset(&s, 0, sizeof(s));
+    s.out = out;
+    s.out_cap = out_cap;
+    s.total = e->size;
+    s.sink = sink;
+    if (src->kind == FA_SOURCE_MEMORY) {
+        s.in = src->mem + data_pos;   /* no copy of a block already in memory */
+        s.in_size = (size_t)e->compressed_size;
+    } else {
+        s.src = src;
+        s.src_left = e->compressed_size;
+        s.in_buf = (uint8_t*)malloc(INF_IN_CHUNK);
+        if (!s.in_buf) return FA_ERROR_OUT_OF_MEMORY;
+    }
+    if (e->method == 8) {
+        r = inf_run(&s);
+    } else {
+        r = inf_copy(&s, e->size) == 0 ? FA_OK : s.io_error ? FA_ERROR_IO : FA_ERROR_UNSUPPORTED_FORMAT;
+    }
+    free(s.in_buf);
+    if (r == FA_OK && sink) {
+        if (fwrite(s.out, 1, s.out_pos, sink) != s.out_pos || fflush(sink) != 0) r = FA_ERROR_IO;
+    }
+    if (r == FA_OK && crc32_update(s.crc, s.out, s.out_pos) != e->crc32) r = FA_ERROR_UNSUPPORTED_FORMAT;
+    return r;
+}
+
+fa_result fa_zip_extract(fa_source* src, const fa_zip_entry* e, uint64_t max_size, uint8_t** out_data)
+{
+    uint8_t* out;
+    fa_result r;
+    *out_data = NULL;
+    if (e->size > max_size || e->size > (uint64_t)(SIZE_MAX - 1)) return FA_ERROR_TOO_LARGE;
     out = (uint8_t*)malloc(e->size ? (size_t)e->size : 1);
     if (!out) return FA_ERROR_OUT_OF_MEMORY;
-    if (e->method == 0) {
-        memcpy(out, zip + data_pos, (size_t)e->size);
-        r = FA_OK;
-    } else {
-        r = fa_inflate(zip + data_pos, (size_t)e->compressed_size, out, (size_t)e->size);
-    }
-    if (r == FA_OK && fa_crc32(out, (size_t)e->size) != e->crc32) r = FA_ERROR_UNSUPPORTED_FORMAT;
+    r = unpack(src, e, out, (size_t)e->size, NULL);
     if (r != FA_OK) { free(out); return r; }
     *out_data = out;
     return FA_OK;
+}
+
+fa_result fa_zip_extract_file(fa_source* src, const fa_zip_entry* e, FILE* f)
+{
+    uint8_t* out = (uint8_t*)malloc(INF_OUT_CHUNK);
+    fa_result r;
+    if (!out) return FA_ERROR_OUT_OF_MEMORY;
+    r = unpack(src, e, out, INF_OUT_CHUNK, f);
+    free(out);
+    return r;
 }
