@@ -183,6 +183,11 @@ In .NET, `stream.PlayOn(device)` attaches (or moves) and plays, and `stream.Deta
 - Other variants (AIFF, RIFX, 8-bit, ADPCM, A-law, µ-law, 64-bit float) go through dr_wav's own conversion, a little slower.
 - A forward-only source (or a web stream) is read in order, so trailing chunks after the audio are never sought to.
 
+## FLAC
+
+- Seeks are sample exact, with or without a SEEKTABLE. A file without one (FatzAudio's own FLAC encoder writes none, nor does FFmpeg's) is searched: each probe decodes one frame near where the target should be and narrows the range, and two to four probes usually find it, about a millisecond per seek. A SEEKTABLE narrows the search to the stretch between two of its points.
+- Audio whose compression changes sharply, such as long digital silence followed by music, can take more probes (about a dozen) but still lands exactly.
+
 ## MP3
 
 MP3 files decode built in (minimp3, inside miniaudio), in 32-bit float: nothing is rounded to 16 bits, so the output matches a reference float decoder to about 124 dB.
