@@ -144,6 +144,16 @@ if(MSVC)
     set_property(TARGET fatzaudio PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 elseif(MINGW)
     target_link_options(fatzaudio PRIVATE -static-libstdc++ -static-libgcc)
+    # fatzaudio.dll, the same name as the MSVC build (MinGW would add "lib").
+    set_target_properties(fatzaudio PROPERTIES PREFIX "")
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # The same on Linux: libstdc++ and libgcc go into libfatzaudio.so, so it needs
+    # only libc and libm. --exclude-libs keeps their symbols out of the export
+    # table, and the version script also hides the std:: templates stretch.cpp
+    # instantiates (libstdc++ declares them with default visibility).
+    target_link_options(fatzaudio PRIVATE -static-libstdc++ -static-libgcc "-Wl,--exclude-libs,ALL"
+        "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/fatzaudio.map")
+    set_property(TARGET fatzaudio APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/fatzaudio.map)
 endif()
 
 target_include_directories(fatzaudio
