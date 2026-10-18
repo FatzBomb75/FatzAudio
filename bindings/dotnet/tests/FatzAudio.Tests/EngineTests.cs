@@ -162,6 +162,35 @@ public class EngineTests
     }
 
     [Fact]
+    public void LevelsAndSpectrum_FollowPlayback()
+    {
+        using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true });
+        using var output = engine.OpenOutput();
+        using var s = engine.OpenMemory(TestAudio.SineWav(3.0, 48000, 1500.0));
+        Assert.Equal(0f, s.GetLevels().Peak[0]);            // not playing; starts recording
+        output.GetLevels();
+        s.PlayOn(output);
+        Thread.Sleep(500);
+        var levels = s.GetLevels(TimeSpan.FromMilliseconds(100));
+        Assert.Single(levels.Peak);                          // a mono file
+        Assert.InRange(levels.Peak[0], 0.45f, 0.55f);
+        Assert.InRange(levels.Rms[0], 0.30f, 0.40f);
+        var spectrum = s.GetSpectrum(4096);
+        Assert.Equal(2048, spectrum.Magnitudes.Length);
+        Assert.True(spectrum.BinHz > 0);
+        int top = Array.IndexOf(spectrum.Magnitudes, spectrum.Magnitudes.Max());
+        Assert.InRange(top * spectrum.BinHz, 1500 - spectrum.BinHz, 1500 + spectrum.BinHz);
+        Assert.InRange(spectrum.Magnitudes[top], 0.35f, 0.55f);
+        Assert.InRange(output.GetLevels().Peak[0], 0.3f, 0.6f);
+        Span<float> bins = stackalloc float[1024];
+        Assert.True(output.GetSpectrum(bins, SpectrumOptions.Left) > 0);
+        Assert.Throws<FatzAudioException>(() => s.GetSpectrum(1000));
+        Assert.Throws<FatzAudioException>(() => s.GetSpectrum(4097));
+        s.Pause();
+        Assert.Equal(0f, s.GetLevels().Peak[0]);
+    }
+
+    [Fact]
     public void Volume_RoundTrips_OnAttachedStream()
     {
         using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true });
@@ -181,7 +210,7 @@ public class EngineTests
     {
         using var engine = AudioEngine.Create();
         using var s = engine.OpenMemory(TestAudio.SineWav(), DecodeOnly);
-        var ex = Assert.Throws<FatzAudioException>(() => s.GetLevels());   // still a stub
+        var ex = Assert.Throws<FatzAudioException>(() => s.AddPositionEvent(TimeSpan.FromSeconds(1)));   // still a stub
         Assert.Equal(ErrorCode.NotImplemented, ex.ErrorCode);
         Assert.Contains("mplemented", ex.Message, StringComparison.OrdinalIgnoreCase);
     }

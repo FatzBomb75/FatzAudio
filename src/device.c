@@ -153,6 +153,10 @@ void fa_device_render_at(fa_device* dev, float* out, uint32_t frames, int64_t no
         if (encs)
             for (i = 0; i < encs->count; i++) fa_encode_push(encs->items[i], out, frames, dev->rate);
     }
+    {
+        fa_tap* tap = (fa_tap*)fa_load_ptr(&dev->tap);
+        if (tap) fa_tap_write(tap, fa_load64(&dev->clock), out, frames);
+    }
     fa_fetch_add64(&dev->clock, frames);
 }
 
@@ -304,6 +308,7 @@ FA_API void FA_CALL fa_device_close(fa_device* device)
     fa_limiter_free(&device->limiter);
     fa_buses_free_all(device);
     free(fa_load_ptr(&device->voices));
+    fa_tap_free((fa_tap*)fa_load_ptr(&device->tap));
     fa_mutex_destroy(&device->xf_lock);
     fa_mutex_destroy(&device->lock);
     free(device);

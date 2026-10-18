@@ -33,11 +33,13 @@ static fa_device* g_dev;
 
 /* 16-bit mono WAV at the device rate (no resampling, so samples come out exact).
  * kind 0: constant 0.5; kind 1: a sawtooth whose value encodes the frame index;
- * kind 2: constant 0.25. */
+ * kind 2: constant 0.25; kind 3: a 0.5 sine of 32 frames per period, so bin 64
+ * of a 2048-point spectrum. */
 static int16_t sample_of(int kind, uint32_t i)
 {
     if (kind == 0) return 16384;
     if (kind == 2) return 8192;
+    if (kind == 3) return (int16_t)lrint(16384.0 * sin(6.283185307179586 * (i % 32) / 32.0));
     return (int16_t)((int)(i % 4096) * 8 - 16384);
 }
 static float expected(int kind, uint32_t i) { return (float)sample_of(kind, i) / 32768.0f; }
@@ -813,6 +815,62 @@ static void test_queue_in_first_callback(void)
     fa_stream_close(e);
 }
 
+/* Levels and spectrum: a stream's own audio (before its volume) and the device's
+ * output, read where it is heard; zeros when nothing plays. */
+static void test_levels_and_spectrum(void)
+{
+    fa_stream* s = open_wav(96000, 3, 0, 1);
+    float peak[2], rms[2], bins[1024], hz = -1.0f, top = 0.0f;
+    uint32_t i, at = 0;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_get_levels(s, 50000000, peak, rms, 3), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_get_spectrum(s, 1000, 0, bins, NULL), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_get_spectrum(s, 2048, FA_SPECTRUM_LEFT | FA_SPECTRUM_RIGHT, bins, NULL), FA_ERROR_INVALID_ARG);
+    /* Not playing: zeros (this first call also starts recording). */
+    peak[0] = rms[0] = 1.0f;
+    CHECK_EQ(fa_stream_get_levels(s, 50000000, peak, rms, 1), FA_OK);
+    CHECK(peak[0] == 0.0f && rms[0] == 0.0f);
+    CHECK_EQ(fa_stream_get_spectrum(s, 2048, 0, bins, &hz), FA_OK);
+    CHECK(hz == 0.0f && bins[64] == 0.0f);
+    CHECK_EQ(fa_device_get_levels(g_dev, 50000000, peak, NULL, 1), FA_OK);   /* records from here */
+    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_VOLUME, 0.25f), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    rec_reset();
+    render(24000);
+    /* The stream: its 0.5 sine whatever its volume. */
+    CHECK_EQ(fa_stream_get_levels(s, 100000000, peak, rms, 2), FA_OK);
+    CHECK_NEAR(peak[0], 0.5, 0.01);
+    CHECK_NEAR(peak[1], 0.5, 0.01);
+    CHECK_NEAR(rms[0], 0.5 / sqrt(2.0), 0.01);
+    CHECK_EQ(fa_stream_get_spectrum(s, 2048, 0, bins, &hz), FA_OK);
+    CHECK_NEAR(hz, g_dev->rate / 2048.0, 1e-3);
+    for (i = 0; i < 1024; i++) if (bins[i] > top) { top = bins[i]; at = i; }
+    CHECK_EQ(at, 64);
+    CHECK_NEAR(top, 0.5, 0.01);
+    CHECK(bins[10] < 0.001f && bins[300] < 0.001f);
+    CHECK_EQ(fa_stream_get_spectrum(s, 2048, FA_SPECTRUM_RIGHT | FA_SPECTRUM_NO_WINDOW, bins, NULL), FA_OK);
+    CHECK_NEAR(bins[64], 0.5, 0.01);
+    /* The device: what is heard, after the volume. */
+    CHECK_EQ(fa_device_get_levels(g_dev, 100000000, peak, NULL, 1), FA_OK);
+    CHECK_NEAR(peak[0], 0.125, 0.005);
+    CHECK_EQ(fa_device_get_spectrum(g_dev, 2048, FA_SPECTRUM_LEFT, bins, &hz), FA_OK);
+    CHECK_NEAR(bins[64], 0.125, 0.005);
+    /* Paused: zeros at once. */
+    CHECK_EQ(fa_stream_pause(s), FA_OK);
+    CHECK_EQ(fa_stream_get_levels(s, 50000000, peak, rms, 2), FA_OK);
+    CHECK(peak[0] == 0.0f && peak[1] == 0.0f && rms[1] == 0.0f);
+    /* A device with no callbacks for a while (stopped) is silent too. */
+    fa_sleep_ms(300);
+    CHECK_EQ(fa_device_get_levels(g_dev, 50000000, peak, rms, 1), FA_OK);
+    CHECK(peak[0] == 0.0f);
+    fa_stream_close(s);
+    /* Decode-only streams have nothing playing. */
+    s = open_wav(4800, 3, FA_OPEN_DECODE_ONLY, 0);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_get_levels(s, 50000000, peak, rms, 1), FA_ERROR_INVALID_ARG);
+    fa_stream_close(s);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -844,6 +902,7 @@ int main(void)
     RUN(test_loop_markers_and_queue);
     RUN(test_zero_length_scheduled_ramp);
     RUN(test_queue_in_first_callback);
+    RUN(test_levels_and_spectrum);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

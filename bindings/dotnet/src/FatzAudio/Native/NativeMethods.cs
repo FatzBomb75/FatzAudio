@@ -397,6 +397,15 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_levels(StreamHandle stream, long window, float* peak, float* rms, uint channels);
 
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_device_get_levels(DeviceHandle device, long window, float* peak, float* rms, uint channels);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_spectrum(StreamHandle stream, uint size, uint flags, float* bins, float* binHz);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_device_get_spectrum(DeviceHandle device, uint size, uint flags, float* bins, float* binHz);
+
     // ---- Audio CDs ---------------------------------------------------------
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_disc_drive_count(out uint count);

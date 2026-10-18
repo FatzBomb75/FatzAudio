@@ -55,6 +55,7 @@ set(FA_SOURCES
     src/scan.c
     src/normalize.c
     src/limiter.c
+    src/analysis.c
     src/clock.c
     src/codec.c
     src/ac3.c
