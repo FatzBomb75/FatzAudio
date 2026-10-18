@@ -71,6 +71,21 @@ public sealed class OutputDevice : IDisposable
         }
     }
 
+    /// <summary>
+    /// Silences everything the device plays without touching <see cref="Volume"/>; glides over 5 ms. An encoder
+    /// recording the device records the silence too.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The device was disposed.</exception>
+    public bool Muted
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_get_mute(Handle, out int m));
+            return m != 0;
+        }
+        set => FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_set_mute(Handle, value ? 1 : 0));
+    }
+
     /// <summary>Output latency of the device.</summary>
     /// <exception cref="ObjectDisposedException">The device was disposed.</exception>
     /// <exception cref="FatzAudioException">The latency could not be determined.</exception>

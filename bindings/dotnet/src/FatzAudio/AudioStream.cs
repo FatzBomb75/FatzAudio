@@ -414,6 +414,8 @@ public unsafe class AudioStream : IDisposable
     /// stops while the stream is paused, stalled or ended, and jumps to the target on a seek. File streams report the
     /// position in the file; <see cref="FeedAudioStream"/>s report the timestamps you pushed, converted to time.
     /// Streams that are not playing report the time of their next frame.
+    /// Cheap and lock-free for streams on a device and file streams, so a render loop can read it every vsync
+    /// (240 Hz and more); it never waits for a seek, a decode worker or the audio thread.
     /// </remarks>
     /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
     public TimeSpan Clock
@@ -638,6 +640,39 @@ public unsafe class AudioStream : IDisposable
 
     /// <summary>Linear gain of this stream (1 = unity).</summary>
     public float Volume { get => GetParam(AudioParameter.Volume); set => SetParam(AudioParameter.Volume, value); }
+
+    /// <summary>
+    /// Silences the stream without touching <see cref="Volume"/>: unmuting brings the volume back, and fades and ramps
+    /// keep running while muted. Glides over 5 ms, so it never clicks. Position, clock and events carry on as usual.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public bool Muted
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_mute(Handle, out int m));
+            return m != 0;
+        }
+        set => FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_mute(Handle, value ? 1 : 0));
+    }
+
+    /// <summary>
+    /// Loops from the cue-out marker (or the end) back to the cue-in marker (or the start), without a gap. Can be
+    /// changed at any time, also while playing; <see cref="StreamOptions.Loop"/> sets it at open. Turning it off
+    /// lets the stream play on to its end. <see cref="Looped"/> is raised for each jump.
+    /// </summary>
+    /// <exception cref="FatzAudioException">Turning it on for a stream that cannot seek (push, packet and live web
+    /// streams): <see cref="ErrorCode.NotSeekable"/>.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public bool Loop
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_loop(Handle, out int on));
+            return on != 0;
+        }
+        set => FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_loop(Handle, value ? 1 : 0));
+    }
 
     /// <summary>Stereo pan from -1 (left) to 1 (right).</summary>
     public float Pan { get => GetParam(AudioParameter.Pan); set => SetParam(AudioParameter.Pan, value); }
@@ -1105,6 +1140,15 @@ public unsafe class AudioStream : IDisposable
     /// return quickly, since they delay later events.
     /// </summary>
     public event EventHandler<MidiTextEventArgs>? MidiTextReached;
+    /// <summary>
+    /// Raised each time a looping stream (<see cref="Loop"/>) jumps back. Like <see cref="MarkerReached"/> it is raised
+    /// as the audio is mixed, about one device latency before the jump is heard; follow <see cref="Clock"/> for
+    /// frame-exact timing.
+    /// <see cref="StreamEventArgs.Frame"/> is the loop end it left and <see cref="StreamEventArgs.Value"/> the frame it
+    /// went to. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method
+    /// but should return quickly, since they delay later events.
+    /// </summary>
+    public event EventHandler<StreamEventArgs>? Looped;
     /// <summary>Raised when the output device changed. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler<StreamEventArgs>? DeviceChanged;
 
@@ -1183,6 +1227,7 @@ public unsafe class AudioStream : IDisposable
                 case 11:
                     if (MidiTextReached is { } onText) onText(this, new MidiTextEventArgs(GetMidiText((int)value)));
                     break;
+                case 12: Looped?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
             }
         }
         catch

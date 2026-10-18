@@ -191,6 +191,10 @@ FA_API fa_result FA_CALL fa_device_stop(fa_device* device);
 FA_API fa_result FA_CALL fa_device_is_started(fa_device* device, int32_t* out_started);
 FA_API fa_result FA_CALL fa_device_set_volume(fa_device* device, float volume);
 FA_API fa_result FA_CALL fa_device_get_volume(fa_device* device, float* out_volume);
+/* Mutes everything the device plays, keeping its volume; glides over 5 ms. An
+ * encoder recording the device (fa_encoder_attach_device) records the silence too. */
+FA_API fa_result FA_CALL fa_device_set_mute(fa_device* device, int32_t muted);
+FA_API fa_result FA_CALL fa_device_get_mute(fa_device* device, int32_t* out_muted);
 FA_API fa_result FA_CALL fa_device_get_latency(fa_device* device, fa_time* out_latency);
 /* The device's sample clock: how much audio it has mixed since it was opened, in
  * nanoseconds (frames mixed / sample rate). It starts at 0, advances only while the
@@ -230,7 +234,8 @@ typedef struct fa_io_callbacks {
 
 typedef enum fa_open_flags {
     FA_OPEN_DECODE_ONLY = 1 << 0,  /* not attached to a device; pull with fa_stream_read */
-    FA_OPEN_LOOP        = 1 << 1,
+    FA_OPEN_LOOP        = 1 << 1,  /* loop from CUE_OUT back to CUE_IN; fa_stream_set_loop
+                                      turns it on or off later */
     FA_OPEN_PRESCAN     = 1 << 2,  /* build exact seek index / length before returning */
     FA_OPEN_NO_NORMALIZE = 1 << 3, /* opt this stream out of engine normalization
                                       (jingles, sound effects, already-mastered mixes) */
@@ -869,6 +874,22 @@ FA_API fa_result FA_CALL fa_stream_seek(fa_stream* stream, fa_frames frame);
  * Frames decoded ahead into the buffer are not counted. */
 FA_API fa_result FA_CALL fa_stream_get_position(fa_stream* stream, fa_frames* out_frame);
 
+/* Looping on or off at any time, also while playing (FA_OPEN_LOOP sets it at open).
+ * A looping stream plays from CUE_OUT (or the end) back to CUE_IN (or 0) without a
+ * gap and raises FA_EVENT_LOOPED each time it jumps back (like markers, raised as the
+ * audio is mixed, one device latency before it is heard). Turning it off lets
+ * the stream play on to CUE_OUT and end. Only seekable streams loop: push, packet
+ * and forward-only web streams return FA_ERROR_NOT_SEEKABLE for on = 1. */
+FA_API fa_result FA_CALL fa_stream_set_loop(fa_stream* stream, int32_t on);
+FA_API fa_result FA_CALL fa_stream_get_loop(fa_stream* stream, int32_t* out_on);
+
+/* Mute: silent without touching FA_PARAM_VOLUME, so unmuting brings back the volume
+ * (and any fade or ramp, which keeps running while muted). It glides over 5 ms, like
+ * a volume change, so it never clicks. The stream keeps playing and its position,
+ * clock, markers and events carry on as usual. */
+FA_API fa_result FA_CALL fa_stream_set_mute(fa_stream* stream, int32_t muted);
+FA_API fa_result FA_CALL fa_stream_get_mute(fa_stream* stream, int32_t* out_muted);
+
 /* The presentation clock: the timestamp of the audio leaving the speaker right
  * now, in nanoseconds. Follow it with your video (or CD+G) renderer: show the
  * frame whose pts is closest to the clock, and the picture stays in sync by itself.
@@ -881,7 +902,12 @@ FA_API fa_result FA_CALL fa_stream_get_position(fa_stream* stream, fa_frames* ou
  *   the speaker), jumps to the target on a seek, and continues when playback does.
  * - File streams: the position in the file as time (0 = the start). Push and
  *   packet streams: in your own timeline, the pts you pushed.
- * Streams that are not attached report the time of their next frame. */
+ * Streams that are not attached report the time of their next frame.
+ *
+ * Cheap and safe from a render loop: for attached streams and file streams it takes
+ * no lock and never waits for a seek, a worker or the audio thread, so it can be
+ * called every vsync (240 Hz and more) from any thread. Push and packet streams
+ * that are not attached take the stream's lock briefly. */
 FA_API fa_result FA_CALL fa_stream_get_clock(fa_stream* stream, fa_time* out_pts);
 
 /* Decode-only streams (FA_OPEN_DECODE_ONLY): pull interleaved F32 PCM in the
@@ -1433,8 +1459,9 @@ FA_API fa_result FA_CALL fa_stream_get_midi_channel_mute(fa_stream* stream, uint
  * FA_EVENT_RAMP_DONE       position               fa_ramp.tag of the finished ramp
  * FA_EVENT_STARTED         position               0
  * FA_EVENT_MIDI_TEXT       the text's frame       index for fa_stream_get_midi_text
+ * FA_EVENT_LOOPED          loop end it left       loop start it went to (CUE_IN or 0)
  *
- * Delivered today: ENDED, MARKER, LOUDNESS_FINAL, RAMP_DONE and STARTED; MIDI_TEXT from MIDI
+ * Delivered today: ENDED, MARKER, LOOPED, LOUDNESS_FINAL, RAMP_DONE and STARTED; MIDI_TEXT from MIDI
  * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); METADATA from web
  * streams; STALLED and RESUMED from push, packet and web streams; DECODE_ERROR from packet
  * and disc streams. The others are raised by the features that produce them as those land (see docs/features). */
@@ -1450,7 +1477,8 @@ typedef enum fa_event_type {
     FA_EVENT_LOUDNESS_FINAL,  /* the stream's final loudness is known (fa_stream_get_loudness) */
     FA_EVENT_RAMP_DONE,       /* a ramp reached its target or was replaced */
     FA_EVENT_STARTED,         /* a scheduled, crossfaded or queued start happened */
-    FA_EVENT_MIDI_TEXT        /* a MIDI lyric or other text event is heard */
+    FA_EVENT_MIDI_TEXT,       /* a MIDI lyric or other text event is heard */
+    FA_EVENT_LOOPED           /* a looping stream jumped back to its loop start */
 } fa_event_type;
 
 typedef struct fa_event {

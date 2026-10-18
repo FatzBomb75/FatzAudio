@@ -1023,6 +1023,216 @@ static void test_vorbis_imdct(void)
     }
 }
 
+/* Looping turned on while the decoder already reached the end (a restart at the
+ * position heard), then off again after it jumped back: playback stays continuous,
+ * LOOPED is raised for each jump heard, and the stream then ends at its length. */
+static void test_loop_toggle_while_playing(void)
+{
+    uint32_t len = 5000, i, done = 0;
+    fa_stream* s = open_attached(len, 1, 0);
+    float out[2 * 1000];
+    recorder rec;
+    int32_t on = -1;
+    rec_init(&rec);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(s, out, 1000);
+    done = 1000;
+    for (i = 0; i < 200 && !fa_load32(&s->eof); i++) fa_sleep_ms(5);
+    CHECK(fa_load32(&s->eof));                                         /* decoded to the end */
+    CHECK_EQ(fa_stream_set_loop(s, 1), FA_OK);
+    CHECK_EQ(fa_stream_get_loop(s, &on), FA_OK);
+    CHECK_EQ(on, 1);
+    while (done < 2 * len + 2000) {
+        render(s, out, 1000);
+        for (i = 0; i < 1000; i++) CHECK(out[i * 2] == expected(1, (done + i) % len));
+        done += 1000;
+    }
+    CHECK_EQ(count_events(&rec, FA_EVENT_LOOPED, 2), 2);
+    fa_mutex_lock(&rec.lock);
+    for (i = 0; i < (uint32_t)rec.count && i < 64; i++)
+        if (rec.ev[i].type == FA_EVENT_LOOPED) { CHECK_EQ(rec.ev[i].frame, len); CHECK_EQ(rec.ev[i].value, 0); }
+    fa_mutex_unlock(&rec.lock);
+    for (i = 0; i < 200; i++) {
+        int64_t head;
+        fa_mutex_lock(&s->decode_lock);
+        head = fa_load64(&s->seek_base) + s->decoded;
+        fa_mutex_unlock(&s->decode_lock);
+        if (head > (int64_t)(3 * len)) break;
+        fa_sleep_ms(5);
+    }
+    CHECK_EQ(fa_stream_set_loop(s, 0), FA_OK);                         /* decoded into the next turn */
+    while (done < 3 * len) {
+        render(s, out, 1000);
+        for (i = 0; i < 1000; i++) CHECK(out[i * 2] == expected(1, (done + i) % len));
+        done += 1000;
+    }
+    render(s, out, 1000);
+    for (i = 0; i < 1000; i++) CHECK(out[i * 2] == 0.0f);               /* ended at the length */
+    CHECK_EQ(count_events(&rec, FA_EVENT_ENDED, 1), 1);
+    CHECK_EQ(count_events(&rec, FA_EVENT_LOOPED, 2), 2);
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
+/* A loop shorter than a callback jumps back several times per callback: one
+ * LOOPED for each jump. */
+static void test_short_loop_counts_every_jump(void)
+{
+    fa_stream* s = open_attached(5000, 1, FA_OPEN_LOOP);
+    float out[2 * 1000];
+    recorder rec;
+    uint32_t i;
+    rec_init(&rec);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_marker(s, FA_MARKER_CUE_IN, 1000), FA_OK);
+    CHECK_EQ(fa_stream_set_marker(s, FA_MARKER_CUE_OUT, 1200), FA_OK);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);           /* starts at the cue-in */
+    render(s, out, 1000);                         /* 1000..1200 five times */
+    for (i = 0; i < 1000; i++) CHECK(out[i * 2] == expected(1, 1000 + i % 200));
+    CHECK_EQ(count_events(&rec, FA_EVENT_LOOPED, 5), 5);
+    fa_sleep_ms(50);
+    CHECK_EQ(count_events(&rec, FA_EVENT_LOOPED, 5), 5);
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
+static void test_loop_needs_seekable(void)
+{
+    fa_stream* s = NULL;
+    fa_audio_format f;
+    memset(&f, 0, sizeof(f));
+    f.sample_format = FA_FORMAT_F32; f.sample_rate = 48000; f.channels = 2;
+    CHECK_EQ(fa_stream_open_push(g_engine, &f, NULL, &s), FA_OK);
+    CHECK_EQ(fa_stream_set_loop(s, 1), FA_ERROR_NOT_SEEKABLE);
+    CHECK_EQ(fa_stream_set_loop(s, 0), FA_OK);
+    fa_stream_close(s);
+}
+
+/* render() and then the device clock moves on, as after a real callback. */
+static void render_on(fa_stream* s, float* out, uint32_t frames)
+{
+    render(s, out, frames);
+    fa_fetch_add64(&g_dev->clock, frames);
+}
+
+/* Mute glides to silence in 5 ms and back, keeping the volume; muted before the
+ * start, the very first sample is silent. */
+static void test_mute_glides_and_keeps_volume(void)
+{
+    uint32_t glide = g_dev->rate / 200, i;
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    float out[2 * 4096], vol = 0.0f;
+    int32_t m = -1;
+    CHECK(s != NULL);
+    CHECK(glide + 64 <= 4096);
+    CHECK_EQ(fa_stream_set_mute(s, 1), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render_on(s, out, 64);
+    for (i = 0; i < 64; i++) CHECK(out[i * 2] == 0.0f);
+    CHECK_EQ(fa_stream_set_mute(s, 0), FA_OK);
+    render_on(s, out, glide + 64);
+    CHECK(out[0] < 0.01f);                                   /* glides up from silence */
+    CHECK(out[glide / 2 * 2] > 0.1f && out[glide / 2 * 2] < 0.4f);
+    for (i = glide + 1; i < glide + 64; i++) CHECK_NEAR(out[i * 2], 0.5, 1e-6);
+    CHECK_EQ(fa_stream_set_mute(s, 1), FA_OK);
+    CHECK_EQ(fa_stream_get_mute(s, &m), FA_OK);
+    CHECK_EQ(m, 1);
+    render_on(s, out, glide + 64);
+    CHECK(out[0] > 0.49f);                                   /* no jump: glides down */
+    for (i = glide + 1; i < glide + 64; i++) CHECK(out[i * 2] == 0.0f);
+    CHECK_EQ(fa_stream_get_param(s, FA_PARAM_VOLUME, &vol), FA_OK);
+    CHECK_NEAR(vol, 1.0, 1e-9);
+    fa_stream_close(s);
+}
+
+static void test_device_mute(void)
+{
+    uint32_t glide = g_dev->rate / 200, i;
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    float out[2 * 4096];
+    int32_t m = -1;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(s, out, 64);
+    CHECK_EQ(fa_device_set_mute(g_dev, 1), FA_OK);
+    CHECK_EQ(fa_device_get_mute(g_dev, &m), FA_OK);
+    CHECK_EQ(m, 1);
+    for (i = 0; i < 2000 && fa_ring_readable(&s->ring) < (int64_t)(glide + 64); i++) fa_sleep_ms(1);
+    fa_fetch_add64(&g_dev->epoch, 1);
+    fa_device_render(g_dev, out, glide + 64);
+    fa_fetch_add64(&g_dev->epoch, 1);
+    for (i = glide + 1; i < glide + 64; i++) CHECK(out[i * 2] == 0.0f && out[i * 2 + 1] == 0.0f);
+    CHECK_EQ(fa_device_set_mute(g_dev, 0), FA_OK);
+    for (i = 0; i < 2000 && fa_ring_readable(&s->ring) < (int64_t)(glide + 64); i++) fa_sleep_ms(1);
+    fa_fetch_add64(&g_dev->epoch, 1);
+    fa_device_render(g_dev, out, glide + 64);
+    fa_fetch_add64(&g_dev->epoch, 1);
+    CHECK(out[(glide + 63) * 2] > 0.1f);
+    fa_stream_close(s);
+}
+
+typedef struct clock_probe { fa_stream* s; fa_atomic32 done; fa_atomic32 stop; fa_time t; } clock_probe;
+
+static void clock_hammer(void* arg)
+{
+    clock_probe* p = (clock_probe*)arg;
+    while (!fa_load32(&p->stop)) fa_stream_get_clock(p->s, &p->t);
+    fa_store32(&p->done, 1);
+}
+
+/* Lock-free reads while the stream moves on and off a device (TSan/ASan). */
+static void test_clock_during_attach_detach(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    clock_probe p;
+    fa_thread t;
+    int i;
+    CHECK(s != NULL);
+    memset(&p, 0, sizeof(p));
+    p.s = s;
+    CHECK(fa_thread_create(&t, clock_hammer, &p) == 0);
+    for (i = 0; i < 50; i++) {
+        CHECK_EQ(fa_stream_detach(s), FA_OK);
+        CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    }
+    fa_store32(&p.stop, 1);
+    fa_thread_join(&t);
+    fa_stream_close(s);
+}
+
+static void clock_probe_run(void* arg)
+{
+    clock_probe* p = (clock_probe*)arg;
+    fa_stream_get_clock(p->s, &p->t);
+    fa_store32(&p->done, 1);
+}
+
+/* A render loop's clock read must not wait behind a seek, which holds the API lock
+ * while it refills: this one holds it the whole time. */
+static void test_clock_never_waits_for_api_lock(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    clock_probe p;
+    fa_thread t;
+    int64_t deadline;
+    int done;
+    CHECK(s != NULL);
+    memset(&p, 0, sizeof(p));
+    p.s = s;
+    fa_mutex_lock(&s->api_lock);
+    CHECK(fa_thread_create(&t, clock_probe_run, &p) == 0);
+    deadline = fa_monotonic_ns() + 2000000000LL;
+    while (!fa_load32(&p.done) && fa_monotonic_ns() < deadline) fa_sleep_ms(1);
+    done = fa_load32(&p.done);
+    fa_mutex_unlock(&s->api_lock);
+    fa_thread_join(&t);
+    CHECK(done);
+    fa_stream_close(s);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -1063,6 +1273,13 @@ int main(void)
     RUN(test_full_queue_never_drops);
     RUN(test_vorbis_imdct);
     RUN(test_source_prefix_dropped);
+    RUN(test_loop_toggle_while_playing);
+    RUN(test_short_loop_counts_every_jump);
+    RUN(test_loop_needs_seekable);
+    RUN(test_mute_glides_and_keeps_volume);
+    RUN(test_device_mute);
+    RUN(test_clock_never_waits_for_api_lock);
+    RUN(test_clock_during_attach_detach);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);
