@@ -12,6 +12,18 @@ internal struct FaAudioFormat
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal struct FaEqBand
+{
+    public int Type;
+    public float Frequency;
+    public float Q;
+    public float GainDb;
+
+    public FaEqBand(EqualizerBand b) { Type = (int)b.Type; Frequency = b.Frequency; Q = b.Q; GainDb = b.GainDb; }
+    public EqualizerBand ToBand() => new((EqualizerBandType)Type, Frequency, Q, GainDb);
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal unsafe struct FaEngineConfig
 {
     public uint StructSize;
