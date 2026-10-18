@@ -437,6 +437,21 @@ void fa_truepeak_free(fa_truepeak* tp);
 float fa_truepeak_push(fa_truepeak* tp, const float* frame);
 void fa_truepeak_flush(fa_truepeak* tp);
 
+/* ---- Analysis taps (analysis.c) ------------------------------------------
+ * What a stream or device played lately, by device frame, for levels and the
+ * spectrum. Made on the first request (fa_tap_get, any thread); written by the
+ * audio thread only; read without locks. */
+typedef struct fa_tap {
+    float* buf;               /* `frames` stereo frames, a ring by device frame */
+    uint32_t frames;          /* power of two, about 2 s at the device rate */
+    fa_atomic64 start;        /* first device frame written since the last jump */
+    fa_atomic64 end;          /* device frame after the newest one written */
+} fa_tap;
+fa_tap* fa_tap_get(fa_atomic_ptr* slot, uint32_t rate);
+/* `n` frames played from device frame `at`; skipped frames are silence. */
+void fa_tap_write(fa_tap* t, int64_t at, const float* frames, int64_t n);
+void fa_tap_free(fa_tap* t);
+
 /* K-weighted energy meter: one mean-square energy per 100 ms sub-block. */
 typedef struct fa_meter {
     uint32_t rate, channels;
@@ -626,6 +641,7 @@ struct fa_engine {
     struct fa_stream* streams;   /* attached streams the workers keep filled */
     struct fa_device* devices;
     struct fa_stream* graveyard; /* closed streams, freed by the event thread */
+    struct fa_stream* cdg_watched; /* streams with CD+G change events (cdg.c), via cdg_watch_link */
     fa_qevent* pending;          /* events posted by API/worker threads */
     uint32_t pending_count, pending_cap;
 
@@ -699,6 +715,7 @@ struct fa_device {
     fa_atomic32 muted;           /* fa_device_set_mute */
     float mute_level;            /* audio thread: 0 = audible .. 1 = silent */
     fa_atomic_ptr encoders;      /* fa_enc_list* recording the output (encode.c) */
+    fa_atomic_ptr tap;           /* fa_tap*, the output after the limiter (analysis.c) */
     struct fa_device* next;      /* engine->devices */
 };
 
@@ -1001,12 +1018,22 @@ struct fa_stream {
     struct fa_cdg_surface* cdg_surfaces;
     uint32_t cdg_gen;
     fa_atomic64 cdg_offset;      /* fa_time */
+    /* FA_EVENT_CDG_CHANGED (fa_stream_set_cdg_events): the event thread follows the
+     * clock over the packs. cdg_events is read without the lock; the rest under it. */
+    fa_atomic32 cdg_events;
+    struct fa_stream* cdg_watch_link; /* engine->cdg_watched, under list_lock */
+    int cdg_watch_listed;        /* under list_lock */
+    size_t cdg_watch_next;       /* packs the app was last told about */
+    uint32_t cdg_watch_gen;
+    int cdg_watch_dirty;         /* report the whole screen next (enabled, packs rewritten) */
+    int cdg_watch_shifted;       /* smooth-scroll offsets are not 0: tiles move */
 
     /* Encoders (encode.c): taps recording what the stream plays (fa_enc_list*, read
      * by the audio thread), and the one reading it as a decode-only stream. Both
      * under api_lock. */
     fa_atomic_ptr encoders;
     struct fa_encoder* reader;
+    fa_atomic_ptr tap;           /* fa_tap*, the stream's audio as mixed (analysis.c) */
     /* MIDI: the soundfont the stream was opened with (a reference, NULL for other
      * formats or none) and the decoder's MIDI state (live controls, texts). */
     struct fa_soundfont* soundfont;

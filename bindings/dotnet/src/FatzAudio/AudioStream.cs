@@ -1116,13 +1116,17 @@ public unsafe class AudioStream : IDisposable
         }
     }
 
-    /// <summary>Measures peak and RMS levels of the audio currently playing.</summary>
-    /// <param name="window">Length of the measurement window; defaults to 50 ms.</param>
-    /// <returns>Levels per channel.</returns>
-    /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
+    /// <summary>
+    /// Peak and RMS of the stream's audio being heard now, after its equalizer, before its volume, pan, fades and normalization:
+    /// for a VU meter, call it from a timer. All zeros while the stream is not playing. The first call starts
+    /// recording, so it reads silence.
+    /// </summary>
+    /// <param name="window">Length of the measurement window; defaults to 50 ms, at most about 1 s.</param>
+    /// <returns>Levels for left and right (one value for a mono stream).</returns>
+    /// <exception cref="FatzAudioException">A decode-only stream (<see cref="ErrorCode.InvalidArgument"/>).</exception>
     public StreamLevels GetLevels(TimeSpan? window = null)
     {
-        int ch = Math.Max(1, _channels);
+        int ch = _channels == 1 ? 1 : 2;
         var peak = new float[ch];
         var rms = new float[ch];
         fixed (float* pp = peak)
@@ -1132,6 +1136,40 @@ public unsafe class AudioStream : IDisposable
                 Handle, TimeConvert.ToNanoseconds(window ?? TimeSpan.FromMilliseconds(50)), pp, pr, (uint)ch));
         }
         return new StreamLevels(peak, rms);
+    }
+
+    /// <summary>
+    /// The magnitude spectrum of the stream's audio being heard now, for a visualizer (same source and timing
+    /// as <see cref="GetLevels"/>). All zeros while the stream is not playing.
+    /// </summary>
+    /// <param name="size">Transform size: a power of two from 64 to 16384. 2048 at 48 kHz is 23.4 Hz per bin over 43 ms.</param>
+    /// <param name="options">Channel and window.</param>
+    /// <returns><paramref name="size"/> / 2 magnitudes and the bin width.</returns>
+    /// <exception cref="FatzAudioException">An invalid size, or a decode-only stream (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    public Spectrum GetSpectrum(int size = 2048, SpectrumOptions options = SpectrumOptions.None)
+    {
+        var bins = new float[Math.Max(1, size / 2)];
+        float hz;
+        fixed (float* p = bins)
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_spectrum(Handle, (uint)Math.Max(0, size), (uint)options, p, &hz));
+        }
+        return new Spectrum(bins, hz);
+    }
+
+    /// <summary>Like <see cref="GetSpectrum(int, SpectrumOptions)"/>, into your own buffer (no allocation per call).</summary>
+    /// <param name="magnitudes">Half the transform size: 32 to 8192 values, a power of two.</param>
+    /// <param name="options">Channel and window.</param>
+    /// <returns>The bin width in Hz; 0 while the stream is not playing.</returns>
+    /// <exception cref="FatzAudioException">An invalid length, or a decode-only stream (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    public float GetSpectrum(Span<float> magnitudes, SpectrumOptions options = SpectrumOptions.None)
+    {
+        float hz;
+        fixed (float* p = magnitudes)
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_spectrum(Handle, (uint)magnitudes.Length * 2, (uint)options, p, &hz));
+        }
+        return hz;
     }
 
     /// <summary>
@@ -1262,6 +1300,38 @@ public unsafe class AudioStream : IDisposable
     /// </summary>
     public event EventHandler<StreamEventArgs>? Looped;
     /// <summary>
+    /// Raised when the CD+G picture heard now changes: lyrics being coloured in, a screen clear, a colour change, a
+    /// seek, new graphics. Call <see cref="CdgSurface.Update"/> on your surfaces then, instead of every frame. The
+    /// first handler turns the native events on, and the first event after that covers the whole screen; removing the
+    /// last handler turns them off. Raised on the engine's event thread (never the audio thread), at most once per
+    /// few milliseconds; handlers may call any FatzAudio method but should return quickly.
+    /// </summary>
+    public event EventHandler<CdgChangedEventArgs>? CdgChanged
+    {
+        add
+        {
+            lock (_cdgEventLock)
+            {
+                if (_cdgChanged == null && value != null)
+                    FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_cdg_events(Handle, 1));
+                _cdgChanged += value;
+            }
+        }
+        remove
+        {
+            lock (_cdgEventLock)
+            {
+                _cdgChanged -= value;
+                if (_cdgChanged != null || _handle.IsClosed) return;
+                try { NativeMethods.fa_stream_set_cdg_events(_handle, 0); }
+                catch (ObjectDisposedException) { /* closed meanwhile: its events stopped with it */ }
+            }
+        }
+    }
+    private EventHandler<CdgChangedEventArgs>? _cdgChanged;
+    private readonly object _cdgEventLock = new();
+
+    /// <summary>
     /// Raised when a <see cref="RequestSeek(TimeSpan)"/> could not be carried out (for example a web server refusing
     /// the range); playback goes on where it was. <see cref="StreamEventArgs.Position"/> is the target and
     /// <see cref="StreamEventArgs.Value"/> the <see cref="ErrorCode"/>. Raised on the engine's event thread (never the
@@ -1347,7 +1417,12 @@ public unsafe class AudioStream : IDisposable
                     if (MidiTextReached is { } onText) onText(this, new MidiTextEventArgs(GetMidiText((int)value)));
                     break;
                 case 12: Looped?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
-                case 13: SeekFailed?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
+                case 13:
+                    _cdgChanged?.Invoke(this, new CdgChangedEventArgs(
+                        new CdgRect((int)(value & 0xFFF), (int)((value >> 12) & 0xFFF), (int)((value >> 24) & 0xFFF), (int)((value >> 36) & 0xFFF)),
+                        ((value >> 48) & 1) != 0, frame));
+                    break;
+                case 14: SeekFailed?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
             }
         }
         catch

@@ -200,6 +200,9 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_stream_get_cdg_info(StreamHandle stream, out FaCdgInfo info);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_cdg_events(StreamHandle stream, int enabled);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_set_dynamic_range(StreamHandle stream, int mode);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
@@ -402,6 +405,15 @@ internal static unsafe partial class NativeMethods
     // ---- Analysis ----------------------------------------------------------
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_levels(StreamHandle stream, long window, float* peak, float* rms, uint channels);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_device_get_levels(DeviceHandle device, long window, float* peak, float* rms, uint channels);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_spectrum(StreamHandle stream, uint size, uint flags, float* bins, float* binHz);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_device_get_spectrum(DeviceHandle device, uint size, uint flags, float* bins, float* binHz);
 
     // ---- Audio CDs ---------------------------------------------------------
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

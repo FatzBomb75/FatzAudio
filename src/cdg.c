@@ -48,6 +48,9 @@
                        FA_CDG_TRANSPARENT_BACKGROUND_ONLY | FA_CDG_HIDE_UNTIL_PRESET | \
                        FA_CDG_BACKGROUND_COLOR | FA_CDG_BACKGROUND_OPACITY)
 #define CDG_MAX_CHECKPOINTS 180   /* ~12 MB; longer graphics space them out further */
+/* fa_event.value of FA_EVENT_CDG_CHANGED; the header's FA_CDG_CHANGE_* take it apart. */
+#define FA_CDG_CHANGE_MAKE(x, y, w, h, pal) \
+    ((int64_t)(x) | ((int64_t)(y) << 12) | ((int64_t)(w) << 24) | ((int64_t)(h) << 36) | ((int64_t)((pal) != 0) << 48))   /* ~12 MB; longer graphics space them out further */
 
 typedef struct cdg_state {
     uint8_t screen[FA_CDG_HEIGHT][FA_CDG_WIDTH];  /* colour indices */
@@ -705,6 +708,7 @@ int fa_stream_cdg_write(struct fa_stream* s, uint32_t token, size_t first, const
              * may land behind a surface, which goes back to replay them. */
             for (f = s->cdg_surfaces; f; f = f->next)
                 if (f->st.next > first && first < f->stale_from) f->stale_from = first;
+            if (s->cdg_watch_next > first) s->cdg_watch_dirty = 1;
             index_written(data, first, n, 1);
         } else {
             index_written(data, first, n, 0);
@@ -714,9 +718,12 @@ int fa_stream_cdg_write(struct fa_stream* s, uint32_t token, size_t first, const
     return ok;
 }
 
+static int watch_list(struct fa_stream* s, int on);
+
 void fa_stream_cdg_close(struct fa_stream* s)
 {
     fa_cdg_surface* f;
+    watch_list(s, 0);
     fa_mutex_lock(&s->cdg_lock);
     /* Surfaces belong to the app: they outlive the stream until destroyed, and
      * only refuse to update from now on. */
@@ -934,18 +941,22 @@ static void decode_to(fa_cdg_surface* f, const fa_cdg_data* d, size_t target)
     }
 }
 
+/* `time` on the stream's timeline minus its CD+G offset, saturated. */
+static fa_time graphics_time(struct fa_stream* s, fa_time time)
+{
+    fa_time offset = fa_load64(&s->cdg_offset);
+    if (offset > 0 && time < INT64_MIN + offset) return INT64_MIN;
+    if (offset < 0 && time > INT64_MAX + offset) return INT64_MAX;
+    return time - offset;
+}
+
 static fa_result surface_update(fa_cdg_surface* f, fa_time time, fa_cdg_frame* out)
 {
     struct fa_stream* s = f->stream;
     size_t target;
-    fa_time offset;
     if (!s) return FA_ERROR_INVALID_ARG; /* its stream was closed */
     fa_mutex_lock(&s->cdg_lock);
-    offset = fa_load64(&s->cdg_offset);
-    /* time - offset, saturated */
-    if (offset > 0 && time < INT64_MIN + offset) time = INT64_MIN;
-    else if (offset < 0 && time > INT64_MAX + offset) time = INT64_MAX;
-    else time -= offset;
+    time = graphics_time(s, time);
     if (f->gen != s->cdg_gen) {
         index_build(s->cdg);      /* graphics loaded since the surface was created */
         restore(f, NULL);
@@ -965,6 +976,155 @@ static fa_result surface_update(fa_cdg_surface* f, fa_time time, fa_cdg_frame* o
     render(f, out);
     out->time = time;
     return FA_OK;
+}
+
+/* ---- change events ---------------------------------------------------------------- */
+
+/* Adds the stream to (or takes it off) the engine's list the event thread watches,
+ * and sets cdg_events with it, both under list_lock so they always agree. A closed
+ * stream is never added: 0 then. */
+static int watch_list(struct fa_stream* s, int on)
+{
+    fa_engine* e = s->engine;
+    struct fa_stream** link;
+    int ok = 1;
+    if (!e) return 0;   /* a stream that failed to open */
+    fa_mutex_lock(&e->list_lock);
+    if (on && fa_load32(&s->closed)) {
+        ok = 0;
+    } else if (on && !s->cdg_watch_listed) {
+        s->cdg_watch_link = e->cdg_watched;
+        e->cdg_watched = s;
+        s->cdg_watch_listed = 1;
+    } else if (!on && s->cdg_watch_listed) {
+        for (link = &e->cdg_watched; *link; link = &(*link)->cdg_watch_link)
+            if (*link == s) { *link = s->cdg_watch_link; break; }
+        s->cdg_watch_listed = 0;
+    }
+    if (ok) fa_store32(&s->cdg_events, on ? 1 : 0);
+    fa_mutex_unlock(&e->list_lock);
+    return ok;
+}
+
+FA_API fa_result FA_CALL fa_stream_set_cdg_events(fa_stream* stream, int32_t enabled)
+{
+    if (!stream) return FA_ERROR_INVALID_ARG;
+    if (enabled) {
+        /* Before the stream is watched, so the first round sees this. */
+        fa_mutex_lock(&stream->cdg_lock);
+        stream->cdg_watch_dirty = 1;   /* the first event asks for a whole picture */
+        stream->cdg_watch_gen = stream->cdg_gen;
+        index_build(stream->cdg);      /* a seek report reads the checkpoints */
+        fa_mutex_unlock(&stream->cdg_lock);
+    }
+    return watch_list(stream, enabled != 0) ? FA_OK : FA_ERROR_INVALID_ARG;
+}
+
+/* 1 when a scroll pack's data sets smooth-scroll offsets other than 0. */
+static int scroll_shifted(const uint8_t* d) { return (d[1] & 0x07) != 0 || (d[2] & 0x0F) != 0; }
+
+/* Smooth-scroll offsets in force after packs [0, upto): from the last scroll pack,
+ * looking back no further than the checkpoint before `upto`. */
+static int shifted_at(const fa_cdg_data* d, size_t upto)
+{
+    const struct fa_cdg_index* ix = d->index;
+    size_t k = ix ? upto / ix->step : 0, base;
+    if (ix && k > ix->count) k = ix->count;
+    base = k ? k * ix->step : 0;
+    while (upto > base) {
+        const uint8_t* p = d->packs + --upto * FA_CDG_PACK_BYTES;
+        int op = p[1] & 0x3F;
+        if ((p[0] & 0x3F) == CDG_MODE_GRAPHICS && (op == CDG_SCROLL_PRESET || op == CDG_SCROLL_COPY))
+            return scroll_shifted(p + 4);
+    }
+    return k ? ix->at[k - 1].hoff != 0 || ix->at[k - 1].voff != 0 : 0;
+}
+
+static void grow(int* r, int x0, int y0, int x1, int y1)
+{
+    if (r[0] >= r[2]) { r[0] = x0; r[1] = y0; r[2] = x1; r[3] = y1; return; }
+    if (x0 < r[0]) r[0] = x0;
+    if (y0 < r[1]) r[1] = y0;
+    if (x1 > r[2]) r[2] = x1;
+    if (y1 > r[3]) r[3] = y1;
+}
+
+/* What packs [from, to) change on the screen, without decoding them: the area tiles
+ * cover, the whole screen for clears, borders and scrolls, and `palette` for colour
+ * and transparency loads. Over-reports at worst (a repeated clear). */
+static void pack_changes(struct fa_stream* s, const fa_cdg_data* d, size_t from, size_t to, int* r, int* palette)
+{
+    for (; from < to; from++) {
+        const uint8_t* p = d->packs + from * FA_CDG_PACK_BYTES;
+        const uint8_t* dd = p + 4;
+        if ((p[0] & 0x3F) != CDG_MODE_GRAPHICS) continue;
+        switch (p[1] & 0x3F) {
+        case CDG_TILE_NORMAL:
+        case CDG_TILE_XOR: {
+            int row = dd[2] & 0x1F, col = dd[3] & 0x3F;
+            if (row >= CDG_ROWS || col >= CDG_COLS) break;
+            if (s->cdg_watch_shifted) grow(r, 0, 0, FA_CDG_WIDTH, FA_CDG_HEIGHT);
+            else grow(r, col * CDG_TILE_W, row * CDG_TILE_H, (col + 1) * CDG_TILE_W, (row + 1) * CDG_TILE_H);
+            break;
+        }
+        case CDG_SCROLL_PRESET:
+        case CDG_SCROLL_COPY:
+            s->cdg_watch_shifted = scroll_shifted(dd);
+            grow(r, 0, 0, FA_CDG_WIDTH, FA_CDG_HEIGHT);   /* the picture moves */
+            break;
+        case CDG_MEMORY_PRESET:
+        case CDG_BORDER_PRESET:
+            grow(r, 0, 0, FA_CDG_WIDTH, FA_CDG_HEIGHT);
+            break;
+        case CDG_TRANSPARENT:
+        case CDG_COLORS_LOW:
+        case CDG_COLORS_HIGH:
+            *palette = 1;
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+void fa_stream_cdg_watch(struct fa_stream* s)
+{
+    fa_time now;
+    fa_cdg_data* d;
+    size_t target;
+    int r[4] = { 0, 0, 0, 0 }, palette = 0;
+    /* Like a callback: fa_stream_close sets `closed`, then waits for in_callback 0
+     * before it frees what the clock reads, so either it sees us or we see it. */
+    fa_store32(&s->in_callback, 1);
+    if (!fa_load32(&s->cdg_events) || fa_load32(&s->closed) || fa_stream_get_clock(s, &now) != FA_OK) {
+        fa_store32(&s->in_callback, 0);
+        return;
+    }
+    fa_mutex_lock(&s->cdg_lock);
+    d = s->cdg;
+    target = d ? packs_at(graphics_time(s, now), d->count) : 0;
+    if (s->cdg_watch_gen != s->cdg_gen || s->cdg_watch_dirty || target < s->cdg_watch_next ||
+        target - s->cdg_watch_next > CDG_CHECKPOINT_PACKS) {
+        /* New graphics, rewritten packs, a seek back or a long jump: the whole screen. */
+        grow(r, 0, 0, FA_CDG_WIDTH, FA_CDG_HEIGHT);
+        palette = 1;
+        s->cdg_watch_shifted = d ? shifted_at(d, target) : 0;
+        s->cdg_watch_gen = s->cdg_gen;
+        s->cdg_watch_dirty = 0;
+    } else if (d) {
+        pack_changes(s, d, s->cdg_watch_next, target, r, &palette);
+    }
+    s->cdg_watch_next = target;
+    fa_mutex_unlock(&s->cdg_lock);
+    fa_store32(&s->in_callback, 0);
+    if (r[0] < r[2] || palette) {
+        fa_event ev;
+        ev.type = FA_EVENT_CDG_CHANGED;
+        ev.stream = s;
+        ev.frame = (fa_frames)target;
+        ev.value = FA_CDG_CHANGE_MAKE(r[0], r[1], r[2] - r[0], r[3] - r[1], palette);
+        fa_engine_post_event(s->engine, &ev);
+    }
 }
 
 FA_API fa_result FA_CALL fa_cdg_surface_update(fa_cdg_surface* surface, fa_cdg_frame* out_frame)

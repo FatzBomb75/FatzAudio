@@ -86,6 +86,57 @@ public sealed class OutputDevice : IDisposable
         set => FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_set_mute(Handle, value ? 1 : 0));
     }
 
+    /// <summary>
+    /// Peak and RMS of the device's whole output being heard now (after the limiter), for a master VU meter.
+    /// All zeros while the device is stopped. The first call starts recording, so it reads silence.
+    /// </summary>
+    /// <param name="window">Length of the measurement window; defaults to 50 ms, at most about 1 s.</param>
+    /// <returns>Levels for left and right.</returns>
+    /// <exception cref="ObjectDisposedException">The device was disposed.</exception>
+    public unsafe StreamLevels GetLevels(TimeSpan? window = null)
+    {
+        var peak = new float[2];
+        var rms = new float[2];
+        fixed (float* pp = peak)
+        fixed (float* pr = rms)
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_get_levels(
+                Handle, TimeConvert.ToNanoseconds(window ?? TimeSpan.FromMilliseconds(50)), pp, pr, 2));
+        }
+        return new StreamLevels(peak, rms);
+    }
+
+    /// <summary>The magnitude spectrum of the device's whole output being heard now, for a visualizer.</summary>
+    /// <param name="size">Transform size: a power of two from 64 to 16384.</param>
+    /// <param name="options">Channel and window.</param>
+    /// <returns><paramref name="size"/> / 2 magnitudes and the bin width.</returns>
+    /// <exception cref="FatzAudioException">An invalid size (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    public unsafe Spectrum GetSpectrum(int size = 2048, SpectrumOptions options = SpectrumOptions.None)
+    {
+        var bins = new float[Math.Max(1, size / 2)];
+        float hz;
+        fixed (float* p = bins)
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_get_spectrum(Handle, (uint)Math.Max(0, size), (uint)options, p, &hz));
+        }
+        return new Spectrum(bins, hz);
+    }
+
+    /// <summary>Like <see cref="GetSpectrum(int, SpectrumOptions)"/>, into your own buffer (no allocation per call).</summary>
+    /// <param name="magnitudes">Half the transform size: 32 to 8192 values, a power of two.</param>
+    /// <param name="options">Channel and window.</param>
+    /// <returns>The bin width in Hz; 0 while the device is stopped.</returns>
+    /// <exception cref="FatzAudioException">An invalid length (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    public unsafe float GetSpectrum(Span<float> magnitudes, SpectrumOptions options = SpectrumOptions.None)
+    {
+        float hz;
+        fixed (float* p = magnitudes)
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_get_spectrum(Handle, (uint)magnitudes.Length * 2, (uint)options, p, &hz));
+        }
+        return hz;
+    }
+
     /// <summary>Output latency of the device.</summary>
     /// <exception cref="ObjectDisposedException">The device was disposed.</exception>
     /// <exception cref="FatzAudioException">The latency could not be determined.</exception>

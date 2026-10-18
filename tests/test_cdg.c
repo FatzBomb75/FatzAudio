@@ -1500,6 +1500,105 @@ static void test_follows_audio_clock(void)
     free(c.p);
 }
 
+/* Push model: FA_EVENT_CDG_CHANGED follows the clock and says what changed. */
+static fa_event g_cdg_events[64];
+static fa_atomic32 g_cdg_event_count;
+
+static void FA_CALL on_cdg_event(const fa_event* ev, void* user)
+{
+    int32_t n = fa_load32(&g_cdg_event_count);
+    (void)user;
+    if (ev->type != FA_EVENT_CDG_CHANGED || n >= 64) return;
+    g_cdg_events[n] = *ev;
+    fa_store32(&g_cdg_event_count, n + 1);
+}
+
+/* Waits for event number `n` (0-based); NULL after 3 s. */
+static const fa_event* cdg_event(int32_t n)
+{
+    int64_t deadline = fa_monotonic_ns() + 3000000000LL;
+    while (fa_load32(&g_cdg_event_count) <= n && fa_monotonic_ns() < deadline) fa_sleep_ms(2);
+    return fa_load32(&g_cdg_event_count) > n ? &g_cdg_events[n] : NULL;
+}
+
+static void read_to(fa_stream* s, fa_frames frame)
+{
+    float pcm[2 * 1024];
+    fa_frames pos = 0;
+    while (fa_stream_get_position(s, &pos) == FA_OK && pos < frame) {
+        fa_frames got = 0, want = frame - pos < 1024 ? frame - pos : 1024;
+        if (fa_stream_read(s, pcm, want, &got) != FA_OK || got == 0) break;
+    }
+}
+
+static void test_change_events(void)
+{
+    buf c = { 0 };
+    fa_stream* s = open_wav_stream(3, FA_OPEN_DECODE_ONLY);
+    const fa_event* ev;
+    int64_t v;
+    static const uint8_t other[8][3] = { { 1, 2, 3 } };
+    colors(&c, 0, k_low);          /* pack 0 */
+    preset(&c, 2, 0);              /* 1 */
+    empty_packs_to(&c, 300);
+    tile(&c, 0, 2, 1, 5, 5, 0x3F); /* 300: at 1 s */
+    empty_packs_to(&c, 600);
+    colors(&c, 0, other);          /* 600: at 2 s */
+    empty_packs_to(&c, 900);
+    CHECK(s);
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    fa_store32(&g_cdg_event_count, 0);
+    CHECK_EQ(fa_stream_set_event_callback(s, on_cdg_event, NULL), FA_OK);
+    CHECK_EQ(fa_stream_set_cdg_events(s, 1), FA_OK);
+    /* The first event asks for the whole picture */
+    CHECK((ev = cdg_event(0)) != NULL);
+    v = ev->value;
+    CHECK(FA_CDG_CHANGE_X(v) == 0 && FA_CDG_CHANGE_Y(v) == 0);
+    CHECK(FA_CDG_CHANGE_WIDTH(v) == 300 && FA_CDG_CHANGE_HEIGHT(v) == 216);
+    CHECK_EQ(FA_CDG_CHANGE_PALETTE(v), 1);
+    CHECK_EQ(ev->stream, s);
+    /* Colours and the clear */
+    read_to(s, 4000);
+    CHECK((ev = cdg_event(1)) != NULL);
+    CHECK_EQ(ev->frame, 150);
+    CHECK_EQ(FA_CDG_CHANGE_WIDTH(ev->value), 300);
+    CHECK_EQ(FA_CDG_CHANGE_PALETTE(ev->value), 1);
+    /* One tile: just its area */
+    read_to(s, 8100);
+    CHECK((ev = cdg_event(2)) != NULL);
+    v = ev->value;
+    CHECK_EQ(FA_CDG_CHANGE_X(v), 30);
+    CHECK_EQ(FA_CDG_CHANGE_Y(v), 60);
+    CHECK_EQ(FA_CDG_CHANGE_WIDTH(v), 6);
+    CHECK_EQ(FA_CDG_CHANGE_HEIGHT(v), 12);
+    CHECK_EQ(FA_CDG_CHANGE_PALETTE(v), 0);
+    /* Nothing new while the clock stands still */
+    fa_sleep_ms(30);
+    CHECK_EQ(fa_load32(&g_cdg_event_count), 3);
+    /* A colour change only */
+    read_to(s, 16100);
+    CHECK((ev = cdg_event(3)) != NULL);
+    CHECK_EQ(FA_CDG_CHANGE_WIDTH(ev->value), 0);
+    CHECK_EQ(FA_CDG_CHANGE_PALETTE(ev->value), 1);
+    /* A seek back: the whole screen */
+    CHECK_EQ(fa_stream_seek(s, 0), FA_OK);
+    CHECK((ev = cdg_event(4)) != NULL);
+    CHECK_EQ(FA_CDG_CHANGE_WIDTH(ev->value), 300);
+    CHECK_EQ(ev->frame, 0);
+    /* Off: no more */
+    CHECK_EQ(fa_stream_set_cdg_events(s, 0), FA_OK);
+    read_to(s, 8100);
+    fa_sleep_ms(30);
+    CHECK_EQ(fa_load32(&g_cdg_event_count), 5);
+    CHECK_EQ(fa_stream_set_cdg_events(NULL, 1), FA_ERROR_INVALID_ARG);
+    /* Closing a stream with events on takes it off the watch list */
+    CHECK_EQ(fa_stream_set_cdg_events(s, 1), FA_OK);
+    CHECK(cdg_event(5) != NULL);
+    fa_stream_close(s);
+    fa_sleep_ms(30);
+    free(c.p);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -1528,6 +1627,7 @@ int main(void)
     RUN(test_checkpoints);
     RUN(test_checkpoints_streamed);
     RUN(test_timing_rule);
+    RUN(test_change_events);
     fa_engine_destroy(g_engine);
     remove("cdg_pair.zip");
     remove("cdg_sibling.wav");

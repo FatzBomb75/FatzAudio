@@ -1375,6 +1375,25 @@ FA_API fa_result FA_CALL fa_stream_get_cdg_offset(fa_stream* stream, fa_time* ou
  * are found. */
 FA_API fa_result FA_CALL fa_stream_get_cdg_info(fa_stream* stream, fa_cdg_info* out_info);
 
+/* Push model, for apps that would rather be told than poll (off by default). With it
+ * on, the engine's event thread follows the stream's clock over the packs and raises
+ * FA_EVENT_CDG_CHANGED (on the stream's event callback) whenever the picture heard
+ * changes: lyrics being coloured in, a screen clear, a colour change, a seek, new
+ * graphics. At most one event per few milliseconds, covering all packs since the
+ * last. On the event, call fa_cdg_surface_update for your surfaces (from your render
+ * thread, or in the callback) and upload what they report; the surfaces themselves
+ * stay yours. The first event after turning it on covers the whole screen.
+ * fa_event.frame is the number of packs shown, fa_event.value what changed, in
+ * native 300x216 screen pixels (a surface's dirty rectangle is in its own pixels):
+ *   FA_CDG_CHANGE_X/Y/WIDTH/HEIGHT(value)  the area (0 wide: only colours changed)
+ *   FA_CDG_CHANGE_PALETTE(value)           1 = colours or transparency changed */
+FA_API fa_result FA_CALL fa_stream_set_cdg_events(fa_stream* stream, int32_t enabled);
+#define FA_CDG_CHANGE_X(value)       ((uint32_t)((value) & 0xFFF))
+#define FA_CDG_CHANGE_Y(value)       ((uint32_t)(((value) >> 12) & 0xFFF))
+#define FA_CDG_CHANGE_WIDTH(value)   ((uint32_t)(((value) >> 24) & 0xFFF))
+#define FA_CDG_CHANGE_HEIGHT(value)  ((uint32_t)(((value) >> 36) & 0xFFF))
+#define FA_CDG_CHANGE_PALETTE(value) ((int32_t)(((value) >> 48) & 1))
+
 /* config NULL = BGRA32, native size. A stream without graphics gives a blank
  * (black) picture until graphics are loaded. Destroy every surface you create, before
  * or after closing its stream (not while fa_stream_close runs): once the stream is
@@ -1546,8 +1565,10 @@ FA_API fa_result FA_CALL fa_stream_get_midi_channel_mute(fa_stream* stream, uint
  * FA_EVENT_STARTED         position               0
  * FA_EVENT_MIDI_TEXT       the text's frame       index for fa_stream_get_midi_text
  * FA_EVENT_LOOPED          loop end it left       loop start it went to (CUE_IN or 0)
+ * FA_EVENT_CDG_CHANGED     CD+G packs now shown   what changed: FA_CDG_CHANGE_* (CD+G above)
+ * FA_EVENT_SEEK_FAILED     the target not reached the fa_result (fa_stream_seek_async)
  *
- * Delivered today: ENDED, MARKER, LOOPED, LOUDNESS_FINAL, RAMP_DONE and STARTED; MIDI_TEXT from MIDI
+ * Delivered today: ENDED, MARKER, LOOPED, CDG_CHANGED (when asked for), LOUDNESS_FINAL, RAMP_DONE, STARTED and SEEK_FAILED; MIDI_TEXT from MIDI
  * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); METADATA from web
  * streams; STALLED and RESUMED from push, packet and web streams; DECODE_ERROR from packet
  * and disc streams. The others are raised by the features that produce them as those land (see docs/features). */
@@ -1565,6 +1586,7 @@ typedef enum fa_event_type {
     FA_EVENT_STARTED,         /* a scheduled, crossfaded or queued start happened */
     FA_EVENT_MIDI_TEXT,       /* a MIDI lyric or other text event is heard */
     FA_EVENT_LOOPED,          /* a looping stream jumped back to its loop start */
+    FA_EVENT_CDG_CHANGED,     /* the CD+G picture heard now changed (fa_stream_set_cdg_events) */
     FA_EVENT_SEEK_FAILED      /* fa_stream_seek_async could not reach `frame` (value = the fa_result) */
 } fa_event_type;
 
@@ -1837,7 +1859,33 @@ FA_API fa_result FA_CALL fa_stream_remove_dsp(fa_stream* stream, uint32_t dsp_id
 
 /* ---- Analysis --------------------------------------------------------- */
 
+/* Peak and RMS (linear, 1.0 = full scale) of the last `window` of audio being
+ * heard now: for a VU meter, call it from a timer. channels 1 gives one value for
+ * both sides, 2 gives left and right. A stream's levels are of its own audio,
+ * after its equalizer and DSP, before volume, pan, fades and normalization (as
+ * BASS_ChannelGetLevel); a device's are of its whole output after the limiter.
+ * The window ends at the audio the speaker plays now. Zeros while the stream is
+ * not playing or the device is stopped. The first call starts recording, so it
+ * reads silence; a window over about 1 s is shortened. Either output may be NULL.
+ * Decode-only streams: FA_ERROR_INVALID_ARG (measure what fa_stream_read gives). */
 FA_API fa_result FA_CALL fa_stream_get_levels(fa_stream* stream, fa_time window, float* out_peak, float* out_rms, uint32_t channels);
+FA_API fa_result FA_CALL fa_device_get_levels(fa_device* device, fa_time window, float* out_peak, float* out_rms, uint32_t channels);
+
+typedef enum fa_spectrum_flags {
+    FA_SPECTRUM_LEFT      = 1 << 0,  /* the left channel only (default: both, mixed) */
+    FA_SPECTRUM_RIGHT     = 1 << 1,  /* the right channel only */
+    FA_SPECTRUM_NO_WINDOW = 1 << 2   /* no Hann window (BASS_FFT_NOWINDOW) */
+} fa_spectrum_flags;
+
+/* The magnitude spectrum of the last `size` frames being heard now, for a
+ * visualizer: `size` is a power of two from 64 to 16384, and `out_bins` gets
+ * size / 2 values, bin k centred on k * bin_hz (DC first). A full-scale sine
+ * reads 1.0 in its bin (lower when it falls between two). Same source, timing
+ * and zeros as the levels above; out_bin_hz (may be NULL) is the device rate
+ * divided by size, 0 while nothing plays. Bigger sizes give finer
+ * frequencies and slower response: 2048 at 48 kHz is 23.4 Hz per bin over 43 ms. */
+FA_API fa_result FA_CALL fa_stream_get_spectrum(fa_stream* stream, uint32_t size, uint32_t flags, float* out_bins, float* out_bin_hz);
+FA_API fa_result FA_CALL fa_device_get_spectrum(fa_device* device, uint32_t size, uint32_t flags, float* out_bins, float* out_bin_hz);
 
 #ifdef __cplusplus
 }

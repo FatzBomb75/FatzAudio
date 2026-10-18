@@ -43,6 +43,10 @@ The first packaged version (NuGet `FatzAudio` with `win-x64` and `linux-x64` nat
 - Tag reader with cover art and file properties (`fa_tags_*`; .NET `Tags`); bitrate, file size and audio
   size in `fa_stream_info`.
 - MIDI: DLS soundfonts and the operating system's own soundfont as the default.
+- MIDI: SF2 instrument attenuation follows the SoundFont spec (quiet instruments in some SF2 banks were
+  up to 10x too loud).
+- Levels and spectrum (FFT) for streams and devices (`fa_stream_get_levels`, `fa_stream_get_spectrum`,
+  `fa_device_get_levels`, `fa_device_get_spectrum`; .NET `GetLevels`, `GetSpectrum`).
 - Everything else built so far: decoding (MP3, AAC, ALAC, FLAC, Opus, Vorbis, AC-3/E-AC-3, WMA on Windows,
   MIDI), web streams and HLS, crossfades, markers, buses, R128 normalization, tempo and pitch, CD+G,
   disc playback, encoding (WAV, FLAC, MP3 via LAME) and the FFmpeg packet hand-off. See

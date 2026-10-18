@@ -76,6 +76,10 @@ fa_result fa_cdg_data_blank(size_t count, fa_cdg_data** out);
 int fa_stream_cdg_attach_if_none(struct fa_stream* s, fa_cdg_data* data, uint32_t* out_token);
 int fa_stream_cdg_write(struct fa_stream* s, uint32_t token, size_t first, const uint8_t* packs, size_t n);
 void fa_stream_cdg_close(struct fa_stream* s);
+/* The event thread, every round (never with list_lock held: the clock of a push
+ * stream takes api_lock): raises FA_EVENT_CDG_CHANGED for a stream whose shown
+ * packs changed since the last call. */
+void fa_stream_cdg_watch(struct fa_stream* s);
 int fa_stream_cdg_present(struct fa_stream* s);
 /* Looks for "<path without extension>.cdg" next to an audio file. */
 fa_cdg_data* fa_cdg_find_sibling(const char* audio_path);
