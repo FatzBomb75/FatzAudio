@@ -137,7 +137,7 @@ A URL that isn't an absolute http or https URL throws `ArgumentException`. Other
 | `FA_ERROR_NOT_FOUND` | The server answered with an error (404, 403, 500, ...) |
 | `FA_ERROR_UNSUPPORTED_FORMAT` | What came back isn't audio FatzAudio can decode (a web page, say) |
 | `FA_ERROR_PROTECTED_CONTENT` | The stream is DRM-protected: HLS with `SAMPLE-AES` or another DRM key method, or an encrypted file |
-| `FA_ERROR_PROVIDER_MISSING` | `https://` on a Linux system without libcurl, or a codec that needs the app's FFmpeg (such as xHE-AAC where the system has no decoder for it) without it |
+| `FA_ERROR_PROVIDER_MISSING` | `https://` on a Linux system without libcurl, or a codec that needs the app's FFmpeg without it |
 
 ## Buffering, stalls and reconnects
 

@@ -522,6 +522,10 @@ static void test_unsupported_configs(void)
     p.extradata = xhe;
     p.extradata_size = sizeof(xhe);
     CHECK_EQ(fa_aac_codec_open(&c, &p), FA_ERROR_UNSUPPORTED_FORMAT);
+#if defined(__linux__) && !defined(__ANDROID__)
+    /* No system decoder here, and AAC never goes to FFmpeg, even when it is loaded. */
+    CHECK_EQ(fa_codec_open(&c, &p), FA_ERROR_UNSUPPORTED_FORMAT);
+#endif
     p.extradata = lc;
     p.extradata_size = sizeof(lc);
     CHECK_EQ(fa_codec_open(&c, &p), FA_OK);

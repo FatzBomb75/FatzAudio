@@ -475,7 +475,8 @@ fa_result fa_codec_open(fa_codec* c, const fa_codec_params* p)
     if (strcmp(p->codec, "alac") == 0) return fa_alac_codec_open(c, p);
     if (strcmp(p->codec, "aac") == 0) {
         /* Built in: AAC-LC, HE-AAC, HE-AAC v2, Main and LTP, in ADTS or after an
-         * AudioSpecificConfig. The system's decoders take what it does not (xHE-AAC). */
+         * AudioSpecificConfig. The system's decoders take what it does not (xHE-AAC),
+         * where the system has one; otherwise it is unsupported. */
         r = fa_aac_codec_open(c, p);
         if (r != FA_ERROR_UNSUPPORTED_FORMAT) return r;
         memset(c, 0, sizeof(*c));
@@ -491,6 +492,8 @@ fa_result fa_codec_open(fa_codec* c, const fa_codec_params* p)
     if (r != FA_ERROR_UNSUPPORTED_FORMAT) return r;
     memset(c, 0, sizeof(*c));
     snprintf(c->name, sizeof(c->name), "%s", p->codec);
+    /* AAC never goes to FFmpeg: what neither decoder takes is unsupported. */
+    if (strcmp(p->codec, "aac") == 0) return FA_ERROR_UNSUPPORTED_FORMAT;
     r = fa_ffmpeg_open_codec(c, p);
     if (r != FA_OK) {
         free(c->out);

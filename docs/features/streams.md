@@ -17,7 +17,7 @@ A stream is anything that produces audio. You open it from a file, a memory bloc
 | WMA, ASF | `.wma`, `.asf` and `.wmv` files (Advanced Systems Format), local or over HTTP: Windows Media Audio 1, 2, 9 Professional, 9 Lossless and Voice, plus PCM, MP3 and AC-3 in ASF. Audio streams only ([WMA](#wma)) | `wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`, `pcm_*`, `mp3`, ... (container `asf`) |
 | MIDI | Standard MIDI Files (format 0, 1, 2), karaoke `.kar`, RIFF `.rmi`; played with a SoundFont 2 you load ([MIDI](midi.md)) | `midi` (container `smf` or `rmid`) |
 
-Inside MP4, Matroska and ASF, PCM, MP3, AC-3, E-AC-3, Opus, Vorbis, FLAC and ALAC tracks decode built in (ALAC to the bit, all channel layouts up to 7.1 and every bit depth). AAC (AAC-LC, HE-AAC, HE-AAC v2, Main and LTP, up to 7.1) decodes built in as well, on every platform ([AAC](#aac)). Every other codec (DTS, TrueHD, WMA outside Windows, xHE-AAC where the system has no decoder for it) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`.
+Inside MP4, Matroska and ASF, PCM, MP3, AC-3, E-AC-3, Opus, Vorbis, FLAC and ALAC tracks decode built in (ALAC to the bit, all channel layouts up to 7.1 and every bit depth). AAC (AAC-LC, HE-AAC, HE-AAC v2, Main and LTP, up to 7.1) decodes built in as well, on every platform ([AAC](#aac)). Every other codec (DTS, TrueHD, WMA outside Windows) uses the FFmpeg your app already has, loaded at runtime ([loading FFmpeg](ffmpeg.md#loading-ffmpeg)). Without it those tracks return `FA_ERROR_PROVIDER_MISSING`.
 
 More formats are added to the same registry (built-in or OS decoders for the codecs above follow the build order in the design doc). Ask the library at runtime with `fa_format_count` / `fa_format_get_info`, or `AudioEngine.SupportedFormats` in .NET.
 
@@ -199,8 +199,8 @@ AAC decodes with FatzAudio's own decoder, the same on every platform, with no FF
 | HE-AAC v2 (parametric stereo) | ✅ every PS mode: 10, 20 and 34 bands, fine and coarse IID, both mixing procedures, IPD/OPD phase |
 | AAC Main | ✅ with backward-adaptive prediction |
 | AAC-LTP | ✅ with long-term prediction |
-| xHE-AAC (USAC) | Through the system's decoder where there is one (Media Foundation, AudioToolbox, MediaCodec), otherwise the app's FFmpeg |
-| AAC SSR, low delay and the other error-resilient (ER) profiles, 960-sample frames | Not supported. MP4/MKV tracks with such a configuration go to the system's decoder or the app's FFmpeg; an `.aac` (ADTS) file of AAC SSR, the only one of these that ADTS can carry, returns `FA_ERROR_UNSUPPORTED_FORMAT` |
+| xHE-AAC (USAC) | Through the system's decoder where there is one (Media Foundation, AudioToolbox, MediaCodec). Elsewhere it returns `FA_ERROR_UNSUPPORTED_FORMAT`; an app that must play it can decode it with its own FFmpeg and hand FatzAudio the frames ([FFmpeg hand-off](ffmpeg.md)) |
+| AAC SSR, low delay and the other error-resilient (ER) profiles, 960-sample frames | Not supported. MP4/MKV tracks with such a configuration return `FA_ERROR_UNSUPPORTED_FORMAT`; an `.aac` (ADTS) file of AAC SSR, the only one of these that ADTS can carry, returns `FA_ERROR_UNSUPPORTED_FORMAT` |
 
 The output matches FFmpeg's AAC decoder to float precision: about 136 dB SNR for AAC-LC, AAC Main and AAC-LTP and 90 to 130 dB for HE-AAC and HE-AAC v2 (measured on streams from Fraunhofer's encoder and FFmpeg's; the tests check every profile and PS mode). For PS phase data (IPD/OPD) the lowest QMF band differs slightly from FFmpeg, which conjugates the phase of its negative-frequency part only at the start of each interpolation; FatzAudio follows the standard there, as FAAD2 does.
 

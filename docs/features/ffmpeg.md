@@ -13,10 +13,10 @@ FatzAudio never links or ships FFmpeg. Packet streams decode PCM, MP3, AAC (LC, 
 
 | Codec | Windows | macOS, iOS | Android | Linux |
 |---|---|---|---|---|
-| xHE-AAC (`aac` with a USAC configuration) | Media Foundation where the system has it | AudioToolbox where the system has it | MediaCodec where the system has it | FFmpeg |
+| xHE-AAC (`aac` with a USAC configuration) | Media Foundation where the system has it | AudioToolbox where the system has it | MediaCodec where the system has it | Unsupported |
 | WMA (`wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`) | Media Foundation | FFmpeg | FFmpeg | FFmpeg |
 
-Give AAC its AudioSpecificConfig as `extradata` (`codecpar->extradata` from MP4 or Matroska); whole ADTS frames (from MPEG-TS) need none. ALAC needs its 24-byte configuration or the `alac` box that holds it. WMA needs `extradata` (the bytes after the WAVEFORMATEX) and `block_align`. A system decoder's audio matches FFmpeg's to within a decoder's rounding, not to the bit. HE-AAC comes out at twice the rate the stream states, which the stream's format reports.
+AAC never goes to FFmpeg: xHE-AAC without a system decoder returns `FA_ERROR_UNSUPPORTED_FORMAT`, and an app that must play it can decode it with its own FFmpeg and push the frames (`fa_stream_push_frame`). Give AAC its AudioSpecificConfig as `extradata` (`codecpar->extradata` from MP4 or Matroska); whole ADTS frames (from MPEG-TS) need none. ALAC needs its 24-byte configuration or the `alac` box that holds it. WMA needs `extradata` (the bytes after the WAVEFORMATEX) and `block_align`. A system decoder's audio matches FFmpeg's to within a decoder's rounding, not to the bit. HE-AAC comes out at twice the rate the stream states, which the stream's format reports.
 
 FLAC packets (`codec = "flac"`) take FFmpeg's extradata as it is: the 34-byte STREAMINFO, with or without a `fLaC` marker and block header in front. Without extradata the frame headers and the `sample_rate`, `channels` and `bits_per_coded_sample` you give are enough.
 
