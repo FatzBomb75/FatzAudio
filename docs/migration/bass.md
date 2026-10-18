@@ -267,7 +267,7 @@ AC-3 and E-AC-3 are built-in formats: the ordinary open calls play them, in raw 
 | BASS_CONFIG_AC3_DYNRNG / BASS_AC3_DYNAMIC_RANGE | `fa_open_options.dynamic_range` per stream (`FA_DYNAMIC_RANGE_FULL`, `NORMAL` or `NIGHT`), changeable while playing with `fa_stream_set_dynamic_range` | `StreamOptions.DynamicRange`, `stream.DynamicRange` | ✅ |
 | BASS_AC3_DOWNMIX_2 / BASS_AC3_DOWNMIX_4 | The engine downmixes to the device automatically; for a custom downmix, `fa_stream_set_matrix` | `stream.SetMatrix` | ✅ |
 | BASS_AC3_DOWNMIX_DOLBY (Pro Logic Lt/Rt) | Not provided: the plain stereo downmix, or your own matrix | — | ➖ (rarely needed today) |
-| E-AC-3 (Dolby Digital Plus), 7.1 | Built in, including dependent substreams; Atmos streams play their bed | Built in | ✅ |
+| E-AC-3 (Dolby Digital Plus), 7.1 | Built in with every coding tool (dependent substreams, spectral extension, enhanced coupling, the adaptive hybrid transform); Atmos streams play their bed | Built in | ✅ |
 | AC-3 packets from your own FFmpeg demuxer | `fa_stream_open_packets` with codec `ac3` / `eac3`, decoded natively | `engine.OpenPackets` | ✅ |
 | Passthrough to an AV receiver (S/PDIF, HDMI) | Not provided | — | 🗓️ |
 
