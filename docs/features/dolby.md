@@ -92,7 +92,7 @@ A frame that fails its checksum, or doesn't parse, plays as silence for its leng
 
 ## Speed and memory
 
-The decoder runs at about 400 times real time for 5.1 and 900 times for stereo on one core (the black-box comparison in `tools/bass-compare`, where bass_ac3 does about 350 and 820), and a stream uses about 50 KB for stereo and 150 KB for 5.1, including its read buffer and one access unit of output.
+The decoder runs at about 400 times real time for 5.1 and 900 times for stereo on one core (the black-box comparison in `tools/bass-compare`, where bass_ac3 does about 350 and 820), and a 5.1 stream uses about 100 KB (bass_ac3 140 KB, each measured alone under Wine), including its read buffer and one access unit of output. A unit of one syncframe, which is every AC-3 stream and E-AC-3 with a single substream, is mixed block by block straight into that output. 7.1 and other E-AC-3 with more than one substream (a dependent one adding channels, or other programs) also keep the whole unit per speaker, about 6 KB more per channel.
 
 ## Threads
 
