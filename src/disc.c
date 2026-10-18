@@ -709,6 +709,10 @@ fa_result fa_disc_decoder_open(fa_decoder* dec, fa_source* src, fa_disc* d, int3
     dec->format.sample_rate = 44100;
     dec->format.channels = 2;
     dec->length = t->frames;
+    dec->audio_bytes = (int64_t)t->frames * 4;
+    dec->bits_per_sample = 16;
+    dec->bitrate = 1411200;
+    dec->file_size = -1;
     dec->seekable = 1;
     dec->audio_track = -1;
     dec->track_count = 1;

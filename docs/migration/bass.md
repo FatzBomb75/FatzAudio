@@ -80,7 +80,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_StreamCreate (STREAMPROC callback) | Planned pull-callback source | | 🗓️ |
 | BASS_StreamPutFileData | `fa_stream_open_io` with `seek = NULL` (forward-only source fed from your own buffer) | `engine.OpenStream(stream)` with a non-seekable stream | ✅ |
 | BASS_StreamGetFilePosition (web streams) | `fa_stream_get_net_status`: `BASS_FILEPOS_DOWNLOAD` → `downloaded`, `BUFFER` → `buffered_bytes` (and `buffered` as time), `END`/`SIZE` → `content_length`, `CONNECTED` → `connected`, `BUFFERING` → `FA_STATE_BUFFERING` ([web streams](../features/web-streams.md#status-and-headers)) | `NetworkStatus` | ✅ |
-| BASS_StreamGetFilePosition (files) | Not needed: positions are in frames; use `fa_stream_get_position` | — | ➖ (by design) |
+| BASS_StreamGetFilePosition (files) | Positions are in frames: use `fa_stream_get_position`. `BASS_FILEPOS_END`/`SIZE` (file size) → `fa_stream_info.file_size`; `START` (where the audio begins, after tags) is not needed: `audio_bytes` already leaves tags and headers out | `stream.Info.FileSize`, `AudioBytes` | ✅ |
 | BASS_StreamCancel | Async open with cancellation | | 🗓️ |
 | BASS_StreamFree / BASS_ChannelFree | `fa_stream_close` | `Dispose()` | ✅ |
 | `BASS_STREAM_DECODE` flag + BASS_ChannelGetData (PCM) | `FA_OPEN_DECODE_ONLY` + `fa_stream_read`; returns `FA_ERROR_END_OF_STREAM` with 0 frames at the end ([decoding](../features/streams.md#decoding-without-playback)) | `Read(Span<float>)`, 0 at the end | ✅ |
@@ -93,7 +93,9 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_ChannelPlay at a precise time | `fa_stream_play_at` on the device clock (`fa_device_get_time`) ([crossfade](../features/crossfade.md#the-device-clock)) | `stream.PlayAt(output.Time + delay)` | ✅ |
 | BASS_ChannelPause / BASS_ChannelStop | `fa_stream_pause` / `fa_stream_stop` | `Pause()` / `Stop()` | ✅ |
 | BASS_ChannelIsActive | `fa_stream_get_state` | `stream.State` | ✅ |
-| BASS_ChannelGetInfo | `fa_stream_get_info` (the source's own format; unchanged by attaching) | `stream.Info` | ✅ |
+| BASS_ChannelGetInfo | `fa_stream_get_info` (the source's own format; unchanged by attaching), plus `bits_per_sample` (`origres`), `file_size`, `audio_bytes` and `bitrate` ([stream info](../features/streams.md#stream-info)) | `stream.Info` | ✅ |
+| BASS_ChannelGetAttribute `BASS_ATTRIB_BITRATE` | `fa_stream_info.bitrate` (average bits per second; also from `fa_tags_get_info` without opening a stream) | `Info.Bitrate`, `Tags.Bitrate` | ✅ |
+| BASS_ChannelGetLength + bitrate + file size for a media library (a decode stream per file just to read them) | `fa_tags_read_path`: tags, cover and properties in one call, no engine or stream ([tags](../features/tags.md)) | `Tags.Read(path)` | ✅ |
 | BASS_ChannelGetLength | `fa_stream_info.length_frames` or `.duration` (ns) | `stream.Info.Duration` | ✅ |
 | BASS_ChannelGetPosition / SetPosition | `fa_stream_get_position` / `fa_stream_seek` (frames); seek refills 100 ms before returning | `stream.Position` (TimeSpan) | ✅ |
 | BASS_ChannelGetPosition with BASS_POS_DECODE | Not needed: the position always counts what was played, never what was decoded ahead | — | ➖ (by design) |
@@ -118,7 +120,10 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_ChannelSetDSP (+Ex) / RemoveDSP | `fa_stream_add_dsp` / `fa_stream_remove_dsp` | | 🧩 |
 | BASS_ChannelGetLevel (+Ex) | `fa_stream_get_levels` | `GetLevels()` | 🧩 |
 | BASS_ChannelGetData (FFT) | Planned `fa_stream_get_spectrum` | | 🗓️ |
-| BASS_ChannelGetTags | Planned `fa_stream_get_tags` (one reader for all formats) | | 🗓️ |
+| BASS_ChannelGetTags | `fa_stream_get_tags` for an open stream, or `fa_tags_read_path`/`_memory` without one: one reader for every format, common fields with `fa_tags_get(tags, FA_TAG_ARTIST)`, every item with `fa_tags_get_item` ([tags](../features/tags.md)) | `stream.GetTags()`, `Tags.Read(path)`: `tags.Artist`, `tags.Title`, ... | ✅ |
+| BASS_ChannelGetTags `BASS_TAG_ID3` (ID3v1) / `BASS_TAG_ID3V2` / `BASS_TAG_APE` / `BASS_TAG_MP4` / `BASS_TAG_RIFF_INFO` | Parsed for you: no raw blocks to decode. Items keep their format's own keys (`TIT2`, `©nam`, `INAM`, ...) and `format` says which tag they came from; ID3v2 wins over APEv2 over ID3v1 for the common fields | `tags.Items` (`Key`, `Value`, `Format`), `tags["KEY"]` | ✅ |
+| BASS_ChannelGetTags `BASS_TAG_APE_BINARY` / ID3v2 `APIC` / MP4 `covr` (cover art) | `fa_tags_get_cover`, or every picture with `fa_tags_get_picture` (type, MIME, description, data) | `tags.Cover`, `tags.Pictures` | ✅ |
+| Tags add-on (tags.dll) `TAGS_Read(h, "%ARTI - %TITL")` | No format strings: build the text from `fa_tags_get` fields | String interpolation on `Tags` | ➖ (formatting is the app's) |
 | BASS_ChannelGetTags `BASS_TAG_META` (ICY StreamTitle) | `fa_stream_get_metadata`: the title heard now, split into artist and title ([song titles](../features/web-streams.md#song-titles-icy-metadata)) | `stream.Metadata` | ✅ |
 | BASS_ChannelGetTags `BASS_TAG_ICY` / `BASS_TAG_HTTP` | `fa_stream_get_metadata` (station, genre, bitrate, ...) or any header by name with `fa_stream_get_http_header` | `stream.Metadata`, `GetHttpHeader(name)` | ✅ |
 | BASS_ChannelGetTags `BASS_TAG_HLS_*` | `fa_stream_get_info` (container `hls`, codec) and `fa_stream_get_net_status` (`is_hls`, media playlist URL) | `Info`, `NetworkStatus` | ✅ |
@@ -161,7 +166,7 @@ BASS has no normalization: apps measure each file themselves with a decode pass 
 | Storing your analysis result and reapplying it next time | `fa_stream_set_loudness` (wins over everything); results cached automatically in `fa_engine_config.cache_directory` | `stream.SetLoudness(lufs)`, `AudioEngineOptions.CacheDirectory` | ✅ |
 | Analysing files ahead of playback (library import) | `fa_scan_loudness_path`: audio only, all cores, cached | `engine.ScanLoudness(path)` | ✅ |
 | `BASS_ATTRIB_VOLDSP` to boost above 1.0 | Normalization gain is separate from `FA_PARAM_VOLUME` and boosts up to +12 dB; volume stays free for fades | automatic | ✅ |
-| Reading ReplayGain tags yourself (`BASS_ChannelGetTags` + parsing) | Read automatically: ID3v2 `TXXX`, FLAC and Ogg Vorbis comments, OpusTags, APEv2; RG2 and R128 | automatic | ✅ |
+| Reading ReplayGain tags yourself (`BASS_ChannelGetTags` + parsing) | Read automatically: ID3v2 `TXXX` (also in WAV and AIFF), FLAC and Ogg Vorbis comments, OpusTags, APEv2, MP4 freeform atoms, ASF attributes; RG2 and R128. The raw values are also in `fa_tags_get_item` | automatic | ✅ |
 | BASSloud: `BASS_Loudness_Start` / `GetLevel` (integrated, range, true peak) | `fa_stream_get_loudness`, `fa_scan_loudness_path` (BS.1770-4 / R128) | `GetLoudness()`, `ScanLoudness()` | ✅ integrated, range, true peak; momentary/short-term meters 🗓️ |
 | bass_fx `BASS_FX_BFX_DAMP` (dynamic amplification) on live streams | Running loudness estimate drives the gain for streams that can't be scanned | automatic | ✅ |
 | bass_fx `BASS_FX_BFX_COMPRESSOR2` used to stop clipping | `fa_engine_set_limiter`: true-peak, look-ahead, on every device | `engine.SetLimiter(...)` | ✅ |
@@ -288,7 +293,7 @@ Opus and Vorbis are built-in formats: `.opus` and `.ogg` files, chained files, O
 | BASS_ChannelSetPosition on Opus and Vorbis | `fa_stream_seek`: lands on the frame asked for. Opus decodes 300 ms ahead of the target, so the audio after a seek matches a straight decode (bassopus: about 30 dB off in Ogg, 55 dB in WebM); Vorbis is bit exact. About a millisecond per seek ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | `stream.Position` | ✅ |
 | BASS_ATTRIB_OPUS_GAIN / the header's output gain | The header gain is applied; add your own with the stream volume | `stream.Volume` | ✅ |
 | BASS_ATTRIB_OPUS_ORIGFREQ (the encoder's input rate) | Not exposed: Opus always decodes at 48 kHz | — | ➖ |
-| BASS_ChannelGetTags(BASS_TAG_OGG) | ReplayGain / R128 comments are used for normalization automatically, and radio titles come through `fa_stream_get_metadata`; a general tag reader is planned | | 🗓️ |
+| BASS_ChannelGetTags(BASS_TAG_OGG) | `fa_stream_get_tags` / `fa_tags_read_path`: Vorbis comments of Ogg Vorbis, Opus and Ogg FLAC, including `METADATA_BLOCK_PICTURE` covers ([tags](../features/tags.md)); ReplayGain / R128 also feed normalization, and radio titles come through `fa_stream_get_metadata` | `GetTags()`, `Tags.Read` | ✅ |
 
 ### bassflac
 
@@ -303,8 +308,9 @@ FLAC is a built-in format wherever it appears: `.flac` files, Ogg FLAC, FLAC tra
 | FLAC in MP4 / Matroska (bassflac via basswebm or the MP4 demuxer) | Built in, no FFmpeg; `audio_track` picks the track | `StreamOptions.AudioTrack` | ✅ |
 | Raw FLAC frames (decoding packets from your own demuxer) | `fa_stream_open_packets` with codec `flac` and the 34-byte STREAMINFO as extradata (or none: then the rate, channels and `bits_per_coded_sample` are used) ([FFmpeg hand-off](../features/ffmpeg.md)) | `engine.OpenPackets`, `PushPacket` | ✅ |
 | BASS_PluginLoad("bassflac.dll") | Not needed: built in | — | ➖ (by design) |
-| BASS_ChannelGetTags(BASS_TAG_VENDOR / BASS_TAG_OGG on FLAC) | ReplayGain / R128 comments feed normalization automatically; a general tag reader is planned | | 🗓️ |
-| BASS_ChannelGetTags(BASS_TAG_FLAC_CUE / BASS_TAG_FLAC_PICTURE / BASS_TAG_FLAC_METADATA) | Planned with the general tag reader | | 🗓️ |
+| BASS_ChannelGetTags(BASS_TAG_VENDOR / BASS_TAG_OGG on FLAC) | `fa_tags_read_path` / `fa_stream_get_tags`: every Vorbis comment as an item (`FA_TAG_FORMAT_VORBIS`); the vendor string is not exposed, `FA_TAG_ENCODER` gives the `ENCODER` comment ([tags](../features/tags.md)) | `Tags.Items`, `Tags.Encoder` | ✅ |
+| BASS_ChannelGetTags(BASS_TAG_FLAC_PICTURE) | `fa_tags_get_picture` / `fa_tags_get_cover` (type, MIME, description, data) | `Tags.Pictures`, `Tags.Cover` | ✅ |
+| BASS_ChannelGetTags(BASS_TAG_FLAC_CUE / BASS_TAG_FLAC_METADATA) | Not exposed: embedded cue sheets and application blocks are rare in music libraries | — | ➖ |
 
 ### bassalac (Apple Lossless)
 
@@ -334,7 +340,7 @@ WMA plays through the ordinary open calls: a built-in ASF demuxer, decoded by Wi
 | `mms://` URLs, Windows Media Server HTTP streaming (WMSP), BASS_CONFIG_WMA_PREBUF, BASS_CONFIG_WMA_NETSEEK | Not supported | — | ➖ (the protocol and its servers are retired) |
 | `audio_track`-style stream choice in multi-stream / multiple-bitrate files | `fa_open_options.audio_track`, `fa_stream_info.audio_track_count` | `StreamOptions.AudioTrack`, `Info.AudioTrackCount` | ✅ |
 | BASS_TAG_WMA_CODEC (via BASS_ChannelGetTags) | `fa_stream_info.codec` (`wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`) | `Info.Codec` | ✅ |
-| BASS_TAG_WMA / BASS_WMA_GetTags (title, author, attributes) | ReplayGain and R128 attributes feed normalization; title and other tags are not exposed yet (no file tag API) | — | 🗓️ |
+| BASS_TAG_WMA / BASS_WMA_GetTags (title, author, attributes) | `fa_tags_read_path` / `fa_stream_get_tags`: Title, Author, Copyright, Description, Rating and every extended attribute (`WM/AlbumTitle`, ...) on every platform, plus `WM/Picture` covers ([tags](../features/tags.md)); ReplayGain and R128 attributes also feed normalization | `Tags.Read`, `GetTags()` | ✅ |
 | BASS_TAG_WMA_META, BASS_SYNC_WMA_META, BASS_SYNC_WMA_CHANGE (broadcast script commands and stream changes) | Not supported | — | ➖ (Windows Media broadcasts) |
 | BASS_WMA_GetWMObject | No Windows Media Format SDK reader is used | — | ➖ (by design) |
 | BASS_CONFIG_WMA_BASSFILE, BASS_CONFIG_WMA_ASYNC, BASS_CONFIG_WMA_VIDEO | Not needed: FatzAudio reads every file through its own reader, decodes on its worker threads, and never reads video | — | ➖ (by design) |
@@ -462,7 +468,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | bassopus.dll | Built-in: `.opus` files, Opus web radio, Opus in WebM/MKV/MP4, and raw packets through `fa_stream_open_packets` ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
 | basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM, MP3, AAC, AC-3, E-AC-3, Opus, Vorbis, FLAC and ALAC tracks built in, others unsupported ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ |
 | OGG Vorbis in bass.dll | Built-in: `.ogg` files, chained files, Ogg radio with song titles ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
-| basswma.dll | Built-in ASF demuxer (`.wma`, `.asf`, `.wmv` audio; files, memory, your own reader, HTTP), decoded by Media Foundation on Windows (unsupported elsewhere); ReplayGain attributes for normalization ([WMA](../features/streams.md#wma)) | ✅ playback; ➖ encoding (record to MP3, FLAC or WAV with `fa_encoder_*` instead), MMS, broadcasting and DRM |
+| basswma.dll | Built-in ASF demuxer (`.wma`, `.asf`, `.wmv` audio; files, memory, your own reader, HTTP), decoded by Media Foundation on Windows (unsupported elsewhere); ReplayGain attributes for normalization, tags and covers ([WMA](../features/streams.md#wma)) | ✅ playback; ➖ encoding (record to MP3, FLAC or WAV with `fa_encoder_*` instead), MMS, broadcasting and DRM |
 | bassenc.dll, bassenc_mp3.dll, bassenc_flac.dll (if added later) | Built in: `fa_encoder_*` writes WAV and FLAC itself and MP3 through the app's LAME ([recording and encoding](../features/recording-encoding.md)) | ✅ WAV/FLAC/MP3, 🗓️ Opus/AAC/casting |
 | bassmidi.dll | Built-in SoundFont 2 synthesizer for `.mid`, `.kar` and `.rmi`: engine-wide or per-stream soundfont, lyrics and text events, transpose and channel mute ([MIDI](../features/midi.md)) | ✅ (SF3, SFZ and MIDI input 🗓️) |
 | bass_fx.dll | Tempo/pitch/rate params on every stream ([tempo and pitch](../features/tempo-pitch.md)); reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | ✅ tempo/pitch/rate and level control, 🗓️ reverse and BPM |

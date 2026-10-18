@@ -143,13 +143,7 @@ public unsafe class AudioStream : IDisposable
     private StreamInfo ReadInfo()
     {
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_info(Handle, out FaStreamInfo n));
-        var format = AudioFormat.FromNative(n.Format);
-        TimeSpan? duration = n.Duration >= 0 ? TimeConvert.FromNanoseconds(n.Duration) : null;
-        return new StreamInfo(
-            format,
-            Marshal.PtrToStringUTF8((nint)n.Codec) ?? "",
-            Marshal.PtrToStringUTF8((nint)n.Container) ?? "",
-            duration, n.LengthFrames, n.Seekable != 0, n.AudioTrackCount, n.HasCdg != 0);
+        return StreamInfo.FromNative(n);
     }
 
     /// <summary>
@@ -505,6 +499,16 @@ public unsafe class AudioStream : IDisposable
     }
 
     // ---- MIDI -----------------------------------------------------------------
+
+    /// <summary>
+    /// The tags, cover art and properties of the file this stream plays (see <see cref="Tags"/>). Streams of app
+    /// callbacks, web streams and CD tracks give empty tags (web stream titles come from <see cref="Metadata"/>);
+    /// MIDI streams give the title, artist and copyright of <see cref="MidiInfo"/>.
+    /// </summary>
+    /// <param name="options">What to skip.</param>
+    /// <returns>The tags.</returns>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public Tags GetTags(TagReadOptions options = TagReadOptions.None) => Tags.FromStream(Handle, options);
 
     /// <summary>
     /// Title, format and text counts of a MIDI stream (Standard MIDI File, .kar or .rmi); null for streams that are not MIDI.

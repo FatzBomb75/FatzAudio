@@ -431,23 +431,23 @@ static void test_tags(void)
 {
     char path[512];
     fa_source src;
-    fa_asf_tags t;
     fa_tag_loudness l;
+    fa_tags* t = NULL;
+    fa_stream_info info;
     data_path(path, sizeof(path), "tone.wma");
+    CHECK_EQ(fa_tags_read_path(path, 0, &t), FA_OK);
+    CHECK_STR(fa_tags_get(t, FA_TAG_TITLE), "Test Tone");
+    CHECK_STR(fa_tags_get(t, FA_TAG_ARTIST), "FatzAudio");
+    CHECK_STR(fa_tags_get(t, FA_TAG_ALBUM), "");
+    CHECK(fa_tags_get_item_count(t) >= 3);
+    /* Properties: only where Media Foundation can open WMA. */
+    if (fa_tags_get_info(t, &info) == FA_OK) CHECK(info.bitrate > 0);
+    fa_tags_close(t);
     CHECK_EQ(fa_source_open_path(&src, path), FA_OK);
-    CHECK(fa_asf_read_tags(&src, &t));
-    CHECK_STR(t.title, "Test Tone");
-    CHECK_STR(t.artist, "FatzAudio");
-    CHECK_NEAR(t.loudness.track_lufs, -18.0 + 6.5, 1e-9);
-    CHECK_NEAR(t.loudness.track_peak_db, 20.0 * log10(0.5), 1e-9);
-    CHECK(t.loudness.album_lufs != t.loudness.album_lufs);     /* NAN: absent */
     fa_tags_read_loudness(&src, &l);
-    CHECK_NEAR(l.track_lufs, -11.5, 1e-9);
-    fa_source_close(&src);
-    /* Not ASF: 0, nothing found. */
-    data_path(path, sizeof(path), "../tone.mp3");
-    CHECK_EQ(fa_source_open_path(&src, path), FA_OK);
-    CHECK(!fa_asf_read_tags(&src, &t));
+    CHECK_NEAR(l.track_lufs, -18.0 + 6.5, 1e-9);
+    CHECK_NEAR(l.track_peak_db, 20.0 * log10(0.5), 1e-9);
+    CHECK(l.album_lufs != l.album_lufs);     /* NAN: absent */
     fa_source_close(&src);
 }
 

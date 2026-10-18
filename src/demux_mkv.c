@@ -87,6 +87,7 @@ typedef struct mkv {
     fa_track track;
     int64_t seg_start, seg_end;   /* segment data; end -1 = unknown */
     int64_t first_cluster;        /* -1 = none */
+    int all_tracks;               /* tracks of every type */
     uint64_t scale;               /* ns per timestamp unit */
     double duration;              /* Info Duration in timestamp units, < 0 = unknown */
     uint64_t track_num;
@@ -516,6 +517,7 @@ static fa_result parse_tracks(mkv* m, const uint8_t* p, size_t len, int32_t want
     while (mem_next(&cur, p + len, &te)) {
         if (te.id != ID_TRACKENTRY) continue;
         parse_entry(&te, &t);
+        if (t.number != 0) m->all_tracks++;
         if (t.type != 2 || t.number == 0) continue;
         if (n == want) { chosen = t; have = 1; }
         if (!have_first) { first = t; have_first = 1; }
@@ -912,6 +914,8 @@ static fa_result mkv_open(fa_decoder* dec)
     mkv* m = (mkv*)calloc(1, sizeof(mkv));
     uint32_t id;
     int64_t size, data, cues_pos = -1, tracks_pos = -1;
+    int64_t meta_pos[8];          /* SeekHead positions of Cues, Tags, Attachments, Chapters */
+    int nmeta = 0;
     int webm = 0, have_tracks = 0, have_cues = 0, count = 0;
     fa_track_params tp;
     uint8_t* body = NULL;
@@ -984,6 +988,8 @@ static fa_result mkv_open(fa_decoder* dec)
                     }
                     if (sid == ID_CUES) cues_pos = spos;
                     else if (sid == ID_TRACKS) tracks_pos = spos;
+                    if ((sid == ID_CUES || sid == ID_TAGS || sid == ID_ATTACHMENTS || sid == ID_CHAPTERS) && spos >= 0 && nmeta < 8)
+                        meta_pos[nmeta++] = spos;
                 }
             }
             free(body);
@@ -1041,6 +1047,16 @@ static fa_result mkv_open(fa_decoder* dec)
     if (r != FA_OK) goto fail;
     dec->impl = m;
     dec->seekable = src->seekable;
+    /* An audio-only file: the clusters are its audio (block headers are counted
+     * too, a fraction of a percent). Cues, Tags, Attachments (cover art) and
+     * Chapters the SeekHead places after the clusters are left out. */
+    if (m->all_tracks == 1 && m->first_cluster >= 0 && !src->remote) {
+        int64_t end = m->seg_end >= 0 ? m->seg_end : src->length;
+        int i;
+        for (i = 0; i < nmeta; i++)
+            if (meta_pos[i] > m->first_cluster && meta_pos[i] < end) end = meta_pos[i];
+        if (end > m->first_cluster) dec->audio_bytes = end - m->first_cluster;
+    }
     snprintf(dec->container, sizeof(dec->container), "%s", webm ? "webm" : "matroska");
     return FA_OK;
 fail:

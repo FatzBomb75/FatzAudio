@@ -414,6 +414,14 @@ static void test_karaoke(void)
     CHECK(strcmp(info.title, "My Song") == 0);
     CHECK(strcmp(info.artist, "The Singer") == 0);
     CHECK_EQ(info.lyric_count, 4);
+    {
+        /* The same through the tag reader. */
+        fa_tags* tags = NULL;
+        CHECK_EQ(fa_stream_get_tags(s, FA_TAGS_NO_PICTURES, &tags), FA_OK);
+        CHECK(strcmp(fa_tags_get(tags, FA_TAG_TITLE), "My Song") == 0);
+        CHECK(strcmp(fa_tags_get(tags, FA_TAG_ARTIST), "The Singer") == 0);
+        fa_tags_close(tags);
+    }
     for (i = 0; i < info.text_count; i++) {
         fa_stream_get_midi_text(s, i, &x);
         if (x.type != FA_MIDI_LYRIC) { CHECK(x.text[0] == '@' || x.type == FA_MIDI_TRACK_NAME); continue; }

@@ -97,6 +97,10 @@ static fa_result wav_open(fa_decoder* dec)
     dec->format.channels = channels;
     dec->seekable = dec->src->seekable;
     if (frames > 0) dec->length = (fa_frames)frames;
+    fa_drwav_props(dec->impl, &dec->bits_per_sample, &dec->audio_bytes);
+    /* PCM: exactly the samples (AIFF's SSND chunk also counts its offset fields). */
+    if (dec->bits_per_sample && dec->length > 0)
+        dec->audio_bytes = (int64_t)dec->length * channels * ((dec->bits_per_sample + 7) / 8);
     snprintf(dec->codec, sizeof(dec->codec), "pcm");
     snprintf(dec->container, sizeof(dec->container), "%s", n >= 4 && memcmp(head, "FORM", 4) == 0 ? "aiff" : "wav");
     return FA_OK;

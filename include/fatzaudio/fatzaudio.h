@@ -84,6 +84,7 @@ typedef struct fa_device fa_device;   /* an opened output device */
 typedef struct fa_stream fa_stream;   /* any playable/decodable source */
 typedef struct fa_bus fa_bus;         /* a mix bus (deck/group) */
 typedef struct fa_soundfont fa_soundfont; /* SoundFont 2 instruments for MIDI files */
+typedef struct fa_tags fa_tags;       /* the tags and pictures of a file */
 
 typedef enum fa_sample_format {
     FA_FORMAT_F32 = 0, /* interleaved float, the internal format */
@@ -655,6 +656,16 @@ typedef struct fa_stream_info {
     int32_t audio_track_count;
     int32_t has_cdg;             /* CD+G side stream present */
     fa_time duration;            /* length in nanoseconds, -1 if unknown */
+    int64_t file_size;           /* bytes of the file (of the ZIP for an MP3+G archive),
+                                    -1 if unknown (live web streams, app I/O without a size) */
+    int64_t audio_bytes;         /* bytes of this audio stream's coded data, without tags,
+                                    headers and other tracks; -1 if unknown. Exact for
+                                    WAV/AIFF/CD and MP4, close for MP3, AAC, AC-3, FLAC,
+                                    Ogg and single-track Matroska */
+    uint32_t bitrate;            /* average bits per second: audio_bytes over the duration,
+                                    else the codec's nominal rate; 0 if unknown */
+    uint32_t bits_per_sample;    /* PCM and lossless sources (WAV, AIFF, FLAC, ALAC, CD):
+                                    16, 24, ...; 0 for lossy codecs */
 } fa_stream_info;
 
 FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* out_info);
@@ -664,6 +675,130 @@ FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* o
  * default). Streams of other formats accept and ignore it. */
 FA_API fa_result FA_CALL fa_stream_set_dynamic_range(fa_stream* stream, fa_dynamic_range mode);
 FA_API fa_result FA_CALL fa_stream_get_dynamic_range(fa_stream* stream, fa_dynamic_range* out_mode);
+
+/* ---- Tags and cover art ------------------------------------------------
+ *
+ * Title, artist, album and the rest, plus embedded pictures, from every tag
+ * format the library meets: ID3v2.2/2.3/2.4 and ID3v1 (MP3, AAC, AC-3, WAV,
+ * AIFF), APEv2, Vorbis comments (FLAC, Ogg Vorbis, Opus, Ogg FLAC), MP4/M4A
+ * (iTunes atoms), ASF (WMA), RIFF INFO (WAV), AIFF text chunks and Matroska/WebM
+ * tags and attachments. A ZIP (MP3+G) is read through the audio file inside it.
+ *
+ * Reading needs no engine: a media library gets the tags, the cover and the
+ * file's properties (duration, bitrate, channels, ...) in one call.
+ * FA_TAGS_NO_PICTURES skips the picture data without reading it, and
+ * FA_TAGS_NO_INFO skips the properties (no decoder is opened). A tag
+ * object is immutable: every string and picture it hands out stays valid until
+ * fa_tags_close, and it may be read from any thread.
+ *
+ * Web streams have no file tags: their titles come from fa_stream_get_metadata.
+ * MIDI streams return the title, artist and copyright of fa_stream_get_midi_info. */
+
+typedef enum fa_tag_field {
+    FA_TAG_TITLE = 0,
+    FA_TAG_ARTIST,
+    FA_TAG_ALBUM,
+    FA_TAG_ALBUM_ARTIST,
+    FA_TAG_COMPOSER,
+    FA_TAG_GENRE,          /* ID3 and MP4 genre numbers are turned into names */
+    FA_TAG_DATE,           /* as written: "2024", "2024-05-17", ... */
+    FA_TAG_TRACK,          /* "3" (a "3/12" in the file is split into TRACK and TRACK_TOTAL) */
+    FA_TAG_TRACK_TOTAL,
+    FA_TAG_DISC,
+    FA_TAG_DISC_TOTAL,
+    FA_TAG_COMMENT,
+    FA_TAG_LYRICS,         /* unsynchronised lyrics */
+    FA_TAG_COPYRIGHT,
+    FA_TAG_ENCODER,        /* the software that made the file */
+    FA_TAG_BPM,
+    FA_TAG_FIELD_COUNT
+} fa_tag_field;
+
+/* Where an item or picture was found. */
+typedef enum fa_tag_format {
+    FA_TAG_FORMAT_ID3V2 = 1,
+    FA_TAG_FORMAT_ID3V1,
+    FA_TAG_FORMAT_APE,
+    FA_TAG_FORMAT_VORBIS,    /* Vorbis comments, FLAC pictures */
+    FA_TAG_FORMAT_MP4,
+    FA_TAG_FORMAT_ASF,
+    FA_TAG_FORMAT_RIFF,      /* WAV LIST/INFO */
+    FA_TAG_FORMAT_AIFF,      /* NAME, AUTH, (c), ANNO */
+    FA_TAG_FORMAT_MATROSKA,
+    FA_TAG_FORMAT_MIDI
+} fa_tag_format;
+
+typedef enum fa_tags_flags {
+    FA_TAGS_NO_PICTURES = 1 << 0,    /* skip picture data (faster for library scans) */
+    FA_TAGS_NO_INFO = 1 << 1         /* skip the properties (fa_tags_get_info): no decoder
+                                        is opened, only the tags are read */
+} fa_tags_flags;
+
+/* One tag item exactly as the file stores it. `key` is the format's own name:
+ * an ID3v2 frame ID ("TIT2"; user-defined TXXX items use their description,
+ * e.g. "REPLAYGAIN_TRACK_GAIN"), a Vorbis/APE key ("ARTIST"), an MP4 atom
+ * ("\xC2\xA9nam" = "©nam"; freeform "----" atoms use their name), an ASF
+ * attribute ("WM/AlbumTitle"), a RIFF/AIFF chunk ID ("INAM") or a Matroska tag
+ * name ("TITLE", "ALBUM/TITLE" for album-level tags). Text is UTF-8; numbers
+ * (track numbers, BPM) are written as text. A list of values is joined with "; ". */
+typedef struct fa_tag_item {
+    const char* key;
+    const char* value;
+    int32_t format;          /* fa_tag_format */
+} fa_tag_item;
+
+/* Picture types: the ID3v2 / FLAC numbering (0..20), which MP4 and Matroska
+ * covers are mapped to. */
+typedef enum fa_picture_type {
+    FA_PICTURE_OTHER = 0,
+    FA_PICTURE_FILE_ICON = 1,
+    FA_PICTURE_FRONT_COVER = 3,
+    FA_PICTURE_BACK_COVER = 4,
+    FA_PICTURE_LEAFLET = 5,
+    FA_PICTURE_MEDIA = 6,
+    FA_PICTURE_ARTIST = 8
+} fa_picture_type;
+
+typedef struct fa_tag_picture {
+    int32_t type;            /* fa_picture_type (any ID3v2 value 0..20) */
+    const char* mime;        /* "image/jpeg", "image/png", ...; "" when not stated
+                                nor recognisable from the data */
+    const char* description; /* UTF-8, "" if none */
+    const void* data;        /* the encoded image, as stored */
+    size_t size;
+    int32_t format;          /* fa_tag_format */
+} fa_tag_picture;
+
+/* Reads the tags of a file (UTF-8 path) or of a file in memory (not copied:
+ * `data` is only used during the call). A file without tags, or of a format
+ * with none, gives an empty tag object and FA_OK. FA_ERROR_NOT_FOUND when the
+ * file is missing. Flags: fa_tags_flags. */
+FA_API fa_result FA_CALL fa_tags_read_path(const char* path, uint32_t flags, fa_tags** out_tags);
+FA_API fa_result FA_CALL fa_tags_read_memory(const void* data, size_t size, uint32_t flags, fa_tags** out_tags);
+/* The tags of the file a stream plays (opened from a path or memory). Streams
+ * of the app's I/O callbacks, web streams and CD tracks give empty tags. */
+FA_API fa_result FA_CALL fa_stream_get_tags(fa_stream* stream, uint32_t flags, fa_tags** out_tags);
+FA_API void FA_CALL fa_tags_close(fa_tags* tags);
+
+/* A common field, whichever format it came from: UTF-8, "" when absent (never
+ * NULL). With several tag formats in one file the richest wins: ID3v2 before
+ * APEv2 before ID3v1; in WAV and AIFF, ID3v2 before the native chunks. */
+FA_API const char* FA_CALL fa_tags_get(const fa_tags* tags, fa_tag_field field);
+/* Every item in file order, index 0 .. count - 1 (FA_ERROR_NOT_FOUND past it). */
+FA_API uint32_t FA_CALL fa_tags_get_item_count(const fa_tags* tags);
+FA_API fa_result FA_CALL fa_tags_get_item(const fa_tags* tags, uint32_t index, fa_tag_item* out_item);
+/* Embedded pictures in file order (none with FA_TAGS_NO_PICTURES). */
+FA_API uint32_t FA_CALL fa_tags_get_picture_count(const fa_tags* tags);
+FA_API fa_result FA_CALL fa_tags_get_picture(const fa_tags* tags, uint32_t index, fa_tag_picture* out_picture);
+/* The front cover, else the first picture: FA_ERROR_NOT_FOUND when there is none. */
+FA_API fa_result FA_CALL fa_tags_get_cover(const fa_tags* tags, fa_tag_picture* out_picture);
+/* The file's properties: codec, container, channels, sample rate, duration,
+ * bitrate, file and audio size, bits per sample, has_cdg (a .cdg next to the file
+ * or in its ZIP), as fa_stream_get_info gives them for a stream of the file.
+ * FA_ERROR_NOT_FOUND when they were not read (FA_TAGS_NO_INFO, or no decoder
+ * recognised the file: MIDI files need a soundfont, so give a MIDI stream's tags
+ * with fa_stream_get_tags). */
+FA_API fa_result FA_CALL fa_tags_get_info(const fa_tags* tags, fa_stream_info* out_info);
 
 /* ---- Transport and position -------------------------------------------- */
 

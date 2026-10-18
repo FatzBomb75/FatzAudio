@@ -527,6 +527,11 @@ fa_result fa_track_open(fa_track* t, fa_decoder* dec, const fa_demux_ops* ops, v
     }
     snprintf(dec->codec, sizeof(dec->codec), "%s", p->codec.codec);
     dec->length = t->length;
+    if (p->codec.bit_rate > 0 && p->codec.bit_rate < 0xFFFFFFFF) dec->bitrate = (uint32_t)p->codec.bit_rate;
+    /* Bit depth only means something for PCM and lossless codecs. */
+    if (strncmp(dec->codec, "pcm", 3) == 0 || strcmp(dec->codec, "flac") == 0 || strcmp(dec->codec, "alac") == 0 ||
+        strcmp(dec->codec, "wmalossless") == 0)
+        dec->bits_per_sample = p->codec.bits_per_coded_sample;
     return FA_OK;
 }
 

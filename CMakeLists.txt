@@ -50,6 +50,7 @@ set(FA_SOURCES
     src/event.c
     src/loudness.c
     src/tags.c
+    src/tags_read.c
     src/scan.c
     src/normalize.c
     src/limiter.c

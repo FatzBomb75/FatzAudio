@@ -164,6 +164,13 @@ using var fromStream = engine.OpenStream(File.OpenRead("track.wav"));
 | `length_frames` | Length in frames, -1 if unknown (live streams) |
 | `duration` | Length in nanoseconds, -1 if unknown. In .NET, `Info.Duration` (null if unknown) |
 | `seekable` | 0 for forward-only sources |
+| `has_cdg` | A CD+G graphics stream is present (a `.cdg` next to the file, in its ZIP, or on the disc) |
+| `file_size` | Bytes of the file (of the ZIP for an MP3+G archive), -1 if unknown (live web streams, custom I/O without a `length` callback). .NET: `Info.FileSize` (null if unknown) |
+| `audio_bytes` | Bytes of this audio stream's coded data, without tags, headers or other tracks; -1 if unknown. Exact for WAV, AIFF, CD and MP4; close for MP3, AAC, AC-3, E-AC-3, FLAC, Ogg and single-track Matroska/WebM. .NET: `Info.AudioBytes` |
+| `bitrate` | Average bits per second: `audio_bytes` over the duration, else the codec's nominal rate; 0 if unknown. For a VBR MP3 it includes the small Xing/LAME header frame |
+| `bits_per_sample` | 16, 24, ... for PCM and lossless sources (WAV, AIFF, FLAC, ALAC, WMA Lossless, CD); 0 for lossy codecs |
+
+The same properties come without opening a stream, together with the tags, from `fa_tags_read_path` (see [tags.md](tags.md)).
 
 ## Attaching to a device
 

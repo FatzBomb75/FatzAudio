@@ -524,7 +524,7 @@ static void comment_title(const uint8_t* p, size_t n, char* out, size_t cap)
  * then collects its header packets. *out_audio = the group's audio stream count.
  * A later link with fewer audio streams plays its first one; the first link
  * returns FA_ERROR_NOT_FOUND then. */
-static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_tag_loudness* tags)
+static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_tag_sink* tags)
 {
     oggs_page pg;
     uint8_t* hdr[3] = { NULL, NULL, NULL };
@@ -1025,6 +1025,11 @@ static fa_result ogg_open(fa_decoder* dec)
     dec->impl = o;
     /* A chained web file is played through; its links are not known up front. */
     dec->seekable = dec->src->seekable && o->enumerated;
+    /* Everything after the first link's headers is audio (and the headers of later
+     * links), unless other streams (video, Skeleton) are multiplexed in. */
+    if (o->ngroup == 1 && dec->src->length > 0 && !dec->src->remote && o->links[0]->data > 0 &&
+        o->links[0]->data < dec->src->length)
+        dec->audio_bytes = dec->src->length - o->links[0]->data;
     snprintf(dec->container, sizeof(dec->container), "ogg");
     return FA_OK;
 fail:
@@ -1067,7 +1072,7 @@ const fa_decoder_vtable fa_decoder_ogg = {
 
 /* ---- loudness tags --------------------------------------------------------------------------- */
 
-void fa_ogg_read_loudness(fa_source* src, fa_tag_loudness* out)
+void fa_ogg_read_tags(fa_source* src, fa_tag_sink* out)
 {
     ogg* o;
     oggs_link* l;

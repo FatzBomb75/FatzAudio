@@ -825,6 +825,13 @@ static fa_result mp4_open(fa_decoder* dec)
     if (r != FA_OK) goto fail;
     dec->impl = m;
     dec->seekable = src->seekable && !m->lazy;
+    if (!m->lazy) {
+        /* The track's own samples: exact even with video and other tracks in the file. */
+        size_t i;
+        int64_t total = 0;
+        for (i = 0; i < m->npk; i++) total += m->pk[i].size;
+        dec->audio_bytes = total;
+    }
     snprintf(dec->container, sizeof(dec->container), "%s", qt ? "mov" : "mp4");
     return FA_OK;
 fail:
