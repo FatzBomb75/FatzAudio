@@ -73,6 +73,8 @@ set(FA_SOURCES
     src/dec_midi.c
     src/dec_tracker.c
     src/dls.c
+    src/sf3.c
+    src/midi_fx.c
     src/tinysoundfont_impl.c
     src/mdct.c
     src/push.c

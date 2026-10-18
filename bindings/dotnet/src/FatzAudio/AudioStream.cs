@@ -821,6 +821,23 @@ public unsafe class AudioStream : IDisposable
     }
 
     /// <summary>
+    /// MIDI streams: reverb and chorus, on by default. How much of each channel goes to them follows the file's
+    /// CC91 (reverb, 40 until the file sets it) and CC93 (chorus, 0) and the soundfont's effect sends. False plays the
+    /// dry synthesizer, like <c>BASS_MIDI_NOFX</c>; the tails stop at once. Heard after the decode-ahead buffer.
+    /// </summary>
+    /// <exception cref="FatzAudioException">The stream is not MIDI (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public bool MidiEffects
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_midi_effects(Handle, out int v));
+            return v != 0;
+        }
+        set => FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_midi_effects(Handle, value ? 1 : 0));
+    }
+
+    /// <summary>
     /// Mutes or unmutes a MIDI channel (0..15, MIDI channel 1..16): it goes silent at once and stays silent until
     /// unmuted, for example to turn a karaoke file's guide melody off. Master volume is <see cref="Volume"/> and the
     /// tempo is <see cref="Tempo"/>, as for every stream.

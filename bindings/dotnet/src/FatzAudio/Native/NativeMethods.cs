@@ -394,6 +394,12 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_midi_channel_mute(StreamHandle stream, uint channel, out int muted);
 
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_midi_effects(StreamHandle stream, int enabled);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_midi_effects(StreamHandle stream, out int enabled);
+
     // ---- Events ------------------------------------------------------------
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_set_event_callback(StreamHandle stream, delegate* unmanaged[Cdecl]<FaEvent*, void*, void> callback, void* user);

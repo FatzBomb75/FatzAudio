@@ -7,17 +7,18 @@ FatzAudio plays MIDI files itself, with a built-in SoundFont 2 synthesizer. They
 | Standard MIDI Files (`.mid`, `.midi`, `.smf`) | Format 0, 1 and 2, tempo maps, SMPTE time division, running status |
 | Karaoke (`.kar`) | Lyrics from the "Words" track, `@T` title and artist lines, line and paragraph marks |
 | RIFF MIDI (`.rmi`) | The Standard MIDI File inside it |
-| Instruments | A SoundFont 2 (`.sf2`) or DLS (`.dls`) bank you load, else the one the OS ships (Windows `gm.dls`, macOS `gs_instruments.dls`, a Linux GM `.sf2` package): General MIDI; GS/XG variation banks through bank select (falling back to bank 0 when the soundfont lacks them); drums on channel 10 and on the parts GS, XG and GM2 files make drum parts |
+| Instruments | A SoundFont 2 (`.sf2`, also SF3 with compressed samples) or DLS (`.dls`) bank you load, else the one the OS ships (Windows `gm.dls`, macOS `gs_instruments.dls`, a Linux GM `.sf2` package): General MIDI; GS/XG variation banks through bank select (falling back to bank 0 when the soundfont lacks them); drums on channel 10 and on the parts GS, XG and GM2 files make drum parts |
 | SysEx | GM, GM2, GS and XG resets, GS rhythm parts, XG drum parts and drum banks (127, and 120 in GM2), master volume and master tuning ([below](#sysex)) |
 | Lyrics and other text | Lyric, text, marker, cue, track and instrument name, copyright: listed and raised as events |
 | Tempo and signatures | Tempo changes, time and key signatures, listed with their numbers |
+| Effects | Reverb and chorus, on by default: the soundfont's effect sends plus CC91 and CC93 ([below](#reverb-and-chorus)) |
 | Live controls | Transpose (the synthesizer plays the new notes), channel mute, plus every stream parameter (volume, tempo, pitch) |
 
 Files are detected from their content (`MThd`, or `RIFF....RMID`), never from the extension. `fa_stream_get_info` reports codec `midi`, container `smf` or `rmid`, and stereo F32 audio at the engine's `mix_sample_rate`, or 44100 Hz when that is 0 (device native).
 
 ## Soundfonts
 
-No instruments are built in: you load a bank once and share it. A General MIDI SoundFont 2 such as GeneralUser GS or FluidR3_GM covers almost every file, and DLS banks (`.dls`, Level 1 and 2) load the same way. Set it on the engine and every MIDI stream opened from then on uses it, or give one stream its own in `fa_open_options.soundfont`.
+No instruments are built in: you load a bank once and share it. A General MIDI SoundFont 2 such as GeneralUser GS or FluidR3_GM covers almost every file, and DLS banks (`.dls`, Level 1 and 2) load the same way. So do SF3 files, SoundFont 2 files with Ogg Vorbis compressed samples (the format MuseScore ships): the samples are decoded at load by the library's own Vorbis decoder, so a loaded SF3 takes as much memory as the same bank as `.sf2` (many times the size of the `.sf3` file). A sample that fails to decode plays as silence instead of failing the whole bank. SFZ is not supported. Set it on the engine and every MIDI stream opened from then on uses it, or give one stream its own in `fa_open_options.soundfont`.
 
 ### The OS's instruments
 
@@ -189,6 +190,27 @@ song.MidiTranspose = -2;
 song.SetMidiChannelMuted(3, true);
 ```
 
+## Reverb and chorus
+
+Reverb and chorus are built in and on by default, as in BASSMIDI. Each voice sends part of its sound to them: the soundfont's own effect-send setting for that sound, plus the channel's CC91 (reverb) and CC93 (chorus) controllers, as the SoundFont 2.04 default modulators say (a controller value of 127 adds 20%, and the total is at most 100%). Channels start at CC91 = 40 and CC93 = 0, the GS and GM2 defaults, also after a GM, GS or XG reset; CC121 (reset all controllers) leaves them alone. A file that sets CC91 or CC93 therefore changes its own reverb and chorus. The master volume SysEx scales the effects too.
+
+The reverb is a Schroeder-Moorer design of comb and allpass filters that dies away in about 1.3 seconds (to -60 dB). The chorus is two delay taps per channel, modulated at 0.4 Hz between 10 and 16 ms. Both are fixed: their type and level are not adjustable ([SysEx](#sysex)).
+
+`fa_stream_set_midi_effects` (`MidiEffects`) turns both off for a stream, which plays the dry synthesizer (BASSMIDI's `BASS_MIDI_NOFX`); the tails stop at once. It may be called from any thread.
+
+```c
+fa_stream_set_midi_effects(song, 0);             /* dry, no reverb or chorus */
+int32_t on = 1;
+fa_stream_get_midi_effects(song, &on);           /* on again: 1 */
+```
+
+```csharp
+song.MidiEffects = false;                        // dry
+bool wet = song.MidiEffects;
+```
+
+A channel mute silences the channel's dry sound at once, but reverb it has already sent keeps ringing out. The output is deterministic and does not depend on the read size.
+
 ## SysEx
 
 The SysEx messages that change how a file sounds are applied; the rest are ignored. Checksums aren't checked, and any device number is accepted.
@@ -206,7 +228,7 @@ Without a reset, channel 10 is the drum channel and bank 127 is an ordinary (GS 
 
 ## Seeking and length
 
-Seeking is sample-exact and fast: the events up to the target are replayed into a fresh synthesizer without rendering any audio, so programs, controllers, pitch bends, SysEx settings and the tempo are exactly as if the song had played up to there. Notes held across the target, by their key or by the sustain pedal, start again from their attack (as in BASSMIDI), so a chord or pad held across a seek is heard right away. A key struck several times and still held comes back as one note, at the loudest of those strikes, and ends with the last of their note-offs. Drum notes aren't restarted, since they'd sound as a new hit. Where no note is held, the audio after a seek is exactly what playing through gives.
+Seeking is sample-exact and fast: the events up to the target are replayed into a fresh synthesizer without rendering any audio, so programs, controllers, pitch bends, SysEx settings and the tempo are exactly as if the song had played up to there. Notes held across the target, by their key or by the sustain pedal, start again from their attack (as in BASSMIDI), so a chord or pad held across a seek is heard right away. A key struck several times and still held comes back as one note, at the loudest of those strikes, and ends with the last of their note-offs. Drum notes aren't restarted, since they'd sound as a new hit. A seek also clears the reverb and chorus tails. Where no note is held, the audio after a seek is therefore what playing through gives once the reverb of the notes before the target would have died away, or exactly that with effects off.
 
 The length is the time of the last event plus one second, so the final notes ring out. Audio from a given position is the same whatever the read size or the seeks before it, so loudness scans are cached like those of any other file (the cache key includes the soundfont and the sample rate).
 
@@ -221,6 +243,6 @@ Rendering runs on the engine's worker threads like decoding of any other format.
 - Damaged files play what can be read: a track cut short plays up to the cut. A file with no usable track fails with `FA_ERROR_UNSUPPORTED_FORMAT`.
 - DLS banks play their regions, samples, loops, envelopes, LFOs, filter and gains. Articulation scaled by a controller (other than the default mod wheel vibrato) and DLS 2 conditional chunks are ignored.
 - Each instrument's level (`initialAttenuation`) is applied as the SoundFont 2 spec states it, 0.1 dB per unit. FluidSynth applies 0.4 of that (an EMU hardware habit), so a bank tuned by ear in FluidSynth can sound with a wider gap between its quiet and loud instruments here.
-- SF3 (compressed samples) and SFZ soundfonts, MIDI input from devices, and per-channel effects (reverb and chorus send levels) aren't supported yet. See the [engineering notes](../engineering-notes.md).
+- SFZ soundfonts and MIDI input from devices aren't supported yet. See the [engineering notes](../engineering-notes.md).
 - Shift-JIS lyrics (Japanese files) are read as Windows-1252 and come out garbled.
-- SysEx other than the messages listed [above](#sysex) is ignored: GS and XG effect settings, insertion effects, scale tuning and drum setup (per-note drum edits) have no effect.
+- SysEx other than the messages listed [above](#sysex) is ignored: GS and XG effect settings (reverb and chorus type and level, so the reverb and chorus stay the one built-in design), insertion effects, scale tuning and drum setup (per-note drum edits) have no effect.

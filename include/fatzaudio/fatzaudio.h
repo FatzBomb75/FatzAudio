@@ -1458,8 +1458,13 @@ FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_ti
  * rendering audio. Programs, controllers, pitch bends and SysEx settings are
  * restored, and notes held across the target (by their key or the sustain pedal)
  * start again from their attack, so a held chord is heard after a seek into it
- * (drum notes are not restarted). Where no note is held, what follows a seek is
- * exactly what playing through gives.
+ * (drum notes are not restarted). A seek clears the reverb and chorus tails, so
+ * where no note is held and the reverb of earlier notes has died away (or with
+ * fa_stream_set_midi_effects off), what follows a seek is exactly what playing
+ * through gives.
+ *
+ * Reverb and chorus are built in and on: each channel's CC91 / CC93 and the
+ * soundfont's effect sends set how much of it goes to them (fa_stream_set_midi_effects).
  *
  * SysEx: GM, GM2, GS and XG resets; GS "use for rhythm part" and XG part mode set
  * drum channels other than channel 10; bank select MSB 127 (XG) and 120 (GM2)
@@ -1469,10 +1474,11 @@ FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_ti
  * ring out. Lyrics and other text events are listed by fa_stream_get_midi_text and
  * raised as FA_EVENT_MIDI_TEXT when they are heard. */
 
-/* A SoundFont 2 (.sf2) or DLS (.dls, Level 1 and 2) bank from a UTF-8 path, or from
- * memory (copied). FA_ERROR_NOT_FOUND when the file is missing,
- * FA_ERROR_UNSUPPORTED_FORMAT when it is not a usable bank (SF3 and SFZ are not
- * supported yet). */
+/* A SoundFont 2 (.sf2), SF3 (.sf3, SoundFont 2 with Ogg Vorbis samples, decoded
+ * at load) or DLS (.dls, Level 1 and 2) bank from a UTF-8 path, or from memory
+ * (copied). FA_ERROR_NOT_FOUND when the file is missing,
+ * FA_ERROR_UNSUPPORTED_FORMAT when it is not a usable bank (SFZ is not
+ * supported). */
 FA_API fa_result FA_CALL fa_soundfont_open_path(const char* path, fa_soundfont** out_font);
 FA_API fa_result FA_CALL fa_soundfont_open_memory(const void* data, size_t size, fa_soundfont** out_font);
 /* The instruments the operating system ships: %SystemRoot%\System32\drivers\gm.dls
@@ -1582,6 +1588,12 @@ FA_API fa_result FA_CALL fa_stream_set_midi_transpose(fa_stream* stream, int32_t
 FA_API fa_result FA_CALL fa_stream_get_midi_transpose(fa_stream* stream, int32_t* out_semitones);
 FA_API fa_result FA_CALL fa_stream_set_midi_channel_mute(fa_stream* stream, uint32_t channel, int32_t muted);
 FA_API fa_result FA_CALL fa_stream_get_midi_channel_mute(fa_stream* stream, uint32_t channel, int32_t* out_muted);
+/* Reverb and chorus: on by default, following each channel's CC91 / CC93 (reverb
+ * 40 and chorus 0 until the file sets them) and the soundfont's effect sends.
+ * Off plays the dry synth (BASS_MIDI_NOFX); the tails stop at once. Live, like
+ * the controls above. */
+FA_API fa_result FA_CALL fa_stream_set_midi_effects(fa_stream* stream, int32_t enabled);
+FA_API fa_result FA_CALL fa_stream_get_midi_effects(fa_stream* stream, int32_t* out_enabled);
 
 /* ---- Tracker modules ------------------------------------------------------
  *

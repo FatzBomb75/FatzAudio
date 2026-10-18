@@ -20,7 +20,13 @@
  * drum banks (bank select MSB 127 and 120), master volume (universal, GS, XG)
  * and master fine and coarse tuning. Other SysEx is ignored.
  *
- * Live controls (transpose, channel mute) are atomics the decode thread reads at
+ * Reverb and chorus (src/midi_fx.c) are fed by each voice's send levels: CC91
+ * and CC93 (40 and 0 after a reset, as on GS and GM2 devices) and the
+ * soundfont's effect-send generators. They are on unless the app turns them off.
+ * A seek clears their tails: what is heard after a seek equals reading through
+ * once the reverb of the notes before the target would have died away.
+ *
+ * Live controls (transpose, channel mute, effects) are atomics the decode thread reads at
  * the start of each block. */
 #include "fa_internal.h"
 #include "tsf.h"
@@ -110,6 +116,17 @@ static fa_result soundfont_from_memory(const uint8_t* data, size_t size, fa_soun
     }
     if (size < 12 || size > FA_MIDI_MAX_SOUNDFONT || memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "sfbk", 4) != 0)
         return FA_ERROR_UNSUPPORTED_FORMAT;
+    if (fa_sf3_probe(data, size)) {
+        /* SF3 (Ogg Vorbis samples, MuseScore's banks): as SoundFont 2. */
+        uint8_t* sf2 = NULL;
+        size_t sf2_size = 0;
+        fa_result r = fa_sf3_to_sf2(data, size, &sf2, &sf2_size);
+        if (r != FA_OK) return r;
+        r = sf2_size <= FA_MIDI_MAX_SOUNDFONT && !fa_sf3_probe(sf2, sf2_size) ? soundfont_from_memory(sf2, sf2_size, out)
+                                                                              : FA_ERROR_UNSUPPORTED_FORMAT;
+        free(sf2);
+        return r;
+    }
     f = (fa_soundfont*)calloc(1, sizeof(*f));
     if (!f) return FA_ERROR_OUT_OF_MEMORY;
     if (fa_mutex_init(&f->lock) != 0) { free(f); return FA_ERROR_GENERIC; }
@@ -405,6 +422,9 @@ struct fa_midi {
 
     /* Rendering: blk holds frames [rpos - blk_len, rpos); blk_off of them were read. */
     float blk[FA_MIDI_BLOCK * 2];
+    float rev[FA_MIDI_BLOCK * 2], cho[FA_MIDI_BLOCK * 2];   /* the block's reverb and chorus sends */
+    fa_midi_fx* fx;
+    int effects_now;            /* as applied by the decode thread */
     int blk_len, blk_off;
     fa_frames rpos;
 
@@ -438,6 +458,7 @@ struct fa_midi {
 
     fa_atomic32 transpose;      /* set by the API */
     fa_atomic32 mute;           /* bit n = channel n */
+    fa_atomic32 effects;        /* reverb and chorus on (1, the default) or off */
 };
 
 struct fa_midi* fa_midi_of(fa_decoder* dec)
@@ -538,6 +559,8 @@ static void reset_channels(struct fa_midi* m, int mode, fa_frames frame)
         tsf_channel_midi_control(m->synth, ch, TML_VOLUME_MSB, 100);
         tsf_channel_set_sustain(m->synth, ch, 0);
         tsf_channel_set_pitchwheel(m->synth, ch, 8192);
+        tsf_channel_midi_control(m->synth, ch, 91, 40);   /* reverb send: the GM2 / GS default */
+        tsf_channel_midi_control(m->synth, ch, 93, 0);
         sync_bank(m, ch);
         m->pedal[ch] = 0;
         select_program(m, ch);
@@ -659,7 +682,7 @@ static void apply_event(struct fa_midi* m, const midi_event* e, int silent)
 static void take_controls(struct fa_midi* m)
 {
     uint32_t mute = (uint32_t)fa_load32(&m->mute);
-    int ch;
+    int ch, effects;
     m->transpose_now = fa_load32(&m->transpose);
     for (ch = 0; ch < 16; ch++) {
         if (!((mute & ~m->mute_now) >> ch & 1)) continue;
@@ -667,6 +690,9 @@ static void take_controls(struct fa_midi* m)
         forget_channel(m, ch);
     }
     m->mute_now = mute;
+    effects = fa_load32(&m->effects);
+    if (m->effects_now && !effects) fa_midi_fx_reset(m->fx);   /* off: the tails stop too */
+    m->effects_now = effects;
 }
 
 /* Renders the block starting at rpos (a multiple of FA_MIDI_BLOCK). */
@@ -674,21 +700,33 @@ static void render_block(struct fa_midi* m)
 {
     fa_frames start = m->rpos, n = m->length - start, done = 0;
     if (n > FA_MIDI_BLOCK) n = FA_MIDI_BLOCK;
+    fa_frames i;
     take_controls(m);
+    if (m->effects_now) {
+        memset(m->rev, 0, sizeof(m->rev));
+        memset(m->cho, 0, sizeof(m->cho));
+    }
     while (done < n) {
-        fa_frames upto = n, i;
+        fa_frames upto = n;
         while (m->next < m->nev && m->ev[m->next].frame <= start + done) apply_event(m, &m->ev[m->next++], 0);
         if (m->next < m->nev && m->ev[m->next].frame < start + n) upto = m->ev[m->next].frame - start;
-        tsf_render_float(m->synth, m->blk + done * 2, (int)(upto - done), 0);
-        for (i = done; i < upto && start + i < m->gain_at + FA_MIDI_GAIN_RAMP; i++) {   /* the ramp */
-            float g = gain_at(m, start + i);
-            m->blk[i * 2] *= g;
-            m->blk[i * 2 + 1] *= g;
-        }
-        if (m->gain_to != 1.0f)
-            for (; i < upto; i++) { m->blk[i * 2] *= m->gain_to; m->blk[i * 2 + 1] *= m->gain_to; }
+        if (m->effects_now)
+            tsf_render_float_fx(m->synth, m->blk + done * 2, m->rev + done * 2, m->cho + done * 2, (int)(upto - done), 0);
+        else
+            tsf_render_float(m->synth, m->blk + done * 2, (int)(upto - done), 0);
         done = upto;
     }
+    /* The effects run on the whole block, so their output does not depend on
+     * where events split it; master volume is applied after them, to the wet
+     * sound too. */
+    if (m->effects_now) fa_midi_fx_process(m->fx, m->rev, m->cho, m->blk, (int)n, start);
+    for (i = 0; i < n && start + i < m->gain_at + FA_MIDI_GAIN_RAMP; i++) {   /* the ramp */
+        float g = gain_at(m, start + i);
+        m->blk[i * 2] *= g;
+        m->blk[i * 2 + 1] *= g;
+    }
+    if (m->gain_to != 1.0f)
+        for (; i < n; i++) { m->blk[i * 2] *= m->gain_to; m->blk[i * 2 + 1] *= m->gain_to; }
     m->blk_len = (int)n;
     m->blk_off = 0;
     m->rpos = start + n;
@@ -747,6 +785,7 @@ static fa_result midi_seek(fa_decoder* dec, fa_frames frame)
     if (!fresh) return FA_ERROR_OUT_OF_MEMORY;
     synth_free(m->font, m->synth);
     m->synth = fresh;
+    fa_midi_fx_reset(m->fx);   /* the reverb tail of what came before is not heard */
     start_song(m);   /* also forgets every held note */
     /* Everything before the target's block, without sound; what is at its first
      * frame is applied by render_block, as when playing through. */
@@ -768,6 +807,7 @@ static void midi_free(struct fa_midi* m)
     uint32_t i;
     if (!m) return;
     if (m->synth) synth_free(m->font, m->synth);
+    fa_midi_fx_free(m->fx);
     fa_soundfont_release(m->font);
     for (i = 0; i < m->ntexts; i++) free(m->texts[i].text);
     free(m->texts);
@@ -1110,7 +1150,10 @@ static fa_result midi_open(fa_decoder* dec)
     free(bytes);
     if (r == FA_OK) {
         m->synth = synth_new(m->font, m->rate);
-        if (!m->synth) r = FA_ERROR_OUT_OF_MEMORY;
+        m->fx = fa_midi_fx_new(m->rate);
+        fa_store32(&m->effects, 1);
+        m->effects_now = 1;
+        if (!m->synth || !m->fx) r = FA_ERROR_OUT_OF_MEMORY;
         else start_song(m);
     }
     if (r != FA_OK) { midi_free(m); return r; }
@@ -1180,6 +1223,20 @@ FA_API fa_result FA_CALL fa_stream_get_midi_transpose(fa_stream* stream, int32_t
 {
     if (!stream || !out_semitones || !stream->midi) return FA_ERROR_INVALID_ARG;
     *out_semitones = fa_load32(&stream->midi->transpose);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_set_midi_effects(fa_stream* stream, int32_t enabled)
+{
+    if (!stream || !stream->midi) return FA_ERROR_INVALID_ARG;
+    fa_store32(&stream->midi->effects, enabled ? 1 : 0);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_midi_effects(fa_stream* stream, int32_t* out_enabled)
+{
+    if (!stream || !out_enabled || !stream->midi) return FA_ERROR_INVALID_ARG;
+    *out_enabled = fa_load32(&stream->midi->effects);
     return FA_OK;
 }
 

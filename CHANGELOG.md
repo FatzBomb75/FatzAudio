@@ -50,6 +50,10 @@ The first packaged version (NuGet `FatzAudio` with `win-x64` and `linux-x64` nat
 - MIDI: GM/GM2/GS/XG SysEx (resets, drum parts on any channel, XG and GM2 drum banks, master volume and
   tuning); notes held across a seek start again at the target; tempo changes and time and key signatures
   (`fa_stream_get_midi_marks`; .NET `MidiMarks`).
+- MIDI: SF3 soundfonts (SoundFont 2 with Ogg Vorbis samples) load with `fa_soundfont_open_path` /
+  `fa_soundfont_open_memory` (.NET `SoundFont.FromFile` / `FromMemory`); samples are decoded to 16-bit at load.
+- MIDI: built-in reverb and chorus, on by default and driven by CC91, CC93 and the soundfont's effect sends;
+  `fa_stream_set_midi_effects` / `fa_stream_get_midi_effects` (.NET `AudioStream.MidiEffects`) turn them off.
 - Levels and spectrum (FFT) for streams and devices (`fa_stream_get_levels`, `fa_stream_get_spectrum`,
   `fa_device_get_levels`, `fa_device_get_spectrum`; .NET `GetLevels`, `GetSpectrum`).
 - Everything else built so far: decoding (MP3, AAC, ALAC, FLAC, Opus, Vorbis, AC-3/E-AC-3, WMA on Windows,

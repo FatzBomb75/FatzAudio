@@ -45,6 +45,12 @@ against untrusted files and add what the decoder needs:
 - `initialAttenuation` is applied at the SF2 spec's 0.1 dB per centibel, up to 144 dB
   (upstream used 0.01 dB, at most 14.4 dB, which flattened the level differences between
   zones and instruments).
+- Effect-send generators 15 and 16 (`chorusSend`, `reverbSend`, in 0.1% units) are kept per
+  region; they were skipped upstream.
+- Per-channel CC91 and CC93 (`midiReverb`, default 40, and `midiChorus`, default 0) are stored
+  and set from the controller messages.
+- `tsf_render_float_fx`: like `tsf_render_float`, and also adds each voice to the reverb and chorus
+  send buses (the soundfont's sends plus CC91/CC93); the effects themselves are in `src/midi_fx.c`.
 - `tsf_hydra_valid`: minimum record counts, and every bag/generator/instrument/sample
   index checked monotonic and in range; out-of-range sample IDs and instrument indices
   skipped; sample offsets and loop points clamped inside the sample.
