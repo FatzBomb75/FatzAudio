@@ -9,11 +9,13 @@
  * one after another, so pack n is shown at n / 300 s of the audio.
  *
  * Every surface decodes on its own (a 300x216 index screen per surface) up to the
- * pack for the time it is asked for. Moving forward applies the new packs; moving
- * back restores the last checkpoint before the target (one every 30 s of graphics,
- * taken on the way forward) and replays from there, so a seek costs at most 30 s of
- * packs, a fraction of a millisecond. Everything runs on the caller's thread under
- * the stream's cdg_lock; the audio thread never sees any of it. */
+ * pack for the time it is asked for. Moving forward applies the new packs. The
+ * stream's graphics carry checkpoints, the decoder state every 10 s of packs, shared
+ * by all its surfaces: built in full when a file's first surface is created, and as
+ * the packs arrive for discs. A seek anywhere, back or forward, the first one too, restores the last
+ * checkpoint before the target and replays at most 10 s of packs, a fraction of a
+ * millisecond. Updates run on the caller's thread under the stream's cdg_lock; the
+ * audio thread never sees any of it. */
 #include "cdg.h"
 #include <stdint.h>
 #include <stdlib.h>
@@ -40,7 +42,12 @@
 #define CDG_BORDER_X 6
 #define CDG_BORDER_Y 12
 #define CDG_MAX_OUTPUT 8192
-#define CDG_CHECKPOINT_PACKS (30 * FA_CDG_PACKS_PER_SECOND)
+#define CDG_CHECKPOINT_PACKS (10 * FA_CDG_PACKS_PER_SECOND)
+#define CDG_CONFIG_V1_SIZE 20       /* fa_cdg_surface_config up to `flags` */
+#define CDG_ALL_FLAGS (FA_CDG_NO_BORDER | FA_CDG_TRANSPARENT | FA_CDG_PREMULTIPLIED | FA_CDG_SMOOTH | \
+                       FA_CDG_TRANSPARENT_BACKGROUND_ONLY | FA_CDG_HIDE_UNTIL_PRESET | \
+                       FA_CDG_BACKGROUND_COLOR | FA_CDG_BACKGROUND_OPACITY)
+#define CDG_MAX_CHECKPOINTS 180   /* ~12 MB; longer graphics space them out further */
 
 typedef struct cdg_state {
     uint8_t screen[FA_CDG_HEIGHT][FA_CDG_WIDTH];  /* colour indices */
@@ -48,10 +55,23 @@ typedef struct cdg_state {
     uint8_t transparency[16];     /* 0 = opaque .. 63 = invisible (transparent colour packs) */
     uint8_t bg;                   /* colour of the last memory preset */
     uint8_t hoff, voff;           /* smooth-scroll offsets, 0..5 and 0..11 */
+    int8_t preset;                /* a memory preset was applied (bg is real) */
+    int8_t border;                /* colour of the last border preset, -1 = none */
     int clean;                    /* nothing drawn since the last memory preset */
     size_t next;                  /* packs applied so far */
     int dx0, dy0, dx1, dy1;       /* screen area changed since the last render; empty if dx0 >= dx1 */
 } cdg_state;
+
+/* Checkpoints of one fa_cdg_data, under the stream's cdg_lock once attached. */
+struct fa_cdg_index {
+    size_t step;                  /* packs between checkpoints */
+    cdg_state* at;                /* [k] = state after (k + 1) * step packs */
+    size_t count;                 /* valid checkpoints */
+    size_t cap;
+    cdg_state build;              /* discs: the decoder running over the packs written */
+    size_t high;                  /* discs: packs written up to here; the decoder
+                                     catches up with it a little at each write */
+};
 
 struct fa_cdg_surface {
     struct fa_stream* stream;
@@ -65,12 +85,15 @@ struct fa_cdg_surface {
     uint32_t gen;                 /* stream->cdg_gen the state belongs to */
     int drawn;                    /* the pixels hold a whole picture */
     uint8_t shown_palette[16][4]; /* as of the last render */
+    uint8_t shown_transparency[16];
+    int shown_bg, shown_border;
     uint8_t shown_hoff, shown_voff;
+    uint64_t revision, palette_revision;
+    uint32_t bg_color;            /* config.background_color, 0xAARRGGBB */
+    uint32_t bg_opacity;          /* config.background_opacity, % */
     uint16_t* xmap;               /* output column -> window column (sharp scaling) */
     uint16_t* ymap;               /* output row -> window row */
     cdg_state st;
-    cdg_state* checkpoints;       /* [k] = state after (k + 1) * CDG_CHECKPOINT_PACKS packs */
-    size_t checkpoint_count;
     size_t stale_from;            /* packs from here were rewritten (SIZE_MAX = none), under cdg_lock */
 };
 
@@ -83,15 +106,19 @@ fa_result fa_cdg_data_adopt(uint8_t* bytes, size_t size, fa_cdg_data** out)
     if (size < FA_CDG_PACK_BYTES) { free(bytes); return FA_ERROR_UNSUPPORTED_FORMAT; }
     d = (fa_cdg_data*)malloc(sizeof(*d));
     if (!d) { free(bytes); return FA_ERROR_OUT_OF_MEMORY; }
+    memset(d, 0, sizeof(*d));
     d->packs = bytes;
     d->count = size / FA_CDG_PACK_BYTES;
     *out = d;
     return FA_OK;
 }
 
+static void index_free(struct fa_cdg_index* ix);
+
 void fa_cdg_data_free(fa_cdg_data* data)
 {
     if (!data) return;
+    index_free(data->index);
     free(data->packs);
     free(data);
 }
@@ -197,6 +224,7 @@ static void mark_all(cdg_state* st) { mark(st, 0, 0, FA_CDG_WIDTH, FA_CDG_HEIGHT
 static void state_reset(cdg_state* st)
 {
     memset(st, 0, sizeof(*st));
+    st->border = -1;
     st->clean = 1;
     mark_all(st);
 }
@@ -206,9 +234,10 @@ static void memory_preset(cdg_state* st, const uint8_t* d)
     uint8_t color = d[0] & 0x0F;
     /* Discs repeat the preset (repeat count in d[1]) in case one is damaged; a file
      * has no damage, so a repeat of a screen that is still clean changes nothing. */
-    if ((d[1] & 0x0F) != 0 && st->clean && st->bg == color) return;
+    if ((d[1] & 0x0F) != 0 && st->preset && st->clean && st->bg == color) return;
     memset(st->screen, color, sizeof(st->screen));
     st->bg = color;
+    st->preset = 1;
     st->clean = 1;
     mark_all(st);
 }
@@ -225,6 +254,7 @@ static void border_preset(cdg_state* st, const uint8_t* d)
             memset(st->screen[y] + FA_CDG_WIDTH - CDG_BORDER_X, color, CDG_BORDER_X);
         }
     }
+    st->border = (int8_t)color;
     st->clean = 0;
     mark_all(st);
 }
@@ -328,6 +358,84 @@ static void apply_pack(cdg_state* st, const uint8_t* pack)
     }
 }
 
+/* ---- checkpoints ------------------------------------------------------------------ */
+
+static void index_free(struct fa_cdg_index* ix)
+{
+    if (!ix) return;
+    free(ix->at);
+    free(ix);
+}
+
+/* 10 s of packs, more for graphics longer than CDG_MAX_CHECKPOINTS of those. */
+static size_t index_step(size_t count)
+{
+    size_t per = (size_t)CDG_CHECKPOINT_PACKS * CDG_MAX_CHECKPOINTS;
+    return CDG_CHECKPOINT_PACKS * (count > per ? (count + per - 1) / per : 1);
+}
+
+static struct fa_cdg_index* index_new(size_t count)
+{
+    struct fa_cdg_index* ix = (struct fa_cdg_index*)calloc(1, sizeof(*ix));
+    if (!ix) return NULL;
+    ix->step = index_step(count);
+    ix->cap = count / ix->step;
+    if (ix->cap) {
+        ix->at = (cdg_state*)malloc(ix->cap * sizeof(cdg_state));
+        if (!ix->at) { free(ix); return NULL; }
+    }
+    state_reset(&ix->build);
+    return ix;
+}
+
+/* Runs the index's decoder over packs [build.next, upto), saving each checkpoint. */
+static void index_advance(struct fa_cdg_index* ix, const fa_cdg_data* d, size_t upto)
+{
+    cdg_state* st = &ix->build;
+    while (st->next < upto) {
+        apply_pack(st, d->packs + st->next * FA_CDG_PACK_BYTES);
+        st->next++;
+        if (st->next % ix->step == 0 && st->next / ix->step == ix->count + 1 && ix->count < ix->cap) {
+            st->dx0 = st->dy0 = st->dx1 = st->dy1 = 0;
+            ix->at[ix->count++] = *st;
+        }
+    }
+}
+
+/* Files and memory blocks: every checkpoint at once, when the stream's first surface
+ * needs them (under cdg_lock, a few milliseconds for a song), so opening songs that
+ * are never drawn costs nothing. Without memory for it, seeks replay from the start. */
+static void index_build(fa_cdg_data* d)
+{
+    struct fa_cdg_index* ix;
+    if (!d || d->index || d->from_disc) return;
+    ix = index_new(d->count);
+    if (!ix) return;
+    index_advance(ix, d, d->count);
+    d->index = ix;
+}
+
+/* Discs: packs [first, first + n) were written, `changed` if they differ from what
+ * was there. Checkpoints after a change no longer hold: the decoder goes back to the
+ * last one that does. It then runs over this write and at most 10 s more towards
+ * the packs written so far, so no write holds the lock long. */
+static void index_written(fa_cdg_data* d, size_t first, size_t n, int changed)
+{
+    struct fa_cdg_index* ix = d->index;
+    size_t upto;
+    if (!ix) return;
+    if (changed && first < ix->build.next) {
+        size_t keep = first / ix->step;
+        if (keep < ix->count) ix->count = keep;
+        if (ix->count) ix->build = ix->at[ix->count - 1]; else state_reset(&ix->build);
+    }
+    if (first + n > ix->high) ix->high = first + n;
+    upto = first + n > ix->build.next ? first + n : ix->build.next;
+    upto += CDG_CHECKPOINT_PACKS;
+    if (upto > ix->high) upto = ix->high;
+    index_advance(ix, d, upto);
+}
+
 /* ---- rendering ------------------------------------------------------------------- */
 
 /* Colour index of window pixel (x, y): the picture area shows the screen shifted by
@@ -342,18 +450,41 @@ static uint8_t window_index(const fa_cdg_surface* f, uint32_t x, uint32_t y)
     return f->st.screen[sy][sx];
 }
 
+/* The background colour with FA_CDG_BACKGROUND_COLOR / FA_CDG_BACKGROUND_OPACITY
+ * applied; `rgba` holds the colour the flags above give it. */
+static void background_options(const fa_cdg_surface* f, uint8_t rgba[4])
+{
+    if (f->flags & FA_CDG_BACKGROUND_COLOR) {
+        rgba[0] = (uint8_t)(f->bg_color >> 16);
+        rgba[1] = (uint8_t)(f->bg_color >> 8);
+        rgba[2] = (uint8_t)f->bg_color;
+        rgba[3] = (uint8_t)(f->bg_color >> 24);
+    }
+    if (f->flags & FA_CDG_BACKGROUND_OPACITY) {
+        uint32_t base = f->flags & FA_CDG_BACKGROUND_COLOR ? rgba[3] : 255;
+        rgba[3] = (uint8_t)((base * f->bg_opacity + 50) / 100);
+    }
+}
+
 static void palette_rgba(const fa_cdg_surface* f, uint8_t out[16][4])
 {
     int i;
+    int bg_only = (f->flags & FA_CDG_TRANSPARENT_BACKGROUND_ONLY) != 0;
+    int hidden = (f->flags & FA_CDG_HIDE_UNTIL_PRESET) && !f->st.preset;
     for (i = 0; i < 16; i++) {
         uint8_t a = 255;
-        if (f->flags & FA_CDG_TRANSPARENT)
+        if (bg_only)
+            a = i == f->st.bg ? 0 : 255;
+        else if (f->flags & FA_CDG_TRANSPARENT)
             a = i == f->st.bg ? 0 : (uint8_t)(255 - (f->st.transparency[i] * 255 + 31) / 63);
         out[i][0] = f->st.rgb[i][0];
         out[i][1] = f->st.rgb[i][1];
         out[i][2] = f->st.rgb[i][2];
         out[i][3] = a;
     }
+    if (f->st.preset) background_options(f, out[f->st.bg]);
+    if (hidden)
+        for (i = 0; i < 16; i++) out[i][3] = 0;
 }
 
 static void store_pixel(const fa_cdg_surface* f, uint8_t* px, uint32_t r, uint32_t g, uint32_t b, uint32_t a)
@@ -493,6 +624,21 @@ static void render(fa_cdg_surface* f, fa_cdg_frame* out)
         out->dirty_x = out->dirty_y = out->dirty_width = out->dirty_height = 0;
     }
     memcpy(out->palette, pal, sizeof(pal));
+
+    out->background_index = st->preset ? st->bg : -1;
+    out->border_index = st->border;
+    memcpy(out->transparency, st->transparency, sizeof(out->transparency));
+    if (st->preset) memcpy(out->background, pal[st->bg], 4);
+    else memset(out->background, 0, 4);
+    if (out->dirty_width) f->revision++;
+    if (palette_changed || out->background_index != f->shown_bg || out->border_index != f->shown_border ||
+        memcmp(st->transparency, f->shown_transparency, sizeof(st->transparency)) != 0)
+        f->palette_revision++;
+    f->shown_bg = out->background_index;
+    f->shown_border = out->border_index;
+    memcpy(f->shown_transparency, st->transparency, sizeof(st->transparency));
+    out->revision = f->revision;
+    out->palette_revision = f->palette_revision;
 }
 
 /* ---- the public API ------------------------------------------------------------------ */
@@ -529,6 +675,7 @@ fa_result fa_cdg_data_blank(size_t count, fa_cdg_data** out)
 int fa_stream_cdg_attach_if_none(struct fa_stream* s, fa_cdg_data* data, uint32_t* out_token)
 {
     int ok;
+    if (!data->index) data->index = index_new(data->count);
     fa_mutex_lock(&s->cdg_lock);
     ok = s->cdg == NULL;
     if (ok) {
@@ -549,12 +696,19 @@ int fa_stream_cdg_write(struct fa_stream* s, uint32_t token, size_t first, const
     data = s->cdg;
     ok = data && s->cdg_gen == token;   /* any load since bumps the generation */
     if (ok && first < data->count && n > 0) {
+        uint8_t* at = data->packs + first * FA_CDG_PACK_BYTES;
         if (n > data->count - first) n = data->count - first;
-        memcpy(data->packs + first * FA_CDG_PACK_BYTES, packs, n * FA_CDG_PACK_BYTES);
-        /* Normally the packs arrive well ahead of what is shown; after a seek they
-         * may land behind a surface, which goes back to replay them. */
-        for (f = s->cdg_surfaces; f; f = f->next)
-            if (f->st.next > first && first < f->stale_from) f->stale_from = first;
+        /* A part read again after a seek usually holds the same packs: nothing to redo. */
+        if (memcmp(at, packs, n * FA_CDG_PACK_BYTES) != 0) {
+            memcpy(at, packs, n * FA_CDG_PACK_BYTES);
+            /* Normally the packs arrive well ahead of what is shown; after a seek they
+             * may land behind a surface, which goes back to replay them. */
+            for (f = s->cdg_surfaces; f; f = f->next)
+                if (f->st.next > first && first < f->stale_from) f->stale_from = first;
+            index_written(data, first, n, 1);
+        } else {
+            index_written(data, first, n, 0);
+        }
     }
     fa_mutex_unlock(&s->cdg_lock);
     return ok;
@@ -575,7 +729,6 @@ void fa_stream_cdg_close(struct fa_stream* s)
 
 static void surface_free(fa_cdg_surface* f)
 {
-    free(f->checkpoints);
     free(f->xmap);
     free(f->ymap);
     free(f->pixels);
@@ -633,6 +786,25 @@ FA_API fa_result FA_CALL fa_stream_get_cdg_offset(fa_stream* stream, fa_time* ou
     return FA_OK;
 }
 
+FA_API fa_result FA_CALL fa_stream_get_cdg_info(fa_stream* stream, fa_cdg_info* out_info)
+{
+    const fa_cdg_data* d;
+    if (!stream || !out_info) return FA_ERROR_INVALID_ARG;
+    memset(out_info, 0, sizeof(*out_info));
+    out_info->disc_parity = -1;
+    fa_mutex_lock(&stream->cdg_lock);
+    d = stream->cdg;
+    if (d) {
+        out_info->source = d->from_disc ? FA_CDG_SOURCE_DISC : FA_CDG_SOURCE_FILE;
+        out_info->pack_count = d->count;
+        out_info->checkpoint_interval = (fa_time)index_step(d->count) * 1000000000 / FA_CDG_PACKS_PER_SECOND;
+        if (d->index) out_info->checkpoint_count = (uint32_t)d->index->count;
+        if (d->from_disc) out_info->disc_parity = d->disc_parity;
+    }
+    fa_mutex_unlock(&stream->cdg_lock);
+    return FA_OK;
+}
+
 FA_API fa_result FA_CALL fa_cdg_surface_create(fa_stream* stream, const fa_cdg_surface_config* config, fa_cdg_surface** out_surface)
 {
     fa_cdg_surface_config c;
@@ -642,17 +814,21 @@ FA_API fa_result FA_CALL fa_cdg_surface_create(fa_stream* stream, const fa_cdg_s
     if (!stream || !out_surface) return FA_ERROR_INVALID_ARG;
     fa_cdg_surface_config_init(&c);
     if (config) {
-        if (config->struct_size < sizeof(c)) return FA_ERROR_INVALID_ARG;
-        c = *config;
+        /* Apps built before the background fields pass the shorter struct. */
+        if (config->struct_size < CDG_CONFIG_V1_SIZE) return FA_ERROR_INVALID_ARG;
+        memcpy(&c, config, config->struct_size < sizeof(c) ? config->struct_size : sizeof(c));
     }
     if ((uint32_t)c.pixel_format > FA_CDG_PIXELS_INDEXED8 || c.width > CDG_MAX_OUTPUT || c.height > CDG_MAX_OUTPUT ||
-        (c.flags & ~(uint32_t)(FA_CDG_NO_BORDER | FA_CDG_TRANSPARENT | FA_CDG_PREMULTIPLIED | FA_CDG_SMOOTH)))
+        (c.flags & ~(uint32_t)CDG_ALL_FLAGS) ||
+        ((c.flags & FA_CDG_BACKGROUND_OPACITY) && c.background_opacity > 100))
         return FA_ERROR_INVALID_ARG;
     f = (fa_cdg_surface*)calloc(1, sizeof(*f));
     if (!f) return FA_ERROR_OUT_OF_MEMORY;
     f->stream = stream;
     f->format = c.pixel_format;
     f->flags = c.flags;
+    f->bg_color = c.background_color;
+    f->bg_opacity = c.background_opacity;
     if (c.flags & FA_CDG_NO_BORDER) {
         f->win_x = CDG_BORDER_X; f->win_y = CDG_BORDER_Y;
         f->win_w = FA_CDG_PICTURE_WIDTH; f->win_h = FA_CDG_PICTURE_HEIGHT;
@@ -672,6 +848,7 @@ FA_API fa_result FA_CALL fa_cdg_surface_create(fa_stream* stream, const fa_cdg_s
     state_reset(&f->st);
     f->stale_from = SIZE_MAX;
     fa_mutex_lock(&stream->cdg_lock);
+    index_build(stream->cdg);
     f->gen = stream->cdg_gen;
     f->next = stream->cdg_surfaces;
     stream->cdg_surfaces = f;
@@ -696,7 +873,8 @@ FA_API void FA_CALL fa_cdg_surface_destroy(fa_cdg_surface* surface)
 }
 
 /* Packs shown at `time` (ns): pack n arrives during [n/300 s, (n+1)/300 s), so all
- * packs that started before `time` are applied. */
+ * packs that started before `time` are applied: [0, ceil(time * 300 / 1e9)), the rule
+ * the header documents. */
 static size_t packs_at(fa_time time, size_t count)
 {
     int64_t n;
@@ -706,31 +884,54 @@ static size_t packs_at(fa_time time, size_t count)
     return (uint64_t)n < (uint64_t)count ? (size_t)n : count;
 }
 
-/* Moving back: the newest checkpoint at or before `target`, else the start. */
-static void rewind_to(fa_cdg_surface* f, size_t target)
+/* Replaces the surface's state with `from` (NULL = the start), marking only the
+ * screen area that differs, so a seek uploads no more than it has to. */
+static void restore(fa_cdg_surface* f, const cdg_state* from)
 {
-    size_t k = target / CDG_CHECKPOINT_PACKS;
-    if (k > f->checkpoint_count) k = f->checkpoint_count;
-    if (k == 0) { state_reset(&f->st); return; }
-    f->st = f->checkpoints[k - 1];
-    mark_all(&f->st);
+    cdg_state* st = &f->st;
+    int x0 = st->dx0, y0 = st->dy0, x1 = st->dx1, y1 = st->dy1, y;
+    static const uint8_t zero_row[FA_CDG_WIDTH];
+    for (y = 0; y < FA_CDG_HEIGHT; y++) {
+        const uint8_t* a = st->screen[y];
+        const uint8_t* b = from ? from->screen[y] : zero_row;
+        int l = 0, r = FA_CDG_WIDTH;
+        if (memcmp(a, b, FA_CDG_WIDTH) == 0) continue;
+        while (a[l] == b[l]) l++;
+        while (a[r - 1] == b[r - 1]) r--;
+        if (x0 >= x1) { x0 = l; y0 = y; x1 = r; y1 = y + 1; continue; }
+        if (l < x0) x0 = l;
+        if (r > x1) x1 = r;
+        if (y < y0) y0 = y;
+        if (y + 1 > y1) y1 = y + 1;
+    }
+    if (from) *st = *from; else state_reset(st);
+    st->dx0 = st->dy0 = st->dx1 = st->dy1 = 0;
+    if (x0 < x1) mark(st, x0, y0, x1, y1);
 }
 
-static void save_checkpoint(fa_cdg_surface* f)
+/* The newest checkpoint at or before pack `pos` (or the start). */
+static void rewind_before(fa_cdg_surface* f, const fa_cdg_data* d, size_t pos)
 {
-    cdg_state* grown;
-    if (f->st.next / CDG_CHECKPOINT_PACKS != f->checkpoint_count + 1) return; /* already have it */
-    grown = (cdg_state*)realloc(f->checkpoints, (f->checkpoint_count + 1) * sizeof(*grown));
-    if (!grown) return; /* without it, seeking back just replays more */
-    f->checkpoints = grown;
-    f->checkpoints[f->checkpoint_count++] = f->st;
+    const struct fa_cdg_index* ix = d ? d->index : NULL;
+    size_t k = ix ? pos / ix->step : 0;
+    if (ix && k > ix->count) k = ix->count;
+    restore(f, k > 0 ? &ix->at[k - 1] : NULL);
 }
 
-static void drop_checkpoints(fa_cdg_surface* f)
+/* Brings the surface's state to `target` packs: from the newest checkpoint at or
+ * before it when that saves replaying (any seek back, or a jump forward past one),
+ * then pack by pack. */
+static void decode_to(fa_cdg_surface* f, const fa_cdg_data* d, size_t target)
 {
-    free(f->checkpoints);
-    f->checkpoints = NULL;
-    f->checkpoint_count = 0;
+    const struct fa_cdg_index* ix = d ? d->index : NULL;
+    size_t k = ix ? target / ix->step : 0;
+    if (ix && k > ix->count) k = ix->count;
+    if (target < f->st.next || (k > 0 && k * ix->step > f->st.next))
+        rewind_before(f, d, target);
+    while (f->st.next < target) {
+        apply_pack(&f->st, d->packs + f->st.next * FA_CDG_PACK_BYTES);
+        f->st.next++;
+    }
 }
 
 static fa_result surface_update(fa_cdg_surface* f, fa_time time, fa_cdg_frame* out)
@@ -745,21 +946,20 @@ static fa_result surface_update(fa_cdg_surface* f, fa_time time, fa_cdg_frame* o
     if (offset > 0 && time < INT64_MIN + offset) time = INT64_MIN;
     else if (offset < 0 && time > INT64_MAX + offset) time = INT64_MAX;
     else time -= offset;
-    if (f->gen != s->cdg_gen) { state_reset(&f->st); drop_checkpoints(f); f->gen = s->cdg_gen; f->stale_from = SIZE_MAX; }
+    if (f->gen != s->cdg_gen) {
+        index_build(s->cdg);      /* graphics loaded since the surface was created */
+        restore(f, NULL);
+        f->gen = s->cdg_gen;
+        f->stale_from = SIZE_MAX;
+    }
     if (f->stale_from != SIZE_MAX) {
-        /* Packs from stale_from changed: only checkpoints before them still hold. */
-        size_t keep = f->stale_from / CDG_CHECKPOINT_PACKS;
-        if (keep < f->checkpoint_count) f->checkpoint_count = keep;
-        if (f->st.next > f->stale_from) rewind_to(f, f->stale_from);
+        /* Packs from stale_from changed: back to the checkpoint before them (the
+         * stream's own were redone), and on from there to the target below. */
+        if (f->st.next > f->stale_from) rewind_before(f, s->cdg, f->stale_from);
         f->stale_from = SIZE_MAX;
     }
     target = s->cdg ? packs_at(time, s->cdg->count) : 0;
-    if (target < f->st.next) rewind_to(f, target);
-    while (f->st.next < target) {
-        apply_pack(&f->st, s->cdg->packs + f->st.next * FA_CDG_PACK_BYTES);
-        f->st.next++;
-        if (f->st.next % CDG_CHECKPOINT_PACKS == 0) save_checkpoint(f);
-    }
+    decode_to(f, s->cdg, target);
     fa_mutex_unlock(&s->cdg_lock);
     /* Drawing uses only this surface's state: other surfaces and loads need not wait. */
     render(f, out);
