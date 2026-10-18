@@ -90,43 +90,66 @@ static uint16_t crc16(const uint8_t* d, size_t n)
     return c;
 }
 
-static buf make_flac(uint32_t rate, uint32_t channels, uint32_t frames, int with_id3)
+/* Blocks that start before frame `quiet` are digital silence (CONSTANT subframes,
+ * a few bytes each), so the file's bytes per frame change across it. With
+ * `seek_every`, a SEEKTABLE has a point every that many blocks. */
+static buf make_flac_ex(uint32_t rate, uint32_t channels, uint32_t frames, int with_id3, uint32_t quiet, uint32_t seek_every)
 {
     const uint32_t block = 4096;
-    buf b = { 0 };
-    uint32_t start, f, i, c;
+    buf b = { 0 }, fr = { 0 };
+    uint32_t start, f, i, c, points = seek_every ? (frames + block * seek_every - 1) / (block * seek_every) : 0;
+    uint64_t* offset = (uint64_t*)calloc(points + 1, sizeof(uint64_t));
+    for (start = 0, f = 0; start < frames; start += block, f++) {
+        uint32_t n = frames - start < block ? frames - start : block;
+        size_t h = fr.n;
+        uint8_t hdr[8];
+        if (seek_every && f % seek_every == 0) offset[f / seek_every] = fr.n;
+        put8(&fr, 0xFF); put8(&fr, 0xF8);                           /* sync, fixed blocksize */
+        put8(&fr, (7 << 4) | 0);                                     /* blocksize: 16-bit n-1 follows; rate from STREAMINFO */
+        put8(&fr, ((channels - 1) << 4) | (4 << 1));                 /* independent channels, 16 bps */
+        if (f < 128) put8(&fr, f); else { put8(&fr, 0xC0 | (f >> 6)); put8(&fr, 0x80 | (f & 63)); } /* UTF-8 frame number */
+        be16(&fr, n - 1);
+        memcpy(hdr, fr.p + h, fr.n - h);
+        put8(&fr, crc8(hdr, fr.n - h));
+        for (c = 0; c < channels; c++) {
+            if (start < quiet) { put8(&fr, 0x00); be16(&fr, 0); continue; } /* CONSTANT 0 */
+            put8(&fr, 0x02);                                         /* VERBATIM, no wasted bits */
+            for (i = 0; i < n; i++) be16(&fr, (uint16_t)tone(start + i, rate, c));
+        }
+        be16(&fr, crc16(fr.p + h, fr.n - h));
+    }
+
     if (with_id3) {
         uint8_t id3[10] = { 'I', 'D', '3', 4, 0, 0, 0, 0, 0, 20 };
         uint8_t pad[20] = { 0 };
         put(&b, id3, 10); put(&b, pad, 20);
     }
     put(&b, "fLaC", 4);
-    put8(&b, 0x80); put8(&b, 0); put8(&b, 0); put8(&b, 34);       /* last block: STREAMINFO */
+    put8(&b, points ? 0x00 : 0x80); put8(&b, 0); put8(&b, 0); put8(&b, 34); /* STREAMINFO */
     be16(&b, block); be16(&b, block); put8(&b, 0); put8(&b, 0); put8(&b, 0); put8(&b, 0); put8(&b, 0); put8(&b, 0);
     /* rate(20) channels-1(3) bps-1(5) total(36) */
     put8(&b, rate >> 12); put8(&b, rate >> 4);
     put8(&b, ((rate & 15) << 4) | ((channels - 1) << 1) | (15 >> 4));
     put8(&b, ((15 & 15) << 4) | 0); be32(&b, frames);
     for (i = 0; i < 16; i++) put8(&b, 0); /* MD5 unknown */
-
-    for (start = 0, f = 0; start < frames; start += block, f++) {
-        uint32_t n = frames - start < block ? frames - start : block;
-        size_t h = b.n;
-        uint8_t hdr[8];
-        put8(&b, 0xFF); put8(&b, 0xF8);                             /* sync, fixed blocksize */
-        put8(&b, (7 << 4) | 0);                                      /* blocksize: 16-bit n-1 follows; rate from STREAMINFO */
-        put8(&b, ((channels - 1) << 4) | (4 << 1));                  /* independent channels, 16 bps */
-        if (f < 128) put8(&b, f); else { put8(&b, 0xC0 | (f >> 6)); put8(&b, 0x80 | (f & 63)); } /* UTF-8 frame number */
-        be16(&b, n - 1);
-        memcpy(hdr, b.p + h, b.n - h);
-        put8(&b, crc8(hdr, b.n - h));
-        for (c = 0; c < channels; c++) {
-            put8(&b, 0x02);                                          /* VERBATIM, no wasted bits */
-            for (i = 0; i < n; i++) be16(&b, (uint16_t)tone(start + i, rate, c));
+    if (points) {
+        put8(&b, 0x83); put8(&b, 0); be16(&b, points * 18);          /* last block: SEEKTABLE */
+        for (i = 0; i < points; i++) {
+            uint32_t first = i * seek_every * block;
+            be32(&b, 0); be32(&b, first);
+            be32(&b, (uint32_t)(offset[i] >> 32)); be32(&b, (uint32_t)offset[i]);
+            be16(&b, frames - first < block ? frames - first : block);
         }
-        be16(&b, crc16(b.p + h, b.n - h));
     }
+    put(&b, fr.p, fr.n);
+    free(fr.p);
+    free(offset);
     return b;
+}
+
+static buf make_flac(uint32_t rate, uint32_t channels, uint32_t frames, int with_id3)
+{
+    return make_flac_ex(rate, channels, frames, with_id3, 0, 0);
 }
 
 /* MP3: MPEG-1 Layer III 128 kbps 44.1 kHz frames with zeroed side info (decode to silence). */
@@ -150,7 +173,7 @@ static buf make_mp3(uint32_t nframes, int with_id3)
 
 /* fail_at: reads at or past this byte fail (0 = never); seek_limit: seeks past it
  * are refused (0 = no limit). */
-typedef struct mem_io { const uint8_t* p; size_t n, pos; int closes; size_t fail_at, seek_limit; } mem_io;
+typedef struct mem_io { const uint8_t* p; size_t n, pos; int closes; size_t fail_at, seek_limit; int seeks; } mem_io;
 static int64_t FA_CALL io_read(void* u, void* dst, size_t bytes)
 {
     mem_io* m = (mem_io*)u;
@@ -171,6 +194,7 @@ static fa_result FA_CALL io_seek(void* u, int64_t off)
     if (off < 0 || (size_t)off > m->n) return FA_ERROR_INVALID_ARG;
     if (m->seek_limit && (size_t)off > m->seek_limit) return FA_ERROR_IO;
     m->pos = (size_t)off;
+    m->seeks++;
     return FA_OK;
 }
 static int64_t FA_CALL io_length(void* u) { return (int64_t)((mem_io*)u)->n; }
@@ -392,6 +416,52 @@ static void test_open_io_seekable(void)
     fa_stream_close(s);
     CHECK_EQ(m.closes, 1); /* close is called exactly once, by fa_stream_close */
     free(media.p);
+}
+
+/* A .flac without a SEEKTABLE (FatzAudio's and FFmpeg's encoders write none) seeks
+ * by searching the file for the frame, and one with a coarse SEEKTABLE searches
+ * between its points: every seek lands on exactly the right sample, in a few
+ * probes (one file seek each), also where silence makes the bytes per frame jump. */
+static void test_flac_seek_search(void)
+{
+    static const struct { uint32_t quiet, seek_every, max_seeks; } cases[] = {
+        { 0, 0, 4 },            /* upstream dr_flac: up to 11 */
+        { 73 * 4096, 0, 16 },   /* silence, then the tone (upstream: up to 11) */
+        { 0, 40, 6 },           /* a point every 40 blocks, 3.7 s (upstream: up to 8) */
+    };
+    const uint32_t frames = 600000;
+    size_t q;
+    for (q = 0; q < sizeof(cases) / sizeof(cases[0]); q++) {
+        buf media = make_flac_ex(44100, 2, frames, 0, cases[q].quiet, cases[q].seek_every);
+        mem_io m = { 0 };
+        fa_io_callbacks io = { io_read, io_seek, io_length, io_close };
+        fa_open_options o = decode_only();
+        fa_stream* s = NULL;
+        float out[2 * 64];
+        uint32_t k, worst = 0;
+        m.p = media.p; m.n = media.n;
+        CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_OK);
+        for (k = 0; k < 40; k++) {
+            uint32_t at = (uint32_t)(((uint64_t)k * 7919u * 4099u) % (frames - 64)), i, c;
+            fa_frames got = 0;
+            int before = m.seeks;
+            CHECK_EQ(fa_stream_seek(s, at), FA_OK);
+            CHECK_EQ(fa_stream_read(s, out, 64, &got), FA_OK);
+            CHECK_EQ(got, 64);
+            for (i = 0; i < 64; i++) for (c = 0; c < 2; c++) {
+                float want = at + i < cases[q].quiet ? 0.0f : (float)tone(at + i, 44100, c) / 32768.0f;
+                if (out[i * 2 + c] != want) {
+                    fprintf(stderr, "  case %u, seek to %u: frame %u is %.9g, expected %.9g\n", (unsigned)q, at, at + i, out[i * 2 + c], want);
+                    CHECK(0);
+                }
+            }
+            if ((uint32_t)(m.seeks - before) > worst) worst = (uint32_t)(m.seeks - before);
+        }
+        printf("  case %u: at most %u file seeks per seek\n", (unsigned)q, worst);
+        CHECK(worst <= cases[q].max_seeks);
+        fa_stream_close(s);
+        free(media.p);
+    }
 }
 
 static void test_open_io_forward_only(void)
@@ -710,6 +780,7 @@ int main(void)
     RUN(test_missing_file);
     RUN(test_open_path_utf8);
     RUN(test_open_io_seekable);
+    RUN(test_flac_seek_search);
     RUN(test_open_io_forward_only);
     RUN(test_open_io_failure_keeps_ownership);
     RUN(test_forward_only_with_length);

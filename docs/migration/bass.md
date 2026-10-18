@@ -299,6 +299,7 @@ FLAC is a built-in format wherever it appears: `.flac` files, Ogg FLAC, FLAC tra
 | BASS_FLAC_StreamCreateFile (`.flac` and Ogg FLAC) | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ |
 | BASS_FLAC_StreamCreateURL | `fa_stream_open_url` (FLAC and Ogg FLAC streams, Ogg FLAC radio titles from the comment block) | `engine.OpenUrl` | ✅ |
 | BASS_FLAC_StreamCreateFileUser | `fa_stream_open_io` | `engine.OpenStream` | ✅ |
+| BASS_ChannelSetPosition on FLAC | `fa_stream_seek`: sample exact, about a millisecond, with or without a SEEKTABLE in the file ([FLAC](../features/streams.md#flac)) | `stream.Position` | ✅ |
 | FLAC in MP4 / Matroska (bassflac via basswebm or the MP4 demuxer) | Built in, no FFmpeg; `audio_track` picks the track | `StreamOptions.AudioTrack` | ✅ |
 | Raw FLAC frames (decoding packets from your own demuxer) | `fa_stream_open_packets` with codec `flac` and the 34-byte STREAMINFO as extradata (or none: then the rate, channels and `bits_per_coded_sample` are used) ([FFmpeg hand-off](../features/ffmpeg.md)) | `engine.OpenPackets`, `PushPacket` | ✅ |
 | BASS_PluginLoad("bassflac.dll") | Not needed: built in | — | ➖ (by design) |

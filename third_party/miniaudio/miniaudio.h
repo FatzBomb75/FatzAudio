@@ -88306,76 +88306,72 @@ static ma_bool32 ma_dr_flac__decode_flac_frame_and_seek_forward_by_pcm_frames(ma
 #endif
     return ma_dr_flac__seek_forward_by_pcm_frames(pFlac, offset) == offset;
 }
+/* FatzAudio patch (see third_party/miniaudio/PATCHES.md): a guarded interpolation
+ * search in place of upstream's bisection. Each probe aims one block before the
+ * target between the closest known points either side; when one fails to halve
+ * the range (audio whose compression changes a lot, such as silence then music)
+ * the next two bisect it. A file without a SEEKTABLE then seeks in
+ * two or three probes instead of up to a dozen or more. Probes still fully
+ * decode (and CRC-check) the frame they land on, as upstream's do. */
 static ma_bool32 ma_dr_flac__seek_to_pcm_frame__binary_search_internal(ma_dr_flac* pFlac, ma_uint64 pcmFrameIndex, ma_uint64 byteRangeLo, ma_uint64 byteRangeHi)
 {
-    ma_uint64 targetByte;
-    ma_uint64 pcmRangeLo = pFlac->totalPCMFrameCount;
-    ma_uint64 pcmRangeHi = 0;
-    ma_uint64 lastSuccessfulSeekOffset = (ma_uint64)-1;
-    ma_uint64 closestSeekOffsetBeforeTargetPCMFrame = byteRangeLo;
-    ma_uint32 seekForwardThreshold = (pFlac->maxBlockSizeInPCMFrames != 0) ? pFlac->maxBlockSizeInPCMFrames*2 : 4096;
-    targetByte = byteRangeLo + (ma_uint64)(((ma_int64)((pcmFrameIndex - pFlac->currentPCMFrame) * pFlac->channels * pFlac->bitsPerSample)/8.0f) * MA_DR_FLAC_BINARY_SEARCH_APPROX_COMPRESSION_RATIO);
-    if (targetByte > byteRangeHi) {
-        targetByte = byteRangeHi;
-    }
-    for (;;) {
-        if (ma_dr_flac__seek_to_approximate_flac_frame_to_byte(pFlac, targetByte, byteRangeLo, byteRangeHi, &lastSuccessfulSeekOffset)) {
-            ma_uint64 newPCMRangeLo;
-            ma_uint64 newPCMRangeHi;
-            ma_dr_flac__get_pcm_frame_range_of_current_flac_frame(pFlac, &newPCMRangeLo, &newPCMRangeHi);
-            if (pcmRangeLo == newPCMRangeLo) {
-                if (!ma_dr_flac__seek_to_approximate_flac_frame_to_byte(pFlac, closestSeekOffsetBeforeTargetPCMFrame, closestSeekOffsetBeforeTargetPCMFrame, byteRangeHi, &lastSuccessfulSeekOffset)) {
-                    break;
-                }
-                if (ma_dr_flac__decode_flac_frame_and_seek_forward_by_pcm_frames(pFlac, pcmFrameIndex - pFlac->currentPCMFrame)) {
-                    return MA_TRUE;
-                } else {
-                    break;
-                }
-            }
-            pcmRangeLo = newPCMRangeLo;
-            pcmRangeHi = newPCMRangeHi;
-            if (pcmRangeLo <= pcmFrameIndex && pcmRangeHi >= pcmFrameIndex) {
-                if (ma_dr_flac__decode_flac_frame_and_seek_forward_by_pcm_frames(pFlac, pcmFrameIndex - pFlac->currentPCMFrame) ) {
-                    return MA_TRUE;
-                } else {
-                    break;
-                }
-            } else {
-                const float approxCompressionRatio = (ma_int64)(lastSuccessfulSeekOffset - pFlac->firstFLACFramePosInBytes) / ((ma_int64)(pcmRangeLo * pFlac->channels * pFlac->bitsPerSample)/8.0f);
-                if (pcmRangeLo > pcmFrameIndex) {
-                    byteRangeHi = lastSuccessfulSeekOffset;
-                    if (byteRangeLo > byteRangeHi) {
-                        byteRangeLo = byteRangeHi;
-                    }
-                    targetByte = byteRangeLo + ((byteRangeHi - byteRangeLo) / 2);
-                    if (targetByte < byteRangeLo) {
-                        targetByte = byteRangeLo;
-                    }
-                } else  {
-                    if ((pcmFrameIndex - pcmRangeLo) < seekForwardThreshold) {
-                        if (ma_dr_flac__decode_flac_frame_and_seek_forward_by_pcm_frames(pFlac, pcmFrameIndex - pFlac->currentPCMFrame)) {
-                            return MA_TRUE;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        byteRangeLo = lastSuccessfulSeekOffset;
-                        if (byteRangeHi < byteRangeLo) {
-                            byteRangeHi = byteRangeLo;
-                        }
-                        targetByte = lastSuccessfulSeekOffset + (ma_uint64)(((ma_int64)((pcmFrameIndex-pcmRangeLo) * pFlac->channels * pFlac->bitsPerSample)/8.0f) * approxCompressionRatio);
-                        if (targetByte > byteRangeHi) {
-                            targetByte = byteRangeHi;
-                        }
-                        if (closestSeekOffsetBeforeTargetPCMFrame < lastSuccessfulSeekOffset) {
-                            closestSeekOffsetBeforeTargetPCMFrame = lastSuccessfulSeekOffset;
-                        }
-                    }
-                }
-            }
+    /* The search starts from the frame at byteRangeLo, which the caller has made current (the first frame, or a seek point). */
+    ma_uint64 loByte = byteRangeLo;
+    ma_uint64 loPCM = pFlac->currentPCMFrame;
+    const ma_uint64 startPCM = loPCM;
+    ma_uint64 hiByte = byteRangeHi;
+    ma_uint64 hiPCM = 0;
+    ma_bool32 haveHi = MA_FALSE;
+    int bisections = 0;                 /* still to make before interpolating again */
+    ma_uint64 lead = (pFlac->maxBlockSizeInPCMFrames != 0) ? pFlac->maxBlockSizeInPCMFrames : 4096;
+    double guessBytesPerPCMFrame = (pFlac->channels * pFlac->bitsPerSample / 8.0) * MA_DR_FLAC_BINARY_SEARCH_APPROX_COMPRESSION_RATIO;
+    int iProbe;
+    for (iProbe = 0; iProbe < 64; ++iProbe) {
+        ma_uint64 aim = (pcmFrameIndex > loPCM + lead) ? pcmFrameIndex - lead : loPCM;
+        ma_uint64 span = hiByte - loByte;
+        ma_uint64 targetByte;
+        ma_uint64 probeByte;
+        ma_uint64 frameLo;
+        if (bisections > 0) {
+            targetByte = loByte + span/2;
+        } else if (haveHi) {
+            targetByte = loByte + (ma_uint64)((double)(aim - loPCM) * (double)span / (double)(hiPCM - loPCM));
         } else {
+            /* No point past the target yet: step at least at the guessed rate, so a quiet start doesn't make for tiny steps. */
+            double bytesPerPCMFrame = guessBytesPerPCMFrame;
+            if (loPCM > startPCM && (double)(loByte - byteRangeLo) / (double)(loPCM - startPCM) > bytesPerPCMFrame) {
+                bytesPerPCMFrame = (double)(loByte - byteRangeLo) / (double)(loPCM - startPCM);
+            }
+            targetByte = loByte + (ma_uint64)((double)(aim - loPCM) * bytesPerPCMFrame);
+        }
+        if (targetByte > hiByte) {
+            targetByte = hiByte;
+        }
+        if (!ma_dr_flac__seek_to_approximate_flac_frame_to_byte(pFlac, targetByte, loByte, hiByte, &probeByte)) {
             break;
+        }
+        ma_dr_flac__get_pcm_frame_range_of_current_flac_frame(pFlac, &frameLo, NULL);
+        if (frameLo > pcmFrameIndex) {
+            if (probeByte <= loByte) {
+                break;
+            }
+            hiByte = probeByte;
+            hiPCM = frameLo;
+            haveHi = MA_TRUE;
+        } else if (pcmFrameIndex - frameLo < lead * 2 || (probeByte <= loByte && frameLo <= loPCM)) {
+            /* Close enough, or no further frame can be found past the lower point: decode forward from here. */
+            if (ma_dr_flac__decode_flac_frame_and_seek_forward_by_pcm_frames(pFlac, pcmFrameIndex - pFlac->currentPCMFrame)) {
+                return MA_TRUE;
+            }
+            break;
+        } else {
+            loByte = probeByte;
+            loPCM = frameLo;
+        }
+        if (bisections > 0) {
+            bisections -= 1;
+        } else if (haveHi && (hiByte - loByte) > span/2) {
+            bisections = 2;
         }
     }
     ma_dr_flac__seek_to_first_frame(pFlac);
