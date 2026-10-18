@@ -20,12 +20,6 @@
 #define AC3_RESYNC 65536            /* junk bytes skipped looking for a frame */
 #define AC3_MAX_INDEX (1 << 24)     /* index limit: 149 hours at 32 ms per unit */
 
-/* An access unit starts at an AC-3 frame or an E-AC-3 independent frame of program 0. */
-static int starts_unit(const fa_ac3_header* h)
-{
-    return !h->eac3 || (h->strmtyp != 1 && h->substreamid == 0);
-}
-
 /* ---- codec -------------------------------------------------------------------- */
 
 typedef struct ac3_codec {
@@ -89,7 +83,7 @@ static size_t next_unit(ac3_codec* st, size_t* pos, int ending)
             (*pos)++;
             continue;
         }
-        if (!starts_unit(&h)) {
+        if (!fa_ac3_starts_unit(&h)) {
             /* A frame without its independent one (joined mid-unit): skipped whole. */
             if (h.eac3 && h.strmtyp == 1) st->has_dep = 1;
             if (h.frame_size > st->len - *pos) {
@@ -117,7 +111,7 @@ static size_t next_unit(ac3_codec* st, size_t* pos, int ending)
                 if (!ending && (q < st->len || (st->has_dep && q == *pos + h.frame_size))) return 0;
                 break;
             }
-            if (!fa_ac3_parse_header(st->buf + q, st->len - q, &n) || starts_unit(&n)) break;
+            if (!fa_ac3_parse_header(st->buf + q, st->len - q, &n) || fa_ac3_starts_unit(&n)) break;
             if (n.eac3 && n.strmtyp == 1) st->has_dep = 1;
             if (n.frame_size > st->len - q) {
                 if (!ending) return 0;
@@ -234,7 +228,7 @@ int64_t fa_ac3_packet_samples(const uint8_t* d, size_t n, uint32_t* out_rate)
     while (pos + 8 <= n) {
         fa_ac3_header h;
         if (!fa_ac3_parse_header(d + pos, n - pos, &h)) break;
-        if (starts_unit(&h)) {
+        if (fa_ac3_starts_unit(&h)) {
             samples += (int64_t)h.blocks * 256;
             *out_rate = h.rate;
         }
@@ -400,7 +394,7 @@ static fa_result raw_next(void* ctx, fa_demux_packet* out)
     for (;;) {
         r = raw_sync(a, &h);
         if (r != FA_OK) return r;
-        if (starts_unit(&h)) break;
+        if (fa_ac3_starts_unit(&h)) break;
         r = read_frame(a, &h, 0);
         if (r != FA_OK) return r;
     }
@@ -412,7 +406,7 @@ static fa_result raw_next(void* ctx, fa_demux_packet* out)
     /* What follows up to the next unit. */
     for (;;) {
         fa_ac3_header n;
-        if (!fill_h(a, 8) || !fa_ac3_parse_header(a->h, 8, &n) || starts_unit(&n)) break;
+        if (!fill_h(a, 8) || !fa_ac3_parse_header(a->h, 8, &n) || fa_ac3_starts_unit(&n)) break;
         if (len + n.frame_size > AC3_MAX_AU) break;
         if (read_frame(a, &n, len) != FA_OK) break;
         len += n.frame_size;
@@ -484,7 +478,7 @@ static int check_cbr(ac3_raw* a, const fa_ac3_header* first, int64_t* out_end)
         int64_t at = i == 0 ? 1 : i == AC3_CBR_CHECKS + 1 ? n - 1 : n * i / (AC3_CBR_CHECKS + 1);
         if (at >= n) at = n - 1;
         if (fa_br_seek(&a->br, a->data_start + at * size) != FA_OK || fa_br_read(&a->br, hb, 8) != 8 ||
-            !fa_ac3_parse_header(hb, 8, &h) || !starts_unit(&h) || h.frame_size != first->frame_size ||
+            !fa_ac3_parse_header(hb, 8, &h) || !fa_ac3_starts_unit(&h) || h.frame_size != first->frame_size ||
             h.rate != first->rate || h.blocks != first->blocks || h.eac3 != first->eac3)
             return 0;
     }
@@ -526,7 +520,7 @@ static fa_result build_index(ac3_raw* a, int64_t* out_end)
             pos = p;
         }
         if (len > 0 && pos + (int64_t)h.frame_size > len) break;   /* cut short */
-        if (starts_unit(&h)) {
+        if (fa_ac3_starts_unit(&h)) {
             if (a->nindex == cap) {
                 ac3_unit* u;
                 if (cap >= AC3_MAX_INDEX) {
@@ -570,7 +564,7 @@ static void estimate_rate(ac3_raw* a)
         if (fa_br_seek(&a->br, pos) != FA_OK || fa_br_read(&a->br, hb, 8) != 8) break;
         if (!fa_ac3_parse_header(hb, 8, &h)) break;
         bytes += (int64_t)h.frame_size;
-        if (starts_unit(&h)) samples += (int64_t)h.blocks * 256;
+        if (fa_ac3_starts_unit(&h)) samples += (int64_t)h.blocks * 256;
         pos += (int64_t)h.frame_size;
     }
     if (samples >= 4096) a->bytes_per_sample = (double)bytes / (double)samples;
@@ -600,7 +594,7 @@ static fa_result raw_open(fa_decoder* dec)
     for (;;) {
         r = raw_sync(a, &h);
         if (r != FA_OK) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
-        if (starts_unit(&h)) break;
+        if (fa_ac3_starts_unit(&h)) break;
         r = read_frame(a, &h, 0);   /* a dependent frame before the first unit */
         if (r != FA_OK) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
     }
