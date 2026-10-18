@@ -88252,6 +88252,22 @@ static ma_bool32 ma_dr_flac__seek_to_pcm_frame__brute_force(ma_dr_flac* pFlac, m
 }
 #if !defined(MA_DR_FLAC_NO_CRC)
 #define MA_DR_FLAC_BINARY_SEARCH_APPROX_COMPRESSION_RATIO 0.6f
+/* FatzAudio patch: the next frame header that fits the stream (block size, channels
+ * and sample rate), skipping the odd false sync whose CRC-8 happens to match. */
+static ma_bool32 ma_dr_flac__fa_read_next_stream_frame_header(ma_dr_flac* pFlac)
+{
+    ma_dr_flac_frame_header* h = &pFlac->currentFLACFrame.header;
+    for (;;) {
+        if (!ma_dr_flac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, h)) {
+            return MA_FALSE;
+        }
+        if (h->blockSizeInPCMFrames <= pFlac->maxBlockSizeInPCMFrames &&
+            ma_dr_flac__get_channel_count_from_channel_assignment(h->channelAssignment) == pFlac->channels &&
+            (h->sampleRate == 0 || h->sampleRate == pFlac->sampleRate)) {
+            return MA_TRUE;
+        }
+    }
+}
 static ma_bool32 ma_dr_flac__seek_to_approximate_flac_frame_to_byte(ma_dr_flac* pFlac, ma_uint64 targetByte, ma_uint64 rangeLo, ma_uint64 rangeHi, ma_uint64* pLastSuccessfulSeekOffset)
 {
     MA_DR_FLAC_ASSERT(pFlac != NULL);
@@ -88270,21 +88286,15 @@ static ma_bool32 ma_dr_flac__seek_to_approximate_flac_frame_to_byte(ma_dr_flac* 
             rangeHi = targetByte;
         } else {
             MA_DR_FLAC_ZERO_MEMORY(&pFlac->currentFLACFrame, sizeof(pFlac->currentFLACFrame));
-#if 1
-            if (!ma_dr_flac__read_and_decode_next_flac_frame(pFlac)) {
+            /* FatzAudio patch: a probe reads the frame header alone (its CRC-8 checked, and
+             * its format the stream's), not the whole frame. The frame the search ends on
+             * is decoded, and CRC-16 checked, by the caller. */
+            if (!ma_dr_flac__fa_read_next_stream_frame_header(pFlac)) {
                 targetByte = rangeLo + ((rangeHi - rangeLo)/2);
                 rangeHi = targetByte;
             } else {
                 break;
             }
-#else
-            if (!ma_dr_flac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
-                targetByte = rangeLo + ((rangeHi - rangeLo)/2);
-                rangeHi = targetByte;
-            } else {
-                break;
-            }
-#endif
         }
         if(targetByte == lastTargetByte) {
             return MA_FALSE;
@@ -88311,8 +88321,8 @@ static ma_bool32 ma_dr_flac__decode_flac_frame_and_seek_forward_by_pcm_frames(ma
  * target between the closest known points either side; when one fails to halve
  * the range (audio whose compression changes a lot, such as silence then music)
  * the next two bisect it. A file without a SEEKTABLE then seeks in
- * two or three probes instead of up to a dozen or more. Probes still fully
- * decode (and CRC-check) the frame they land on, as upstream's do. */
+ * two or three probes instead of up to a dozen or more. Probes read the frame
+ * header alone; the frame the search ends on is decoded and CRC-checked. */
 static ma_bool32 ma_dr_flac__seek_to_pcm_frame__binary_search_internal(ma_dr_flac* pFlac, ma_uint64 pcmFrameIndex, ma_uint64 byteRangeLo, ma_uint64 byteRangeHi)
 {
     /* The search starts from the frame at byteRangeLo, which the caller has made current (the first frame, or a seek point). */
@@ -88323,6 +88333,7 @@ static ma_bool32 ma_dr_flac__seek_to_pcm_frame__binary_search_internal(ma_dr_fla
     ma_uint64 hiPCM = 0;
     ma_bool32 haveHi = MA_FALSE;
     int bisections = 0;                 /* still to make before interpolating again */
+    int iFalse;
     ma_uint64 lead = (pFlac->maxBlockSizeInPCMFrames != 0) ? pFlac->maxBlockSizeInPCMFrames : 4096;
     double guessBytesPerPCMFrame = (pFlac->channels * pFlac->bitsPerSample / 8.0) * MA_DR_FLAC_BINARY_SEARCH_APPROX_COMPRESSION_RATIO;
     int iProbe;
@@ -88351,6 +88362,19 @@ static ma_bool32 ma_dr_flac__seek_to_pcm_frame__binary_search_internal(ma_dr_fla
             break;
         }
         ma_dr_flac__get_pcm_frame_range_of_current_flac_frame(pFlac, &frameLo, NULL);
+        /* A header that can't be where it was found (before the lower point, past the upper one or the
+         * end) is a false sync that passed its CRC-8: the next header instead. */
+        for (iFalse = 0; frameLo < loPCM || (haveHi && frameLo > hiPCM) ||
+                         (pFlac->totalPCMFrameCount != 0 && frameLo >= pFlac->totalPCMFrameCount); ++iFalse) {
+            if (iFalse == 16 || !ma_dr_flac__fa_read_next_stream_frame_header(pFlac)) {
+                break;
+            }
+            ma_dr_flac__get_pcm_frame_range_of_current_flac_frame(pFlac, &frameLo, NULL);
+            pFlac->currentPCMFrame = frameLo;
+        }
+        if (frameLo < loPCM || (haveHi && frameLo > hiPCM) || (pFlac->totalPCMFrameCount != 0 && frameLo >= pFlac->totalPCMFrameCount)) {
+            break;
+        }
         if (frameLo > pcmFrameIndex) {
             if (probeByte <= loByte) {
                 break;
@@ -88359,7 +88383,19 @@ static ma_bool32 ma_dr_flac__seek_to_pcm_frame__binary_search_internal(ma_dr_fla
             hiPCM = frameLo;
             haveHi = MA_TRUE;
         } else if (pcmFrameIndex - frameLo < lead * 2 || (probeByte <= loByte && frameLo <= loPCM)) {
-            /* Close enough, or no further frame can be found past the lower point: decode forward from here. */
+            /* Close enough, or no further frame can be found past the lower point: decode forward from here.
+             * The probe read only the header: the frame is decoded now (or, if it fails its CRC-16, the
+             * next good one, as long as it doesn't start past the target). */
+            if (ma_dr_flac__decode_flac_frame(pFlac) != MA_SUCCESS) {
+                if (!ma_dr_flac__read_and_decode_next_flac_frame(pFlac)) {
+                    break;
+                }
+                ma_dr_flac__get_pcm_frame_range_of_current_flac_frame(pFlac, &frameLo, NULL);
+                if (frameLo > pcmFrameIndex) {
+                    break;
+                }
+                pFlac->currentPCMFrame = frameLo;
+            }
             if (ma_dr_flac__decode_flac_frame_and_seek_forward_by_pcm_frames(pFlac, pcmFrameIndex - pFlac->currentPCMFrame)) {
                 return MA_TRUE;
             }

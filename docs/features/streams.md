@@ -25,7 +25,7 @@ Apps that demux files themselves (for example with FFmpeg, for the video) can pu
 
 ### How detection works
 
-1. The first 8 KB of the source are read once and kept, so detection works even on sources that can't seek.
+1. The first 8 KB of the source are read once and kept while the decoder opens, so detection works even on sources that can't seek. A file lets them go once the stream is open; your own read callbacks keep them, since they may not be able to go back, or not cheaply.
 2. A leading ID3v2 tag is skipped. If the tag is bigger than the 8 KB window (cover art often is), detection reads the 8 KB right after it instead. A forward-only source can't do that, so there the file name or `mime_hint` picks the decoder.
 3. Every decoder in the registry scores the data from 0 to 100: magic bytes for WAV/AIFF/FLAC/Ogg/ASF, two chained valid frame headers for MP3.
 4. The best-scoring decoder opens the stream. If it rejects the data, the next candidate gets a turn.
@@ -185,7 +185,7 @@ In .NET, `stream.PlayOn(device)` attaches (or moves) and plays, and `stream.Deta
 
 ## FLAC
 
-- Seeks are sample exact, with or without a SEEKTABLE. A file without one (FatzAudio's own FLAC encoder writes none, nor does FFmpeg's) is searched: each probe decodes one frame near where the target should be and narrows the range, and two to four probes usually find it, about a millisecond per seek. A SEEKTABLE narrows the search to the stretch between two of its points.
+- Seeks are sample exact, with or without a SEEKTABLE. A file without one (FatzAudio's own FLAC encoder writes none, nor does FFmpeg's) is searched: each probe reads one frame header near where the target should be and narrows the range, two to four probes usually find it, and only the frame the search ends on is decoded. A seek takes well under a millisecond. A SEEKTABLE narrows the search to the stretch between two of its points.
 - Audio whose compression changes sharply, such as long digital silence followed by music, can take more probes (about a dozen) but still lands exactly.
 
 ## MP3

@@ -32,7 +32,8 @@ typedef struct fa_source {
                           reading far ahead or scanning the whole file */
     int prefix_filled;
     size_t prefix_len;
-    uint8_t prefix[FA_PROBE_BYTES];
+    const uint8_t* prefix;  /* the first bytes: prefix_buf, or the memory block itself */
+    uint8_t* prefix_buf;
 } fa_source;
 
 fa_result fa_source_open_path(fa_source* src, const char* path);
@@ -42,6 +43,13 @@ fa_result fa_source_open_memory_ref(fa_source* src, const void* data, size_t siz
 fa_result fa_source_open_io(fa_source* src, const fa_io_callbacks* io, void* user);
 /* Returns the first bytes of the source (up to FA_PROBE_BYTES) without moving the read position. */
 size_t fa_source_peek(fa_source* src, const uint8_t** out_data);
+/* Frees the copy of a file's first bytes once the format is known (other sources
+ * keep theirs: memory blocks have no copy, app callbacks may not go back). A later
+ * fa_source_peek on a file reads them again, moving the file: call it only from
+ * the thread that reads the source. */
+void fa_source_drop_prefix(fa_source* src);
+/* The first bytes if they are held now (0 after fa_source_drop_prefix), never reading. */
+size_t fa_source_peek_held(const fa_source* src, const uint8_t** out_data);
 int64_t fa_source_read(fa_source* src, void* buf, size_t n); /* bytes read, 0 at end, <0 fa_result */
 fa_result fa_source_seek(fa_source* src, int64_t offset);
 int64_t fa_source_tell(const fa_source* src);

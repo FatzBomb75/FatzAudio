@@ -173,7 +173,7 @@ static buf make_mp3(uint32_t nframes, int with_id3)
 
 /* fail_at: reads at or past this byte fail (0 = never); seek_limit: seeks past it
  * are refused (0 = no limit). */
-typedef struct mem_io { const uint8_t* p; size_t n, pos; int closes; size_t fail_at, seek_limit; int seeks; } mem_io;
+typedef struct mem_io { const uint8_t* p; size_t n, pos; int closes; size_t fail_at, seek_limit; int seeks; size_t bytes; } mem_io;
 static int64_t FA_CALL io_read(void* u, void* dst, size_t bytes)
 {
     mem_io* m = (mem_io*)u;
@@ -186,6 +186,7 @@ static int64_t FA_CALL io_read(void* u, void* dst, size_t bytes)
     if (k > bytes) k = bytes;
     memcpy(dst, m->p + m->pos, k);
     m->pos += k;
+    m->bytes += k;
     return (int64_t)k;
 }
 static fa_result FA_CALL io_seek(void* u, int64_t off)
@@ -424,10 +425,11 @@ static void test_open_io_seekable(void)
  * probes (one file seek each), also where silence makes the bytes per frame jump. */
 static void test_flac_seek_search(void)
 {
-    static const struct { uint32_t quiet, seek_every, max_seeks; } cases[] = {
-        { 0, 0, 4 },            /* upstream dr_flac: up to 11 */
-        { 73 * 4096, 0, 16 },   /* silence, then the tone (upstream: up to 11) */
-        { 0, 40, 6 },           /* a point every 40 blocks, 3.7 s (upstream: up to 8) */
+    /* Probes read a frame header, not the frame: bytes read per seek, on average. */
+    static const struct { uint32_t quiet, seek_every, max_seeks, max_bytes; } cases[] = {
+        { 0, 0, 4, 56000 },            /* upstream dr_flac: up to 11; whole-frame probes: 65000 bytes */
+        { 73 * 4096, 0, 16, 120000 },  /* silence, then the tone (upstream: up to 11; whole-frame probes: 174000 bytes) */
+        { 0, 40, 6, 58000 },           /* a point every 40 blocks, 3.7 s (upstream: up to 8) */
     };
     const uint32_t frames = 600000;
     size_t q;
@@ -439,8 +441,10 @@ static void test_flac_seek_search(void)
         fa_stream* s = NULL;
         float out[2 * 64];
         uint32_t k, worst = 0;
+        size_t bytes;
         m.p = media.p; m.n = media.n;
         CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_OK);
+        bytes = m.bytes;
         for (k = 0; k < 40; k++) {
             uint32_t at = (uint32_t)(((uint64_t)k * 7919u * 4099u) % (frames - 64)), i, c;
             fa_frames got = 0;
@@ -457,8 +461,10 @@ static void test_flac_seek_search(void)
             }
             if ((uint32_t)(m.seeks - before) > worst) worst = (uint32_t)(m.seeks - before);
         }
-        printf("  case %u: at most %u file seeks per seek\n", (unsigned)q, worst);
+        bytes = (m.bytes - bytes) / 40;
+        printf("  case %u: at most %u file seeks per seek, %u bytes read per seek\n", (unsigned)q, worst, (unsigned)bytes);
         CHECK(worst <= cases[q].max_seeks);
+        CHECK(bytes <= cases[q].max_bytes);
         fa_stream_close(s);
         free(media.p);
     }

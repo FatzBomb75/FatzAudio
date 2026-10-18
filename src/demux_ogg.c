@@ -63,9 +63,8 @@ typedef struct oggs_link {
     int64_t first_gran;     /* granule where its first packet starts; OGG_NO_GRAN = not seen yet */
     int64_t last_gran;      /* granule of its last page, OGG_NO_GRAN = unknown */
     int64_t base;           /* pts of its first audible frame */
-    vorbis_info vi;         /* Vorbis: mode table for the block sizes */
-    vorbis_comment vc;
-    int vi_ready;
+    uint16_t vbs[64];       /* Vorbis: block size of an audio packet by the 6 bits after its
+                               type bit (its mode), 0 = no such mode */
     uint8_t* extra;         /* the codec's extradata: OpusHead, or the 3 Vorbis headers laced */
     size_t extra_len;
     fa_codec_params params;
@@ -101,7 +100,8 @@ typedef struct ogg {
     /* Packets completed on the current page. */
     uint8_t* qdata;
     size_t qdata_len, qdata_cap;
-    oggs_pkt q[OGG_MAX_QUEUE];
+    oggs_pkt* q;            /* grows up to OGG_MAX_QUEUE */
+    int q_cap;
     int nq, iq;
     int q_new;              /* the first packet of the latest page (the ones before were kept) */
     int keep;               /* packets the next page keeps at the front of the queue */
@@ -259,6 +259,21 @@ static fa_result page_packets(ogg* o, const oggs_page* pg)
 {
     size_t pos = 0;
     uint32_t i;
+    {
+        /* Room for the kept packets and one per segment, made before anything moves. */
+        int need = (o->keep > 0 && o->keep <= o->nq ? o->keep : 0) + pg->nseg;
+        if (need > OGG_MAX_QUEUE) need = OGG_MAX_QUEUE;
+        if (need > o->q_cap) {
+            int cap = o->q_cap ? o->q_cap : 32;
+            oggs_pkt* b;
+            while (cap < need) cap *= 2;
+            if (cap > OGG_MAX_QUEUE) cap = OGG_MAX_QUEUE;
+            b = (oggs_pkt*)realloc(o->q, sizeof(oggs_pkt) * (size_t)cap);
+            if (!b) { o->oom = 1; return FA_ERROR_OUT_OF_MEMORY; }
+            o->q = b;
+            o->q_cap = cap;
+        }
+    }
     if (o->keep > 0 && o->keep <= o->nq) {
         /* Kept from the page before: moved to the front, data and all. */
         int i0 = o->nq - o->keep, j;
@@ -341,13 +356,8 @@ static int64_t packet_duration(ogg* o, oggs_link* l, const uint8_t* d, size_t n)
         int64_t s = fa_demux_packet_samples("flac", l->channels, l->rate, d, n, &rate);
         return s < 0 ? 0 : s;       /* metadata or a corrupt frame: no samples */
     } else {
-        ogg_packet op;
-        long bs;
         int64_t dur;
-        memset(&op, 0, sizeof(op));
-        op.packet = (unsigned char*)d;
-        op.bytes = (long)n;
-        bs = n > 0 && !(d[0] & 1) ? vorbis_packet_blocksize(&l->vi, &op) : -1;
+        int bs = n > 0 && !(d[0] & 1) ? l->vbs[(d[0] >> 1) & 63] : 0;
         if (bs <= 0) return 0;      /* not an audio packet: no samples */
         dur = o->prev_bs < 0 ? -1 : o->prev_bs == 0 ? 0 : (o->prev_bs + bs) / 4;
         o->prev_bs = (int)bs;
@@ -410,11 +420,53 @@ static void time_packets(ogg* o, oggs_link* l, const oggs_page* pg)
     }
 }
 
+/* Parses the three Vorbis headers for the link's format and its mode table, then
+ * lets libvorbis's copy go (the codec parses its own): only the block size of
+ * each mode is kept. libvorbis reads a packet's mode from the bits right after
+ * its type bit, at most 6 of them (64 modes), all in the first byte; asking it
+ * about a one-byte packet for each of the 64 values gives the table. */
+static fa_result vorbis_setup(oggs_link* l, uint8_t* const hdr[3], const size_t hlen[3])
+{
+    vorbis_info vi;
+    vorbis_comment vc;
+    fa_result r = FA_OK;
+    int i;
+    vorbis_info_init(&vi);
+    vorbis_comment_init(&vc);
+    for (i = 0; i < 3 && r == FA_OK; i++) {
+        ogg_packet op;
+        memset(&op, 0, sizeof(op));
+        op.packet = hdr[i];
+        op.bytes = (long)hlen[i];
+        op.b_o_s = i == 0;
+        op.packetno = i;
+        if (hlen[i] > 0x7FFFFFFF || vorbis_synthesis_headerin(&vi, &vc, &op) != 0) r = FA_ERROR_UNSUPPORTED_FORMAT;
+    }
+    if (r == FA_OK && (vi.rate <= 0 || vi.channels <= 0)) r = FA_ERROR_UNSUPPORTED_FORMAT;
+    if (r == FA_OK) {
+        l->rate = (uint32_t)vi.rate;
+        l->channels = (uint32_t)vi.channels;
+        l->long_block = vorbis_info_blocksize(&vi, 1);
+        for (i = 0; i < 64; i++) {
+            unsigned char b = (unsigned char)(i << 1);
+            ogg_packet op;
+            long bs;
+            memset(&op, 0, sizeof(op));
+            op.packet = &b;
+            op.bytes = 1;
+            bs = vorbis_packet_blocksize(&vi, &op);
+            l->vbs[i] = (uint16_t)(bs > 0 && bs <= 65535 ? bs : 0);
+        }
+    }
+    vorbis_comment_clear(&vc);
+    vorbis_info_clear(&vi);
+    return r;
+}
+
 /* ---- links -------------------------------------------------------------------------------- */
 
 static void link_free(oggs_link* l)
 {
-    if (l->vi_ready) { vorbis_comment_clear(&l->vc); vorbis_info_clear(&l->vi); }
     free(l->extra);
     memset(l, 0, sizeof(*l));
 }
@@ -591,27 +643,8 @@ static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_ta
     } else {
         size_t n = 1, k;
         uint8_t* e;
-        vorbis_info_init(&l->vi);
-        vorbis_comment_init(&l->vc);
-        l->vi_ready = 1;
-        for (i = 0; i < 3; i++) {
-            ogg_packet op;
-            memset(&op, 0, sizeof(op));
-            op.packet = hdr[i];
-            op.bytes = (long)hlen[i];
-            op.b_o_s = i == 0;
-            op.packetno = i;
-            if (hlen[i] > 0x7FFFFFFF || vorbis_synthesis_headerin(&l->vi, &l->vc, &op) != 0) {
-                r = FA_ERROR_UNSUPPORTED_FORMAT;
-                goto done;
-            }
-        }
-        if (l->vi.rate <= 0 || l->vi.channels <= 0) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
-        l->rate = (uint32_t)l->vi.rate;
-        l->channels = (uint32_t)l->vi.channels;
-        l->long_block = vorbis_info_blocksize(&l->vi, 1);
-        vorbis_comment_clear(&l->vc);              /* read below from the packet itself */
-        vorbis_comment_init(&l->vc);
+        r = vorbis_setup(l, hdr, hlen);
+        if (r != FA_OK) goto done;
         if (hlen[1] > 7) {
             comment_title(hdr[1] + 7, hlen[1] - 7, title, sizeof(title));
             if (tags) fa_tags_parse_vorbis_comments(hdr[1] + 7, hlen[1] - 7, tags);
@@ -858,6 +891,7 @@ static void ogg_free(ogg* o)
     free(o->links);
     free(o->pend);
     free(o->qdata);
+    free(o->q);
     free(o->body);
     fa_br_free(&o->br);
     free(o);

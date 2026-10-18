@@ -65,7 +65,7 @@ fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint
     if (count > 16) count = 16;
     memset(dec, 0, sizeof(*dec));
     n = fa_source_peek(src, &head);
-    if (n == 0) return src->length == 0 ? FA_ERROR_UNSUPPORTED_FORMAT : FA_ERROR_IO;
+    if (n == 0) return src->length == 0 ? FA_ERROR_UNSUPPORTED_FORMAT : !src->prefix_filled ? FA_ERROR_OUT_OF_MEMORY : FA_ERROR_IO;
     id3 = fa_probe_id3v2_size(head, n);
     if (id3 > 0 && id3 + 16 > n) {
         /* A tag (usually cover art) fills the window. Look right after it when the

@@ -113,19 +113,46 @@ size_t fa_source_peek(fa_source* src, const uint8_t** out_data)
         src->prefix_filled = 1;
         if (src->kind == FA_SOURCE_MEMORY) {
             got = (int64_t)(src->mem_size < FA_PROBE_BYTES ? src->mem_size : FA_PROBE_BYTES);
-            memcpy(src->prefix, src->mem, (size_t)got);
-        } else if (src->kind == FA_SOURCE_FILE) {
-            file_seek(src->file, 0, SEEK_SET);
-            got = (int64_t)fread(src->prefix, 1, FA_PROBE_BYTES, src->file);
-            file_seek(src->file, src->pos, SEEK_SET);
-        } else if (src->pos == 0 && src->raw_pos == 0) {
-            got = io_read_raw(src, src->prefix, FA_PROBE_BYTES);
-            if (got < 0) got = 0;
+            src->prefix = src->mem;
+        } else if (src->kind == FA_SOURCE_FILE || (src->pos == 0 && src->raw_pos == 0)) {
+            src->prefix_buf = (uint8_t*)malloc(FA_PROBE_BYTES);
+            src->prefix = src->prefix_buf;
+            if (!src->prefix_buf) {
+                src->prefix_filled = 0;  /* out of memory: fa_decoder_open says so */
+                got = 0;
+            } else if (src->kind == FA_SOURCE_FILE) {
+                file_seek(src->file, 0, SEEK_SET);
+                got = (int64_t)fread(src->prefix_buf, 1, FA_PROBE_BYTES, src->file);
+                file_seek(src->file, src->pos, SEEK_SET);
+            } else {
+                got = io_read_raw(src, src->prefix_buf, FA_PROBE_BYTES);
+                if (got < 0) got = 0;
+            }
         }
         src->prefix_len = (size_t)got;
     }
     *out_data = src->prefix;
     return src->prefix_len;
+}
+
+size_t fa_source_peek_held(const fa_source* src, const uint8_t** out_data)
+{
+    *out_data = src->prefix;
+    return src->prefix_filled ? src->prefix_len : 0;
+}
+
+void fa_source_drop_prefix(fa_source* src)
+{
+    /* A memory block's are the block itself. App callbacks keep theirs: they may
+     * not go back, and where they can, a seek can cost more than 8 KB (a network
+     * behind the app's stream); reads near the start (FLAC goes back to its first
+     * frame on every seek) are served from the copy. */
+    if (src->kind != FA_SOURCE_FILE) return;
+    free(src->prefix_buf);
+    src->prefix_buf = NULL;
+    src->prefix = NULL;
+    src->prefix_len = 0;
+    src->prefix_filled = 0;
 }
 
 int64_t fa_source_read(fa_source* src, void* buf, size_t n)
@@ -244,5 +271,6 @@ void fa_source_close(fa_source* src)
     if (src->kind == FA_SOURCE_FILE && src->file) fclose(src->file);
     if (src->kind == FA_SOURCE_IO && src->io.close) src->io.close(src->io_user);
     free(src->owned);
+    free(src->prefix_buf);
     memset(src, 0, sizeof(*src));
 }
