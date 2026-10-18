@@ -60,7 +60,9 @@ Rules:
 |---|---|
 | WAV/AIFF/W64/RF64, MP3, FLAC | dr_wav, dr_mp3, dr_flac (PD/MIT-0), hardened (see below) |
 | Ogg Vorbis, Opus | libvorbis/stb_vorbis, libopus + opusfile (BSD) |
-| AAC-LC/HE-AAC/xHE, ALAC | OS codec (Media Foundation, AudioToolbox, MediaCodec); FFmpeg bridge on Linux |
+| AAC-LC, HE-AAC, HE-AAC v2, AAC Main, AAC-LTP | Built-in decoder written from the public specs (src/aac.c, aac_sbr.c, aac_ps.c), up to 7.1, same on every platform, no FFmpeg |
+| xHE-AAC (USAC) | OS codec where there is one (Media Foundation, AudioToolbox, MediaCodec), otherwise unsupported (never FFmpeg) |
+| ALAC | Built-in decoder |
 | **AC-3, E-AC-3 (DD+), incl. Atmos-in-DD+ core** | Built-in decoder written from the public specs (src/ac3.c), up to 7.1; FFmpeg only for the rare AHT/enhanced-coupling frames; **passthrough** (IEC 61937 bitstream over HDMI/S/PDIF) planned |
 | **TrueHD, DTS / DTS-HD** | Passthrough + FFmpeg bridge. No OS decodes these reliably |
 | WMA | Media Foundation on Windows, FFmpeg bridge elsewhere |

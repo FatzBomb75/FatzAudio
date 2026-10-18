@@ -588,8 +588,7 @@ void fa_track_close(fa_track* t)
 
 /* ---- AAC ---------------------------------------------------------------------------- */
 
-const uint32_t fa_aac_rates[13] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000,
-                                        22050, 16000, 12000, 11025, 8000, 7350 };
+/* fa_aac_rates is in aac.c. */
 
 typedef struct bitw { uint8_t* p; size_t bit; } bitw;
 

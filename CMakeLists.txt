@@ -57,6 +57,10 @@ set(FA_SOURCES
     src/codec.c
     src/ac3.c
     src/dec_ac3.c
+    src/aac.c
+    src/aac_sbr.c
+    src/aac_ps.c
+    src/aac_tables.c
     src/dec_midi.c
     src/tinysoundfont_impl.c
     src/mdct.c

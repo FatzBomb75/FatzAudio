@@ -1042,6 +1042,11 @@ fa_result fa_xiph_codec_open(fa_codec* c, const fa_codec_params* p);
 /* Splits Vorbis extradata (Xiph lacing, or 16-bit lengths) into its three headers. */
 int fa_xiph_split_headers(const uint8_t* p, size_t n, const uint8_t* out[3], size_t out_len[3]);
 
+/* aac.c: the built-in AAC codec (AAC-LC, HE-AAC, HE-AAC v2): ADTS frames, or raw
+ * access units after an AudioSpecificConfig in the extradata.
+ * FA_ERROR_UNSUPPORTED_FORMAT for a configuration it does not decode (xHE-AAC). */
+fa_result fa_aac_codec_open(fa_codec* c, const fa_codec_params* p);
+
 /* dec_ac3.c: the built-in Dolby Digital / Dolby Digital Plus codec, and the
  * samples in an AC-3 or E-AC-3 packet from its frame headers (-1 if none). */
 fa_result fa_ac3_codec_open(fa_codec* c, const fa_codec_params* p);
