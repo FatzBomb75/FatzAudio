@@ -535,30 +535,41 @@ static int read_source(fa_tags* t, fa_source* src, const char* name, uint32_t fl
     return 1;
 }
 
-/* A karaoke ZIP: the audio entry (the one named like the .cdg first). */
-static fa_result read_zip(fa_tags* t, const uint8_t* zip, size_t size, uint32_t flags)
+/* A karaoke ZIP: the audio entry (the one named like the .cdg first). A stored
+ * entry is read in place, through a window on `src`. */
+static fa_result read_zip(fa_tags* t, fa_source* src, uint32_t flags)
 {
     fa_zip_entry* e;
     uint32_t count, i, pass;
     int cdg = -1, ok;
-    fa_result r = fa_zip_list(zip, size, &e, &count);
+    int64_t size = src->length;
+    fa_result r = fa_zip_list(src, &e, &count);
     if (r != FA_OK) return FA_OK;        /* not readable: no tags */
     for (i = 0; i < count && cdg < 0; i++) if (fa_cdg_is_cdg_name(e[i].name)) cdg = (int)i;
     for (pass = 0; pass < 2; pass++) {
         for (i = 0; i < count; i++) {
-            uint8_t* audio;
-            fa_source src;
             size_t stem = cdg >= 0 ? strlen(e[cdg].name) - 4 : 0;
             int preferred = cdg >= 0 && strncmp(e[i].name, e[cdg].name, stem) == 0 && e[i].name[stem] == '.';
+            int64_t offset;
             if ((int)i == cdg || fa_cdg_is_cdg_name(e[i].name) || preferred != (pass == 0) || e[i].size == 0) continue;
-            if (fa_zip_extract(zip, size, &e[i], &audio) != FA_OK) continue;
-            fa_source_open_memory_ref(&src, audio, (size_t)e[i].size);
-            /* Not audio (a text file in the archive): the next entry. */
-            ok = read_source(t, &src, e[i].name, flags, 1);
-            fa_source_close(&src);
-            free(audio);
+            if (e[i].method == 0) {
+                if (fa_zip_entry_offset(src, &e[i], &offset) != FA_OK ||
+                    fa_source_set_window(src, offset, (int64_t)e[i].size) != FA_OK)
+                    continue;
+                /* Not audio (a text file in the archive): the next entry. */
+                ok = read_source(t, src, e[i].name, flags, 1);
+                fa_source_set_window(src, 0, size);
+            } else {
+                uint8_t* audio;
+                fa_source mem;
+                if (fa_zip_extract(src, &e[i], FA_ZIP_DEFAULT_MEMORY_LIMIT, &audio) != FA_OK) continue;
+                fa_source_open_memory_ref(&mem, audio, (size_t)e[i].size);
+                ok = read_source(t, &mem, e[i].name, flags, 1);
+                fa_source_close(&mem);
+                free(audio);
+            }
             if (!ok) continue;
-            if (t->have_info) { t->info.has_cdg = cdg >= 0; t->info.file_size = (int64_t)size; }
+            if (t->have_info) { t->info.has_cdg = cdg >= 0; t->info.file_size = size; }
             free(e);
             return FA_OK;
         }
@@ -571,17 +582,7 @@ static fa_result read_any(fa_tags* t, fa_source* src, const char* path, uint32_t
 {
     const uint8_t* head;
     size_t n = fa_source_peek(src, &head);
-    if (fa_zip_probe(head, n)) {
-        uint8_t* bytes = NULL;
-        size_t size = 0;
-        fa_result r;
-        if (src->kind == FA_SOURCE_MEMORY) return read_zip(t, src->mem, src->mem_size, flags);
-        r = fa_source_read_all(src, FA_ZIP_MAX_BYTES, &bytes, &size);
-        if (r != FA_OK) return FA_OK;
-        r = read_zip(t, bytes, size, flags);
-        free(bytes);
-        return r;
-    }
+    if (fa_zip_probe(head, n)) return read_zip(t, src, flags);
     read_source(t, src, path, flags, 0);
     if (t->have_info && path) {
         fa_cdg_data* g = fa_cdg_find_sibling(path);
@@ -639,11 +640,12 @@ FA_API fa_result FA_CALL fa_stream_get_tags(fa_stream* stream, uint32_t flags, f
      * belongs to its decode thread. Memory blocks stay fixed while the stream is open. */
     if (stream->path || stream->source.kind == FA_SOURCE_MEMORY) {
         fa_source src;
-        r = stream->path ? fa_source_open_path(&src, stream->path)
+        /* A stored ZIP entry is reopened as its bytes in the archive. */
+        r = stream->path ? fa_source_open_path_window(&src, stream->path, stream->path_offset, stream->path_length)
                          : fa_source_open_memory_ref(&src, stream->source.mem, stream->source.mem_size);
         if (r == FA_OK) {
             /* A ZIP (MP3+G) gives the tags of the audio file inside it. */
-            r = read_any(t, &src, NULL, flags | FA_TAGS_NO_INFO);
+            r = read_any(t, &src, stream->path_name[0] ? stream->path_name : NULL, flags | FA_TAGS_NO_INFO);
             fa_source_close(&src);
         }
     }

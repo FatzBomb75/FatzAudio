@@ -35,7 +35,7 @@ If nothing matches, the open returns `FA_ERROR_UNSUPPORTED_FORMAT`.
 
 Protected content returns `FA_ERROR_PROTECTED_CONTENT` instead, so the app can tell the user the file is copy-protected rather than broken. That covers DRM-protected WMA/ASF, MP4/M4A with Common Encryption (`enca`) or iTunes FairPlay (`drms`), Matroska/WebM tracks with ContentEncryption, and HLS with `SAMPLE-AES` or another DRM key method. FatzAudio never decrypts these: the licences live with the platform's DRM components.
 
-Karaoke files: a ZIP archive opened with `fa_stream_open_path` or `fa_stream_open_memory` plays the audio file inside it, and `fa_stream_open_path` on an audio file also loads a `.cdg` of the same name next to it (turn that off with `FA_OPEN_NO_CDG`). See [CD+G](cdg.md).
+Karaoke files: a ZIP archive opened with `fa_stream_open_path`, `fa_stream_open_memory` or `fa_stream_open_io` plays the audio file inside it, and `fa_stream_open_path` on an audio file also loads a `.cdg` of the same name next to it (turn that off with `FA_OPEN_NO_CDG`). See [CD+G](cdg.md).
 
 ## C
 

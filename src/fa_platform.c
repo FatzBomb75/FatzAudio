@@ -7,12 +7,15 @@
 #endif
 #include "fa_platform.h"
 #include <stdlib.h>
+#include <string.h>
 
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
+#  include <fcntl.h>
+#  include <io.h>
 
 int fa_mutex_init(fa_mutex* m)
 {
@@ -121,6 +124,62 @@ int fa_replace_file(const char* from, const char* to)
     free(wf); free(wt);
     return ok ? 0 : -1;
 }
+/* "fa-<process>-<n>.tmp", opened exclusively with delete-on-close: Windows removes
+ * it when the handle closes, also when the process dies. */
+FILE* fa_temp_file_create(const char* folder)
+{
+    static fa_atomic32 counter;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    FILE* f;
+    int attempt, fd;
+    for (attempt = 0; attempt < 64 && h == INVALID_HANDLE_VALUE; attempt++) {
+        char path[1024];
+        wchar_t* wp;
+        if (snprintf(path, sizeof(path), "%s/fa-%lu-%ld.tmp", folder, (unsigned long)GetCurrentProcessId(),
+                     (long)fa_fetch_add32(&counter, 1)) >= (int)sizeof(path))
+            return NULL;
+        wp = widen(path);
+        if (!wp) return NULL;
+        h = CreateFileW(wp, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_NEW,
+                        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+        free(wp);
+        if (h == INVALID_HANDLE_VALUE && GetLastError() != ERROR_FILE_EXISTS) return NULL;
+    }
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    fd = _open_osfhandle((intptr_t)h, _O_RDWR | _O_BINARY);
+    if (fd < 0) { CloseHandle(h); return NULL; }
+    f = _fdopen(fd, "w+b");
+    if (!f) _close(fd);
+    return f;
+}
+
+/* Files still open (another process's) cannot be deleted: only leftovers go. */
+void fa_temp_folder_sweep(const char* folder)
+{
+    char pattern[1024];
+    wchar_t* wp;
+    WIN32_FIND_DATAW fd;
+    HANDLE find;
+    size_t dir_len;
+    if (snprintf(pattern, sizeof(pattern), "%s/fa-*.tmp", folder) >= (int)sizeof(pattern)) return;
+    wp = widen(pattern);
+    if (!wp) return;
+    dir_len = wcslen(wp) - wcslen(L"fa-*.tmp");
+    find = FindFirstFileW(wp, &fd);
+    if (find != INVALID_HANDLE_VALUE) {
+        do {
+            size_t n = wcslen(fd.cFileName);
+            wchar_t* full = (wchar_t*)malloc((dir_len + n + 1) * sizeof(wchar_t));
+            if (!full || (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) { free(full); continue; }
+            memcpy(full, wp, dir_len * sizeof(wchar_t));
+            memcpy(full + dir_len, fd.cFileName, (n + 1) * sizeof(wchar_t));
+            DeleteFileW(full);
+            free(full);
+        } while (FindNextFileW(find, &fd));
+        FindClose(find);
+    }
+    free(wp);
+}
 int64_t fa_monotonic_ns(void)
 {
     static LARGE_INTEGER freq;
@@ -137,6 +196,7 @@ int64_t fa_monotonic_ns(void)
 #  include <unistd.h>
 #  include <sys/stat.h>
 #  include <sys/types.h>
+#  include <dirent.h>
 
 int fa_mutex_init(fa_mutex* m)
 {
@@ -246,6 +306,40 @@ int64_t fa_monotonic_ns(void)
 FILE* fa_fopen_utf8(const char* path, const char* mode) { return fopen(path, mode); }
 int fa_mkdir_utf8(const char* path) { return (mkdir(path, 0777) == 0 || errno == EEXIST) ? 0 : -1; }
 int fa_replace_file(const char* from, const char* to) { return rename(from, to) == 0 ? 0 : -1; }
+
+/* The name is removed as soon as the file exists: it goes away with the last
+ * descriptor, also when the process dies. */
+FILE* fa_temp_file_create(const char* folder)
+{
+    char path[1024];
+    int fd;
+    FILE* f;
+    if (snprintf(path, sizeof(path), "%s/fa-XXXXXX", folder) >= (int)sizeof(path)) return NULL;
+    fd = mkstemp(path);
+    if (fd < 0) return NULL;
+    unlink(path);
+    f = fdopen(fd, "w+b");
+    if (!f) close(fd);
+    return f;
+}
+
+/* Names live only for a moment (see above), so a leftover is one that survived a
+ * crash between mkstemp and unlink. Young ones may be another process's. */
+void fa_temp_folder_sweep(const char* folder)
+{
+    DIR* d = opendir(folder);
+    struct dirent* ent;
+    time_t now = time(NULL);
+    if (!d) return;
+    while ((ent = readdir(d)) != NULL) {
+        char path[1024];
+        struct stat st;
+        if (strncmp(ent->d_name, "fa-", 3) != 0 || strlen(ent->d_name) != 9) continue;
+        if (snprintf(path, sizeof(path), "%s/%s", folder, ent->d_name) >= (int)sizeof(path)) continue;
+        if (lstat(path, &st) == 0 && S_ISREG(st.st_mode) && now - st.st_mtime > 60) unlink(path);
+    }
+    closedir(d);
+}
 #endif
 
 void fa_lazy_mutex_lock(fa_lazy_mutex* l)

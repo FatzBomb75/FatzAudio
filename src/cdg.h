@@ -15,15 +15,25 @@ typedef struct fa_zip_entry {
     uint64_t header_offset;  /* of the local file header */
 } fa_zip_entry;
 
-#define FA_ZIP_MAX_BYTES ((size_t)1 << 30)   /* archives are read into memory */
+/* Compressed entries are unpacked into memory up to this size unless the engine
+ * says otherwise (fa_engine_config.zip_memory_limit_mb). */
+#define FA_ZIP_DEFAULT_MEMORY_LIMIT ((uint64_t)256 << 20)
 
 /* 1 when `data` starts like a ZIP archive. */
 int fa_zip_probe(const uint8_t* data, size_t size);
-/* Reads the central directory. *out_entries is malloc'ed (free it), directories are
- * skipped. FA_ERROR_UNSUPPORTED_FORMAT for damaged, encrypted or ZIP64 archives. */
-fa_result fa_zip_list(const uint8_t* zip, size_t zip_size, fa_zip_entry** out_entries, uint32_t* out_count);
-/* Extracts one entry into a malloc'ed buffer, CRC checked. */
-fa_result fa_zip_extract(const uint8_t* zip, size_t zip_size, const fa_zip_entry* entry, uint8_t** out_data);
+/* Reads the central directory of the archive `src` (seekable, known length): the
+ * end of the file and the directory only. *out_entries is malloc'ed (free it),
+ * directories are skipped. FA_ERROR_UNSUPPORTED_FORMAT for damaged, encrypted or
+ * ZIP64 archives, FA_ERROR_NOT_SEEKABLE for a source that cannot seek. */
+fa_result fa_zip_list(fa_source* src, fa_zip_entry** out_entries, uint32_t* out_count);
+/* Where entry `e`'s data starts in `src`, after checking its local header. */
+fa_result fa_zip_entry_offset(fa_source* src, const fa_zip_entry* e, int64_t* out_offset);
+/* Unpacks one entry into a malloc'ed buffer, CRC checked. FA_ERROR_TOO_LARGE when
+ * it is bigger than max_size. */
+fa_result fa_zip_extract(fa_source* src, const fa_zip_entry* e, uint64_t max_size, uint8_t** out_data);
+/* Unpacks one entry into `f` (written from its current position), CRC checked;
+ * memory use stays at about 1 MB whatever the size. */
+fa_result fa_zip_extract_file(fa_source* src, const fa_zip_entry* e, FILE* f);
 /* Raw DEFLATE (RFC 1951). FA_OK only when the stream ends exactly at out_size bytes. */
 fa_result fa_inflate(const uint8_t* in, size_t in_size, uint8_t* out, size_t out_size);
 uint32_t fa_crc32(const uint8_t* data, size_t size);

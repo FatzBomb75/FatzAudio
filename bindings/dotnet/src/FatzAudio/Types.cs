@@ -396,6 +396,15 @@ public sealed record AudioEngineOptions
     /// </summary>
     public string? CacheDirectory { get; init; }
     /// <summary>
+    /// Where compressed songs in ZIP archives (MP3+G) too big for <see cref="ZipMemoryLimitMb"/> are
+    /// unpacked, in a <c>fatzaudio-tmp</c> folder inside it. The files are deleted when the stream
+    /// closes, also if the app crashes. Null (the default) never writes temp files: such archives
+    /// fail with <see cref="ErrorCode.TooLarge"/>. Uncompressed entries always play straight from the archive.
+    /// </summary>
+    public string? TempDirectory { get; init; }
+    /// <summary>Compressed ZIP entries up to this many MB are unpacked into memory; 0 uses 256.</summary>
+    public int ZipMemoryLimitMb { get; init; }
+    /// <summary>
     /// Output devices play into a silent output that still runs in real time. Use it for automated
     /// tests, build servers without audio hardware, and headless services.
     /// </summary>
