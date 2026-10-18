@@ -1,18 +1,22 @@
-/* The DCT-IV behind the inverse MDCT (mdct.c). */
+/* The DCT-IV behind the inverse MDCT (mdct.c), for every transform codec. */
 #ifndef FA_MDCT_H
 #define FA_MDCT_H
 
 #include "fa_internal.h"
+#include "fa_vorbis_imdct.h"
 
 typedef struct fa_mdct {
-    int m;           /* coefficients in, 2m samples out */
-    float* twiddle;  /* m/2 complex rotations before the FFT */
-    float* post;     /* and after it */
-    float* fft_tw;   /* FFT roots, per radix-4 pass */
-    int* rev;        /* bit reversal of m/2 */
-    float* work;     /* m/2 complex */
+    int m;                 /* coefficients in, 2m samples out */
+    const float* twiddle;  /* m/2 complex rotations before the FFT */
+    const float* post;     /* and after it */
+    const float* fft_tw;   /* FFT roots, per radix-4 pass */
+    const int* rev;        /* bit reversal of m/2 */
+    float* work;           /* m/2 complex, this transform's own */
 } fa_mdct;
 
+/* m: a power of two from 4 to 2^20. The tables are computed once per size and
+ * shared by every transform of that size (they stay until the process ends); only
+ * the work buffer is per transform. */
 fa_result fa_imdct_init(fa_mdct* t, int m);
 void fa_imdct_free(fa_mdct* t);
 /* u[j] = sum_k in[k] cos(pi/m (j + 1/2)(k + 1/2)), j = 0..m-1 (DCT-IV, no scaling).

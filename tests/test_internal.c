@@ -6,6 +6,7 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include "fa_internal.h"
+#include "mdct.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -928,6 +929,47 @@ static void test_counters_wrap(void)
     rec_free(&rec);
 }
 
+/* libvorbis's inverse MDCT through FatzAudio's (third_party/XIPH.md), in place:
+ * x[0..n/2) coefficients in, x[0..n) = sum_k c[k] cos(2 pi/n (j + 1/2 + n/4)(k + 1/2))
+ * out, for every Vorbis block size; two transforms of a size share their tables. */
+static void test_vorbis_imdct(void)
+{
+    int n;
+    for (n = 64; n <= 8192; n *= 2) {
+        int m = n / 2, j, k, t;
+        float* x = (float*)malloc(sizeof(float) * (size_t)n * 2);
+        double* c = (double*)malloc(sizeof(double) * (size_t)m);
+        void* tr[2];
+        double err = 0, pow_ = 0;
+        tr[0] = fa_vorbis_imdct_create(n);
+        tr[1] = fa_vorbis_imdct_create(n);
+        CHECK(x && c && tr[0] && tr[1]);
+        for (t = 0; t < 2; t++) {
+            for (k = 0; k < m; k++) c[k] = sin(k * 0.731 + t) * (1.0 + (k % 5)) / (1.0 + k * 0.01);
+            for (k = 0; k < m; k++) x[k] = (float)c[k];
+            for (k = m; k < 2 * n; k++) x[k] = 12345.0f;     /* overwritten below n, left past it */
+            fa_vorbis_imdct(tr[t], x);
+            for (j = 0; j < n; j++) {
+                double want = 0;
+                for (k = 0; k < m; k++) want += c[k] * cos(3.14159265358979323846 / m * (j + 0.5 + m / 2.0) * (k + 0.5));
+                err += (x[j] - want) * (x[j] - want);
+                pow_ += want * want;
+            }
+            for (k = n; k < 2 * n; k++) CHECK(x[k] == 12345.0f);
+        }
+        if (10 * log10(err / pow_) > -100) {
+            fprintf(stderr, "  n %d: error %.1f dB\n", n, 10 * log10(err / pow_));
+            CHECK(0);
+        }
+        /* One set of tables per size. */
+        CHECK(((fa_mdct*)tr[0])->twiddle == ((fa_mdct*)tr[1])->twiddle && ((fa_mdct*)tr[0])->work != ((fa_mdct*)tr[1])->work);
+        fa_vorbis_imdct_free(tr[0]);
+        fa_vorbis_imdct_free(tr[1]);
+        free(x);
+        free(c);
+    }
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -966,6 +1008,7 @@ int main(void)
     RUN(test_publishing_audio_event_holds_later_ones);
     RUN(test_counters_wrap);
     RUN(test_full_queue_never_drops);
+    RUN(test_vorbis_imdct);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);
