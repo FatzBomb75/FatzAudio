@@ -350,6 +350,30 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_engine_set_soundfont(EngineHandle engine, nint font);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_tracker_info(StreamHandle stream, FaTrackerInfo* info);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_tracker_text(StreamHandle stream, int type, uint index, byte* buffer, nuint capacity, nuint* length);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_tracker_time(StreamHandle stream, uint order, uint row, out double seconds);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_seek_tracker(StreamHandle stream, uint order, uint row);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_tracker_param(StreamHandle stream, int param, int value);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_tracker_param(StreamHandle stream, int param, out int value);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_tracker_channel_mute(StreamHandle stream, uint channel, int muted);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_tracker_channel_mute(StreamHandle stream, uint channel, out int muted);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_midi_info(StreamHandle stream, FaMidiInfo* info);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

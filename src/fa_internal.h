@@ -125,7 +125,7 @@ struct fa_decoder {
     fa_atomic32* dynamic_range;
     /* MIDI, from fa_decoder_open's env (wrapping decoders such as HLS pass both on). */
     struct fa_soundfont* soundfont;   /* borrowed, NULL = none */
-    uint32_t midi_rate;               /* MIDI: output rate */
+    uint32_t midi_rate;               /* MIDI and tracker modules: output rate */
     /* Properties (fa_stream_info), set by the decoder when it knows them;
      * fa_decoder_open fills the rest in for whole-file formats. */
     int64_t audio_bytes;              /* coded audio data, -1 = unknown */
@@ -140,7 +140,7 @@ typedef struct fa_decoder_env {
                                          NULL = full range */
     struct fa_soundfont* soundfont;   /* MIDI: the instruments (the caller keeps it alive
                                          while the decoder is open), NULL = none */
-    uint32_t midi_rate;               /* MIDI: output rate, 0 = FA_MIDI_DEFAULT_RATE */
+    uint32_t midi_rate;               /* MIDI and tracker modules: output rate, 0 = FA_MIDI_DEFAULT_RATE */
 } fa_decoder_env;
 
 /* Detects the format of `src` and opens the matching decoder. `name_hint` (a path
@@ -210,6 +210,8 @@ extern const fa_decoder_vtable fa_decoder_ac3;
 extern const fa_decoder_vtable fa_decoder_adts;
 /* Standard MIDI Files and RIFF MIDI, synthesized with a soundfont (dec_midi.c). */
 extern const fa_decoder_vtable fa_decoder_midi;
+/* Tracker modules, played by libopenmpt (dec_tracker.c). */
+extern const fa_decoder_vtable fa_decoder_tracker;
 /* ASF / Windows Media Audio (demux_asf.c). */
 extern const fa_decoder_vtable fa_decoder_asf;
 
@@ -219,6 +221,7 @@ int fa_probe_wav(const uint8_t* data, size_t size, size_t id3_size);
 int fa_probe_flac(const uint8_t* data, size_t size, size_t id3_size);
 int fa_probe_mp3(const uint8_t* data, size_t size, size_t id3_size);
 int fa_probe_midi(const uint8_t* data, size_t size, size_t id3_size);
+int fa_probe_tracker(const uint8_t* data, size_t size, size_t id3_size);
 /* First MPEG audio Layer III frame at or after `start`: bitrate (kbps), sample rate.
  * 0 if none is found in the window. */
 int fa_probe_mp3_header(const uint8_t* data, size_t size, size_t start, uint32_t* out_kbps, uint32_t* out_rate);
@@ -247,6 +250,8 @@ uint32_t fa_engine_midi_rate(const fa_engine* engine);
 
 /* The MIDI state of an open MIDI decoder, NULL for other decoders. */
 struct fa_midi* fa_midi_of(fa_decoder* dec);
+/* The decoder's tracker state, or NULL when it is not a tracker module. */
+struct fa_tracker* fa_tracker_of(fa_decoder* dec);
 /* Frames of the text events, sorted, fixed while the decoder is open (read by the
  * audio thread to raise FA_EVENT_MIDI_TEXT). */
 const fa_frames* fa_midi_text_frames(const struct fa_midi* m, uint32_t* out_count);
@@ -1056,6 +1061,7 @@ struct fa_stream {
      * formats or none) and the decoder's MIDI state (live controls, texts). */
     struct fa_soundfont* soundfont;
     struct fa_midi* midi;
+    struct fa_tracker* tracker;  /* tracker modules: the decoder's state (dec_tracker.c) */
 
     struct fa_stream* next;      /* engine->streams or engine->graveyard */
 };

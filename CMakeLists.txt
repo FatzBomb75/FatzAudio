@@ -71,6 +71,7 @@ set(FA_SOURCES
     src/aac_ps.c
     src/aac_tables.c
     src/dec_midi.c
+    src/dec_tracker.c
     src/dls.c
     src/tinysoundfont_impl.c
     src/mdct.c
@@ -143,8 +144,9 @@ else()
 endif()
 
 include(third_party/xiph.cmake)
+include(third_party/libopenmpt.cmake)
 add_library(fatzaudio SHARED ${FA_SOURCES})
-target_link_libraries(fatzaudio PRIVATE fa_opus fa_vorbis)
+target_link_libraries(fatzaudio PRIVATE fa_opus fa_vorbis fa_openmpt)
 set_source_files_properties(src/stretch.cpp PROPERTIES
     INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/third_party/signalsmith)
 # One self-contained binary: no compiler runtime DLLs next to fatzaudio.dll (the
@@ -152,7 +154,7 @@ set_source_files_properties(src/stretch.cpp PROPERTIES
 if(MSVC)
     set_property(TARGET fatzaudio PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 elseif(MINGW)
-    target_link_options(fatzaudio PRIVATE -static-libstdc++ -static-libgcc)
+    target_link_options(fatzaudio PRIVATE -static-libstdc++ -static-libgcc -Wl,--gc-sections)
     # fatzaudio.dll, the same name as the MSVC build (MinGW would add "lib").
     set_target_properties(fatzaudio PROPERTIES PREFIX "")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -160,9 +162,17 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     # only libc and libm. --exclude-libs keeps their symbols out of the export
     # table, and the version script also hides the std:: templates stretch.cpp
     # instantiates (libstdc++ declares them with default visibility).
-    target_link_options(fatzaudio PRIVATE -static-libstdc++ -static-libgcc "-Wl,--exclude-libs,ALL"
+    target_link_options(fatzaudio PRIVATE -static-libstdc++ -static-libgcc "-Wl,--exclude-libs,ALL" -Wl,--gc-sections
         "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/fatzaudio.map")
     set_property(TARGET fatzaudio APPEND PROPERTY LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/fatzaudio.map)
+endif()
+
+# What nothing calls is left out (libopenmpt is built with a section per
+# function); MSVC does this in release builds already (/OPT:REF).
+if(APPLE)
+    target_link_options(fatzaudio PRIVATE -Wl,-dead_strip)
+elseif(ANDROID)
+    target_link_options(fatzaudio PRIVATE -Wl,--gc-sections)
 endif()
 
 target_include_directories(fatzaudio

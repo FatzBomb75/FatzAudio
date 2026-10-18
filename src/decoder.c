@@ -14,6 +14,7 @@ const fa_decoder_vtable* const fa_decoder_registry[] = {
     &fa_decoder_adts,
     &fa_decoder_midi,
     &fa_decoder_asf,
+    &fa_decoder_tracker,
 };
 const uint32_t fa_decoder_registry_count = (uint32_t)(sizeof(fa_decoder_registry) / sizeof(fa_decoder_registry[0]));
 
