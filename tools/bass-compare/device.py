@@ -108,6 +108,11 @@ def record(rec, player, args, seconds, work, capture):
     x = np.fromfile(out, dtype='<f4').astype(np.float64).reshape(-1, 2).mean(axis=1)
     os.remove(out)
     res['capture_device'] = stamps['device']
+    peak = float(np.abs(x).max()) if len(x) else 0.0
+    res['recording'] = {'seconds': len(x) / RATE, 'peak_db': 20 * np.log10(peak) if peak > 0 else None}
+    if peak < 1e-4:
+        res['error'] = 'nothing reached the recorder (%s)' % describe(res)
+        return res, x, None
     s = np.array(stamps['stamps'], dtype=np.float64).reshape(-1, 2)
     if len(s) < 10:
         return {'error': 'recorder: no audio arrived'}, None, None
@@ -123,6 +128,17 @@ def record(rec, player, args, seconds, work, capture):
     k = 25
     local = np.array([bound[max(0, i - k): i + k + 1].min() for i in range(len(bound))])
     return res, x, (lambda f: np.interp(f, s[:, 0], local) + np.asarray(f) * ms_per_frame)
+
+
+def describe(res):
+    r = res.get('recording', {})
+    return '%.1f s recorded, loudest %s' % (r.get('seconds', 0), 'silence' if r.get('peak_db') is None
+                                             else '%.0f dBFS' % r['peak_db'])
+
+
+def level(e, keep):
+    """The steady level of a tone over `keep` (its median), or 0."""
+    return float(np.median(e[keep])) if keep.any() else 0.0
 
 
 def envelope(x, freq):
@@ -153,7 +169,7 @@ def dropout(ga, gb, keep):
 def latency(x, ftime, res):
     if 'calls' not in res:
         return res
-    on = np.abs(x) > 0.1
+    on = np.abs(x) > 0.3 * np.abs(x).max()      # the click, whatever the recording level
     t_frames = ftime(np.arange(len(x)))
     lat = []
     for tc in res['calls']:
@@ -164,6 +180,8 @@ def latency(x, ftime, res):
     # reported on its own and left out of the rest.
     got = [v for v in lat[1:] if v is not None]
     res.update({'latency_ms': lat, 'first_ms': lat[0] if lat else None, 'heard': len(got), 'trials': len(lat) - 1})
+    if not got:
+        res['error'] = 'no click within %d ms of any start (%s)' % (GAP_MS - 50, describe(res))
     if got:
         res.update({'median_ms': float(np.median(got)), 'min_ms': float(np.min(got)),
                     'max_ms': float(np.max(got)), 'spread_ms': float(np.percentile(got, 90) - np.percentile(got, 10))})
@@ -177,11 +195,17 @@ def crossfade(x, ftime, res):
     ea, centre = envelope(x, FA_TONE)
     eb, _ = envelope(x, FB_TONE)
     t = ftime(centre) - res['fade']                # ms after the crossfade call
-    before = (t > -1000) & (t < -100)
-    if not before.any() or np.median(ea[before]) < LEVEL / 4:
-        res['error'] = 'first stream not heard'
+    # Levels relative to each tone's own steady level, so the recording level
+    # (system volume, a microphone) does not matter.
+    ref_a = level(ea, (t > -1000) & (t < -100))
+    ref_b = level(eb, (t > FADE_MS + 200) & (t < FADE_MS + 700))
+    if ref_a < 1e-4 or ref_a < 0.1 * ea.max():
+        res['error'] = 'first stream not heard where expected (%s)' % describe(res)
         return res
-    ga, gb = ea / LEVEL, eb / LEVEL
+    if ref_b < 1e-4 or ref_b < 0.1 * eb.max():
+        res['error'] = 'second stream not heard where expected (%s)' % describe(res)
+        return res
+    ga, gb = ea / ref_a, eb / ref_b
     equal = res.get('curve') == 'equal'
 
     def shape(u):
@@ -218,14 +242,15 @@ def gapless(x, ftime, res):
         return res
     ea, centre = envelope(x, FA_TONE)
     eb, _ = envelope(x, FB_TONE)
-    ga, gb = ea / LEVEL, eb / LEVEL
-    on = int(np.argmax(ga > 0.5))
-    if ga[on] <= 0.5:
-        res['error'] = 'first file not heard'
+    if ea.max() < 1e-4 or eb.max() < 1e-4:
+        res['error'] = '%s file not heard (%s)' % ('first' if ea.max() < 1e-4 else 'second', describe(res))
         return res
+    ga = ea / level(ea, ea > 0.5 * ea.max())   # relative to each file's steady level
+    gb = eb / level(eb, eb > 0.5 * eb.max())
+    on = int(np.argmax(ga > 0.5))
     rise = cross50(gb, on, True)
     if rise is None:
-        res['error'] = 'second file not heard'
+        res['error'] = 'second file not heard (%s)' % describe(res)
         return res
     # The first file's end: the last time it is at half level (it plays once, and
     # a dropout inside it is caught below).
@@ -256,6 +281,7 @@ def gapless(x, ftime, res):
 
 def run(args, fa, bass, rec, inputs, work, write_wav):
     files = make_signals(os.path.join(inputs, 'device'), write_wav)
+    kept = os.path.join(os.path.dirname(inputs), 'failed-recordings')
     wine_slack = 15 if (rec.wine or bass.wine or fa.wine) else 5   # Wine takes seconds to start a program
     tests = [
         ('latency', latency, (TRIALS + 1) * GAP_MS / 1000 + 1,
@@ -282,6 +308,12 @@ def run(args, fa, bass, rec, inputs, work, write_wav):
                 res, x, ftime = record(rec, tool, argv(tool), seconds + wine_slack, work, args.capture)
                 if 'error' not in res:
                     res = analyse(x, ftime, res)
+                if 'error' in res and x is not None:
+                    # Kept for a look: what the recorder got when a measurement failed.
+                    os.makedirs(kept, exist_ok=True)
+                    p = os.path.join(kept, '%s-%s.wav' % (name.replace(' ', '-'), tool.name))
+                    write_wav(p, np.column_stack([x, x]), RATE, 's16')
+                    res['kept_recording'] = p
                 res['attempts'] = attempt + 1
                 time.sleep(0.5)
                 if res.get('error') != 'dropout in the recording':
@@ -293,6 +325,12 @@ def run(args, fa, bass, rec, inputs, work, write_wav):
 
 def fmt(v, spec='%.1f', none='–'):
     return none if v is None else spec % v
+
+
+def failures(results):
+    """The measurements that did not produce a result."""
+    return ['%s (%s): %s' % (name, lib, r['error']) for name, row in results.items() for lib, r in row.items()
+            if 'error' in r and r['error'] != 'BASS has no equal-power slide']
 
 
 def report(results, worse):

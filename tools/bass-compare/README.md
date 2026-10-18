@@ -99,7 +99,7 @@ python3 tools/bass-compare/run.py --device-only --fa build-win/bin/fa_bench.exe 
     --rec build-win/bin/loop_rec.exe --rec-wine --capture Monitor --out device-results
 ```
 
-A recording where the two tones drop far below full level (the device lost audio) is taken again, up to three times; `attempts` in results.json says how many it took.
+A recording where the two tones drop far below full level (the device lost audio) is taken again, up to three times; `attempts` in results.json says how many it took. Levels are measured relative to what was recorded, so the system volume does not matter. When a measurement fails, the report lists it with how much was recorded and how loud it was, and the recording is kept in `failed-recordings` in the output folder (16-bit WAV) for a look.
 
 A machine without a sound card can use a PulseAudio null sink (`pulseaudio --start --load="module-null-sink sink_name=out"`); its timing is a virtual device's, not a real one's, so treat it as a check that everything runs.
 

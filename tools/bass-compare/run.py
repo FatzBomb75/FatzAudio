@@ -652,11 +652,15 @@ def main():
 def finish(out, work, results, L, worse):
     """Writes results.json and report.md, which opens with every measurement where
     BASS won."""
-    with open(os.path.join(out, 'results.json'), 'w') as f:
+    with open(os.path.join(out, 'results.json'), 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=1, default=float)
-    L.insert(1, '## Where FatzAudio is worse than BASS\n\n' + ('\n'.join('- ' + w for w in worse) if worse
-                                                              else 'Nowhere in these measurements.') + '\n')
-    with open(os.path.join(out, 'report.md'), 'w') as f:
+    failed = device.failures(results.get('device', {}))
+    summary = '\n'.join('- ' + w for w in worse) if worse else 'Nowhere in these measurements.'
+    if failed:
+        summary += ('\n\n**%d measurements failed** and are not compared (the recordings are kept in '
+                    'failed-recordings):\n\n' % len(failed)) + '\n'.join('- ' + f for f in failed)
+    L.insert(1, '## Where FatzAudio is worse than BASS\n\n' + summary + '\n')
+    with open(os.path.join(out, 'report.md'), 'w', encoding='utf-8') as f:
         f.write('\n'.join(L) + '\n')
     shutil.rmtree(work, ignore_errors=True)
     print('wrote', os.path.join(out, 'report.md'))
