@@ -335,15 +335,15 @@ public sealed class AudioEngine : IDisposable
     /// <summary>
     /// Opens a stream for the compressed packets of one audio track, for apps that demux the file themselves
     /// (typically with FFmpeg, for the video). Push packets straight from <c>av_read_frame</c>; FatzAudio decodes
-    /// them on its worker threads (PCM, MP3, AC-3 and E-AC-3 built in, other codecs through the FFmpeg your app loaded) and
+    /// them on its worker threads (PCM, MP3, AAC, AC-3, E-AC-3, Opus, Vorbis, FLAC, ALAC, and WMA on Windows) and
     /// <see cref="AudioStream.Clock"/> reports their timestamps as they leave the speaker.
     /// </summary>
     /// <param name="parameters">The track: codec name, rate, channels, codec configuration and time base.</param>
     /// <param name="options">Optional open options (<see cref="StreamOptions.Loop"/> is not allowed).</param>
     /// <returns>A packet stream; dispose it when done.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="parameters"/> is null.</exception>
-    /// <exception cref="FatzAudioException">The codec needs FFmpeg and none was found (<see cref="ErrorCode.ProviderMissing"/>),
-    /// FFmpeg has no decoder for it (<see cref="ErrorCode.UnsupportedFormat"/>), or a parameter is invalid.</exception>
+    /// <exception cref="FatzAudioException">FatzAudio does not decode the codec (<see cref="ErrorCode.UnsupportedFormat"/>:
+    /// DTS, TrueHD and the like; decode those with your FFmpeg and use <see cref="CreatePushStream"/>), or a parameter is invalid.</exception>
     /// <example>
     /// <code>
     /// using var audio = engine.OpenPackets(new CodecParameters("ac3", 48000, 6) { TimeBase = new Rational(1, 90000) });

@@ -406,9 +406,9 @@ static void codec_settings(fa_track* t, const fa_codec_params* p)
      * 30 dB from a straight decode; after 300 ms it is within about 80 dB. This
      * overrides a container's shorter SeekPreRoll (WebM writes 80 ms). */
     if (strcmp(p->codec, "opus") == 0 && t->p.seek_preroll_s < OPUS_PREROLL_S) t->p.seek_preroll_s = OPUS_PREROLL_S;
-    /* FFmpeg's WMA 1 and 2 give their first audio a packet or two late; so may the
-     * systems' decoders (MediaCodec decodes asynchronously). */
-    t->trails = strcmp(p->codec, "wmav1") == 0 || strcmp(p->codec, "wmav2") == 0 || t->codec.trails;
+    /* The systems' decoders can give their first audio a packet or more late
+     * (MediaCodec decodes asynchronously). */
+    t->trails = t->codec.trails;
 }
 
 /* A chained stream's next song: its own codec, set up from its own headers. */

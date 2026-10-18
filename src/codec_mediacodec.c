@@ -5,7 +5,7 @@
  * linked, so the library loads on any Android; its functions are declared here
  * rather than taken from the NDK's headers. When anything is missing (the
  * library, a decoder for the type, the configuration), opening returns
- * FA_ERROR_UNSUPPORTED_FORMAT and codec.c tries the app's FFmpeg instead.
+ * FA_ERROR_UNSUPPORTED_FORMAT.
  * AAC is "audio/mp4a-latm" with the AudioSpecificConfig as "csd-0"; ADTS frames
  * lose their header first (codec_os.c).
  * Float output is asked for (Android 7.0 and later honour "pcm-encoding"); 16-bit

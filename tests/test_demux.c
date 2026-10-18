@@ -23,7 +23,6 @@ static int g_failures = 0;
 #define CHECK_NEAR(a, b, tol) do { double va_ = (a), vb_ = (b); if (fabs(va_ - vb_) > (tol)) { \
     fprintf(stderr, "  FAIL %s:%d: %s ~ %s (%.6f vs %.6f)\n", __FILE__, __LINE__, #a, #b, va_, vb_); g_failures++; return; } } while (0)
 #define RUN(t) do { int before_ = g_failures; printf("%s\n", #t); t(); if (g_failures == before_) printf("  ok\n"); } while (0)
-#define SKIP_NO_FFMPEG(r) do { if ((r) == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); return; } } while (0)
 
 static fa_engine* g_engine;
 
@@ -392,7 +391,6 @@ static void test_webm_opus(void)
     int64_t n;
     double worst;
     fa_result r = open_file("opus.webm", -1, &s);
-    SKIP_NO_FFMPEG(r);
     CHECK_EQ(r, FA_OK);
     CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
     CHECK(strcmp(info.codec, "opus") == 0);
@@ -1183,7 +1181,6 @@ static void test_m4a_alac(void)
     int64_t n, i;
     double worst = 0;
     fa_result r = open_file("alac.m4a", -1, &s);
-    SKIP_NO_FFMPEG(r);
     CHECK_EQ(r, FA_OK);
     CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
     CHECK(strcmp(info.codec, "alac") == 0);
@@ -1422,7 +1419,6 @@ int main(void)
     cfg.flags = FA_ENGINE_NULL_OUTPUT;
     cfg.worker_threads = 2;
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) { fprintf(stderr, "engine create failed\n"); return 1; }
-    printf("FFmpeg %s\n", fa_ffmpeg_load(NULL) == FA_OK ? "found" : "not found");
 
     RUN(test_aac_config_explicit_rates);
     RUN(test_os_codec_helpers);

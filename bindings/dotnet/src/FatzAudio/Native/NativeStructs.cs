@@ -197,15 +197,6 @@ internal unsafe struct FaAudioFrame
 }
 
 [StructLayout(LayoutKind.Sequential)]
-internal unsafe struct FaFfmpegInfo
-{
-    public int Loaded;
-    public uint AvcodecVersion;
-    public uint AvutilVersion;
-    public fixed byte AvcodecPath[512];
-}
-
-[StructLayout(LayoutKind.Sequential)]
 internal struct FaTempoOptions
 {
     public uint StructSize;

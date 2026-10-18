@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using FatzAudio.Native;
 
 namespace FatzAudio;
@@ -218,7 +217,7 @@ public sealed unsafe class PushAudioStream : FeedAudioStream
 /// <summary>
 /// A stream fed with compressed packets of one audio track (<see cref="AudioEngine.OpenPackets"/>), straight
 /// from your demuxer (<c>av_read_frame</c>) with no audio decoding in your app. FatzAudio decodes them on its
-/// worker threads: PCM and MP3 built in, everything else through the FFmpeg your app already loaded.
+/// worker threads, with its own decoders (see <see cref="AudioEngine.OpenPackets"/> for the codecs).
 /// See <see cref="FeedAudioStream"/> for buffering and the clock.
 /// </summary>
 /// <example>
@@ -274,58 +273,13 @@ public sealed unsafe class PacketAudioStream : FeedAudioStream
     }
 }
 
-/// <summary>Where FatzAudio found FFmpeg (<see cref="FFmpeg.Info"/>).</summary>
-/// <param name="IsLoaded">True when FFmpeg is in use.</param>
-/// <param name="AvcodecVersion">libavcodec version, or null when not loaded.</param>
-/// <param name="AvutilVersion">libavutil version, or null when not loaded.</param>
-/// <param name="AvcodecPath">Where libavcodec was found (a file name if the full path is unknown), or null.</param>
-public sealed record FFmpegInfo(bool IsLoaded, Version? AvcodecVersion, Version? AvutilVersion, string? AvcodecPath);
-
 /// <summary>
-/// FFmpeg at runtime. FatzAudio never links or bundles FFmpeg; packet streams whose codec it has no decoder of
-/// its own for use the libavcodec of your app: the one already loaded in the process (for example by
-/// FFmpeg.AutoGen), else the one the system finds, or the one in the folder given to <see cref="Load"/>.
-/// FFmpeg 4.0 to 8.x is supported.
+/// Helpers for apps that read audio with FFmpeg (the hand-off). FatzAudio never loads, links or bundles FFmpeg:
+/// packet streams decode their codecs themselves, and codecs it does not decode (DTS, TrueHD, ...) are decoded by
+/// your FFmpeg and pushed as frames (<see cref="PushAudioStream.PushFrame"/>).
 /// </summary>
-public static unsafe class FFmpeg
+public static class FFmpeg
 {
-    /// <summary>
-    /// Loads FFmpeg (libavcodec and libavutil) now. Without a folder it uses the copy already loaded in the
-    /// process or the one the system loader finds; packet streams do this by themselves when needed, so call it
-    /// only to use a specific folder or to check up front. Once loaded, FFmpeg stays loaded.
-    /// </summary>
-    /// <param name="directory">Folder with the FFmpeg libraries, or null.</param>
-    /// <returns>True when FFmpeg is (already) loaded; false when no usable libavcodec was found.</returns>
-    /// <example>
-    /// <code>
-    /// if (!FFmpeg.Load(@"C:\MyApp\ffmpeg"))
-    ///     Console.WriteLine("AAC and Opus packets need FFmpeg");
-    /// </code>
-    /// </example>
-    public static bool Load(string? directory = null)
-    {
-        NativeLoader.EnsureInitialized();
-        int rc = NativeMethods.fa_ffmpeg_load(directory);
-        if (rc == (int)ErrorCode.ProviderMissing) return false;
-        FatzAudioException.ThrowIfFailed(rc);
-        return true;
-    }
-
-    /// <summary>Which FFmpeg is in use, if any.</summary>
-    public static FFmpegInfo Info
-    {
-        get
-        {
-            NativeLoader.EnsureInitialized();
-            FatzAudioException.ThrowIfFailed(NativeMethods.fa_ffmpeg_get_info(out FaFfmpegInfo n));
-            if (n.Loaded == 0) return new FFmpegInfo(false, null, null, null);
-            return new FFmpegInfo(true, ToVersion(n.AvcodecVersion), ToVersion(n.AvutilVersion),
-                                  Marshal.PtrToStringUTF8((nint)n.AvcodecPath));
-        }
-    }
-
-    private static Version ToVersion(uint v) => new((int)(v >> 16), (int)((v >> 8) & 0xFF), (int)(v & 0xFF));
-
     /// <summary>
     /// Maps an FFmpeg <c>AVSampleFormat</c> (<c>AVFrame.format</c>) to the matching <see cref="SampleFormat"/>, for
     /// <see cref="PushAudioStream.PushFrame"/>.

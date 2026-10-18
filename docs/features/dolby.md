@@ -102,6 +102,5 @@ Decoding runs on the engine's worker threads like every other format. `fa_stream
 
 - Loudness normalization scans decode with full dynamic range, so the measured loudness is the same whichever mode you play in. The compressed modes play a little louder in quiet passages than the scan says.
 - The stream's own downmix levels (centre and surround mix levels, Lt/Rt matrix-surround hints) and its dialogue level ("dialnorm") are not applied. Normalization takes care of level, and the channel matrix of the downmix.
-- `FA_ERROR_PROVIDER_MISSING` is never returned for AC-3 or E-AC-3, and FFmpeg is never used for them, even when the app has loaded it.
 - A damaged frame plays as silence for its 1 to 6 blocks, and decoding carries on with the next frame.
 - Passthrough (sending the compressed stream to an AV receiver over S/PDIF or HDMI) is not supported.

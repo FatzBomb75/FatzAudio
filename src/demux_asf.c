@@ -11,7 +11,7 @@
  *
  * Codecs: Windows Media Audio 1, 2, 9 Professional, 9 Lossless and Voice, plus
  * the PCM, MP3 and AC-3 that some ASF files carry. The codec decides by name
- * (codec.c): Media Foundation's decoder on Windows, else the app's FFmpeg.
+ * (codec.c): Media Foundation's decoder on Windows; elsewhere WMA is unsupported.
  *
  * Seeking needs a seekable source. The Simple Index Object (when the file has one
  * and is local) gives a packet at or before the target; a search over the packets'

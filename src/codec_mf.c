@@ -8,14 +8,13 @@
  *    HEAACWAVEINFO's fields as MF_MT_USER_DATA. ADTS frames lose their header
  *    first (codec_os.c). SBR doubles the rate: the output type says the rate.
  *  - ALAC is not taken: Windows' ALAC decoder accepts the stream's configuration
- *    (bare or in its 'alac' box) and then decodes nothing, so FFmpeg does it.
+ *    (bare or in its 'alac' box) and then decodes nothing; codec_alac.c decodes it.
  * Their output is in WAVE channel order, which is the library's.
  *
  * mfplat.dll is loaded at run time, never imported: Windows N and KN editions
  * without the Media Feature Pack, and Server Core, have no Media Foundation, and
  * fatzaudio.dll must still load there. When anything is missing (the DLL, the
- * decoder, the format), opening returns FA_ERROR_UNSUPPORTED_FORMAT and codec.c
- * tries the app's FFmpeg instead.
+ * decoder, the format), opening returns FA_ERROR_UNSUPPORTED_FORMAT.
  *
  * COM: the decoder is created in the multithreaded apartment of the opening
  * thread (or in its single-threaded apartment if it already has one; both
@@ -478,7 +477,7 @@ static fa_result open_aac(fa_codec* c, const fa_codec_params* p)
     asc_n = fa_aac_os_asc(p, 0, user + 12, sizeof(user) - 12);
     if (asc_n == 0 || !fa_aac_parse_asc(user + 12, asc_n, &info)) return FA_ERROR_UNSUPPORTED_FORMAT;
     /* Main, LC, SSR and LTP cores, with or without SBR and PS: what the decoder
-     * knows (xHE-AAC, ELD and the rest go to FFmpeg). */
+     * knows (xHE-AAC, ELD and the rest are unsupported). */
     if (info.object_type < 1 || info.object_type > 4) return FA_ERROR_UNSUPPORTED_FORMAT;
     memset(user, 0, 12);
     user[2] = 0xFE;
