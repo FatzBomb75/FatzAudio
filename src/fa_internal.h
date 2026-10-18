@@ -611,10 +611,16 @@ struct fa_device {
     ma_device device;
     uint32_t rate;
     fa_mutex lock;               /* serializes voice list edits (API threads only) */
+    /* Held by the audio callback while it takes commands, and by fa_crossfade while it
+     * posts a start and two fades for the current clock, so a callback sees all of
+     * them or none. The callback only tries it: when fa_crossfade holds it, `xf_busy`
+     * is set and the callback leaves every command and start due now or earlier for
+     * the next callback (later ones can't be a crossfade's). */
+    fa_mutex xf_lock;
+    int xf_busy;                 /* audio thread only */
     fa_atomic_ptr voices;        /* fa_voice_list*, read by the audio callback */
     fa_atomic_ptr buses;         /* fa_bus_list*, read by the audio callback */
     fa_atomic64 clock;           /* frames mixed so far (start of the next callback) */
-    fa_atomic32 period;          /* frames of the last callback */
     /* When the last callback started: its first device frame and the (smoothed)
      * monotonic time, seqlocked by cb_seq. The presentation clock interpolates from it. */
     fa_atomic64 cb_seq, cb_frame, cb_time;
@@ -698,6 +704,9 @@ float fa_lane_get(fa_lane* l);
  * previous callback and is heard now (otherwise plain sets apply without a glide).
  * Returns 1 (and the tag) when a running ramp that raises RAMP_DONE was replaced. */
 int fa_lane_take(fa_lane* l, int audible, uint32_t rate, int64_t* out_replaced_tag);
+/* The same, but leaves a command that starts at once or by frame `hold_upto` where it
+ * is (fa_device.xf_busy). */
+int fa_lane_take_after(fa_lane* l, int64_t hold_upto, int audible, uint32_t rate, int64_t* out_replaced_tag);
 /* Audio thread: value after `done` frames of the active ramp. */
 float fa_lane_ramp_value(const fa_param_voice* v, int64_t done);
 /* Audio thread: starts a ramp directly (queue transitions decided on the audio thread). */

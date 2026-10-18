@@ -18,7 +18,7 @@ When a stream is attached to a device, FatzAudio decodes it **ahead of time on w
 |---|---|---|
 | Your threads (API calls) | Open, attach, seek, play/pause, set params | — |
 | Decode workers (`worker_threads`, default = CPU cores, max 8) | Decode, resample, channel-convert into each stream's ring buffer; the emptiest buffer is filled first, and a stream another worker is busy with (say, a slow network source) is skipped | Touch the device |
-| Audio callback | Mix ring buffers with volume/pan ramps, count position, queue events | Lock, allocate, do I/O, decode, or call your code |
+| Audio callback | Mix ring buffers with volume/pan ramps, count position, queue events | Wait on a lock, allocate, do I/O, decode, or call your code |
 | Event thread (one per engine) | Call your event callbacks, free closed streams | Run on the audio thread |
 
 On Windows the audio thread runs in the MMCSS "Pro Audio" class.

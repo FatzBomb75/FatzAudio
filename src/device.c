@@ -113,6 +113,7 @@ void fa_device_render_at(fa_device* dev, float* out, uint32_t frames, int64_t no
     uint32_t i;
     publish_callback_time(dev, fa_load64(&dev->clock), now_ns);
     dev->cb_prev_frames = frames;
+    dev->xf_busy = !fa_mutex_trylock(&dev->xf_lock);   /* never waits */
     memset(out, 0, (size_t)frames * FA_DEVICE_CHANNELS * sizeof(float));
     fa_buses_begin(dev);
     list = (fa_voice_list*)fa_load_ptr(&dev->voices);
@@ -129,6 +130,7 @@ void fa_device_render_at(fa_device* dev, float* out, uint32_t frames, int64_t no
         }
         for (i = 0; i < list->count; i++) fa_stream_mix(list->items[i], dev, out, frames);
     }
+    if (!dev->xf_busy) fa_mutex_unlock(&dev->xf_lock);   /* commands taken */
     fa_buses_end(dev, frames);
     fa_limiter_process(&dev->limiter, out, frames,
                        powf(10.0f, fa_load_float(&dev->engine->limiter_ceiling) / 20.0f), limiter_on(dev->engine));
@@ -137,7 +139,6 @@ void fa_device_render_at(fa_device* dev, float* out, uint32_t frames, int64_t no
         if (encs)
             for (i = 0; i < encs->count; i++) fa_encode_push(encs->items[i], out, frames, dev->rate);
     }
-    fa_store32(&dev->period, (int32_t)frames);
     fa_fetch_add64(&dev->clock, frames);
 }
 
@@ -227,6 +228,7 @@ FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id
     if (!d) return FA_ERROR_OUT_OF_MEMORY;
     d->engine = engine;
     if (fa_mutex_init(&d->lock) != 0) { free(d); return FA_ERROR_GENERIC; }
+    if (fa_mutex_init(&d->xf_lock) != 0) { fa_mutex_destroy(&d->lock); free(d); return FA_ERROR_GENERIC; }
 
     cfg = ma_device_config_init(ma_device_type_playback);
     cfg.playback.pDeviceID = pid;
@@ -240,6 +242,7 @@ FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id
     cfg.wasapi.usage = ma_wasapi_usage_pro_audio; /* MMCSS "Pro Audio" scheduling on Windows */
 
     if (ma_device_init(&engine->context, &cfg, &d->device) != MA_SUCCESS) {
+        fa_mutex_destroy(&d->xf_lock);
         fa_mutex_destroy(&d->lock);
         free(d);
         return FA_ERROR_DEVICE;
@@ -247,6 +250,7 @@ FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id
     d->rate = d->device.sampleRate;
     if (fa_limiter_init(&d->limiter, d->rate, FA_DEVICE_CHANNELS) != FA_OK) {
         ma_device_uninit(&d->device);
+        fa_mutex_destroy(&d->xf_lock);
         fa_mutex_destroy(&d->lock);
         free(d);
         return FA_ERROR_OUT_OF_MEMORY;
@@ -282,6 +286,7 @@ FA_API void FA_CALL fa_device_close(fa_device* device)
     fa_limiter_free(&device->limiter);
     fa_buses_free_all(device);
     free(fa_load_ptr(&device->voices));
+    fa_mutex_destroy(&device->xf_lock);
     fa_mutex_destroy(&device->lock);
     free(device);
 }
