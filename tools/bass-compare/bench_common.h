@@ -19,14 +19,6 @@ static inline double bench_now_ms(void)
     QueryPerformanceCounter(&t);
     return (double)t.QuadPart * 1000.0 / (double)freq.QuadPart;
 }
-/* Peak working set of the process so far, in KB. */
-static inline double bench_peak_kb(void)
-{
-    PROCESS_MEMORY_COUNTERS pmc;
-    pmc.cb = sizeof(pmc);
-    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return -1;
-    return (double)pmc.PeakWorkingSetSize / 1024.0;
-}
 /* Current working set, in KB: the baseline before the first stream is opened. */
 static inline double bench_current_kb(void)
 {
@@ -34,6 +26,30 @@ static inline double bench_current_kb(void)
     pmc.cb = sizeof(pmc);
     if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return -1;
     return (double)pmc.WorkingSetSize / 1024.0;
+}
+/* The process's peak working set since it started (fa_bench's loudness scan). */
+static inline double bench_process_peak_kb(void)
+{
+    PROCESS_MEMORY_COUNTERS pmc;
+    pmc.cb = sizeof(pmc);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc))) return -1;
+    return (double)pmc.PeakWorkingSetSize / 1024.0;
+}
+/* That peak counts everything since the process started:
+ * the warm-up, loading the DLLs. Measured from bench_mem_start on instead, by
+ * sampling the working set while the streams run (bench_mem_sample, every 16
+ * reads: a buffer allocated and freed between two samples is not seen). */
+static double bench_peak_seen = -1;
+static inline double bench_mem_start(void) { return bench_peak_seen = bench_current_kb(); }
+static inline void bench_mem_sample(void)
+{
+    double kb = bench_current_kb();
+    if (kb > bench_peak_seen) bench_peak_seen = kb;
+}
+static inline double bench_peak_kb(void)
+{
+    bench_mem_sample();
+    return bench_peak_seen;
 }
 #else
 #  include <time.h>
@@ -57,8 +73,33 @@ static inline double bench_status_kb(const char* key)
     fclose(f);
     return v;
 }
-static inline double bench_peak_kb(void) { return bench_status_kb("VmHWM:"); }
 static inline double bench_current_kb(void) { return bench_status_kb("VmRSS:"); }
+static inline double bench_process_peak_kb(void) { return bench_status_kb("VmHWM:"); }
+/* VmHWM counts everything since the process started; writing 5 to clear_refs
+ * resets it to the current size, so the peak is the run's own. Where that is
+ * refused, the size is sampled as on Windows. */
+static double bench_peak_seen = -1;
+static int bench_hwm_reset = 0;
+static inline double bench_mem_start(void)
+{
+    FILE* f = fopen("/proc/self/clear_refs", "w");
+    bench_hwm_reset = f && fputs("5", f) >= 0;
+    if (f && fclose(f) != 0) bench_hwm_reset = 0;
+    return bench_peak_seen = bench_current_kb();
+}
+static inline void bench_mem_sample(void)
+{
+    double kb;
+    if (bench_hwm_reset) return;
+    kb = bench_current_kb();
+    if (kb > bench_peak_seen) bench_peak_seen = kb;
+}
+static inline double bench_peak_kb(void)
+{
+    if (bench_hwm_reset) return bench_process_peak_kb();
+    bench_mem_sample();
+    return bench_peak_seen;
+}
 #endif
 
 /* Raw output: interleaved float32, no header (run.py knows rate and channels from
