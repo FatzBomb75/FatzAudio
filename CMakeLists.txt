@@ -51,6 +51,7 @@ set(FA_SOURCES
     src/fa_platform.c
     src/ring.c
     src/curve.c
+    src/eq.c
     src/lane.c
     src/bus.c
     src/event.c

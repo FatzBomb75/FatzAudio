@@ -1664,11 +1664,89 @@ typedef struct fa_lame_info {
 FA_API fa_result FA_CALL fa_lame_load(const char* directory);
 FA_API fa_result FA_CALL fa_lame_get_info(fa_lame_info* out_info);
 
+/* ---- Equalizer ------------------------------------------------------- */
+
+/* A parametric equalizer on every stream: up to FA_EQ_MAX_BANDS bands, each a peak
+ * (bell) or a low or high shelf. Use ten peaks on the octave frequencies for a
+ * graphic EQ, or start from a preset (fa_eq_get_preset).
+ *
+ * - It runs in the mixer, before the stream's volume, fades and normalization gain,
+ *   so a change is heard at once, not after the decode-ahead buffer. It works on
+ *   every stream played on a device, push and packet streams included.
+ * - Changes glide (about 10 ms), so moving a slider while playing never clicks.
+ * - Off, flat, or a band at 0 dB costs nothing: such bands are skipped.
+ * - Decode-only streams are not equalized (fa_stream_read returns the audio as
+ *   decoded); use fa_stream_add_dsp there.
+ *
+ * fa_stream_set_eq replaces all bands (count 0 = no bands: off). Out-of-range values
+ * are clamped: frequency 10 Hz to just under half the device rate, q 0.1 to 20,
+ * gain -24 to +24 dB. */
+#define FA_EQ_MAX_BANDS 16
+
+typedef enum fa_eq_type {
+    FA_EQ_PEAK = 0,     /* bell around frequency_hz; q sets the width (1.41 = one octave) */
+    FA_EQ_LOW_SHELF,    /* everything below frequency_hz; q 0.71 is the usual slope */
+    FA_EQ_HIGH_SHELF    /* everything above frequency_hz */
+} fa_eq_type;
+
+typedef struct fa_eq_band {
+    fa_eq_type type;
+    float frequency_hz;
+    float q;
+    float gain_db;
+} fa_eq_band;
+
+FA_API fa_result FA_CALL fa_stream_set_eq(fa_stream* stream, const fa_eq_band* bands, uint32_t count);
+/* Copies up to `capacity` bands, as set (after clamping; the frequency is also capped
+ * at just under half the device rate while playing); *out_count = how many there are. */
+FA_API fa_result FA_CALL fa_stream_get_eq(fa_stream* stream, fa_eq_band* out_bands, uint32_t capacity, uint32_t* out_count);
+/* One band's gain, for a slider: FA_ERROR_INVALID_ARG if `band` >= the band count. */
+FA_API fa_result FA_CALL fa_stream_set_eq_gain(fa_stream* stream, uint32_t band, float gain_db);
+/* Bypass without losing the bands: 0 glides to flat, 1 back to the bands. On by default. */
+FA_API fa_result FA_CALL fa_stream_set_eq_enabled(fa_stream* stream, int32_t enabled);
+FA_API fa_result FA_CALL fa_stream_get_eq_enabled(fa_stream* stream, int32_t* out_enabled);
+
+/* Built-in presets: ten peak bands on the octave frequencies (31 Hz to 16 kHz,
+ * q 1.41), so switching presets moves the same sliders. */
+typedef enum fa_eq_preset {
+    FA_EQ_PRESET_FLAT = 0,
+    FA_EQ_PRESET_ROCK,
+    FA_EQ_PRESET_POP,
+    FA_EQ_PRESET_JAZZ,
+    FA_EQ_PRESET_CLASSICAL,
+    FA_EQ_PRESET_DANCE,
+    FA_EQ_PRESET_HIP_HOP,
+    FA_EQ_PRESET_ACOUSTIC,
+    FA_EQ_PRESET_VOCAL,
+    FA_EQ_PRESET_SPOKEN_WORD,
+    FA_EQ_PRESET_BASS_BOOST,
+    FA_EQ_PRESET_TREBLE_BOOST,
+    FA_EQ_PRESET_LOUDNESS,     /* lows and highs up, for quiet listening */
+    FA_EQ_PRESET_COUNT
+} fa_eq_preset;
+
+#define FA_EQ_PRESET_BANDS 10
+
+/* Fills out_bands (room for FA_EQ_PRESET_BANDS) and *out_count. */
+FA_API fa_result FA_CALL fa_eq_get_preset(fa_eq_preset preset, fa_eq_band* out_bands, uint32_t* out_count);
+/* English display name ("Rock"), NULL for an unknown preset. */
+FA_API const char* FA_CALL fa_eq_preset_name(fa_eq_preset preset);
+
 /* ---- User DSP --------------------------------------------------------- */
 
-/* In-place processing of interleaved float frames in the stream's format. */
-typedef void (FA_CALL *fa_dsp_callback)(float* frames, fa_frames count, uint32_t channels, void* user);
+/* In-place processing of interleaved float frames. Streams on a device: device
+ * channels (2) at the device rate, after rate/tempo/pitch, before the equalizer,
+ * volume, fades and normalization. Decode-only streams: the format fa_stream_read
+ * returns. Runs where the stream is decoded, never on the audio thread, so it may
+ * take a little time; it is heard after the decode-ahead buffer. That is usually an
+ * engine worker, but the first 100 ms after fa_stream_seek or fa_stream_attach are
+ * decoded on the thread making that call, and decode-only streams decode inside
+ * fa_stream_read. It runs with the stream's locks held: don't call any fa_stream_*
+ * function of that stream from inside it. */
+typedef void (FA_CALL *fa_dsp_callback)(float* frames, fa_frames count, uint32_t channels, uint32_t sample_rate, void* user);
 
+/* Higher priorities run first; equal ones in the order added. Safe to call while
+ * playing. After fa_stream_remove_dsp returns, the callback is never called again. */
 FA_API fa_result FA_CALL fa_stream_add_dsp(fa_stream* stream, fa_dsp_callback callback, void* user, int32_t priority, uint32_t* out_dsp_id);
 FA_API fa_result FA_CALL fa_stream_remove_dsp(fa_stream* stream, uint32_t dsp_id);
 
