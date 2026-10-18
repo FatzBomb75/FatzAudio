@@ -72,6 +72,8 @@ set(FA_SOURCES
     src/aac_tables.c
     src/dec_midi.c
     src/dls.c
+    src/sf3.c
+    src/midi_fx.c
     src/tinysoundfont_impl.c
     src/mdct.c
     src/push.c

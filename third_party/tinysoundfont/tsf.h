@@ -199,6 +199,13 @@ TSFDEF int tsf_active_voice_count(tsf* f);
 TSFDEF void tsf_render_short(tsf* f, short* buffer, int samples, int flag_mixing CPP_DEFAULT0);
 TSFDEF void tsf_render_float(tsf* f, float* buffer, int samples, int flag_mixing CPP_DEFAULT0);
 
+// FatzAudio: like tsf_render_float, and also adds each voice to the reverb and
+// chorus send buses (same layout as buffer) at its send levels: the region's
+// effect-send generator plus CC91 / CC93 * 200 / 127 (the SoundFont 2.04 default
+// modulators), at most 100%. Mono and stereo interleaved output only (stereo
+// unweaved renders dry, like tsf_render_float). The buses are always added to.
+TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* chorus, int samples, int flag_mixing);
+
 // Higher level channel based functions, set up channel parameters
 //   channel: channel number
 //   preset_index: preset index >= 0 and < tsf_get_presetcount()
@@ -448,6 +455,7 @@ struct tsf_region
 	int freqModLFO, modLfoToPitch;
 	float delayVibLFO;
 	int freqVibLFO, vibLfoToPitch;
+	float chorusSend, reverbSend; // FatzAudio: effect sends, 0.1% units (generators 15 and 16)
 };
 
 struct tsf_preset
@@ -475,6 +483,7 @@ struct tsf_channel
 {
 	unsigned short presetIndex, bank, pitchWheel, midiPan, midiVolume, midiExpression, midiRPN, midiData : 14, sustain : 1;
 	float panOffset, gainDB, pitchRange, tuning;
+	unsigned char midiReverb, midiChorus; // FatzAudio: CC91 and CC93
 };
 
 struct tsf_channels
@@ -579,8 +588,8 @@ static void tsf_region_operator(struct tsf_region* region, tsf_u16 genOper, unio
 		{ GEN_UINT_ADD15                   , _TSFREGIONOFFSET(unsigned int, end                  ) }, //12 EndAddrsCoarseOffset
 		{ GEN_INT   | GEN_INT_LIMIT960     , _TSFREGIONOFFSET(         int, modLfoToVolume       ) }, //13 ModLfoToVolume
 		{ 0                                , (0                                                  ) }, //   Unused
-		{ 0                                , (0                                                  ) }, //15 ChorusEffectsSend (unsupported)
-		{ 0                                , (0                                                  ) }, //16 ReverbEffectsSend (unsupported)
+		{ GEN_FLOAT | GEN_FLOAT_MAX1000    , _TSFREGIONOFFSET(       float, chorusSend           ) }, //15 ChorusEffectsSend (FatzAudio)
+		{ GEN_FLOAT | GEN_FLOAT_MAX1000    , _TSFREGIONOFFSET(       float, reverbSend           ) }, //16 ReverbEffectsSend (FatzAudio)
 		{ GEN_FLOAT | GEN_FLOAT_LIMITPAN   , _TSFREGIONOFFSET(       float, pan                  ) }, //17 Pan
 		{ 0                                , (0                                                  ) }, //   Unused
 		{ 0                                , (0                                                  ) }, //   Unused
@@ -1810,6 +1819,47 @@ TSFDEF void tsf_render_float(tsf* f, float* buffer, int samples, int flag_mixing
 			tsf_voice_render(f, v, buffer, samples);
 }
 
+// FatzAudio: effect sends
+static float tsf_voice_send(float region_send, int cc)
+{
+	float s = (region_send + cc * (200.0f / 127.0f)) * 0.001f;
+	return (s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s));
+}
+
+TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* chorus, int samples, int flag_mixing)
+{
+	float tmp[TSF_RENDER_EFFECTSAMPLEBLOCK * 2];
+	int chans = (f->outputmode == TSF_MONO ? 1 : 2);
+	struct tsf_voice *v, *vEnd = f->voices + f->voiceNum;
+	if (f->outputmode == TSF_STEREO_UNWEAVED) { tsf_render_float(f, buffer, samples, flag_mixing); return; }
+	if (!flag_mixing) TSF_MEMSET(buffer, 0, chans * sizeof(float) * samples);
+	while (samples > 0)
+	{
+		int k = (samples < TSF_RENDER_EFFECTSAMPLEBLOCK ? samples : TSF_RENDER_EFFECTSAMPLEBLOCK), n = k * chans, i;
+		for (v = f->voices; v != vEnd; v++)
+		{
+			float rs = 0.0f, cs = 0.0f;
+			if (v->playingPreset == -1) continue;
+			if (f->channels && v->playingChannel >= 0 && v->playingChannel < f->channels->channelNum)
+			{
+				struct tsf_channel* c = &f->channels->channels[v->playingChannel];
+				rs = tsf_voice_send(v->region->reverbSend, c->midiReverb);
+				cs = tsf_voice_send(v->region->chorusSend, c->midiChorus);
+			}
+			else
+			{
+				rs = tsf_voice_send(v->region->reverbSend, 0);
+				cs = tsf_voice_send(v->region->chorusSend, 0);
+			}
+			if (rs == 0.0f && cs == 0.0f) { tsf_voice_render(f, v, buffer, k); continue; }
+			TSF_MEMSET(tmp, 0, n * sizeof(float));
+			tsf_voice_render(f, v, tmp, k);
+			for (i = 0; i != n; i++) { buffer[i] += tmp[i]; reverb[i] += tmp[i] * rs; chorus[i] += tmp[i] * cs; }
+		}
+		buffer += n; reverb += n; chorus += n; samples -= k;
+	}
+}
+
 static void tsf_channel_setup_voice(tsf* f, struct tsf_voice* v)
 {
 	struct tsf_channel* c = &f->channels->channels[f->channels->activeChannel];
@@ -1854,6 +1904,8 @@ static struct tsf_channel* tsf_channel_init(tsf* f, int channel)
 		c->gainDB = 0.0f;
 		c->pitchRange = 2.0f;
 		c->tuning = 0.0f;
+		c->midiReverb = 40; // FatzAudio: the GM2 / GS default
+		c->midiChorus = 0;
 	}
 	return &f->channels->channels[channel];
 }
@@ -2078,6 +2130,8 @@ TSFDEF int tsf_channel_midi_control(tsf* f, int channel, int controller, int con
 		case  98 /*NRPN_LSB*/        : c->midiRPN = 0xFFFF; return 1;
 		case  99 /*NRPN_MSB*/        : c->midiRPN = 0xFFFF; return 1;
 		case  64 /*SUSTAIN*/         : tsf_channel_set_sustain(f, channel, (int)(control_value >= 64)); return 1;
+		case  91 /*REVERB*/          : c->midiReverb = (unsigned char)(control_value & 0x7F); return 1; // FatzAudio
+		case  93 /*CHORUS*/          : c->midiChorus = (unsigned char)(control_value & 0x7F); return 1; // FatzAudio
 		case 120 /*ALL_SOUND_OFF*/   : tsf_channel_sounds_off_all(f, channel); return 1;
 		case 123 /*ALL_NOTES_OFF*/   : tsf_channel_note_off_all(f, channel);   return 1;
 		case 121 /*ALL_CTRL_OFF*/    :

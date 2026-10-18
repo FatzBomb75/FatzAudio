@@ -232,6 +232,20 @@ int fa_probe_mp3_header(const uint8_t* data, size_t size, size_t start, uint32_t
 /* DLS banks (dls.c), turned into a SoundFont 2 image the synthesizer loads. */
 int fa_dls_probe(const uint8_t* data, size_t size);
 fa_result fa_dls_to_sf2(const uint8_t* data, size_t size, uint8_t** out_sf2, size_t* out_size);
+/* SF3 (SoundFont 2 with Ogg Vorbis samples, src/sf3.c): whether `data` is one, and
+ * the same bank as plain SoundFont 2 (malloc'ed) with the samples decoded. */
+int fa_sf3_probe(const uint8_t* data, size_t size);
+fa_result fa_sf3_to_sf2(const uint8_t* data, size_t size, uint8_t** out_sf2, size_t* out_size);
+
+/* MIDI reverb and chorus (src/midi_fx.c), stereo at the stream's rate: process
+ * adds the effects of the two send buses (interleaved, `frames` each) to `out`;
+ * `song_frame` is the song position of the first frame (the chorus LFO follows
+ * it). Reset clears the tails (a seek). */
+typedef struct fa_midi_fx fa_midi_fx;
+fa_midi_fx* fa_midi_fx_new(uint32_t rate);
+void fa_midi_fx_free(fa_midi_fx* fx);
+void fa_midi_fx_reset(fa_midi_fx* fx);
+void fa_midi_fx_process(fa_midi_fx* fx, const float* reverb_in, const float* chorus_in, float* out, int frames, fa_frames song_frame);
 struct fa_soundfont* fa_soundfont_retain(struct fa_soundfont* f);
 void fa_soundfont_release(struct fa_soundfont* f);
 /* A fingerprint of the soundfont's content, for the loudness cache. */
