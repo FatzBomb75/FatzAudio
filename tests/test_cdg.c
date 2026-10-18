@@ -1120,8 +1120,8 @@ static void test_replay_speed(void)
     }
     t0 = fa_monotonic_ns();
     CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
-    printf("  loading a 5 minute song, checkpoints included: %.2f ms\n", (fa_monotonic_ns() - t0) / 1e6);
     CHECK_EQ(fa_cdg_surface_create(s, NULL, &surf), FA_OK);
+    printf("  loading a 5 minute song, checkpoints included: %.2f ms\n", (fa_monotonic_ns() - t0) / 1e6);
     t0 = fa_monotonic_ns();
     CHECK_EQ(fa_cdg_surface_update_at(surf, 300LL * 1000000000, &fr), FA_OK);
     printf("  first jump to the end: %.2f ms\n", (fa_monotonic_ns() - t0) / 1e6);
@@ -1194,7 +1194,7 @@ static void test_frame_state(void)
     CHECK_EQ(px(&fr, 0, 0)[3], 0);                 /* hidden, border included */
     CHECK_EQ(px(&fr, 150, 100)[3], 0);
     CHECK_EQ(fa_cdg_surface_update_at(opts, t_packs(3), &fr), FA_OK);
-    CHECK(fr.background[0] == 0x11 && fr.background[1] == 0x22 && fr.background[2] == 0x33 && fr.background[3] == 64);
+    for (i = 0; i < 4; i++) CHECK_EQ(fr.background[i], 0);   /* no background yet */
 
     /* After the preset */
     CHECK_EQ(fa_cdg_surface_update_at(ix, t_packs(5), &fr), FA_OK);
@@ -1328,8 +1328,10 @@ static void test_checkpoints(void)
     CHECK_EQ(ci.source, FA_CDG_SOURCE_FILE);
     CHECK_EQ(ci.pack_count, 300 * 120);
     CHECK_EQ(ci.checkpoint_interval, 10000000000LL);
-    CHECK_EQ(ci.checkpoint_count, 12);
+    CHECK_EQ(ci.checkpoint_count, 0);           /* built for the first surface */
     CHECK_EQ(fa_cdg_surface_create(s, NULL, &jump), FA_OK);
+    CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
+    CHECK_EQ(ci.checkpoint_count, 12);
     CHECK_EQ(fa_cdg_surface_create(s, NULL, &walk), FA_OK);
     /* Jumps all over, compared with a surface that only walks forward from the start */
     for (t = 0; t < 12; t++) {
@@ -1350,10 +1352,13 @@ static void test_checkpoints(void)
     /* Graphics over 30 minutes space their checkpoints further apart */
     c.p = NULL; c.n = c.cap = 0;
     empty_packs_to(&c, (size_t)300 * 60 * 31);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &jump), FA_OK);
     CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    CHECK_EQ(fa_cdg_surface_update_at(jump, 0, &fr), FA_OK);   /* a load under a surface */
     CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
     CHECK_EQ(ci.checkpoint_interval, 20000000000LL);
     CHECK_EQ(ci.checkpoint_count, 93);
+    fa_cdg_surface_destroy(jump);
     fa_stream_close(s);
     free(c.p);
 }

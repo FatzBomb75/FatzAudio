@@ -1318,8 +1318,8 @@ typedef struct fa_cdg_frame {
     uint8_t background[4];             /* R, G, B, A the background is drawn with (palette
                                           entry background_index, or background_color with
                                           FA_CDG_BACKGROUND_COLOR): to fill the area around
-                                          a scaled picture. All 0 while background_index is -1
-                                          and there is no FA_CDG_BACKGROUND_COLOR */
+                                          a scaled picture. All 0 while background_index
+                                          is -1 */
     uint64_t revision;                 /* goes up by one whenever an update changes a pixel
                                           (1 after the first update): compare it with the one
                                           a render target last uploaded */
@@ -1339,8 +1339,9 @@ typedef struct fa_cdg_info {
     uint64_t pack_count;               /* 300 per second (a disc track's whole length) */
     fa_time checkpoint_interval;       /* seeks replay at most this much (10 s, longer for
                                           files over 30 minutes) */
-    uint32_t checkpoint_count;         /* built so far: all of them for files, at load; as
-                                          the packs arrive for discs */
+    uint32_t checkpoint_count;         /* built so far. Files: all of them once the stream's
+                                          first surface exists (0 before; a few ms for a
+                                          song). Discs: as the packs arrive */
     int32_t disc_parity;               /* discs: 1 = the subcode layout was chosen by the
                                           packs' P/Q parity, 0 = by counting instructions
                                           (drives that zero the parity). Either way the packs
@@ -1385,7 +1386,8 @@ FA_API fa_result FA_CALL fa_cdg_surface_update(fa_cdg_surface* surface, fa_cdg_f
  * packs 0..299 are applied, at 1 s + 1 ns packs 0..300. g <= 0 shows no pack.
  *
  * Seeking anywhere replays at most fa_cdg_info.checkpoint_interval of packs from a
- * checkpoint, even the first time and in parts never played. */
+ * checkpoint, even the first time and in parts never played (on a disc: in the parts
+ * read so far). */
 FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_time time, fa_cdg_frame* out_frame);
 
 /* ---- MIDI ---------------------------------------------------------------

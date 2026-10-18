@@ -11,8 +11,8 @@
  * Every surface decodes on its own (a 300x216 index screen per surface) up to the
  * pack for the time it is asked for. Moving forward applies the new packs. The
  * stream's graphics carry checkpoints, the decoder state every 10 s of packs, shared
- * by all its surfaces: built in full when a file is loaded, and as the packs arrive
- * for discs. A seek anywhere, back or forward, the first one too, restores the last
+ * by all its surfaces: built in full when a file's first surface is created, and as
+ * the packs arrive for discs. A seek anywhere, back or forward, the first one too, restores the last
  * checkpoint before the target and replays at most 10 s of packs, a fraction of a
  * millisecond. Updates run on the caller's thread under the stream's cdg_lock; the
  * audio thread never sees any of it. */
@@ -69,7 +69,8 @@ struct fa_cdg_index {
     size_t count;                 /* valid checkpoints */
     size_t cap;
     cdg_state build;              /* discs: the decoder running over the packs written */
-    size_t high;                  /* discs: packs written up to here */
+    size_t high;                  /* discs: packs written up to here; the decoder
+                                     catches up with it a little at each write */
 };
 
 struct fa_cdg_surface {
@@ -401,32 +402,38 @@ static void index_advance(struct fa_cdg_index* ix, const fa_cdg_data* d, size_t 
     }
 }
 
-/* Files and memory blocks: every checkpoint, before the graphics are attached. A few
- * milliseconds for a song; without memory for it, seeks replay from the start. */
+/* Files and memory blocks: every checkpoint at once, when the stream's first surface
+ * needs them (under cdg_lock, a few milliseconds for a song), so opening songs that
+ * are never drawn costs nothing. Without memory for it, seeks replay from the start. */
 static void index_build(fa_cdg_data* d)
 {
     struct fa_cdg_index* ix;
-    if (d->index || d->from_disc) return;
+    if (!d || d->index || d->from_disc) return;
     ix = index_new(d->count);
     if (!ix) return;
     index_advance(ix, d, d->count);
     d->index = ix;
 }
 
-/* Discs: packs [first, first + n) were rewritten. Checkpoints after `first` no longer
- * hold; the decoder goes back to the last one that does and runs up to the packs
- * written so far. */
-static void index_written(fa_cdg_data* d, size_t first, size_t n)
+/* Discs: packs [first, first + n) were written, `changed` if they differ from what
+ * was there. Checkpoints after a change no longer hold: the decoder goes back to the
+ * last one that does. It then runs over this write and at most 10 s more towards
+ * the packs written so far, so no write holds the lock long. */
+static void index_written(fa_cdg_data* d, size_t first, size_t n, int changed)
 {
     struct fa_cdg_index* ix = d->index;
+    size_t upto;
     if (!ix) return;
-    if (first < ix->build.next) {
+    if (changed && first < ix->build.next) {
         size_t keep = first / ix->step;
         if (keep < ix->count) ix->count = keep;
         if (ix->count) ix->build = ix->at[ix->count - 1]; else state_reset(&ix->build);
     }
     if (first + n > ix->high) ix->high = first + n;
-    index_advance(ix, d, ix->high);
+    upto = first + n > ix->build.next ? first + n : ix->build.next;
+    upto += CDG_CHECKPOINT_PACKS;
+    if (upto > ix->high) upto = ix->high;
+    index_advance(ix, d, upto);
 }
 
 /* ---- rendering ------------------------------------------------------------------- */
@@ -621,12 +628,8 @@ static void render(fa_cdg_surface* f, fa_cdg_frame* out)
     out->background_index = st->preset ? st->bg : -1;
     out->border_index = st->border;
     memcpy(out->transparency, st->transparency, sizeof(out->transparency));
-    if (st->preset) {
-        memcpy(out->background, pal[st->bg], 4);
-    } else {
-        memset(out->background, 0, 4);
-        if (f->flags & FA_CDG_BACKGROUND_COLOR) background_options(f, out->background);
-    }
+    if (st->preset) memcpy(out->background, pal[st->bg], 4);
+    else memset(out->background, 0, 4);
     if (out->dirty_width) f->revision++;
     if (palette_changed || out->background_index != f->shown_bg || out->border_index != f->shown_border ||
         memcmp(st->transparency, f->shown_transparency, sizeof(st->transparency)) != 0)
@@ -651,7 +654,6 @@ FA_API void FA_CALL fa_cdg_surface_config_init(fa_cdg_surface_config* config)
 void fa_stream_cdg_attach(struct fa_stream* s, fa_cdg_data* data)
 {
     fa_cdg_data* old;
-    if (data) index_build(data);   /* before the lock: surfaces keep drawing meanwhile */
     fa_mutex_lock(&s->cdg_lock);
     old = s->cdg;
     s->cdg = data;
@@ -703,9 +705,9 @@ int fa_stream_cdg_write(struct fa_stream* s, uint32_t token, size_t first, const
              * may land behind a surface, which goes back to replay them. */
             for (f = s->cdg_surfaces; f; f = f->next)
                 if (f->st.next > first && first < f->stale_from) f->stale_from = first;
-            index_written(data, first, n);
-        } else if (data->index && first + n > data->index->high) {
-            index_written(data, first, n);  /* blank packs written as blank: still advance */
+            index_written(data, first, n, 1);
+        } else {
+            index_written(data, first, n, 0);
         }
     }
     fa_mutex_unlock(&s->cdg_lock);
@@ -846,6 +848,7 @@ FA_API fa_result FA_CALL fa_cdg_surface_create(fa_stream* stream, const fa_cdg_s
     state_reset(&f->st);
     f->stale_from = SIZE_MAX;
     fa_mutex_lock(&stream->cdg_lock);
+    index_build(stream->cdg);
     f->gen = stream->cdg_gen;
     f->next = stream->cdg_surfaces;
     stream->cdg_surfaces = f;
@@ -906,6 +909,15 @@ static void restore(fa_cdg_surface* f, const cdg_state* from)
     if (x0 < x1) mark(st, x0, y0, x1, y1);
 }
 
+/* The newest checkpoint at or before pack `pos` (or the start). */
+static void rewind_before(fa_cdg_surface* f, const fa_cdg_data* d, size_t pos)
+{
+    const struct fa_cdg_index* ix = d ? d->index : NULL;
+    size_t k = ix ? pos / ix->step : 0;
+    if (ix && k > ix->count) k = ix->count;
+    restore(f, k > 0 ? &ix->at[k - 1] : NULL);
+}
+
 /* Brings the surface's state to `target` packs: from the newest checkpoint at or
  * before it when that saves replaying (any seek back, or a jump forward past one),
  * then pack by pack. */
@@ -915,7 +927,7 @@ static void decode_to(fa_cdg_surface* f, const fa_cdg_data* d, size_t target)
     size_t k = ix ? target / ix->step : 0;
     if (ix && k > ix->count) k = ix->count;
     if (target < f->st.next || (k > 0 && k * ix->step > f->st.next))
-        restore(f, k > 0 ? &ix->at[k - 1] : NULL);
+        rewind_before(f, d, target);
     while (f->st.next < target) {
         apply_pack(&f->st, d->packs + f->st.next * FA_CDG_PACK_BYTES);
         f->st.next++;
@@ -934,10 +946,16 @@ static fa_result surface_update(fa_cdg_surface* f, fa_time time, fa_cdg_frame* o
     if (offset > 0 && time < INT64_MIN + offset) time = INT64_MIN;
     else if (offset < 0 && time > INT64_MAX + offset) time = INT64_MAX;
     else time -= offset;
-    if (f->gen != s->cdg_gen) { restore(f, NULL); f->gen = s->cdg_gen; f->stale_from = SIZE_MAX; }
+    if (f->gen != s->cdg_gen) {
+        index_build(s->cdg);      /* graphics loaded since the surface was created */
+        restore(f, NULL);
+        f->gen = s->cdg_gen;
+        f->stale_from = SIZE_MAX;
+    }
     if (f->stale_from != SIZE_MAX) {
-        /* Packs from stale_from changed (the stream's checkpoints were redone too). */
-        if (f->st.next > f->stale_from) decode_to(f, s->cdg, f->stale_from);
+        /* Packs from stale_from changed: back to the checkpoint before them (the
+         * stream's own were redone), and on from there to the target below. */
+        if (f->st.next > f->stale_from) rewind_before(f, s->cdg, f->stale_from);
         f->stale_from = SIZE_MAX;
     }
     target = s->cdg ? packs_at(time, s->cdg->count) : 0;

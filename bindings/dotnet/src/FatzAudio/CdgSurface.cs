@@ -64,7 +64,8 @@ public enum CdgSource
 /// <param name="Source">Where they come from.</param>
 /// <param name="PackCount">Packs, 300 per second (a disc track's whole length).</param>
 /// <param name="CheckpointInterval">A seek replays at most this much (10 s, longer for graphics over 30 minutes).</param>
-/// <param name="CheckpointCount">Checkpoints built so far: all of them at load for files, as the packs arrive for discs.</param>
+/// <param name="CheckpointCount">Checkpoints built so far. Files: all of them once the stream's first surface exists.
+/// Discs: as the packs arrive.</param>
 /// <param name="DiscParity">Discs: true when the packs' parity chose the subcode layout, false when instruction counts
 /// did (drives that zero the parity). Either way the packs are applied as read. Null for other sources.</param>
 public readonly record struct CdgInfo(CdgSource Source, long PackCount, TimeSpan CheckpointInterval, int CheckpointCount, bool? DiscParity);
@@ -147,7 +148,7 @@ public readonly unsafe ref struct CdgFrame
     /// <summary>The disc's transparent-colour values for colours 0..15: 0 opaque .. 63 invisible, whatever the options.</summary>
     public ReadOnlySpan<byte> Transparency { get; }
     /// <summary>The colour the background is drawn with (after <see cref="CdgSurfaceOptions.BackgroundColor"/>), to fill
-    /// the area around a scaled picture. All zero while <see cref="BackgroundIndex"/> is -1 and no colour is set.</summary>
+    /// the area around a scaled picture. All zero while <see cref="BackgroundIndex"/> is -1.</summary>
     public CdgColor Background { get; }
     /// <summary>Goes up by one whenever an update changes a pixel. Each render target compares it with the revision it
     /// last uploaded, so one surface can feed several targets.</summary>

@@ -147,7 +147,7 @@ None of these change what a surface draws without them. Apps built against the o
 | `background_index` | Colour of the last memory preset (screen clear); -1 before the first one and for streams without graphics |
 | `border_index` | Colour of the last border preset; -1 before one |
 | `transparency[16]` | The values of the last transparent-colour pack, 0 opaque .. 63 invisible, whatever the surface's flags |
-| `background[4]` | R, G, B, A the background is drawn with, options applied: fill the area around a scaled picture with it. All 0 while `background_index` is -1 and no `FA_CDG_BACKGROUND_COLOR` is set |
+| `background[4]` | R, G, B, A the background is drawn with, options applied: fill the area around a scaled picture with it. All 0 while `background_index` is -1 |
 | `revision` | Goes up by one whenever an update changes a pixel (1 after the first update). Never goes down, also not on seeks |
 | `palette_revision` | Goes up whenever `palette`, `background_index`, `border_index` or `transparency` change |
 
@@ -194,7 +194,7 @@ Drawing runs on the thread that calls update, not on the audio thread, and costs
 
 ### Seeking
 
-The graphics carry checkpoints, the decoder state every 10 s of packs, shared by all surfaces of the stream. A `.cdg` file, ZIP entry or memory block gets all of them when it is loaded (about 5 ms for a dense 5-minute song); a disc track gets them as its packs arrive, and redoes them if a part is read again with different packs. Any seek, back or forward, the first one too and into parts never played, restores the checkpoint before the target and replays at most 10 s of packs: well under a millisecond, so a seek-bar drag that sends many seeks per second stays cheap. A seek also uploads only the area that differs from what was shown. Graphics longer than 30 minutes space the checkpoints further apart (20 s up to an hour, and so on), which keeps their memory under about 12 MB.
+The graphics carry checkpoints, the decoder state every 10 s of packs, shared by all surfaces of the stream. A `.cdg` file, ZIP entry or memory block gets all of them when the stream's first surface is created (about 5 ms for a dense 5-minute song), so opening songs you never draw costs nothing. A disc track gets them as its packs arrive, and redoes them if a part is read again with different packs. Any seek, back or forward, the first one too and into parts never played (on a disc: parts read so far), restores the checkpoint before the target and replays at most 10 s of packs: well under a millisecond, so a seek-bar drag that sends many seeks per second stays cheap. A seek also uploads only the area that differs from what was shown. Graphics longer than 30 minutes space the checkpoints further apart (20 s up to an hour, and so on), which keeps their memory under about 12 MB.
 
 ## ZIP archives
 
@@ -236,7 +236,7 @@ Every instruction of the CD+G "TV graphics" mode is implemented: memory preset (
 
 - Surfaces can be created, updated and destroyed from any thread; one surface is updated from one thread at a time. Different surfaces, even of the same stream, may be updated from different threads.
 - Loading or removing graphics while surfaces are being updated is safe: each surface starts over on the new graphics at its next update.
-- An update never waits for the device or decode threads. It shares one short lock per stream with graphics loads (only the hand-over: checkpoints are built before it), a disc's pack writes and the stream's other surfaces. `fa_cdg_surface_update` also reads `fa_stream_get_clock`; `fa_cdg_surface_update_at` does not.
+- An update never waits for the device or decode threads. It shares one short lock per stream with graphics loads, a disc's pack writes and the stream's other surfaces. The one longer hold is building a file's checkpoints, once, in the first `fa_cdg_surface_create` (or the first update after a load): about 5 ms for a song. `fa_cdg_surface_update` also reads `fa_stream_get_clock`; `fa_cdg_surface_update_at` does not.
 - An update with nothing new compares the palette and returns: no pixels are copied, so calling it at 240 Hz costs next to nothing.
 - Destroy every surface you create with `fa_cdg_surface_destroy`, before or after closing its stream (not while `fa_stream_close` is running on another thread). After the stream is closed, updates return `FA_ERROR_INVALID_ARG`. In .NET, disposing the stream also disposes its surfaces, and `Update` then throws `ObjectDisposedException`.
 
