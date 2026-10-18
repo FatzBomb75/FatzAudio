@@ -1,0 +1,5 @@
+/* Exports of libfatzaudio.so on Linux: the C API and nothing else. */
+{
+    global: fa_*;
+    local: *;
+};
