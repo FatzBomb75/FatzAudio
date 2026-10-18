@@ -89,7 +89,9 @@ typedef struct ogg {
     int enumerated;         /* every link is known (a seekable file) */
     int scanning;           /* reading the whole file at open: nothing is handed out */
     double rate0;           /* pts units per second (the first link's rate) */
-    uint8_t body[OGG_MAX_BODY];
+    uint8_t* body;          /* the last page's body, grown to the largest page */
+    size_t body_cap;
+    int oom;                /* growing it failed: every later call fails (sticky) */
     /* The packet being put together across pages. */
     uint8_t* pend;
     size_t pend_len, pend_cap;
@@ -156,7 +158,7 @@ static uint64_t le64(const uint8_t* p) { return (uint64_t)le32(p) | ((uint64_t)l
 
 /* Reads the page at `pos`, whose first `have` header bytes are already in h, into
  * pg and o->body. 1 = a valid page, 0 = not one (the reader is left wherever
- * reading stopped), -1 = the data ends first. */
+ * reading stopped), -1 = the data ends first, -2 = out of memory. */
 static int page_rest(ogg* o, uint8_t* h, size_t have, int64_t pos, oggs_page* pg)
 {
     uint32_t i, crc;
@@ -167,6 +169,15 @@ static int page_rest(ogg* o, uint8_t* h, size_t have, int64_t pos, oggs_page* pg
     if (fa_br_read(&o->br, h + OGG_HEADER, pg->nseg) < pg->nseg) return -1;
     pg->body_len = 0;
     for (i = 0; i < pg->nseg; i++) pg->body_len += h[OGG_HEADER + i];
+    if (pg->body_len > o->body_cap || !o->body) {   /* never NULL, also for an empty page */
+        size_t cap = o->body_cap ? o->body_cap : 4096;
+        while (cap < pg->body_len) cap *= 2;
+        if (cap > OGG_MAX_BODY) cap = OGG_MAX_BODY;
+        free(o->body);                              /* nothing in it is needed any more */
+        o->body = (uint8_t*)malloc(cap);
+        o->body_cap = o->body ? cap : 0;
+        if (!o->body) { o->oom = 1; return -2; }
+    }
     if (fa_br_read(&o->br, o->body, pg->body_len) < pg->body_len) return -1;
     crc = le32(h + 22);
     memset(h + 22, 0, 4);
@@ -182,7 +193,9 @@ static int page_rest(ogg* o, uint8_t* h, size_t have, int64_t pos, oggs_page* pg
 }
 
 /* The next valid page at or after the reader's position, searching at most
- * `limit` bytes. FA_ERROR_END_OF_STREAM when there is none. */
+ * `limit` bytes. FA_ERROR_END_OF_STREAM when there is none, FA_ERROR_OUT_OF_MEMORY
+ * when its body didn't fit and the buffer couldn't grow (o->oom: the scans that
+ * stop on any error leave it to the entry points to report). */
 static fa_result next_page(ogg* o, oggs_page* pg, int64_t limit)
 {
     uint8_t h[OGG_HEADER + 255];
@@ -211,7 +224,7 @@ static fa_result next_page(ogg* o, oggs_page* pg, int64_t limit)
         memcpy(h, "OggS", 4);
         r = page_rest(o, h, 4, pos, pg);
     }
-    return r > 0 ? FA_OK : FA_ERROR_END_OF_STREAM;
+    return r > 0 ? FA_OK : r == -2 ? FA_ERROR_OUT_OF_MEMORY : FA_ERROR_END_OF_STREAM;
 }
 
 /* Moves the reader; a held page is forgotten. */
@@ -475,6 +488,7 @@ static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_ta
     /* The BOS pages: one per logical stream, each with exactly one packet. */
     for (;;) {
         r = next_page(o, &pg, OGG_RESYNC_MAX);
+        if (r == FA_ERROR_OUT_OF_MEMORY) goto done;
         if (r != FA_OK) break;
         if (!(pg.flags & 2)) {
             o->held = pg;
@@ -509,7 +523,7 @@ static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_ta
     o->have_seq = 0;
     while (l->kind == OGG_FLAC ? !flac_done : nh < need) {
         r = next_page(o, &pg, OGG_RESYNC_MAX);
-        if (r != FA_OK) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
+        if (r != FA_OK) { if (r != FA_ERROR_OUT_OF_MEMORY) r = FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
         if (pg.serial != l->serial) continue;
         r = page_packets(o, &pg);
         if (r != FA_OK) goto done;
@@ -677,6 +691,7 @@ static fa_result fill_queue(ogg* o)
         if (o->iq < o->nq) return FA_OK;
         if (o->at_end) return FA_ERROR_END_OF_STREAM;
         r = next_page(o, &pg, OGG_RESYNC_MAX);
+        if (r == FA_ERROR_OUT_OF_MEMORY) return r;
         if (r != FA_OK) { o->at_end = 1; return FA_ERROR_END_OF_STREAM; }
         if (pg.flags & 2) {
             /* The next link of a chained stream. */
@@ -733,7 +748,7 @@ static fa_result ogg_next(void* ctx, fa_demux_packet* out)
 {
     ogg* o = (ogg*)ctx;
     oggs_pkt* q;
-    fa_result r = fill_queue(o);
+    fa_result r = o->oom ? FA_ERROR_OUT_OF_MEMORY : fill_queue(o);
     if (r != FA_OK) return r;
     /* A seek lands on the page before the target, up to a second of audio; the
      * packets more than skip_back before the one holding it are never decoded.
@@ -828,7 +843,7 @@ static fa_result ogg_seek(void* ctx, int64_t t, int packets_back, size_t bytes_b
         o->codec_link = k;
         o->reopen = &l->params;
     }
-    r = seek_to(o, at);
+    r = o->oom ? FA_ERROR_OUT_OF_MEMORY : seek_to(o, at);   /* the page search may have run out */
     if (r != FA_OK) o->skipping = 0;
     return r;
 }
@@ -843,6 +858,7 @@ static void ogg_free(ogg* o)
     free(o->links);
     free(o->pend);
     free(o->qdata);
+    free(o->body);
     fa_br_free(&o->br);
     free(o);
 }
@@ -969,6 +985,7 @@ static fa_result ogg_open(fa_decoder* dec)
     }
     tp.last_pts = FA_DEMUX_NO_PTS;
     tp.seek_preroll_s = 0.0;      /* Opus: the track's own (OPUS_PREROLL_S) */
+    if (o->oom) { r = FA_ERROR_OUT_OF_MEMORY; goto fail; }   /* a scan above ran out */
     r = fa_track_open(&o->track, dec, &ogg_ops, o, &tp);
     if (r != FA_OK) goto fail;
     dec->impl = o;
