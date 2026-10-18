@@ -652,11 +652,15 @@ def main():
 def finish(out, work, results, L, worse):
     """Writes results.json and report.md, which opens with every measurement where
     BASS won."""
-    with open(os.path.join(out, 'results.json'), 'w') as f:
+    with open(os.path.join(out, 'results.json'), 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=1, default=float)
-    L.insert(1, '## Where FatzAudio is worse than BASS\n\n' + ('\n'.join('- ' + w for w in worse) if worse
-                                                              else 'Nowhere in these measurements.') + '\n')
-    with open(os.path.join(out, 'report.md'), 'w') as f:
+    failed = device.failures(results.get('device', {}))
+    summary = '\n'.join('- ' + w for w in worse) if worse else 'Nowhere in these measurements.'
+    if failed:
+        summary += ('\n\n**%d measurements failed** and are not compared (the recordings are kept in '
+                    'failed-recordings):\n\n' % len(failed)) + '\n'.join('- ' + f for f in failed)
+    L.insert(1, '## Where FatzAudio is worse than BASS\n\n' + summary + '\n')
+    with open(os.path.join(out, 'report.md'), 'w', encoding='utf-8') as f:
         f.write('\n'.join(L) + '\n')
     shutil.rmtree(work, ignore_errors=True)
     print('wrote', os.path.join(out, 'report.md'))
@@ -763,8 +767,8 @@ def write_report(results, cases, args, tempo):
     L.append('\n## Speed and memory\n')
     L.append('Best of %d runs. Speed is times real time for the whole file (higher is better); open is '
              'the open call, first audio the time from the open call to the first decoded frames; '
-             'memory is what the process grew by while decoding one stream (after a warm-up decode, so '
-             'loading code and one-time setup are not counted). Bold marks the better one where the '
+             'memory is the most the process grew by while decoding one stream, from just before it '
+             'opens (after a warm-up decode, so loading code and one-time setup are not counted). Bold marks the better one where the '
              'gap is real: more than 10%% in speed, 1 ms in time, 256 KB and 25%% in memory.\n' % args.runs)
     L.append('| File | FatzAudio speed | BASS speed | FatzAudio open ms | BASS open ms | FatzAudio first audio ms | '
              'BASS first audio ms | FatzAudio memory KB | BASS memory KB |')

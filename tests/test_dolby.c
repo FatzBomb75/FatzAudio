@@ -168,6 +168,92 @@ static void test_matches_ffmpeg(void)
     compare("dolby/2_1_lfe.ec3", "dolby/2_1_lfe.wav", FA_DYNAMIC_RANGE_NORMAL, lrs_lfe);
     compare("dolby/3_1_lfe.ec3", "dolby/3_1_lfe.wav", FA_DYNAMIC_RANGE_NORMAL, lcrs_lfe);
     compare("dolby/2_2.ec3", "dolby/2_2.wav", FA_DYNAMIC_RANGE_NORMAL, quad);
+    /* The adaptive hybrid transform (vector and gain-adaptive quantization). */
+    compare("dolby/aht_mono.ec3", "dolby/aht_mono.wav", FA_DYNAMIC_RANGE_NORMAL, k_same);
+    compare("dolby/aht_stereo.ec3", "dolby/aht_stereo.wav", FA_DYNAMIC_RANGE_NORMAL, k_same);
+    compare("dolby/aht_51.ec3", "dolby/aht_51.wav", FA_DYNAMIC_RANGE_NORMAL, k_same);
+    compare("dolby/aht_71.ec3", "dolby/aht_71.wav", FA_DYNAMIC_RANGE_NORMAL, k_same);
+}
+
+/* Decodes a raw stream access unit by access unit with ac3.c, counting the units
+ * that fail and the decoded samples that are not 0. */
+static void decode_units(const char* name, int* units, int* errors, long* nonzero)
+{
+    size_t size, pos = 0;
+    uint8_t* data = load_file(name, &size);
+    fa_ac3* d = fa_ac3_create();
+    float* pcm = NULL;
+    size_t cap = 0;
+    *units = *errors = 0;
+    *nonzero = 0;
+    while (data && d && pos + 8 <= size) {
+        fa_ac3_header h, n;
+        size_t end;
+        int frames = 0, channels = 0, i;
+        uint32_t rate = 0;
+        if (!fa_ac3_parse_header(data + pos, size - pos, &h)) { pos++; continue; }
+        end = pos + h.frame_size;
+        while (end + 8 <= size && fa_ac3_parse_header(data + end, size - end, &n) && n.eac3 && n.strmtyp == 1)
+            end += n.frame_size;
+        if (end > size) break;
+        if (fa_ac3_decode(d, data + pos, end - pos, FA_AC3_DRC_OFF, &pcm, &cap, &frames, &channels, &rate) != FA_OK)
+            (*errors)++;
+        for (i = 0; i < frames * channels; i++) *nonzero += pcm[i] != 0.0f;
+        (*units)++;
+        pos = end;
+    }
+    fa_ac3_destroy(d);
+    free(pcm);
+    free(data);
+}
+
+/* Two streams that code the same audio two ways decode the same. */
+static void same_audio(const char* a, const char* b)
+{
+    decoded m, r;
+    uint32_t c;
+    int units, errors;
+    long nonzero;
+    double worst = 999;
+    decode_units(a, &units, &errors, &nonzero);
+    CHECK(units > 0);
+    CHECK_EQ(errors, 0);
+    CHECK(nonzero > 0);
+    decode_units(b, &units, &errors, &nonzero);
+    CHECK_EQ(errors, 0);
+    CHECK(decode(a, FA_DYNAMIC_RANGE_FULL, &m));
+    CHECK(decode(b, FA_DYNAMIC_RANGE_FULL, &r));
+    CHECK_EQ(m.frames, r.frames);
+    CHECK_EQ(m.info.format.channels, r.info.format.channels);
+    for (c = 0; c < r.info.format.channels; c++) {
+        double v = snr(&m, (int)c, &r, (int)c, 0, m.frames);
+        if (v < worst) worst = v;
+    }
+    printf("  %s = %s: %d units, %u channels, %.0f dB\n", a, b, units, m.info.format.channels, worst);
+    CHECK(worst > 200);
+    free(m.pcm);
+    free(r.pcm);
+}
+
+static void test_tools_ffmpeg_lacks(void)
+{
+    int units, errors;
+    long nonzero;
+    /* Enhanced coupling against the same bands as standard coupling (sub-band 4
+     * and up, amplitudes standard coordinates can express). */
+    same_audio("dolby/ecpl_stereo.ec3", "dolby/ecpl_stereo_std.ec3");
+    same_audio("dolby/ecpl_51.ec3", "dolby/ecpl_51_std.ec3");
+    /* Enhanced coupling from sub-band 0, with any amplitude and the reserved
+     * fields: every frame must parse to its end. */
+    decode_units("dolby/ecpl_any.ec3", &units, &errors, &nonzero);
+    printf("  dolby/ecpl_any.ec3: %d units, %d errors\n", units, errors);
+    CHECK(units == 6);
+    CHECK_EQ(errors, 0);
+    CHECK(nonzero > 0);
+    /* Block-level SNR offsets and default fast gains (TS 102 366 E.1.2.4), against
+     * frame-level offsets and fast gains sent. */
+    same_audio("dolby/snr_51.ec3", "dolby/snr_51_frame.ec3");
+    same_audio("dolby/snr_any.ec3", "dolby/snr_any_frame.ec3");
 }
 
 static void test_dynamic_range_modes(void)
@@ -566,6 +652,7 @@ int main(void)
 
     RUN(test_registry_lists_dolby);
     RUN(test_matches_ffmpeg);
+    RUN(test_tools_ffmpeg_lacks);
     RUN(test_dynamic_range_modes);
     RUN(test_seek_is_exact);
     RUN(test_tones_in_containers);
