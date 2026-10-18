@@ -1228,7 +1228,7 @@ public unsafe class AudioStream : IDisposable
     /// <summary>
     /// Raised when the CD+G picture heard now changes: lyrics being coloured in, a screen clear, a colour change, a
     /// seek, new graphics. Call <see cref="CdgSurface.Update"/> on your surfaces then, instead of every frame. The
-    /// first event after subscribing covers the whole screen. Subscribing turns the native events on; removing the
+    /// first handler turns the native events on, and the first event after that covers the whole screen; removing the
     /// last handler turns them off. Raised on the engine's event thread (never the audio thread), at most once per
     /// few milliseconds; handlers may call any FatzAudio method but should return quickly.
     /// </summary>
@@ -1238,10 +1238,9 @@ public unsafe class AudioStream : IDisposable
         {
             lock (_cdgEventLock)
             {
-                bool first = _cdgChanged == null;
-                _cdgChanged += value;
-                if (first && _cdgChanged != null)
+                if (_cdgChanged == null && value != null)
                     FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_cdg_events(Handle, 1));
+                _cdgChanged += value;
             }
         }
         remove

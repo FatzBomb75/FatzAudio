@@ -47,7 +47,7 @@
 #define CDG_ALL_FLAGS (FA_CDG_NO_BORDER | FA_CDG_TRANSPARENT | FA_CDG_PREMULTIPLIED | FA_CDG_SMOOTH | \
                        FA_CDG_TRANSPARENT_BACKGROUND_ONLY | FA_CDG_HIDE_UNTIL_PRESET | \
                        FA_CDG_BACKGROUND_COLOR | FA_CDG_BACKGROUND_OPACITY)
-#define CDG_MAX_CHECKPOINTS 180
+#define CDG_MAX_CHECKPOINTS 180   /* ~12 MB; longer graphics space them out further */
 /* fa_event.value of FA_EVENT_CDG_CHANGED; the header's FA_CDG_CHANGE_* take it apart. */
 #define FA_CDG_CHANGE_MAKE(x, y, w, h, pal) \
     ((int64_t)(x) | ((int64_t)(y) << 12) | ((int64_t)(w) << 24) | ((int64_t)(h) << 36) | ((int64_t)((pal) != 0) << 48))   /* ~12 MB; longer graphics space them out further */
@@ -718,12 +718,11 @@ int fa_stream_cdg_write(struct fa_stream* s, uint32_t token, size_t first, const
     return ok;
 }
 
-static void watch_list(struct fa_stream* s, int on);
+static int watch_list(struct fa_stream* s, int on);
 
 void fa_stream_cdg_close(struct fa_stream* s)
 {
     fa_cdg_surface* f;
-    fa_store32(&s->cdg_events, 0);
     watch_list(s, 0);
     fa_mutex_lock(&s->cdg_lock);
     /* Surfaces belong to the app: they outlive the stream until destroyed, and
@@ -981,14 +980,19 @@ static fa_result surface_update(fa_cdg_surface* f, fa_time time, fa_cdg_frame* o
 
 /* ---- change events ---------------------------------------------------------------- */
 
-/* Adds the stream to (or takes it off) the engine's list the event thread watches. */
-static void watch_list(struct fa_stream* s, int on)
+/* Adds the stream to (or takes it off) the engine's list the event thread watches,
+ * and sets cdg_events with it, both under list_lock so they always agree. A closed
+ * stream is never added: 0 then. */
+static int watch_list(struct fa_stream* s, int on)
 {
     fa_engine* e = s->engine;
     struct fa_stream** link;
-    if (!on && !s->cdg_watch_listed) return;   /* only API calls on this stream change it */
+    int ok = 1;
+    if (!e) return 0;   /* a stream that failed to open */
     fa_mutex_lock(&e->list_lock);
-    if (on && !s->cdg_watch_listed) {
+    if (on && fa_load32(&s->closed)) {
+        ok = 0;
+    } else if (on && !s->cdg_watch_listed) {
         s->cdg_watch_link = e->cdg_watched;
         e->cdg_watched = s;
         s->cdg_watch_listed = 1;
@@ -997,34 +1001,43 @@ static void watch_list(struct fa_stream* s, int on)
             if (*link == s) { *link = s->cdg_watch_link; break; }
         s->cdg_watch_listed = 0;
     }
+    if (ok) fa_store32(&s->cdg_events, on ? 1 : 0);
     fa_mutex_unlock(&e->list_lock);
+    return ok;
 }
 
 FA_API fa_result FA_CALL fa_stream_set_cdg_events(fa_stream* stream, int32_t enabled)
 {
-    if (!stream || fa_load32(&stream->closed)) return FA_ERROR_INVALID_ARG;
-    if (enabled) watch_list(stream, 1);
-    fa_mutex_lock(&stream->cdg_lock);
-    if (enabled && !fa_load32(&stream->cdg_events)) {
+    if (!stream) return FA_ERROR_INVALID_ARG;
+    if (enabled) {
+        /* Before the stream is watched, so the first round sees this. */
+        fa_mutex_lock(&stream->cdg_lock);
         stream->cdg_watch_dirty = 1;   /* the first event asks for a whole picture */
         stream->cdg_watch_gen = stream->cdg_gen;
+        index_build(stream->cdg);      /* a seek report reads the checkpoints */
+        fa_mutex_unlock(&stream->cdg_lock);
     }
-    fa_store32(&stream->cdg_events, enabled ? 1 : 0);
-    fa_mutex_unlock(&stream->cdg_lock);
-    if (!enabled) watch_list(stream, 0);
-    return FA_OK;
+    return watch_list(stream, enabled != 0) ? FA_OK : FA_ERROR_INVALID_ARG;
 }
 
-/* Smooth-scroll offsets in force after packs [0, upto): from the last scroll pack. */
+/* 1 when a scroll pack's data sets smooth-scroll offsets other than 0. */
+static int scroll_shifted(const uint8_t* d) { return (d[1] & 0x07) != 0 || (d[2] & 0x0F) != 0; }
+
+/* Smooth-scroll offsets in force after packs [0, upto): from the last scroll pack,
+ * looking back no further than the checkpoint before `upto`. */
 static int shifted_at(const fa_cdg_data* d, size_t upto)
 {
-    while (upto > 0) {
+    const struct fa_cdg_index* ix = d->index;
+    size_t k = ix ? upto / ix->step : 0, base;
+    if (ix && k > ix->count) k = ix->count;
+    base = k ? k * ix->step : 0;
+    while (upto > base) {
         const uint8_t* p = d->packs + --upto * FA_CDG_PACK_BYTES;
         int op = p[1] & 0x3F;
         if ((p[0] & 0x3F) == CDG_MODE_GRAPHICS && (op == CDG_SCROLL_PRESET || op == CDG_SCROLL_COPY))
-            return (p[5] & 0x07) != 0 || (p[6] & 0x0F) != 0;
+            return scroll_shifted(p + 4);
     }
-    return 0;
+    return k ? ix->at[k - 1].hoff != 0 || ix->at[k - 1].voff != 0 : 0;
 }
 
 static void grow(int* r, int x0, int y0, int x1, int y1)
@@ -1056,7 +1069,7 @@ static void pack_changes(struct fa_stream* s, const fa_cdg_data* d, size_t from,
         }
         case CDG_SCROLL_PRESET:
         case CDG_SCROLL_COPY:
-            s->cdg_watch_shifted = (dd[1] & 0x07) != 0 || (dd[2] & 0x0F) != 0;
+            s->cdg_watch_shifted = scroll_shifted(dd);
             grow(r, 0, 0, FA_CDG_WIDTH, FA_CDG_HEIGHT);   /* the picture moves */
             break;
         case CDG_MEMORY_PRESET:
@@ -1080,8 +1093,13 @@ void fa_stream_cdg_watch(struct fa_stream* s)
     fa_cdg_data* d;
     size_t target;
     int r[4] = { 0, 0, 0, 0 }, palette = 0;
-    if (!fa_load32(&s->cdg_events) || fa_load32(&s->closed)) return;
-    if (fa_stream_get_clock(s, &now) != FA_OK) return;
+    /* Like a callback: fa_stream_close sets `closed`, then waits for in_callback 0
+     * before it frees what the clock reads, so either it sees us or we see it. */
+    fa_store32(&s->in_callback, 1);
+    if (!fa_load32(&s->cdg_events) || fa_load32(&s->closed) || fa_stream_get_clock(s, &now) != FA_OK) {
+        fa_store32(&s->in_callback, 0);
+        return;
+    }
     fa_mutex_lock(&s->cdg_lock);
     d = s->cdg;
     target = d ? packs_at(graphics_time(s, now), d->count) : 0;
@@ -1098,6 +1116,7 @@ void fa_stream_cdg_watch(struct fa_stream* s)
     }
     s->cdg_watch_next = target;
     fa_mutex_unlock(&s->cdg_lock);
+    fa_store32(&s->in_callback, 0);
     if (r[0] < r[2] || palette) {
         fa_event ev;
         ev.type = FA_EVENT_CDG_CHANGED;

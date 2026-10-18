@@ -1554,7 +1554,7 @@ FA_API fa_result FA_CALL fa_stream_get_midi_channel_mute(fa_stream* stream, uint
  * FA_EVENT_STARTED         position               0
  * FA_EVENT_MIDI_TEXT       the text's frame       index for fa_stream_get_midi_text
  * FA_EVENT_LOOPED          loop end it left       loop start it went to (CUE_IN or 0)
- * FA_EVENT_CDG_CHANGED     CD+G packs now shown   what changed: FA_CDG_CHANGE_* below
+ * FA_EVENT_CDG_CHANGED     CD+G packs now shown   what changed: FA_CDG_CHANGE_* (CD+G above)
  *
  * Delivered today: ENDED, MARKER, LOOPED, CDG_CHANGED (when asked for), LOUDNESS_FINAL, RAMP_DONE and STARTED; MIDI_TEXT from MIDI
  * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); METADATA from web
