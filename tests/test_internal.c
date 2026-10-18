@@ -211,6 +211,92 @@ static void test_seek_while_attached(void)
     fa_stream_close(s);
 }
 
+/* The system moved the default device's stream by itself (WASAPI, Core Audio):
+ * every stream on it gets FA_EVENT_DEVICE_CHANGED (value 0) with its next mix. */
+static void test_device_rerouted_event(void)
+{
+    fa_stream* s = open_attached(g_dev->rate * 2, 0, 0);
+    recorder rec;
+    float out[2 * 512];
+    rec_init(&rec);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    fa_device_simulate(g_dev, 0);
+    fa_fetch_add64(&g_dev->epoch, 1);
+    fa_device_render_at(g_dev, out, 512, fa_monotonic_ns());
+    fa_fetch_add64(&g_dev->epoch, 1);
+    CHECK_EQ(count_events(&rec, FA_EVENT_DEVICE_CHANGED, 1), 1);
+    CHECK_EQ(rec.ev[0].value, 0);
+    fa_fetch_add64(&g_dev->epoch, 1);
+    fa_device_render_at(g_dev, out, 512, fa_monotonic_ns());   /* only once */
+    fa_fetch_add64(&g_dev->epoch, 1);
+    fa_sleep_ms(30);
+    CHECK_EQ(count_events(&rec, FA_EVENT_DEVICE_CHANGED, 1), 1);
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
+/* A started device that stops by itself (unplugged) is reopened on the default at
+ * the same rate: its streams stay attached, keep their position and play on. */
+static void test_device_lost_reopens_default(void)
+{
+    fa_device* d = NULL;
+    fa_stream* s = NULL;
+    recorder rec;
+    size_t n;
+    uint8_t* wav = make_wav(g_dev->rate, g_dev->rate * 20, 0, &n);
+    fa_frames before = 0, after = 0;
+    uint32_t rate;
+    int i;
+    rec_init(&rec);
+    CHECK_EQ(fa_device_open(g_engine, NULL, &d), FA_OK);
+    rate = d->rate;
+    CHECK_EQ(fa_stream_open_memory(g_engine, wav, n, NULL, &s), FA_OK);
+    free(wav);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, d, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    CHECK_EQ(fa_device_start(d), FA_OK);
+    CHECK_EQ(fa_device_set_volume(d, 0.25f), FA_OK);
+    for (i = 0; i < 200 && before == 0; i++) { fa_sleep_ms(5); fa_stream_get_position(s, &before); }
+    CHECK(before > 0);
+    fa_device_simulate(d, 1);
+    CHECK_EQ(count_events(&rec, FA_EVENT_DEVICE_CHANGED, 1), 1);
+    CHECK_EQ(rec.ev[0].value, 1);
+    CHECK_EQ(fa_load32(&d->lost), 0);
+    CHECK_EQ(d->rate, rate);
+    CHECK(d->device_ok);
+    {
+        float v = 0;
+        CHECK_EQ(fa_device_get_volume(d, &v), FA_OK);
+        CHECK_NEAR(v, 0.25, 1e-6);
+        CHECK_EQ(ma_device_get_master_volume(&d->device, &v), MA_SUCCESS);
+        CHECK_NEAR(v, 0.25, 1e-6);                   /* set again on the reopened device */
+    }
+    for (i = 0; i < 200; i++) {
+        fa_stream_get_position(s, &after);
+        if (after > before + (fa_frames)rate / 20) break;
+        fa_sleep_ms(5);
+    }
+    CHECK(after > before + (fa_frames)rate / 20);   /* plays on, from where it was */
+    {
+        int32_t started = 0;
+        CHECK_EQ(fa_device_is_started(d, &started), FA_OK);
+        CHECK_EQ(started, 1);
+    }
+    /* Stopped, then rerouted by the backend itself (WASAPI when the default goes):
+     * no loss, so no reopen of our own. */
+    fa_device_simulate(d, 1);
+    fa_device_simulate(d, 0);
+    fa_sleep_ms(500);
+    CHECK_EQ(fa_load32(&d->lost), 0);
+    CHECK_EQ(count_events(&rec, FA_EVENT_DEVICE_CHANGED, 2), 1);
+    fa_stream_close(s);
+    fa_device_close(d);
+    rec_free(&rec);
+}
+
 /* Waits for a worker to carry out a pending fa_stream_seek_async. */
 static int wait_seek_done(fa_stream* s)
 {
@@ -1557,6 +1643,8 @@ int main(void)
     RUN(test_curves);
     RUN(test_mix_is_bit_exact);
     RUN(test_seek_while_attached);
+    RUN(test_device_rerouted_event);
+    RUN(test_device_lost_reopens_default);
     RUN(test_seek_async);
     RUN(test_seek_async_then_detach);
     RUN(test_detach_resumes_at_heard_position);

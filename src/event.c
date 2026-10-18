@@ -234,6 +234,8 @@ void fa_event_thread_main(void* arg)
         fa_mutex_unlock(&e->list_lock);
 
         for (i = 0; i < n; i++) deliver(&batch[i].ev);
+        /* After delivering: a reopen can take a while and should not hold events up. */
+        if (!quit) fa_devices_service(e);
         while (grave) {
             struct fa_stream* next = grave->next;
             fa_stream_free_memory(grave);
