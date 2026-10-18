@@ -194,6 +194,9 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_stream_get_cdg_offset(StreamHandle stream, out long offset);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_cdg_info(StreamHandle stream, out FaCdgInfo info);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_set_dynamic_range(StreamHandle stream, int mode);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

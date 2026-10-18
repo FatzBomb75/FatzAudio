@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.21)
-project(fatzaudio VERSION 0.1.0 LANGUAGES C CXX)
+# The version lives in the public header only (FA_VERSION_*); everything else reads it.
+file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/include/fatzaudio/fatzaudio.h" fa_version_lines REGEX "^#define FA_VERSION_(MAJOR|MINOR|PATCH) ")
+foreach(part MAJOR MINOR PATCH)
+    string(REGEX MATCH "FA_VERSION_${part} ([0-9]+)" _ "${fa_version_lines}")
+    set(fa_version_${part} ${CMAKE_MATCH_1})
+endforeach()
+project(fatzaudio VERSION ${fa_version_MAJOR}.${fa_version_MINOR}.${fa_version_PATCH} LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -165,10 +171,16 @@ target_include_directories(fatzaudio
             ${CMAKE_CURRENT_SOURCE_DIR}/third_party/miniaudio
             ${CMAKE_CURRENT_SOURCE_DIR}/third_party/tinysoundfont)
 target_compile_definitions(fatzaudio PRIVATE FA_BUILDING)
+# Before 1.0 a minor version may change the ABI (CHANGELOG.md), so it is part of the SONAME.
+if(PROJECT_VERSION_MAJOR EQUAL 0)
+    set(fa_soversion ${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR})
+else()
+    set(fa_soversion ${PROJECT_VERSION_MAJOR})
+endif()
 set_target_properties(fatzaudio PROPERTIES
     OUTPUT_NAME fatzaudio
     VERSION ${PROJECT_VERSION}
-    SOVERSION 0)
+    SOVERSION ${fa_soversion})
 
 find_package(Threads REQUIRED)
 target_link_libraries(fatzaudio PRIVATE Threads::Threads ${CMAKE_DL_LIBS})

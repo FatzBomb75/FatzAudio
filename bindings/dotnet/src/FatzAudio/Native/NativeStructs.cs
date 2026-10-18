@@ -249,6 +249,8 @@ internal struct FaCdgSurfaceConfig
     public int PixelFormat;
     public uint Width, Height;
     public uint Flags;
+    public uint BackgroundColor;
+    public uint BackgroundOpacity;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -263,6 +265,22 @@ internal unsafe struct FaCdgFrame
     public uint DirtyX, DirtyY, DirtyWidth, DirtyHeight;
     public fixed byte Palette[64];
     public long Time;
+    public int BackgroundIndex;
+    public int BorderIndex;
+    public fixed byte Transparency[16];
+    public fixed byte Background[4];
+    public ulong Revision;
+    public ulong PaletteRevision;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaCdgInfo
+{
+    public int Source;
+    public ulong PackCount;
+    public long CheckpointInterval;
+    public uint CheckpointCount;
+    public int DiscParity;
 }
 
 [StructLayout(LayoutKind.Sequential)]

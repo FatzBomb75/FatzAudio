@@ -33,6 +33,55 @@ C library (`libc`, `libm`), whatever GCC version built it. On Linux only the
 cannot clash with the app's. The `deps` test checks both on Windows and Linux.
 MinGW builds name the library `fatzaudio.dll`, like Visual Studio.
 
+## NuGet package and versions
+
+CI builds the NuGet package `FatzAudio` on every run, from the `win-x64` and
+`linux-x64` libraries its own build and test jobs just tested, and keeps it as
+the run's `nuget` artifact. The Linux library is built on Ubuntu 22.04, so it
+runs on any distribution with glibc 2.35 or newer (Debian 12, Ubuntu 22.04,
+Fedora 36 and later).
+
+Each run's package is a prerelease, such as `0.2.0-ci.123`, and pushes to
+`main` publish it to the repository owner's GitHub Packages feed, so the
+newest `main` is always there. The stable `0.2.0` is published by running the
+`build` workflow by hand on `main` (Actions, build, Run workflow) with
+"release" ticked.
+
+The version is set in one place, `FA_VERSION_*` in
+`include/fatzaudio/fatzaudio.h`; CMake and the .NET project read it from there.
+[CHANGELOG.md](../CHANGELOG.md) lists every version and every breaking change.
+Before 1.0 a minor bump may break the API, so bump the minor version with any
+breaking change and the patch version otherwise. A stable version can be
+published only once (the run fails otherwise), so bump the version before each
+release. On Linux the minor version is part of the SONAME while the major is 0
+(`libfatzaudio.so.0.2`), so a C program linked against 0.1 does not load 0.2.
+
+To use the feed, add it to the app's `nuget.config`. GitHub Packages needs a
+personal access token with `read:packages`, even for your own packages:
+
+```xml
+<configuration>
+  <packageSources>
+    <add key="fatzaudio" value="https://nuget.pkg.github.com/FatzBomb75/index.json" />
+  </packageSources>
+  <packageSourceCredentials>
+    <fatzaudio>
+      <add key="Username" value="FatzBomb75" />
+      <add key="ClearTextPassword" value="%FATZAUDIO_PACKAGES_TOKEN%" />
+    </fatzaudio>
+  </packageSourceCredentials>
+</configuration>
+```
+
+Or download the `nuget` artifact of a CI run and point a local folder feed at it.
+Pin the version in `Directory.Packages.props` as usual:
+`<PackageVersion Include="FatzAudio" Version="0.2.0" />`, or
+`Version="0.2.0-ci.*"` to follow `main`.
+
+To pack locally, put the libraries under
+`bindings/dotnet/src/FatzAudio/runtimes/<rid>/native/` and run
+`dotnet pack bindings/dotnet/src/FatzAudio -c Release`.
+
 ## Android
 
 Requirements: the Android NDK (r28 or later recommended; Android Studio's SDK

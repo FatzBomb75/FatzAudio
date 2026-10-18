@@ -59,6 +59,54 @@ public class CdgTests
     }
 
     [Fact]
+    public void Frame_ReportsDecoderStateRevisionsAndInfo()
+    {
+        using var engine = CreateHeadless();
+        using var song = engine.OpenMemory(TestAudio.SineWav(), DecodeOnly);
+        Assert.Equal(CdgSource.None, song.CdgInfo.Source);
+        var transparent = new byte[16];
+        transparent[2] = 63;              // colour 2 invisible
+        var bytes = SimpleCdg().Concat(Pack(28, transparent)).ToArray();
+        song.LoadCdg(bytes);
+        var info = song.CdgInfo;
+        Assert.Equal(CdgSource.File, info.Source);
+        Assert.Equal(4, info.PackCount);
+        Assert.Equal(TimeSpan.FromSeconds(10), info.CheckpointInterval);
+        Assert.Null(info.DiscParity);
+
+        using var indexed = song.CreateCdgSurface(new CdgSurfaceOptions { PixelFormat = CdgPixelFormat.Indexed8 });
+        var f = indexed.UpdateAt(AfterPacks(0));
+        Assert.Equal(-1, f.BackgroundIndex);
+        Assert.Equal(-1, f.BorderIndex);
+        Assert.Equal(1UL, f.Revision);
+        f = indexed.UpdateAt(AfterPacks(4));
+        Assert.Equal(1, f.BackgroundIndex);
+        Assert.Equal(2, f.BorderIndex);
+        Assert.Equal(63, f.Transparency[2]);
+        Assert.Equal(new CdgColor(255, 0, 0, 255), f.Background);
+        Assert.Equal(255, f.Palette[2].A);    // no option: alpha untouched
+        Assert.Equal(2UL, f.Revision);
+        ulong rev = f.Revision, prev = f.PaletteRevision;
+        f = indexed.UpdateAt(AfterPacks(4));
+        Assert.Equal((rev, prev), (f.Revision, f.PaletteRevision));
+
+        using var bgOnly = song.CreateCdgSurface(new CdgSurfaceOptions { TransparentBackgroundOnly = true });
+        f = bgOnly.UpdateAt(AfterPacks(4));
+        Assert.Equal(0, f.Palette[1].A);
+        Assert.Equal(255, f.Palette[2].A);    // the transparent-colour pack is ignored
+
+        using var custom = song.CreateCdgSurface(new CdgSurfaceOptions
+            { BackgroundColor = new CdgColor(1, 2, 3, 255), BackgroundOpacity = 40 });
+        f = custom.UpdateAt(AfterPacks(4));
+        Assert.Equal(new CdgColor(1, 2, 3, 102), f.Palette[1]);
+        Assert.Equal(f.Palette[1], f.Background);
+
+        using var hidden = song.CreateCdgSurface(new CdgSurfaceOptions { HideUntilPreset = true });
+        Assert.Equal(0, hidden.UpdateAt(AfterPacks(0)).Pixels[3]);
+        Assert.Throws<ArgumentOutOfRangeException>(() => song.CreateCdgSurface(new CdgSurfaceOptions { BackgroundOpacity = 101 }));
+    }
+
+    [Fact]
     public void SurfaceOptions_ScaleCropAndTransparency()
     {
         using var engine = CreateHeadless();

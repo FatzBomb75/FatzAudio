@@ -1178,6 +1178,13 @@ static void test_cdg_image(void)
         CHECK_EQ(play_through(s), FA_OK);
         CHECK_EQ(has_cdg(s), 1);
         CHECK(same_packs(s, packs));
+        {
+            fa_cdg_info ci;
+            CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
+            CHECK_EQ(ci.source, FA_CDG_SOURCE_DISC);
+            CHECK_EQ(ci.pack_count, SONG_PACKS);
+            CHECK_EQ(ci.disc_parity, g_with_parity);     /* how the layout was chosen */
+        }
         CHECK_EQ(pixel_at(f, 1000000000LL), 0xFF0000u);   /* red */
         CHECK_EQ(pixel_at(f, 3000000000LL), 0x00FF00u);   /* green after 2 s */
         CHECK_EQ(pixel_at(f, 500000000LL), 0xFF0000u);    /* and back */

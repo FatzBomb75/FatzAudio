@@ -43,10 +43,14 @@ uint32_t fa_crc32(const uint8_t* data, size_t size);
 #define FA_CDG_PACK_BYTES 24
 #define FA_CDG_PACKS_PER_SECOND 300
 
-/* The graphics of a stream: the raw packs, read in full (a song's .cdg is a few MB). */
+/* The graphics of a stream: the raw packs, read in full (a song's .cdg is a few MB),
+ * and the checkpoints every surface of the stream seeks from (cdg.c). */
 typedef struct fa_cdg_data {
     uint8_t* packs;
     size_t count;            /* whole packs */
+    struct fa_cdg_index* index; /* NULL until built (or out of memory: seeks replay from the start) */
+    int from_disc;           /* read from a disc's subcode while it plays */
+    int disc_parity;         /* from_disc: the subcode layout was chosen by the packs' parity */
 } fa_cdg_data;
 
 /* Takes ownership of `bytes` (malloc'ed) on success and on failure. */
@@ -61,7 +65,8 @@ int fa_cdg_is_cdg_name(const char* name);
  * the data and detaches the surfaces (the app still destroys them). */
 void fa_stream_cdg_attach(struct fa_stream* s, fa_cdg_data* data);
 /* Graphics that arrive while the stream plays (audio CDs read the packs with the
- * audio): fa_cdg_data_blank makes `count` zero packs (no-ops);
+ * audio): fa_cdg_data_blank makes `count` zero packs (no-ops) whose checkpoints are
+ * taken as the writes arrive;
  * fa_stream_cdg_attach_if_none attaches them unless the stream already has graphics
  * (returns 0 and frees `data` then), and gives a token for fa_stream_cdg_write,
  * which fills packs [first, first + n). Surfaces already past `first` go back to

@@ -459,6 +459,21 @@ public unsafe class AudioStream : IDisposable
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_load_cdg_memory(Handle, p, (nuint)cdg.Length));
     }
 
+    /// <summary>
+    /// Where the stream's CD+G graphics come from, how far apart their seek checkpoints are, and for disc tracks
+    /// whether the subcode layout was chosen by the packs' parity.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public CdgInfo CdgInfo
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_cdg_info(Handle, out var i));
+            return new CdgInfo((CdgSource)i.Source, (long)i.PackCount, TimeConvert.FromNanoseconds(i.CheckpointInterval),
+                (int)i.CheckpointCount, i.DiscParity < 0 ? null : i.DiscParity != 0);
+        }
+    }
+
     /// <summary>Removes the stream's CD+G graphics; surfaces show a blank picture afterwards.</summary>
     /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
     public void RemoveCdg() => FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_load_cdg_path(Handle, null));

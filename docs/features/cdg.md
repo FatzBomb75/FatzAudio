@@ -127,6 +127,12 @@ A surface turns the graphics into pixels for one output. Each has its own pixel 
 | `FA_CDG_TRANSPARENT` | The background colour (the colour of the last screen clear) is fully transparent, so the lyrics can be drawn over video. Colours a disc marks with the "transparent colour" instruction get that transparency (0 opaque .. 63 invisible) |
 | `FA_CDG_PREMULTIPLIED` | Colour multiplied by alpha, for WPF `Pbgra32`, Direct2D and most compositors. Without it alpha is straight |
 | `FA_CDG_SMOOTH` | Bilinear scaling. Without it, scaling keeps sharp square pixels (the classic look). Ignored for INDEXED8 |
+| `FA_CDG_TRANSPARENT_BACKGROUND_ONLY` | Like `FA_CDG_TRANSPARENT`, but only the background colour is transparent: transparent-colour packs are ignored. Some discs set them in ways that punch holes in the lyrics. Wins over `FA_CDG_TRANSPARENT` |
+| `FA_CDG_HIDE_UNTIL_PRESET` | Every colour is fully transparent until the first screen clear (memory preset), so the picture or video underneath shows instead of a black screen at the start of a song |
+| `FA_CDG_BACKGROUND_COLOR` + `background_color` | Replaces the background colour with your own, `0xAARRGGBB`, alpha included |
+| `FA_CDG_BACKGROUND_OPACITY` + `background_opacity` | How opaque the background is, 0..100 % of 255 (or of `background_color`'s alpha), whatever the transparency flags make it. A host's "background opacity" slider |
+
+None of these change what a surface draws without them. Apps built against the older, shorter `fa_cdg_surface_config` keep working: pass its `struct_size` as before.
 
 `fa_cdg_surface_update` returns:
 
@@ -136,8 +142,42 @@ A surface turns the graphics into pixels for one output. Each has its own pixel 
 | `changed` | 1 when the pixels or the palette differ from the previous update. Always 1 the first time |
 | `dirty_x`, `dirty_y`, `dirty_width`, `dirty_height` | The pixels that changed, in output pixels. Usually one 6x12 tile per pack while lyrics are being coloured in, so uploads stay tiny |
 | `palette_changed` | 1 when `palette` changed. With INDEXED8 a colour-table change recolours the screen without touching a pixel, so the dirty rectangle is empty: update your palette (or shader lookup) instead |
-| `palette[16][4]` | R, G, B, A of the 16 colours (straight alpha) |
+| `palette[16][4]` | R, G, B, A of the 16 colours (straight alpha). A is 255 unless a transparency or background option is set, and RGB never has alpha folded in |
 | `time` | The position on the graphics timeline that is shown |
+| `background_index` | Colour of the last memory preset (screen clear); -1 before the first one and for streams without graphics |
+| `border_index` | Colour of the last border preset; -1 before one |
+| `transparency[16]` | The values of the last transparent-colour pack, 0 opaque .. 63 invisible, whatever the surface's flags |
+| `background[4]` | R, G, B, A the background is drawn with, options applied: fill the area around a scaled picture with it. All 0 while `background_index` is -1 |
+| `revision` | Goes up by one whenever an update changes a pixel (1 after the first update). Never goes down, also not on seeks |
+| `palette_revision` | Goes up whenever `palette`, `background_index`, `border_index` or `transparency` change |
+
+### Your own compositor (INDEXED8)
+
+Apps that scale, colour and blend the picture themselves take INDEXED8 pixels and the raw state, and apply their own policy. A typical setup: one INDEXED8 surface per stream at native size, flags 0, updated with your own presentation clock.
+
+```c
+cfg.pixel_format = FA_CDG_PIXELS_INDEXED8;   /* width = height = 0, flags = 0 */
+fa_cdg_surface_create(song, &cfg, &cdg);
+
+/* Presentation thread, once per displayed frame: */
+fa_cdg_surface_update_at(cdg, my_presentation_time, &frame);
+for (each render target t) {
+    if (t->revision != frame.revision) { upload_indices(t, &frame); t->revision = frame.revision; }
+    if (t->palette_revision != frame.palette_revision) {
+        upload_palette(t, frame.palette);    /* RGB; alpha is 255 with flags 0 */
+        t->palette_revision = frame.palette_revision;
+    }
+}
+/* In the shader: skip pixels equal to frame.background_index (draw nothing at all
+ * while it is -1), draw every other index opaque. transparency[] is there if you
+ * want to honour the disc's transparent-colour packs. */
+```
+
+The revisions let one surface feed several render targets (a main window and a projector window, each with its own textures): each target compares them with what it last uploaded. `changed` and the dirty rectangle are relative to the previous update and suit a single target.
+
+### Graphics info
+
+`fa_stream_get_cdg_info` says where a stream's graphics come from (`FA_CDG_SOURCE_FILE` for a `.cdg`, ZIP entry or memory block, `FA_CDG_SOURCE_DISC` for a disc's subcode), how many packs there are, and how far apart the seek checkpoints are. For a disc track, `disc_parity` is 1 when the subcode layout was chosen by the packs' P/Q parity and 0 when it was chosen by counting instructions (drives that return the parity zeroed). Either way the packs are applied as read: there is no error correction. In .NET this is `song.CdgInfo`.
 
 ## Sync
 
@@ -146,9 +186,15 @@ Pack *n* of a `.cdg` belongs at *n* / 300 seconds of the audio. `fa_cdg_surface_
 - **Pause, seek, loop, crossfade, queue:** the clock follows the audio, and so do the graphics.
 - **Tempo and pitch:** the clock is a position in the song, so slower or faster playback moves the graphics with it.
 - **Out-of-sync files:** `fa_stream_set_cdg_offset(song, 150000000)` shows the graphics 150 ms later (negative: earlier).
-- **Your own clock** (rendering a karaoke video, a scrub preview): `fa_cdg_surface_update_at(cdg, time, &frame)` draws the picture at any time you choose.
+- **Your own clock** (rendering a karaoke video, a scrub preview): `fa_cdg_surface_update_at(cdg, time, &frame)` draws the picture at any time you choose. The CD+G offset still applies.
 
-Drawing runs on the thread that calls update, not on the audio thread, and costs microseconds per frame during playback. Only the packs are read under the stream's lock; each surface draws on its own, so a large TV surface never holds up a small preview. Seeking backwards restores the newest checkpoint before the target (one is kept every 30 s of graphics) and replays from there, well under a millisecond even in a long song.
+The exact rule, for apps that compare their own decoder frame for frame: at time *t* (in seconds, after subtracting the offset) the picture shows packs [0, ceil(*t* × 300)) applied. Pack *n* occupies [*n*/300, (*n*+1)/300) and counts as soon as its slot starts, so at *t* = 1 s exactly packs 0..299 are applied, and at 1 s + 1 ns packs 0..300. *t* ≤ 0 shows no pack.
+
+Drawing runs on the thread that calls update, not on the audio thread, and costs microseconds per frame during playback. Only the packs are read under the stream's lock; each surface draws on its own, so a large TV surface never holds up a small preview.
+
+### Seeking
+
+The graphics carry checkpoints, the decoder state every 10 s of packs, shared by all surfaces of the stream. A `.cdg` file, ZIP entry or memory block gets all of them when the stream's first surface is created (about 5 ms for a dense 5-minute song), so opening songs you never draw costs nothing. A disc track gets them as its packs arrive, and redoes them if a part is read again with different packs. Any seek, back or forward, the first one too and into parts never played (on a disc: parts read so far), restores the checkpoint before the target and replays at most 10 s of packs: well under a millisecond, so a seek-bar drag that sends many seeks per second stays cheap. A seek also uploads only the area that differs from what was shown. Graphics longer than 30 minutes space the checkpoints further apart (20 s up to an hour, and so on), which keeps their memory under about 12 MB.
 
 ## ZIP archives
 
@@ -184,12 +230,14 @@ using var engine = AudioEngine.Create(new AudioEngineOptions { TempDirectory = P
 
 ## The CD+G format
 
-Every instruction of the CD+G "TV graphics" mode is implemented: memory preset (clear the screen), border preset, tile block in normal and XOR mode, scroll preset and scroll copy (horizontal and vertical, with the smooth-scroll offsets), define transparent colour, and both halves of the colour table. Repeated memory-preset packs are skipped when the screen is still clean, so they cause no redraws. CD+EG (extended graphics) packs are ignored, and so are packs of other subcode modes.
+Every instruction of the CD+G "TV graphics" mode is implemented: memory preset (clear the screen), border preset, tile block in normal and XOR mode, scroll preset and scroll copy (horizontal and vertical, with the smooth-scroll offsets), define transparent colour, and both halves of the colour table. Repeated memory-preset packs (repeat count above 0) are skipped when the screen is still clean in that colour, so they cause no redraws. The palette starts black until the first colour-table load. CD+EG (extended graphics) packs are ignored, and so are packs of other subcode modes.
 
 ## Threading
 
 - Surfaces can be created, updated and destroyed from any thread; one surface is updated from one thread at a time. Different surfaces, even of the same stream, may be updated from different threads.
 - Loading or removing graphics while surfaces are being updated is safe: each surface starts over on the new graphics at its next update.
+- An update never waits for the device or decode threads. It shares one short lock per stream with graphics loads, a disc's pack writes and the stream's other surfaces. The one longer hold is building a file's checkpoints, once, in the first `fa_cdg_surface_create` (or the first update after a load): about 5 ms for a song. `fa_cdg_surface_update` also reads `fa_stream_get_clock`; `fa_cdg_surface_update_at` does not.
+- An update with nothing new compares the palette and returns: no pixels are copied, so calling it at 240 Hz costs next to nothing.
 - Destroy every surface you create with `fa_cdg_surface_destroy`, before or after closing its stream (not while `fa_stream_close` is running on another thread). After the stream is closed, updates return `FA_ERROR_INVALID_ARG`. In .NET, disposing the stream also disposes its surfaces, and `Update` then throws `ObjectDisposedException`.
 
 ## Pitfalls
@@ -201,4 +249,5 @@ Every instruction of the CD+G "TV graphics" mode is implemented: memory preset (
 ## Not provided yet
 
 - CD+EG extended graphics.
+- A push model (the engine updating a surface and raising an event when the picture changed). Update from your render loop instead.
 - Ready-made helpers for specific renderers (a D3D11 texture updater, a CVPixelBuffer on Apple). The pixel buffer above covers them all today.

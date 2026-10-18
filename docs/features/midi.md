@@ -177,6 +177,7 @@ Rendering runs on the engine's worker threads like decoding of any other format.
 - 256 voices per stream. When a dense passage needs more, the voices furthest into their release are cut; if all 256 are held, the new notes are skipped.
 - Damaged files play what can be read: a track cut short plays up to the cut. A file with no usable track fails with `FA_ERROR_UNSUPPORTED_FORMAT`.
 - DLS banks play their regions, samples, loops, envelopes, LFOs, filter and gains. Articulation scaled by a controller (other than the default mod wheel vibrato) and DLS 2 conditional chunks are ignored.
+- Each instrument's level (`initialAttenuation`) is applied as the SoundFont 2 spec states it, 0.1 dB per unit. FluidSynth applies 0.4 of that (an EMU hardware habit), so a bank tuned by ear in FluidSynth can sound with a wider gap between its quiet and loud instruments here.
 - SF3 (compressed samples) and SFZ soundfonts, MIDI input from devices, and per-channel effects (reverb and chorus send levels) aren't supported yet. See the [engineering notes](../engineering-notes.md).
 - Shift-JIS lyrics (Japanese files) are read as Windows-1252 and come out garbled.
 - Drum parts on channels other than 10 (set by GS SysEx, or XG bank 127) play as melodic instruments: only channel 10 plays drums. SysEx is ignored altogether.

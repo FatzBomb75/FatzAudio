@@ -29,7 +29,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 
 | BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
-| BASS_GetVersion | `fa_version` | `AudioEngine.NativeVersion` | ✅ |
+| BASS_GetVersion | `fa_version` | `AudioEngine.NativeVersion` (and `AudioEngine.BindingVersion`; `AudioEngine.Create` throws if their major.minor differ, see [CHANGELOG](../../CHANGELOG.md)) | ✅ |
 | BASS_ErrorGetCode | Return value of every call; `fa_result_string` | `FatzAudioException.ErrorCode` | ✅ |
 | BASS_ERROR_WMA_LICENSE (protected WMA) | `FA_ERROR_PROTECTED_CONTENT`, also for encrypted MP4/MKV and SAMPLE-AES HLS | `ErrorCode.ProtectedContent` | ✅ |
 | BASS_Init | `fa_engine_create` + `fa_device_open` | `AudioEngine.Create()` + `engine.OpenOutput()` | ✅ |
@@ -395,6 +395,9 @@ BASS has no CD+G decoder: apps read the `.cdg` themselves, time it from `BASS_Ch
 | Timer: `BASS_ChannelGetPosition` → `Bytes2Seconds` → pack index → decode up to it | `fa_cdg_surface_update` (follows `fa_stream_get_clock`, device latency included) | `surface.Update()` | ✅ |
 | Your own sync offset | `fa_stream_set_cdg_offset` | `song.CdgOffset` | ✅ |
 | Converting the 300x216 index buffer to a bitmap, scaling, borders | `fa_cdg_surface_config`: BGRA/RGBA/indexed, any size, sharp or smooth, with or without border, transparent background, premultiplied | `CdgSurfaceOptions` | ✅ |
+| Your own transparency policy (background index only, ignoring transparent-colour packs), background opacity or colour | `FA_CDG_TRANSPARENT_BACKGROUND_ONLY`, `FA_CDG_HIDE_UNTIL_PRESET`, `FA_CDG_BACKGROUND_COLOR`, `FA_CDG_BACKGROUND_OPACITY`; or INDEXED8 with `fa_cdg_frame.background_index`, `border_index`, `transparency` | `CdgSurfaceOptions.TransparentBackgroundOnly`, `HideUntilPreset`, `BackgroundColor`, `BackgroundOpacity`; `CdgFrame.BackgroundIndex` | ✅ |
+| Tracking which render targets need a re-upload | `fa_cdg_frame.revision` / `palette_revision` | `CdgFrame.Revision` / `PaletteRevision` | ✅ |
+| Your own seek checkpoints so scrubbing doesn't replay the whole `.cdg` | Built in: checkpoints every 10 s, at load for files and as packs arrive for discs | Built in | ✅ |
 | Redrawing the whole bitmap each tick | Upload only `frame.dirty_*`, only when `frame.changed` | `frame.Changed`, `frame.Dirty` | ✅ |
 | CD+G from a disc via `BASS_CD_StreamCreate(..., BASS_CD_SUBCHANNEL)`, then de-interleaving the subchannel and decoding it yourself | `fa_stream_open_disc`: the graphics are read with the audio and drawn by the same surfaces ([disc playback](../features/disc.md#cdg-karaoke-discs)) | `engine.OpenDisc(disc, n)`, then `CreateCdgSurface()` | ✅ |
 

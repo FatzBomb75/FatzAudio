@@ -11,14 +11,63 @@ namespace FatzAudio.Native;
 /// </summary>
 internal static class NativeLoader
 {
-    private static int _initialized;
+    private static readonly object Gate = new();
+    private static volatile bool _loaded, _versionChecked;
+    private static string? _versionError;
 
+    /// <summary>
+    /// Sets up loading and, on first use, checks that the native library has this binding's
+    /// major.minor version (before 1.0 a minor version may change the ABI, see CHANGELOG.md).
+    /// Every entry point that calls into the library goes through here.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The native library is another major.minor version.</exception>
     public static void EnsureInitialized()
     {
-        if (Interlocked.Exchange(ref _initialized, 1) != 0) return;
-        NativeLibrary.SetDllImportResolver(typeof(NativeLoader).Assembly, Resolve);
-        if (OperatingSystem.IsAndroid()) SetJavaVmFromRuntime();
+        EnsureLoaded();
+        if (!_versionChecked)
+        {
+            lock (Gate)
+            {
+                if (!_versionChecked)
+                {
+                    // A missing library throws DllNotFoundException here and is checked again next time.
+                    _versionError = VersionMismatch(Unpack(NativeMethods.fa_version()), BindingVersion);
+                    _versionChecked = true;
+                }
+            }
+        }
+        if (_versionError is not null) throw new InvalidOperationException(_versionError);
     }
+
+    /// <summary>Sets up loading without the version check, for reporting the native version or an error text.</summary>
+    public static void EnsureLoaded()
+    {
+        if (_loaded) return;
+        lock (Gate)
+        {
+            if (_loaded) return;
+            NativeLibrary.SetDllImportResolver(typeof(NativeLoader).Assembly, Resolve);
+            if (OperatingSystem.IsAndroid()) SetJavaVmFromRuntime();
+            _loaded = true;
+        }
+    }
+
+    /// <summary>The version this binding was built for: the assembly version, which comes from FA_VERSION_*.</summary>
+    public static Version BindingVersion
+    {
+        get
+        {
+            var v = typeof(NativeLoader).Assembly.GetName().Version ?? new Version(0, 0, 0);
+            return new Version(v.Major, v.Minor, Math.Max(0, v.Build));
+        }
+    }
+
+    public static Version Unpack(uint v) => new((int)(v >> 16), (int)((v >> 8) & 0xFF), (int)(v & 0xFF));
+
+    /// <summary>Null when <paramref name="native"/> can be used with <paramref name="binding"/>, else the error text.</summary>
+    internal static string? VersionMismatch(Version native, Version binding) =>
+        native.Major == binding.Major && native.Minor == binding.Minor ? null
+        : $"The native fatzaudio library is version {native}, but this FatzAudio package needs {binding.Major}.{binding.Minor}.x. Use the native library from the same package.";
 
     /// <summary>
     /// HTTPS on Android runs on the app's Java VM. The native library finds it by itself from
