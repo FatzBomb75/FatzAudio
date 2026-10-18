@@ -213,9 +213,74 @@ public class MidiTests
     [Fact]
     public void NoSoundFont_Throws()
     {
-        using var engine = CreateHeadless();
+        using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true, MixSampleRate = Rate, NoSystemSoundFont = true });
         var ex = Assert.Throws<FatzAudioException>(() => engine.OpenMemory(Song(), DecodeOnly));
         Assert.Equal(ErrorCode.NoSoundFont, ex.ErrorCode);
+    }
+
+    [Fact]
+    public void SystemSoundFont_IsTheFallback()
+    {
+        // Whatever this machine has: CI images usually have no OS bank.
+        using var system = SoundFont.FromSystem();
+        using var engine = CreateHeadless();
+        if (system is null)
+        {
+            var ex = Assert.Throws<FatzAudioException>(() => engine.OpenMemory(Song(), DecodeOnly));
+            Assert.Equal(ErrorCode.NoSoundFont, ex.ErrorCode);
+            return;
+        }
+        Assert.True(system.Info.PresetCount > 0);
+        using var s = engine.OpenMemory(Song(), DecodeOnly);
+        Assert.Equal("midi", s.Info.Codec);
+    }
+
+    // ---- a DLS bank: one instrument, one region, the same looped 440 Hz sine ----
+
+    private static byte[] List(string type, byte[] body) => Build(w => Chunk(w, "LIST", Build(b => { b.Write(Encoding.ASCII.GetBytes(type)); b.Write(body); })));
+
+    private static byte[] SineDls()
+    {
+        var wave = List("wave", Build(w =>
+        {
+            Chunk(w, "fmt ", Build(b => { b.Write((short)1); b.Write((short)1); b.Write(Rate); b.Write(Rate * 2); b.Write((short)2); b.Write((short)16); }));
+            // wsmp: unity note 69, a forward loop over the whole wave.
+            Chunk(w, "wsmp", Build(b => { b.Write(20); b.Write((short)69); b.Write((short)0); b.Write(0); b.Write(0); b.Write(1); b.Write(16); b.Write(0); b.Write(0); b.Write(4410); }));
+            Chunk(w, "data", Build(b => { for (int i = 0; i < 4410; i++) b.Write((short)Math.Round(Math.Sin(2 * Math.PI * 440 * i / Rate) * 32000)); }));
+        }));
+        var region = List("rgn ", Build(w =>
+        {
+            Chunk(w, "rgnh", Build(b => { b.Write((short)0); b.Write((short)127); b.Write((short)0); b.Write((short)127); b.Write((short)0); b.Write((short)0); }));
+            Chunk(w, "wlnk", Build(b => { b.Write((short)0); b.Write((short)0); b.Write(1); b.Write(0); }));
+        }));
+        var ins = List("ins ", Build(w =>
+        {
+            Chunk(w, "insh", Build(b => { b.Write(1); b.Write(0); b.Write(0); }));
+            w.Write(List("lrgn", region));
+        }));
+        var riff = Build(w =>
+        {
+            w.Write(Encoding.ASCII.GetBytes("DLS "));
+            Chunk(w, "colh", BitConverter.GetBytes(1));
+            w.Write(List("lins", ins));
+            Chunk(w, "ptbl", Build(b => { b.Write(8); b.Write(1); b.Write(0); }));
+            w.Write(List("wvpl", wave));
+            w.Write(List("INFO", Build(b => Chunk(b, "INAM", Encoding.ASCII.GetBytes("Test DLS\0")))));
+        });
+        return Build(w => Chunk(w, "RIFF", riff));
+    }
+
+    [Fact]
+    public void DlsBank_Plays()
+    {
+        using var engine = CreateHeadless();
+        using var font = SoundFont.FromMemory(SineDls());
+        Assert.Equal("Test DLS", font.Info.Name);
+        Assert.Equal(1, font.Info.PresetCount);
+        using var s = engine.OpenMemory(Song(), DecodeOnly with { SoundFont = font });
+        var all = ReadAll(s, 3L * Rate);
+        Assert.True(Rms(all, 1000, 20000) > 0.1);
+        Assert.True(Rms(all, 30000, 65000) < 1e-3);
     }
 
     [Fact]

@@ -6,7 +6,11 @@
 #  endif
 #endif
 #include "fa_platform.h"
+#include <stdio.h>
 #include <stdlib.h>
+#if defined(__APPLE__)
+#  include <TargetConditionals.h>
+#endif
 
 #if defined(_WIN32)
 #  ifndef WIN32_LEAN_AND_MEAN
@@ -112,6 +116,16 @@ int fa_mkdir_utf8(const char* path)
     ok = CreateDirectoryW(wp, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
     free(wp);
     return ok ? 0 : -1;
+}
+int fa_system_soundfont_path(int index, char* out, size_t cap)
+{
+    wchar_t dir[MAX_PATH + 32];
+    UINT n;
+    if (index != 0 || cap == 0) return 0;
+    n = GetSystemDirectoryW(dir, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return 0;
+    wcscpy_s(dir + n, (sizeof(dir) / sizeof(dir[0])) - n, L"\\drivers\\gm.dls");
+    return WideCharToMultiByte(CP_UTF8, 0, dir, -1, out, (int)cap, NULL, NULL) > 0;
 }
 int fa_replace_file(const char* from, const char* to)
 {
@@ -246,6 +260,24 @@ int64_t fa_monotonic_ns(void)
 FILE* fa_fopen_utf8(const char* path, const char* mode) { return fopen(path, mode); }
 int fa_mkdir_utf8(const char* path) { return (mkdir(path, 0777) == 0 || errno == EEXIST) ? 0 : -1; }
 int fa_replace_file(const char* from, const char* to) { return rename(from, to) == 0 ? 0 : -1; }
+int fa_system_soundfont_path(int index, char* out, size_t cap)
+{
+    static const char* const paths[] = {
+#  if defined(__APPLE__) && !(defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE)
+        "/System/Library/Components/CoreAudio.component/Contents/Resources/gs_instruments.dls",
+#  elif !defined(__ANDROID__) && !defined(__APPLE__)
+        /* Linux: the distribution's default GM bank, then the common packages. */
+        "/usr/share/sounds/sf2/default-GM.sf2", "/usr/share/soundfonts/default.sf2",
+        "/usr/share/sounds/sf2/FluidR3_GM.sf2", "/usr/share/soundfonts/FluidR3_GM.sf2",
+        "/usr/share/sounds/sf2/TimGM6mb.sf2", "/usr/share/soundfonts/TimGM6mb.sf2",
+        "/usr/share/sounds/sf2/FluidR3_GS.sf2", "/usr/share/soundfonts/FluidR3_GS.sf2",
+#  endif
+        NULL
+    };
+    if (index < 0 || index >= (int)(sizeof(paths) / sizeof(paths[0])) || !paths[index] || cap == 0) return 0;
+    snprintf(out, cap, "%s", paths[index]);
+    return 1;
+}
 #endif
 
 void fa_lazy_mutex_lock(fa_lazy_mutex* l)

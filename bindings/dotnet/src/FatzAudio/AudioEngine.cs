@@ -55,6 +55,7 @@ public sealed class AudioEngine : IDisposable
                 config.PeriodMs = options.Period is { } p ? (uint)Math.Max(0, p.TotalMilliseconds) : 0;
                 config.WorkerThreads = (uint)Math.Max(0, options.WorkerThreads);
                 if (options.NullOutput) config.Flags |= 1; // FA_ENGINE_NULL_OUTPUT
+                if (options.NoSystemSoundFont) config.Flags |= 2; // FA_ENGINE_NO_SYSTEM_SOUNDFONT
                 if (options.CacheDirectory is { } dir)
                 {
                     cachePtr = Marshal.StringToCoTaskMemUTF8(dir);

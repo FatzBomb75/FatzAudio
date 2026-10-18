@@ -422,20 +422,21 @@ basscd is an add-on DLL; FatzAudio reads CDs and `.cue` images itself, with one 
 
 ### bassmidi (MIDI files and soundfonts)
 
-MIDI files are a built-in format: the ordinary open calls play them with a SoundFont 2 you load once ([MIDI](../features/midi.md)). There are no per-stream font arrays, font handles per preset or sample loading on demand.
+MIDI files are a built-in format: the ordinary open calls play them with a SoundFont 2 or DLS bank you load once, or with the OS's own bank (Windows `gm.dls`) when you load none ([MIDI](../features/midi.md#the-oss-instruments)). There are no per-stream font arrays, font handles per preset or sample loading on demand.
 
 | BASSMIDI | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
 | BASS_MIDI_StreamCreateFile / BASS_MIDI_StreamCreateFileUser | `fa_stream_open_path` / `fa_stream_open_memory` / `fa_stream_open_io` (`.mid`, `.kar`, `.rmi` detected from content) | `engine.OpenFile` / `engine.OpenMemory` / `engine.OpenStream` | ✅ |
 | BASS_MIDI_StreamCreateURL | `fa_stream_open_url` | `engine.OpenUrl` | ✅ |
 | BASS_PluginLoad("bassmidi.dll") | Not needed: built in | — | ➖ (by design) |
-| BASS_MIDI_FontInit (file or BASS_MIDI_FONT_MEM) | `fa_soundfont_open_path` / `fa_soundfont_open_memory` | `SoundFont.FromFile` / `SoundFont.FromMemory` | ✅ SF2; SF3 and SFZ 🗓️ |
+| BASS_MIDI_FontInit (file or BASS_MIDI_FONT_MEM) | `fa_soundfont_open_path` / `fa_soundfont_open_memory`, for `.sf2` and also `.dls` banks | `SoundFont.FromFile` / `SoundFont.FromMemory` | ✅ SF2 and DLS; SF3 and SFZ 🗓️ |
 | BASS_MIDI_FontInitUser | Read the file yourself and use `fa_soundfont_open_memory` | `SoundFont.FromMemory` | ✅ |
 | BASS_MIDI_FontFree | `fa_soundfont_close` (reference-counted: streams using it keep it) | `soundFont.Dispose()` | ✅ |
 | BASS_MIDI_FontGetInfo | `fa_soundfont_get_info` (name, presets, sample memory) | `soundFont.Info` | ✅ |
 | BASS_MIDI_FontLoad / BASS_MIDI_FontCompact / BASS_MIDI_FontUnload | Not needed: the whole bank loads at open | — | ➖ (by design) |
 | BASS_MIDI_FontPack / BASS_MIDI_FontUnpack (SF2PACK) | Not provided: SF3 support is planned instead | — | ➖ |
 | BASS_CONFIG_MIDI_DEFFONT, BASS_MIDI_StreamSetFonts(0, ...) | `fa_engine_set_soundfont` | `engine.DefaultSoundFont` | ✅ |
+| BASSMIDI's default font (it looks only for its own default `.sf2` in the Windows folder; nothing plays without one, though Windows ships `gm.dls`) | Automatic: with no soundfont set, MIDI plays with the OS's bank (`gm.dls` on Windows, `gs_instruments.dls` on macOS, a GM `.sf2` package on Linux); `FA_ENGINE_NO_SYSTEM_SOUNDFONT` turns it off; `fa_soundfont_open_system` loads it yourself | Automatic; `AudioEngineOptions.NoSystemSoundFont`, `SoundFont.FromSystem()` | ✅ |
 | BASS_MIDI_StreamSetFonts(stream, ...) | `fa_open_options.soundfont` when opening | `StreamOptions.SoundFont` | ✅ (one font per stream; no stacks or per-preset mapping) |
 | BASS_MIDI_FontSetVolume | Stream volume (`FA_PARAM_VOLUME`) | `Volume` | ✅ |
 | BASS_MIDI_StreamGetMark (LYRIC, TEXT, MARKER, CUE, COPY, TRACK, INST) | `fa_stream_get_midi_text` (cleaned-up lyrics with line and paragraph flags, UTF-8) and `fa_stream_get_midi_info` | `stream.MidiTexts`, `stream.MidiInfo` | ✅ |
@@ -471,7 +472,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | OGG Vorbis in bass.dll | Built-in: `.ogg` files, chained files, Ogg radio with song titles ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
 | basswma.dll | Built-in ASF demuxer (`.wma`, `.asf`, `.wmv` audio; files, memory, your own reader, HTTP), decoded by Media Foundation on Windows (unsupported elsewhere); ReplayGain attributes for normalization, tags and covers ([WMA](../features/streams.md#wma)) | ✅ playback; ➖ encoding (record to MP3, FLAC or WAV with `fa_encoder_*` instead), MMS, broadcasting and DRM |
 | bassenc.dll, bassenc_mp3.dll, bassenc_flac.dll (if added later) | Built in: `fa_encoder_*` writes WAV and FLAC itself and MP3 through the app's LAME ([recording and encoding](../features/recording-encoding.md)) | ✅ WAV/FLAC/MP3, 🗓️ Opus/AAC/casting |
-| bassmidi.dll | Built-in SoundFont 2 synthesizer for `.mid`, `.kar` and `.rmi`: engine-wide or per-stream soundfont, lyrics and text events, transpose and channel mute ([MIDI](../features/midi.md)) | ✅ (SF3, SFZ and MIDI input 🗓️) |
+| bassmidi.dll | Built-in SoundFont 2 synthesizer for `.mid`, `.kar` and `.rmi`: SF2 or DLS banks, engine-wide or per-stream, the OS's `gm.dls` when the app sets none, lyrics and text events, transpose and channel mute ([MIDI](../features/midi.md)) | ✅ (SF3, SFZ and MIDI input 🗓️) |
 | bass_fx.dll | Tempo/pitch/rate params on every stream ([tempo and pitch](../features/tempo-pitch.md)); reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | ✅ tempo/pitch/rate and level control, 🗓️ reverse and BPM |
 | basscd.dll | Built-in disc source: drives on Windows, macOS and Linux, `.cue` images, CD-Text, freedb and MusicBrainz ids, CD+G graphics ([disc playback](../features/disc.md)); analog playback not provided | ✅ disc and CD+G discs |
 | Your own CD+G decoder and renderer (MP3+G, ZIP) | Built in: `fa_cdg_surface_*` draws the graphics in sync with the audio ([CD+G](../features/cdg.md)) | ✅ |

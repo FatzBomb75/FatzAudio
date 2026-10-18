@@ -141,8 +141,10 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
     fa_store_float(&e->norm_target, -16.0f);
     fa_store32(&e->limiter_mode, FA_LIMITER_AUTO);
     fa_store_float(&e->limiter_ceiling, -1.0f);
-    if (fa_mutex_init(&e->list_lock) != 0 || fa_cond_init(&e->work_cond) != 0 || fa_cond_init(&e->event_cond) != 0) {
+    if (fa_mutex_init(&e->list_lock) != 0 || fa_mutex_init(&e->system_soundfont_lock) != 0 || fa_cond_init(&e->work_cond) != 0 ||
+        fa_cond_init(&e->event_cond) != 0) {
         fa_cond_destroy(&e->event_cond); fa_cond_destroy(&e->work_cond); fa_mutex_destroy(&e->list_lock);
+        fa_mutex_destroy(&e->system_soundfont_lock);
         fa_cond_destroy(&e->scan_cond); fa_mutex_destroy(&e->scan_lock);
         ma_mutex_uninit(&e->lock);
         free((char*)e->config.cache_directory); free(e);
@@ -156,6 +158,7 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
     }
     if (r != MA_SUCCESS) {
         fa_cond_destroy(&e->event_cond); fa_cond_destroy(&e->work_cond); fa_mutex_destroy(&e->list_lock);
+        fa_mutex_destroy(&e->system_soundfont_lock);
         fa_cond_destroy(&e->scan_cond); fa_mutex_destroy(&e->scan_lock);
         ma_mutex_uninit(&e->lock);
         free((char*)e->config.cache_directory); free(e);
@@ -186,9 +189,11 @@ void fa_engine_free(fa_engine* e)
     fa_cond_destroy(&e->event_cond);
     fa_cond_destroy(&e->work_cond);
     fa_mutex_destroy(&e->list_lock);
+    fa_mutex_destroy(&e->system_soundfont_lock);
     free(e->pending);
     free((char*)e->config.cache_directory);
     fa_soundfont_release(e->soundfont);
+    fa_soundfont_release(e->system_soundfont);
     free(e);
 }
 

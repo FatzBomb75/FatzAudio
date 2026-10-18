@@ -90,6 +90,16 @@ static fa_result soundfont_from_memory(const uint8_t* data, size_t size, fa_soun
     size_t mid;
     int i;
     *out = NULL;
+    if (size <= FA_MIDI_MAX_SOUNDFONT && fa_dls_probe(data, size)) {
+        /* A DLS bank (Windows' gm.dls, macOS's gs_instruments.dls): as SoundFont 2. */
+        uint8_t* sf2 = NULL;
+        size_t sf2_size = 0;
+        fa_result r = fa_dls_to_sf2(data, size, &sf2, &sf2_size);
+        if (r != FA_OK) return r;
+        r = sf2_size <= FA_MIDI_MAX_SOUNDFONT ? soundfont_from_memory(sf2, sf2_size, out) : FA_ERROR_UNSUPPORTED_FORMAT;
+        free(sf2);
+        return r;
+    }
     if (size < 12 || size > FA_MIDI_MAX_SOUNDFONT || memcmp(data, "RIFF", 4) != 0 || memcmp(data + 8, "sfbk", 4) != 0)
         return FA_ERROR_UNSUPPORTED_FORMAT;
     f = (fa_soundfont*)calloc(1, sizeof(*f));
@@ -188,6 +198,38 @@ FA_API fa_result FA_CALL fa_engine_set_soundfont(fa_engine* engine, fa_soundfont
     fa_mutex_unlock(&engine->list_lock);
     fa_soundfont_release(old);
     return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_soundfont_open_system(fa_soundfont** out_font)
+{
+    char path[1024];
+    fa_result last = FA_ERROR_NOT_FOUND;
+    int i;
+    if (out_font) *out_font = NULL;
+    if (!out_font) return FA_ERROR_INVALID_ARG;
+    for (i = 0; fa_system_soundfont_path(i, path, sizeof(path)); i++) {
+        fa_result r = fa_soundfont_open_path(path, out_font);
+        if (r == FA_OK) return FA_OK;
+        if (r != FA_ERROR_NOT_FOUND) last = r;   /* there but not usable: say why */
+    }
+    return last;
+}
+
+fa_soundfont* fa_engine_system_soundfont(fa_engine* engine)
+{
+    fa_soundfont* f = NULL;
+    if (engine->config.flags & FA_ENGINE_NO_SYSTEM_SOUNDFONT) return NULL;
+    /* One load at a time: streams opening together wait for the first one's bank
+     * instead of each loading their own. A failure other than "there is none"
+     * (out of memory, a locked file) is tried again by the next stream. */
+    fa_mutex_lock(&engine->system_soundfont_lock);
+    if (!engine->system_soundfont_tried) {
+        fa_result r = fa_soundfont_open_system(&engine->system_soundfont);
+        if (r == FA_OK || r == FA_ERROR_NOT_FOUND) engine->system_soundfont_tried = 1;
+    }
+    f = fa_soundfont_retain(engine->system_soundfont);
+    fa_mutex_unlock(&engine->system_soundfont_lock);
+    return f;
 }
 
 fa_soundfont* fa_engine_soundfont(fa_engine* engine)

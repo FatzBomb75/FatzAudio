@@ -4,10 +4,13 @@ using FatzAudio.Native;
 namespace FatzAudio;
 
 /// <summary>
-/// SoundFont 2 (.sf2) instruments for playing MIDI files. Load one once and share it: set it as the engine's
-/// <see cref="AudioEngine.DefaultSoundFont"/> for every MIDI stream, or pass it in <see cref="StreamOptions.SoundFont"/>
-/// for one stream. No soundfont is built in; opening a MIDI file without one throws
-/// <see cref="FatzAudioException"/> with <see cref="ErrorCode.NoSoundFont"/>.
+/// SoundFont 2 (.sf2) or DLS (.dls) instruments for playing MIDI files. Load one once and share it: set it as the
+/// engine's <see cref="AudioEngine.DefaultSoundFont"/> for every MIDI stream, or pass it in
+/// <see cref="StreamOptions.SoundFont"/> for one stream. No soundfont is built in. A MIDI file opened without one
+/// plays with the instruments the OS ships (<see cref="FromSystem"/>: gm.dls on Windows, gs_instruments.dls on
+/// macOS, a General MIDI .sf2 package on Linux); where there is none, or with
+/// <see cref="AudioEngineOptions.NoSystemSoundFont"/>, the open throws <see cref="FatzAudioException"/> with
+/// <see cref="ErrorCode.NoSoundFont"/>.
 /// </summary>
 /// <remarks>
 /// The native soundfont is reference-counted: the engine and every stream using it keep their own reference, so
@@ -41,10 +44,10 @@ public sealed class SoundFont : IDisposable
         }
     }
 
-    /// <summary>Loads a SoundFont 2 file.</summary>
-    /// <param name="path">Path of the .sf2 file.</param>
+    /// <summary>Loads a SoundFont 2 (.sf2) or DLS (.dls) bank.</summary>
+    /// <param name="path">Path of the .sf2 or .dls file.</param>
     /// <returns>A soundfont that must be disposed.</returns>
-    /// <exception cref="FatzAudioException">The file is missing (<see cref="ErrorCode.NotFound"/>) or not a usable SoundFont 2 file
+    /// <exception cref="FatzAudioException">The file is missing (<see cref="ErrorCode.NotFound"/>) or not a usable bank
     /// (<see cref="ErrorCode.UnsupportedFormat"/>; SF3 and SFZ are not supported yet).</exception>
     public static SoundFont FromFile(string path)
     {
@@ -53,16 +56,30 @@ public sealed class SoundFont : IDisposable
         return Wrap(NativeMethods.fa_soundfont_open_path(path, out nint native), native);
     }
 
-    /// <summary>Loads a SoundFont 2 file from memory (the bytes are copied).</summary>
-    /// <param name="data">The .sf2 file's bytes.</param>
+    /// <summary>Loads a SoundFont 2 or DLS bank from memory (the bytes are copied).</summary>
+    /// <param name="data">The .sf2 or .dls file's bytes.</param>
     /// <returns>A soundfont that must be disposed.</returns>
-    /// <exception cref="FatzAudioException">The data is not a usable SoundFont 2 file (<see cref="ErrorCode.UnsupportedFormat"/>).</exception>
+    /// <exception cref="FatzAudioException">The data is not a usable bank (<see cref="ErrorCode.UnsupportedFormat"/>).</exception>
     public static unsafe SoundFont FromMemory(ReadOnlySpan<byte> data)
     {
         NativeLoader.EnsureInitialized();
         nint native;
         int rc;
         fixed (byte* p = data) rc = NativeMethods.fa_soundfont_open_memory(p, (nuint)data.Length, out native);
+        return Wrap(rc, native);
+    }
+
+    /// <summary>
+    /// Loads the instruments the operating system ships for its own MIDI synthesizer: gm.dls on Windows,
+    /// gs_instruments.dls on macOS, the first General MIDI .sf2 package found on Linux.
+    /// </summary>
+    /// <returns>The OS's bank (dispose it), or null where there is none (Android, iOS, Linux without one).</returns>
+    /// <exception cref="FatzAudioException">The bank is there but not usable.</exception>
+    public static SoundFont? FromSystem()
+    {
+        NativeLoader.EnsureInitialized();
+        int rc = NativeMethods.fa_soundfont_open_system(out nint native);
+        if (rc == (int)ErrorCode.NotFound) return null;
         return Wrap(rc, native);
     }
 

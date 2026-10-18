@@ -114,7 +114,10 @@ FA_API const char* FA_CALL fa_result_string(fa_result result);
 typedef enum fa_engine_flags {
     /* Devices play into a silent "null" output that runs in real time on its own
      * thread. For automated tests, CI machines without audio hardware, and servers. */
-    FA_ENGINE_NULL_OUTPUT = 1 << 0
+    FA_ENGINE_NULL_OUTPUT = 1 << 0,
+    /* MIDI files opened without a soundfont fail with FA_ERROR_NO_SOUNDFONT instead
+     * of playing with the OS's instruments (fa_soundfont_open_system). */
+    FA_ENGINE_NO_SYSTEM_SOUNDFONT = 1 << 1
 } fa_engine_flags;
 
 typedef struct fa_engine_config {
@@ -1290,7 +1293,12 @@ FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_ti
  *     fa_soundfont_close(gm);                (the engine keeps its own reference)
  *
  * fa_open_options.soundfont picks another one for a single stream. No soundfont
- * is built in: opening a MIDI file without one returns FA_ERROR_NO_SOUNDFONT.
+ * is built in. A MIDI file opened without one plays with the instruments the OS
+ * ships for its own MIDI synthesizer (fa_soundfont_open_system: gm.dls on
+ * Windows, gs_instruments.dls on macOS, a General MIDI .sf2 package on Linux),
+ * loaded once per engine by the first MIDI stream that needs it. Where there is
+ * none (Android, iOS), or with FA_ENGINE_NO_SYSTEM_SOUNDFONT, the open returns
+ * FA_ERROR_NO_SOUNDFONT.
  * A soundfont is reference-counted: the engine and every stream using it hold a
  * reference, so it may be closed (or replaced on the engine) at any time and is
  * freed when the last user is done. Its samples are kept in memory as 32-bit
@@ -1303,11 +1311,18 @@ FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_ti
  * ring out. Lyrics and other text events are listed by fa_stream_get_midi_text and
  * raised as FA_EVENT_MIDI_TEXT when they are heard. */
 
-/* A SoundFont 2 (.sf2) file from a UTF-8 path, or from memory (copied). FA_ERROR_NOT_FOUND
- * when the file is missing, FA_ERROR_UNSUPPORTED_FORMAT when it is not a usable
- * SoundFont 2 file (SF3 and SFZ are not supported yet). */
+/* A SoundFont 2 (.sf2) or DLS (.dls, Level 1 and 2) bank from a UTF-8 path, or from
+ * memory (copied). FA_ERROR_NOT_FOUND when the file is missing,
+ * FA_ERROR_UNSUPPORTED_FORMAT when it is not a usable bank (SF3 and SFZ are not
+ * supported yet). */
 FA_API fa_result FA_CALL fa_soundfont_open_path(const char* path, fa_soundfont** out_font);
 FA_API fa_result FA_CALL fa_soundfont_open_memory(const void* data, size_t size, fa_soundfont** out_font);
+/* The instruments the operating system ships: %SystemRoot%\System32\drivers\gm.dls
+ * (Windows), gs_instruments.dls in CoreAudio.component (macOS), the first General
+ * MIDI .sf2 found under /usr/share/sounds/sf2 and /usr/share/soundfonts (Linux:
+ * default-GM, default, FluidR3_GM, TimGM6mb, FluidR3_GS). FA_ERROR_NOT_FOUND when
+ * there is none (Android, iOS, Linux without such a package). */
+FA_API fa_result FA_CALL fa_soundfont_open_system(fa_soundfont** out_font);
 /* Releases your reference. Streams and engines using the soundfont keep theirs. */
 FA_API void FA_CALL fa_soundfont_close(fa_soundfont* font);
 

@@ -1,6 +1,6 @@
 /* MIDI: detection, length, sample-exact seeking, lyrics and other texts, live
- * controls (transpose, channel mute), soundfont sharing, the missing-soundfont
- * error, FA_EVENT_MIDI_TEXT on a device, loudness scans, and malformed MIDI and
+ * controls (transpose, channel mute), soundfont sharing, DLS banks, the OS's bank
+ * as the fallback, the missing-soundfont error, FA_EVENT_MIDI_TEXT on a device, loudness scans, and malformed MIDI and
  * SF2 data. The soundfont (a sine wave, a "drum" with the same sample) and every
  * MIDI file are built here, so no third-party data is needed. */
 #if !defined(_WIN32)
@@ -24,6 +24,7 @@ static int g_failures = 0;
 
 #define RATE 44100
 #define PI 3.14159265358979323846
+#define FA_MIDI_TEST_DRUMS 9
 
 static fa_engine* g_engine;
 static fa_soundfont* g_font;
@@ -281,6 +282,8 @@ static void test_no_soundfont(void)
     fa_result r = FA_OK;
     fa_stream* s;
     fa_engine_set_soundfont(g_engine, NULL);
+    /* As on a machine without an OS bank (white box): see test_system_soundfont. */
+    g_engine->system_soundfont_tried = 1;
     s = open_bytes(&song, FA_OPEN_DECODE_ONLY, NULL, &r);
     CHECK(!s);
     CHECK_EQ(r, FA_ERROR_NO_SOUNDFONT);
@@ -792,6 +795,249 @@ static void test_malformed_soundfont(void)
     free(copy); free(sf.d); free(song.d);
 }
 
+/* ---- DLS banks ------------------------------------------------------------------- */
+
+static void list_chunk(buf* b, const char* type, const buf* body)
+{
+    buf l = { 0 };
+    put(&l, type, 4);
+    put(&l, body->d, body->n);
+    chunk(b, "LIST", &l);
+    free(l.d);
+}
+
+/* wsmp: unity note, gain (dB), and a forward loop over [start, start + len) if len. */
+static void dls_wsmp(buf* b, unsigned unity, double gain_db, uint32_t start, uint32_t len)
+{
+    buf c = { 0 };
+    put32le(&c, 20); put16le(&c, unity); put16le(&c, 0);
+    put32le(&c, (uint32_t)(int32_t)lrint(gain_db * 655360.0)); put32le(&c, 0); put32le(&c, len ? 1 : 0);
+    if (len) { put32le(&c, 16); put32le(&c, 0); put32le(&c, start); put32le(&c, len); }
+    chunk(b, "wsmp", &c);
+    free(c.d);
+}
+
+static void dls_wave(buf* pool, uint32_t* offsets, int index, int channels, int bits, uint32_t rate, uint32_t frames,
+                     double hz_left, double hz_right, int with_wsmp)
+{
+    buf w = { 0 }, c = { 0 };
+    uint32_t i;
+    int ch;
+    put16le(&c, 1); put16le(&c, (unsigned)channels); put32le(&c, rate);
+    put32le(&c, rate * (uint32_t)channels * (uint32_t)bits / 8); put16le(&c, (unsigned)(channels * bits / 8)); put16le(&c, (unsigned)bits);
+    chunk(&w, "fmt ", &c);
+    if (with_wsmp) dls_wsmp(&w, 69, 0.0, 0, frames);
+    c.n = 0;
+    for (i = 0; i < frames; i++)
+        for (ch = 0; ch < channels; ch++) {
+            double v = sin(2.0 * PI * (ch ? hz_right : hz_left) * i / rate) * 0.9;
+            if (bits == 8) put8(&c, (unsigned)lrint(128.0 + v * 127.0));
+            else put16le(&c, (unsigned)(uint16_t)(int16_t)lrint(v * 32767.0));
+        }
+    chunk(&w, "data", &c);
+    offsets[index] = (uint32_t)pool->n;
+    list_chunk(pool, "wave", &w);
+    free(w.d); free(c.d);
+}
+
+static void dls_region(buf* lrgn, unsigned klo, unsigned khi, uint32_t cue, uint32_t channels, const buf* wsmp)
+{
+    buf r = { 0 }, c = { 0 };
+    put16le(&c, klo); put16le(&c, khi); put16le(&c, 0); put16le(&c, 127); put16le(&c, 0); put16le(&c, 0);
+    chunk(&r, "rgnh", &c);
+    if (wsmp) put(&r, wsmp->d, wsmp->n);
+    c.n = 0; put16le(&c, 0); put16le(&c, 0); put32le(&c, channels); put32le(&c, cue);
+    chunk(&r, "wlnk", &c);
+    list_chunk(lrgn, "rgn ", &r);
+    free(r.d); free(c.d);
+}
+
+/* EG1: 2^-3 s release, full sustain. */
+static void dls_art(buf* ins)
+{
+    buf a = { 0 }, l = { 0 };
+    put32le(&a, 8); put32le(&a, 2);
+    put16le(&a, 0); put16le(&a, 0); put16le(&a, 0x209); put16le(&a, 0); put32le(&a, (uint32_t)(-3600 * 65536));
+    put16le(&a, 0); put16le(&a, 0); put16le(&a, 0x20A); put16le(&a, 0); put32le(&a, 1000u * 65536u);
+    chunk(&l, "art1", &a);
+    list_chunk(ins, "lart", &l);
+    free(a.d); free(l.d);
+}
+
+static void dls_instrument(buf* lins, uint32_t bank, uint32_t program, const char* name, const buf* lrgn, int regions, int art)
+{
+    buf i = { 0 }, c = { 0 }, info = { 0 };
+    put32le(&c, (uint32_t)regions); put32le(&c, bank); put32le(&c, program);
+    chunk(&i, "insh", &c);
+    list_chunk(&i, "lrgn", lrgn);
+    if (art) dls_art(&i);
+    c.n = 0; put(&c, name, strlen(name) + 1);
+    chunk(&info, "INAM", &c);
+    list_chunk(&i, "INFO", &info);
+    list_chunk(lins, "ins ", &i);
+    free(i.d); free(c.d); free(info.d);
+}
+
+/* Program 0: a looped 440 Hz sine (16-bit, its own wsmp). Program 1: keys 0..63 an
+ * 8-bit 441 Hz sine at 22050 Hz, keys 64..127 the right channel (220.5 Hz) of a
+ * stereo wave. Drum kit: key 36 plays the 440 Hz sine once, 6 dB down. The pool
+ * table counts offsets from the pool's data, or (`with_type`) from its 'wvpl'. */
+static buf make_dls(int with_type)
+{
+    buf dls = { 0 }, riff = { 0 }, lins = { 0 }, lrgn = { 0 }, pool = { 0 }, ptbl = { 0 }, ws = { 0 }, c = { 0 }, info = { 0 };
+    uint32_t offs[3];
+    int i;
+    dls_wave(&pool, offs, 0, 1, 16, RATE, SINE_LEN, 440.0, 0, 1);
+    dls_wave(&pool, offs, 1, 1, 8, 22050, 2200, 441.0, 0, 1);
+    dls_wave(&pool, offs, 2, 2, 16, RATE, 4400, 440.0, 220.5, 0);
+    dls_region(&lrgn, 0, 127, 0, 1, NULL);
+    dls_instrument(&lins, 0, 0, "DLS Sine", &lrgn, 1, 1);
+    lrgn.n = 0;
+    dls_region(&lrgn, 0, 63, 1, 1, NULL);
+    dls_wsmp(&ws, 69, 0.0, 0, 4400);
+    dls_region(&lrgn, 64, 127, 2, 2, &ws);
+    dls_instrument(&lins, 0, 1, "DLS Two", &lrgn, 2, 1);
+    lrgn.n = 0; ws.n = 0;
+    dls_wsmp(&ws, 36, -6.0, 0, 0);
+    dls_region(&lrgn, 36, 36, 0, 1, &ws);
+    dls_instrument(&lins, 0x80000000u, 0, "DLS Kit", &lrgn, 1, 0);
+    put(&riff, "DLS ", 4);
+    put32le(&c, 3); chunk(&riff, "colh", &c);
+    list_chunk(&riff, "lins", &lins);
+    put32le(&ptbl, 8); put32le(&ptbl, 3);
+    for (i = 0; i < 3; i++) put32le(&ptbl, offs[i] + (with_type ? 4 : 0));
+    chunk(&riff, "ptbl", &ptbl);
+    list_chunk(&riff, "wvpl", &pool);
+    c.n = 0; put(&c, "Test DLS", 9); chunk(&info, "INAM", &c);
+    list_chunk(&riff, "INFO", &info);
+    chunk(&dls, "RIFF", &riff);
+    free(riff.d); free(lins.d); free(lrgn.d); free(pool.d); free(ptbl.d); free(ws.d); free(c.d); free(info.d);
+    return dls;
+}
+
+/* Program `prog` on channel `ch`, then key `key` from 0 to 1 s. */
+static buf make_prog_note(int ch, int prog, int key)
+{
+    buf f = { 0 }, t = { 0 };
+    mthd(&f, 0, 1, 480);
+    varlen(&t, 0); put8(&t, 0xC0 | ch); put8(&t, prog);
+    ev3(&t, 0, 0x90 | ch, key, 127);
+    ev3(&t, 960, 0x80 | ch, key, 0);
+    eot(&t, 0);
+    mtrk(&f, &t);
+    free(t.d);
+    return f;
+}
+
+/* Renders a note with `font`: the first 2 s. */
+static fa_frames render_note(fa_soundfont* font, int ch, int prog, int key, float* x)
+{
+    buf song = make_prog_note(ch, prog, key);
+    fa_stream* s = open_bytes(&song, FA_OPEN_DECODE_ONLY, font, NULL);
+    fa_frames got = 0;
+    if (s) { got = read_all(s, x, 2 * RATE, 4096); fa_stream_close(s); }
+    free(song.d);
+    return got;
+}
+
+static void test_dls_bank(void)
+{
+    int with_type;
+    float* x = (float*)malloc(sizeof(float) * 2 * 2 * RATE);
+    float* ref = (float*)malloc(sizeof(float) * 2 * 2 * RATE);
+    CHECK(render_note(g_font, 0, 0, 69, ref) == 2 * RATE);
+    for (with_type = 0; with_type < 2; with_type++) {
+        buf dls = make_dls(with_type);
+        fa_soundfont* f = NULL;
+        fa_soundfont_info info;
+        CHECK_EQ(fa_soundfont_open_memory(dls.d, dls.n, &f), FA_OK);
+        free(dls.d);
+        CHECK_EQ(fa_soundfont_get_info(f, &info), FA_OK);
+        CHECK(strcmp(info.name, "Test DLS") == 0);
+        CHECK_EQ(info.preset_count, 3);
+        /* The looped 16-bit sine: 440 Hz, held for the note, then a 125 ms release,
+         * at the level of the same sine in the SF2 test bank. */
+        CHECK_EQ(render_note(f, 0, 0, 69, x), 2 * RATE);
+        CHECK_NEAR(frequency(x, RATE / 10, RATE * 9 / 10), 440.0, 3.0);
+        CHECK(rms(x, RATE / 2, RATE * 9 / 10) > 0.05);
+        CHECK_NEAR(rms(x, RATE / 2, RATE * 9 / 10) / rms(ref, RATE / 2, RATE * 9 / 10), 0.9, 0.05);
+        CHECK(rms(x, RATE * 3 / 2, 2 * RATE) < 1e-3);
+        /* 8-bit at 22050 Hz, played 29 semitones down; the right channel of a stereo wave. */
+        CHECK_EQ(render_note(f, 0, 1, 40, x), 2 * RATE);
+        CHECK_NEAR(frequency(x, RATE / 10, RATE * 9 / 10), 441.0 * pow(2.0, -29.0 / 12.0), 2.0);
+        CHECK_EQ(render_note(f, 0, 1, 69, x), 2 * RATE);
+        CHECK_NEAR(frequency(x, RATE / 10, RATE * 9 / 10), 220.5, 2.0);
+        /* The drum: 440 Hz once (100 ms, no loop), 6 dB down. */
+        CHECK_EQ(render_note(f, FA_MIDI_TEST_DRUMS, 0, 36, x), 2 * RATE);
+        CHECK_NEAR(frequency(x, RATE / 100, RATE / 12), 440.0, 15.0);
+        CHECK_NEAR(rms(x, RATE / 100, RATE / 12) / rms(ref, RATE / 100, RATE / 12), 0.9 * 0.5012, 0.05);
+        CHECK(rms(x, RATE / 4, RATE / 2) < 1e-3);
+        fa_soundfont_close(f);
+    }
+    free(x);
+    free(ref);
+}
+
+static void test_malformed_dls(void)
+{
+    buf dls = make_dls(0), song = make_note(0);
+    uint8_t* copy = (uint8_t*)malloc(dls.n);
+    size_t n;
+    int i;
+    for (n = 0; n <= dls.n; n += (n < 300 ? 1 : 61)) try_font(dls.d, n, &song);
+    for (i = 0; i < 1500; i++) {
+        int k, flips = 1 + (int)(rnd() % 4);
+        memcpy(copy, dls.d, dls.n);
+        /* The instruments, regions and pool table come first; the samples after them. */
+        for (k = 0; k < flips; k++) copy[rnd() % 4 == 0 ? rnd() % dls.n : rnd() % 1200] = (uint8_t)rnd();
+        try_font(copy, dls.n, &song);
+    }
+    free(copy); free(dls.d); free(song.d);
+}
+
+/* MIDI files opened without a soundfont play with the OS's bank, loaded once per
+ * engine, unless FA_ENGINE_NO_SYSTEM_SOUNDFONT. */
+static void test_system_soundfont(void)
+{
+    buf song = make_song();
+    fa_soundfont* sys = NULL;
+    fa_engine* e = NULL;
+    fa_engine_config cfg;
+    fa_stream* s = NULL;
+    fa_open_options o;
+    fa_result r = fa_soundfont_open_system(&sys);
+    /* Whatever this machine has (CI images usually have none). */
+    CHECK(r == FA_OK || r == FA_ERROR_NOT_FOUND);
+    CHECK((r == FA_OK) == (sys != NULL));
+    fa_soundfont_close(sys);
+    CHECK_EQ(fa_soundfont_open_system(NULL), FA_ERROR_INVALID_ARG);
+
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    fa_engine_config_init(&cfg);
+    cfg.flags = FA_ENGINE_NULL_OUTPUT;
+    CHECK_EQ(fa_engine_create(&cfg, &e), FA_OK);
+    /* Stand in for the OS's bank (white box): the test bank. */
+    e->system_soundfont = fa_soundfont_retain(g_font);
+    e->system_soundfont_tried = 1;
+    CHECK_EQ(fa_stream_open_memory(e, song.d, song.n, &o, &s), FA_OK);
+    fa_stream_close(s);
+    s = NULL;
+    /* An app's soundfont still wins, and other formats never load the bank. */
+    CHECK(fa_engine_system_soundfont(e) == g_font);
+    fa_soundfont_release(g_font);
+    fa_engine_destroy(e);
+
+    cfg.flags = FA_ENGINE_NULL_OUTPUT | FA_ENGINE_NO_SYSTEM_SOUNDFONT;
+    CHECK_EQ(fa_engine_create(&cfg, &e), FA_OK);
+    e->system_soundfont = fa_soundfont_retain(g_font);
+    e->system_soundfont_tried = 1;
+    CHECK_EQ(fa_stream_open_memory(e, song.d, song.n, &o, &s), FA_ERROR_NO_SOUNDFONT);
+    CHECK(fa_engine_system_soundfont(e) == NULL);
+    fa_engine_destroy(e);
+    free(song.d);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -820,6 +1066,9 @@ int main(void)
     RUN(test_loudness_scan);
     RUN(test_malformed_midi);
     RUN(test_malformed_soundfont);
+    RUN(test_dls_bank);
+    RUN(test_malformed_dls);
+    RUN(test_system_soundfont);
 
     fa_soundfont_close(g_font);
     fa_engine_destroy(g_engine);
