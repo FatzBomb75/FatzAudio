@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Runtime.InteropServices;
 
@@ -16,6 +17,28 @@ internal static class NativeLoader
     {
         if (Interlocked.Exchange(ref _initialized, 1) != 0) return;
         NativeLibrary.SetDllImportResolver(typeof(NativeLoader).Assembly, Resolve);
+        if (OperatingSystem.IsAndroid()) SetJavaVmFromRuntime();
+    }
+
+    /// <summary>
+    /// HTTPS on Android runs on the app's Java VM. The native library finds it by itself from
+    /// Android 12; for older versions this hands it over from .NET for Android's own runtime
+    /// (looked up by reflection, so the binding needs no reference to Mono.Android).
+    /// </summary>
+    [DynamicDependency(DynamicallyAccessedMemberTypes.PublicProperties, "Java.Interop.JniRuntime", "Java.Interop")]
+    private static void SetJavaVmFromRuntime()
+    {
+        try
+        {
+            var runtimeType = Type.GetType("Java.Interop.JniRuntime, Java.Interop", throwOnError: false);
+            var runtime = runtimeType?.GetProperty("CurrentRuntime", BindingFlags.Public | BindingFlags.Static)?.GetValue(null);
+            var vm = runtime?.GetType().GetProperty("InvocationPointer", BindingFlags.Public | BindingFlags.Instance)?.GetValue(runtime);
+            if (vm is nint p && p != 0) NativeMethods.fa_android_set_java_vm(p);
+        }
+        catch (Exception)
+        {
+            // Not .NET for Android's runtime: the app can call AudioEngine.SetAndroidJavaVM.
+        }
     }
 
     private static nint Resolve(string name, Assembly assembly, DllImportSearchPath? searchPath)

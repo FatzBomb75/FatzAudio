@@ -65,8 +65,10 @@ ABIs only for old or low-end phones.
 What your app needs:
 
 - `android.permission.INTERNET` for web streams, `RECORD_AUDIO` for recording.
-- `https://` URLs do not work on Android yet (`FA_ERROR_PROVIDER_MISSING`);
-  `http://` does. See [web streams](features/web-streams.md#https).
+- `https://` goes through Android's own `HttpURLConnection` on the app's Java
+  VM. Apps on Android 12 and later and .NET for Android apps need nothing more;
+  Java and Kotlin apps that support Android 7 to 11 call
+  `fa_android_set_java_vm` once ([web streams](features/web-streams.md#android)).
 - FFmpeg or LAME, if the app wants them: their `.so` files in the app's own
   native library folder, as for any other library it loads.
 
@@ -99,6 +101,13 @@ x86 run natively; arm64-v8a and armeabi-v7a run under qemu-user
 sudo tools/android-test/run.sh build-android-x86_64
 sudo tools/android-test/run.sh build-android-arm64-v8a 'core|ogg'   # only some tests
 ```
+
+The `net` suite also runs the web stream tests over `https://` through Android's
+own `HttpURLConnection`: the test starts Android's Java runtime inside the chroot,
+for which `run.sh` mounts the APEX modules and writes the linker namespaces as a
+booted device does (it compiles `tools/android-test/props.c` with the build's
+NDK compiler for that). The Java runtime opens IPv6 sockets, so the machine needs
+IPv6 support in its kernel (CI runners have it).
 
 It needs root (`chroot` and bind mounts). What it cannot cover is anything that
 needs Android's system services: real audio output (AAudio, OpenSL ES) and the

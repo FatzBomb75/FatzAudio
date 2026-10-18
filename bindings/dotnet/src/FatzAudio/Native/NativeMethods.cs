@@ -120,6 +120,9 @@ internal static unsafe partial class NativeMethods
     public static partial void fa_net_options_init(FaNetOptions* options);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_android_set_java_vm(nint javaVm);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_metadata(StreamHandle stream, FaMetadata* metadata);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

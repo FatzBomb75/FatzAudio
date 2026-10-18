@@ -406,8 +406,9 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream);
  * When reconnecting fails for that long, the stream plays what it has and ends.
  *
  * HTTPS uses the system's TLS stack (WinHTTP on Windows, URLSession on Apple
- * platforms, libcurl on Linux, loaded at runtime; FA_ERROR_PROVIDER_MISSING if
- * the system has none). Plain http:// uses FatzAudio's own HTTP/1.1 client. */
+ * platforms, HttpURLConnection on Android, libcurl on Linux, loaded at runtime;
+ * FA_ERROR_PROVIDER_MISSING if the system has none). Plain http:// uses
+ * FatzAudio's own HTTP/1.1 client. */
 
 typedef enum fa_net_flags {
     FA_NET_NO_RECONNECT = 1 << 0,  /* end the stream when the connection drops */
@@ -435,6 +436,13 @@ struct fa_net_options {
 };
 
 FA_API void FA_CALL fa_net_options_init(fa_net_options* options);
+
+/* Android: HTTPS runs on the app's Java VM (java.net.HttpURLConnection, through
+ * JNI). FatzAudio finds the VM by itself on Android 12 (API 31) and later; on
+ * older versions, call this once with the app's JavaVM* (JNI_OnLoad's vm, or
+ * JNIEnv's GetJavaVM) before opening https:// URLs. The .NET binding does it for
+ * you. FA_ERROR_INVALID_ARG for NULL; FA_ERROR_NOT_IMPLEMENTED off Android. */
+FA_API fa_result FA_CALL fa_android_set_java_vm(void* java_vm);
 
 /* What a web stream is playing. Every string is UTF-8 and "" when unknown. Streams
  * that are not web streams return FA_OK with everything empty. */

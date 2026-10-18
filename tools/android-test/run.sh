@@ -15,6 +15,7 @@
 # Android image is downloaded once into BUILD_DIR/android-rootfs (about 870 MB
 # compressed, 2 GB unpacked, pinned by digest) and reused after that;
 # FA_ANDROID_ROOTFS=DIR keeps it elsewhere (for example a CI cache).
+# FA_ANDROID_TEST_VERBOSE=1 prints the output of passing tests too.
 set -euo pipefail
 
 build=$(cd "${1:?usage: run.sh BUILD_DIR [test-regex]}" && pwd)
@@ -79,12 +80,6 @@ if [ ! -e "$root/.complete-$manifest" ]; then
         tar xzf "$root/layer.tgz" -C "$root"
         rm "$root/layer.tgz"
     done
-    # The image's APEX modules are flattened folders; a booted device mounts them
-    # on /apex, here a link does.
-    for d in "$root"/system/apex/*; do
-        n=$(basename "$d")
-        [ -e "$root/apex/$n" ] || ln -s "/system/apex/$n" "$root/apex/$n"
-    done
     touch "$root/.complete-$manifest"
 fi
 
@@ -117,12 +112,57 @@ bind /proc /proc
 bind /dev /dev
 bind "$src" "$src"
 [ "${build#"$src"/}" != "$build" ] || bind "$build" "$build"
+# The test programs also run from here: the linker gives programs under
+# /data/local/tmp the namespaces of a shell tool, as adb-pushed tests get.
+bind "$build" /data/local/tmp/fatzaudio-build
+
+# The image's APEX modules are flattened folders; a booted device mounts each on
+# /apex/<name> (the name in its manifest), and so does this. (Earlier versions of
+# this script linked them instead; the links go.)
+apex_info="<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<apex-info-list>\n"
+for d in "$root"/system/apex/*; do
+    [ -f "$d/apex_manifest.pb" ] || continue
+    # Field 1 of the ApexManifest protobuf: the module name.
+    n=$(python3 -c 'import sys; b=open(sys.argv[1],"rb").read(); print(b[2:2+b[1]].decode() if b[:1]==b"\n" else "")' "$d/apex_manifest.pb")
+    [ -n "$n" ] || n=$(basename "$d")
+    [ ! -L "$root/apex/$(basename "$d")" ] || rm "$root/apex/$(basename "$d")"
+    bind "$d" "/apex/$n"
+    apex_info+="  <apex-info moduleName=\"$n\" modulePath=\"/system/apex/$n.apex\" preinstalledModulePath=\"/system/apex/$n.apex\" versionCode=\"1\" versionName=\"1\" isFactory=\"true\" isActive=\"true\"/>\n"
+done
+printf "%b</apex-info-list>\n" "$apex_info" > "$root/apex/apex-info-list.xml"
+
+# The linker namespaces of a booted device, which the Java runtime needs (the
+# HTTPS tests start one): linkerconfig writes them at boot from the system
+# properties. There is no property service here, so a small preloaded library
+# (props.c, built with the build's own NDK compiler for the image's 64-bit ABI)
+# answers from the image's build.prop files. Without a compiler the tests still
+# run; the ones that need a Java VM skip.
+if [ ! -s "$root/linkerconfig/ld.config.txt" ]; then
+    # Starts over: a half-written config would also apply to linkerconfig itself.
+    rm -rf "$root/linkerconfig" && mkdir "$root/linkerconfig"
+    cc=$(sed -n 's/^set(CMAKE_C_COMPILER "\(.*\)")$/\1/p' "$build"/CMakeFiles/*/CMakeCCompiler.cmake 2>/dev/null | head -1)
+    case $image in x86) triple=x86_64-linux-android24 ;; *) triple=aarch64-linux-android24 ;; esac
+    if [ -x "$cc" ] && "$cc" --target=$triple -shared -fPIC -O2 -o "$root/linkerconfig/props.so" "$src/tools/android-test/props.c"; then
+        chroot "$root" $shell_runner /system/bin/sh -c \
+            "LD_PRELOAD=/linkerconfig/props.so $shell_runner /apex/com.android.runtime/bin/linkerconfig --target /linkerconfig" ||
+            echo "linkerconfig failed; tests that need a Java VM will skip" >&2
+    else
+        echo "no NDK compiler found in $build/CMakeFiles; tests that need a Java VM will skip" >&2
+    fi
+fi
 
 ctest --test-dir "$build" --show-only=json-v1 > "$build/android-tests.json"
 python3 - "$build" "$filter" "$root" "$shell_runner" "$test_runner" <<'EOF'
-import json, re, subprocess, sys, time
+import json, os, re, subprocess, sys, time
+verbose = os.environ.get("FA_ANDROID_TEST_VERBOSE") == "1"
 build, pattern, root = sys.argv[1:4]
 shell_runner, test_runner = [r for r in sys.argv[4:5] if r], [r for r in sys.argv[5:6] if r]
+# What init exports on a device, for a test that starts a Java VM.
+jars = ["/apex/com.android.art/javalib/%s.jar" % j for j in ("core-oj", "core-libart", "okhttp", "bouncycastle", "apache-xml")]
+jars += ["/apex/com.android.i18n/javalib/core-icu4j.jar", "/apex/com.android.conscrypt/javalib/conscrypt.jar"]
+java_env = ("BOOTCLASSPATH=%s ANDROID_ROOT=/system ANDROID_DATA=/data ANDROID_ART_ROOT=/apex/com.android.art "
+            "ANDROID_I18N_ROOT=/apex/com.android.i18n ANDROID_TZDATA_ROOT=/apex/com.android.tzdata" % ":".join(jars))
+run_dir = "/data/local/tmp/fatzaudio-build"
 failed = []
 for t in json.load(open(build + "/android-tests.json"))["tests"]:
     if not re.search(pattern, t["name"]):
@@ -131,7 +171,10 @@ for t in json.load(open(build + "/android-tests.json"))["tests"]:
     cwd = props.get("WORKING_DIRECTORY", build)
     timeout = float(props.get("TIMEOUT", 1500))
     # Android's CMake builds carry no rpath: the tests find libfatzaudio.so here.
-    cmd = "cd '%s' && LD_LIBRARY_PATH='%s/bin' exec %s" % (cwd, build, " ".join(test_runner + ["'%s'" % c for c in t["command"]]))
+    command = list(t["command"])
+    if command[0].startswith(build + "/"):
+        command[0] = run_dir + command[0][len(build):]
+    cmd = "cd '%s' && %s LD_LIBRARY_PATH='%s/bin' exec %s" % (cwd, java_env, run_dir, " ".join(test_runner + ["'%s'" % c for c in command]))
     start = time.time()
     try:
         p = subprocess.run(["chroot", root] + shell_runner + ["/system/bin/sh", "-c", cmd],
@@ -145,6 +188,7 @@ for t in json.load(open(build + "/android-tests.json"))["tests"]:
     print("%-4s %-12s %6.1fs" % ("ok" if ok else "FAIL", t["name"], time.time() - start), flush=True)
     if not ok:
         failed.append(t["name"])
+    if not ok or verbose:
         print(out)
 print("%d failed: %s" % (len(failed), " ".join(failed)) if failed else "all Android tests passed")
 sys.exit(1 if failed else 0)

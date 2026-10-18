@@ -122,11 +122,14 @@ elseif(APPLE)
         set_source_files_properties(src/miniaudio_impl.c PROPERTIES LANGUAGE OBJC)
     endif()
 else()
-    list(APPEND FA_SOURCES src/net_https_curl.c src/disc_linux.c)
+    list(APPEND FA_SOURCES src/disc_linux.c)
     if(ANDROID)
-        # codec_mediacodec.c: AAC through MediaCodec (libmediandk.so is
-        # loaded at run time).
-        list(APPEND FA_SOURCES src/codec_mediacodec.c)
+        # net_https_android.c: HTTPS through the app's Java VM (HttpURLConnection,
+        # found at run time). codec_mediacodec.c: AAC through MediaCodec
+        # (libmediandk.so is loaded at run time).
+        list(APPEND FA_SOURCES src/net_https_android.c src/codec_mediacodec.c)
+    else()
+        list(APPEND FA_SOURCES src/net_https_curl.c)
     endif()
 endif()
 

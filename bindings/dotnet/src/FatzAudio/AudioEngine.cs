@@ -296,6 +296,23 @@ public sealed class AudioEngine : IDisposable
         return AudioStream.Wrap(this, rc, s, null);
     }
 
+    /// <summary>
+    /// Android only: the Java VM that HTTPS web streams run on (HttpURLConnection). You rarely
+    /// need this: the library finds the VM itself on Android 12 and later, and the binding hands
+    /// over .NET for Android's VM on older versions. Call it when your app hosts the runtime some
+    /// other way and <c>https://</c> URLs fail with <see cref="ErrorCode.ProviderMissing"/>.
+    /// </summary>
+    /// <param name="javaVM">The process's <c>JavaVM*</c>.</param>
+    /// <exception cref="ArgumentException"><paramref name="javaVM"/> is zero.</exception>
+    /// <exception cref="PlatformNotSupportedException">Not running on Android.</exception>
+    public static void SetAndroidJavaVM(nint javaVM)
+    {
+        if (javaVM == 0) throw new ArgumentException("A JavaVM* is required.", nameof(javaVM));
+        if (!OperatingSystem.IsAndroid()) throw new PlatformNotSupportedException("SetAndroidJavaVM is for Android.");
+        NativeLoader.EnsureInitialized();
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_android_set_java_vm(javaVM));
+    }
+
     /// <summary>Opens a network URL.</summary>
     /// <param name="url">The URL.</param>
     /// <param name="options">Optional open options.</param>

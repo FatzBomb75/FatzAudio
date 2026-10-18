@@ -142,6 +142,14 @@ public sealed class WebStreamTests : IDisposable
     }
 
     [Fact]
+    public void SetAndroidJavaVM_IsForAndroidOnly()
+    {
+        Assert.Throws<ArgumentException>(() => AudioEngine.SetAndroidJavaVM(0));
+        if (!OperatingSystem.IsAndroid())
+            Assert.Throws<PlatformNotSupportedException>(() => AudioEngine.SetAndroidJavaVM(1));
+    }
+
+    [Fact]
     public void Radio_AnnouncesSongTitles()
     {
         using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true });

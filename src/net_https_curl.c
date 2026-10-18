@@ -1,7 +1,7 @@
-/* HTTPS on Linux and Android: libcurl, loaded at runtime (never linked, never
+/* HTTPS on Linux: libcurl, loaded at runtime (never linked, never
  * bundled). Desktop Linux distributions ship it; when it is missing, https URLs
  * return FA_ERROR_PROVIDER_MISSING and http:// keeps working. */
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__ANDROID__)
 #define _POSIX_C_SOURCE 200809L
 #include "net.h"
 #include <dlfcn.h>

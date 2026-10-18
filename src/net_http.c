@@ -98,7 +98,7 @@ static int no_proxy_matches(const char* list, const char* host)
     return 0;
 }
 
-#if defined(_WIN32) || defined(__APPLE__)
+#if defined(_WIN32) || defined(__APPLE__) || defined(__ANDROID__)
 int fa_net_system_proxy(const char* scheme, const char* host, char* out, size_t cap);  /* net_https_*.c */
 #endif
 
@@ -114,14 +114,18 @@ static int find_proxy(const fa_http_request* req, const fa_url* target, fa_url* 
         if (np && no_proxy_matches(np, target->host)) return 0;
         p = getenv("http_proxy");
         if (!p || !*p) p = getenv("HTTP_PROXY");
-#if defined(_WIN32) || defined(__APPLE__)
+#if defined(_WIN32) || defined(__APPLE__) || defined(__ANDROID__)
         if ((!p || !*p) && fa_net_system_proxy("http", target->host, buf, sizeof(buf))) p = buf;
 #endif
         if (!p || !*p) return 0;
     }
     if (!*p) return 0;
     if (!strstr(p, "://")) {
-        snprintf(buf, sizeof(buf), "http://%s", p);
+        /* p may be buf itself (the system proxy): move it, never snprintf over it. */
+        size_t len = strlen(p);
+        if (len + 8 > sizeof(buf)) return 0;
+        memmove(buf + 7, p, len + 1);
+        memcpy(buf, "http://", 7);
         p = buf;
     }
     return fa_url_parse(p, proxy) == FA_OK;
