@@ -99,7 +99,7 @@ python3 tools/bass-compare/run.py --device-only --fa build-win/bin/fa_bench.exe 
     --rec build-win/bin/loop_rec.exe --rec-wine --capture Monitor --out device-results
 ```
 
-A recording where the two tones drop far below full level (the device lost audio) is taken again, up to three times; `attempts` in results.json says how many it took.
+A recording where the two tones drop far below full level (the device lost audio) is taken again, up to three times; `attempts` in results.json says how many it took. Levels are measured relative to what was recorded, so the system volume does not matter. When a measurement fails, the report lists it with how much was recorded and how loud it was, and the recording is kept in `failed-recordings` in the output folder (16-bit WAV) for a look.
 
 A machine without a sound card can use a PulseAudio null sink (`pulseaudio --start --load="module-null-sink sink_name=out"`); its timing is a virtual device's, not a real one's, so treat it as a check that everything runs.
 
@@ -107,6 +107,7 @@ A machine without a sound card can use a PulseAudio null sink (`pulseaudio --sta
 
 - The report opens with **where FatzAudio is worse than BASS**: every measurement where BASS won by more than the noise margin. Everything else is a tie or a FatzAudio win.
 - Accuracy is signal-to-error in dB; 200 means bit exact. Against FFmpeg it shows the decoder's own accuracy; against the original it shows what the codec allows. Above about 80 dB a difference cannot be heard.
+- Memory is the most the process grew by from just before the stream opened: on Windows the working set sampled every 16 reads while it decodes (the process's own peak would count the warm-up and loading the DLLs, and a buffer freed between two samples is missed), on Linux VmHWM reset through `/proc/self/clear_refs`.
 - Speed and memory under Wine are comparable between the two libraries (both are Windows code running the same way), but not with a native Windows run.
 - Bold marks the better result where the gap is larger than the margin given above each table.
 

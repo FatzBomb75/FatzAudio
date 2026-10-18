@@ -35,9 +35,8 @@ void fa_ac3_reset(fa_ac3* d);
  * the dependent frames that follow it (data may hold several of them; frames of
  * other programs, substreamid > 0, are skipped). Writes interleaved samples to
  * *pcm (grown as needed; *cap counts floats) in the default speaker order for
- * *channels (see ac3.c). FA_ERROR_UNSUPPORTED_FORMAT: the stream uses a feature
- * this decoder does not have (*frames still holds the access unit's length, of
- * silence); FA_ERROR_GENERIC: damaged data (silence too). */
+ * *channels (see ac3.c). FA_ERROR_GENERIC: damaged data (*frames still holds the
+ * access unit's length, of silence). */
 fa_result fa_ac3_decode(fa_ac3* d, const uint8_t* data, size_t size, int drc,
                         float** pcm, size_t* cap, int* frames, int* channels, uint32_t* rate);
 

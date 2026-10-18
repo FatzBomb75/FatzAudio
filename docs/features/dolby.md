@@ -5,10 +5,9 @@ FatzAudio decodes Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3) itself, i
 | What | Supported |
 |---|---|
 | AC-3 (Dolby Digital) | Every mode: mono to 5.1, 32, 44.1 and 48 kHz, all bit rates |
-| E-AC-3 (Dolby Digital Plus) | Independent and dependent substreams (7.1), 1 to 6 blocks per frame, spectral extension, transient pre-noise processing, all bit allocation options |
+| E-AC-3 (Dolby Digital Plus) | Every coding tool: independent and dependent substreams (7.1), 1 to 6 blocks per frame, spectral extension, enhanced coupling, the adaptive hybrid transform, all bit allocation options. Transient pre-noise processing data is read and not applied, as in most decoders |
 | Atmos (Dolby Digital Plus with JOC) | The 5.1 or 7.1 bed plays; the height objects are not rendered |
-| Adaptive hybrid transform, enhanced coupling | Rare E-AC-3 tools: these frames go through the app's FFmpeg when it is loaded, and are silent without it |
-| Dolby TrueHD | Through the app's FFmpeg (MP4/MKV tracks and packets) |
+| Dolby TrueHD | Not supported. If you need it, we recommend decoding it with FFmpeg in your app and handing FatzAudio the audio ([FFmpeg hand-off](ffmpeg.md)) |
 
 `fa_stream_get_info` reports codec `ac3` or `eac3`. The container is `ac3` or `ec3` for raw files, or the video file's (`mp4`, `matroska`, `hls`, ...).
 
@@ -103,5 +102,6 @@ Decoding runs on the engine's worker threads like every other format. `fa_stream
 
 - Loudness normalization scans decode with full dynamic range, so the measured loudness is the same whichever mode you play in. The compressed modes play a little louder in quiet passages than the scan says.
 - The stream's own downmix levels (centre and surround mix levels, Lt/Rt matrix-surround hints) and its dialogue level ("dialnorm") are not applied. Normalization takes care of level, and the channel matrix of the downmix.
-- `FA_ERROR_PROVIDER_MISSING` is never returned for AC-3 or E-AC-3. A rare stream that needs the adaptive hybrid transform or enhanced coupling plays those frames silent when FFmpeg isn't loaded.
+- `FA_ERROR_PROVIDER_MISSING` is never returned for AC-3 or E-AC-3, and FFmpeg is never used for them, even when the app has loaded it.
+- A damaged frame plays as silence for its 1 to 6 blocks, and decoding carries on with the next frame.
 - Passthrough (sending the compressed stream to an AV receiver over S/PDIF or HDMI) is not supported.

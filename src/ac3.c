@@ -13,9 +13,9 @@
  * E-AC-3 streams can carry several programs (independent substreams); program 0
  * plays, with its dependent substreams adding or replacing channels (7.1 is a
  * 5.1 independent substream plus a dependent one). Atmos (JOC) streams play
- * their 5.1 or 7.1 bed. Not decoded here: the adaptive hybrid transform and
- * enhanced coupling (fa_ac3_decode returns FA_ERROR_UNSUPPORTED_FORMAT, and the
- * codec hands such streams to FFmpeg when the app has it).
+ * their 5.1 or 7.1 bed. Every E-AC-3 coding tool is decoded, including the
+ * adaptive hybrid transform (a 6-point DCT across the blocks of a frame, with
+ * vector and gain-adaptive quantization) and enhanced coupling.
  *
  * Output order is the default layout for the channel count (miniaudio's, which
  * is Microsoft's): 1 C, 2 L R, 3 L R C, 4 L R C S, 5 L R C Ls Rs,
@@ -24,6 +24,7 @@
  * plays as 5.1 with C and the surrounds silent). Dual mono (1+1) plays as stereo. */
 #include "ac3.h"
 #include "mdct.h"
+#include "ac3_aht.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,6 +97,31 @@ static const uint8_t rematbnd[5] = { 13, 25, 37, 61, 253 };
 static const uint8_t def_cplbndstrc[18] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1 };
 static const uint8_t def_spxbndstrc[17] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1 };
 
+/* Adaptive hybrid transform (TS 102 366 E.2.4): high-efficiency bap per address
+ * (Table E.2.1); VQ index bits for hebap 1..7 and GAQ mantissa bits for 8..19
+ * (Table E.2.2); remapping constants a (G = 1, 2, 4) and b for x < 0 (G = 2, 4)
+ * as 16-bit fractions (Table E.2.6; b is 1/G for x >= 0, and 0 for G = 1). */
+static const uint8_t hebaptab[64] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 8, 8, 8, 9, 9, 9, 10, 10, 10, 10, 11, 11, 11, 11, 12, 12, 12, 12,
+    13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15, 16, 16, 16, 16, 17, 17, 17, 17, 18, 18, 18,
+    18, 18, 18, 18, 18, 19, 19, 19, 19, 19, 19, 19, 19, 19 };
+static const uint8_t aht_vqbits[8] = { 0, 2, 3, 4, 5, 7, 8, 9 };
+static const uint8_t aht_mbits[12] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16 };
+static const int16_t gaq_a1[12] = { 0x1249, 0x0889, 0x0421, 0x0208, 0x0102, 0x0081, 0x0040, 0x0020, 0x0010,
+                                    0x0008, 0x0002, 0x0000 };
+static const uint16_t gaq_a[2][9] = {
+    { 0xd555, 0xc925, 0xc444, 0xc211, 0xc104, 0xc081, 0xc040, 0xc020, 0xc010 },
+    { 0xedb7, 0xe666, 0xe319, 0xe186, 0xe0c2, 0xe060, 0xe030, 0xe018, 0xe00c } };
+static const uint16_t gaq_bneg[2][9] = {
+    { 0xeaab, 0xd249, 0xc889, 0xc421, 0xc208, 0xc102, 0xc081, 0xc040, 0xc020 },
+    { 0xfb6e, 0xeccd, 0xe632, 0xe30c, 0xe183, 0xe0c1, 0xe060, 0xe030, 0xe018 } };
+
+/* Enhanced coupling (E.2.5): first bin of each sub-band (Table E.2.9), default
+ * band structure (Table E.1.13) and amplitudes (Table E.2.10). */
+static const uint8_t ecplsubbndtab[23] = { 13, 19, 25, 31, 37, 49, 61, 73, 85, 97, 109, 121, 133, 145,
+                                           157, 169, 181, 193, 205, 217, 229, 241, 253 };
+static const uint8_t def_ecplbndstrc[22] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 1, 1 };
+
 /* Tables computed once (ac3_init_tables). */
 static uint8_t latab[256];        /* log-addition (Table 7.15) */
 static uint16_t crctab[256];       /* CRC-16 of each byte value */
@@ -105,6 +131,8 @@ static float kbd[AC3_BLOCK * 2];  /* Kaiser-Bessel derived window, alpha 5 */
 static float b1q[27][3], b2q[125][3], b4q[121][2], b3q[8], b5q[16];
 static uint8_t frmexpstr[32][6];  /* E-AC-3 frame exponent strategies (Table E2.10) */
 static float spxatten[32][3];
+static float aht_idct[6][6];      /* [block][j]: the AHT's inverse DCT */
+static float ecplamptab[32];
 static fa_atomic32 tables_state;  /* 0 not done, 1 in progress, 2 done */
 
 static double bessel_i0(double x)
@@ -186,6 +214,18 @@ static void ac3_init_tables(void)
     }
     for (i = 0; i < 32; i++)
         for (k = 0; k < 3; k++) spxatten[i][k] = (float)pow(2.0, -(double)((k + 1) * (i + 1)) / 15.0);
+    /* The AHT's inverse DCT (E.2.4.5): C(m) = X(0) + sqrt 2 * the sum over j >= 1
+     * of X(j) cos(pi (2m + 1) j / 12), at the scale FFmpeg decodes with
+     * (checked on test streams). */
+    for (i = 0; i < 6; i++)
+        for (k = 0; k < 6; k++)
+            aht_idct[i][k] = (float)((k == 0 ? 1.0 : sqrt(2.0)) * cos(M_PI * (2 * i + 1) * k / 12.0));
+    {
+        static const uint8_t mant[4] = { 0x1b, 0x17, 0x13, 0x10 };
+        ecplamptab[0] = 1.0f;
+        for (i = 1; i < 31; i++) ecplamptab[i] = ldexpf((float)mant[(i - 1) % 4] / 32.0f, -((i - 1) / 4));
+        ecplamptab[31] = 0.0f;
+    }
     fa_store32(&tables_state, 2);
 }
 
@@ -322,7 +362,7 @@ typedef struct sub_state {
     uint32_t locs;               /* the locations it wrote last (bit per LOC_) */
 } sub_state;
 
-#define BA_KEY 39
+#define BA_KEY 40
 
 /* Everything one syncframe needs while it is decoded. */
 typedef struct frame {
@@ -354,6 +394,11 @@ typedef struct frame {
     int nspxbnd, spxbndsz[17];
     uint8_t spxbndstrc[17];
     float spx_nblend[AC3_MAX_FBW][17], spx_sblend[AC3_MAX_FBW][17];
+    int ahtinu[AC3_NCH];          /* this frame's mantissas of the channel are AHT coded */
+    int ecplinu, ecpl_begin, ecpl_end;   /* sub-bands */
+    int necplbnd;
+    uint8_t ecplbndstrc[22], ecplbnd[22];   /* sub-band -> band */
+    float ecplamp[AC3_MAX_FBW][22];
     int strtmant[AC3_NCH], endmant[AC3_NCH];
     int ngrps[AC3_NCH];
     uint8_t exp[AC3_NCH][256];
@@ -369,6 +414,9 @@ typedef struct frame {
     int ba_key[AC3_NCH][BA_KEY];
     uint8_t ba_exp[AC3_NCH][256];
     int ba_ok[AC3_NCH];
+    /* AHT channels: every block's mantissas, read in block 0 (allocated with the
+     * first frame that uses AHT). */
+    float (*aht)[6][256];
 } frame;
 
 struct fa_ac3 {
@@ -406,6 +454,7 @@ void fa_ac3_destroy(fa_ac3* d)
     fa_imdct_free(&d->t128);
     for (i = 0; i < LOC_COUNT; i++) free(d->loc[i]);
     for (i = 0; i < AC3_MAX_SUBSTREAMS; i++) free(d->sub[i]);
+    free(d->f.aht);
     free(d);
 }
 
@@ -448,9 +497,11 @@ static int calc_lowcomp(int a, int b0, int b1, int bin)
 static int imax(int a, int b) { return a > b ? a : b; }
 static int imin(int a, int b) { return a < b ? a : b; }
 
-/* bap[] of channel ch for bins strtmant..endmant. 0 on success. */
+/* bap[] of channel ch for bins strtmant..endmant (hebap[] when the channel is
+ * AHT coded). 0 on success. */
 static int bit_alloc(frame* f, int ch)
 {
+    const uint8_t* tab = f->ahtinu[ch] ? hebaptab : baptab;
     int start = f->strtmant[ch], end = f->endmant[ch];
     int16_t psd[256], bndpsd[51], mask[50] = { 0 };
     uint8_t* bap = f->bap[ch];
@@ -472,6 +523,7 @@ static int bit_alloc(frame* f, int ch)
         key[23 + k] = on ? f->deltlen[ch][k] : 0;
         key[31 + k] = on ? f->deltba[ch][k] : 0;
     }
+    key[39] = f->ahtinu[ch];   /* hebap[] or bap[] */
     if (f->ba_ok[ch] && memcmp(key, f->ba_key[ch], sizeof(key)) == 0 &&
         memcmp(f->exp[ch] + start, f->ba_exp[ch] + start, (size_t)(end - start)) == 0)
         return 0;
@@ -553,7 +605,7 @@ static int bit_alloc(frame* f, int ch)
         m = (m & 0x1fe0) + f->floorv;
         for (; bin < lastbin; bin++) {
             int addr = (psd[bin] - m) >> 5;
-            bap[bin] = baptab[addr < 0 ? 0 : addr > 63 ? 63 : addr];
+            bap[bin] = tab[addr < 0 ? 0 : addr > 63 ? 63 : addr];
         }
         j++;
     } while (end > lastbin);
@@ -566,13 +618,13 @@ done:
 
 #ifdef FA_AC3_STATS
 /* Test builds: which coding tools the decoded streams used. */
-long fa_ac3_stats[16];
+long fa_ac3_stats[20];
 #define STAT(i) (fa_ac3_stats[i]++)
 #else
 #define STAT(i) ((void)0)
 #endif
 enum { ST_BLOCKS, ST_CPL, ST_SHORT, ST_REMAT, ST_DBA, ST_SPX, ST_SPXATTEN, ST_PHSFLG, ST_DEP, ST_DYNRNG,
-       ST_EXPREUSE, ST_D25, ST_D45, ST_SNRBLK, ST_FGAIN, ST_FRMEXP };
+       ST_EXPREUSE, ST_D25, ST_D45, ST_SNRBLK, ST_FGAIN, ST_FRMEXP, ST_AHT, ST_ECPL };
 
 /* ---- syntax helpers ------------------------------------------------------------- */
 
@@ -715,7 +767,7 @@ static int parse_bsi(bits* b, frame* f)
 static int parse_audfrm(bits* b, frame* f)
 {
     const fa_ac3_header* h = &f->h;
-    int expstre = 1, transproce, spxattene, blk, ch, ncplblks = 0;
+    int expstre = 1, transproce, spxattene, blk, ch, i, ncplblks = 0;
     int nfch = f->nfchans;
     f->ahte = 0;
     if (h->blocks == 6) {
@@ -762,21 +814,20 @@ static int parse_audfrm(bits* b, frame* f)
     for (blk = 0; blk < h->blocks; blk++) f->expstr[blk][AC3_LFE] = h->lfeon ? gb1(b) : 0;
     if (h->strmtyp == 0 && (h->blocks == 6 || gb1(b))) skipb(b, 5 * (size_t)nfch);   /* convexpstr */
     if (f->ahte) {
-        /* AHT is possible only for channels that reuse block 0's exponents in every
-         * other block; each such channel then says whether it uses it. */
-        int any = 0;
-        for (ch = 0; ch < AC3_NCH; ch++) {
-            int possible = 1;
-            if (ch < AC3_LFE && ch >= nfch) continue;
-            if (ch == AC3_LFE && !h->lfeon) continue;
+        /* AHT is possible for a channel whose exponents (and coupling strategy)
+         * are sent once in the frame, in block 0: the coupling channel, the
+         * full-bandwidth channels, then the LFE. */
+        for (i = 0; i < 2 + nfch; i++) {
+            int nregs = 0;
+            ch = i == 0 ? AC3_CPL : i <= nfch ? i - 1 : AC3_LFE;
             if (ch == AC3_CPL && ncplblks != 6) continue;
-            for (blk = 1; blk < 6; blk++)
-                if (f->expstr[blk][ch] != 0 || (ch == AC3_CPL && f->cplstre[blk])) possible = 0;
-            if (possible && gb1(b)) any = 1;
+            if (ch == AC3_LFE && !h->lfeon) continue;
+            for (blk = 0; blk < 6; blk++)
+                if (f->expstr[blk][ch] != 0 || (ch == AC3_CPL && f->cplstre[blk])) nregs++;
+            if (nregs == 1) f->ahtinu[ch] = gb1(b);
         }
-        if (any) return 1;                         /* uses AHT: not decoded here */
-        f->ahte = 0;
     }
+    if (f->snroffststr == 3) return -1;            /* reserved */
     if (f->snroffststr == 0) {
         int csnr = (int)gb(b, 6), fsnr = (int)gb(b, 4);
         int v = ((csnr - 15) * 16 + fsnr) * 4;
@@ -802,6 +853,13 @@ typedef struct mant_groups {
     float b1[3], b2[3], b4[2];
     int n1, n2, n4;
 } mant_groups;
+
+/* n bits, signed (two's complement). */
+static int32_t gsb(bits* b, int n)
+{
+    uint32_t u = gb(b, n);
+    return (int32_t)(u << (32 - n)) >> (32 - n);
+}
 
 static float read_mantissa(bits* b, mant_groups* g, int bap)
 {
@@ -835,9 +893,7 @@ static float read_mantissa(bits* b, mant_groups* g, int bap)
     case 5: return b5q[gb(b, 4)];
     default: {
         int n = qbits[bap];
-        uint32_t u = gb(b, n);
-        int32_t s = (int32_t)(u << (32 - n)) >> (32 - n);
-        return (float)s * pow2tab[n - 1];
+        return (float)gsb(b, n) * pow2tab[n - 1];
     }
     }
 }
@@ -861,12 +917,109 @@ static void read_mantissas(fa_ac3* d, bits* b, mant_groups* g, int ch, int dithe
     }
 }
 
+/* One gain-adaptive quantized mantissa (E.2.4.4.2) of a bin with the given hebap
+ * (8..19) and gain 2^lg. */
+static float gaq_mantissa(bits* b, int hebap, int lg)
+{
+    int mb = aht_mbits[hebap - 8], n = mb - lg;
+    int32_t x = gsb(b, n);
+    float y, a, c;
+    if (lg == 0) return ldexpf((float)x, 1 - mb) * (1.0f + (float)gaq_a1[hebap - 8] / 32768.0f);
+    if (x != -(1 << (n - 1))) return ldexpf((float)x, 1 - n - lg);   /* small: attenuated by the gain */
+    /* The tag: a large mantissa follows, from a dead-zone quantizer. */
+    n = lg == 1 ? mb - 1 : mb;
+    x = gsb(b, n);
+    y = ldexpf((float)x, 1 - n);
+    a = (float)(int16_t)gaq_a[lg - 1][hebap - 8] / 32768.0f;
+    c = x >= 0 ? ldexpf(1.0f, -lg) : (float)(int16_t)gaq_bneg[lg - 1][hebap - 8] / 32768.0f;
+    return y + a * y + c;
+}
+
+/* The AHT-coded mantissas of channel ch for all six blocks, read in block 0, and
+ * their inverse DCT into aht[ch][block][bin] (E.2.4). bap[] holds hebap[]. */
+static int read_aht(bits* b, frame* f, int ch)
+{
+    int start = f->strtmant[ch], end = f->endmant[ch], bin, j, m, k, nactive = 0;
+    int gaqmod = (int)gb(b, 2), endbap = gaqmod < 2 ? 12 : 17;
+    uint8_t gain[258];   /* log2 of each gain-coded bin's gain, in order */
+    memset(gain, 0, sizeof(gain));
+    for (bin = start; bin < end; bin++)
+        if (f->bap[ch][bin] > 7 && f->bap[ch][bin] < endbap) nactive++;
+    if (gaqmod == 1 || gaqmod == 2) {
+        for (k = 0; k < nactive; k++) gain[k] = (uint8_t)(gb1(b) ? gaqmod : 0);   /* G = 2 or 4 */
+    } else if (gaqmod == 3) {
+        for (k = 0; k < nactive; k += 3) {   /* three gains of 1, 2 or 4 per word */
+            int v = (int)gb(b, 5);
+            if (v > 26) v = 26;   /* reserved: clamped, like grouped mantissa codes */
+            gain[k] = (uint8_t)(v / 9);
+            gain[k + 1] = (uint8_t)((v % 9) / 3);
+            gain[k + 2] = (uint8_t)(v % 3);
+        }
+    }
+    k = 0;
+    for (bin = start; bin < end; bin++) {
+        int hb = f->bap[ch][bin];
+        float x[6];
+        if (hb == 0) {   /* no mantissas (dithered later, by dithflag) */
+            for (m = 0; m < 6; m++) f->aht[ch][m][bin] = 0.0f;
+            continue;
+        }
+        if (hb < 8) {
+            uint32_t v = gb(b, aht_vqbits[hb]);
+            const int16_t* q = hb == 1 ? aht_vq1[v] : hb == 2 ? aht_vq2[v] : hb == 3 ? aht_vq3[v] : hb == 4 ? aht_vq4[v]
+                             : hb == 5 ? aht_vq5[v] : hb == 6 ? aht_vq6[v] : aht_vq7[v];
+            for (j = 0; j < 6; j++) x[j] = (float)q[j] / 32768.0f;
+        } else {
+            int lg = hb < endbap ? gain[k++] : 0;
+            for (j = 0; j < 6; j++) x[j] = gaq_mantissa(b, hb, lg);
+        }
+        for (m = 0; m < 6; m++) {
+            float acc = 0.0f;
+            for (j = 0; j < 6; j++) acc += aht_idct[m][j] * x[j];
+            f->aht[ch][m][bin] = acc;
+        }
+    }
+    return b->overrun ? -1 : 0;
+}
+
+/* Mantissas of channel ch in block blk, AHT-coded or not. */
+static int channel_mantissas(fa_ac3* d, bits* b, mant_groups* g, int ch, int blk, int dither)
+{
+    frame* f = &d->f;
+    int bin;
+    if (!f->ahtinu[ch]) {
+        read_mantissas(d, b, g, ch, dither);
+        return 0;
+    }
+    if (blk == 0 && read_aht(b, f, ch) < 0) return -1;
+    for (bin = f->strtmant[ch]; bin < f->endmant[ch]; bin++) {
+        float m = f->aht[ch][blk][bin];
+        if (f->bap[ch][bin] == 0 && dither) m = rnd(d) * 0.707f;
+        f->coef[ch][bin] = m * pow2tab[f->exp[ch][bin]];
+    }
+    return 0;
+}
+
 static void decouple(fa_ac3* d)
 {
     frame* f = &d->f;
     int ch, bnd, bin, k;
     for (ch = 0; ch < f->nfchans; ch++) {
         if (!f->chincpl[ch]) continue;
+        if (f->ecplinu) {
+            /* Enhanced coupling: an amplitude per band (E.2.5.5). */
+            int sb;
+            for (sb = f->ecpl_begin; sb < f->ecpl_end; sb++) {
+                float amp = f->ecplamp[ch][f->ecplbnd[sb]];
+                for (bin = ecplsubbndtab[sb]; bin < ecplsubbndtab[sb + 1]; bin++) {
+                    float c = f->coef[AC3_CPL][bin];
+                    if (f->bap[AC3_CPL][bin] == 0)
+                        c = f->dithflag[ch] ? rnd(d) * 0.707f * pow2tab[f->exp[AC3_CPL][bin]] : 0.0f;
+                    f->coef[ch][bin] = c * amp;
+                }
+            }
+            continue;
+        }
         bin = f->strtmant[AC3_CPL];
         for (bnd = 0; bnd < f->ncplbnd; bnd++) {
             float co = f->cplco[ch][bnd];
@@ -947,6 +1100,15 @@ static void spectral_extension(fa_ac3* d)
     }
 }
 
+/* The rematrixing bands below where coupling or spectral extension begins
+ * (A/52 7.5.2, TS 102 366 E.2.3.2). */
+static int rematrix_bands(const frame* f, int cplinu)
+{
+    int limit = cplinu ? f->strtmant[AC3_CPL] : f->spxinu ? f->spx_start : 253, n = 0;
+    while (n < 4 && rematbnd[n] < limit) n++;
+    return n;
+}
+
 static int parse_block(fa_ac3* d, bits* b, int blk)
 {
     frame* f = &d->f;
@@ -1024,11 +1186,36 @@ static int parse_block(fa_ac3* d, bits* b, int blk)
         if (!eac3) f->cplinu_blk[blk] = gb1(b);
         f->cplinu = f->cplinu_blk[blk];
         if (f->cplinu) {
-            int endsub;
+            int endsub, was_ecpl = f->ecplinu;
             if (acmod < 2) return -1;
-            if (eac3 && gb1(b)) return 1;                       /* enhanced coupling */
+            f->ecplinu = eac3 ? gb1(b) : 0;
             if (eac3 && acmod == 2) f->chincpl[0] = f->chincpl[1] = 1;
             else for (ch = 0; ch < nfch; ch++) f->chincpl[ch] = gb1(b);
+            if (f->ecplinu) {
+                /* Enhanced coupling (E.1.3.3.16 to E.1.3.3.19): sub-bands of 6 bins
+                 * up to bin 37, 12 above, combined into bands above sub-band 8. */
+                int begf = (int)gb(b, 4), begin, end, sb, first;
+                begin = begf < 3 ? begf * 2 : begf < 13 ? begf + 2 : begf * 2 - 10;
+                end = f->spxinu ? (f->spx_start - 25) / 12 + 3 : (int)gb(b, 4) + 7;
+                if (begin >= end || end > 22) return -1;
+                f->ecpl_begin = begin;
+                f->ecpl_end = end;
+                if (blk == 0 || !was_ecpl) memcpy(f->ecplbndstrc, def_ecplbndstrc, sizeof(f->ecplbndstrc));
+                first = imax(9, begin + 1);
+                if (gb1(b))
+                    for (sb = first; sb < end; sb++) f->ecplbndstrc[sb] = (uint8_t)gb1(b);
+                for (sb = 0; sb < first; sb++) f->ecplbndstrc[sb] = 0;
+                f->necplbnd = 0;
+                for (sb = begin; sb < end; sb++) {
+                    if (sb > begin && !f->ecplbndstrc[sb]) f->necplbnd++;
+                    f->ecplbnd[sb] = (uint8_t)f->necplbnd;
+                }
+                f->necplbnd++;
+                f->strtmant[AC3_CPL] = ecplsubbndtab[begin];
+                f->endmant[AC3_CPL] = ecplsubbndtab[end];
+                f->phsflginu = 0;
+                goto cpl_done;
+            }
             f->phsflginu = acmod == 2 ? gb1(b) : 0;
             f->cplbegf = (int)gb(b, 4);
             endsub = f->spxinu ? (f->spx_start - 37) / 12 : (int)gb(b, 4) + 3;
@@ -1039,10 +1226,12 @@ static int parse_block(fa_ac3* d, bits* b, int blk)
             if (!eac3 || gb1(b))
                 for (bnd = f->cplbegf + 1; bnd < endsub; bnd++) f->cplbndstrc[bnd] = (uint8_t)gb1(b);
             f->ncplbnd = band_sizes(f->cplbndstrc, f->cplbegf, endsub, f->cplbndsz);
+        cpl_done:;
         } else {
             for (ch = 0; ch < AC3_MAX_FBW; ch++) { f->chincpl[ch] = 0; f->firstcplcos[ch] = 1; }
             f->firstcplleak = 1;
             f->phsflginu = 0;
+            f->ecplinu = 0;
         }
     } else if (!eac3) {
         if (blk == 0) return -1;
@@ -1052,8 +1241,29 @@ static int parse_block(fa_ac3* d, bits* b, int blk)
     }
     cplinu = f->cplinu = f->cplinu_blk[blk];
 
-    /* Coupling coordinates and phase flags. */
-    if (cplinu) {
+    /* Coupling coordinates and phase flags, or enhanced coupling amplitudes
+     * (the angle and chaos parameters that may follow them are reserved). */
+    if (cplinu && f->ecplinu) {
+        int first = -1;
+        skipb(b, 1);
+        for (ch = 0; ch < nfch; ch++) {
+            int param1e, rsvd;
+            if (!f->chincpl[ch]) { f->firstcplcos[ch] = 1; continue; }
+            if (first < 0) first = ch;
+            if (f->firstcplcos[ch]) {
+                param1e = 1;
+                rsvd = ch > first;
+                f->firstcplcos[ch] = 0;
+            } else {
+                param1e = gb1(b);
+                rsvd = ch > first ? gb1(b) : 0;
+            }
+            if (param1e)
+                for (bnd = 0; bnd < f->necplbnd; bnd++) f->ecplamp[ch][bnd] = ecplamptab[gb(b, 5)];
+            if (rsvd) skipb(b, 9 * (size_t)(f->necplbnd - 1));
+            if (ch > first) skipb(b, 1);
+        }
+    } else if (cplinu) {
         int any = 0;
         for (ch = 0; ch < nfch; ch++) {
             if (!f->chincpl[ch]) { f->firstcplcos[ch] = 1; continue; }
@@ -1078,9 +1288,7 @@ static int parse_block(fa_ac3* d, bits* b, int blk)
     /* Rematrixing. */
     if (acmod == 2) {
         if ((eac3 && blk == 0) || gb1(b)) {
-            f->nrematbd = 4;
-            if (cplinu && f->strtmant[AC3_CPL] <= 61) f->nrematbd -= 1 + (f->strtmant[AC3_CPL] == 37);
-            else if (f->spxinu && f->spx_start <= 61) f->nrematbd--;
+            f->nrematbd = rematrix_bands(f, cplinu);
             for (bnd = 0; bnd < f->nrematbd; bnd++) f->rematflg[bnd] = gb1(b);
         } else if (blk == 0) {
             f->nrematbd = 0;
@@ -1182,26 +1390,26 @@ static int parse_block(fa_ac3* d, bits* b, int blk)
             return -1;
         }
     } else {
-        /* Block-level offsets are sent in block 0 only, behind a flag (this is
-         * what deployed decoders read; checked against FFmpeg). */
-        if (f->snroffststr != 0 && blk == 0 && gb1(b)) {
+        /* Block-level offsets: always in block 0, then when they change. */
+        if (f->snroffststr != 0 && (blk == 0 || gb1(b))) {
             int csnr = (int)gb(b, 6), v;
             if (f->snroffststr == 1) {
                 v = ((csnr - 15) * 16 + (int)gb(b, 4)) * 4;
-                for (ch = 0; ch < AC3_NCH; ch++) if (ch != AC3_CPL || cplinu) f->snroffset[ch] = v;
+                for (ch = 0; ch < AC3_NCH; ch++) f->snroffset[ch] = v;
             } else {
                 if (cplinu) f->snroffset[AC3_CPL] = ((csnr - 15) * 16 + (int)gb(b, 4)) * 4;
                 for (ch = 0; ch < nfch; ch++) f->snroffset[ch] = ((csnr - 15) * 16 + (int)gb(b, 4)) * 4;
                 if (h->lfeon) f->snroffset[AC3_LFE] = ((csnr - 15) * 16 + (int)gb(b, 4)) * 4;
             }
+            STAT(ST_SNRBLK);
         }
+        /* Fast gains: sent, or the default in every block that has none. */
         if (f->frmfgaincode && gb1(b)) {
             if (cplinu) f->fgain[AC3_CPL] = fastgain[gb(b, 3)];
             for (ch = 0; ch < nfch; ch++) f->fgain[ch] = fastgain[gb(b, 3)];
             if (h->lfeon) f->fgain[AC3_LFE] = fastgain[gb(b, 3)];
-        } else if (blk == 0) {
-            /* The default; the coupling channel's only when coupling is on in
-             * block 0 (it otherwise keeps its last value, as FFmpeg does). */
+            STAT(ST_FGAIN);
+        } else {
             for (ch = 0; ch < AC3_NCH; ch++) if (ch != AC3_CPL || cplinu) f->fgain[ch] = fastgain[4];
         }
         if (h->strmtyp == 0 && gb1(b)) skipb(b, 10);           /* convsnroffst */
@@ -1253,12 +1461,18 @@ static int parse_block(fa_ac3* d, bits* b, int blk)
     if (f->spxinu) STAT(ST_SPX);
     if (f->spxinu) for (ch = 0; ch < nfch; ch++) if (f->chinspx[ch] && f->spxattencod[ch] >= 0) { STAT(ST_SPXATTEN); break; }
     if (cplinu && f->phsflginu) STAT(ST_PHSFLG);
+    if (cplinu && f->ecplinu) STAT(ST_ECPL);
+    if (blk == 0) for (ch = 0; ch < AC3_NCH; ch++) if (f->ahtinu[ch]) { STAT(ST_AHT); break; }
     if (f->dynrng[0] != 1.0f) STAT(ST_DYNRNG);
 
-    /* Bit allocation (skipped for a channel whose inputs did not change). */
-    if (cplinu && bit_alloc(f, AC3_CPL) < 0) return -1;
-    for (ch = 0; ch < nfch; ch++) if (bit_alloc(f, ch) < 0) return -1;
-    if (h->lfeon && bit_alloc(f, AC3_LFE) < 0) return -1;
+    /* Bit allocation (skipped for a channel whose inputs did not change).
+     * AHT channels' (hebap) only in block 0, where all their mantissas are. */
+    for (i = 0; i < nfch + 2; i++) {
+        ch = i == 0 ? AC3_CPL : i <= nfch ? i - 1 : AC3_LFE;
+        if (ch == AC3_CPL ? !cplinu : ch == AC3_LFE && !h->lfeon) continue;
+        if (blk > 0 && f->ahtinu[ch]) continue;
+        if (bit_alloc(f, ch) < 0) return -1;
+    }
 
     /* Mantissas: each channel's, the coupling channel's right after the first
      * coupled channel, then the LFE. Grouped mantissas carry across channels. */
@@ -1266,13 +1480,13 @@ static int parse_block(fa_ac3* d, bits* b, int blk)
     {
         int got_cpl = 0;
         for (ch = 0; ch < nfch; ch++) {
-            read_mantissas(d, b, &g, ch, f->dithflag[ch]);
+            if (channel_mantissas(d, b, &g, ch, blk, f->dithflag[ch]) < 0) return -1;
             if (cplinu && f->chincpl[ch] && !got_cpl) {
-                read_mantissas(d, b, &g, AC3_CPL, 0);
+                if (channel_mantissas(d, b, &g, AC3_CPL, blk, 0) < 0) return -1;
                 got_cpl = 1;
             }
         }
-        if (h->lfeon) read_mantissas(d, b, &g, AC3_LFE, 0);
+        if (h->lfeon && channel_mantissas(d, b, &g, AC3_LFE, blk, 0) < 0) return -1;
     }
     if (b->overrun) return -1;
 
@@ -1363,7 +1577,7 @@ static const int8_t chanmap_loc[16][2] = {
     { LOC_LTS, LOC_RTS }, { LOC_LFE2, -1 }, { LOC_LFE, -1 } };
 
 /* Decodes one syncframe into the location buffers at block offset `at`.
- * Returns 0, 1 (unsupported feature), -1 (damaged) or -2 (out of memory). */
+ * Returns 0, -1 (damaged) or -2 (out of memory). */
 static int decode_frame(fa_ac3* d, const uint8_t* p, const fa_ac3_header* h, int state, int at, int drc,
                         int* wrote)
 {
@@ -1385,6 +1599,10 @@ static int decode_frame(fa_ac3* d, const uint8_t* p, const fa_ac3_header* h, int
     if (h->eac3) {
         r = parse_audfrm(&b, f);
         if (r != 0) return r;
+        if (f->ahte && !f->aht) {
+            f->aht = (float(*)[6][256])malloc(AC3_NCH * sizeof(*f->aht));
+            if (!f->aht) return -2;
+        }
     }
     /* Where this substream's channels go. */
     for (ch = 0; ch < 6; ch++) loc[ch] = -1;
@@ -1438,6 +1656,9 @@ static int decode_frame(fa_ac3* d, const uint8_t* p, const fa_ac3_header* h, int
             synth(d, f->coef[ch], ch < AC3_LFE && f->blksw[ch], gain, ss->delay[ch], dst);
         }
     }
+    /* The blocks must leave room for the error check (crcrsv and crc2): a
+     * stream read past that was not read the way it was written. */
+    if (b.pos + 17 > b.end) return -1;
     ss->locs = 0;
     for (ch = 0; ch < 6; ch++)
         if (loc[ch] >= 0) { d->loc_used[loc[ch]] = 1; ss->locs |= 1u << loc[ch]; }
@@ -1617,7 +1838,6 @@ fa_result fa_ac3_decode(fa_ac3* d, const uint8_t* data, size_t size, int drc,
     /* A dependent substream missing from this unit starts clean when it returns. */
     for (i = 1; i < AC3_MAX_SUBSTREAMS; i++) if (d->sub[i] && !d->sub[i]->seen) d->sub[i]->used = 0;
     if (err == 0) memcpy(d->last_used, d->loc_used, sizeof(d->loc_used));
-    if (err > 0) return FA_ERROR_UNSUPPORTED_FORMAT;
     if (err < 0) return FA_ERROR_GENERIC;
     return FA_OK;
 }

@@ -268,7 +268,7 @@ AC-3 and E-AC-3 are built-in formats: the ordinary open calls play them, in raw 
 | BASS_CONFIG_AC3_DYNRNG / BASS_AC3_DYNAMIC_RANGE | `fa_open_options.dynamic_range` per stream (`FA_DYNAMIC_RANGE_FULL`, `NORMAL` or `NIGHT`), changeable while playing with `fa_stream_set_dynamic_range` | `StreamOptions.DynamicRange`, `stream.DynamicRange` | ✅ |
 | BASS_AC3_DOWNMIX_2 / BASS_AC3_DOWNMIX_4 | The engine downmixes to the device automatically; for a custom downmix, `fa_stream_set_matrix` | `stream.SetMatrix` | ✅ |
 | BASS_AC3_DOWNMIX_DOLBY (Pro Logic Lt/Rt) | Not provided: the plain stereo downmix, or your own matrix | — | ➖ (rarely needed today) |
-| E-AC-3 (Dolby Digital Plus), 7.1 | Built in, including dependent substreams; Atmos streams play their bed | Built in | ✅ |
+| E-AC-3 (Dolby Digital Plus), 7.1 | Built in with every coding tool (dependent substreams, spectral extension, enhanced coupling, the adaptive hybrid transform); Atmos streams play their bed | Built in | ✅ |
 | AC-3 packets from your own FFmpeg demuxer | `fa_stream_open_packets` with codec `ac3` / `eac3`, decoded natively | `engine.OpenPackets` | ✅ |
 | Passthrough to an AV receiver (S/PDIF, HDMI) | Not provided | — | 🗓️ |
 
@@ -859,13 +859,13 @@ Stored positions (cue points, mix points, lyrics or CD+G offsets saved by your a
 
 ### Playback timing
 
-With `--rec`, the harness also plays both libraries through the output device and records what comes out (tools/bass-compare README, "Playback on a real device"). Measured so far on a virtual sound card under Wine; a run on Windows hardware is still to come:
+With `--rec`, the harness also plays both libraries through the output device and records what comes out (tools/bass-compare README, "Playback on a real device"). Measured on Windows hardware (WASAPI loopback of the default output device, 2026-10-17):
 
-- **Gapless:** `fa_stream_set_next` joins two files with no gap and no overlap. With plain BASS, starting the next stream from a `BASS_SYNC_END` sync leaves a gap of about 30 ms, and with `BASS_SYNC_MIXTIME` the next stream starts about half a second early, while the end of the first is still in BASS's playback buffer. Replace either with `fa_stream_set_next(current, next, 0, NULL)`.
+- **Gapless:** `fa_stream_set_next` joins two files with no gap and no overlap. With plain BASS, starting the next stream from a `BASS_SYNC_END` sync leaves a gap of about 50 ms, and with `BASS_SYNC_MIXTIME` the next stream starts about 460 ms early, while the end of the first is still in BASS's playback buffer. Replace either with `fa_stream_set_next(current, next, 0, NULL)`.
 - **Crossfades:** both libraries follow the curve closely and start both fades together (within 1 ms). `fa_crossfade` also offers equal power (no dip in loudness); BASS slides are linear, which dips 3 dB in the middle.
-- **Latency:** FatzAudio started sounds and crossfades 10 to 35 ms later than BASS (see below).
+- **Latency:** in this run FatzAudio started a sound about 9 ms later than BASS (36.5 against 27.7 ms from the call to the sound) and a crossfade about 19 ms later (49.5 against 30.1 ms). The causes were its device buffer (three 10 ms periods, 32 ms, against BASS's 25 ms) and one extra period that `fa_crossfade` waited. Both are fixed since: the buffer on Windows is two periods, and a crossfade starts in the next callback, like a play. That should take about 10 ms off a start and about 20 ms off a crossfade; a new run will confirm it.
 
 ### Where BASS is still ahead
 
-The comparison report opens with every measurement where BASS won; the ones to fix are in the [engineering notes](../engineering-notes.md) (area "bass-compare"). In short: on the virtual device FatzAudio's start latency was 10 to 35 ms higher than BASS's and its crossfades started about 30 ms later after the call (to be confirmed on Windows hardware); WMA has not been compared yet (basswma does not run under Wine), and 16 AC-3 5.1 streams at once take more memory each than in bass_ac3. The AC-3 decoder now runs faster than bass_ac3 (5.1 about 400× real time against 350×, stereo 900× against 820×) and opens a file in about 0.5 ms. MP3 now seeks exactly in about 0.3 ms (BASS lands off target unless it prescans), decodes as accurately as BASS, and its loudness scan runs faster than BASS decodes the file. `.aac` files and AAC radio start on the same frame as in bass_aac. Ogg Opus and Ogg Vorbis match bassopus and BASS's Vorbis decoder.
+The comparison report opens with every measurement where BASS won; the ones to fix are in the [engineering notes](../engineering-notes.md) (area "bass-compare"). In short: the start and crossfade latency measured on Windows hardware (about 9 and 19 ms behind BASS) is fixed but not yet measured again; WMA has not been compared yet (basswma does not run under Wine), and 16 AC-3 5.1 streams at once take more memory each than in bass_ac3. The AC-3 decoder now runs faster than bass_ac3 (5.1 about 400× real time against 350×, stereo 900× against 820×) and opens a file in about 0.5 ms. MP3 now seeks exactly in about 0.3 ms (BASS lands off target unless it prescans), decodes as accurately as BASS, and its loudness scan runs faster than BASS decodes the file. `.aac` files and AAC radio start on the same frame as in bass_aac. Ogg Opus and Ogg Vorbis match bassopus and BASS's Vorbis decoder.
 
