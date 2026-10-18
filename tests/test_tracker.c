@@ -469,9 +469,9 @@ static void FA_CALL on_event(const fa_event* ev, void* user)
     fa_mutex_unlock(&r->lock);
 }
 
-/* Plays the whole song through the device (rendered here, not by a device
- * thread) and collects the row events. */
-static void play_rows(const buf* mod, int32_t mode, row_rec* rec)
+/* Plays the song through the device (rendered here, not by a device thread)
+ * for 2.5 s, from `seek` (looping, if asked), and collects the row events. */
+static void play_rows(const buf* mod, int32_t mode, int loop, fa_frames seek, row_rec* rec)
 {
     fa_device* dev = NULL;
     fa_stream* s = NULL;
@@ -485,6 +485,8 @@ static void play_rows(const buf* mod, int32_t mode, row_rec* rec)
     fa_open_options_init(&o);
     if (fa_stream_open_memory(g_engine, mod->d, mod->n, &o, &s) != FA_OK) { fa_device_close(dev); return; }
     fa_stream_set_tracker_param(s, FA_TRACKER_ROW_EVENTS, mode);
+    fa_stream_set_loop(s, loop);
+    if (seek > 0) fa_stream_seek(s, seek);
     fa_stream_set_event_callback(s, on_event, rec);
     fa_stream_attach(s, dev, NULL);
     fa_stream_play(s);
@@ -499,7 +501,7 @@ static void play_rows(const buf* mod, int32_t mode, row_rec* rec)
         fa_fetch_add64(&dev->epoch, 1);
         rendered += 512;
     }
-    for (tries = 0; tries < 400; tries++) {
+    for (tries = 0; tries < 400 && !loop; tries++) {
         int done;
         fa_mutex_lock(&rec->lock);
         done = rec->ended;
@@ -518,7 +520,7 @@ static void test_row_events_on_device(void)
     int i;
     fa_frames row = (fa_frames)llround(ROW_S * RATE);
     /* Every row, once, in order, within a step of its start. */
-    play_rows(&mod, 1, &rec);
+    play_rows(&mod, 1, 0, 0, &rec);
     CHECK(rec.ended);
     CHECK_EQ(rec.count, 32);
     for (i = 0; i < rec.count; i++) {
@@ -528,16 +530,32 @@ static void test_row_events_on_device(void)
     }
     fa_mutex_destroy(&rec.lock);
     /* Orders only. */
-    play_rows(&mod, 2, &rec);
+    play_rows(&mod, 2, 0, 0, &rec);
     CHECK(rec.ended);
     CHECK_EQ(rec.count, 2);
     CHECK_EQ(rec.values[0], 0);
     CHECK_EQ(rec.values[1], 1 << 16);
     fa_mutex_destroy(&rec.lock);
     /* Off (the default): none. */
-    play_rows(&mod, 0, &rec);
+    play_rows(&mod, 0, 0, 0, &rec);
     CHECK(rec.ended);
     CHECK_EQ(rec.count, 0);
+    fa_mutex_destroy(&rec.lock);
+    /* From a seek into row 8 (0.5 s): the rows after it. */
+    play_rows(&mod, 1, 0, RATE / 2, &rec);
+    CHECK(rec.ended);
+    CHECK_EQ(rec.count, 32 - 9);
+    CHECK_EQ(rec.values[0], 9);
+    CHECK(rec.frames[0] >= 9 * row && rec.frames[0] <= 9 * row + FA_TRACKER_STEP_TEST);
+    fa_mutex_destroy(&rec.lock);
+    /* Looping: the song's rows, then the first ones again from frame 0. */
+    play_rows(&mod, 1, 1, 0, &rec);
+    CHECK(rec.count >= 40);
+    for (i = 0; i < rec.count; i++) {
+        CHECK_EQ(rec.values[i] >> 16, (i % 32) / 16);
+        CHECK_EQ(rec.values[i] & 0xFFFF, i % 16);
+        CHECK_EQ(rec.frames[i], rec.frames[i % 32]);
+    }
     fa_mutex_destroy(&rec.lock);
     free(mod.d);
 }

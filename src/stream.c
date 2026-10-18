@@ -2717,7 +2717,7 @@ static void frame_events(struct fa_stream* s, fa_device* dev, int64_t played0, i
 static void heard_events(struct fa_stream* s, fa_device* dev, int64_t played0, int64_t played1, int ended)
 {
     if (s->midi) frame_events(s, dev, played0, played1, ended, post_midi_texts);
-    if (s->tracker) frame_events(s, dev, played0, played1, ended, post_tracker_rows);
+    if (s->tracker && fa_tracker_row_events_on(s->tracker)) frame_events(s, dev, played0, played1, ended, post_tracker_rows);
 }
 
 /* Ends the stream from the audio thread (its data ran out, or a crossfade-out

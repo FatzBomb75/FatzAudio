@@ -21,13 +21,18 @@ namespace FatzAudio;
 /// <param name="ChannelNames">Channel names (most formats leave them empty).</param>
 /// <param name="PatternNames">Pattern names (most formats leave them empty).</param>
 /// <param name="Subsongs">Subsong names.</param>
-/// <param name="Subsong">The subsong this stream plays: the <c>AudioTrack</c> it was opened with, 0 by default
-/// (<see cref="RestartOrder"/>, <see cref="RestartRow"/> and <see cref="Duration"/> are this subsong's).</param>
 public sealed record TrackerInfo(
     string Type, string TypeName, string Tracker, string Title, string Artist, string Message,
     int Channels, int Orders, int Patterns, int RestartOrder, int RestartRow, TimeSpan Duration,
     IReadOnlyList<string> Instruments, IReadOnlyList<string> Samples, IReadOnlyList<string> ChannelNames,
-    IReadOnlyList<string> PatternNames, IReadOnlyList<string> Subsongs, int Subsong);
+    IReadOnlyList<string> PatternNames, IReadOnlyList<string> Subsongs)
+{
+    /// <summary>
+    /// The subsong this stream plays: the <c>AudioTrack</c> it was opened with, 0 by default
+    /// (<see cref="RestartOrder"/>, <see cref="RestartRow"/> and <see cref="Duration"/> are this subsong's).
+    /// </summary>
+    public int Subsong { get; init; }
+}
 
 /// <summary>A row of a tracker module: an entry of the order list and a row of its pattern, both 0-based.</summary>
 /// <param name="Order">Entry of the order list.</param>

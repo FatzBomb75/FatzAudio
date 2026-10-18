@@ -43,8 +43,8 @@
 #define FA_TRACKER_RUNS 8           /* runs kept (seeks) */
 #define FA_TRACKER_NEW_ORDER ((int64_t)1 << 32)
 
-typedef struct fa_tracker_row { fa_atomic64 frame, value; } fa_tracker_row;   /* value: order << 16 | row, + NEW_ORDER */
-typedef struct fa_tracker_run { fa_atomic64 first, start, end; } fa_tracker_run;
+typedef struct fa_tracker_row { fa_atomic64 tag, frame, value; } fa_tracker_row;   /* value: order << 16 | row, + NEW_ORDER */
+typedef struct fa_tracker_run { fa_atomic64 tag, first, start, end; } fa_tracker_run;
 
 struct fa_tracker {
     openmpt_module_ext* ext;
@@ -76,58 +76,99 @@ struct fa_tracker {
     fa_tracker_run runs[FA_TRACKER_RUNS];
     fa_atomic64 rows_w, runs_w;
     int64_t last_value;         /* the run's last entry, -1 = none yet */
+    int log_after;              /* at open: note the first row after the first read */
 };
 
 /* ---- Row log ---- */
+
+/* Each entry and run carries its index (`tag`): -1 while the writer fills it,
+ * then the index. A reader takes a field only if the tag reads the index it
+ * wants before and after, so a slot the writer reuses meanwhile is seen as gone. */
 
 static void log_new_run(struct fa_tracker* t, fa_frames start)
 {
     int64_t k = fa_load64(&t->runs_w);
     fa_tracker_run* r = &t->runs[k % FA_TRACKER_RUNS];
+    fa_store64(&r->tag, -1);
     fa_store64(&r->first, fa_load64(&t->rows_w));
     fa_store64(&r->start, start);
     fa_store64(&r->end, start);
+    fa_store64(&r->tag, k);
     fa_store64(&t->runs_w, k + 1);
     t->last_value = -1;
+}
+
+static void set_run_end(struct fa_tracker* t, fa_frames end)
+{
+    fa_store64(&t->runs[(fa_load64(&t->runs_w) - 1) % FA_TRACKER_RUNS].end, end);
 }
 
 /* The row playing at `frame` (libopenmpt's current one), noted if it is new. */
 static void log_row(struct fa_tracker* t, fa_frames frame)
 {
     int32_t order = openmpt_module_get_current_order(t->mod), row = openmpt_module_get_current_row(t->mod);
-    int64_t v, i;
+    int64_t v, i, last = t->last_value & 0xFFFFFFFF;
+    fa_tracker_row* e;
     if (order < 0 || row < 0) return;
     v = ((int64_t)order << 16) | (row & 0xFFFF);
-    if (v == (t->last_value & 0xFFFFFFFF)) return;
-    /* A new order: the order changed within the run, or the run starts at a row 0. */
-    if (t->last_value < 0 ? row == 0 : order != (int32_t)((t->last_value & 0xFFFFFFFF) >> 16)) v |= FA_TRACKER_NEW_ORDER;
+    if (t->last_value >= 0 && v == last) return;
+    /* The first row of an order: the order changed, or the song went back to
+     * row 0 of the same one (a jump to itself); a run's first entry when it is
+     * a row 0. */
+    if (t->last_value < 0 ? row == 0
+                          : order != (int32_t)(last >> 16) || (row == 0 && (last & 0xFFFF) != 0))
+        v |= FA_TRACKER_NEW_ORDER;
     i = fa_load64(&t->rows_w);
-    fa_store64(&t->rows[i & (FA_TRACKER_ROWS - 1)].frame, frame);
-    fa_store64(&t->rows[i & (FA_TRACKER_ROWS - 1)].value, v);
+    e = &t->rows[i & (FA_TRACKER_ROWS - 1)];
+    fa_store64(&e->tag, -1);
+    fa_store64(&e->frame, frame);
+    fa_store64(&e->value, v);
+    fa_store64(&e->tag, i);
     fa_store64(&t->rows_w, i + 1);
     t->last_value = v;
 }
 
-/* A run from `start`, where libopenmpt now is: its row is known at once, also
- * before anything is rendered (a seek that lands exactly on a row start). */
+/* A run from `start`, where libopenmpt now is (after a seek): its row is known
+ * at once, also when nothing is rendered (a seek that lands on a row start). */
 static void log_start(struct fa_tracker* t, fa_frames start)
 {
+    t->log_after = 0;
     log_new_run(t, start);
     log_row(t, start);
-    fa_store64(&t->runs[(fa_load64(&t->runs_w) - 1) % FA_TRACKER_RUNS].end, start + 1);
+    set_run_end(t, start + 1);
 }
 
-/* The newest run that decoded `frame`, as its entry range [*first, *last]. */
-static int find_run(const struct fa_tracker* t, fa_frames frame, int64_t* first, int64_t* last)
+/* Entry i, if it is still entry i (see the tags above). */
+static int read_row(const struct fa_tracker* t, int64_t i, fa_frames* frame, int64_t* value)
+{
+    fa_tracker_row* e = (fa_tracker_row*)&t->rows[i & (FA_TRACKER_ROWS - 1)];
+    if (fa_load64(&e->tag) != i) return 0;
+    *frame = fa_load64(&e->frame);
+    *value = fa_load64(&e->value);
+    return fa_load64(&e->tag) == i;
+}
+
+typedef struct run_view { int64_t first, last; fa_frames start, end; } run_view;
+
+/* The newest run that decoded `frame`, with entries in it, as its entry range. */
+static int find_run(const struct fa_tracker* t, fa_frames frame, run_view* out)
 {
     int64_t rw = fa_load64((fa_atomic64*)&t->rows_w), kw = fa_load64((fa_atomic64*)&t->runs_w), k, next = rw;
     for (k = kw - 1; k >= 0 && k >= kw - FA_TRACKER_RUNS; k--) {
-        const fa_tracker_run* r = &t->runs[k % FA_TRACKER_RUNS];
-        int64_t f = fa_load64((fa_atomic64*)&r->first);
-        if (fa_load64((fa_atomic64*)&r->start) <= frame && frame < fa_load64((fa_atomic64*)&r->end)) {
-            *first = f > rw - FA_TRACKER_ROWS ? f : rw - FA_TRACKER_ROWS;
-            *last = next - 1;
-            return *last >= *first;
+        fa_tracker_run* r = (fa_tracker_run*)&t->runs[k % FA_TRACKER_RUNS];
+        int64_t f;
+        fa_frames start, end;
+        if (fa_load64(&r->tag) != k) return 0;   /* reused: older runs are gone too */
+        f = fa_load64(&r->first);
+        start = fa_load64(&r->start);
+        end = fa_load64(&r->end);
+        if (fa_load64(&r->tag) != k) return 0;
+        if (start <= frame && frame < end && next > f) {
+            out->first = f > rw - FA_TRACKER_ROWS + 1 ? f : rw - FA_TRACKER_ROWS + 1;
+            out->last = next - 1;
+            out->start = start;
+            out->end = end;
+            if (out->last >= out->first) return 1;
         }
         next = f;
     }
@@ -136,12 +177,13 @@ static int find_run(const struct fa_tracker* t, fa_frames frame, int64_t* first,
 
 int fa_tracker_row_at(const struct fa_tracker* t, fa_frames frame, uint32_t* order, uint32_t* row)
 {
-    int64_t first, i;
-    if (!find_run(t, frame, &first, &i)) return 0;
-    for (; i >= first; i--) {
-        const fa_tracker_row* e = &t->rows[i & (FA_TRACKER_ROWS - 1)];
-        if (fa_load64((fa_atomic64*)&e->frame) <= frame) {
-            int64_t v = fa_load64((fa_atomic64*)&e->value);
+    run_view rv;
+    int64_t i, v;
+    fa_frames f;
+    if (!find_run(t, frame, &rv)) return 0;
+    for (i = rv.last; i >= rv.first; i--) {
+        if (!read_row(t, i, &f, &v)) return 0;
+        if (f <= frame) {
             *order = (uint32_t)((v >> 16) & 0xFFFF);
             *row = (uint32_t)(v & 0xFFFF);
             return 1;
@@ -150,25 +192,39 @@ int fa_tracker_row_at(const struct fa_tracker* t, fa_frames frame, uint32_t* ord
     return 0;
 }
 
+int fa_tracker_row_events_on(const struct fa_tracker* t)
+{
+    return fa_load32((fa_atomic32*)&t->row_events) != 0;
+}
+
 uint32_t fa_tracker_rows_in(const struct fa_tracker* t, fa_frames from, fa_frames to, fa_frames* frames,
                             int64_t* values, uint32_t cap)
 {
     int32_t mode = fa_load32((fa_atomic32*)&t->row_events);
-    int64_t first, last, i;
     uint32_t n = 0;
-    if (mode == 0 || to <= from || !find_run(t, from, &first, &last)) return 0;
-    /* Back from the newest entry to the first one before `from` (the decoder is
-     * only a little ahead, so this is a few entries), then forward. */
-    for (i = last; i > first && fa_load64((fa_atomic64*)&t->rows[i & (FA_TRACKER_ROWS - 1)].frame) >= from; i--) {}
-    for (; i <= last && n < cap; i++) {
-        const fa_tracker_row* e = &t->rows[i & (FA_TRACKER_ROWS - 1)];
-        fa_frames f = fa_load64((fa_atomic64*)&e->frame);
-        int64_t v = fa_load64((fa_atomic64*)&e->value);
-        if (f < from) continue;
-        if (f >= to) break;
-        if (mode == 2 && !(v & FA_TRACKER_NEW_ORDER)) continue;
-        frames[n] = f;
-        values[n++] = v & 0xFFFFFFFF;
+    if (mode == 0) return 0;
+    /* Run by run: a run covers only what it decoded, and a later stretch of the
+     * range may be in an older run (a loop shorter than the decode-ahead). */
+    while (from < to && n < cap) {
+        run_view rv;
+        int64_t i, v;
+        fa_frames f, stop;
+        if (!find_run(t, from, &rv)) break;
+        stop = rv.end < to ? rv.end : to;
+        /* Back from the newest entry to the first one before `from` (the decoder
+         * is only a little ahead, so this is a few entries), then forward. */
+        for (i = rv.last; i > rv.first; i--)
+            if (!read_row(t, i, &f, &v) || f < from) break;
+        for (; i <= rv.last && n < cap; i++) {
+            if (!read_row(t, i, &f, &v)) continue;
+            if (f < from) continue;
+            if (f >= stop) break;
+            if (mode == 2 && !(v & FA_TRACKER_NEW_ORDER)) continue;
+            frames[n] = f;
+            values[n++] = v & 0xFFFFFFFF;
+        }
+        if (n == cap) break;
+        from = stop;
     }
     return n;
 }
@@ -380,12 +436,16 @@ static void render_block(struct fa_tracker* t)
     while (!t->ended && got < (size_t)n) {
         size_t step = (size_t)n - got, k;
         if (step > FA_TRACKER_STEP) step = FA_TRACKER_STEP;
-        log_row(t, t->pos + (fa_frames)got);
+        if (!t->log_after) log_row(t, t->pos + (fa_frames)got);
         k = openmpt_module_read_interleaved_float_stereo(t->mod, (int32_t)t->rate, step, t->blk + got * 2);
+        if (t->log_after) {
+            log_row(t, t->pos + (fa_frames)got);
+            t->log_after = 0;
+        }
         got += k;
         if (k < step) t->ended = 1;
     }
-    fa_store64(&t->runs[(fa_load64(&t->runs_w) - 1) % FA_TRACKER_RUNS].end, t->pos + n);
+    set_run_end(t, t->pos + n);
     if (got < (size_t)n) memset(t->blk + got * 2, 0, ((size_t)n - got) * 2 * sizeof(float));
     t->blk_len = (int)n;
     t->blk_off = 0;
@@ -492,7 +552,10 @@ static fa_result tracker_open(fa_decoder* dec)
     if (duration > FA_TRACKER_MAX_SECONDS) duration = FA_TRACKER_MAX_SECONDS;
     t->length = (fa_frames)llround(duration * t->rate);
     if (t->length <= 0) { tracker_free(t); return FA_ERROR_UNSUPPORTED_FORMAT; }
-    log_start(t, 0);
+    /* Before the first read libopenmpt reports order 0 even when the song
+     * starts later (a "+++" skip at order 0): the first row is noted after it. */
+    log_new_run(t, 0);
+    t->log_after = 1;
 
     /* Defaults, as libopenmpt has them. */
     t->interpolation_now = 0;

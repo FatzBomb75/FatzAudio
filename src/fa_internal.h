@@ -271,6 +271,7 @@ struct fa_tracker* fa_tracker_of(fa_decoder* dec);
  * [from, to) that FA_TRACKER_ROW_EVENTS asks for (frames and order << 16 | row
  * values, at most cap). */
 int fa_tracker_row_at(const struct fa_tracker* t, fa_frames frame, uint32_t* order, uint32_t* row);
+int fa_tracker_row_events_on(const struct fa_tracker* t);   /* FA_TRACKER_ROW_EVENTS is not 0 */
 uint32_t fa_tracker_rows_in(const struct fa_tracker* t, fa_frames from, fa_frames to, fa_frames* frames,
                             int64_t* values, uint32_t cap);
 /* Frames of the text events, sorted, fixed while the decoder is open (read by the

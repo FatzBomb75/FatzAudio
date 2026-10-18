@@ -592,7 +592,7 @@ public unsafe class AudioStream : IDisposable
             return new TrackerInfo(Str(n.Type), Str(n.TypeName), Str(n.Tracker), Str(n.Title), Str(n.Artist),
                 TrackerText(0, 0), (int)n.Channels, (int)n.Orders, (int)n.Patterns, n.RestartOrder, n.RestartRow,
                 TimeSpan.FromSeconds(n.Duration), TrackerTexts(1, n.Instruments), TrackerTexts(2, n.Samples),
-                TrackerTexts(3, n.Channels), TrackerTexts(4, n.Patterns), TrackerTexts(5, n.Subsongs), n.Subsong);
+                TrackerTexts(3, n.Channels), TrackerTexts(4, n.Patterns), TrackerTexts(5, n.Subsongs)) { Subsong = n.Subsong };
         }
     }
 
