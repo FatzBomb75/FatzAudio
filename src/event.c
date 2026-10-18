@@ -6,6 +6,7 @@
  * user's callbacks in sequence order, so user code never runs on the audio
  * thread. It also frees closed streams, after their last event. */
 #include "fa_internal.h"
+#include "cdg.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -173,13 +174,34 @@ void fa_event_thread_main(void* arg)
     fa_engine* e = (fa_engine*)arg;
     fa_qevent* batch = NULL;
     uint32_t cap = 0;
+    struct fa_stream** watched = NULL;
+    uint32_t watched_cap = 0;
     fa_store64(&e->event_thread_id, (int64_t)fa_thread_current_id());
 
     fa_mutex_lock(&e->list_lock);
     for (;;) {
         struct fa_stream* grave = NULL;
-        uint32_t n = 0, i;
+        struct fa_stream* s;
+        uint32_t n = 0, i, nw = 0;
         int quit = fa_load32(&e->quit);
+        /* CD+G change events: streams that asked for them are checked outside the
+         * lock. Only this thread frees streams (below, after this round), so the
+         * pointers stay valid even if one is closed meanwhile. */
+        for (s = e->cdg_watched; s; s = s->cdg_watch_link) {
+            if (nw == watched_cap) {
+                uint32_t c = watched_cap ? watched_cap * 2 : 8;
+                struct fa_stream** p = (struct fa_stream**)realloc(watched, c * sizeof(*p));
+                if (!p) break;
+                watched = p;
+                watched_cap = c;
+            }
+            watched[nw++] = s;
+        }
+        if (nw) {
+            fa_mutex_unlock(&e->list_lock);
+            for (i = 0; i < nw; i++) fa_stream_cdg_watch(watched[i]);
+            fa_mutex_lock(&e->list_lock);
+        }
         /* Every sequence number below `w` was taken before this point. API events
          * take theirs under list_lock (held), so those are all in `pending`; once no
          * audio thread is between taking a number and publishing it, the collection
@@ -225,5 +247,6 @@ void fa_event_thread_main(void* arg)
     }
     fa_mutex_unlock(&e->list_lock);
     free(batch);
+    free(watched);
     if (e->destroy_on_event_thread) fa_engine_free(e); /* see fa_engine_destroy */
 }
