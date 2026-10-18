@@ -194,9 +194,44 @@ BASS has no normalization: apps measure each file themselves with a decode pass 
 
 ### Tracker music
 
-| BASS | FatzAudio | Status |
-|---|---|---|
-| BASS_MusicLoad / BASS_MusicFree | `fa_stream_open_*` once libopenmpt is added | 🗓️ |
+MOD, S3M, XM, IT, MPTM and many more play through the statically linked libopenmpt ([tracker modules](../features/trackers.md)). A module is an ordinary stream: it plays once, loops with the stream's loop toggle, and has no separate `HMUSIC` type. Where BASS offered a flag or attribute with no counterpart, the row says so.
+
+| BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| BASS_MusicLoad / BASS_MusicFree (file, memory) | `fa_stream_open_path` / `_memory` / `_io`, `fa_stream_close`; detected from the content | `engine.OpenFile` / `OpenMemory` / `OpenStream`, `Dispose()` | ✅ |
+| BASS_MUSIC_RAMP / BASS_MUSIC_RAMPS (normal and sensitive ramping) | `fa_stream_set_tracker_param(FA_TRACKER_VOLUME_RAMPING, v)`: -1 default, 0 off, 1 to 10 (higher is softer), live | `TrackerVolumeRamping` | ✅ |
+| BASS_MUSIC_NONINTER / BASS_MUSIC_SINCINTER (interpolation) | `FA_TRACKER_INTERPOLATION`: 1 none, 2 linear, 4 cubic, 8 sinc, 0 default; live | `TrackerInterpolation` | ✅ (linear, cubic and sinc are extras) |
+| BASS_MUSIC_SURROUND / BASS_MUSIC_SURROUND2 | Not available: libopenmpt has no surround matrix. `FA_TRACKER_STEREO_SEPARATION` (0 to 200 %) widens or narrows the image | `TrackerStereoSeparation` | ➖ (separation instead) |
+| BASS_MUSIC_FT2MOD / BASS_MUSIC_PT1MOD (play as FastTracker 2 or ProTracker 1 would) | Not available: libopenmpt picks the playback quirks from the file itself (the tracker that wrote it). `FA_TRACKER_AMIGA_RESAMPLER` only switches Paula emulation for MOD files | `TrackerAmigaResampler` | ➖ |
+| BASS_MUSIC_POSRESET / BASS_MUSIC_POSRESETEX (reset position and state on seeking) | Seeking always restores libopenmpt's state at the target row, and the sample positions; there is no flag | `Position = ...` | ✅ (always on) |
+| BASS_MUSIC_STOPBACK (stop when the song loops back) | Always: the module plays once and the stream ends (`FA_EVENT_ENDED`); the module's own loop is never followed | `Ended` | ✅ (always on) |
+| BASS_MUSIC_LOOP | `fa_stream_set_loop`, from the start of the song (not the module's restart order) | `Loop` | ✅ (see the note in [trackers.md](../features/trackers.md)) |
+| BASS_MUSIC_PRESCAN (calculate the length before playing) | Always: the length is known when the stream opens | `Info` (duration) | ✅ (always on) |
+| BASS_MUSIC_DECODE / BASS_STREAM_DECODE | `FA_OPEN_DECODE_ONLY` and `fa_stream_read` | `StreamOptions.DecodeOnly` | ✅ |
+| BASS_MUSIC_FLOAT / BASS_MUSIC_STEREO / BASS_MUSIC_MONO | Always stereo 32-bit float at the mix rate; mix down with the channel matrix | — | ➖ |
+| BASS_MUSIC_NOSAMPLE, BASS_MUSIC_AUTOFREE, BASS_MUSIC_CALCLEN | No counterpart: samples are always loaded, you close the stream yourself, the length is always calculated | — | ➖ |
+| BASS_ChannelGetLength(BASS_POS_MUSIC_ORDER) (number of orders) | `fa_tracker_info.orders` from `fa_stream_get_tracker_info` | `TrackerInfo.Orders` | ✅ |
+| BASS_ChannelGetPosition(BASS_POS_MUSIC_ORDER) (the order and row being played) | Not yet: only the position in time is known | — | 🗓️ planned |
+| BASS_ChannelSetPosition with `MAKELONG(order, row)` | `fa_stream_seek_tracker(stream, order, row)`; `fa_stream_get_tracker_time` gives its time (`FA_ERROR_NOT_FOUND` for a row the song never plays) | `SeekTracker(order, row)`, `GetTrackerTime(order, row)` | ✅ |
+| BASS_ChannelGetInfo for a music (`BASS_CHANNELINFO.ctype`, plugin type strings) | `fa_tracker_info.type` and `type_name` | `TrackerInfo.Type`, `TypeName` | ✅ |
+| BASS_ChannelGetTags(BASS_TAG_MUSIC_NAME) | `fa_tracker_info.title`; `fa_tags_*` `FA_TAG_TITLE` | `TrackerInfo.Title`, `GetTags().Title` | ✅ |
+| BASS_ChannelGetTags(BASS_TAG_MUSIC_MESSAGE) | `fa_stream_get_tracker_text(FA_TRACKER_TEXT_MESSAGE)`; `FA_TAG_COMMENT` | `TrackerInfo.Message` | ✅ |
+| BASS_ChannelGetTags(BASS_TAG_MUSIC_INST + n) | `fa_stream_get_tracker_text(FA_TRACKER_TEXT_INSTRUMENT, n)` | `TrackerInfo.Instruments` | ✅ |
+| BASS_ChannelGetTags(BASS_TAG_MUSIC_SAMPLE + n) | `fa_stream_get_tracker_text(FA_TRACKER_TEXT_SAMPLE, n)` | `TrackerInfo.Samples` | ✅ |
+| BASS_ChannelGetTags(BASS_TAG_MUSIC_AUTH) (author) | `fa_tracker_info.artist`; `FA_TAG_ARTIST` | `TrackerInfo.Artist` | ✅ (where the format stores one) |
+| BASS_ChannelGetTags(BASS_TAG_MUSIC_ORDERS) (order list) | Not exposed: only the order count, and the time of each order and row | `GetTrackerTime` | 🗓️ planned |
+| BASS_ChannelGetAttribute(BASS_ATTRIB_MUSIC_AMPLIFY) (amplification) | Not exposed; use `FA_PARAM_VOLUME` or normalization | — | 🗓️ planned |
+| BASS_ATTRIB_MUSIC_PANSEP | `FA_TRACKER_STEREO_SEPARATION`, 0 to 200 percent (BASS: 0 to 100 around a default of 50) | `TrackerStereoSeparation` | ✅ (different scale: 100 is the module's own) |
+| BASS_ATTRIB_MUSIC_PSCALER (positional scaler) | No counterpart: libopenmpt has no such control | — | ➖ |
+| BASS_ATTRIB_MUSIC_BPM / BASS_ATTRIB_MUSIC_SPEED (live tempo and speed) | Not exposed. `FA_PARAM_TEMPO` time-stretches the finished audio instead (the module's own tempo and speed are not changed) | `Tempo` | 🗓️ planned (the stretch is a substitute) |
+| BASS_ATTRIB_MUSIC_VOL_GLOBAL | Not exposed; use `FA_PARAM_VOLUME` | — | 🗓️ planned |
+| BASS_ATTRIB_MUSIC_VOL_CHAN + n (channel volume) | `fa_stream_set_tracker_channel_mute` mutes a channel (0 or full); a volume per channel is not exposed | `SetTrackerChannelMuted`, `IsTrackerChannelMuted` | ✅ mute; volume 🗓️ planned |
+| BASS_ATTRIB_MUSIC_VOL_INST + n (instrument volume) | Not exposed | — | 🗓️ planned |
+| BASS_ATTRIB_MUSIC_ACTIVE (voices in use) | Not exposed | — | ➖ |
+| BASS_SYNC_MUSICPOS (row reached) | Not yet. A marker at the time from `fa_stream_get_tracker_time(order, row)` fires when that row first plays ([crossfade.md](../features/crossfade.md)) | `Markers` + `GetTrackerTime` | 🗓️ planned (markers meanwhile) |
+| BASS_SYNC_MUSICINST (instrument played) | Not available | — | 🗓️ planned |
+| BASS_SYNC_MUSICFX (effect `Zxx`/sync command hit) | Not available | — | 🗓️ planned |
+| BASS_SYNC_END | `FA_EVENT_ENDED` | `Ended` | ✅ |
 
 ### Recording
 

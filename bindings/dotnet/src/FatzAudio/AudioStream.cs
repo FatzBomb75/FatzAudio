@@ -563,10 +563,26 @@ public unsafe class AudioStream : IDisposable
     /// <summary>
     /// Format, names and counts of a tracker module (MOD, S3M, XM, IT, ...); null for streams that are not modules.
     /// </summary>
+    /// <remarks>Read once and kept: a module's names do not change while the stream is open.</remarks>
     /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
-    public unsafe TrackerInfo? TrackerInfo
+    public TrackerInfo? TrackerInfo
     {
         get
+        {
+            if (!_trackerInfoRead)
+            {
+                _trackerInfo = ReadTrackerInfo();
+                _trackerInfoRead = true;
+            }
+            return _trackerInfo;
+        }
+    }
+
+    private TrackerInfo? _trackerInfo;
+    private bool _trackerInfoRead;
+
+    private unsafe TrackerInfo? ReadTrackerInfo()
+    {
         {
             FaTrackerInfo n = default;
             n.StructSize = (uint)sizeof(FaTrackerInfo);

@@ -2,7 +2,7 @@
 # reads), linked into fatzaudio as a static library of position-independent
 # C++17. No external libraries: no zlib, mpg123 or Vorbis (so no MO3 files with
 # compressed samples), nothing exported from the shared library
-# (FA_OPENMPT_STATIC, see libopenmpt/README.md).
+# (FA_OPENMPT_STATIC, see third_party/libopenmpt/README.md).
 
 file(STRINGS ${CMAKE_CURRENT_LIST_DIR}/libopenmpt/sources.txt FA_OPENMPT_FILES)
 list(TRANSFORM FA_OPENMPT_FILES PREPEND ${CMAKE_CURRENT_LIST_DIR}/libopenmpt/)

@@ -164,7 +164,7 @@ static void test_detect_and_info(void)
         CHECK(strcmp(fa_tags_get(tags, FA_TAG_TITLE), "Test Module") == 0);
         fa_tags_close(tags);
     }
-    /* A struct from an older header (shorter) is filled as far as it goes. */
+    /* The full struct is filled; one smaller than this version's is refused. */
     {
         fa_tracker_info small;
         memset(&small, 0x55, sizeof(small));
@@ -294,6 +294,34 @@ static void test_live_settings(void)
     free(mod.d);
 }
 
+/* Sample data that looks like MPEG audio (chained MP3 frame headers) must not
+ * make the module play as an MP3: the module's signature wins. */
+static void test_mp3_like_samples(void)
+{
+    buf mod = make_mod();
+    fa_stream* s;
+    fa_stream_info info;
+    size_t i, extra = 4000;
+    uint8_t* d;
+    /* Sample 2: 4000 bytes holding MPEG-1 layer III 128 kbit/s 44.1 kHz headers every 417 bytes. */
+    mod.d[20 + 30 + 22] = (uint8_t)((extra / 2) >> 8);
+    mod.d[20 + 30 + 23] = (uint8_t)((extra / 2) & 255);
+    mod.d[20 + 30 + 25] = 64;
+    mod.d[20 + 30 + 29] = 1;
+    d = (uint8_t*)calloc(1, extra);
+    for (i = 0; i + 4 <= extra; i += 417) { d[i] = 0xFF; d[i + 1] = 0xFB; d[i + 2] = 0x90; d[i + 3] = 0x00; }
+    put(&mod, d, extra);
+    free(d);
+    s = open_mod(&mod, NULL);
+    CHECK(s);
+    if (s) {
+        CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+        CHECK(strcmp(info.codec, "mod") == 0);
+        fa_stream_close(s);
+    }
+    free(mod.d);
+}
+
 static void test_not_a_module(void)
 {
     fa_audio_format fmt;
@@ -367,6 +395,7 @@ int main(void)
     RUN(test_detect_and_info);
     RUN(test_render_and_seek);
     RUN(test_live_settings);
+    RUN(test_mp3_like_samples);
     RUN(test_not_a_module);
     RUN(test_damaged);
     fa_engine_destroy(g_engine);

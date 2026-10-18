@@ -14,7 +14,7 @@ loaded at runtime if the app has them.
 
 ## Windows, macOS, Linux
 
-Requirements: CMake 3.21+ and a C11 compiler (Visual Studio 2026, Xcode, GCC or Clang).
+Requirements: CMake 3.21+ and a C11 and C++17 compiler (Visual Studio 2026, Xcode, GCC 8+ or Clang 7+; libopenmpt, which plays tracker modules, is C++17).
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

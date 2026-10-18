@@ -1646,7 +1646,8 @@ FA_API fa_result FA_CALL fa_stream_get_tracker_text(fa_stream* stream, fa_tracke
 
 /* Order and row: the time (seconds from the start) where the song plays that row
  * first, and a seek there (fa_stream_seek of that frame). FA_ERROR_NOT_FOUND
- * when the song never plays it (a skipped order, or a row past the pattern). */
+ * when the song never plays it (a skipped order, a row past the pattern, or an
+ * order of a later subsong: the stream plays the first subsong). */
 FA_API fa_result FA_CALL fa_stream_get_tracker_time(fa_stream* stream, uint32_t order, uint32_t row, double* out_seconds);
 FA_API fa_result FA_CALL fa_stream_seek_tracker(fa_stream* stream, uint32_t order, uint32_t row);
 
@@ -1666,7 +1667,8 @@ typedef enum fa_tracker_param {
 FA_API fa_result FA_CALL fa_stream_set_tracker_param(fa_stream* stream, fa_tracker_param param, int32_t value);
 FA_API fa_result FA_CALL fa_stream_get_tracker_param(fa_stream* stream, fa_tracker_param param, int32_t* out_value);
 
-/* Mutes or unmutes channel 0..channels-1 (the first 64), live. */
+/* Mutes or unmutes channel 0..channels-1 (the first 64), live.
+ * FA_ERROR_NOT_IMPLEMENTED if libopenmpt offers no channel control for the module. */
 FA_API fa_result FA_CALL fa_stream_set_tracker_channel_mute(fa_stream* stream, uint32_t channel, int32_t muted);
 FA_API fa_result FA_CALL fa_stream_get_tracker_channel_mute(fa_stream* stream, uint32_t channel, int32_t* out_muted);
 

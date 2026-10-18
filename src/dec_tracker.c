@@ -59,6 +59,26 @@ struct fa_tracker* fa_tracker_of(fa_decoder* dec)
     return dec && dec->vt == &fa_decoder_tracker ? (struct fa_tracker*)dec->impl : NULL;
 }
 
+/* The signature of a common format: such a header beats the frame-sync
+ * scanners (MP3, AC-3, ADTS), which can match raw sample data later in the window. */
+static int has_magic(const uint8_t* d, size_t n)
+{
+    static const char* const mod_tags[] = { "M.K.", "M!K!", "M&K!", "FLT4", "FLT8", "CD81", "OKTA", "OCTA" };
+    size_t i;
+    if (n >= 17 && memcmp(d, "Extended Module: ", 17) == 0) return 1;   /* XM */
+    if (n >= 4 && (memcmp(d, "IMPM", 4) == 0 || memcmp(d, "MO3", 3) == 0)) return 1;   /* IT, MPTM, MO3 */
+    if (n >= 48 && memcmp(d + 44, "SCRM", 4) == 0) return 1;   /* S3M */
+    if (n >= 1084) {
+        const uint8_t* t = d + 1080;   /* 31-sample MOD */
+        for (i = 0; i < sizeof(mod_tags) / sizeof(mod_tags[0]); i++)
+            if (memcmp(t, mod_tags[i], 4) == 0) return 1;
+        if (t[0] >= '1' && t[0] <= '9' && memcmp(t + 1, "CHN", 3) == 0) return 1;
+        if (t[0] >= '1' && t[0] <= '9' && t[1] >= '0' && t[1] <= '9' && (memcmp(t + 2, "CH", 2) == 0 || memcmp(t + 2, "CN", 2) == 0))
+            return 1;
+    }
+    return 0;
+}
+
 int fa_probe_tracker(const uint8_t* data, size_t size, size_t id3_size)
 {
     int r;
@@ -69,7 +89,7 @@ int fa_probe_tracker(const uint8_t* data, size_t size, size_t id3_size)
                                                    NULL, NULL);
     /* Some formats have no magic number (15-sample MODs) and the window may be
      * too short to tell: low scores, so a format that is sure wins. */
-    if (r == OPENMPT_PROBE_FILE_HEADER_RESULT_SUCCESS) return 30;
+    if (r == OPENMPT_PROBE_FILE_HEADER_RESULT_SUCCESS) return has_magic(data, size) ? 90 : 30;
     if (r == OPENMPT_PROBE_FILE_HEADER_RESULT_WANTMOREDATA) return 2;
     return 0;
 }
@@ -80,7 +100,26 @@ static fa_result read_source(fa_source* src, uint8_t** out, size_t* out_size)
     uint8_t* buf;
     *out = NULL;
     *out_size = 0;
-    if (src->length > (int64_t)FA_TRACKER_MAX_FILE) return FA_ERROR_UNSUPPORTED_FORMAT;
+    /* A live or unknown-length source is never a module, and a weak probe
+     * (no magic number) is checked again with the real file size before the
+     * whole file is read. */
+    if (src->length <= 0 || src->length > (int64_t)FA_TRACKER_MAX_FILE) return FA_ERROR_UNSUPPORTED_FORMAT;
+    {
+        uint8_t head[4096];
+        size_t h = 0, want = openmpt_probe_file_header_get_recommended_size();
+        int pr;
+        if (want > sizeof(head)) want = sizeof(head);
+        while (h < want) {
+            int64_t got = fa_source_read(src, head + h, want - h);
+            if (got < 0) return (fa_result)got;
+            if (got == 0) break;
+            h += (size_t)got;
+        }
+        pr = openmpt_probe_file_header(OPENMPT_PROBE_FILE_HEADER_FLAGS_DEFAULT, head, h, (uint64_t)src->length,
+                                       openmpt_log_func_silent, NULL, openmpt_error_func_ignore, NULL, NULL, NULL);
+        if (pr != OPENMPT_PROBE_FILE_HEADER_RESULT_SUCCESS) return FA_ERROR_UNSUPPORTED_FORMAT;
+        if (fa_source_seek(src, 0) != FA_OK) return FA_ERROR_NOT_SEEKABLE;
+    }
     cap = (src->length > 0 ? (size_t)src->length : 65536) + 1;
     buf = (uint8_t*)malloc(cap);
     if (!buf) return FA_ERROR_OUT_OF_MEMORY;
@@ -490,6 +529,7 @@ FA_API fa_result FA_CALL fa_stream_set_tracker_channel_mute(fa_stream* stream, u
     int64_t old, bit;
     if (!stream || !stream->tracker || channel >= stream->tracker->info.channels || channel >= FA_TRACKER_MUTE_CHANNELS)
         return FA_ERROR_INVALID_ARG;
+    if (!stream->tracker->has_interactive) return FA_ERROR_NOT_IMPLEMENTED;
     mask = &stream->tracker->mute;
     bit = (int64_t)((uint64_t)1 << channel);
     do {

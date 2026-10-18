@@ -19,6 +19,7 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Dolby Digital and Dolby Digital Plus (AC-3, E-AC-3, up to 7.1, dynamic range) | [dolby.md](dolby.md) | ✅ (passthrough 🗓️) |
 | Disc playback (audio CDs, CD+G discs and `.cue` images) | [disc.md](disc.md) | ✅ |
 | MIDI and karaoke files (SoundFont 2 and DLS, the OS's gm.dls by default, lyrics, transpose, channel mute) | [midi.md](midi.md) | ✅ (SF3, SFZ and MIDI input 🗓️) |
+| Tracker modules (MOD, XM, S3M, IT, MPTM and more via libopenmpt; info and names, order/row seeking, interpolation, stereo separation, channel mute) | [trackers.md](trackers.md) | ✅ (currently-heard order/row and row events 🗓️) |
 | Recording and encoding (WAV, FLAC, MP3 via LAME; device, stream or file sources) | [recording-encoding.md](recording-encoding.md) | ✅ WAV/FLAC/MP3; Opus, AAC and casting 🗓️ |
 | Equalizer, presets and user DSP (parametric/graphic EQ, 13 presets, `fa_stream_add_dsp`) | [equalizer.md](equalizer.md) | ✅ |
 | Levels and spectrum (VU meters, FFT for visualizers; per stream or the whole output) | [levels-spectrum.md](levels-spectrum.md) | ✅ |
