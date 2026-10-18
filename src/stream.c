@@ -1981,23 +1981,28 @@ FA_API fa_result FA_CALL fa_crossfade(fa_stream* from, fa_stream* to, fa_time du
     fa_mutex_unlock(&to->api_lock);
     if (r != FA_OK) return r;
 
-    /* Then publish the start and both fades back to back, holding both streams, one
-     * period ahead: a callback that is running now has taken its commands already,
-     * and the next one starts at `at` with both in place. */
+    /* Then publish the start and both fades back to back, holding both streams and,
+     * while posting, the device's xf_lock, for the start of the next callback: no
+     * callback takes commands meanwhile, and one that starts anyway leaves every
+     * command due by then for the callback after it, which starts both together. */
     lock_pair(from, to);
     if (to->device != dev || from->device != dev) r = FA_ERROR_INVALID_ARG;
     else {
         int32_t st = fa_load32(&to->state);
-        at = fa_load64(&dev->clock) + fa_load32(&dev->period);
         if (st != FA_STATE_PLAYING) {
             if (st == FA_STATE_ENDED || st == FA_STATE_STOPPED) rewind_locked(to);  /* changed meanwhile */
             collect_events(to);
+        }
+        fa_mutex_lock(&dev->xf_lock);
+        at = fa_load64(&dev->clock);
+        if (st != FA_STATE_PLAYING) {
             fa_store64(&to->start_frame, at);
             fa_store32(&to->state, FA_STATE_SCHEDULED);
             post_lane_locked(to, FA_LANE_FADE, 0.0f, 0, NULL, 0, 0, -1, 0);
         }
         post_lane_locked(to, FA_LANE_FADE, 1.0f, duration, &shape, tag, 1, at, 0);
         post_lane_locked(from, FA_LANE_FADE, 0.0f, duration, &shape, tag, 1, at, FA_LANE_MIRROR | FA_LANE_END_STREAM);
+        fa_mutex_unlock(&dev->xf_lock);
     }
     unlock_pair(from, to);
     return r;
@@ -2482,7 +2487,9 @@ static void settle_fade_lane(struct fa_stream* s, fa_device* dev, int audible)
 {
     fa_param_voice* v = &s->lanes[FA_LANE_FADE].v;
     int64_t tag = 0;
-    if (fa_lane_take(&s->lanes[FA_LANE_FADE], audible, dev->rate, &tag)) push_event(dev, s, FA_EVENT_RAMP_DONE, tag);
+    if (fa_lane_take_after(&s->lanes[FA_LANE_FADE], dev->xf_busy ? fa_load64(&dev->clock) : INT64_MIN, audible,
+                           dev->rate, &tag))
+        push_event(dev, s, FA_EVENT_RAMP_DONE, tag);
     if (v->active && v->notify) push_event(dev, s, FA_EVENT_RAMP_DONE, v->tag);
     v->active = 0;
 }
@@ -2598,7 +2605,7 @@ static void net_title_heard(struct fa_stream* s, fa_device* dev)
 static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames, int64_t* mixed_off,
                        int64_t* mixed_n)
 {
-    int64_t avail, n, done = 0, clock, off = 0, played0;
+    int64_t avail, n, done = 0, clock, off = 0, played0, hold;
     int p, playing, audible, ended = 0, at_cue_out = 0, looping;
     fa_frames loop_end, loop_back;
     int32_t state;
@@ -2610,10 +2617,13 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
     if (fa_load32(&s->flushing)) return;
     clock = fa_load64(&dev->clock);
 
+    /* fa_crossfade is posting (fa_device.xf_lock): starts and commands due now wait
+     * for the next callback, which sees all of them. */
+    hold = dev->xf_busy ? clock : INT64_MIN;
     state = fa_load32(&s->state);
     if (state == FA_STATE_SCHEDULED) {
         int64_t start = fa_load64(&s->start_frame);
-        if (start != FA_START_QUEUED && start < clock + (int64_t)frames &&
+        if (start != FA_START_QUEUED && start < clock + (int64_t)frames && start > hold &&
             fa_cas32(&s->state, FA_STATE_SCHEDULED, FA_STATE_PLAYING)) {
             off = start > clock ? start - clock : 0;
             state = FA_STATE_PLAYING;
@@ -2631,7 +2641,7 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
     for (p = 0; p < FA_STREAM_LANES; p++) {
         int64_t tag = 0;
         fa_param_voice* v = &s->lanes[p].v;
-        if (fa_lane_take(&s->lanes[p], audible, dev->rate, &tag)) push_event(dev, s, FA_EVENT_RAMP_DONE, tag);
+        if (fa_lane_take_after(&s->lanes[p], hold, audible, dev->rate, &tag)) push_event(dev, s, FA_EVENT_RAMP_DONE, tag);
         /* A zero-length ramp that has started is a jump: the first sample already uses the target. */
         if (playing && v->active && v->done >= v->total && (v->at < 0 || v->at <= clock + off))
             if (finish_lane(s, dev, v)) { end_stream(s, dev); playing = 0; }
