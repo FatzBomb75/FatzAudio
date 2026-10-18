@@ -53,7 +53,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_CONFIG_NET_META | Always asks for ICY titles; `FA_NET_NO_ICY` turns it off | `NetworkOptions.SongTitles = false` | ✅ |
 | BASS_CONFIG_NET_RESTRATE | Not needed: the download only runs 2 MB ahead of playback, so it's paced by playback anyway | — | ➖ (by design) |
 | BASS_CONFIG_NET_PASSIVE (FTP) | FTP isn't supported | — | ➖ |
-| BASS_CONFIG_DEV_PERIOD / BASS_CONFIG_DEV_BUFFER | `fa_engine_config.period_ms` (0 = the system's default, 10 ms on WASAPI); the device buffer is three periods. `fa_device_get_latency` reports what the system gave | `AudioEngineOptions.Period` | ✅ |
+| BASS_CONFIG_DEV_PERIOD / BASS_CONFIG_DEV_BUFFER | `fa_engine_config.period_ms` (0 = the system's default, 10 ms on Windows); the device buffer is two periods on Windows, the system's default elsewhere. `fa_device_get_latency` reports what the system gave | `AudioEngineOptions.Period` | ✅ |
 | BASS_CONFIG_UPDATETHREADS / UPDATEPERIOD | `fa_engine_config.worker_threads`; workers refill the emptiest buffer first, nothing to tune | `AudioEngineOptions.WorkerThreads` | ✅ |
 | BASS_Update / BASS_ChannelUpdate | Not needed: worker threads keep buffers full | — | ➖ (by design) |
 | BASS_GetCPU | Planned `fa_engine_get_stats` | | 🗓️ |

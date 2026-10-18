@@ -240,6 +240,10 @@ FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id
     cfg.pUserData = d;
     cfg.noPreSilencedOutputBuffer = MA_TRUE;  /* the callback clears the buffer itself */
     cfg.wasapi.usage = ma_wasapi_usage_pro_audio; /* MMCSS "Pro Audio" scheduling on Windows */
+    /* Shared-mode WASAPI runs the system mixer every 10 ms; two periods ahead of it
+     * is enough with the callback only mixing decoded audio, and one period (10 ms)
+     * less latency than miniaudio's default of three. A larger period_ms buys margin. */
+    if (engine->context.backend == ma_backend_wasapi) cfg.periods = 2;
 
     if (ma_device_init(&engine->context, &cfg, &d->device) != MA_SUCCESS) {
         fa_mutex_destroy(&d->xf_lock);
