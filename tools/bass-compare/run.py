@@ -399,7 +399,10 @@ def decode_case(tool, c, work, runs, prescan_too=True):
     res['total_ms'] = min(s['total_ms'] for s in speed)
     res['open_ms'] = min(s['open_ms'] for s in speed)
     res['first_ms'] = min(s['first_ms'] for s in speed)
-    res['mem_kb'] = float(np.median([s['peak_kb'] - s['base_kb'] for s in speed]))
+    # The smallest growth of the runs: under Wine a fast decode sometimes grows the
+    # working set by 0.3 to 3.5 MB that the library never allocated (massif sees
+    # about 20 KB of heap for a WAV stream), and noise only ever adds.
+    res['mem_kb'] = float(min(s['peak_kb'] - s['base_kb'] for s in speed))
     res['own'] = x
     return res
 
