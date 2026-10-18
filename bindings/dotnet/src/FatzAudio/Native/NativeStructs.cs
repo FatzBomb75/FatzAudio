@@ -412,6 +412,18 @@ internal unsafe struct FaMidiText
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaMidiMark
+{
+    public long Frame;
+    public long Time;
+    public int Type;
+    public int Track;
+    public int Value;
+    public int Value2;
+    public fixed byte Text[32];
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal unsafe struct FaMidiInfo
 {
     public fixed byte Title[256];

@@ -156,6 +156,33 @@ public enum MidiTextFlags
 /// <param name="Track">The track (MTrk chunk) it came from, 0-based.</param>
 public sealed record MidiText(int Index, MidiTextType Type, string Text, MidiTextFlags Flags, TimeSpan Position, long Frame, int Track);
 
+/// <summary>Kind of a <see cref="MidiMark"/>.</summary>
+public enum MidiMarkType
+{
+    /// <summary>A tempo change: <see cref="MidiMark.Value"/> is microseconds per quarter note; the text "120 bpm".</summary>
+    Tempo = 0,
+    /// <summary>A time signature: <see cref="MidiMark.Value"/> / <see cref="MidiMark.Value2"/>; the text "3/4".</summary>
+    TimeSignature = 1,
+    /// <summary>
+    /// A key signature: <see cref="MidiMark.Value"/> is the number of sharps (negative: flats), <see cref="MidiMark.Value2"/>
+    /// 1 for minor and 0 for major; the text "E minor".
+    /// </summary>
+    KeySignature = 2,
+}
+
+/// <summary>
+/// A tempo change or a time or key signature of a MIDI file (<see cref="AudioStream.MidiMarks"/>). Positions are where it is
+/// heard in the file; <see cref="AudioStream.Tempo"/> stretches the stream on top of the file's own tempo.
+/// </summary>
+/// <param name="Type">What it is.</param>
+/// <param name="Value">Its first number (see <see cref="MidiMarkType"/>).</param>
+/// <param name="Value2">Its second number, 0 for a tempo.</param>
+/// <param name="Text">A readable form: "120 bpm", "3/4", "E minor".</param>
+/// <param name="Position">Where it is heard.</param>
+/// <param name="Frame">Where it is heard, in frames.</param>
+/// <param name="Track">The track (MTrk chunk) it came from, 0-based.</param>
+public sealed record MidiMark(MidiMarkType Type, int Value, int Value2, string Text, TimeSpan Position, long Frame, int Track);
+
 /// <summary>Information about a MIDI stream (<see cref="AudioStream.MidiInfo"/>).</summary>
 /// <param name="Title">The .kar title line, else the name of the first track.</param>
 /// <param name="Artist">The second .kar title line, "" if none.</param>

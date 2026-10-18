@@ -128,7 +128,9 @@ typedef struct tml_message
 	double seconds;
 
 	// FatzAudio: text of TML_TEXT .. TML_CUE_POINT messages, NUL-terminated (the
-	// raw bytes of the file, any encoding), and its length; NULL for other types
+	// raw bytes of the file, any encoding), and its length; the data bytes of
+	// TML_TIME_SIGNATURE, TML_KEY_SIGNATURE and TML_SYSEX (up to 64 bytes, without
+	// the F0) the same way; NULL for other types
 	const char* text;
 	unsigned int text_length;
 
@@ -374,11 +376,16 @@ static int tml_parsemessage(tml_message** f, struct tml_parser* p)
 	//check what message we have
 	if ((status == TML_SYSEX) || (status == TML_EOX)) //sysex
 	{
-		//sysex messages are not handled
 		int len = tml_readvariablelength(p);
 		if (len < 0 || len > p->buf_end - p->buf) { TML_WARN("Unexpected end of file"); p->buf = p->buf_end; return -1; } // FatzAudio
+		// FatzAudio: short sysex messages (GM/GS/XG resets, drum parts, master volume) are kept, without the F0
+		if (status == TML_SYSEX && len <= 64)
+		{
+			if (!tml_keeptext(p, evt, p->buf, len)) { TML_ERROR("Out of memory"); return -1; }
+			evt->type = TML_SYSEX;
+		}
+		else evt->type = 0;
 		p->buf += len;
-		evt->type = 0;
 	}
 	else if (status == 0xFF) //meta events
 	{
@@ -407,6 +414,7 @@ static int tml_parsemessage(tml_message** f, struct tml_parser* p)
 			// FatzAudio: text events are kept (lyrics, markers, names, copyright)
 			case TML_TEXT: case TML_COPYRIGHT: case TML_TRACK_NAME: case TML_INST_NAME:
 			case TML_LYRIC: case TML_MARKER: case TML_CUE_POINT:
+			case TML_TIME_SIGNATURE: case TML_KEY_SIGNATURE: // FatzAudio: their bytes, as text
 				if (!tml_keeptext(p, evt, metadata, buflen)) { TML_ERROR("Out of memory"); return -1; }
 				evt->type = (unsigned char)meta_type;
 				break;
@@ -623,7 +631,7 @@ TMLDEF tml_message* tml_load(struct tml_stream* stream)
 			for (i = 0; i < out; i++)
 			{
 				sorted[i].next = (i + 1 < out ? &sorted[i + 1] : TML_NULL);
-				if (sorted[i].type >= TML_TEXT && sorted[i].type <= TML_CUE_POINT) sorted[i].text = (const char*)(sorted + p.message_count) + sorted[i].text_offset;
+				if ((sorted[i].type >= TML_TEXT && sorted[i].type <= TML_CUE_POINT) || sorted[i].type == TML_TIME_SIGNATURE || sorted[i].type == TML_KEY_SIGNATURE || sorted[i].type == TML_SYSEX) sorted[i].text = (const char*)(sorted + p.message_count) + sorted[i].text_offset;
 				else sorted[i].text = TML_NULL;
 			}
 		}

@@ -458,7 +458,10 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | BASS_MIDI_StreamSetFonts(stream, ...) | `fa_open_options.soundfont` when opening | `StreamOptions.SoundFont` | ✅ (one font per stream; no stacks or per-preset mapping) |
 | BASS_MIDI_FontSetVolume | Stream volume (`FA_PARAM_VOLUME`) | `Volume` | ✅ |
 | BASS_MIDI_StreamGetMark (LYRIC, TEXT, MARKER, CUE, COPY, TRACK, INST) | `fa_stream_get_midi_text` (cleaned-up lyrics with line and paragraph flags, UTF-8) and `fa_stream_get_midi_info` | `stream.MidiTexts`, `stream.MidiInfo` | ✅ |
-| BASS_MIDI_MARK_KEYSIG / TIMESIG / TEMPO / TICK | Not provided | — | 🗓️ |
+| BASS_MIDI_StreamGetMark BASS_MIDI_MARK_KEYSIG / TIMESIG / TEMPO | `fa_stream_get_midi_marks`: type `FA_MIDI_MARK_KEY_SIGNATURE` / `TIME_SIGNATURE` / `TEMPO`, numbers in `value`/`value2`, text like `"3/4"` ([MIDI](../features/midi.md#tempo-time-and-key-signatures)) | `stream.MidiMarks` | ✅ |
+| BASS_SYNC_MIDI_KEYSIG / TIMESIG / TEMPO | Not raised as events: follow the clock through `fa_stream_get_midi_marks` | — | ➖ |
+| BASS_MIDI_MARK_TICK (positions in ticks) | Not provided: positions are frames and nanoseconds | — | ➖ |
+| GS/XG/GM2 SysEx (resets, drum parts, master volume and tuning), handled by BASSMIDI | Applied the same way ([SysEx](../features/midi.md#sysex)) | automatic | ✅ (effects SysEx ignored) |
 | BASS_SYNC_MIDI_LYRIC / BASS_SYNC_MIDI_TEXT / BASS_SYNC_MIDI_MARK | `FA_EVENT_MIDI_TEXT` (`value` = text index) | `stream.MidiTextReached` | ✅ |
 | BASS_MIDI_StreamEvent MIDI_EVENT_TRANSPOSE | `fa_stream_set_midi_transpose` | `stream.MidiTranspose` | ✅ |
 | BASS_MIDI_StreamEvent MIDI_EVENT_MUTE | `fa_stream_set_midi_channel_mute` | `stream.SetMidiChannelMuted` | ✅ |
@@ -472,7 +475,8 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | BASS_ATTRIB_MIDI_PPQN, BASS_POS_MIDI_TICK | Not provided: positions are frames and time | — | ➖ |
 | BASS_ATTRIB_MIDI_TRACK_VOL, BASS_MIDI_StreamGetChannel | Not provided | — | 🗓️ |
 | BASS_MIDI_DECAYEND | Always on: one second after the last event | — | ✅ |
-| BASS_MIDI_DECAYSEEK (held notes after a seek) | Not provided: held notes sound again from their next note-on | — | ➖ |
+| Notes held across a seek (BASSMIDI starts them again) | The same: held notes, by key or sustain pedal, start again at the target; drum notes don't ([seeking](../features/midi.md#seeking-and-length)) | automatic | ✅ |
+| BASS_MIDI_DECAYSEEK (let the sound before a seek decay) | Not provided: a seek starts from silence, with the held notes restarted | — | ➖ |
 | BASS_MIDI_NOFX (reverb and chorus) | No reverb or chorus yet | — | 🗓️ |
 | BASS_ATTRIB_MIDI_SRC / BASS_MIDI_SINCINTER | Not configurable: the synthesizer's own interpolation | — | ➖ |
 

@@ -1450,8 +1450,16 @@ FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_ti
  * float (about twice the size of the .sf2 file).
  *
  * Seeking is sample-exact and fast: events up to the target are replayed without
- * rendering audio. Programs, controllers and pitch bends are restored; notes held
- * across the target are not restarted (they sound again from their next note-on).
+ * rendering audio. Programs, controllers, pitch bends and SysEx settings are
+ * restored, and notes held across the target (by their key or the sustain pedal)
+ * start again from their attack, so a held chord is heard after a seek into it
+ * (drum notes are not restarted). Where no note is held, what follows a seek is
+ * exactly what playing through gives.
+ *
+ * SysEx: GM, GM2, GS and XG resets; GS "use for rhythm part" and XG part mode set
+ * drum channels other than channel 10; bank select MSB 127 (XG) and 120 (GM2)
+ * pick drum kits; master volume (universal, GS and XG) and master fine and coarse
+ * tuning take effect. Other SysEx is ignored.
  * The length is the time of the last event plus one second, so the last notes
  * ring out. Lyrics and other text events are listed by fa_stream_get_midi_text and
  * raised as FA_EVENT_MIDI_TEXT when they are heard. */
@@ -1528,6 +1536,30 @@ typedef struct fa_midi_info {
 FA_API fa_result FA_CALL fa_stream_get_midi_info(fa_stream* stream, fa_midi_info* out_info);
 /* Text events in time order, index 0 .. text_count - 1 (FA_ERROR_NOT_FOUND past it). */
 FA_API fa_result FA_CALL fa_stream_get_midi_text(fa_stream* stream, uint32_t index, fa_midi_text* out_text);
+
+typedef enum fa_midi_mark_type {
+    FA_MIDI_MARK_TEMPO = 0,          /* value = microseconds per quarter note; text "120 bpm" */
+    FA_MIDI_MARK_TIME_SIGNATURE,     /* value / value2 = numerator / denominator; text "3/4" */
+    FA_MIDI_MARK_KEY_SIGNATURE       /* value = sharps (negative: flats), value2 = 1 minor, 0 major; text "E minor" */
+} fa_midi_mark_type;
+
+/* A tempo change or a time or key signature of the file. Frames and times are
+ * where it is heard; FA_PARAM_TEMPO stretches the stream on top of the file's own
+ * tempo and changes neither. */
+typedef struct fa_midi_mark {
+    fa_frames frame;             /* source frames */
+    fa_time time;                /* the same, in nanoseconds */
+    int32_t type;                /* fa_midi_mark_type */
+    int32_t track;               /* MTrk chunk it came from, 0-based */
+    int32_t value;               /* see fa_midi_mark_type */
+    int32_t value2;
+    char text[32];               /* readable form, UTF-8 */
+} fa_midi_mark;
+
+/* Copies up to `capacity` marks, in time order, into `out_marks` (NULL with capacity
+ * 0 to count them) and gives how many the file has in *out_count. Malformed
+ * signature events are left out. FA_ERROR_INVALID_ARG for streams that are not MIDI. */
+FA_API fa_result FA_CALL fa_stream_get_midi_marks(fa_stream* stream, fa_midi_mark* out_marks, uint32_t capacity, uint32_t* out_count);
 
 /* Live controls. Like FA_PARAM_PITCH they change the audio where it is rendered,
  * so a change is heard after the decode-ahead buffer: MIDI streams default to a

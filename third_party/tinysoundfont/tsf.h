@@ -222,6 +222,7 @@ TSFDEF int tsf_channel_set_volume(tsf* f, int channel, float volume);
 TSFDEF int tsf_channel_set_pitchwheel(tsf* f, int channel, int pitch_wheel);
 TSFDEF int tsf_channel_set_pitchrange(tsf* f, int channel, float pitch_range);
 TSFDEF int tsf_channel_set_tuning(tsf* f, int channel, float tuning);
+TSFDEF void tsf_set_tuning(tsf* f, float tuning); // FatzAudio: master tuning in semitones, for every channel
 TSFDEF int tsf_channel_set_sustain(tsf* f, int channel, int flag_sustain);
 
 // Start or stop playing notes on a channel (needs channel preset to be set)
@@ -349,6 +350,7 @@ struct tsf
 	float outSampleRate;
 	float globalGainDB;
 	int* refCount;
+	float globalTuning; // FatzAudio: semitones added to every channel (master tuning)
 };
 
 #ifndef TSF_NO_STDIO
@@ -1814,7 +1816,7 @@ static void tsf_channel_setup_voice(tsf* f, struct tsf_voice* v)
 	float newpan = v->region->pan + c->panOffset;
 	v->playingChannel = f->channels->activeChannel;
 	v->noteGainDB += c->gainDB;
-	tsf_voice_calcpitchratio(v, (c->pitchWheel == 8192 ? c->tuning : ((c->pitchWheel / 16383.0f * c->pitchRange * 2.0f) - c->pitchRange + c->tuning)), f->outSampleRate);
+	tsf_voice_calcpitchratio(v, f->globalTuning + (c->pitchWheel == 8192 ? c->tuning : ((c->pitchWheel / 16383.0f * c->pitchRange * 2.0f) - c->pitchRange + c->tuning)), f->outSampleRate); // FatzAudio: globalTuning
 	if      (newpan <= -0.5f) { v->panFactorLeft = 1.0f; v->panFactorRight = 0.0f; }
 	else if (newpan >=  0.5f) { v->panFactorLeft = 0.0f; v->panFactorRight = 1.0f; }
 	else { v->panFactorLeft = TSF_SQRTF(0.5f - newpan); v->panFactorRight = TSF_SQRTF(0.5f + newpan); }
@@ -1859,7 +1861,7 @@ static struct tsf_channel* tsf_channel_init(tsf* f, int channel)
 static void tsf_channel_applypitch(tsf* f, int channel, struct tsf_channel* c)
 {
 	struct tsf_voice *v, *vEnd;
-	float pitchShift = (c->pitchWheel == 8192 ? c->tuning : ((c->pitchWheel / 16383.0f * c->pitchRange * 2.0f) - c->pitchRange + c->tuning));
+	float pitchShift = f->globalTuning + (c->pitchWheel == 8192 ? c->tuning : ((c->pitchWheel / 16383.0f * c->pitchRange * 2.0f) - c->pitchRange + c->tuning)); // FatzAudio: globalTuning
 	for (v = f->voices, vEnd = v + f->voiceNum; v != vEnd; v++)
 		if (v->playingPreset != -1 && v->playingChannel == channel)
 			tsf_voice_calcpitchratio(v, pitchShift, f->outSampleRate);
@@ -1974,6 +1976,15 @@ TSFDEF int tsf_channel_set_tuning(tsf* f, int channel, float tuning)
 	c->tuning = tuning;
 	tsf_channel_applypitch(f, channel, c);
 	return 1;
+}
+
+TSFDEF void tsf_set_tuning(tsf* f, float tuning) // FatzAudio
+{
+	int i;
+	if (f->globalTuning == tuning) return;
+	f->globalTuning = tuning;
+	if (f->channels)
+		for (i = 0; i < f->channels->channelNum; i++) tsf_channel_applypitch(f, i, &f->channels->channels[i]);
 }
 
 TSFDEF int tsf_channel_set_sustain(tsf* f, int channel, int flag_sustain)

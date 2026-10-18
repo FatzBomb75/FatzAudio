@@ -194,6 +194,33 @@ public class MidiTests
     }
 
     [Fact]
+    public void TempoAndSignatures_AreListedWithTheirNumbers()
+    {
+        var t = new List<byte> { 0, 0xFF, 0x51, 3, 0x07, 0xA1, 0x20 };      // 500000 us: 120 bpm
+        t.AddRange(new byte[] { 0, 0xFF, 0x58, 4, 6, 3, 24, 8 });            // 6/8
+        t.AddRange(new byte[] { 0, 0xFF, 0x59, 2, 3, 1 });                   // 3 sharps, minor: F# minor
+        Ev(t, 0, 0x90, 69, 127);
+        Ev(t, 480, 0x80, 69, 0);
+        Ev(t, 0, 0xFF, 0x2F, 0);
+        var f = new List<byte>();
+        f.AddRange("MThd"u8.ToArray()); f.AddRange(new byte[] { 0, 0, 0, 6, 0, 0, 0, 1, 480 >> 8, 480 & 255 });
+        f.AddRange("MTrk"u8.ToArray());
+        f.AddRange(new[] { (byte)(t.Count >> 24), (byte)(t.Count >> 16), (byte)(t.Count >> 8), (byte)t.Count });
+        f.AddRange(t);
+
+        using var engine = CreateHeadless();
+        using var font = SoundFont.FromMemory(SineSoundFont());
+        using var s = engine.OpenMemory(f.ToArray(), DecodeOnly with { SoundFont = font });
+        Assert.Empty(s.MidiTexts);
+        var marks = s.MidiMarks;
+        Assert.Equal(3, marks.Count);
+        Assert.Equal((MidiMarkType.Tempo, 500000, "120 bpm"), (marks[0].Type, marks[0].Value, marks[0].Text));
+        Assert.Equal((MidiMarkType.TimeSignature, 6, 8, "6/8"), (marks[1].Type, marks[1].Value, marks[1].Value2, marks[1].Text));
+        Assert.Equal((MidiMarkType.KeySignature, 3, 1, "F# minor"), (marks[2].Type, marks[2].Value, marks[2].Value2, marks[2].Text));
+        Assert.Equal(TimeSpan.Zero, marks[2].Position);
+    }
+
+    [Fact]
     public void LiveControls()
     {
         using var engine = CreateHeadless();

@@ -66,7 +66,7 @@ static void gen(buf* b, unsigned oper, unsigned amount) { put16le(b, oper); put1
 /* Preset 0 bank 0 ("Sine") and preset 0 bank 128 ("Kit"): the same looped 440 Hz
  * sine, root key 69, 125 ms release. `atten` (centibels) is the Sine zone's
  * initialAttenuation; 0 leaves it out. */
-static buf make_sf2_atten(unsigned atten)
+static buf make_sf2_ex(unsigned atten, int kit_coarse)
 {
     buf sf = { 0 }, riff = { 0 }, info = { 0 }, sdta = { 0 }, pdta = { 0 }, c = { 0 };
     int i;
@@ -103,7 +103,7 @@ static buf make_sf2_atten(unsigned atten)
     chunk(&pdta, "inst", &c);
     {
         unsigned first = atten ? 4 : 3;
-        c.n = 0; put16le(&c, 0); put16le(&c, 0); put16le(&c, first); put16le(&c, 0); put16le(&c, first + 3); put16le(&c, 0);
+        c.n = 0; put16le(&c, 0); put16le(&c, 0); put16le(&c, first); put16le(&c, 0); put16le(&c, first + 3 + (kit_coarse != 0)); put16le(&c, 0);
     }
     chunk(&pdta, "ibag", &c);
     c.n = 0; for (i = 0; i < 10; i++) put8(&c, 0);
@@ -113,7 +113,9 @@ static buf make_sf2_atten(unsigned atten)
     gen(&c, 38, (unsigned)(uint16_t)-3600);  /* releaseVolEnv: 2^-3 s */
     if (atten) gen(&c, 48, atten);           /* initialAttenuation */
     gen(&c, 53, 0);                          /* sampleID */
-    gen(&c, 54, 1); gen(&c, 38, (unsigned)(uint16_t)-3600); gen(&c, 53, 0);
+    gen(&c, 54, 1); gen(&c, 38, (unsigned)(uint16_t)-3600);
+    if (kit_coarse) gen(&c, 51, (unsigned)(uint16_t)(int16_t)kit_coarse);   /* coarseTune */
+    gen(&c, 53, 0);
     gen(&c, 0, 0);
     chunk(&pdta, "igen", &c);
     c.n = 0;
@@ -127,7 +129,8 @@ static buf make_sf2_atten(unsigned atten)
     return sf;
 }
 
-static buf make_sf2(void) { return make_sf2_atten(0); }
+static buf make_sf2_atten(unsigned atten) { return make_sf2_ex(atten, 0); }
+static buf make_sf2(void) { return make_sf2_ex(0, 0); }
 
 /* ---- MIDI files -------------------------------------------------------------------- */
 
@@ -502,6 +505,238 @@ static void test_channel_mute(void)
     CHECK(rms(x, 1000, RATE / 4) > 0.1);
     fa_stream_close(s);
     free(x); free(melody.d);
+}
+
+/* ---- SysEx, held notes, tempo and signature marks ------------------------------ */
+
+static void sysex(buf* t, uint32_t delta, const uint8_t* d, size_t n)
+{
+    varlen(t, delta); put8(t, 0xF0); varlen(t, (uint32_t)n); put(t, d, n);
+}
+
+/* A file of `pre` SysEx messages (all at 0), then a note on `ch` from 0 to 1 s, a
+ * bank select `bank` (>= 0) and program 0 before it. */
+static buf make_sysex_note(const uint8_t* const* msgs, const size_t* lens, int count, int ch, int bank)
+{
+    buf f = { 0 }, t = { 0 };
+    int i;
+    mthd(&f, 0, 1, 480);
+    for (i = 0; i < count; i++) sysex(&t, 0, msgs[i], lens[i]);
+    if (bank >= 0) ev3(&t, 0, 0xB0 | ch, 0, (unsigned)bank);
+    ev3(&t, 0, 0xC0 | ch, 0, 0);
+    t.n -= 1;
+    ev3(&t, 0, 0x90 | ch, 69, 127);
+    ev3(&t, 960, 0x80 | ch, 69, 0);
+    eot(&t, 0);
+    mtrk(&f, &t);
+    free(t.d);
+    return f;
+}
+
+/* The pitch heard in the first second (the test kit is an octave up: 880 Hz). */
+static double note_frequency(fa_soundfont* font, const uint8_t* const* msgs, const size_t* lens, int count, int ch, int bank,
+                             double* out_rms)
+{
+    buf f = make_sysex_note(msgs, lens, count, ch, bank);
+    float* x = (float*)calloc((size_t)RATE * 2, sizeof(float));
+    fa_stream* s = open_bytes(&f, FA_OPEN_DECODE_ONLY, font, NULL);
+    double hz = -1;
+    if (s && read_all(s, x, RATE, 512) == RATE) {
+        hz = frequency(x, 2000, RATE - 2000);
+        if (out_rms) *out_rms = rms(x, 2000, RATE - 2000);
+    }
+    fa_stream_close(s);
+    free(x); free(f.d);
+    return hz;
+}
+
+static void test_sysex(void)
+{
+    static const uint8_t gm_on[] = { 0x7E, 0x7F, 0x09, 0x01, 0xF7 };
+    static const uint8_t gm2_on[] = { 0x7E, 0x7F, 0x09, 0x03, 0xF7 };
+    static const uint8_t gs_reset[] = { 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7 };
+    static const uint8_t gs_part2_drums[] = { 0x41, 0x10, 0x42, 0x12, 0x40, 0x12, 0x15, 0x01, 0x18, 0xF7 };   /* part 2 = channel 1 */
+    static const uint8_t gs_part10_normal[] = { 0x41, 0x10, 0x42, 0x12, 0x40, 0x10, 0x15, 0x00, 0x1B, 0xF7 };
+    static const uint8_t xg_on[] = { 0x43, 0x10, 0x4C, 0x00, 0x00, 0x7E, 0x00, 0xF7 };
+    static const uint8_t xg_part3_drums[] = { 0x43, 0x10, 0x4C, 0x08, 0x02, 0x07, 0x01, 0xF7 };
+    static const uint8_t xg_part10_normal[] = { 0x43, 0x10, 0x4C, 0x08, 0x09, 0x07, 0x00, 0xF7 };
+    static const uint8_t master_half[] = { 0x7F, 0x7F, 0x04, 0x01, 0x7F, 0x3F, 0xF7 };   /* 8191 / 16383 */
+    static const uint8_t gs_master_half[] = { 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x04, 0x40, 0x7C, 0xF7 };
+    static const uint8_t coarse_up[] = { 0x7F, 0x7F, 0x04, 0x04, 0x00, 0x4C, 0xF7 };       /* +12 semitones */
+    static const uint8_t fine_down[] = { 0x7F, 0x7F, 0x04, 0x03, 0x00, 0x20, 0xF7 };       /* 4096: -0.5 semitone */
+    buf sf = make_sf2_ex(0, 12);
+    fa_soundfont* font = NULL;
+    const uint8_t* m[2];
+    size_t n[2];
+    double full = 0, half = 0;
+    CHECK_EQ(fa_soundfont_open_memory(sf.d, sf.n, &font), FA_OK);
+    /* Without SysEx: channel 10 is the kit, the others melodic. */
+    CHECK_NEAR(note_frequency(font, NULL, NULL, 0, 9, -1, &full), 880.0, 5.0);
+    CHECK_NEAR(note_frequency(font, NULL, NULL, 0, 1, -1, NULL), 440.0, 3.0);
+    /* GS: part 2 made a rhythm part, part 10 a normal one. */
+    m[0] = gs_reset; n[0] = sizeof(gs_reset); m[1] = gs_part2_drums; n[1] = sizeof(gs_part2_drums);
+    CHECK_NEAR(note_frequency(font, m, n, 2, 1, -1, NULL), 880.0, 5.0);
+    m[1] = gs_part10_normal; n[1] = sizeof(gs_part10_normal);
+    CHECK_NEAR(note_frequency(font, m, n, 2, 9, -1, NULL), 440.0, 3.0);
+    /* A GM reset undoes it. */
+    m[0] = gs_part10_normal; n[0] = sizeof(gs_part10_normal); m[1] = gm_on; n[1] = sizeof(gm_on);
+    CHECK_NEAR(note_frequency(font, m, n, 2, 9, -1, NULL), 880.0, 5.0);
+    /* XG: bank 127 is drums on any channel, bank 0 melodic on channel 10; part mode. */
+    m[0] = xg_on; n[0] = sizeof(xg_on);
+    CHECK_NEAR(note_frequency(font, m, n, 1, 0, 127, NULL), 880.0, 5.0);
+    CHECK_NEAR(note_frequency(font, m, n, 1, 9, 0, NULL), 440.0, 3.0);
+    CHECK_NEAR(note_frequency(font, m, n, 1, 9, -1, NULL), 880.0, 5.0);
+    m[1] = xg_part3_drums; n[1] = sizeof(xg_part3_drums);
+    CHECK_NEAR(note_frequency(font, m, n, 2, 2, -1, NULL), 880.0, 5.0);
+    m[1] = xg_part10_normal; n[1] = sizeof(xg_part10_normal);
+    CHECK_NEAR(note_frequency(font, m, n, 2, 9, -1, NULL), 440.0, 3.0);
+    /* Without an XG reset, bank 127 is a melodic bank (GS: the MT-32 set). */
+    CHECK_NEAR(note_frequency(font, NULL, NULL, 0, 0, 127, NULL), 440.0, 3.0);
+    /* GM2: bank 120 is drums, channel 10 starts on it. */
+    m[0] = gm2_on; n[0] = sizeof(gm2_on);
+    CHECK_NEAR(note_frequency(font, m, n, 1, 3, 120, NULL), 880.0, 5.0);
+    CHECK_NEAR(note_frequency(font, m, n, 1, 9, -1, NULL), 880.0, 5.0);
+    CHECK_NEAR(note_frequency(font, m, n, 1, 3, -1, NULL), 440.0, 3.0);
+    /* Master volume halves the level (universal and GS); master tuning. */
+    m[0] = master_half; n[0] = sizeof(master_half);
+    CHECK_NEAR(note_frequency(font, m, n, 1, 9, -1, &half), 880.0, 5.0);
+    CHECK_NEAR(half / full, 0.5, 0.01);
+    m[0] = gs_master_half; n[0] = sizeof(gs_master_half);
+    CHECK_NEAR(note_frequency(font, m, n, 1, 9, -1, &half), 880.0, 5.0);
+    CHECK_NEAR(half / full, 64.0 / 127.0, 0.01);
+    m[0] = coarse_up; n[0] = sizeof(coarse_up);
+    CHECK_NEAR(note_frequency(font, m, n, 1, 0, -1, NULL), 880.0, 5.0);
+    m[1] = fine_down; n[1] = sizeof(fine_down);
+    CHECK_NEAR(note_frequency(font, m, n, 2, 0, -1, NULL), 880.0 * pow(2.0, -0.5 / 12.0), 5.0);
+    fa_soundfont_close(font);
+    free(sf.d);
+}
+
+/* Notes held across a seek target start again: by a key, by the pedal; drums don't.
+ * A master volume set before the target is kept. */
+static void test_seek_restarts_held_notes(void)
+{
+    static const uint8_t master_half[] = { 0x7F, 0x7F, 0x04, 0x01, 0x7F, 0x3F, 0xF7 };
+    buf melody = make_note(0), drums = make_note(9), pedal = { 0 }, twice = { 0 }, t = { 0 }, vol;
+    float* x = (float*)calloc((size_t)RATE * 2, sizeof(float));
+    fa_stream* s;
+    double level;
+    /* Pedal down at 0, note 0..0.25 s, pedal up at 1.5 s. */
+    mthd(&pedal, 0, 1, 480);
+    ev3(&t, 0, 0xB0, 64, 127);
+    ev3(&t, 0, 0x90, 69, 127);
+    ev3(&t, 240, 0x80, 69, 0);
+    ev3(&t, 1200, 0xB0, 64, 0);
+    eot(&t, 0);
+    mtrk(&pedal, &t);
+    /* The same key struck twice (0 and 0.5 s), ended at 1 s and 2 s. */
+    mthd(&twice, 0, 1, 480);
+    ev3(&t, 0, 0x90, 69, 127);
+    ev3(&t, 480, 0x90, 69, 127);
+    ev3(&t, 480, 0x80, 69, 0);
+    ev3(&t, 960, 0x80, 69, 0);
+    eot(&t, 0);
+    mtrk(&twice, &t);
+    {
+        const uint8_t* m[1] = { master_half };
+        size_t n[1] = { sizeof(master_half) };
+        vol = make_sysex_note(m, n, 1, 0, -1);
+    }
+
+    s = open_bytes(&melody, FA_OPEN_DECODE_ONLY, NULL, NULL);
+    CHECK(s);
+    CHECK_EQ(read_all(s, x, RATE / 2, 512), RATE / 2);
+    level = rms(x, 2000, RATE / 2);
+    CHECK_EQ(fa_stream_seek(s, RATE / 2 + 7), FA_OK);
+    CHECK_EQ(read_all(s, x, RATE / 4, 512), RATE / 4);
+    CHECK(rms(x, 1000, RATE / 4) > level * 0.8);
+    CHECK_NEAR(frequency(x, 1000, RATE / 4), 440.0, 5.0);
+    /* Transposed now: the restarted note takes the transpose. */
+    CHECK_EQ(fa_stream_set_midi_transpose(s, 12), FA_OK);
+    CHECK_EQ(fa_stream_seek(s, RATE / 2), FA_OK);
+    CHECK_EQ(read_all(s, x, RATE / 4, 512), RATE / 4);
+    CHECK_NEAR(frequency(x, 1000, RATE / 4), 880.0, 5.0);
+    /* After its note-off: nothing restarts. */
+    fa_stream_set_midi_transpose(s, 0);
+    CHECK_EQ(fa_stream_seek(s, RATE + RATE / 2), FA_OK);
+    CHECK_EQ(read_all(s, x, RATE / 4, 512), RATE / 4);
+    CHECK(rms(x, 0, RATE / 4) < 1e-6);
+    fa_stream_close(s);
+
+    s = open_bytes(&pedal, FA_OPEN_DECODE_ONLY, NULL, NULL);
+    CHECK(s);
+    CHECK_EQ(fa_stream_seek(s, RATE), FA_OK);
+    CHECK_EQ(read_all(s, x, RATE / 4, 512), RATE / 4);
+    CHECK(rms(x, 1000, RATE / 4) > level * 0.8);   /* the pedal holds it */
+    CHECK_EQ(fa_stream_seek(s, 2 * RATE), FA_OK);
+    CHECK_EQ(read_all(s, x, RATE / 4, 512), RATE / 4);
+    CHECK(rms(x, 0, RATE / 4) < 1e-6);             /* released by then */
+    fa_stream_close(s);
+
+    /* Both strikes are held at 0.8 s: the first note-off ends one, the other rings on. */
+    s = open_bytes(&twice, FA_OPEN_DECODE_ONLY, NULL, NULL);
+    CHECK(s);
+    CHECK_EQ(fa_stream_seek(s, RATE * 8 / 10), FA_OK);
+    CHECK_EQ(read_all(s, x, RATE, 512), RATE);
+    CHECK(rms(x, RATE / 2, RATE * 9 / 10) > level * 0.5);
+    fa_stream_close(s);
+
+    s = open_bytes(&drums, FA_OPEN_DECODE_ONLY, NULL, NULL);
+    CHECK(s);
+    CHECK_EQ(fa_stream_seek(s, RATE / 2), FA_OK);
+    CHECK_EQ(read_all(s, x, RATE / 4, 512), RATE / 4);
+    CHECK(rms(x, 0, RATE / 4) < 1e-6);
+    fa_stream_close(s);
+
+    s = open_bytes(&vol, FA_OPEN_DECODE_ONLY, NULL, NULL);
+    CHECK(s);
+    CHECK_EQ(fa_stream_seek(s, RATE / 2), FA_OK);
+    CHECK_EQ(read_all(s, x, RATE / 4, 512), RATE / 4);
+    CHECK_NEAR(rms(x, 1000, RATE / 4) / level, 0.5, 0.02);
+    fa_stream_close(s);
+    free(x); free(melody.d); free(drums.d); free(pedal.d); free(twice.d); free(t.d); free(vol.d);
+}
+
+static void test_tempo_and_signature_marks(void)
+{
+    buf f = { 0 }, t = { 0 };
+    fa_stream* s;
+    fa_midi_info info;
+    fa_midi_mark x[8];
+    uint32_t n = 0;
+    mthd(&f, 0, 1, 480);
+    tempo(&t, 0, 500000);
+    varlen(&t, 0); put8(&t, 0xFF); put8(&t, 0x58); put8(&t, 4); put8(&t, 3); put8(&t, 2); put8(&t, 24); put8(&t, 8);
+    varlen(&t, 0); put8(&t, 0xFF); put8(&t, 0x59); put8(&t, 2); put8(&t, 0xFF); put8(&t, 1);   /* 1 flat, minor */
+    ev3(&t, 0, 0x90, 69, 100);
+    tempo(&t, 960, 416667);                    /* at 1 s: 144 bpm */
+    varlen(&t, 0); put8(&t, 0xFF); put8(&t, 0x59); put8(&t, 2); put8(&t, 2); put8(&t, 0);      /* D major */
+    varlen(&t, 0); put8(&t, 0xFF); put8(&t, 0x59); put8(&t, 2); put8(&t, 9); put8(&t, 0);      /* malformed: skipped */
+    ev3(&t, 480, 0x80, 69, 0);
+    eot(&t, 0);
+    mtrk(&f, &t);
+    s = open_bytes(&f, FA_OPEN_DECODE_ONLY, NULL, NULL);
+    CHECK(s);
+    CHECK_EQ(fa_stream_get_midi_info(s, &info), FA_OK);
+    CHECK_EQ(info.text_count, 0);                    /* marks are not texts */
+    CHECK_EQ(fa_stream_get_midi_marks(s, NULL, 0, &n), FA_OK);
+    CHECK_EQ(n, 5);
+    CHECK_EQ(fa_stream_get_midi_marks(s, x, 2, &n), FA_OK);   /* fewer than there are */
+    CHECK_EQ(n, 5);
+    CHECK_EQ(fa_stream_get_midi_marks(s, x, 8, &n), FA_OK);
+    CHECK_EQ(n, 5);
+    CHECK_EQ(x[0].type, FA_MIDI_MARK_TEMPO); CHECK_EQ(x[0].value, 500000); CHECK(strcmp(x[0].text, "120 bpm") == 0);
+    CHECK_EQ(x[1].type, FA_MIDI_MARK_TIME_SIGNATURE); CHECK_EQ(x[1].value, 3); CHECK_EQ(x[1].value2, 4);
+    CHECK(strcmp(x[1].text, "3/4") == 0);
+    CHECK_EQ(x[2].type, FA_MIDI_MARK_KEY_SIGNATURE); CHECK_EQ(x[2].value, -1); CHECK_EQ(x[2].value2, 1);
+    CHECK(strcmp(x[2].text, "D minor") == 0);
+    CHECK_EQ(x[3].type, FA_MIDI_MARK_TEMPO); CHECK_EQ(x[3].frame, RATE); CHECK_EQ(x[3].time, 1000000000);
+    CHECK(strcmp(x[3].text, "144 bpm") == 0);
+    CHECK_EQ(x[4].type, FA_MIDI_MARK_KEY_SIGNATURE); CHECK_EQ(x[4].value, 2); CHECK_EQ(x[4].value2, 0);
+    CHECK(strcmp(x[4].text, "D major") == 0);
+    CHECK_EQ(fa_stream_get_midi_marks(s, NULL, 1, &n), FA_ERROR_INVALID_ARG);
+    fa_stream_close(s);
+    free(f.d); free(t.d);
 }
 
 /* Format 2: the tracks are patterns played one after another. Also: a .kar
@@ -1082,6 +1317,9 @@ int main(void)
     RUN(test_karaoke);
     RUN(test_transpose_and_drums);
     RUN(test_channel_mute);
+    RUN(test_sysex);
+    RUN(test_seek_restarts_held_notes);
+    RUN(test_tempo_and_signature_marks);
     RUN(test_format2);
     RUN(test_not_midi);
     RUN(test_soundfont_lifetime);

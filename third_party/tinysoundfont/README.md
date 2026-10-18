@@ -33,11 +33,15 @@ against untrusted files and add what the decoder needs:
   `realloc`, `tml_load_memory` rejects NULL or a negative size.
 - `tml_message` gains `seconds`, `text`/`text_length`/`text_offset` (meta text 1..7 kept
   in a pool after the messages) and `track`; `enum TMLSystemType` is public.
+- Sysex messages of up to 64 bytes (`TML_SYSEX`, data without the F0) and the bytes of
+  time and key signature events are kept in the same pool.
 
 `tsf.h`
 - RIFF sizes clamped to the buffer (`tsf_load_memory` passes the real size); chunk size
   checks that cannot overflow; a LIST shorter than 4 bytes rejected; a duplicate hydra
   chunk fails the load.
+- `tsf_set_tuning`: a master tuning in semitones added to every channel's pitch (MIDI
+  master fine/coarse tuning SysEx).
 - `initialAttenuation` is applied at the SF2 spec's 0.1 dB per centibel, up to 144 dB
   (upstream used 0.01 dB, at most 14.4 dB, which flattened the level differences between
   zones and instruments).

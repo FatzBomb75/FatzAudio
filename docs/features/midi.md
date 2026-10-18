@@ -7,8 +7,10 @@ FatzAudio plays MIDI files itself, with a built-in SoundFont 2 synthesizer. They
 | Standard MIDI Files (`.mid`, `.midi`, `.smf`) | Format 0, 1 and 2, tempo maps, SMPTE time division, running status |
 | Karaoke (`.kar`) | Lyrics from the "Words" track, `@T` title and artist lines, line and paragraph marks |
 | RIFF MIDI (`.rmi`) | The Standard MIDI File inside it |
-| Instruments | A SoundFont 2 (`.sf2`) or DLS (`.dls`) bank you load, else the one the OS ships (Windows `gm.dls`, macOS `gs_instruments.dls`, a Linux GM `.sf2` package): General MIDI; GS/XG variation banks through bank select (falling back to bank 0 when the soundfont lacks them); drums on channel 10 |
+| Instruments | A SoundFont 2 (`.sf2`) or DLS (`.dls`) bank you load, else the one the OS ships (Windows `gm.dls`, macOS `gs_instruments.dls`, a Linux GM `.sf2` package): General MIDI; GS/XG variation banks through bank select (falling back to bank 0 when the soundfont lacks them); drums on channel 10 and on the parts GS, XG and GM2 files make drum parts |
+| SysEx | GM, GM2, GS and XG resets, GS rhythm parts, XG drum parts and drum banks (127, and 120 in GM2), master volume and master tuning ([below](#sysex)) |
 | Lyrics and other text | Lyric, text, marker, cue, track and instrument name, copyright: listed and raised as events |
+| Tempo and signatures | Tempo changes, time and key signatures, listed with their numbers |
 | Live controls | Transpose (the synthesizer plays the new notes), channel mute, plus every stream parameter (volume, tempo, pitch) |
 
 Files are detected from their content (`MThd`, or `RIFF....RMID`), never from the extension. `fa_stream_get_info` reports codec `midi`, container `smf` or `rmid`, and stereo F32 audio at the engine's `mix_sample_rate`, or 44100 Hz when that is 0 (device native).
@@ -137,6 +139,32 @@ song.MidiTextReached += (_, e) =>
 };
 ```
 
+### Tempo, time and key signatures
+
+The file's tempo changes and time and key signatures are listed apart from the texts, by `fa_stream_get_midi_marks` (`AudioStream.MidiMarks`), in time order with their numbers in `value` and `value2` and a readable text:
+
+| Type | `value` | `value2` | `text` |
+|---|---|---|---|
+| `FA_MIDI_MARK_TEMPO` (`MidiMarkType.Tempo`) | microseconds per quarter note (500000) | 0 | `120 bpm` |
+| `FA_MIDI_MARK_TIME_SIGNATURE` | numerator (3) | denominator (4) | `3/4` |
+| `FA_MIDI_MARK_KEY_SIGNATURE` | sharps, negative for flats (-1) | 1 for minor, 0 for major | `D minor` |
+
+They aren't raised as events; follow the clock through the list to show the bar or key heard now. `FA_PARAM_TEMPO` stretches the stream on top of the file's own tempo, and the frames and times in the list stay those of the file. Malformed signature events are left out.
+
+```c
+uint32_t n = 0;
+fa_stream_get_midi_marks(song, NULL, 0, &n);              /* how many */
+fa_midi_mark* marks = calloc(n ? n : 1, sizeof(*marks));
+fa_stream_get_midi_marks(song, marks, n, &n);
+for (uint32_t i = 0; i < n; i++) printf("%.2f s: %s\n", marks[i].time / 1e9, marks[i].text);
+free(marks);
+```
+
+```csharp
+var tempo = song.MidiMarks.FirstOrDefault(m => m.Type == MidiMarkType.Tempo);
+double bpm = tempo is null ? 120 : 60_000_000.0 / tempo.Value;
+```
+
 Text events are best effort, like markers: under heavy load an event can be dropped. A screen that must never miss a syllable follows the stream's presentation clock (`fa_stream_get_clock`, `AudioStream.Clock`) through the list, which also keeps it in sync with the speaker latency.
 
 ## Live controls
@@ -161,9 +189,24 @@ song.MidiTranspose = -2;
 song.SetMidiChannelMuted(3, true);
 ```
 
+## SysEx
+
+The SysEx messages that change how a file sounds are applied; the rest are ignored. Checksums aren't checked, and any device number is accepted.
+
+| Message | Effect |
+|---|---|
+| GM System On, GS reset (and GS system mode set), XG System On, GM2 System On | Held notes are released and every channel goes back to its defaults: program 0, controllers reset, volume 100, master volume and tuning cleared. Picks how drum channels are chosen (below) |
+| GS "use for rhythm part" (`40 1x 15`) | Makes any part a drum part, or channel 10 a melodic one |
+| XG part mode (`08 nn 07`) | Makes part nn a drum part |
+| Bank select MSB 127 (and 126) after an XG reset, 120 after a GM2 reset | The channel plays drum kits from its next program change; other banks make it melodic, channel 10 included |
+| Master volume: universal (`7F 04 01`), GS (`40 00 04`), XG (`00 00 04`) | Scales the whole song, without a click |
+| Master fine and coarse tuning (`7F 04 03`, `7F 04 04`) | Retunes every channel, drums included |
+
+Without a reset, channel 10 is the drum channel and bank 127 is an ordinary (GS MT-32) melodic bank. A drum kit the soundfont doesn't have falls back to the standard kit (bank 128, program 0).
+
 ## Seeking and length
 
-Seeking is sample-exact and fast: the events up to the target are replayed into a fresh synthesizer without rendering any audio, so programs, controllers, pitch bends and the tempo are exactly as if the song had played up to there. Notes held across the target aren't restarted: a chord that started before the target sounds again from its next note-on (as in most MIDI players).
+Seeking is sample-exact and fast: the events up to the target are replayed into a fresh synthesizer without rendering any audio, so programs, controllers, pitch bends, SysEx settings and the tempo are exactly as if the song had played up to there. Notes held across the target, by their key or by the sustain pedal, start again from their attack (as in BASSMIDI), so a chord or pad held across a seek is heard right away. A key struck several times and still held comes back as one note, at the loudest of those strikes, and ends with the last of their note-offs. Drum notes aren't restarted, since they'd sound as a new hit. Where no note is held, the audio after a seek is exactly what playing through gives.
 
 The length is the time of the last event plus one second, so the final notes ring out. Audio from a given position is the same whatever the read size or the seeks before it, so loudness scans are cached like those of any other file (the cache key includes the soundfont and the sample rate).
 
@@ -180,4 +223,4 @@ Rendering runs on the engine's worker threads like decoding of any other format.
 - Each instrument's level (`initialAttenuation`) is applied as the SoundFont 2 spec states it, 0.1 dB per unit. FluidSynth applies 0.4 of that (an EMU hardware habit), so a bank tuned by ear in FluidSynth can sound with a wider gap between its quiet and loud instruments here.
 - SF3 (compressed samples) and SFZ soundfonts, MIDI input from devices, and per-channel effects (reverb and chorus send levels) aren't supported yet. See the [engineering notes](../engineering-notes.md).
 - Shift-JIS lyrics (Japanese files) are read as Windows-1252 and come out garbled.
-- Drum parts on channels other than 10 (set by GS SysEx, or XG bank 127) play as melodic instruments: only channel 10 plays drums. SysEx is ignored altogether.
+- SysEx other than the messages listed [above](#sysex) is ignored: GS and XG effect settings, insertion effects, scale tuning and drum setup (per-note drum edits) have no effect.
