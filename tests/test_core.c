@@ -90,10 +90,20 @@ static uint16_t crc16(const uint8_t* d, size_t n)
     return c;
 }
 
+/* With `fake_syncs`, every 256th sample of channel 0 starts a run of three that reads
+ * as a frame header for 24-bit audio (FF F8 C0 1C 00 00), which a search must skip:
+ * a false sync, as real audio has now and then, that fails before its CRC-8 is read. */
+static int16_t flac_sample(uint32_t i, uint32_t rate, uint32_t ch, int fake_syncs)
+{
+    static const int16_t fake[3] = { (int16_t)0xFFF8, (int16_t)0xC01C, 0 };
+    if (fake_syncs && ch == 0 && i % 256 < 3) return fake[i % 256];
+    return tone(i, rate, ch);
+}
+
 /* Blocks that start before frame `quiet` are digital silence (CONSTANT subframes,
  * a few bytes each), so the file's bytes per frame change across it. With
  * `seek_every`, a SEEKTABLE has a point every that many blocks. */
-static buf make_flac_ex(uint32_t rate, uint32_t channels, uint32_t frames, int with_id3, uint32_t quiet, uint32_t seek_every)
+static buf make_flac_ex(uint32_t rate, uint32_t channels, uint32_t frames, int with_id3, uint32_t quiet, uint32_t seek_every, int fake_syncs)
 {
     const uint32_t block = 4096;
     buf b = { 0 }, fr = { 0 };
@@ -114,7 +124,7 @@ static buf make_flac_ex(uint32_t rate, uint32_t channels, uint32_t frames, int w
         for (c = 0; c < channels; c++) {
             if (start < quiet) { put8(&fr, 0x00); be16(&fr, 0); continue; } /* CONSTANT 0 */
             put8(&fr, 0x02);                                         /* VERBATIM, no wasted bits */
-            for (i = 0; i < n; i++) be16(&fr, (uint16_t)tone(start + i, rate, c));
+            for (i = 0; i < n; i++) be16(&fr, (uint16_t)flac_sample(start + i, rate, c, fake_syncs));
         }
         be16(&fr, crc16(fr.p + h, fr.n - h));
     }
@@ -149,7 +159,7 @@ static buf make_flac_ex(uint32_t rate, uint32_t channels, uint32_t frames, int w
 
 static buf make_flac(uint32_t rate, uint32_t channels, uint32_t frames, int with_id3)
 {
-    return make_flac_ex(rate, channels, frames, with_id3, 0, 0);
+    return make_flac_ex(rate, channels, frames, with_id3, 0, 0, 0);
 }
 
 /* MP3: MPEG-1 Layer III 128 kbps 44.1 kHz frames with zeroed side info (decode to silence). */
@@ -426,34 +436,37 @@ static void test_open_io_seekable(void)
 static void test_flac_seek_search(void)
 {
     /* Probes read a frame header, not the frame: bytes read per seek, on average. */
-    static const struct { uint32_t quiet, seek_every, max_seeks, max_bytes; } cases[] = {
-        { 0, 0, 4, 56000 },            /* upstream dr_flac: up to 11; whole-frame probes: 65000 bytes */
-        { 73 * 4096, 0, 16, 120000 },  /* silence, then the tone (upstream: up to 11; whole-frame probes: 174000 bytes) */
-        { 0, 40, 6, 58000 },           /* a point every 40 blocks, 3.7 s (upstream: up to 8) */
+    static const struct { uint32_t quiet, seek_every; int fake_syncs; uint32_t max_seeks, max_bytes; } cases[] = {
+        { 0, 0, 0, 4, 56000 },            /* upstream dr_flac: up to 11; whole-frame probes: 65000 bytes */
+        { 73 * 4096, 0, 0, 17, 120000 },  /* silence, then the tone: 17 just where it starts (upstream: up to 11; whole-frame probes: 174000 bytes) */
+        { 0, 40, 0, 6, 58000 },           /* a point every 40 blocks, 3.7 s (upstream: up to 8) */
+        { 0, 0, 1, 4, 56000 },            /* false syncs (before: up to 18 file seeks and 113000 bytes) */
     };
     const uint32_t frames = 600000;
     size_t q;
     for (q = 0; q < sizeof(cases) / sizeof(cases[0]); q++) {
-        buf media = make_flac_ex(44100, 2, frames, 0, cases[q].quiet, cases[q].seek_every);
+        buf media = make_flac_ex(44100, 2, frames, 0, cases[q].quiet, cases[q].seek_every, cases[q].fake_syncs);
         mem_io m = { 0 };
         fa_io_callbacks io = { io_read, io_seek, io_length, io_close };
         fa_open_options o = decode_only();
         fa_stream* s = NULL;
         float out[2 * 64];
-        uint32_t k, worst = 0;
+        uint32_t k, n = cases[q].quiet ? 43 : 40, worst = 0;
         size_t bytes;
         m.p = media.p; m.n = media.n;
         CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_OK);
         bytes = m.bytes;
-        for (k = 0; k < 40; k++) {
-            uint32_t at = (uint32_t)(((uint64_t)k * 7919u * 4099u) % (frames - 64)), i, c;
+        for (k = 0; k < n; k++) {
+            /* With silence, also just either side of where the tone starts: the search's upper
+             * point lands right past the target there, again and again. */
+            uint32_t at = k < 40 ? (uint32_t)(((uint64_t)k * 7919u * 4099u) % (frames - 64)) : cases[q].quiet - 4008 + (k - 40) * 4200, i, c;
             fa_frames got = 0;
             int before = m.seeks;
             CHECK_EQ(fa_stream_seek(s, at), FA_OK);
             CHECK_EQ(fa_stream_read(s, out, 64, &got), FA_OK);
             CHECK_EQ(got, 64);
             for (i = 0; i < 64; i++) for (c = 0; c < 2; c++) {
-                float want = at + i < cases[q].quiet ? 0.0f : (float)tone(at + i, 44100, c) / 32768.0f;
+                float want = at + i < cases[q].quiet ? 0.0f : (float)flac_sample(at + i, 44100, c, cases[q].fake_syncs) / 32768.0f;
                 if (out[i * 2 + c] != want) {
                     fprintf(stderr, "  case %u, seek to %u: frame %u is %.9g, expected %.9g\n", (unsigned)q, at, at + i, out[i * 2 + c], want);
                     CHECK(0);
@@ -461,7 +474,7 @@ static void test_flac_seek_search(void)
             }
             if ((uint32_t)(m.seeks - before) > worst) worst = (uint32_t)(m.seeks - before);
         }
-        bytes = (m.bytes - bytes) / 40;
+        bytes = (m.bytes - bytes) / n;
         printf("  case %u: at most %u file seeks per seek, %u bytes read per seek\n", (unsigned)q, worst, (unsigned)bytes);
         CHECK(worst <= cases[q].max_seeks);
         CHECK(bytes <= cases[q].max_bytes);

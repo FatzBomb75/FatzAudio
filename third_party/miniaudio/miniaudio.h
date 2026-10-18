@@ -87810,7 +87810,7 @@ static ma_bool32 ma_dr_flac__read_next_flac_frame_header(ma_dr_flac_bs* bs, ma_u
             }
             crc8 = ma_dr_flac_crc8(crc8, header->blockSizeInPCMFrames, 16);
             if (header->blockSizeInPCMFrames == 0xFFFF) {
-                return MA_FALSE;
+                continue;   /* FatzAudio patch: a false sync (its CRC-8 is not checked yet), not the end */
             }
             header->blockSizeInPCMFrames += 1;
         } else {
@@ -87845,7 +87845,7 @@ static ma_bool32 ma_dr_flac__read_next_flac_frame_header(ma_dr_flac_bs* bs, ma_u
             header->bitsPerSample = streaminfoBitsPerSample;
         }
         if (header->bitsPerSample != streaminfoBitsPerSample) {
-            return MA_FALSE;
+            continue;   /* FatzAudio patch: a false sync (its CRC-8 is not checked yet), not the end */
         }
         if (!ma_dr_flac__read_uint8(bs, 8, &header->crc8)) {
             return MA_FALSE;
@@ -88334,6 +88334,7 @@ static ma_bool32 ma_dr_flac__seek_to_pcm_frame__binary_search_internal(ma_dr_fla
     ma_bool32 haveHi = MA_FALSE;
     int bisections = 0;                 /* still to make before interpolating again */
     int iFalse;
+    ma_bool32 nearNewHi;
     ma_uint64 lead = (pFlac->maxBlockSizeInPCMFrames != 0) ? pFlac->maxBlockSizeInPCMFrames : 4096;
     double guessBytesPerPCMFrame = (pFlac->channels * pFlac->bitsPerSample / 8.0) * MA_DR_FLAC_BINARY_SEARCH_APPROX_COMPRESSION_RATIO;
     int iProbe;
@@ -88375,10 +88376,12 @@ static ma_bool32 ma_dr_flac__seek_to_pcm_frame__binary_search_internal(ma_dr_fla
         if (frameLo < loPCM || (haveHi && frameLo > hiPCM) || (pFlac->totalPCMFrameCount != 0 && frameLo >= pFlac->totalPCMFrameCount)) {
             break;
         }
+        nearNewHi = MA_FALSE;
         if (frameLo > pcmFrameIndex) {
             if (probeByte <= loByte) {
                 break;
             }
+            nearNewHi = (!haveHi || frameLo < hiPCM) && frameLo - pcmFrameIndex <= lead * 2;
             hiByte = probeByte;
             hiPCM = frameLo;
             haveHi = MA_TRUE;
@@ -88406,7 +88409,9 @@ static ma_bool32 ma_dr_flac__seek_to_pcm_frame__binary_search_internal(ma_dr_fla
         }
         if (bisections > 0) {
             bisections -= 1;
-        } else if (haveHi && (hiByte - loByte) > span/2) {
+        } else if (haveHi && (hiByte - loByte) > span/2 && !nearNewHi) {
+            /* A probe that found a new upper frame within two blocks past the target landed where it
+             * aimed: no bisecting. Finding the same upper frame again does count as failing. */
             bisections = 2;
         }
     }
