@@ -8,7 +8,7 @@ loaded at runtime if the app has them.
 |---|---|---|
 | Windows x64 | `fatzaudio.dll` | CI: build and all tests |
 | macOS | `libfatzaudio.dylib` | CI: build and all tests |
-| Linux x64 | `libfatzaudio.so` | CI: build and all tests, plus ASan/UBSan |
+| Linux x64 | `libfatzaudio.so` | CI: build and all tests (including a dependency and export check), plus ASan/UBSan |
 | Android arm64-v8a, x86_64, armeabi-v7a, x86 | `libfatzaudio.so` per ABI | CI: build of every ABI with a dependency and export check; all tests on x86_64 and arm64 in an Android 14 user space ([below](#run-the-tests-without-a-device)) |
 | iOS device (arm64), simulator (arm64, x86_64) | `fatzaudio.xcframework` | CI: build only (iOS programs need a signed app to run) |
 
@@ -25,6 +25,13 @@ ctest --test-dir build -C Release --output-on-failure
 The library is written to `build/bin/` (`build/bin/Release/` with Visual Studio).
 On Windows use the "Visual Studio 18 2026" generator and keep any old compilers
 off `PATH`. Linux needs the ALSA headers for audio output (`libasound2-dev`).
+
+The C++ runtime is linked into the library on Windows and Linux, so
+`fatzaudio.dll` needs only Windows' own DLLs and `libfatzaudio.so` needs only the
+C library (`libc`, `libm`), whatever GCC version built it. On Linux only the
+`fa_*` functions are exported (`cmake/fatzaudio.map`), so the C++ runtime inside
+cannot clash with the app's. The `deps` test checks both on Windows and Linux.
+MinGW builds name the library `fatzaudio.dll`, like Visual Studio.
 
 ## Android
 

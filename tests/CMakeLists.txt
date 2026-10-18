@@ -11,6 +11,9 @@ if(WIN32)
         target_compile_definitions(fa_test_deps PRIVATE _CRT_SECURE_NO_WARNINGS)
     endif()
     add_test(NAME deps COMMAND fa_test_deps $<TARGET_FILE:fatzaudio>)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT "${CMAKE_C_FLAGS} ${CMAKE_CXX_FLAGS}" MATCHES "-fsanitize")
+    # Sanitizer builds link their runtimes dynamically on purpose.
+    add_test(NAME deps COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/check_deps_linux.sh $<TARGET_FILE:fatzaudio>)
 endif()
 
 add_executable(fa_test_core test_core.c)
