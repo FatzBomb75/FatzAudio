@@ -139,6 +139,44 @@ public class PlaybackTests
     }
 
     [Fact]
+    public async Task Loop_TurnedOnWhilePlaying_RaisesLooped()
+    {
+        using var engine = CreateHeadless();
+        using var output = engine.OpenOutput();
+        using var s = engine.OpenMemory(TestAudio.SineWav(seconds: 0.3));
+        var looped = new TaskCompletionSource<StreamEventArgs>(TaskCreationOptions.RunContinuationsAsynchronously);
+        s.Looped += (_, e) => looped.TrySetResult(e);
+        Assert.False(s.Loop);
+        s.PlayOn(output);
+        s.Loop = true;
+        Assert.True(s.Loop);
+        var e = await looped.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(0, e.Value);
+        Assert.True(e.Frame > 0);
+        Assert.NotEqual(StreamState.Ended, s.State);
+        s.Loop = false;
+        Assert.False(s.Loop);
+    }
+
+    [Fact]
+    public void Muted_KeepsVolume()
+    {
+        using var engine = CreateHeadless();
+        using var output = engine.OpenOutput();
+        using var s = engine.OpenMemory(TestAudio.SineWav(seconds: 1));
+        s.Volume = 0.7f;
+        s.Muted = true;
+        Assert.True(s.Muted);
+        Assert.Equal(0.7f, s.Volume, 3);
+        s.Muted = false;
+        Assert.False(s.Muted);
+        output.Muted = true;
+        Assert.True(output.Muted);
+        output.Muted = false;
+        Assert.False(output.Muted);
+    }
+
+    [Fact]
     public async Task RampAsync_CompletesWhenTheRampEnds()
     {
         using var engine = CreateHeadless();

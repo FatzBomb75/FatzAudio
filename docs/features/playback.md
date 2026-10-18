@@ -49,13 +49,14 @@ using var s = engine.OpenFile("track.flac", new StreamOptions { BufferLength = T
 | `fa_stream_stop` | Like pause, then rewinds to the cue-in (or 0) |
 | `fa_stream_seek` | Drops the buffer and decodes the first 100 ms at the new position before returning. Seeking a stopped stream leaves it paused there |
 | `fa_stream_detach` / moving to another device | The position continues from what was actually heard, not from what had been decoded ahead |
-| `FA_OPEN_LOOP` | The worker jumps back to the cue-in (or the start) at the cue-out (or the end) without a gap; the position wraps |
+| `FA_OPEN_LOOP` / `fa_stream_set_loop` | The worker jumps back to the cue-in (or the start) at the cue-out (or the end) without a gap; the position wraps and `FA_EVENT_LOOPED` is raised for each jump (as it is mixed, one device latency before it is heard, like markers). `fa_stream_set_loop` turns it on or off at any time, also while playing; turned off, the stream plays on to the cue-out and ends. Seekable streams only |
+| `fa_stream_set_mute` / `fa_device_set_mute` | Silence without touching the volume: glides over 5 ms, fades and ramps keep running, and unmuting brings the volume back. The device mute silences everything it plays |
 | Cue-out marker | The stream ends exactly there ([markers](crossfade.md#markers)) |
 
 ## Position and clock
 
 - `fa_stream_get_position`: source frames handed to the device. Frames decoded ahead into the buffer don't count.
-- `fa_stream_get_clock`: the presentation clock, the time of the audio leaving the speaker now, device latency included. It moves smoothly between audio callbacks, holds while paused, buffering or ended, and jumps on a seek. Sync video, CD+G and lyrics to it. Push and packet streams report your own timestamps ([FFmpeg hand-off](ffmpeg.md#following-the-clock-with-the-video)).
+- `fa_stream_get_clock`: the presentation clock, the time of the audio leaving the speaker now, device latency included. It moves smoothly between audio callbacks, holds while paused, buffering or ended, and jumps on a seek. Sync video, CD+G and lyrics to it. Push and packet streams report your own timestamps ([FFmpeg hand-off](ffmpeg.md#following-the-clock-with-the-video)). It is lock-free for streams on a device and for file streams: it never waits for a seek, a decode worker or the audio thread, so a render loop can call it every vsync, even at 240 Hz. Only a push or packet stream that isn't attached takes the stream's lock, briefly.
 - `fa_device_get_time` (.NET `OutputDevice.Time`): the device clock, the audio the device has mixed since it opened. Scheduled starts and ramps use it ([crossfade](crossfade.md#the-device-clock)).
 
 ```c
@@ -67,6 +68,22 @@ fa_stream_get_clock(s, &clock);
 ```csharp
 TimeSpan pos = song.Position;
 TimeSpan clock = song.Clock;  // for video/lyrics sync
+```
+
+## Loop and mute while playing
+
+```c
+fa_stream_set_loop(s, 1);       /* the Loop button: on at any time, also while playing */
+fa_stream_set_mute(s, 1);       /* silent; FA_PARAM_VOLUME keeps its value */
+fa_device_set_mute(dev, 1);     /* everything on this device */
+/* FA_EVENT_LOOPED: frame = the loop end it left, value = the loop start it went to */
+```
+
+```csharp
+song.Loop = true;
+song.Looped += (_, e) => Console.WriteLine($"looped from {e.Position}");
+song.Muted = true;
+output.Muted = true;
 ```
 
 ## Pitfalls

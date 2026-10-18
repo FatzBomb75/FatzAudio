@@ -42,6 +42,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_Pause | `fa_device_stop` (streams keep their position) | `device.Stop()` | ✅ |
 | BASS_IsStarted | `fa_device_is_started` | `device.IsStarted` | ✅ |
 | BASS_SetVolume / BASS_GetVolume | `fa_device_set_volume` / `get_volume` | `device.Volume` | ✅ |
+| Mute by saving the volume, setting BASS_ATTRIB_VOL (or BASS_SetVolume) to 0 and restoring it | `fa_stream_set_mute` / `fa_device_set_mute`: the volume is kept, fades keep running, 5 ms glide | `stream.Muted`, `device.Muted` | ✅ |
 | BASS_SetConfig / GetConfig (+Ptr) | `fa_engine_config` fields at creation; per-stream options | `AudioEngineOptions` | ✅ partially (rate, period, threads, cache dir) |
 | BASS_CONFIG_BUFFER | `fa_open_options.buffer_ms` per stream, default 500 ms ([playback](../features/playback.md#buffer-length)) | `StreamOptions.BufferLength` | ✅ |
 | BASS_CONFIG_NET_TIMEOUT / NET_READTIMEOUT | `fa_net_options.timeout_ms` per stream: connecting, and the longest the server may stay silent ([web streams](../features/web-streams.md#connection-settings)) | `NetworkOptions.Timeout` | ✅ |
@@ -118,7 +119,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_SYNC_POS used to end playback early (trim) | `FA_MARKER_CUE_OUT` (exact end) and `FA_MARKER_CUE_IN` | `Markers.CueOut`, `Markers.CueIn` | ✅ |
 | `FA_EVENT_MARKER` has no BASS equivalent | Raised when playback passes a marker | `MarkerReached` | ✅ |
 | BASS_SYNC_MIXTIME | Not needed: callbacks never run on the audio thread, so any call is safe in them. Sample-accurate actions are scheduled instead: `fa_stream_play_at`, ramps with a start time, and queues (`fa_stream_set_next`) that start the next track on the exact frame | — | ➖ (by design) |
-| BASS_ChannelSetDSP (+Ex) / RemoveDSP | `fa_stream_add_dsp` / `fa_stream_remove_dsp` | | 🧩 |
+| BASS_ChannelSetDSP (+Ex) / RemoveDSP | `fa_stream_add_dsp` / `fa_stream_remove_dsp`: same idea (in place, priority-ordered, higher first), plus the sample rate in the callback. Runs on a worker as the stream is decoded ahead, never the audio thread ([equalizer and DSP](../features/equalizer.md#user-dsp)) | `stream.AddDsp(...)` (dispose to remove) | ✅ |
 | BASS_ChannelGetLevel (+Ex) | `fa_stream_get_levels` | `GetLevels()` | 🧩 |
 | BASS_ChannelGetData (FFT) | Planned `fa_stream_get_spectrum` | | 🗓️ |
 | BASS_ChannelGetTags | `fa_stream_get_tags` for an open stream, or `fa_tags_read_path`/`_memory` without one: one reader for every format, common fields with `fa_tags_get(tags, FA_TAG_ARTIST)`, every item with `fa_tags_get_item` ([tags](../features/tags.md)) | `stream.GetTags()`, `Tags.Read(path)`: `tags.Artist`, `tags.Title`, ... | ✅ |
@@ -128,7 +129,8 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_ChannelGetTags `BASS_TAG_META` (ICY StreamTitle) | `fa_stream_get_metadata`: the title heard now, split into artist and title ([song titles](../features/web-streams.md#song-titles-icy-metadata)) | `stream.Metadata` | ✅ |
 | BASS_ChannelGetTags `BASS_TAG_ICY` / `BASS_TAG_HTTP` | `fa_stream_get_metadata` (station, genre, bitrate, ...) or any header by name with `fa_stream_get_http_header` | `stream.Metadata`, `GetHttpHeader(name)` | ✅ |
 | BASS_ChannelGetTags `BASS_TAG_HLS_*` | `fa_stream_get_info` (container `hls`, codec) and `fa_stream_get_net_status` (`is_hls`, media playlist URL) | `Info`, `NetworkStatus` | ✅ |
-| BASS_ChannelFlags (loop) | `FA_OPEN_LOOP`, looping between the cue-in and cue-out markers; runtime toggle planned | | ✅ open-time only |
+| BASS_ChannelFlags (BASS_SAMPLE_LOOP), at open or while playing | `FA_OPEN_LOOP` at open, `fa_stream_set_loop` at any time; loops between the cue-in and cue-out markers | `StreamOptions.Loop`, `stream.Loop` | ✅ |
+| BASS_SYNC_END on a looping channel, to notice a loop | `FA_EVENT_LOOPED` for each jump (raised as it is mixed, like markers): frame = the loop end it left, value = where it went | `stream.Looped` | ✅ |
 | BASS_POS_LOOP / BASS_POS_END (loop start, end position) | `FA_MARKER_CUE_IN` / `FA_MARKER_CUE_OUT` | `Markers.CueIn` / `Markers.CueOut` | ✅ |
 | BASS_ChannelSetLink / RemoveLink | `fa_stream_play_at` with the same time starts streams on the same frame; a bus ([buses](../features/buses.md)) groups their volume and pan | `PlayAt`, `MixBus` | ✅ |
 | BASS_ChannelLock | Not needed: parameter changes are applied atomically per buffer | — | ➖ (by design) |
@@ -153,9 +155,14 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 
 ### Effects
 
-| BASS | FatzAudio | Status |
+| BASS | FatzAudio (C; .NET: `SetEqualizer`, `SetEqualizerGain`, `EqualizerEnabled`, `Equalizer.GetPreset`) | Status |
 |---|---|---|
-| BASS_ChannelSetFX / RemoveFX, BASS_FXSetParameters / GetParameters / Reset / SetPriority / SetBypass / Free | One effects chain per stream (EQ, compressor, reverb, echo, chorus, flanger, distortion) | 🗓️ |
+| BASS_ChannelSetFX(BASS_FX_DX8_PARAMEQ) per band, or bass_fx `BASS_FX_BFX_PEAKEQ` with `lBand` per band + BASS_FXSetParameters | `fa_stream_set_eq` with up to 16 peak or shelf bands; `fa_stream_set_eq_gain` for one slider. No FX handles: one equalizer per stream, before volume and normalization, gliding without clicks, free when flat ([equalizer](../features/equalizer.md)) | ✅ |
+| `BASS_BFX_PEAKEQ.fCenter` / `fBandwidth` (octaves) / `fQ` / `fGain` | `fa_eq_band.frequency_hz` / `q` (one octave = 1.41) / `gain_db` | ✅ |
+| BASS_FXSetParameters to switch a whole EQ preset | `fa_eq_get_preset` + `fa_stream_set_eq` (13 presets) | ✅ |
+| BASS_FXSetBypass on the EQ | `fa_stream_set_eq_enabled(s, 0)`: glides to flat, keeps the bands | ✅ |
+| BASS_FXReset (clear the EQ's filter memory after a seek) | Not needed: cleared by itself on a seek, a flush and a restart | ➖ |
+| Other BASS_FX / bass_fx effects (compressor, reverb, echo, chorus, flanger, distortion, phaser, auto-wah, ...) | Not built in: a player rarely needs them, and `fa_stream_add_dsp` takes your own | ➖ (by design) |
 
 ### Loudness and normalization
 
@@ -384,6 +391,9 @@ BASS has no CD+G decoder: apps read the `.cdg` themselves, time it from `BASS_Ch
 | Timer: `BASS_ChannelGetPosition` → `Bytes2Seconds` → pack index → decode up to it | `fa_cdg_surface_update` (follows `fa_stream_get_clock`, device latency included) | `surface.Update()` | ✅ |
 | Your own sync offset | `fa_stream_set_cdg_offset` | `song.CdgOffset` | ✅ |
 | Converting the 300x216 index buffer to a bitmap, scaling, borders | `fa_cdg_surface_config`: BGRA/RGBA/indexed, any size, sharp or smooth, with or without border, transparent background, premultiplied | `CdgSurfaceOptions` | ✅ |
+| Your own transparency policy (background index only, ignoring transparent-colour packs), background opacity or colour | `FA_CDG_TRANSPARENT_BACKGROUND_ONLY`, `FA_CDG_HIDE_UNTIL_PRESET`, `FA_CDG_BACKGROUND_COLOR`, `FA_CDG_BACKGROUND_OPACITY`; or INDEXED8 with `fa_cdg_frame.background_index`, `border_index`, `transparency` | `CdgSurfaceOptions.TransparentBackgroundOnly`, `HideUntilPreset`, `BackgroundColor`, `BackgroundOpacity`; `CdgFrame.BackgroundIndex` | ✅ |
+| Tracking which render targets need a re-upload | `fa_cdg_frame.revision` / `palette_revision` | `CdgFrame.Revision` / `PaletteRevision` | ✅ |
+| Your own seek checkpoints so scrubbing doesn't replay the whole `.cdg` | Built in: checkpoints every 10 s, at load for files and as packs arrive for discs | Built in | ✅ |
 | Redrawing the whole bitmap each tick | Upload only `frame.dirty_*`, only when `frame.changed` | `frame.Changed`, `frame.Dirty` | ✅ |
 | CD+G from a disc via `BASS_CD_StreamCreate(..., BASS_CD_SUBCHANNEL)`, then de-interleaving the subchannel and decoding it yourself | `fa_stream_open_disc`: the graphics are read with the audio and drawn by the same surfaces ([disc playback](../features/disc.md#cdg-karaoke-discs)) | `engine.OpenDisc(disc, n)`, then `CreateCdgSurface()` | ✅ |
 

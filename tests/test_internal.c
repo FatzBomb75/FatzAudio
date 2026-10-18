@@ -27,7 +27,13 @@ static fa_device* g_dev;
 
 /* 16-bit mono WAV. kind 0: constant 0.5; kind 1: a sawtooth whose value encodes
  * the frame index (exact in float), so continuity can be checked sample by sample. */
-static int16_t sample_of(int kind, uint32_t i) { return kind == 0 ? 16384 : (int16_t)((int)(i % 4096) * 8 - 16384); }
+/* kind 2 / 3: a 1 kHz / 100 Hz sine at a quarter of full scale. */
+static int16_t sample_of(int kind, uint32_t i)
+{
+    if (kind >= 2)
+        return (int16_t)lrint(8192.0 * sin(2.0 * 3.14159265358979 * (kind == 2 ? 1000.0 : 100.0) * i / g_dev->rate));
+    return kind == 0 ? 16384 : (int16_t)((int)(i % 4096) * 8 - 16384);
+}
 static float expected(int kind, uint32_t i) { return (float)sample_of(kind, i) / 32768.0f; }
 
 static uint8_t* make_wav(uint32_t rate, uint32_t frames, int kind, size_t* size)
@@ -1023,6 +1029,432 @@ static void test_vorbis_imdct(void)
     }
 }
 
+/* Looping turned on while the decoder already reached the end (a restart at the
+ * position heard), then off again after it jumped back: playback stays continuous,
+ * LOOPED is raised for each jump heard, and the stream then ends at its length. */
+static void test_loop_toggle_while_playing(void)
+{
+    uint32_t len = 5000, i, done = 0;
+    fa_stream* s = open_attached(len, 1, 0);
+    float out[2 * 1000];
+    recorder rec;
+    int32_t on = -1;
+    rec_init(&rec);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(s, out, 1000);
+    done = 1000;
+    for (i = 0; i < 200 && !fa_load32(&s->eof); i++) fa_sleep_ms(5);
+    CHECK(fa_load32(&s->eof));                                         /* decoded to the end */
+    CHECK_EQ(fa_stream_set_loop(s, 1), FA_OK);
+    CHECK_EQ(fa_stream_get_loop(s, &on), FA_OK);
+    CHECK_EQ(on, 1);
+    while (done < 2 * len + 2000) {
+        render(s, out, 1000);
+        for (i = 0; i < 1000; i++) CHECK(out[i * 2] == expected(1, (done + i) % len));
+        done += 1000;
+    }
+    CHECK_EQ(count_events(&rec, FA_EVENT_LOOPED, 2), 2);
+    fa_mutex_lock(&rec.lock);
+    for (i = 0; i < (uint32_t)rec.count && i < 64; i++)
+        if (rec.ev[i].type == FA_EVENT_LOOPED) { CHECK_EQ(rec.ev[i].frame, len); CHECK_EQ(rec.ev[i].value, 0); }
+    fa_mutex_unlock(&rec.lock);
+    for (i = 0; i < 200; i++) {
+        int64_t head;
+        fa_mutex_lock(&s->decode_lock);
+        head = fa_load64(&s->seek_base) + s->decoded;
+        fa_mutex_unlock(&s->decode_lock);
+        if (head > (int64_t)(3 * len)) break;
+        fa_sleep_ms(5);
+    }
+    CHECK_EQ(fa_stream_set_loop(s, 0), FA_OK);                         /* decoded into the next turn */
+    while (done < 3 * len) {
+        render(s, out, 1000);
+        for (i = 0; i < 1000; i++) CHECK(out[i * 2] == expected(1, (done + i) % len));
+        done += 1000;
+    }
+    render(s, out, 1000);
+    for (i = 0; i < 1000; i++) CHECK(out[i * 2] == 0.0f);               /* ended at the length */
+    CHECK_EQ(count_events(&rec, FA_EVENT_ENDED, 1), 1);
+    CHECK_EQ(count_events(&rec, FA_EVENT_LOOPED, 2), 2);
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
+/* A loop shorter than a callback jumps back several times per callback: one
+ * LOOPED for each jump. */
+static void test_short_loop_counts_every_jump(void)
+{
+    fa_stream* s = open_attached(5000, 1, FA_OPEN_LOOP);
+    float out[2 * 1000];
+    recorder rec;
+    uint32_t i;
+    rec_init(&rec);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_marker(s, FA_MARKER_CUE_IN, 1000), FA_OK);
+    CHECK_EQ(fa_stream_set_marker(s, FA_MARKER_CUE_OUT, 1200), FA_OK);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);           /* starts at the cue-in */
+    render(s, out, 1000);                         /* 1000..1200 five times */
+    for (i = 0; i < 1000; i++) CHECK(out[i * 2] == expected(1, 1000 + i % 200));
+    CHECK_EQ(count_events(&rec, FA_EVENT_LOOPED, 5), 5);
+    fa_sleep_ms(50);
+    CHECK_EQ(count_events(&rec, FA_EVENT_LOOPED, 5), 5);
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
+static void test_loop_needs_seekable(void)
+{
+    fa_stream* s = NULL;
+    fa_audio_format f;
+    memset(&f, 0, sizeof(f));
+    f.sample_format = FA_FORMAT_F32; f.sample_rate = 48000; f.channels = 2;
+    CHECK_EQ(fa_stream_open_push(g_engine, &f, NULL, &s), FA_OK);
+    CHECK_EQ(fa_stream_set_loop(s, 1), FA_ERROR_NOT_SEEKABLE);
+    CHECK_EQ(fa_stream_set_loop(s, 0), FA_OK);
+    fa_stream_close(s);
+}
+
+/* render() and then the device clock moves on, as after a real callback. */
+static void render_on(fa_stream* s, float* out, uint32_t frames)
+{
+    render(s, out, frames);
+    fa_fetch_add64(&g_dev->clock, frames);
+}
+
+/* Mute glides to silence in 5 ms and back, keeping the volume; muted before the
+ * start, the very first sample is silent. */
+static void test_mute_glides_and_keeps_volume(void)
+{
+    uint32_t glide = g_dev->rate / 200, i;
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    float out[2 * 4096], vol = 0.0f;
+    int32_t m = -1;
+    CHECK(s != NULL);
+    CHECK(glide + 64 <= 4096);
+    CHECK_EQ(fa_stream_set_mute(s, 1), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render_on(s, out, 64);
+    for (i = 0; i < 64; i++) CHECK(out[i * 2] == 0.0f);
+    CHECK_EQ(fa_stream_set_mute(s, 0), FA_OK);
+    render_on(s, out, glide + 64);
+    CHECK(out[0] < 0.01f);                                   /* glides up from silence */
+    CHECK(out[glide / 2 * 2] > 0.1f && out[glide / 2 * 2] < 0.4f);
+    for (i = glide + 1; i < glide + 64; i++) CHECK_NEAR(out[i * 2], 0.5, 1e-6);
+    CHECK_EQ(fa_stream_set_mute(s, 1), FA_OK);
+    CHECK_EQ(fa_stream_get_mute(s, &m), FA_OK);
+    CHECK_EQ(m, 1);
+    render_on(s, out, glide + 64);
+    CHECK(out[0] > 0.49f);                                   /* no jump: glides down */
+    for (i = glide + 1; i < glide + 64; i++) CHECK(out[i * 2] == 0.0f);
+    CHECK_EQ(fa_stream_get_param(s, FA_PARAM_VOLUME, &vol), FA_OK);
+    CHECK_NEAR(vol, 1.0, 1e-9);
+    fa_stream_close(s);
+}
+
+static void test_device_mute(void)
+{
+    uint32_t glide = g_dev->rate / 200, i;
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    float out[2 * 4096];
+    int32_t m = -1;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(s, out, 64);
+    CHECK_EQ(fa_device_set_mute(g_dev, 1), FA_OK);
+    CHECK_EQ(fa_device_get_mute(g_dev, &m), FA_OK);
+    CHECK_EQ(m, 1);
+    for (i = 0; i < 2000 && fa_ring_readable(&s->ring) < (int64_t)(glide + 64); i++) fa_sleep_ms(1);
+    fa_fetch_add64(&g_dev->epoch, 1);
+    fa_device_render(g_dev, out, glide + 64);
+    fa_fetch_add64(&g_dev->epoch, 1);
+    for (i = glide + 1; i < glide + 64; i++) CHECK(out[i * 2] == 0.0f && out[i * 2 + 1] == 0.0f);
+    CHECK_EQ(fa_device_set_mute(g_dev, 0), FA_OK);
+    for (i = 0; i < 2000 && fa_ring_readable(&s->ring) < (int64_t)(glide + 64); i++) fa_sleep_ms(1);
+    fa_fetch_add64(&g_dev->epoch, 1);
+    fa_device_render(g_dev, out, glide + 64);
+    fa_fetch_add64(&g_dev->epoch, 1);
+    CHECK(out[(glide + 63) * 2] > 0.1f);
+    fa_stream_close(s);
+}
+
+typedef struct clock_probe { fa_stream* s; fa_atomic32 done; fa_atomic32 stop; fa_time t; } clock_probe;
+
+static void clock_hammer(void* arg)
+{
+    clock_probe* p = (clock_probe*)arg;
+    while (!fa_load32(&p->stop)) fa_stream_get_clock(p->s, &p->t);
+    fa_store32(&p->done, 1);
+}
+
+/* Lock-free reads while the stream moves on and off a device (TSan/ASan). */
+static void test_clock_during_attach_detach(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    clock_probe p;
+    fa_thread t;
+    int i;
+    CHECK(s != NULL);
+    memset(&p, 0, sizeof(p));
+    p.s = s;
+    CHECK(fa_thread_create(&t, clock_hammer, &p) == 0);
+    for (i = 0; i < 50; i++) {
+        CHECK_EQ(fa_stream_detach(s), FA_OK);
+        CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    }
+    fa_store32(&p.stop, 1);
+    fa_thread_join(&t);
+    fa_stream_close(s);
+}
+
+static void clock_probe_run(void* arg)
+{
+    clock_probe* p = (clock_probe*)arg;
+    fa_stream_get_clock(p->s, &p->t);
+    fa_store32(&p->done, 1);
+}
+
+/* A render loop's clock read must not wait behind a seek, which holds the API lock
+ * while it refills: this one holds it the whole time. */
+static void test_clock_never_waits_for_api_lock(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    clock_probe p;
+    fa_thread t;
+    int64_t deadline;
+    int done;
+    CHECK(s != NULL);
+    memset(&p, 0, sizeof(p));
+    p.s = s;
+    fa_mutex_lock(&s->api_lock);
+    CHECK(fa_thread_create(&t, clock_probe_run, &p) == 0);
+    deadline = fa_monotonic_ns() + 2000000000LL;
+    while (!fa_load32(&p.done) && fa_monotonic_ns() < deadline) fa_sleep_ms(1);
+    done = fa_load32(&p.done);
+    fa_mutex_unlock(&s->api_lock);
+    fa_thread_join(&t);
+    CHECK(done);
+    fa_stream_close(s);
+}
+
+/* Peak amplitude of the left channel over `n` frames. */
+static float peak_left(const float* out, uint32_t n)
+{
+    float p = 0.0f;
+    uint32_t i;
+    for (i = 0; i < n; i++) if (fabsf(out[i * 2]) > p) p = fabsf(out[i * 2]);
+    return p;
+}
+
+/* Renders 200 ms (the glide settles) and returns the peak of the next 20 ms. */
+static float settled_peak(fa_stream* s)
+{
+    float out[2 * 960];
+    uint32_t i;
+    for (i = 0; i < 10; i++) render_on(s, out, g_dev->rate / 50);
+    render_on(s, out, g_dev->rate / 50);
+    return peak_left(out, g_dev->rate / 50);
+}
+
+static void test_eq_peak_band_and_bypass(void)
+{
+    fa_stream* s = open_attached(g_dev->rate * 3, 2, 0);
+    fa_stream* low = open_attached(g_dev->rate * 3, 3, 0);
+    fa_eq_band b = { FA_EQ_PEAK, 1000.0f, 1.41f, 12.0f }, got[4];
+    uint32_t n = 0, i;
+    int32_t on = 0;
+    float out[2 * 960], p;
+    CHECK(s != NULL && low != NULL);
+    CHECK(g_dev->rate / 50 <= 960);
+    CHECK_EQ(fa_stream_set_eq(s, &b, 1), FA_OK);
+    CHECK_EQ(fa_stream_set_eq(low, &b, 1), FA_OK);
+    CHECK_EQ(fa_stream_get_eq(s, got, 4, &n), FA_OK);
+    CHECK_EQ(n, 1);
+    CHECK_NEAR(got[0].gain_db, 12.0, 1e-6);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    CHECK_EQ(fa_stream_play(low), FA_OK);
+    p = settled_peak(s);
+    CHECK_NEAR(20.0 * log10(p / 0.25), 12.0, 0.3);      /* the 1 kHz sine is boosted 12 dB */
+    p = settled_peak(low);
+    CHECK_NEAR(20.0 * log10(p / 0.25), 0.0, 1.0);       /* 100 Hz is 3.3 octaves away */
+    CHECK_EQ(fa_stream_set_eq_gain(s, 0, -6.0f), FA_OK);
+    CHECK_EQ(fa_stream_set_eq_gain(s, 1, 3.0f), FA_ERROR_INVALID_ARG);
+    p = settled_peak(s);
+    CHECK_NEAR(20.0 * log10(p / 0.25), -6.0, 0.3);
+    /* Bypassed: glides to flat, then the output is the input, bit for bit. */
+    CHECK_EQ(fa_stream_set_eq_enabled(s, 0), FA_OK);
+    CHECK_EQ(fa_stream_get_eq_enabled(s, &on), FA_OK);
+    CHECK_EQ(on, 0);
+    settled_peak(s);
+    CHECK_EQ(fa_stream_get_eq(s, got, 4, &n), FA_OK);
+    CHECK_EQ(n, 1);                                       /* the bands are kept */
+    {
+        fa_frames pos;
+        CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+        render_on(s, out, 480);
+        for (i = 0; i < 480; i++) CHECK(out[i * 2] == expected(2, (uint32_t)pos + i));
+    }
+    fa_stream_close(s);
+    fa_stream_close(low);
+}
+
+/* A gain change while playing glides: no step between samples bigger than the
+ * sine itself can make (2 pi f / rate of its amplitude), plus a little. */
+static void test_eq_change_is_smooth(void)
+{
+    fa_stream* s = open_attached(g_dev->rate * 3, 2, 0);
+    fa_eq_band b = { FA_EQ_PEAK, 1000.0f, 1.41f, 0.0f };
+    float out[2 * 960], prev = 0.0f, max_step = 0.0f;
+    uint32_t i, k;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_eq(s, &b, 1), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render_on(s, out, 480);
+    prev = out[479 * 2];
+    CHECK_EQ(fa_stream_set_eq_gain(s, 0, 18.0f), FA_OK);
+    for (k = 0; k < 10; k++) {
+        render_on(s, out, 480);
+        for (i = 0; i < 480; i++) {
+            float d = fabsf(out[i * 2] - prev);
+            if (d > max_step) max_step = d;
+            prev = out[i * 2];
+        }
+    }
+    /* At +18 dB the sine is 0.25 * 7.94 = 1.99; its biggest step is 2 pi 1000/rate of that. */
+    CHECK(max_step < 1.99f * 6.2832f * 1000.0f / (float)g_dev->rate * 1.2f);
+    fa_stream_close(s);
+}
+
+/* After a seek the filters start from rest, so no ringing of the old audio: the
+ * output equals a stream that starts fresh at that position. */
+static void test_eq_memory_cleared_on_seek(void)
+{
+    fa_stream* a = open_attached(g_dev->rate * 3, 2, 0);
+    fa_stream* b = open_attached(g_dev->rate * 3, 2, 0);
+    fa_eq_band band = { FA_EQ_PEAK, 1000.0f, 8.0f, 18.0f };
+    float oa[2 * 480], ob[2 * 480];
+    uint32_t i;
+    CHECK(a != NULL && b != NULL);
+    CHECK_EQ(fa_stream_set_eq(a, &band, 1), FA_OK);
+    CHECK_EQ(fa_stream_set_eq(b, &band, 1), FA_OK);
+    CHECK_EQ(fa_stream_play(a), FA_OK);
+    for (i = 0; i < 20; i++) render_on(a, oa, 480);   /* settled, ringing at 1 kHz */
+    CHECK_EQ(fa_stream_seek(a, 12345), FA_OK);
+    CHECK_EQ(fa_stream_seek(b, 12345), FA_OK);
+    b->eq = a->eq;                                     /* same glide state, filters at rest */
+    for (i = 0; i < FA_EQ_MAX_BANDS; i++) memset(b->eq.band[i].z, 0, sizeof(b->eq.band[i].z));
+    CHECK_EQ(fa_stream_play(b), FA_OK);
+    render_on(a, oa, 480);
+    b->mute_next = a->mute_next - 480;                    /* b continues "its" last mix too */
+    fa_store32(&b->eq_restart, 0);
+    {
+        int64_t c = fa_load64(&g_dev->clock);
+        fa_store64(&g_dev->clock, c - 480);
+        render_on(b, ob, 480);
+    }
+    for (i = 0; i < 480; i++) CHECK_NEAR(oa[i * 2], ob[i * 2], 1e-6);
+    fa_stream_close(a);
+    fa_stream_close(b);
+}
+
+static void test_eq_presets(void)
+{
+    fa_eq_band b[FA_EQ_PRESET_BANDS];
+    uint32_t n = 0, i;
+    int p;
+    for (p = 0; p < FA_EQ_PRESET_COUNT; p++) {
+        CHECK_EQ(fa_eq_get_preset((fa_eq_preset)p, b, &n), FA_OK);
+        CHECK_EQ(n, FA_EQ_PRESET_BANDS);
+        CHECK(fa_eq_preset_name((fa_eq_preset)p) != NULL);
+        for (i = 0; i < n; i++) CHECK(b[i].type == FA_EQ_PEAK && b[i].gain_db >= -12.0f && b[i].gain_db <= 12.0f);
+    }
+    CHECK_EQ(fa_eq_get_preset(FA_EQ_PRESET_FLAT, b, &n), FA_OK);
+    for (i = 0; i < n; i++) CHECK(b[i].gain_db == 0.0f);
+    CHECK(strcmp(fa_eq_preset_name(FA_EQ_PRESET_ROCK), "Rock") == 0);
+    CHECK_EQ(fa_eq_get_preset(FA_EQ_PRESET_COUNT, b, &n), FA_ERROR_INVALID_ARG);
+    CHECK(fa_eq_preset_name(FA_EQ_PRESET_COUNT) == NULL);
+}
+
+/* A flat preset on a playing stream changes nothing: bit-exact. */
+static void test_eq_flat_is_free(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 1, 0);
+    fa_eq_band b[FA_EQ_PRESET_BANDS];
+    uint32_t n = 0, i;
+    float out[2 * 480];
+    CHECK(s != NULL);
+    CHECK_EQ(fa_eq_get_preset(FA_EQ_PRESET_FLAT, b, &n), FA_OK);
+    CHECK_EQ(fa_stream_set_eq(s, b, n), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render_on(s, out, 480);
+    for (i = 0; i < 480; i++) CHECK(out[i * 2] == expected(1, i));
+    CHECK(!s->eq.active);
+    fa_stream_close(s);
+}
+
+static void FA_CALL dsp_double(float* f, fa_frames n, uint32_t ch, uint32_t rate, void* user)
+{
+    fa_frames i;
+    (void)rate; (void)user;
+    for (i = 0; i < n * (fa_frames)ch; i++) f[i] *= 2.0f;
+}
+
+static void FA_CALL dsp_add(float* f, fa_frames n, uint32_t ch, uint32_t rate, void* user)
+{
+    fa_frames i;
+    float* seen_rate = (float*)user;
+    *seen_rate = (float)rate;
+    for (i = 0; i < n * (fa_frames)ch; i++) f[i] += 0.125f;
+}
+
+/* Higher priority first: add (priority 5) then double (0) = (x + 0.125) * 2. */
+static void test_dsp_order_and_remove(void)
+{
+    fa_stream* s = open_attached(g_dev->rate * 2, 0, 0);
+    uint32_t id_double = 0, id_add = 0, i;
+    float out[2 * 256], rate_seen = 0.0f;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_add_dsp(s, dsp_double, NULL, 0, &id_double), FA_OK);
+    CHECK_EQ(fa_stream_add_dsp(s, dsp_add, &rate_seen, 5, &id_add), FA_OK);
+    CHECK(id_double != id_add);
+    CHECK_EQ(fa_stream_seek(s, 0), FA_OK);              /* drop what was decoded before */
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(s, out, 256);
+    for (i = 0; i < 256; i++) CHECK_NEAR(out[i * 2], (0.5 + 0.125) * 2.0, 1e-6);
+    CHECK_NEAR(rate_seen, (double)g_dev->rate, 0.5);
+    CHECK_EQ(fa_stream_remove_dsp(s, id_add), FA_OK);
+    CHECK_EQ(fa_stream_remove_dsp(s, id_add), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_remove_dsp(s, id_double), FA_OK);
+    CHECK_EQ(fa_stream_seek(s, 256), FA_OK);
+    render(s, out, 256);
+    for (i = 0; i < 256; i++) CHECK_NEAR(out[i * 2], 0.5, 1e-6);
+    CHECK_EQ(fa_stream_add_dsp(s, NULL, NULL, 0, NULL), FA_ERROR_INVALID_ARG);
+    fa_stream_close(s);
+}
+
+static void test_dsp_on_decode_only(void)
+{
+    size_t sz;
+    uint8_t* wav = make_wav(22050, 1000, 0, &sz);
+    fa_open_options o;
+    fa_stream* s = NULL;
+    float buf[1000], rate_seen = 0.0f;
+    fa_frames got = 0;
+    uint32_t id = 0;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    CHECK(fa_stream_open_memory(g_engine, wav, sz, &o, &s) == FA_OK);
+    free(wav);
+    CHECK_EQ(fa_stream_add_dsp(s, dsp_add, &rate_seen, 0, &id), FA_OK);
+    CHECK_EQ(fa_stream_read(s, buf, 1000, &got), FA_OK);
+    CHECK(got > 0);
+    CHECK_NEAR(buf[0], 0.5 + 0.125, 1e-6);
+    CHECK_NEAR(rate_seen, 22050.0, 0.5);
+    fa_stream_close(s);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -1063,6 +1495,20 @@ int main(void)
     RUN(test_full_queue_never_drops);
     RUN(test_vorbis_imdct);
     RUN(test_source_prefix_dropped);
+    RUN(test_loop_toggle_while_playing);
+    RUN(test_short_loop_counts_every_jump);
+    RUN(test_loop_needs_seekable);
+    RUN(test_mute_glides_and_keeps_volume);
+    RUN(test_device_mute);
+    RUN(test_clock_never_waits_for_api_lock);
+    RUN(test_clock_during_attach_detach);
+    RUN(test_eq_peak_band_and_bypass);
+    RUN(test_eq_change_is_smooth);
+    RUN(test_eq_memory_cleared_on_seek);
+    RUN(test_eq_presets);
+    RUN(test_eq_flat_is_free);
+    RUN(test_dsp_order_and_remove);
+    RUN(test_dsp_on_decode_only);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

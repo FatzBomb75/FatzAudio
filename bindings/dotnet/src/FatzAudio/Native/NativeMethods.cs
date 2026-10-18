@@ -57,6 +57,12 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_device_set_volume(DeviceHandle device, float volume);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_device_set_mute(DeviceHandle device, int muted);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_device_get_mute(DeviceHandle device, out int muted);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_device_get_volume(DeviceHandle device, out float volume);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
@@ -162,6 +168,18 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_clock(StreamHandle stream, out long pts);
 
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_loop(StreamHandle stream, int on);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_loop(StreamHandle stream, out int on);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_mute(StreamHandle stream, int muted);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_mute(StreamHandle stream, out int muted);
+
     // ---- CD+G --------------------------------------------------------------
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_load_cdg_path(StreamHandle stream, string? path);
@@ -174,6 +192,9 @@ internal static unsafe partial class NativeMethods
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_cdg_offset(StreamHandle stream, out long offset);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_cdg_info(StreamHandle stream, out FaCdgInfo info);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_set_dynamic_range(StreamHandle stream, int mode);
@@ -349,7 +370,28 @@ internal static unsafe partial class NativeMethods
 
     // ---- User DSP ----------------------------------------------------------
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
-    public static partial int fa_stream_add_dsp(StreamHandle stream, delegate* unmanaged[Cdecl]<float*, long, uint, void*, void> callback, void* user, int priority, out uint dspId);
+    public static partial int fa_stream_add_dsp(StreamHandle stream, delegate* unmanaged[Cdecl]<float*, long, uint, uint, void*, void> callback, void* user, int priority, out uint dspId);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_eq(StreamHandle stream, FaEqBand* bands, uint count);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_eq(StreamHandle stream, FaEqBand* bands, uint capacity, out uint count);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_eq_gain(StreamHandle stream, uint band, float gainDb);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_eq_enabled(StreamHandle stream, int enabled);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_eq_enabled(StreamHandle stream, out int enabled);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_eq_get_preset(int preset, FaEqBand* bands, uint* count);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial byte* fa_eq_preset_name(int preset);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_remove_dsp(StreamHandle stream, uint dspId);

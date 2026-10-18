@@ -694,9 +694,67 @@ struct fa_device {
     fa_atomic32 spilled;         /* 1 = some stream on this device used its spill slots */
     fa_atomic32 publishing;      /* audio thread is between taking a sequence number and publishing */
     fa_limiter limiter;          /* audio thread only */
+    fa_atomic32 muted;           /* fa_device_set_mute */
+    float mute_level;            /* audio thread: 0 = audible .. 1 = silent */
     fa_atomic_ptr encoders;      /* fa_enc_list* recording the output (encode.c) */
     struct fa_device* next;      /* engine->devices */
 };
+
+/* Mute level (0 = audible, 1 = silent) after `n` frames gliding toward `target`:
+ * a full mute or unmute takes 5 ms, like a volume change. */
+static inline float fa_mute_glide(float level, float target, int64_t n, uint32_t rate)
+{
+    float step = rate ? (float)n / ((float)rate * 0.005f) : 1.0f;
+    if (level < target) return level + step < target ? level + step : target;
+    return level - step > target ? level - step : target;
+}
+/* ---- Equalizer (eq.c) --------------------------------------------------------
+ * API threads write the bands (one at a time: `seq` odd while writing); the audio
+ * thread copies them when `seq` changed and was even before and after its read. */
+typedef struct fa_eq_shared {
+    fa_atomic32 seq;
+    fa_atomic32 count, enabled;
+    fa_atomic32 type[FA_EQ_MAX_BANDS];
+    fa_atomic32 freq[FA_EQ_MAX_BANDS], q[FA_EQ_MAX_BANDS], gain[FA_EQ_MAX_BANDS];  /* float bits */
+} fa_eq_shared;
+
+typedef struct fa_eq_bandstate {
+    int32_t type;
+    float f, q, g;               /* applied now (gliding) */
+    float tf, tq, tg;            /* targets */
+    float b0, b1, b2, a1, a2;
+    float z[2][2];               /* per channel */
+    int dirty;                   /* coefficients need a redesign */
+} fa_eq_bandstate;
+
+typedef struct fa_eq_state {     /* audio thread only */
+    int32_t seen;                /* fa_eq_shared.seq taken last, -1 = none */
+    uint32_t rate;
+    int active;
+    uint32_t blocks;             /* fa_eq_process calls, paces redesigns while gliding */
+    fa_eq_bandstate band[FA_EQ_MAX_BANDS];
+} fa_eq_state;
+
+void fa_eq_shared_init(fa_eq_shared* sh);
+void fa_eq_reset(fa_eq_state* st);
+/* Start of a mix: takes new bands; `restart` clears the filter memory (the audio
+ * does not continue the last mix). Returns 0 when the EQ is flat (skip it). */
+int fa_eq_begin(fa_eq_state* st, fa_eq_shared* sh, uint32_t rate, int restart);
+/* Glides and filters `n` stereo frames in place. */
+void fa_eq_process(fa_eq_state* st, float* buf, int64_t n);
+
+/* User DSP (fa_stream_add_dsp): an immutable list, replaced as a whole. */
+typedef struct fa_dsp_entry {
+    fa_dsp_callback callback;
+    void* user;
+    int32_t priority;
+    uint32_t id;
+} fa_dsp_entry;
+
+typedef struct fa_dsp_list {
+    uint32_t count;
+    fa_dsp_entry items[1];
+} fa_dsp_list;
 
 /* ---- Parameter lanes (lane.c) --------------------------------------------
  * One automatable value (stream volume, pan, crossfade gain; bus volume, pan).
@@ -806,9 +864,19 @@ struct fa_stream {
     fa_atomic64 position;        /* source frames, when not attached */
     fa_atomic64 markers[FA_MARKER_COUNT];  /* read by the worker and the audio thread */
     fa_shape_atomic fade_shape[2];         /* FA_FADE_IN, FA_FADE_OUT */
+    fa_atomic32 loop;            /* 1 = loops (FA_OPEN_LOOP, fa_stream_set_loop); changed
+                                    under decode_lock, or while the mixer skips the stream */
+    fa_atomic32 muted;           /* fa_stream_set_mute */
+    float mute_level;            /* audio thread: 0 = audible .. 1 = silent, glides to `muted` */
+    int64_t mute_next;           /* audio thread: device frame right after the last one mixed
+                                    (the mute and the equalizer glide only across continuous mixes) */
 
     /* Decode-ahead, valid while attached. Worker-owned under decode_lock. */
     fa_device* device;           /* written under api_lock */
+    /* The device for fa_stream_get_clock, which takes no lock: set once the voice is
+     * live, cleared first on detach, which then waits for clock_readers to drain. */
+    fa_atomic_ptr clock_device;
+    fa_atomic32 clock_readers;
     fa_atomic_ptr bus;           /* fa_bus*, NULL = master; read by the audio thread */
     uint32_t dev_rate;
     fa_ring ring;
@@ -844,6 +912,11 @@ struct fa_stream {
     struct fa_push* push;        /* NULL for file, memory and I/O streams */
     fa_atomic64 played_audible;  /* frames played since the last flush (stall events) */
     int stalled;                 /* audio thread: FA_EVENT_STALLED raised, RESUMED owed */
+    fa_eq_shared eq_shared;
+    fa_eq_state eq;              /* audio thread */
+    fa_atomic32 eq_restart;      /* 1 = the timeline restarted: clear the EQ's memory */
+    fa_atomic_ptr dsps;          /* fa_dsp_list*, read by whoever decodes (under decode_lock) */
+    uint32_t dsp_next_id;        /* under api_lock */
     /* Push streams, under decode_lock: the source frames at which the app's timeline
      * restarted, so audio kept across a detach (carry) keeps its timestamps. */
     int64_t anchor_pos[FA_SRC_ANCHORS], anchor_pts[FA_SRC_ANCHORS];
@@ -905,6 +978,7 @@ struct fa_stream {
     uint32_t tempo_latency_ms;
     fa_tempo* tempo;             /* NULL until a parameter first leaves neutral */
     int tempo_drained;           /* the chain gave back its tail at the end of the source */
+    int jumped_back;             /* a loop jumped back since the last restart (decode side) */
     int64_t tempo_frames;        /* chain output frames since the last restart */
     fa_tmap tmap;
     fa_atomic32 tempo_live;      /* the chain is engaged: decode-ahead is kept short */

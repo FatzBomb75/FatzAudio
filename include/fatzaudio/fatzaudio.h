@@ -191,6 +191,10 @@ FA_API fa_result FA_CALL fa_device_stop(fa_device* device);
 FA_API fa_result FA_CALL fa_device_is_started(fa_device* device, int32_t* out_started);
 FA_API fa_result FA_CALL fa_device_set_volume(fa_device* device, float volume);
 FA_API fa_result FA_CALL fa_device_get_volume(fa_device* device, float* out_volume);
+/* Mutes everything the device plays, keeping its volume; glides over 5 ms. An
+ * encoder recording the device (fa_encoder_attach_device) records the silence too. */
+FA_API fa_result FA_CALL fa_device_set_mute(fa_device* device, int32_t muted);
+FA_API fa_result FA_CALL fa_device_get_mute(fa_device* device, int32_t* out_muted);
 FA_API fa_result FA_CALL fa_device_get_latency(fa_device* device, fa_time* out_latency);
 /* The device's sample clock: how much audio it has mixed since it was opened, in
  * nanoseconds (frames mixed / sample rate). It starts at 0, advances only while the
@@ -230,7 +234,8 @@ typedef struct fa_io_callbacks {
 
 typedef enum fa_open_flags {
     FA_OPEN_DECODE_ONLY = 1 << 0,  /* not attached to a device; pull with fa_stream_read */
-    FA_OPEN_LOOP        = 1 << 1,
+    FA_OPEN_LOOP        = 1 << 1,  /* loop from CUE_OUT back to CUE_IN; fa_stream_set_loop
+                                      turns it on or off later */
     FA_OPEN_PRESCAN     = 1 << 2,  /* build exact seek index / length before returning */
     FA_OPEN_NO_NORMALIZE = 1 << 3, /* opt this stream out of engine normalization
                                       (jingles, sound effects, already-mastered mixes) */
@@ -869,6 +874,22 @@ FA_API fa_result FA_CALL fa_stream_seek(fa_stream* stream, fa_frames frame);
  * Frames decoded ahead into the buffer are not counted. */
 FA_API fa_result FA_CALL fa_stream_get_position(fa_stream* stream, fa_frames* out_frame);
 
+/* Looping on or off at any time, also while playing (FA_OPEN_LOOP sets it at open).
+ * A looping stream plays from CUE_OUT (or the end) back to CUE_IN (or 0) without a
+ * gap and raises FA_EVENT_LOOPED each time it jumps back (like markers, raised as the
+ * audio is mixed, one device latency before it is heard). Turning it off lets
+ * the stream play on to CUE_OUT and end. Only seekable streams loop: push, packet
+ * and forward-only web streams return FA_ERROR_NOT_SEEKABLE for on = 1. */
+FA_API fa_result FA_CALL fa_stream_set_loop(fa_stream* stream, int32_t on);
+FA_API fa_result FA_CALL fa_stream_get_loop(fa_stream* stream, int32_t* out_on);
+
+/* Mute: silent without touching FA_PARAM_VOLUME, so unmuting brings back the volume
+ * (and any fade or ramp, which keeps running while muted). It glides over 5 ms, like
+ * a volume change, so it never clicks. The stream keeps playing and its position,
+ * clock, markers and events carry on as usual. */
+FA_API fa_result FA_CALL fa_stream_set_mute(fa_stream* stream, int32_t muted);
+FA_API fa_result FA_CALL fa_stream_get_mute(fa_stream* stream, int32_t* out_muted);
+
 /* The presentation clock: the timestamp of the audio leaving the speaker right
  * now, in nanoseconds. Follow it with your video (or CD+G) renderer: show the
  * frame whose pts is closest to the clock, and the picture stays in sync by itself.
@@ -881,7 +902,12 @@ FA_API fa_result FA_CALL fa_stream_get_position(fa_stream* stream, fa_frames* ou
  *   the speaker), jumps to the target on a seek, and continues when playback does.
  * - File streams: the position in the file as time (0 = the start). Push and
  *   packet streams: in your own timeline, the pts you pushed.
- * Streams that are not attached report the time of their next frame. */
+ * Streams that are not attached report the time of their next frame.
+ *
+ * Cheap and safe from a render loop: for attached streams and file streams it takes
+ * no lock and never waits for a seek, a worker or the audio thread, so it can be
+ * called every vsync (240 Hz and more) from any thread. Push and packet streams
+ * that are not attached take the stream's lock briefly. */
 FA_API fa_result FA_CALL fa_stream_get_clock(fa_stream* stream, fa_time* out_pts);
 
 /* Decode-only streams (FA_OPEN_DECODE_ONLY): pull interleaved F32 PCM in the
@@ -1234,8 +1260,20 @@ typedef enum fa_cdg_flags {
                                        transparent are too: for lyrics over video */
     FA_CDG_PREMULTIPLIED = 1 << 2,  /* colour multiplied by alpha (WPF Pbgra32, Direct2D,
                                        most compositors). Without it alpha is straight */
-    FA_CDG_SMOOTH        = 1 << 3   /* bilinear scaling instead of sharp (nearest) pixels;
+    FA_CDG_SMOOTH        = 1 << 3,  /* bilinear scaling instead of sharp (nearest) pixels;
                                        ignored for INDEXED8 */
+    FA_CDG_TRANSPARENT_BACKGROUND_ONLY = 1 << 4, /* like FA_CDG_TRANSPARENT, but only the
+                                       background colour is transparent: transparent-colour
+                                       packs are ignored (some discs set them in ways that
+                                       punch holes in the lyrics). Wins over FA_CDG_TRANSPARENT */
+    FA_CDG_HIDE_UNTIL_PRESET = 1 << 5, /* every colour is fully transparent until the first
+                                       screen clear (memory preset), so a picture or video
+                                       underneath shows instead of a black screen */
+    FA_CDG_BACKGROUND_COLOR = 1 << 6, /* fa_cdg_surface_config.background_color replaces the
+                                       background colour, alpha included */
+    FA_CDG_BACKGROUND_OPACITY = 1 << 7 /* fa_cdg_surface_config.background_opacity sets how
+                                       opaque the background colour is, whatever the flags
+                                       above make it */
 } fa_cdg_flags;
 
 typedef struct fa_cdg_surface_config {
@@ -1244,6 +1282,10 @@ typedef struct fa_cdg_surface_config {
     uint32_t width, height;            /* output size in pixels; 0 = native (300x216, or
                                           288x192 with FA_CDG_NO_BORDER); max 8192 */
     uint32_t flags;                    /* fa_cdg_flags */
+    uint32_t background_color;         /* 0xAARRGGBB, with FA_CDG_BACKGROUND_COLOR */
+    uint32_t background_opacity;       /* 0..100 %, with FA_CDG_BACKGROUND_OPACITY: the
+                                          background's alpha is this share of 255 (or of
+                                          background_color's alpha) */
 } fa_cdg_surface_config;
 
 FA_API void FA_CALL fa_cdg_surface_config_init(fa_cdg_surface_config* config);
@@ -1263,9 +1305,49 @@ typedef struct fa_cdg_frame {
     uint32_t dirty_x, dirty_y;         /* the pixels that changed, in output pixels; upload just
                                           this rectangle. All 0 when no pixel changed */
     uint32_t dirty_width, dirty_height;
-    uint8_t palette[16][4];            /* R, G, B, A of colours 0..15 (straight alpha) */
+    uint8_t palette[16][4];            /* R, G, B, A of colours 0..15 (straight alpha). A is
+                                          255 unless a transparency or background flag or
+                                          option is set; RGB never has alpha folded in */
     fa_time time;                      /* position on the graphics timeline that is shown */
+    /* The decoder's own state, for apps that apply their own transparency policy: */
+    int32_t background_index;          /* colour of the last memory preset (screen clear);
+                                          -1 before the first one, or without graphics */
+    int32_t border_index;              /* colour of the last border preset; -1 before one */
+    uint8_t transparency[16];          /* from transparent-colour packs: 0 opaque .. 63
+                                          invisible, whatever the surface's flags */
+    uint8_t background[4];             /* R, G, B, A the background is drawn with (palette
+                                          entry background_index, or background_color with
+                                          FA_CDG_BACKGROUND_COLOR): to fill the area around
+                                          a scaled picture. All 0 while background_index
+                                          is -1 */
+    uint64_t revision;                 /* goes up by one whenever an update changes a pixel
+                                          (1 after the first update): compare it with the one
+                                          a render target last uploaded */
+    uint64_t palette_revision;         /* goes up whenever palette, background_index,
+                                          border_index or transparency change */
 } fa_cdg_frame;
+
+/* What a stream's graphics are and where they come from. */
+typedef enum fa_cdg_source {
+    FA_CDG_SOURCE_NONE = 0,            /* no graphics */
+    FA_CDG_SOURCE_FILE,                /* a .cdg file, a ZIP entry or a memory block */
+    FA_CDG_SOURCE_DISC                 /* a CD+G disc's subcode, read while the track plays */
+} fa_cdg_source;
+
+typedef struct fa_cdg_info {
+    fa_cdg_source source;
+    uint64_t pack_count;               /* 300 per second (a disc track's whole length) */
+    fa_time checkpoint_interval;       /* seeks replay at most this much (10 s, longer for
+                                          files over 30 minutes) */
+    uint32_t checkpoint_count;         /* built so far. Files: all of them once the stream's
+                                          first surface exists (0 before; a few ms for a
+                                          song). Discs: as the packs arrive */
+    int32_t disc_parity;               /* discs: 1 = the subcode layout was chosen by the
+                                          packs' P/Q parity, 0 = by counting instructions
+                                          (drives that zero the parity). Either way the packs
+                                          are applied as read, without correction. -1 for
+                                          other sources */
+} fa_cdg_info;
 
 /* Attaches graphics to any stream, replacing what it had. The file or block is read
  * in full (memory is copied); path NULL removes the graphics. FA_ERROR_NOT_FOUND if
@@ -1276,19 +1358,36 @@ FA_API fa_result FA_CALL fa_stream_load_cdg_memory(fa_stream* stream, const void
  * For files that are out of sync; default 0. */
 FA_API fa_result FA_CALL fa_stream_set_cdg_offset(fa_stream* stream, fa_time offset);
 FA_API fa_result FA_CALL fa_stream_get_cdg_offset(fa_stream* stream, fa_time* out_offset);
+/* Never blocks on a load. A disc track reports FA_CDG_SOURCE_NONE until its graphics
+ * are found. */
+FA_API fa_result FA_CALL fa_stream_get_cdg_info(fa_stream* stream, fa_cdg_info* out_info);
 
 /* config NULL = BGRA32, native size. A stream without graphics gives a blank
  * (black) picture until graphics are loaded. Destroy every surface you create, before
  * or after closing its stream (not while fa_stream_close runs): once the stream is
- * closed, updates return FA_ERROR_INVALID_ARG. One surface is updated from one
- * thread at a time; different surfaces may be updated from different threads. */
+ * closed, updates return FA_ERROR_INVALID_ARG.
+ *
+ * Threads: one surface is updated from one thread at a time; different surfaces may
+ * be updated from different threads. An update runs on the caller's thread and never
+ * waits for the device or decode threads: it shares one short lock per stream with
+ * graphics loads, disc pack writes and the stream's other surfaces. An update with
+ * nothing new compares the palette and returns; it copies no pixels. */
 FA_API fa_result FA_CALL fa_cdg_surface_create(fa_stream* stream, const fa_cdg_surface_config* config, fa_cdg_surface** out_surface);
 FA_API void FA_CALL fa_cdg_surface_destroy(fa_cdg_surface* surface);
-/* Draws the picture for the audio heard right now. Cheap when nothing changed: call
- * it every frame and upload only when out_frame->changed. */
+/* Draws the picture for the audio heard right now (fa_stream_get_clock). Cheap when
+ * nothing changed: call it every frame and upload only when out_frame->changed. */
 FA_API fa_result FA_CALL fa_cdg_surface_update(fa_cdg_surface* surface, fa_cdg_frame* out_frame);
-/* Same, at a position you choose on the stream's timeline (ns from its start, the
- * offset still applies): for your own clock, previews, or rendering to a video file. */
+/* Same, at a position you choose on the stream's timeline: for your own clock,
+ * previews, or rendering to a video file.
+ *
+ * Timing, exactly: with g = time - the stream's CD+G offset (fa_stream_set_cdg_offset),
+ * the picture shows packs [0, ceil(g * 300 / 1e9)) applied, g in ns. Pack n occupies
+ * [n/300 s, (n+1)/300 s) and counts as soon as its slot starts: at g = 1 s exactly
+ * packs 0..299 are applied, at 1 s + 1 ns packs 0..300. g <= 0 shows no pack.
+ *
+ * Seeking anywhere replays at most fa_cdg_info.checkpoint_interval of packs from a
+ * checkpoint, even the first time and in parts never played (on a disc: in the parts
+ * read so far). */
 FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_time time, fa_cdg_frame* out_frame);
 
 /* ---- MIDI ---------------------------------------------------------------
@@ -1433,8 +1532,9 @@ FA_API fa_result FA_CALL fa_stream_get_midi_channel_mute(fa_stream* stream, uint
  * FA_EVENT_RAMP_DONE       position               fa_ramp.tag of the finished ramp
  * FA_EVENT_STARTED         position               0
  * FA_EVENT_MIDI_TEXT       the text's frame       index for fa_stream_get_midi_text
+ * FA_EVENT_LOOPED          loop end it left       loop start it went to (CUE_IN or 0)
  *
- * Delivered today: ENDED, MARKER, LOUDNESS_FINAL, RAMP_DONE and STARTED; MIDI_TEXT from MIDI
+ * Delivered today: ENDED, MARKER, LOOPED, LOUDNESS_FINAL, RAMP_DONE and STARTED; MIDI_TEXT from MIDI
  * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); METADATA from web
  * streams; STALLED and RESUMED from push, packet and web streams; DECODE_ERROR from packet
  * and disc streams. The others are raised by the features that produce them as those land (see docs/features). */
@@ -1450,7 +1550,8 @@ typedef enum fa_event_type {
     FA_EVENT_LOUDNESS_FINAL,  /* the stream's final loudness is known (fa_stream_get_loudness) */
     FA_EVENT_RAMP_DONE,       /* a ramp reached its target or was replaced */
     FA_EVENT_STARTED,         /* a scheduled, crossfaded or queued start happened */
-    FA_EVENT_MIDI_TEXT        /* a MIDI lyric or other text event is heard */
+    FA_EVENT_MIDI_TEXT,       /* a MIDI lyric or other text event is heard */
+    FA_EVENT_LOOPED           /* a looping stream jumped back to its loop start */
 } fa_event_type;
 
 typedef struct fa_event {
@@ -1634,11 +1735,89 @@ typedef struct fa_lame_info {
 FA_API fa_result FA_CALL fa_lame_load(const char* directory);
 FA_API fa_result FA_CALL fa_lame_get_info(fa_lame_info* out_info);
 
+/* ---- Equalizer ------------------------------------------------------- */
+
+/* A parametric equalizer on every stream: up to FA_EQ_MAX_BANDS bands, each a peak
+ * (bell) or a low or high shelf. Use ten peaks on the octave frequencies for a
+ * graphic EQ, or start from a preset (fa_eq_get_preset).
+ *
+ * - It runs in the mixer, before the stream's volume, fades and normalization gain,
+ *   so a change is heard at once, not after the decode-ahead buffer. It works on
+ *   every stream played on a device, push and packet streams included.
+ * - Changes glide (about 10 ms), so moving a slider while playing never clicks.
+ * - Off, flat, or a band at 0 dB costs nothing: such bands are skipped.
+ * - Decode-only streams are not equalized (fa_stream_read returns the audio as
+ *   decoded); use fa_stream_add_dsp there.
+ *
+ * fa_stream_set_eq replaces all bands (count 0 = no bands: off). Out-of-range values
+ * are clamped: frequency 10 Hz to just under half the device rate, q 0.1 to 20,
+ * gain -24 to +24 dB. */
+#define FA_EQ_MAX_BANDS 16
+
+typedef enum fa_eq_type {
+    FA_EQ_PEAK = 0,     /* bell around frequency_hz; q sets the width (1.41 = one octave) */
+    FA_EQ_LOW_SHELF,    /* everything below frequency_hz; q 0.71 is the usual slope */
+    FA_EQ_HIGH_SHELF    /* everything above frequency_hz */
+} fa_eq_type;
+
+typedef struct fa_eq_band {
+    fa_eq_type type;
+    float frequency_hz;
+    float q;
+    float gain_db;
+} fa_eq_band;
+
+FA_API fa_result FA_CALL fa_stream_set_eq(fa_stream* stream, const fa_eq_band* bands, uint32_t count);
+/* Copies up to `capacity` bands, as set (after clamping; the frequency is also capped
+ * at just under half the device rate while playing); *out_count = how many there are. */
+FA_API fa_result FA_CALL fa_stream_get_eq(fa_stream* stream, fa_eq_band* out_bands, uint32_t capacity, uint32_t* out_count);
+/* One band's gain, for a slider: FA_ERROR_INVALID_ARG if `band` >= the band count. */
+FA_API fa_result FA_CALL fa_stream_set_eq_gain(fa_stream* stream, uint32_t band, float gain_db);
+/* Bypass without losing the bands: 0 glides to flat, 1 back to the bands. On by default. */
+FA_API fa_result FA_CALL fa_stream_set_eq_enabled(fa_stream* stream, int32_t enabled);
+FA_API fa_result FA_CALL fa_stream_get_eq_enabled(fa_stream* stream, int32_t* out_enabled);
+
+/* Built-in presets: ten peak bands on the octave frequencies (31 Hz to 16 kHz,
+ * q 1.41), so switching presets moves the same sliders. */
+typedef enum fa_eq_preset {
+    FA_EQ_PRESET_FLAT = 0,
+    FA_EQ_PRESET_ROCK,
+    FA_EQ_PRESET_POP,
+    FA_EQ_PRESET_JAZZ,
+    FA_EQ_PRESET_CLASSICAL,
+    FA_EQ_PRESET_DANCE,
+    FA_EQ_PRESET_HIP_HOP,
+    FA_EQ_PRESET_ACOUSTIC,
+    FA_EQ_PRESET_VOCAL,
+    FA_EQ_PRESET_SPOKEN_WORD,
+    FA_EQ_PRESET_BASS_BOOST,
+    FA_EQ_PRESET_TREBLE_BOOST,
+    FA_EQ_PRESET_LOUDNESS,     /* lows and highs up, for quiet listening */
+    FA_EQ_PRESET_COUNT
+} fa_eq_preset;
+
+#define FA_EQ_PRESET_BANDS 10
+
+/* Fills out_bands (room for FA_EQ_PRESET_BANDS) and *out_count. */
+FA_API fa_result FA_CALL fa_eq_get_preset(fa_eq_preset preset, fa_eq_band* out_bands, uint32_t* out_count);
+/* English display name ("Rock"), NULL for an unknown preset. */
+FA_API const char* FA_CALL fa_eq_preset_name(fa_eq_preset preset);
+
 /* ---- User DSP --------------------------------------------------------- */
 
-/* In-place processing of interleaved float frames in the stream's format. */
-typedef void (FA_CALL *fa_dsp_callback)(float* frames, fa_frames count, uint32_t channels, void* user);
+/* In-place processing of interleaved float frames. Streams on a device: device
+ * channels (2) at the device rate, after rate/tempo/pitch, before the equalizer,
+ * volume, fades and normalization. Decode-only streams: the format fa_stream_read
+ * returns. Runs where the stream is decoded, never on the audio thread, so it may
+ * take a little time; it is heard after the decode-ahead buffer. That is usually an
+ * engine worker, but the first 100 ms after fa_stream_seek or fa_stream_attach are
+ * decoded on the thread making that call, and decode-only streams decode inside
+ * fa_stream_read. It runs with the stream's locks held: don't call any fa_stream_*
+ * function of that stream from inside it. */
+typedef void (FA_CALL *fa_dsp_callback)(float* frames, fa_frames count, uint32_t channels, uint32_t sample_rate, void* user);
 
+/* Higher priorities run first; equal ones in the order added. Safe to call while
+ * playing. After fa_stream_remove_dsp returns, the callback is never called again. */
 FA_API fa_result FA_CALL fa_stream_add_dsp(fa_stream* stream, fa_dsp_callback callback, void* user, int32_t priority, uint32_t* out_dsp_id);
 FA_API fa_result FA_CALL fa_stream_remove_dsp(fa_stream* stream, uint32_t dsp_id);
 

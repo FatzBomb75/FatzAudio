@@ -207,8 +207,10 @@ static void judge(fa_disc_cdg* c, size_t upto)
     }
     if (chosen >= 0) {
         fa_cdg_data* data;
-        if (fa_cdg_data_blank((size_t)c->track_sectors * PACKS_PER_SECTOR, &data) != FA_OK ||
-            !fa_stream_cdg_attach_if_none(c->stream, data, &c->token)) {
+        if (fa_cdg_data_blank((size_t)c->track_sectors * PACKS_PER_SECTOR, &data) != FA_OK) { stop(c); return; }
+        data->from_disc = 1;
+        data->disc_parity = c->sound[chosen] > 0;   /* fa_cdg_info.disc_parity */
+        if (!fa_stream_cdg_attach_if_none(c->stream, data, &c->token)) {
             stop(c);   /* out of memory, or the app gave the stream graphics of its own */
             return;
         }

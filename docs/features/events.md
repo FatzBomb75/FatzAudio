@@ -17,6 +17,7 @@ Each stream has one event callback. The audio thread queues events without locki
 | `FA_EVENT_DEVICE_CHANGED` | position | 0 | 🗓️ R14 |
 | `FA_EVENT_LOUDNESS_FINAL` | position | 0 | ✅ ([normalization](normalization.md)) |
 | `FA_EVENT_MIDI_TEXT` | the text's frame | its index for `fa_stream_get_midi_text` | ✅ MIDI lyrics and text, streams on a device ([MIDI](midi.md#lyrics-and-text-events)) |
+| `FA_EVENT_LOOPED` | the loop end it left (cue-out or the length) | the frame it went to (cue-in or 0) | ✅ looping streams on a device, once per jump; raised as the audio is mixed, like markers ([playback](playback.md#loop-and-mute-while-playing)) |
 
 ## C
 

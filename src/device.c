@@ -135,6 +135,20 @@ void fa_device_render_at(fa_device* dev, float* out, uint32_t frames, int64_t no
     fa_limiter_process(&dev->limiter, out, frames,
                        powf(10.0f, fa_load_float(&dev->engine->limiter_ceiling) / 20.0f), limiter_on(dev->engine));
     {
+        /* Device mute, after the limiter: glides sample by sample, costs nothing unmuted. */
+        float level = dev->mute_level, target = (float)fa_load32(&dev->muted);
+        if (level != target) {
+            for (i = 0; i < frames; i++) {
+                level = fa_mute_glide(level, target, 1, dev->rate);
+                out[i * FA_DEVICE_CHANNELS] *= 1.0f - level;
+                out[i * FA_DEVICE_CHANNELS + 1] *= 1.0f - level;
+            }
+            dev->mute_level = level;
+        } else if (level == 1.0f) {
+            memset(out, 0, (size_t)frames * FA_DEVICE_CHANNELS * sizeof(float));
+        }
+    }
+    {
         fa_enc_list* encs = (fa_enc_list*)fa_load_ptr(&dev->encoders);
         if (encs)
             for (i = 0; i < encs->count; i++) fa_encode_push(encs->items[i], out, frames, dev->rate);
@@ -326,6 +340,20 @@ FA_API fa_result FA_CALL fa_device_get_volume(fa_device* device, float* out_volu
 {
     if (!device || !out_volume) return FA_ERROR_INVALID_ARG;
     return ma_device_get_master_volume(&device->device, out_volume) == MA_SUCCESS ? FA_OK : FA_ERROR_DEVICE;
+}
+
+FA_API fa_result FA_CALL fa_device_set_mute(fa_device* device, int32_t muted)
+{
+    if (!device) return FA_ERROR_INVALID_ARG;
+    fa_store32(&device->muted, muted ? 1 : 0);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_device_get_mute(fa_device* device, int32_t* out_muted)
+{
+    if (!device || !out_muted) return FA_ERROR_INVALID_ARG;
+    *out_muted = fa_load32(&device->muted);
+    return FA_OK;
 }
 
 FA_API fa_result FA_CALL fa_device_get_latency(fa_device* device, fa_time* out_latency)
