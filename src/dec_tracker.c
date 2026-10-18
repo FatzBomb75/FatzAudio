@@ -16,7 +16,17 @@
  * Live settings (interpolation, stereo separation, volume ramping, Amiga
  * resampler emulation, channel mute) are atomics the decode thread applies at the
  * start of each block. The module itself is only touched by whoever holds the
- * stream's decode_lock (the decode thread, or a seek). */
+ * stream's decode_lock (the decode thread, or a seek).
+ *
+ * The row log: as it renders (in steps of FA_TRACKER_STEP frames), the decode
+ * thread notes the frame where each row starts. The song plays once, so a frame
+ * always belongs to the same row: the log only has to say which frames were
+ * decoded. Each seek starts a new run (the frames from the seek on); a lookup uses
+ * the newest run that covers the frame. The audio thread reads it to raise
+ * FA_EVENT_TRACKER_ROW, the API to tell the row heard now. Single writer (the
+ * decode_lock holder), lock-free readers: entries and runs are atomics published
+ * by their write counters; FA_TRACKER_ROWS entries are many seconds of song, far
+ * more than the decode-ahead, so a reader never sees one being reused. */
 #include "fa_internal.h"
 #include "libopenmpt/libopenmpt.h"
 #include "libopenmpt/libopenmpt_ext.h"
@@ -28,6 +38,13 @@
 #define FA_TRACKER_MAX_FILE ((size_t)128 << 20)
 #define FA_TRACKER_MAX_SECONDS (6.0 * 3600.0)
 #define FA_TRACKER_MUTE_CHANNELS 64
+#define FA_TRACKER_STEP 64          /* row starts are noted to within this many frames */
+#define FA_TRACKER_ROWS 4096        /* row log entries (a power of two) */
+#define FA_TRACKER_RUNS 8           /* runs kept (seeks) */
+#define FA_TRACKER_NEW_ORDER ((int64_t)1 << 32)
+
+typedef struct fa_tracker_row { fa_atomic64 frame, value; } fa_tracker_row;   /* value: order << 16 | row, + NEW_ORDER */
+typedef struct fa_tracker_run { fa_atomic64 first, start, end; } fa_tracker_run;
 
 struct fa_tracker {
     openmpt_module_ext* ext;
@@ -52,7 +69,109 @@ struct fa_tracker {
     fa_atomic64 mute;           /* bit n = channel n */
     int32_t interpolation_now, separation_now, ramping_now, amiga_now;
     uint64_t mute_now;
+    fa_atomic32 row_events;     /* FA_TRACKER_ROW_EVENTS */
+
+    /* Row log (see the top). */
+    fa_tracker_row rows[FA_TRACKER_ROWS];
+    fa_tracker_run runs[FA_TRACKER_RUNS];
+    fa_atomic64 rows_w, runs_w;
+    int64_t last_value;         /* the run's last entry, -1 = none yet */
 };
+
+/* ---- Row log ---- */
+
+static void log_new_run(struct fa_tracker* t, fa_frames start)
+{
+    int64_t k = fa_load64(&t->runs_w);
+    fa_tracker_run* r = &t->runs[k % FA_TRACKER_RUNS];
+    fa_store64(&r->first, fa_load64(&t->rows_w));
+    fa_store64(&r->start, start);
+    fa_store64(&r->end, start);
+    fa_store64(&t->runs_w, k + 1);
+    t->last_value = -1;
+}
+
+/* The row playing at `frame` (libopenmpt's current one), noted if it is new. */
+static void log_row(struct fa_tracker* t, fa_frames frame)
+{
+    int32_t order = openmpt_module_get_current_order(t->mod), row = openmpt_module_get_current_row(t->mod);
+    int64_t v, i;
+    if (order < 0 || row < 0) return;
+    v = ((int64_t)order << 16) | (row & 0xFFFF);
+    if (v == (t->last_value & 0xFFFFFFFF)) return;
+    /* A new order: the order changed within the run, or the run starts at a row 0. */
+    if (t->last_value < 0 ? row == 0 : order != (int32_t)((t->last_value & 0xFFFFFFFF) >> 16)) v |= FA_TRACKER_NEW_ORDER;
+    i = fa_load64(&t->rows_w);
+    fa_store64(&t->rows[i & (FA_TRACKER_ROWS - 1)].frame, frame);
+    fa_store64(&t->rows[i & (FA_TRACKER_ROWS - 1)].value, v);
+    fa_store64(&t->rows_w, i + 1);
+    t->last_value = v;
+}
+
+/* A run from `start`, where libopenmpt now is: its row is known at once, also
+ * before anything is rendered (a seek that lands exactly on a row start). */
+static void log_start(struct fa_tracker* t, fa_frames start)
+{
+    log_new_run(t, start);
+    log_row(t, start);
+    fa_store64(&t->runs[(fa_load64(&t->runs_w) - 1) % FA_TRACKER_RUNS].end, start + 1);
+}
+
+/* The newest run that decoded `frame`, as its entry range [*first, *last]. */
+static int find_run(const struct fa_tracker* t, fa_frames frame, int64_t* first, int64_t* last)
+{
+    int64_t rw = fa_load64((fa_atomic64*)&t->rows_w), kw = fa_load64((fa_atomic64*)&t->runs_w), k, next = rw;
+    for (k = kw - 1; k >= 0 && k >= kw - FA_TRACKER_RUNS; k--) {
+        const fa_tracker_run* r = &t->runs[k % FA_TRACKER_RUNS];
+        int64_t f = fa_load64((fa_atomic64*)&r->first);
+        if (fa_load64((fa_atomic64*)&r->start) <= frame && frame < fa_load64((fa_atomic64*)&r->end)) {
+            *first = f > rw - FA_TRACKER_ROWS ? f : rw - FA_TRACKER_ROWS;
+            *last = next - 1;
+            return *last >= *first;
+        }
+        next = f;
+    }
+    return 0;
+}
+
+int fa_tracker_row_at(const struct fa_tracker* t, fa_frames frame, uint32_t* order, uint32_t* row)
+{
+    int64_t first, i;
+    if (!find_run(t, frame, &first, &i)) return 0;
+    for (; i >= first; i--) {
+        const fa_tracker_row* e = &t->rows[i & (FA_TRACKER_ROWS - 1)];
+        if (fa_load64((fa_atomic64*)&e->frame) <= frame) {
+            int64_t v = fa_load64((fa_atomic64*)&e->value);
+            *order = (uint32_t)((v >> 16) & 0xFFFF);
+            *row = (uint32_t)(v & 0xFFFF);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+uint32_t fa_tracker_rows_in(const struct fa_tracker* t, fa_frames from, fa_frames to, fa_frames* frames,
+                            int64_t* values, uint32_t cap)
+{
+    int32_t mode = fa_load32((fa_atomic32*)&t->row_events);
+    int64_t first, last, i;
+    uint32_t n = 0;
+    if (mode == 0 || to <= from || !find_run(t, from, &first, &last)) return 0;
+    /* Back from the newest entry to the first one before `from` (the decoder is
+     * only a little ahead, so this is a few entries), then forward. */
+    for (i = last; i > first && fa_load64((fa_atomic64*)&t->rows[i & (FA_TRACKER_ROWS - 1)].frame) >= from; i--) {}
+    for (; i <= last && n < cap; i++) {
+        const fa_tracker_row* e = &t->rows[i & (FA_TRACKER_ROWS - 1)];
+        fa_frames f = fa_load64((fa_atomic64*)&e->frame);
+        int64_t v = fa_load64((fa_atomic64*)&e->value);
+        if (f < from) continue;
+        if (f >= to) break;
+        if (mode == 2 && !(v & FA_TRACKER_NEW_ORDER)) continue;
+        frames[n] = f;
+        values[n++] = v & 0xFFFFFFFF;
+    }
+    return n;
+}
 
 struct fa_tracker* fa_tracker_of(fa_decoder* dec)
 {
@@ -258,10 +377,15 @@ static void render_block(struct fa_tracker* t)
     size_t got = 0;
     if (n > FA_TRACKER_BLOCK) n = FA_TRACKER_BLOCK;
     take_controls(t);
-    if (!t->ended) {
-        got = openmpt_module_read_interleaved_float_stereo(t->mod, (int32_t)t->rate, (size_t)n, t->blk);
-        if (got < (size_t)n) t->ended = 1;
+    while (!t->ended && got < (size_t)n) {
+        size_t step = (size_t)n - got, k;
+        if (step > FA_TRACKER_STEP) step = FA_TRACKER_STEP;
+        log_row(t, t->pos + (fa_frames)got);
+        k = openmpt_module_read_interleaved_float_stereo(t->mod, (int32_t)t->rate, step, t->blk + got * 2);
+        got += k;
+        if (k < step) t->ended = 1;
     }
+    fa_store64(&t->runs[(fa_load64(&t->runs_w) - 1) % FA_TRACKER_RUNS].end, t->pos + n);
     if (got < (size_t)n) memset(t->blk + got * 2, 0, ((size_t)n - got) * 2 * sizeof(float));
     t->blk_len = (int)n;
     t->blk_off = 0;
@@ -311,6 +435,7 @@ static fa_result tracker_seek(fa_decoder* dec, fa_frames frame)
         if (from > frame) from = frame;   /* not reached: the start is after it (cannot happen at 0) */
     }
     t->pos = from;
+    log_start(t, from);
     /* On to the exact frame, without handing anything out. */
     while (t->pos < frame) {
         fa_frames skip = frame - t->pos;
@@ -356,11 +481,18 @@ static fa_result tracker_open(fa_decoder* dec)
                                                           &t->interactive, sizeof(t->interactive)) != 0;
     t->rate = dec->midi_rate ? dec->midi_rate : FA_MIDI_DEFAULT_RATE;
     openmpt_module_set_repeat_count(t->mod, 0);
+    /* Subsongs are the stream's audio tracks (fa_open_options.audio_track). A
+     * track past the last fails in fa_decoder_open (FA_ERROR_NOT_FOUND). */
+    dec->track_count = openmpt_module_get_num_subsongs(t->mod);
+    if (dec->track_count < 1) dec->track_count = 1;
+    t->info.subsong = dec->audio_track > 0 && dec->audio_track < dec->track_count ? dec->audio_track : 0;
+    if (t->info.subsong > 0) openmpt_module_select_subsong(t->mod, t->info.subsong);
     duration = openmpt_module_get_duration_seconds(t->mod);
     if (!(duration > 0)) duration = 0;
     if (duration > FA_TRACKER_MAX_SECONDS) duration = FA_TRACKER_MAX_SECONDS;
     t->length = (fa_frames)llround(duration * t->rate);
     if (t->length <= 0) { tracker_free(t); return FA_ERROR_UNSUPPORTED_FORMAT; }
+    log_start(t, 0);
 
     /* Defaults, as libopenmpt has them. */
     t->interpolation_now = 0;
@@ -389,13 +521,9 @@ static fa_result tracker_open(fa_decoder* dec)
     t->info.samples = (uint32_t)count_of(openmpt_module_get_num_samples(t->mod));
     t->info.subsongs = (uint32_t)count_of(openmpt_module_get_num_subsongs(t->mod));
     /* The restart point is per subsong; -1 is not accepted here (it throws and
-       leaks the stored error string), so ask for the selected one. */
-    {
-        int32_t sub = openmpt_module_get_selected_subsong(t->mod);
-        if (sub < 0) sub = 0;
-        t->info.restart_order = openmpt_module_get_restart_order(t->mod, sub);
-        t->info.restart_row = openmpt_module_get_restart_row(t->mod, sub);
-    }
+       leaks the stored error string), so ask for the one playing. */
+    t->info.restart_order = openmpt_module_get_restart_order(t->mod, t->info.subsong);
+    t->info.restart_row = openmpt_module_get_restart_row(t->mod, t->info.subsong);
     t->info.duration = duration;
     s = openmpt_module_get_metadata(t->mod, "message_raw");
     t->message = dup_free(s);
@@ -505,6 +633,10 @@ FA_API fa_result FA_CALL fa_stream_set_tracker_param(fa_stream* stream, fa_track
     case FA_TRACKER_AMIGA_RESAMPLER:
         fa_store32(&t->amiga, value ? 1 : 0);
         return FA_OK;
+    case FA_TRACKER_ROW_EVENTS:
+        if (value < 0 || value > 2) return FA_ERROR_INVALID_ARG;
+        fa_store32(&t->row_events, value);
+        return FA_OK;
     default:
         return FA_ERROR_INVALID_ARG;
     }
@@ -519,8 +651,27 @@ FA_API fa_result FA_CALL fa_stream_get_tracker_param(fa_stream* stream, fa_track
     case FA_TRACKER_STEREO_SEPARATION: *out_value = fa_load32(&t->separation); return FA_OK;
     case FA_TRACKER_VOLUME_RAMPING: *out_value = fa_load32(&t->ramping); return FA_OK;
     case FA_TRACKER_AMIGA_RESAMPLER: *out_value = fa_load32(&t->amiga); return FA_OK;
+    case FA_TRACKER_ROW_EVENTS: *out_value = fa_load32(&t->row_events); return FA_OK;
     default: return FA_ERROR_INVALID_ARG;
     }
+}
+
+FA_API fa_result FA_CALL fa_stream_get_tracker_position(fa_stream* stream, uint32_t* out_order, uint32_t* out_row)
+{
+    fa_time clock;
+    fa_frames frame;
+    uint32_t order, row;
+    fa_result r;
+    if (out_order) *out_order = 0;
+    if (out_row) *out_row = 0;
+    if (!stream || !stream->tracker || !out_order || !out_row) return FA_ERROR_INVALID_ARG;
+    r = fa_stream_get_clock(stream, &clock);
+    if (r != FA_OK) return r;
+    frame = (fa_frames)(((double)clock * stream->tracker->rate + 5e8) / 1e9);
+    if (!fa_tracker_row_at(stream->tracker, frame, &order, &row)) return FA_ERROR_NOT_FOUND;
+    *out_order = order;
+    *out_row = row;
+    return FA_OK;
 }
 
 FA_API fa_result FA_CALL fa_stream_set_tracker_channel_mute(fa_stream* stream, uint32_t channel, int32_t muted)

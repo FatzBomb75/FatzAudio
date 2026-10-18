@@ -2669,12 +2669,34 @@ static void post_texts(struct fa_stream* s, fa_device* dev, const fa_frames* at,
     for (; lo < n && at[lo] < to; lo++) fa_audio_post_event(dev, s, FA_EVENT_MIDI_TEXT, at[lo], (int64_t)lo);
 }
 
-static void midi_text_events(struct fa_stream* s, fa_device* dev, int64_t played0, int64_t played1, int ended)
+static void post_midi_texts(struct fa_stream* s, fa_device* dev, fa_frames from, fa_frames to)
 {
     uint32_t n;
     const fa_frames* at = fa_midi_text_frames(s->midi, &n);
+    if (n > 0) post_texts(s, dev, at, n, from, to);
+}
+
+/* Tracker modules: FA_EVENT_TRACKER_ROW (value = order << 16 | row) for the rows
+ * starting between `from` and `to` that FA_TRACKER_ROW_EVENTS asks for. */
+static void post_tracker_rows(struct fa_stream* s, fa_device* dev, fa_frames from, fa_frames to)
+{
+    fa_frames at[32];
+    int64_t v[32];
+    uint32_t n, i;
+    do {
+        n = fa_tracker_rows_in(s->tracker, from, to, at, v, 32);
+        for (i = 0; i < n; i++) fa_audio_post_event(dev, s, FA_EVENT_TRACKER_ROW, at[i], v[i]);
+        if (n > 0) from = at[n - 1] + 1;
+    } while (n == 32);
+}
+
+/* Events tied to fixed source frames (MIDI texts, tracker rows): `post` for each
+ * range of source frames playback passed between `played0` and `played1`;
+ * wrapping into a loop gives two ranges. */
+static void frame_events(struct fa_stream* s, fa_device* dev, int64_t played0, int64_t played1, int ended,
+                         void (*post)(struct fa_stream*, fa_device*, fa_frames, fa_frames))
+{
     fa_frames p0, p1, end, back, w0, w1;
-    if (n == 0) return;
     p0 = (fa_frames)(linear_position(s, played0) + 0.5);
     p1 = (fa_frames)(linear_position(s, played1) + 0.5);
     if (p1 <= p0 && !ended) return;
@@ -2683,13 +2705,19 @@ static void midi_text_events(struct fa_stream* s, fa_device* dev, int64_t played
     w0 = wrap_position(s, p0);
     w1 = wrap_position(s, p1);
     if (loops(s) && end > back && p1 - p0 >= end - back) {
-        post_texts(s, dev, at, n, back, end);
+        post(s, dev, back, end);
     } else if (loops(s) && end > back && w1 < w0) {
-        post_texts(s, dev, at, n, w0, end);
-        post_texts(s, dev, at, n, back, w1);
+        post(s, dev, w0, end);
+        post(s, dev, back, w1);
     } else {
-        post_texts(s, dev, at, n, w0, ended ? w1 + 1 : w1);
+        post(s, dev, w0, ended ? w1 + 1 : w1);
     }
+}
+
+static void heard_events(struct fa_stream* s, fa_device* dev, int64_t played0, int64_t played1, int ended)
+{
+    if (s->midi) frame_events(s, dev, played0, played1, ended, post_midi_texts);
+    if (s->tracker) frame_events(s, dev, played0, played1, ended, post_tracker_rows);
 }
 
 /* Ends the stream from the audio thread (its data ran out, or a crossfade-out
@@ -3083,20 +3111,20 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
 
     if (ended) {
         marker_events(s, dev, &mk, played0, played0 + done, 0);
-        if (s->midi) midi_text_events(s, dev, played0, played0 + done, 0);
+        heard_events(s, dev, played0, played0 + done, 0);
         end_stream(s, dev);
         return;
     }
     if (at_cue_out) {
         marker_events(s, dev, &mk, played0, played0 + done, 1);
-        if (s->midi) midi_text_events(s, dev, played0, played0 + done, 1);
+        heard_events(s, dev, played0, played0 + done, 1);
         end_stream(s, dev);
         return;
     }
     if (n < (int64_t)frames - off) {
         if (fa_load32(&s->eof) && fa_ring_readable(&s->ring) == 0) {
             marker_events(s, dev, &mk, played0, played0 + done, 1);
-            if (s->midi) midi_text_events(s, dev, played0, played0 + done, 1);
+            heard_events(s, dev, played0, played0 + done, 1);
             end_stream(s, dev);
             return;
         }
@@ -3111,7 +3139,7 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
         }
     }
     marker_events(s, dev, &mk, played0, played0 + done, 0);
-    if (s->midi) midi_text_events(s, dev, played0, played0 + done, 0);
+    heard_events(s, dev, played0, played0 + done, 0);
 }
 
 void fa_stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames)

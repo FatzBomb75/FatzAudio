@@ -104,6 +104,22 @@ public class TrackerTests
     }
 
     [Fact]
+    public void Position_HeardRow_AndRowEvents()
+    {
+        using var engine = CreateHeadless();
+        using var s = engine.OpenMemory(Module(), DecodeOnly);
+        Assert.Equal(0, s.TrackerInfo!.Subsong);
+        ReadAll(s, Rate / 2);   // rows of 60 ms: 0.5 s is order 0, row 8
+        Assert.Equal(new TrackerPosition(0, 8), s.TrackerPosition);
+        s.SeekTracker(1, 3);
+        Assert.Equal(new TrackerPosition(1, 3), s.TrackerPosition);
+        Assert.Equal(TrackerRowEvents.Off, s.TrackerRowEvents);
+        s.TrackerRowEvents = TrackerRowEvents.Orders;
+        Assert.Equal(TrackerRowEvents.Orders, s.TrackerRowEvents);
+        Assert.Throws<FatzAudioException>(() => s.TrackerRowEvents = (TrackerRowEvents)7);
+    }
+
+    [Fact]
     public void Plays_SeeksByOrderRow_AndMutes()
     {
         using var engine = CreateHeadless();

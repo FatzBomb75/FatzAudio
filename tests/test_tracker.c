@@ -1,7 +1,11 @@
 /* Tracker modules (libopenmpt): detection, info and texts, rendering, exact
- * seeking by frame and by order/row, live settings and channel mute, damaged
- * files. Black-box: the public API on a MOD file built here. */
-#include <fatzaudio/fatzaudio.h>
+ * seeking by frame and by order/row, live settings and channel mute, subsongs,
+ * the order/row heard and FA_EVENT_TRACKER_ROW on a device, damaged files. On
+ * MOD files built here; white-box only to play the audio thread itself. */
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
+#include "fa_internal.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +22,7 @@ static int g_failures = 0;
     printf("%s\n", #t); t(); if (g_failures == before_) printf("  ok\n"); } while (0)
 
 #define RATE 44100
+#define FA_TRACKER_STEP_TEST 64      /* dec_tracker.c notes row starts to within this */
 #define PI 3.14159265358979323846
 #define ROW_S 0.06                 /* speed 3 at tempo 125: 3 ticks of 20 ms */
 
@@ -164,12 +169,16 @@ static void test_detect_and_info(void)
         CHECK(strcmp(fa_tags_get(tags, FA_TAG_TITLE), "Test Module") == 0);
         fa_tags_close(tags);
     }
-    /* The full struct is filled; one smaller than this version's is refused. */
+    /* A struct from an older header (without `subsong`) is filled as far as it
+     * goes; one smaller than the first version is refused. */
     {
         fa_tracker_info small;
         memset(&small, 0x55, sizeof(small));
-        small.struct_size = (uint32_t)sizeof(small);
+        small.struct_size = (uint32_t)(offsetof(fa_tracker_info, duration) + sizeof(double));
         CHECK_EQ(fa_stream_get_tracker_info(s, &small), FA_OK);
+        CHECK_EQ(small.struct_size, offsetof(fa_tracker_info, duration) + sizeof(double));
+        CHECK_EQ(small.subsong, 0x55555555);
+        CHECK_NEAR(small.duration, ti.duration, 1e-9);
         small.struct_size = 4;
         CHECK_EQ(fa_stream_get_tracker_info(s, &small), FA_ERROR_INVALID_ARG);
     }
@@ -322,6 +331,217 @@ static void test_mp3_like_samples(void)
     free(mod.d);
 }
 
+/* Two subsongs: order 0 plays pattern 2, which jumps back to order 0 at row 15
+ * (so the first song is that one pattern), and orders 1 and 2 (patterns 0 and 1)
+ * are never reached from it: the second subsong. */
+static buf make_two_songs(void)
+{
+    buf one = make_mod(), m = { 0 };
+    uint8_t pat[64 * 4 * 4];
+    size_t patterns = 1084;
+    one.d[950] = 3;                    /* song length */
+    one.d[952] = 2;
+    one.d[953] = 0;
+    one.d[954] = 1;
+    put(&m, one.d, patterns + 2 * sizeof(pat));
+    memcpy(pat, one.d + patterns, sizeof(pat));
+    cell(pat + (15 * 4 + 2) * 4, 0, 0, 0xB, 0);   /* back to order 0: the song ends */
+    put(&m, pat, sizeof(pat));
+    put(&m, one.d + patterns + 2 * sizeof(pat), one.n - patterns - 2 * sizeof(pat));
+    free(one.d);
+    return m;
+}
+
+static fa_stream* open_track(const buf* b, int32_t track, fa_result* out_r)
+{
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_result r;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    o.audio_track = track;
+    r = fa_stream_open_memory(g_engine, b->d, b->n, &o, &s);
+    if (out_r) *out_r = r;
+    return r == FA_OK ? s : NULL;
+}
+
+static void test_subsongs(void)
+{
+    buf mod = make_two_songs();
+    fa_stream* s;
+    fa_stream_info info;
+    fa_tracker_info ti;
+    fa_result r;
+    double t;
+    s = open_track(&mod, -1, NULL);
+    CHECK(s);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK_EQ(info.audio_track_count, 2);
+    CHECK_NEAR(info.duration / 1e9, 16 * ROW_S, 0.01);
+    ti.struct_size = sizeof(ti);
+    CHECK_EQ(fa_stream_get_tracker_info(s, &ti), FA_OK);
+    CHECK_EQ(ti.subsongs, 2);
+    CHECK_EQ(ti.subsong, 0);
+    /* Order 1 belongs to the other subsong. */
+    CHECK_EQ(fa_stream_get_tracker_time(s, 1, 0, &t), FA_ERROR_NOT_FOUND);
+    CHECK_EQ(fa_stream_get_tracker_time(s, 2, 3, &t), FA_ERROR_NOT_FOUND);
+    CHECK_EQ(fa_stream_seek_tracker(s, 1, 0), FA_ERROR_NOT_FOUND);
+    fa_stream_close(s);
+
+    s = open_track(&mod, 1, NULL);
+    CHECK(s);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK_NEAR(info.duration / 1e9, 32 * ROW_S, 0.01);
+    ti.struct_size = sizeof(ti);
+    CHECK_EQ(fa_stream_get_tracker_info(s, &ti), FA_OK);
+    CHECK_EQ(ti.subsong, 1);
+    CHECK_NEAR(ti.duration, 32 * ROW_S, 0.01);
+    CHECK_EQ(fa_stream_get_tracker_time(s, 0, 5, &t), FA_ERROR_NOT_FOUND);
+    CHECK_EQ(fa_stream_get_tracker_time(s, 1, 0, &t), FA_OK);
+    CHECK_NEAR(t, 0, 1e-6);
+    CHECK_EQ(fa_stream_get_tracker_time(s, 2, 0, &t), FA_OK);
+    CHECK_NEAR(t, 16 * ROW_S, 1e-6);
+    fa_stream_close(s);
+
+    CHECK(open_track(&mod, 2, &r) == NULL);
+    CHECK_EQ(r, FA_ERROR_NOT_FOUND);
+    free(mod.d);
+}
+
+/* The order and row heard: decode-only streams hear what was read. */
+static void test_position(void)
+{
+    buf mod = make_mod();
+    fa_stream* s = open_mod(&mod, NULL);
+    float* x = (float*)malloc(sizeof(float) * 2 * RATE);
+    uint32_t order = 9, row = 9;
+    CHECK(s && x);
+    /* Rows of 60 ms: 0.5 s is order 0 row 8, 1.0 s order 1 row 0. */
+    read_all(s, x, RATE / 2, 1000);
+    CHECK_EQ(fa_stream_get_tracker_position(s, &order, &row), FA_OK);
+    CHECK_EQ(order, 0);
+    CHECK_EQ(row, 8);
+    read_all(s, x, RATE / 2, 777);
+    CHECK_EQ(fa_stream_get_tracker_position(s, &order, &row), FA_OK);
+    CHECK_EQ(order, 1);
+    CHECK_EQ(row, 0);
+    /* After a seek, at once: 1.5 s is order 1 row 9; then back to the start. */
+    CHECK_EQ(fa_stream_seek(s, RATE * 3 / 2), FA_OK);
+    CHECK_EQ(fa_stream_get_tracker_position(s, &order, &row), FA_OK);
+    CHECK_EQ(order, 1);
+    CHECK_EQ(row, 9);
+    CHECK_EQ(fa_stream_seek(s, 0), FA_OK);
+    CHECK_EQ(fa_stream_get_tracker_position(s, &order, &row), FA_OK);
+    CHECK_EQ(order, 0);
+    CHECK_EQ(row, 0);
+    /* A row start, exactly: frame 0.06 s (row 1) and the frame before (row 0). */
+    {
+        fa_frames r1 = (fa_frames)llround(ROW_S * RATE);
+        CHECK_EQ(fa_stream_seek(s, r1 + FA_TRACKER_STEP_TEST), FA_OK);
+        CHECK_EQ(fa_stream_get_tracker_position(s, &order, &row), FA_OK);
+        CHECK_EQ(row, 1);
+        CHECK_EQ(fa_stream_seek(s, r1 - 1), FA_OK);
+        CHECK_EQ(fa_stream_get_tracker_position(s, &order, &row), FA_OK);
+        CHECK_EQ(row, 0);
+    }
+    CHECK_EQ(fa_stream_get_tracker_position(s, NULL, &row), FA_ERROR_INVALID_ARG);
+    fa_stream_close(s);
+    free(x);
+    free(mod.d);
+}
+
+/* ---- on a device: FA_EVENT_TRACKER_ROW ------------------------------------------ */
+
+typedef struct row_rec {
+    fa_mutex lock;
+    int count;
+    int64_t values[64];
+    fa_frames frames[64];
+    int ended;
+} row_rec;
+
+static void FA_CALL on_event(const fa_event* ev, void* user)
+{
+    row_rec* r = (row_rec*)user;
+    fa_mutex_lock(&r->lock);
+    if (ev->type == FA_EVENT_TRACKER_ROW && r->count < 64) { r->values[r->count] = ev->value; r->frames[r->count] = ev->frame; r->count++; }
+    if (ev->type == FA_EVENT_ENDED) r->ended = 1;
+    fa_mutex_unlock(&r->lock);
+}
+
+/* Plays the whole song through the device (rendered here, not by a device
+ * thread) and collects the row events. */
+static void play_rows(const buf* mod, int32_t mode, row_rec* rec)
+{
+    fa_device* dev = NULL;
+    fa_stream* s = NULL;
+    fa_open_options o;
+    float out[512 * 2];
+    int64_t rendered = 0, total;
+    int tries;
+    memset(rec, 0, sizeof(*rec));
+    fa_mutex_init(&rec->lock);
+    if (fa_device_open(g_engine, NULL, &dev) != FA_OK) return;
+    fa_open_options_init(&o);
+    if (fa_stream_open_memory(g_engine, mod->d, mod->n, &o, &s) != FA_OK) { fa_device_close(dev); return; }
+    fa_stream_set_tracker_param(s, FA_TRACKER_ROW_EVENTS, mode);
+    fa_stream_set_event_callback(s, on_event, rec);
+    fa_stream_attach(s, dev, NULL);
+    fa_stream_play(s);
+    total = (int64_t)dev->rate * 5 / 2;
+    while (rendered < total) {
+        for (tries = 0; tries < 2000; tries++) {
+            if (fa_ring_readable(&s->ring) >= 512 || fa_load32(&s->eof)) break;
+            fa_sleep_ms(1);
+        }
+        fa_fetch_add64(&dev->epoch, 1);
+        fa_device_render(dev, out, 512);
+        fa_fetch_add64(&dev->epoch, 1);
+        rendered += 512;
+    }
+    for (tries = 0; tries < 400; tries++) {
+        int done;
+        fa_mutex_lock(&rec->lock);
+        done = rec->ended;
+        fa_mutex_unlock(&rec->lock);
+        if (done) break;
+        fa_sleep_ms(5);
+    }
+    fa_stream_close(s);
+    fa_device_close(dev);
+}
+
+static void test_row_events_on_device(void)
+{
+    buf mod = make_mod();
+    row_rec rec;
+    int i;
+    fa_frames row = (fa_frames)llround(ROW_S * RATE);
+    /* Every row, once, in order, within a step of its start. */
+    play_rows(&mod, 1, &rec);
+    CHECK(rec.ended);
+    CHECK_EQ(rec.count, 32);
+    for (i = 0; i < rec.count; i++) {
+        CHECK_EQ(rec.values[i] >> 16, i / 16);
+        CHECK_EQ(rec.values[i] & 0xFFFF, i % 16);
+        CHECK(rec.frames[i] >= i * row && rec.frames[i] <= i * row + FA_TRACKER_STEP_TEST);
+    }
+    fa_mutex_destroy(&rec.lock);
+    /* Orders only. */
+    play_rows(&mod, 2, &rec);
+    CHECK(rec.ended);
+    CHECK_EQ(rec.count, 2);
+    CHECK_EQ(rec.values[0], 0);
+    CHECK_EQ(rec.values[1], 1 << 16);
+    fa_mutex_destroy(&rec.lock);
+    /* Off (the default): none. */
+    play_rows(&mod, 0, &rec);
+    CHECK(rec.ended);
+    CHECK_EQ(rec.count, 0);
+    fa_mutex_destroy(&rec.lock);
+    free(mod.d);
+}
+
 static void test_not_a_module(void)
 {
     fa_audio_format fmt;
@@ -343,6 +563,10 @@ static void test_not_a_module(void)
     CHECK_EQ(fa_stream_set_tracker_param(s, FA_TRACKER_INTERPOLATION, 0), FA_ERROR_INVALID_ARG);
     CHECK_EQ(fa_stream_get_tracker_param(s, FA_TRACKER_INTERPOLATION, &v), FA_ERROR_INVALID_ARG);
     CHECK_EQ(fa_stream_set_tracker_channel_mute(s, 0, 1), FA_ERROR_INVALID_ARG);
+    {
+        uint32_t o_, r_;
+        CHECK_EQ(fa_stream_get_tracker_position(s, &o_, &r_), FA_ERROR_INVALID_ARG);
+    }
     fa_stream_close(s);
     CHECK_EQ(fa_stream_get_tracker_info(NULL, &ti), FA_ERROR_INVALID_ARG);
 }
@@ -396,6 +620,9 @@ int main(void)
     RUN(test_render_and_seek);
     RUN(test_live_settings);
     RUN(test_mp3_like_samples);
+    RUN(test_subsongs);
+    RUN(test_position);
+    RUN(test_row_events_on_device);
     RUN(test_not_a_module);
     RUN(test_damaged);
     fa_engine_destroy(g_engine);

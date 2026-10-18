@@ -592,7 +592,7 @@ public unsafe class AudioStream : IDisposable
             return new TrackerInfo(Str(n.Type), Str(n.TypeName), Str(n.Tracker), Str(n.Title), Str(n.Artist),
                 TrackerText(0, 0), (int)n.Channels, (int)n.Orders, (int)n.Patterns, n.RestartOrder, n.RestartRow,
                 TimeSpan.FromSeconds(n.Duration), TrackerTexts(1, n.Instruments), TrackerTexts(2, n.Samples),
-                TrackerTexts(3, n.Channels), TrackerTexts(4, n.Patterns), TrackerTexts(5, n.Subsongs));
+                TrackerTexts(3, n.Channels), TrackerTexts(4, n.Patterns), TrackerTexts(5, n.Subsongs), n.Subsong);
         }
     }
 
@@ -706,6 +706,35 @@ public unsafe class AudioStream : IDisposable
     {
         get => GetTrackerParam(3) != 0;
         set => SetTrackerParam(3, value ? 1 : 0);
+    }
+
+    /// <summary>
+    /// Which rows of a tracker module raise <see cref="TrackerRowReached"/> as they are heard; off by default.
+    /// </summary>
+    /// <exception cref="FatzAudioException">The stream is not a module (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public TrackerRowEvents TrackerRowEvents
+    {
+        get => (TrackerRowEvents)GetTrackerParam(4);
+        set => SetTrackerParam(4, (int)value);
+    }
+
+    /// <summary>
+    /// The order and row of a tracker module heard right now (at <see cref="Clock"/>), to within about 2 ms of the
+    /// row's start; null while that audio is not decoded yet (a stream never played or read, or just after a seek).
+    /// Cheap and lock-free, like <see cref="Clock"/>: fine to read every video frame.
+    /// </summary>
+    /// <exception cref="FatzAudioException">The stream is not a module (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public TrackerPosition? TrackerPosition
+    {
+        get
+        {
+            int rc = NativeMethods.fa_stream_get_tracker_position(Handle, out uint order, out uint row);
+            if (rc == (int)ErrorCode.NotFound) return null;
+            FatzAudioException.ThrowIfFailed(rc);
+            return new TrackerPosition((int)order, (int)row);
+        }
     }
 
     /// <summary>Mutes or unmutes a tracker module's channel (0-based, the first 64), live.</summary>
@@ -1557,6 +1586,13 @@ public unsafe class AudioStream : IDisposable
     public event EventHandler<StreamEventArgs>? SeekFailed;
 
     /// <summary>
+    /// Raised as a tracker module's rows are heard, when <see cref="TrackerRowEvents"/> asks for them (every row, or
+    /// the first row of each order). Raised on the engine's event thread, shortly after the row is mixed; best effort,
+    /// like markers, so a display that must follow every row reads <see cref="TrackerPosition"/> instead.
+    /// </summary>
+    public event EventHandler<TrackerRowEventArgs>? TrackerRowReached;
+
+    /// <summary>
     /// Raised when the stream's output changed: <see cref="StreamEventArgs.Value"/> 0 when the system moved it to the
     /// new default device (a headset plugged in), 1 when the device went away (unplugged) and the output was reopened
     /// on the default. The stream stays attached and plays on. Raised on the engine's event thread (never the audio
@@ -1646,6 +1682,10 @@ public unsafe class AudioStream : IDisposable
                         ((value >> 48) & 1) != 0, frame));
                     break;
                 case 14: SeekFailed?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
+                case 15:
+                    TrackerRowReached?.Invoke(this, new TrackerRowEventArgs(
+                        new TrackerPosition((int)((value >> 16) & 0xFFFF), (int)(value & 0xFFFF)), FramesToTime(frame), frame));
+                    break;
             }
         }
         catch

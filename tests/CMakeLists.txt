@@ -16,13 +16,6 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT "${CMAKE_C_FLAGS} ${CMAKE_CXX_
     add_test(NAME deps COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/check_deps_linux.sh $<TARGET_FILE:fatzaudio>)
 endif()
 
-add_executable(fa_test_tracker test_tracker.c)
-target_link_libraries(fa_test_tracker PRIVATE fatzaudio)
-if(UNIX)
-    target_link_libraries(fa_test_tracker PRIVATE m)
-endif()
-add_test(NAME tracker COMMAND fa_test_tracker)
-
 add_executable(fa_test_core test_core.c)
 target_link_libraries(fa_test_core PRIVATE fatzaudio)
 if(UNIX)
@@ -245,6 +238,19 @@ if(UNIX)
 endif()
 add_test(NAME midi COMMAND fa_test_midi WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
+# White-box: it plays the audio thread itself for FA_EVENT_TRACKER_ROW.
+add_executable(fa_test_tracker test_tracker.c ${FA_SOURCES})
+target_include_directories(fa_test_tracker PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
+target_compile_definitions(fa_test_tracker PRIVATE FA_STATIC)
+target_compile_options(fa_test_tracker PRIVATE ${FA_WARNINGS})
+target_link_libraries(fa_test_tracker PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
+if(UNIX)
+    target_link_libraries(fa_test_tracker PRIVATE m)
+endif()
+add_test(NAME tracker COMMAND fa_test_tracker)
+
 add_executable(fa_test_ogg test_ogg.c ${FA_SOURCES})
 target_include_directories(fa_test_ogg PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
@@ -272,7 +278,7 @@ add_test(NAME flac COMMAND fa_test_flac)
 # come prebuilt.
 foreach(t fa_test_internal fa_test_loudness fa_test_crossfade fa_test_handoff fa_test_demux
           fa_test_dolby fa_test_aac fa_test_net fa_test_cdg fa_test_disc fa_test_tempo fa_test_ogg
-          fa_test_encode fa_test_midi fa_test_flac fa_test_asf fa_test_tags)
+          fa_test_encode fa_test_midi fa_test_tracker fa_test_flac fa_test_asf fa_test_tags)
     target_link_libraries(${t} PRIVATE fa_opus fa_vorbis fa_openmpt)
     # The same static C runtime as those libraries: libopenmpt is C++, and MSVC
     # refuses to link C++ objects built for different runtimes.
