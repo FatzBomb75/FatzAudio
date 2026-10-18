@@ -59,6 +59,7 @@ void fa_stream_free_memory(struct fa_stream* s)
 {
     free(s->carry);
     free(fa_load_ptr(&s->dsps));
+    fa_tap_free((fa_tap*)fa_load_ptr(&s->tap));
     fa_mutex_destroy(&s->tempo_lock);
     fa_mutex_destroy(&s->cdg_lock);
     fa_mutex_destroy(&s->norm_lock);
@@ -2840,6 +2841,7 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
     mix_markers mk;
     struct fa_bus* bus;
     int eq_on;
+    fa_tap* tap;
     *mixed_off = 0;
     *mixed_n = 0;
     if (fa_load32(&s->flushing)) return;
@@ -2886,6 +2888,7 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
     load_markers(s, &mk);
     played0 = fa_load64(&s->played);
     bus = (struct fa_bus*)fa_load_ptr(&s->bus);
+    tap = (fa_tap*)fa_load_ptr(&s->tap);
 
     avail = fa_ring_readable(&s->ring);
     n = avail < (int64_t)frames - off ? avail : (int64_t)frames - off;
@@ -2972,8 +2975,13 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
             memcpy(eqb, p1, (size_t)n1 * FA_DEVICE_CHANNELS * sizeof(float));
             if (n2 > 0) memcpy(eqb + n1 * FA_DEVICE_CHANNELS, p2, (size_t)n2 * FA_DEVICE_CHANNELS * sizeof(float));
             fa_eq_process(&s->eq, eqb, blk);
+            if (tap) fa_tap_write(tap, now, eqb, blk);
             mix_region(out + (off + done) * 2, eqb, blk, l0, r0, l1, r1);
         } else {
+            if (tap) {
+                fa_tap_write(tap, now, p1, n1);
+                if (n2 > 0) fa_tap_write(tap, now + n1, p2, n2);
+            }
             float* o = out + (off + done) * 2;
             float lm = l0 + (l1 - l0) * (float)n1 / (float)blk, rm = r0 + (r1 - r0) * (float)n1 / (float)blk;
             mix_region(o, p1, n1, l0, r0, lm, rm);

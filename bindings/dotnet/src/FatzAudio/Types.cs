@@ -203,9 +203,28 @@ public sealed record Loudness(double IntegratedLufs, double RangeLu, double True
 }
 
 /// <summary>Peak and RMS levels per channel, linear 0..1.</summary>
-/// <param name="Peak">Peak level per channel.</param>
+/// <param name="Peak">Peak level per channel: left and right, or one value for both.</param>
 /// <param name="Rms">RMS level per channel.</param>
 public sealed record StreamLevels(float[] Peak, float[] Rms);
+
+/// <summary>Options for <see cref="AudioStream.GetSpectrum(int, SpectrumOptions)"/> and <see cref="OutputDevice.GetSpectrum(int, SpectrumOptions)"/>.</summary>
+[Flags]
+public enum SpectrumOptions
+{
+    /// <summary>Both channels mixed, with a Hann window.</summary>
+    None = 0,
+    /// <summary>The left channel only.</summary>
+    Left = 1,
+    /// <summary>The right channel only.</summary>
+    Right = 2,
+    /// <summary>No window (sharper peaks for tones on a bin, more leakage for everything else).</summary>
+    NoWindow = 4,
+}
+
+/// <summary>A magnitude spectrum: bin <c>k</c> is centred on <c>k * BinHz</c>; a full-scale sine reads 1.0 in its bin.</summary>
+/// <param name="Magnitudes">Half the transform size of linear magnitudes, DC first.</param>
+/// <param name="BinHz">Width of one bin in Hz; 0 while nothing plays.</param>
+public sealed record Spectrum(float[] Magnitudes, float BinHz);
 
 /// <summary>Static information about an opened stream.</summary>
 /// <param name="Format">Decoded output format.</param>

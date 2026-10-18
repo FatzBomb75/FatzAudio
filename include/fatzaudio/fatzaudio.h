@@ -1825,7 +1825,33 @@ FA_API fa_result FA_CALL fa_stream_remove_dsp(fa_stream* stream, uint32_t dsp_id
 
 /* ---- Analysis --------------------------------------------------------- */
 
+/* Peak and RMS (linear, 1.0 = full scale) of the last `window` of audio being
+ * heard now: for a VU meter, call it from a timer. channels 1 gives one value for
+ * both sides, 2 gives left and right. A stream's levels are of its own audio,
+ * after its equalizer and DSP, before volume, pan, fades and normalization (as
+ * BASS_ChannelGetLevel); a device's are of its whole output after the limiter.
+ * The window ends at the audio the speaker plays now. Zeros while the stream is
+ * not playing or the device is stopped. The first call starts recording, so it
+ * reads silence; a window over about 1 s is shortened. Either output may be NULL.
+ * Decode-only streams: FA_ERROR_INVALID_ARG (measure what fa_stream_read gives). */
 FA_API fa_result FA_CALL fa_stream_get_levels(fa_stream* stream, fa_time window, float* out_peak, float* out_rms, uint32_t channels);
+FA_API fa_result FA_CALL fa_device_get_levels(fa_device* device, fa_time window, float* out_peak, float* out_rms, uint32_t channels);
+
+typedef enum fa_spectrum_flags {
+    FA_SPECTRUM_LEFT      = 1 << 0,  /* the left channel only (default: both, mixed) */
+    FA_SPECTRUM_RIGHT     = 1 << 1,  /* the right channel only */
+    FA_SPECTRUM_NO_WINDOW = 1 << 2   /* no Hann window (BASS_FFT_NOWINDOW) */
+} fa_spectrum_flags;
+
+/* The magnitude spectrum of the last `size` frames being heard now, for a
+ * visualizer: `size` is a power of two from 64 to 16384, and `out_bins` gets
+ * size / 2 values, bin k centred on k * bin_hz (DC first). A full-scale sine
+ * reads 1.0 in its bin (lower when it falls between two). Same source, timing
+ * and zeros as the levels above; out_bin_hz (may be NULL) is the device rate
+ * divided by size, 0 while nothing plays. Bigger sizes give finer
+ * frequencies and slower response: 2048 at 48 kHz is 23.4 Hz per bin over 43 ms. */
+FA_API fa_result FA_CALL fa_stream_get_spectrum(fa_stream* stream, uint32_t size, uint32_t flags, float* out_bins, float* out_bin_hz);
+FA_API fa_result FA_CALL fa_device_get_spectrum(fa_device* device, uint32_t size, uint32_t flags, float* out_bins, float* out_bin_hz);
 
 #ifdef __cplusplus
 }

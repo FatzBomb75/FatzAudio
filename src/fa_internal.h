@@ -435,6 +435,21 @@ void fa_truepeak_free(fa_truepeak* tp);
 float fa_truepeak_push(fa_truepeak* tp, const float* frame);
 void fa_truepeak_flush(fa_truepeak* tp);
 
+/* ---- Analysis taps (analysis.c) ------------------------------------------
+ * What a stream or device played lately, by device frame, for levels and the
+ * spectrum. Made on the first request (fa_tap_get, any thread); written by the
+ * audio thread only; read without locks. */
+typedef struct fa_tap {
+    float* buf;               /* `frames` stereo frames, a ring by device frame */
+    uint32_t frames;          /* power of two, about 2 s at the device rate */
+    fa_atomic64 start;        /* first device frame written since the last jump */
+    fa_atomic64 end;          /* device frame after the newest one written */
+} fa_tap;
+fa_tap* fa_tap_get(fa_atomic_ptr* slot, uint32_t rate);
+/* `n` frames played from device frame `at`; skipped frames are silence. */
+void fa_tap_write(fa_tap* t, int64_t at, const float* frames, int64_t n);
+void fa_tap_free(fa_tap* t);
+
 /* K-weighted energy meter: one mean-square energy per 100 ms sub-block. */
 typedef struct fa_meter {
     uint32_t rate, channels;
@@ -697,6 +712,7 @@ struct fa_device {
     fa_atomic32 muted;           /* fa_device_set_mute */
     float mute_level;            /* audio thread: 0 = audible .. 1 = silent */
     fa_atomic_ptr encoders;      /* fa_enc_list* recording the output (encode.c) */
+    fa_atomic_ptr tap;           /* fa_tap*, the output after the limiter (analysis.c) */
     struct fa_device* next;      /* engine->devices */
 };
 
@@ -1003,6 +1019,7 @@ struct fa_stream {
      * under api_lock. */
     fa_atomic_ptr encoders;
     struct fa_encoder* reader;
+    fa_atomic_ptr tap;           /* fa_tap*, the stream's audio as mixed (analysis.c) */
     /* MIDI: the soundfont the stream was opened with (a reference, NULL for other
      * formats or none) and the decoder's MIDI state (live controls, texts). */
     struct fa_soundfont* soundfont;

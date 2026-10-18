@@ -1080,13 +1080,17 @@ public unsafe class AudioStream : IDisposable
         }
     }
 
-    /// <summary>Measures peak and RMS levels of the audio currently playing.</summary>
-    /// <param name="window">Length of the measurement window; defaults to 50 ms.</param>
-    /// <returns>Levels per channel.</returns>
-    /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
+    /// <summary>
+    /// Peak and RMS of the stream's audio being heard now, after its equalizer, before its volume, pan, fades and normalization:
+    /// for a VU meter, call it from a timer. All zeros while the stream is not playing. The first call starts
+    /// recording, so it reads silence.
+    /// </summary>
+    /// <param name="window">Length of the measurement window; defaults to 50 ms, at most about 1 s.</param>
+    /// <returns>Levels for left and right (one value for a mono stream).</returns>
+    /// <exception cref="FatzAudioException">A decode-only stream (<see cref="ErrorCode.InvalidArgument"/>).</exception>
     public StreamLevels GetLevels(TimeSpan? window = null)
     {
-        int ch = Math.Max(1, _channels);
+        int ch = _channels == 1 ? 1 : 2;
         var peak = new float[ch];
         var rms = new float[ch];
         fixed (float* pp = peak)
@@ -1096,6 +1100,40 @@ public unsafe class AudioStream : IDisposable
                 Handle, TimeConvert.ToNanoseconds(window ?? TimeSpan.FromMilliseconds(50)), pp, pr, (uint)ch));
         }
         return new StreamLevels(peak, rms);
+    }
+
+    /// <summary>
+    /// The magnitude spectrum of the stream's audio being heard now, for a visualizer (same source and timing
+    /// as <see cref="GetLevels"/>). All zeros while the stream is not playing.
+    /// </summary>
+    /// <param name="size">Transform size: a power of two from 64 to 16384. 2048 at 48 kHz is 23.4 Hz per bin over 43 ms.</param>
+    /// <param name="options">Channel and window.</param>
+    /// <returns><paramref name="size"/> / 2 magnitudes and the bin width.</returns>
+    /// <exception cref="FatzAudioException">An invalid size, or a decode-only stream (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    public Spectrum GetSpectrum(int size = 2048, SpectrumOptions options = SpectrumOptions.None)
+    {
+        var bins = new float[Math.Max(1, size / 2)];
+        float hz;
+        fixed (float* p = bins)
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_spectrum(Handle, (uint)Math.Max(0, size), (uint)options, p, &hz));
+        }
+        return new Spectrum(bins, hz);
+    }
+
+    /// <summary>Like <see cref="GetSpectrum(int, SpectrumOptions)"/>, into your own buffer (no allocation per call).</summary>
+    /// <param name="magnitudes">Half the transform size: 32 to 8192 values, a power of two.</param>
+    /// <param name="options">Channel and window.</param>
+    /// <returns>The bin width in Hz; 0 while the stream is not playing.</returns>
+    /// <exception cref="FatzAudioException">An invalid length, or a decode-only stream (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    public float GetSpectrum(Span<float> magnitudes, SpectrumOptions options = SpectrumOptions.None)
+    {
+        float hz;
+        fixed (float* p = magnitudes)
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_spectrum(Handle, (uint)magnitudes.Length * 2, (uint)options, p, &hz));
+        }
+        return hz;
     }
 
     /// <summary>
