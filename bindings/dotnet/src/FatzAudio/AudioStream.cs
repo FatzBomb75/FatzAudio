@@ -605,6 +605,35 @@ public unsafe class AudioStream : IDisposable
         }
     }
 
+    /// <summary>
+    /// The tempo changes and time and key signatures of a MIDI stream in time order (empty for other streams).
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// var tempo = song.MidiMarks.FirstOrDefault(m =&gt; m.Type == MidiMarkType.Tempo);
+    /// double bpm = tempo is null ? 120 : 60_000_000.0 / tempo.Value;
+    /// </code>
+    /// </example>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public unsafe IReadOnlyList<MidiMark> MidiMarks
+    {
+        get
+        {
+            uint count = 0;
+            if (NativeMethods.fa_stream_get_midi_marks(Handle, null, 0, &count) != 0 || count == 0) return [];
+            var native = new FaMidiMark[count];
+            fixed (FaMidiMark* p = native)
+                FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_midi_marks(Handle, p, count, &count));
+            var list = new List<MidiMark>(native.Length);
+            foreach (var m in native)
+            {
+                var t = m;
+                list.Add(new MidiMark((MidiMarkType)t.Type, t.Value, t.Value2, Str(t.Text), TimeConvert.FromNanoseconds(t.Time), t.Frame, t.Track));
+            }
+            return list;
+        }
+    }
+
     private unsafe MidiText GetMidiText(int index)
     {
         FaMidiText t;
