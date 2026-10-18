@@ -63,7 +63,7 @@ fa_stream_open_url(engine, "https://cdn.example.com/show/master.m3u8", &opts, &s
 |---|---|---|
 | `user_agent` | `FatzAudio/<version>` | The User-Agent header |
 | `headers` | none | Extra request headers, `Name: value` lines separated by `\r\n` or `\n`. Sent with every request, HLS segments and keys included |
-| `proxy` | the system's | `NULL` uses the `http_proxy`/`https_proxy`/`no_proxy` environment variables and the Windows and macOS proxy settings. `""` connects directly. Or `"host:port"`, `"http://user:password@host:port"` |
+| `proxy` | the system's | `NULL` uses the `http_proxy`/`https_proxy`/`no_proxy` environment variables and the Windows, macOS and Android proxy settings. `""` connects directly. Or `"host:port"`, `"http://user:password@host:port"` |
 | `timeout_ms` | 10000 | How long connecting may take, and the longest the server may stay silent before the connection counts as dropped |
 | `prebuffer_ms` | 1000 | Audio buffered before playback starts, and again before it resumes after a stall |
 | `reconnect_ms` | 30000 | How long to keep reconnecting after the connection drops |
@@ -137,7 +137,7 @@ A URL that isn't an absolute http or https URL throws `ArgumentException`. Other
 | `FA_ERROR_NOT_FOUND` | The server answered with an error (404, 403, 500, ...) |
 | `FA_ERROR_UNSUPPORTED_FORMAT` | What came back isn't audio FatzAudio can decode (a web page, say) |
 | `FA_ERROR_PROTECTED_CONTENT` | The stream is DRM-protected: HLS with `SAMPLE-AES` or another DRM key method, or an encrypted file |
-| `FA_ERROR_PROVIDER_MISSING` | `https://` on a Linux system without libcurl |
+| `FA_ERROR_PROVIDER_MISSING` | `https://` on a Linux system without libcurl, or on Android before the Java VM is known ([Android](#android)) |
 
 ## Buffering, stalls and reconnects
 
@@ -187,9 +187,38 @@ FatzAudio never bundles a TLS library. HTTPS goes through the system's stack, so
 | Windows | WinHTTP (SChannel) |
 | macOS, iOS | URLSession; App Transport Security rules apply |
 | Linux | libcurl, loaded at runtime (`libcurl.so.4`, installed almost everywhere). Without it, `https://` returns `FA_ERROR_PROVIDER_MISSING`; `http://` still works |
-| Android | 🗓️ (HttpURLConnection through JNI) |
+| Android | `HttpURLConnection` (Conscrypt), called through JNI on the app's Java VM. The app's network security config applies |
 
 Plain `http://` uses FatzAudio's own small HTTP/1.1 client on every platform. It understands Shoutcast's `ICY 200 OK` answers, which some HTTP stacks reject.
+
+### Android
+
+HTTPS runs on the Java VM every Android app already has, so `libfatzaudio.so` still needs nothing but libc. The VM is found like this:
+
+- **Android 12 (API 31) and later:** by itself. Nothing to do.
+- **.NET for Android, any version:** the binding hands .NET's VM to the library the first time it's used. Nothing to do. If your app hosts .NET some other way and `https://` fails with `ProviderMissing`, call `AudioEngine.SetAndroidJavaVM(vm)` once.
+- **Java or Kotlin app on Android 7 to 11 (API 24 to 30):** call `fa_android_set_java_vm` once from your own JNI code, before the first `https://` URL. Until then, `https://` returns `FA_ERROR_PROVIDER_MISSING` and `http://` works.
+
+```c
+#include <jni.h>
+#include <fatzaudio/fatzaudio.h>
+
+/* In the app's own JNI library, loaded with System.loadLibrary. */
+JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved)
+{
+    fa_android_set_java_vm(vm);
+    return JNI_VERSION_1_6;
+}
+```
+
+What else to know on Android:
+
+- The certificates, user-added CAs and certificate pinning of your app's [network security config](https://developer.android.com/privacy-and-security/security-config) apply to `https://`, as they do for the app's own requests.
+- The network security config's cleartext rule does not apply to `http://`: that goes through FatzAudio's own client. Use `https://` URLs if your app must not send cleartext.
+- The proxy of the active network (Wi-Fi proxy settings, with its exclusion list) is used for `http://` and `https://` when `proxy` is `NULL`.
+- Credentials in `proxy` (`"http://user:password@host:port"`) are sent for `http://` only, as on Windows: `https://` through a proxy that asks for a password fails with `FA_ERROR_NETWORK`.
+- Android's HTTPS stack rejects the `ICY 200 OK` status line of old Shoutcast v1 servers, so such a server works over `http://` only. Icecast and Shoutcast v2 answer `HTTP/1.x` and work over both.
+- Requests run on the stream's own download thread, never on the app's main thread, so `NetworkOnMainThreadException` can't happen.
 
 ## Not provided yet
 

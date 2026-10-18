@@ -149,6 +149,9 @@ target_link_libraries(fa_test_net PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA
 if(UNIX)
     target_link_libraries(fa_test_net PRIVATE m)
 endif()
+if(ANDROID)
+    target_sources(fa_test_net PRIVATE net_tls_android.c)
+endif()
 add_test(NAME net COMMAND fa_test_net)
 
 add_executable(fa_test_cdg test_cdg.c ${FA_SOURCES})
