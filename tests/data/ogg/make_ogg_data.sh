@@ -46,4 +46,7 @@ ff -f lavfi -i "$(sine '0.5*sin(2*PI*440*t)*(0.6+0.4*sin(2*PI*3*t))' 44100 3)" -
    -page_duration 100000 -map_metadata -1 -fflags +bitexact pages.ogg
 ff -f lavfi -i "$(sine '0.5*sin(2*PI*700*t)*(0.6+0.4*sin(2*PI*3*t))|0.4*sin(2*PI*500*t)' 48000 3)" -c:a libopus -b:a 24k \
    -page_duration 100000 -map_metadata -1 -fflags +bitexact pages.opus
+# Pages as big as Ogg allows (about 4 KB, then 58 KB and 31 KB): the page buffer grows.
+ff -f lavfi -i "aevalsrc=0.4*sin(2*PI*440*t)+0.2*random(0)-0.1:s=44100:d=3" -c:a libvorbis -q:a 10 \
+   -page_duration 30000000 -map_metadata -1 -fflags +bitexact bigpages.ogg
 ls -l *.opus *.ogg

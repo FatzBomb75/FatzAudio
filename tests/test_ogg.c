@@ -221,6 +221,25 @@ static void test_seek_skips_packets(void)
     fa_stream_close(s);
 }
 
+/* Pages of 4 KB, 58 KB and 31 KB: the page buffer grows past its first size and
+ * up to the Ogg maximum, and seeks still match a straight decode. */
+static void test_large_pages(void)
+{
+    static const int64_t at[] = { 0, 1000, 44100, 70000, 100000, 131000, 5 };
+    fa_stream* s;
+    fa_stream_info info;
+    float* full;
+    int64_t n;
+    double worst;
+    CHECK_EQ(open_file("bigpages.ogg", -1, &s, &info), FA_OK);
+    full = read_all(s, 1, &n);
+    CHECK_EQ(n, 132300);
+    CHECK(rms(full, 0, n, 1, 0) > 0.2);
+    CHECK(seek_matches(s, full, n, 1, at, (int)(sizeof(at) / sizeof(at[0])), 1e-6, &worst));
+    free(full);
+    fa_stream_close(s);
+}
+
 /* 5.1 comes out in the library's order (L R C LFE SL SR), not Vorbis order. */
 static void check_surround(const char* name, int lfe_coded)
 {
@@ -590,6 +609,7 @@ int main(void)
     RUN(test_opus_file);
     RUN(test_vorbis_file);
     RUN(test_seek_skips_packets);
+    RUN(test_large_pages);
     RUN(test_surround_order);
     RUN(test_two_audio_streams);
     RUN(test_chained_file);
