@@ -112,30 +112,71 @@ static void utf16_to_utf8(const uint8_t* p, size_t n, char* out, size_t cap)
 
 /* ---- tags --------------------------------------------------------------------------------- */
 
-static void tag_item(fa_asf_tags* t, const uint8_t* name, size_t name_len, const uint8_t* value, size_t value_len)
+#define ASF_TAG_TEXT_MAX (1u << 20)
+
+/* One attribute: strings (type 0) and numbers (BOOL 2, DWORD 3, QWORD 4, WORD 5) are
+ * text items; WM/Picture (bytes, type 1) is a picture. */
+static void tag_item(fa_tag_sink* sink, const uint8_t* name, size_t name_len, size_t type, const uint8_t* value, size_t value_len)
 {
-    char key[128], text[512];
+    char key[128];
     utf16_to_utf8(name, name_len, key, sizeof(key));
-    utf16_to_utf8(value, value_len, text, sizeof(text));
-    fa_tags_handle(key, text, &t->loudness);
-    if (!t->title[0] && fa_tags_key_is(key, "Title")) utf16_to_utf8(value, value_len, t->title, sizeof(t->title));
-    if (!t->artist[0] && (fa_tags_key_is(key, "Author") || fa_tags_key_is(key, "WM/AlbumArtist")))
-        utf16_to_utf8(value, value_len, t->artist, sizeof(t->artist));
+    if (type == 0) {
+        size_t cap = value_len * 3 / 2 + 4;   /* UTF-16 to UTF-8 grows by at most 3/2 */
+        char* text;
+        if (value_len > ASF_TAG_TEXT_MAX || value_len > sink->max_text * 2) return;
+        text = (char*)malloc(cap);
+        if (!text) return;
+        utf16_to_utf8(value, value_len, text, cap);
+        sink->text(sink, FA_TAG_FORMAT_ASF, key, text);
+        free(text);
+    } else if (type >= 2 && type <= 5) {
+        char num[24];
+        uint64_t v = 0;
+        size_t i;
+        for (i = 0; i < value_len && i < 8; i++) v |= (uint64_t)value[i] << (8 * i);
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)v);
+        sink->text(sink, FA_TAG_FORMAT_ASF, key, num);
+    } else if (type == 1 && sink->picture && fa_tags_key_is(key, "WM/Picture") && value_len >= 5) {
+        /* type, data size, MIME and description (NUL-terminated UTF-16), data. */
+        uint32_t size = le32(value + 1);
+        size_t pos = 5, mime_at, desc_at;
+        char mime[64], desc[256];
+        mime_at = pos;
+        while (pos + 1 < value_len && (value[pos] || value[pos + 1])) pos += 2;
+        if (pos + 1 >= value_len) return;
+        utf16_to_utf8(value + mime_at, pos - mime_at, mime, sizeof(mime));
+        pos += 2;
+        desc_at = pos;
+        while (pos + 1 < value_len && (value[pos] || value[pos + 1])) pos += 2;
+        if (pos + 1 >= value_len) return;
+        utf16_to_utf8(value + desc_at, pos - desc_at, desc, sizeof(desc));
+        pos += 2;
+        if (size > value_len - pos) return;
+        sink->picture(sink, FA_TAG_FORMAT_ASF, value[0], mime, desc, value + pos, size);
+    }
 }
 
 /* Content Description: title, author, copyright, description, rating. */
-static void parse_content_desc(const uint8_t* p, size_t n, fa_asf_tags* t)
+static void parse_content_desc(const uint8_t* p, size_t n, fa_tag_sink* sink)
 {
+    static const char* const names[5] = { "Title", "Author", "Copyright", "Description", "Rating" };
     size_t len[5], pos = 10, i;
     if (n < 10) return;
     for (i = 0; i < 5; i++) len[i] = le16(p + 2 * i);
-    if (len[0] > 0 && len[0] <= n - pos) utf16_to_utf8(p + pos, len[0], t->title, sizeof(t->title));
-    pos += len[0];
-    if (len[1] > 0 && pos <= n && len[1] <= n - pos) utf16_to_utf8(p + pos, len[1], t->artist, sizeof(t->artist));
+    for (i = 0; i < 5; i++) {
+        if (pos > n || len[i] > n - pos) return;
+        if (len[i] > 0) {
+            uint8_t name[32];
+            size_t k, m = strlen(names[i]);
+            for (k = 0; k < m; k++) { name[2 * k] = (uint8_t)names[i][k]; name[2 * k + 1] = 0; }
+            tag_item(sink, name, 2 * m, 0, p + pos, len[i]);
+        }
+        pos += len[i];
+    }
 }
 
-/* Extended Content Description: name / type / value items; strings are type 0. */
-static void parse_ext_content_desc(const uint8_t* p, size_t n, fa_asf_tags* t)
+/* Extended Content Description: name / type / value items. */
+static void parse_ext_content_desc(const uint8_t* p, size_t n, fa_tag_sink* sink)
 {
     size_t pos = 2;
     uint32_t count, i;
@@ -154,13 +195,14 @@ static void parse_ext_content_desc(const uint8_t* p, size_t n, fa_asf_tags* t)
         value_len = le16(p + pos + 2);
         pos += 4;
         if (n - pos < value_len) return;
-        if (type == 0) tag_item(t, name, name_len, p + pos, value_len);
+        tag_item(sink, name, name_len, type, p + pos, value_len);
         pos += value_len;
     }
 }
 
-/* Metadata and Metadata Library: per-stream items with 32-bit value sizes. */
-static void parse_metadata(const uint8_t* p, size_t n, fa_asf_tags* t)
+/* Metadata and Metadata Library: per-stream items with 32-bit value sizes (WORD
+ * values are stored in 2 bytes, BOOL in 2 here, unlike the 4 bytes above). */
+static void parse_metadata(const uint8_t* p, size_t n, fa_tag_sink* sink)
 {
     size_t pos = 2;
     uint32_t count, i;
@@ -175,7 +217,7 @@ static void parse_metadata(const uint8_t* p, size_t n, fa_asf_tags* t)
         value_len = le32(p + pos + 8);
         pos += 12;
         if (n - pos < name_len || n - pos - name_len < value_len) return;
-        if (type == 0) tag_item(t, p + pos, name_len, p + pos + name_len, value_len);
+        if (type != 6) tag_item(sink, p + pos, name_len, type, p + pos + name_len, value_len);   /* 6 = GUID */
         pos += name_len + value_len;
     }
 }
@@ -192,36 +234,33 @@ static int ext_children(const uint8_t* p, size_t n, const uint8_t** first, const
     return 1;
 }
 
-static void parse_tag_objects(const uint8_t* cur, const uint8_t* end, fa_asf_tags* t, int depth)
+static void parse_tag_objects(const uint8_t* cur, const uint8_t* end, fa_tag_sink* sink, int depth)
 {
     const uint8_t *guid, *body;
     size_t len;
     while (next_object(&cur, end, &guid, &body, &len)) {
-        if (guid_is(guid, g_content_desc)) parse_content_desc(body, len, t);
-        else if (guid_is(guid, g_ext_content_desc)) parse_ext_content_desc(body, len, t);
-        else if (guid_is(guid, g_metadata) || guid_is(guid, g_metadata_library)) parse_metadata(body, len, t);
+        if (guid_is(guid, g_content_desc)) parse_content_desc(body, len, sink);
+        else if (guid_is(guid, g_ext_content_desc)) parse_ext_content_desc(body, len, sink);
+        else if (guid_is(guid, g_metadata) || guid_is(guid, g_metadata_library)) parse_metadata(body, len, sink);
         else if (guid_is(guid, g_header_ext) && depth == 0) {
             const uint8_t *c2, *e2;
-            if (ext_children(body, len, &c2, &e2)) parse_tag_objects(c2, e2, t, 1);
+            if (ext_children(body, len, &c2, &e2)) parse_tag_objects(c2, e2, sink, 1);
         }
     }
 }
 
-int fa_asf_read_tags(fa_source* src, fa_asf_tags* out)
+int fa_asf_read_tags(fa_source* src, fa_tag_sink* sink)
 {
     uint8_t h[30];
     uint8_t* body;
     uint64_t size;
-    memset(out, 0, sizeof(*out));
-    out->loudness.track_lufs = out->loudness.album_lufs = NAN;
-    out->loudness.track_peak_db = out->loudness.album_peak_db = NAN;
     if (fa_source_seek(src, 0) != FA_OK || fa_source_read(src, h, 30) != 30 || !guid_is(h, g_header)) return 0;
     size = le64(h + 16);
     if (size < 30 || size - 30 > ASF_MAX_HEADER) return 1;
     body = (uint8_t*)malloc((size_t)(size - 30) + 1);
     if (!body) return 1;
     if (fa_source_read(src, body, (size_t)(size - 30)) == (int64_t)(size - 30))
-        parse_tag_objects(body, body + (size - 30), out, 0);
+        parse_tag_objects(body, body + (size - 30), sink, 0);
     free(body);
     return 1;
 }

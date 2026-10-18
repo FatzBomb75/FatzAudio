@@ -114,6 +114,29 @@ internal unsafe struct FaStreamInfo
     public int AudioTrackCount;
     public int HasCdg;
     public long Duration;
+    public long FileSize;
+    public long AudioBytes;
+    public uint Bitrate;
+    public uint BitsPerSample;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaTagItem
+{
+    public nint Key;
+    public nint Value;
+    public int Format;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaTagPicture
+{
+    public int Type;
+    public nint Mime;
+    public nint Description;
+    public nint Data;
+    public nuint Size;
+    public int Format;
 }
 
 [StructLayout(LayoutKind.Sequential)]

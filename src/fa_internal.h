@@ -114,6 +114,12 @@ struct fa_decoder {
     /* MIDI, from fa_decoder_open's env (wrapping decoders such as HLS pass both on). */
     struct fa_soundfont* soundfont;   /* borrowed, NULL = none */
     uint32_t midi_rate;               /* MIDI: output rate */
+    /* Properties (fa_stream_info), set by the decoder when it knows them;
+     * fa_decoder_open fills the rest in for whole-file formats. */
+    int64_t audio_bytes;              /* coded audio data, -1 = unknown */
+    uint32_t bitrate;                 /* nominal bits per second, 0 = unknown */
+    uint32_t bits_per_sample;         /* PCM and lossless, 0 = lossy or unknown */
+    int64_t file_size;                /* -1 = unknown */
 };
 
 /* What a decoder may need from the stream that opens it. */
@@ -131,6 +137,8 @@ typedef struct fa_decoder_env {
  * if the file has no such track. `env` may be NULL (defaults). */
 fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint, const char* mime_hint,
                           int32_t audio_track, const fa_decoder_env* env);
+/* The decoder's part of fa_stream_info (everything but has_cdg). */
+void fa_decoder_get_info(const fa_decoder* dec, fa_stream_info* out);
 fa_result fa_decoder_read(fa_decoder* dec, float* out, fa_frames frames, fa_frames* got);
 fa_result fa_decoder_seek(fa_decoder* dec, fa_frames frame);
 void fa_decoder_close(fa_decoder* dec);
@@ -139,6 +147,8 @@ void fa_decoder_close(fa_decoder* dec);
  * `sequential` = stop at the audio data, for sources that cannot seek back. */
 fa_result fa_drwav_open(fa_source* src, int sequential, void** out_impl,
                         uint32_t* out_rate, uint32_t* out_channels, uint64_t* out_frames);
+/* Bits per sample (PCM and float only, else 0) and the size of the data chunk (-1 = unknown). */
+void fa_drwav_props(void* impl, uint32_t* out_bits, int64_t* out_data_bytes);
 uint64_t fa_drwav_read(void* impl, float* out, uint64_t frames);
 int fa_drwav_seek(void* impl, uint64_t frame);
 void fa_drwav_close(void* impl);
@@ -433,7 +443,27 @@ double fa_meter_peak_dbtp(const fa_meter* m);
 double fa_loudness_integrated(const double* subs, int64_t n); /* -HUGE_VAL for silence */
 double fa_loudness_range(const double* subs, int64_t n);
 
-/* ---- Gain tags (tags.c) ----------------------------------------------------- */
+/* ---- Tags (tags.c, tags_read.c) ------------------------------------------- */
+
+/* Where the tag readers deliver what they find. Readers call `text` for every
+ * text item (UTF-8 key and value) and `picture` for every picture; with
+ * `picture` NULL, picture data is skipped without being read, and text items
+ * longer than `max_text` bytes are skipped too. */
+typedef struct fa_tag_sink fa_tag_sink;
+struct fa_tag_sink {
+    void (*text)(fa_tag_sink* sink, int format, const char* key, const char* value);
+    void (*picture)(fa_tag_sink* sink, int format, int type, const char* mime, const char* description,
+                    const uint8_t* data, size_t size);
+    size_t max_text;
+};
+
+/* Reads every tag of the source into `sink`, in priority order (see fa_tags_get).
+ * Moves the read position; needs a seekable source. */
+void fa_tags_collect(fa_source* src, fa_tag_sink* sink);
+/* Where the audio of an MP3, AAC, AC-3 or FLAC file lies: after an ID3v2 tag and
+ * FLAC's metadata blocks, before APEv2 and ID3v1 tags. *out_bits = FLAC's bits
+ * per sample, else 0. Moves the read position. */
+void fa_tags_audio_span(fa_source* src, int64_t* out_start, int64_t* out_end, uint32_t* out_bits);
 
 /* Loudness stored in ReplayGain 2 / R128 tags, converted to LUFS. NAN = absent. */
 typedef struct fa_tag_loudness {
@@ -441,25 +471,25 @@ typedef struct fa_tag_loudness {
     double track_peak_db, album_peak_db;   /* sample peak in dBFS */
 } fa_tag_loudness;
 
-/* Reads ID3v2 (TXXX), FLAC Vorbis comments and APEv2. Moves the read position. */
+/* The loudness tags of any format fa_tags_collect reads. Moves the read position. */
 void fa_tags_read_loudness(fa_source* src, fa_tag_loudness* out);
-/* The comment header of an Ogg Opus or Vorbis file (demux_ogg.c). */
-void fa_ogg_read_loudness(fa_source* src, fa_tag_loudness* out);
-/* A Vorbis comment block (FLAC, Ogg Vorbis/Opus): vendor, count, "KEY=value" items. */
-void fa_tags_parse_vorbis_comments(const uint8_t* data, size_t size, fa_tag_loudness* out);
+/* The comment header of an Ogg Opus, Vorbis or FLAC file (demux_ogg.c). */
+void fa_ogg_read_tags(fa_source* src, fa_tag_sink* sink);
+/* A Vorbis comment block (FLAC, Ogg Vorbis/Opus): vendor, count, "KEY=value"
+ * items. METADATA_BLOCK_PICTURE items are delivered as pictures. */
+void fa_tags_parse_vorbis_comments(const uint8_t* data, size_t size, fa_tag_sink* sink);
+/* A FLAC PICTURE block body (also the base64 payload of METADATA_BLOCK_PICTURE). */
+void fa_tags_parse_flac_picture(const uint8_t* data, size_t size, int format, fa_tag_sink* sink);
+/* The MIME type of image data from its first bytes, "" if unknown. */
+const char* fa_tags_image_mime(const uint8_t* data, size_t size);
 /* One "KEY" / "value" tag item: the loudness keys are taken, others ignored. */
 void fa_tags_handle(const char* key, const char* value, fa_tag_loudness* out);
 int fa_tags_key_is(const char* key, const char* name);   /* ASCII case-insensitive */
 
 /* ASF tags (demux_asf.c): Content Description, Extended Content Description and
- * Metadata (Library) string items, as UTF-8. Returns 0 if `src` is not ASF.
+ * Metadata (Library) items, WM/Picture included. Returns 0 if `src` is not ASF.
  * Moves the read position. */
-typedef struct fa_asf_tags {
-    char title[256];
-    char artist[256];               /* Author, else WM/AlbumArtist */
-    fa_tag_loudness loudness;       /* NAN = absent */
-} fa_asf_tags;
-int fa_asf_read_tags(fa_source* src, fa_asf_tags* out);
+int fa_asf_read_tags(fa_source* src, fa_tag_sink* sink);
 
 /* ---- Loudness scans (scan.c) ----------------------------------------------- */
 
@@ -808,6 +838,7 @@ struct fa_stream {
 
     /* Normalization */
     char* path;                  /* for scans of path streams; NULL otherwise */
+    int64_t zip_size;            /* bytes of the ZIP the audio came from, 0 = not a ZIP */
     int32_t audio_track;
     fa_mutex norm_lock;          /* scan_job, loud, loud_source */
     fa_scan_job* scan_job;

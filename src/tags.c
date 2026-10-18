@@ -1,14 +1,17 @@
-/* Loudness tags: ReplayGain 2 (REPLAYGAIN_TRACK_GAIN etc., reference -18 LUFS)
- * and R128 (R128_TRACK_GAIN, Q7.8 dB relative to -23 LUFS), read from ID3v2 TXXX
- * frames, FLAC and Ogg Vorbis comments (OpusTags too), APEv2 tags and ASF (.wma)
- * attributes (demux_asf.c). Only the frames that can hold them are read; pictures
- * and other large frames are skipped with a seek. */
+/* Tags: the public tag object (fa_tags_*), the common fields mapped from every
+ * format's own keys, Vorbis comments and FLAC pictures, and the loudness tags
+ * that normalization uses: ReplayGain 2 (REPLAYGAIN_TRACK_GAIN etc., reference
+ * -18 LUFS) and R128 (R128_TRACK_GAIN, Q7.8 dB relative to -23 LUFS). The format
+ * readers are in tags_read.c (and demux_ogg.c, demux_asf.c); they all deliver to
+ * a fa_tag_sink, so each format is parsed once for both uses. */
 #include "fa_internal.h"
+#include "cdg.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define FA_TAG_TEXT_MAX 512
+#define FA_TAGS_MAX_TEXT (16u << 20)     /* lyrics and comments longer than this are skipped */
+#define FA_LOUDNESS_TEXT_MAX 512
 
 static int ieq(const char* a, const char* b)
 {
@@ -50,210 +53,666 @@ void fa_tags_handle(const char* key, const char* value, fa_tag_loudness* out)
     else if (ieq(key, "REPLAYGAIN_ALBUM_PEAK") && v > 0.0) out->album_peak_db = 20.0 * log10(v);
 }
 
-static int read_exact(fa_source* src, void* buf, size_t n) { return fa_source_read(src, buf, n) == (int64_t)n; }
-static uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
 static uint32_t le32(const uint8_t* p) { return ((uint32_t)p[3] << 24) | ((uint32_t)p[2] << 16) | ((uint32_t)p[1] << 8) | p[0]; }
-static uint32_t synchsafe(const uint8_t* p) { return ((uint32_t)(p[0] & 0x7f) << 21) | ((uint32_t)(p[1] & 0x7f) << 14) | ((uint32_t)(p[2] & 0x7f) << 7) | (p[3] & 0x7f); }
+static uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
 
-/* ---- ID3v2 ------------------------------------------------------------------- */
-
-/* Decodes an ID3 text payload to ASCII with '\0' between strings (non-ASCII
- * characters become '?': the keys and numbers we look for are ASCII). */
-static size_t id3_text(const uint8_t* p, size_t n, char* out, size_t cap)
+const char* fa_tags_image_mime(const uint8_t* d, size_t n)
 {
-    size_t i = 0, k = 0;
-    int enc;
-    if (n == 0) return 0;
-    enc = p[i++];
-    if (enc == 1 || enc == 2) {
-        int big = enc == 2;
-        while (i + 1 < n && k + 1 < cap) {
-            unsigned u = big ? ((unsigned)p[i] << 8 | p[i + 1]) : ((unsigned)p[i + 1] << 8 | p[i]);
-            i += 2;
-            if (u == 0xFEFF) continue;                       /* BOM in our byte order */
-            if (u == 0xFFFE) { big = !big; continue; }       /* BOM in the other one */
-            out[k++] = u == 0 ? '\0' : u < 0x80 ? (char)u : '?';
+    if (n >= 3 && d[0] == 0xFF && d[1] == 0xD8 && d[2] == 0xFF) return "image/jpeg";
+    if (n >= 8 && memcmp(d, "\x89PNG\r\n\x1a\n", 8) == 0) return "image/png";
+    if (n >= 4 && memcmp(d, "GIF8", 4) == 0) return "image/gif";
+    if (n >= 12 && memcmp(d, "RIFF", 4) == 0 && memcmp(d + 8, "WEBP", 4) == 0) return "image/webp";
+    if (n >= 2 && d[0] == 'B' && d[1] == 'M') return "image/bmp";
+    return "";
+}
+
+/* ---- Vorbis comments and FLAC pictures ---------------------------------------------- */
+
+void fa_tags_parse_flac_picture(const uint8_t* p, size_t n, int format, fa_tag_sink* sink)
+{
+    uint32_t type, ml, dl, size;
+    size_t pos = 0;
+    char mime[64];
+    char* desc;
+    if (!sink->picture || n < 32) return;
+    type = be32(p);
+    ml = be32(p + 4);
+    pos = 8;
+    if (ml > n - pos) return;
+    snprintf(mime, sizeof(mime), "%.*s", (int)(ml < 63 ? ml : 63), (const char*)(p + pos));
+    pos += ml;
+    if (n - pos < 4) return;
+    dl = be32(p + pos);
+    pos += 4;
+    if (dl > n - pos) return;
+    desc = (char*)malloc(dl + 1);
+    if (!desc) return;
+    memcpy(desc, p + pos, dl);
+    desc[dl] = '\0';
+    pos += dl;
+    if (n - pos < 20) { free(desc); return; }
+    pos += 16;                            /* width, height, depth, colours */
+    size = be32(p + pos);
+    pos += 4;
+    if (size <= n - pos && type <= 20) sink->picture(sink, format, (int)type, mime, desc, p + pos, size);
+    free(desc);
+}
+
+static int b64_value(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+/* Base64 in place: returns the decoded size (stops at '=' or a bad character). */
+static size_t b64_decode(uint8_t* s, size_t n)
+{
+    size_t i, k = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (i = 0; i < n; i++) {
+        int v = b64_value((char)s[i]);
+        if (v < 0) {
+            if (s[i] == '\r' || s[i] == '\n' || s[i] == ' ') continue;
+            break;
         }
-    } else {
-        while (i < n && k + 1 < cap) {
-            uint8_t c = p[i++];
-            out[k++] = c < 0x80 ? (char)c : '?';
-        }
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8) { bits -= 8; s[k++] = (uint8_t)(acc >> bits); }
     }
-    out[k] = '\0';
     return k;
 }
 
-/* Returns the size of the whole tag (header included), 0 if there is none. */
-static int64_t read_id3v2(fa_source* src, fa_tag_loudness* out)
-{
-    uint8_t h[10];
-    int ver, flags;
-    int64_t size, pos, end;
-    if (fa_source_seek(src, 0) != FA_OK || !read_exact(src, h, 10)) return 0;
-    if (memcmp(h, "ID3", 3) != 0 || h[3] < 2 || h[3] > 4) return 0;
-    ver = h[3];
-    flags = h[5];
-    size = synchsafe(h + 6);
-    end = 10 + size;
-    if (flags & 0x10) end += 10;          /* footer */
-    if (ver < 4 && (flags & 0x80)) return end; /* whole-tag unsynchronisation: rare, skip */
-
-    pos = 10;
-    if (flags & 0x40) {                   /* extended header */
-        uint8_t e[4];
-        if (!read_exact(src, e, 4)) return end;
-        pos += ver == 4 ? synchsafe(e) : (int64_t)be32(e) + 4;
-    }
-    while (pos + (ver == 2 ? 6 : 10) <= 10 + size) {
-        uint8_t fh[10];
-        int64_t fsize;
-        int is_txxx;
-        int hl = ver == 2 ? 6 : 10;
-        if (fa_source_seek(src, pos) != FA_OK || !read_exact(src, fh, (size_t)hl)) break;
-        if (fh[0] == 0) break;            /* padding */
-        if (ver == 2) {
-            fsize = ((int64_t)fh[3] << 16) | ((int64_t)fh[4] << 8) | fh[5];
-            is_txxx = memcmp(fh, "TXX", 3) == 0;
-        } else {
-            fsize = ver == 4 ? synchsafe(fh + 4) : be32(fh + 4);
-            /* Compressed or encrypted frames cannot be read as text. */
-            is_txxx = memcmp(fh, "TXXX", 4) == 0 && !(fh[9] & (ver == 4 ? 0x0c : 0xc0));
-        }
-        if (fsize <= 0 || pos + hl + fsize > 10 + size) break;
-        if (is_txxx && fsize < FA_TAG_TEXT_MAX) {
-            uint8_t raw[FA_TAG_TEXT_MAX];
-            char text[FA_TAG_TEXT_MAX];
-            size_t n;
-            if (read_exact(src, raw, (size_t)fsize)) {
-                n = id3_text(raw, (size_t)fsize, text, sizeof(text));
-                if (n > 0) {
-                    size_t klen = strlen(text);
-                    if (klen < n) fa_tags_handle(text, text + klen + 1, out);
-                }
-            }
-        }
-        pos += hl + fsize;
-    }
-    return end;
-}
-
-/* ---- Vorbis comments (FLAC) -------------------------------------------------- */
-
-void fa_tags_parse_vorbis_comments(const uint8_t* p, size_t n, fa_tag_loudness* out)
+void fa_tags_parse_vorbis_comments(const uint8_t* p, size_t n, fa_tag_sink* sink)
 {
     size_t pos = 0;
     uint32_t count, i;
     if (n < 8) return;
     pos = 4 + (size_t)le32(p);            /* vendor string */
-    if (pos + 4 > n) return;
+    if (pos + 4 > n || pos < 4) return;
     count = le32(p + pos);
     pos += 4;
     for (i = 0; i < count && pos + 4 <= n; i++) {
         uint32_t len = le32(p + pos);
+        const uint8_t* item;
+        size_t k;
         pos += 4;
         if (len > n - pos) return;
-        if (len < FA_TAG_TEXT_MAX) {
-            char text[FA_TAG_TEXT_MAX];
-            char* eq;
-            memcpy(text, p + pos, len);
-            text[len] = '\0';
-            eq = strchr(text, '=');
-            if (eq) { *eq = '\0'; fa_tags_handle(text, eq + 1, out); }
-        }
+        item = p + pos;
         pos += len;
+        for (k = 0; k < len && item[k] != '='; k++) {}
+        if (k == len || k == 0 || k > 255) continue;
+        if (k == 22 && memcmp(item, "METADATA_BLOCK_PICTURE", 22) == 0) {
+            uint8_t* raw;
+            size_t m;
+            if (!sink->picture) continue;
+            raw = (uint8_t*)malloc(len - k);
+            if (!raw) continue;
+            memcpy(raw, item + k + 1, len - k - 1);
+            m = b64_decode(raw, len - k - 1);
+            fa_tags_parse_flac_picture(raw, m, FA_TAG_FORMAT_VORBIS, sink);
+            free(raw);
+        } else if (len - k - 1 <= sink->max_text) {
+            char key[256];
+            char* value = (char*)malloc(len - k);
+            if (!value) continue;
+            memcpy(key, item, k);
+            key[k] = '\0';
+            memcpy(value, item + k + 1, len - k - 1);
+            value[len - k - 1] = '\0';
+            sink->text(sink, FA_TAG_FORMAT_VORBIS, key, value);
+            free(value);
+        }
     }
 }
 
-static void read_flac(fa_source* src, int64_t start, fa_tag_loudness* out)
-{
-    uint8_t h[4];
-    int64_t pos = start + 4;
-    if (fa_source_seek(src, start) != FA_OK || !read_exact(src, h, 4) || memcmp(h, "fLaC", 4) != 0) return;
-    for (;;) {
-        int last, type;
-        uint32_t len;
-        if (fa_source_seek(src, pos) != FA_OK || !read_exact(src, h, 4)) return;
-        last = h[0] & 0x80;
-        type = h[0] & 0x7f;
-        len = ((uint32_t)h[1] << 16) | ((uint32_t)h[2] << 8) | h[3];
-        if (type == 4) {
-            /* The whole block, so tags after long lyrics or cue sheets are found.
-             * Blocks over 1 MB are not plausible comments and are skipped. */
-            uint8_t* buf = len <= 1u << 20 ? (uint8_t*)malloc(len ? len : 1) : NULL;
-            if (buf && read_exact(src, buf, len)) fa_tags_parse_vorbis_comments(buf, len, out);
-            free(buf);
-            return;
-        }
-        if (last) return;
-        pos += 4 + (int64_t)len;
-    }
-}
+/* ---- loudness ----------------------------------------------------------------------- */
 
-/* ---- APEv2 ------------------------------------------------------------------- */
+typedef struct loudness_sink {
+    fa_tag_sink sink;
+    fa_tag_loudness* out;
+} loudness_sink;
 
-static int read_ape_at(fa_source* src, int64_t footer_pos, fa_tag_loudness* out)
+/* The first value of each kind wins, in the readers' priority order (FLAC's own
+ * comments before an ID3v2 tag in front of them, ID3v2 before APEv2), as for the
+ * common fields. */
+static void loudness_text(fa_tag_sink* sink, int format, const char* key, const char* value)
 {
-    uint8_t f[32];
-    uint32_t size, count, i;
-    int64_t pos;
-    if (footer_pos < 0 || fa_source_seek(src, footer_pos) != FA_OK || !read_exact(src, f, 32)) return 0;
-    if (memcmp(f, "APETAGEX", 8) != 0) return 0;
-    size = le32(f + 12);                  /* items + footer */
-    count = le32(f + 16);
-    if (size < 32 || size > (1u << 24)) return 1;
-    pos = footer_pos + 32 - (int64_t)size;
-    for (i = 0; i < count; i++) {
-        uint8_t ih[8];
-        char key[256];
-        size_t k = 0;
-        uint32_t vlen;
-        if (pos < 0 || fa_source_seek(src, pos) != FA_OK || !read_exact(src, ih, 8)) return 1;
-        vlen = le32(ih);
-        pos += 8;
-        for (;;) {                        /* key, '\0'-terminated */
-            uint8_t c;
-            if (!read_exact(src, &c, 1)) return 1;
-            pos++;
-            if (c == 0) break;
-            if (k + 1 < sizeof(key)) key[k++] = (char)c;
-        }
-        key[k] = '\0';
-        if (vlen < FA_TAG_TEXT_MAX) {
-            char val[FA_TAG_TEXT_MAX];
-            if (!read_exact(src, val, vlen)) return 1;
-            val[vlen] = '\0';
-            fa_tags_handle(key, val, out);
-        }
-        pos += vlen;
-    }
-    return 1;
-}
-
-static void read_ape(fa_source* src, fa_tag_loudness* out)
-{
-    int64_t len = src->length;
-    uint8_t t[3];
-    if (len < 32) return;
-    if (read_ape_at(src, len - 32, out)) return;
-    /* An ID3v1 tag may follow the APE tag. */
-    if (len >= 128 + 32 && fa_source_seek(src, len - 128) == FA_OK && read_exact(src, t, 3) && memcmp(t, "TAG", 3) == 0)
-        read_ape_at(src, len - 128 - 32, out);
+    fa_tag_loudness* out = ((loudness_sink*)sink)->out;
+    fa_tag_loudness v;
+    (void)format;
+    v.track_lufs = v.album_lufs = v.track_peak_db = v.album_peak_db = NAN;
+    fa_tags_handle(key, value, &v);
+    if (isnan(out->track_lufs)) out->track_lufs = v.track_lufs;
+    if (isnan(out->album_lufs)) out->album_lufs = v.album_lufs;
+    if (isnan(out->track_peak_db)) out->track_peak_db = v.track_peak_db;
+    if (isnan(out->album_peak_db)) out->album_peak_db = v.album_peak_db;
 }
 
 void fa_tags_read_loudness(fa_source* src, fa_tag_loudness* out)
 {
-    int64_t id3;
+    loudness_sink ls;
     out->track_lufs = out->album_lufs = NAN;
     out->track_peak_db = out->album_peak_db = NAN;
-    if (!src->seekable) return;
-    {
-        /* ASF (.wma): Content Description and Extended Content Description / Metadata items. */
-        fa_asf_tags asf;
-        if (fa_asf_read_tags(src, &asf)) { *out = asf.loudness; return; }
+    memset(&ls, 0, sizeof(ls));
+    ls.sink.text = loudness_text;
+    ls.sink.max_text = FA_LOUDNESS_TEXT_MAX;
+    ls.out = out;
+    fa_tags_collect(src, &ls.sink);
+}
+
+/* ---- the tag object ------------------------------------------------------------------ */
+
+typedef struct tag_item_store {
+    char* key;
+    char* value;
+    int32_t format;
+} tag_item_store;
+
+typedef struct tag_picture_store {
+    int32_t type, format;
+    char* mime;
+    char* description;
+    uint8_t* data;
+    size_t size;
+} tag_picture_store;
+
+struct fa_tags {
+    fa_tag_sink sink;                /* first: the readers' callbacks get the object */
+    tag_item_store* items;
+    uint32_t nitems, cap_items;
+    tag_picture_store* pics;
+    uint32_t npics, cap_pics;
+    char* fields[FA_TAG_FIELD_COUNT];
+    int field_format[FA_TAG_FIELD_COUNT];
+    char* field_key[FA_TAG_FIELD_COUNT];
+    int have_info;
+    fa_stream_info info;
+};
+
+/* The ID3v1 genre list with Winamp's extensions (0..191). */
+static const char* const id3_genres[] = {
+    "Blues", "Classic Rock", "Country", "Dance", "Disco", "Funk", "Grunge", "Hip-Hop", "Jazz", "Metal",
+    "New Age", "Oldies", "Other", "Pop", "R&B", "Rap", "Reggae", "Rock", "Techno", "Industrial",
+    "Alternative", "Ska", "Death Metal", "Pranks", "Soundtrack", "Euro-Techno", "Ambient", "Trip-Hop", "Vocal", "Jazz+Funk",
+    "Fusion", "Trance", "Classical", "Instrumental", "Acid", "House", "Game", "Sound Clip", "Gospel", "Noise",
+    "Alternative Rock", "Bass", "Soul", "Punk", "Space", "Meditative", "Instrumental Pop", "Instrumental Rock", "Ethnic", "Gothic",
+    "Darkwave", "Techno-Industrial", "Electronic", "Pop-Folk", "Eurodance", "Dream", "Southern Rock", "Comedy", "Cult", "Gangsta",
+    "Top 40", "Christian Rap", "Pop/Funk", "Jungle", "Native American", "Cabaret", "New Wave", "Psychedelic", "Rave", "Showtunes",
+    "Trailer", "Lo-Fi", "Tribal", "Acid Punk", "Acid Jazz", "Polka", "Retro", "Musical", "Rock & Roll", "Hard Rock",
+    "Folk", "Folk-Rock", "National Folk", "Swing", "Fast Fusion", "Bebop", "Latin", "Revival", "Celtic", "Bluegrass",
+    "Avantgarde", "Gothic Rock", "Progressive Rock", "Psychedelic Rock", "Symphonic Rock", "Slow Rock", "Big Band", "Chorus", "Easy Listening", "Acoustic",
+    "Humour", "Speech", "Chanson", "Opera", "Chamber Music", "Sonata", "Symphony", "Booty Bass", "Primus", "Porn Groove",
+    "Satire", "Slow Jam", "Club", "Tango", "Samba", "Folklore", "Ballad", "Power Ballad", "Rhythmic Soul", "Freestyle",
+    "Duet", "Punk Rock", "Drum Solo", "A Cappella", "Euro-House", "Dance Hall", "Goa", "Drum & Bass", "Club-House", "Hardcore Techno",
+    "Terror", "Indie", "BritPop", "Afro-Punk", "Polsk Punk", "Beat", "Christian Gangsta Rap", "Heavy Metal", "Black Metal", "Crossover",
+    "Contemporary Christian", "Christian Rock", "Merengue", "Salsa", "Thrash Metal", "Anime", "J-Pop", "Synthpop", "Abstract", "Art Rock",
+    "Baroque", "Bhangra", "Big Beat", "Breakbeat", "Chillout", "Downtempo", "Dub", "EBM", "Eclectic", "Electro",
+    "Electroclash", "Emo", "Experimental", "Garage", "Global", "IDM", "Illbient", "Industro-Goth", "Jam Band", "Krautrock",
+    "Leftfield", "Lounge", "Math Rock", "New Romantic", "Nu-Breakz", "Post-Punk", "Post-Rock", "Psytrance", "Shoegaze", "Space Rock",
+    "Trop Rock", "World Music", "Neoclassical", "Audiobook", "Audio Theatre", "Neue Deutsche Welle", "Podcast", "Indie Rock", "G-Funk", "Dubstep",
+    "Garage Rock", "Psybient"
+};
+#define ID3_GENRES ((int)(sizeof(id3_genres) / sizeof(id3_genres[0])))
+
+static int all_digits(const char* s, size_t n)
+{
+    size_t i;
+    if (n == 0) return 0;
+    for (i = 0; i < n; i++) if (s[i] < '0' || s[i] > '9') return 0;
+    return 1;
+}
+
+/* "13", "(13)", "(13)Rock", "(RX)", "(CR)" as a genre name, written to `out`. */
+static void genre_name(const char* v, int index_offset, char* out, size_t cap)
+{
+    size_t n = strlen(v);
+    if (v[0] == '(') {
+        const char* close = strchr(v, ')');
+        if (close && close[1]) { snprintf(out, cap, "%s", close + 1); return; }
+        if (close && all_digits(v + 1, (size_t)(close - v - 1))) {
+            int g = atoi(v + 1);
+            snprintf(out, cap, "%s", g >= 0 && g < ID3_GENRES ? id3_genres[g] : v);
+            return;
+        }
+        if (strcmp(v, "(RX)") == 0) { snprintf(out, cap, "Remix"); return; }
+        if (strcmp(v, "(CR)") == 0) { snprintf(out, cap, "Cover"); return; }
+    } else if (all_digits(v, n) && n < 4) {
+        int g = atoi(v) - index_offset;
+        if (g >= 0 && g < ID3_GENRES) { snprintf(out, cap, "%s", id3_genres[g]); return; }
     }
-    id3 = read_id3v2(src, out);
-    read_flac(src, id3, out);
-    fa_ogg_read_loudness(src, out);
-    read_ape(src, out);
+    snprintf(out, cap, "%s", v);
+}
+
+enum { MAP_SPLIT = 0x100, MAP_GENRE = 0x200, MAP_GENRE_PLUS1 = 0x400, MAP_PLUS1 = 0x800, MAP_EXACT = 0x1000 };
+
+typedef struct field_map {
+    int format;
+    const char* key;
+    int field;                       /* fa_tag_field | MAP_* */
+} field_map;
+
+static const field_map field_maps[] = {
+    { FA_TAG_FORMAT_ID3V2, "TIT2", FA_TAG_TITLE }, { FA_TAG_FORMAT_ID3V2, "TPE1", FA_TAG_ARTIST },
+    { FA_TAG_FORMAT_ID3V2, "TALB", FA_TAG_ALBUM }, { FA_TAG_FORMAT_ID3V2, "TPE2", FA_TAG_ALBUM_ARTIST },
+    { FA_TAG_FORMAT_ID3V2, "TCOM", FA_TAG_COMPOSER }, { FA_TAG_FORMAT_ID3V2, "TCON", FA_TAG_GENRE | MAP_GENRE },
+    { FA_TAG_FORMAT_ID3V2, "TDRC", FA_TAG_DATE }, { FA_TAG_FORMAT_ID3V2, "TYER", FA_TAG_DATE },
+    { FA_TAG_FORMAT_ID3V2, "TRCK", FA_TAG_TRACK | MAP_SPLIT }, { FA_TAG_FORMAT_ID3V2, "TPOS", FA_TAG_DISC | MAP_SPLIT },
+    { FA_TAG_FORMAT_ID3V2, "COMM", FA_TAG_COMMENT }, { FA_TAG_FORMAT_ID3V2, "USLT", FA_TAG_LYRICS },
+    { FA_TAG_FORMAT_ID3V2, "TCOP", FA_TAG_COPYRIGHT }, { FA_TAG_FORMAT_ID3V2, "TSSE", FA_TAG_ENCODER },
+    { FA_TAG_FORMAT_ID3V2, "TBPM", FA_TAG_BPM },
+
+    { FA_TAG_FORMAT_ID3V1, "TITLE", FA_TAG_TITLE }, { FA_TAG_FORMAT_ID3V1, "ARTIST", FA_TAG_ARTIST },
+    { FA_TAG_FORMAT_ID3V1, "ALBUM", FA_TAG_ALBUM }, { FA_TAG_FORMAT_ID3V1, "YEAR", FA_TAG_DATE },
+    { FA_TAG_FORMAT_ID3V1, "COMMENT", FA_TAG_COMMENT }, { FA_TAG_FORMAT_ID3V1, "TRACK", FA_TAG_TRACK },
+    { FA_TAG_FORMAT_ID3V1, "GENRE", FA_TAG_GENRE | MAP_GENRE },
+
+    { FA_TAG_FORMAT_APE, "Title", FA_TAG_TITLE }, { FA_TAG_FORMAT_APE, "Artist", FA_TAG_ARTIST },
+    { FA_TAG_FORMAT_APE, "Album", FA_TAG_ALBUM }, { FA_TAG_FORMAT_APE, "Album Artist", FA_TAG_ALBUM_ARTIST },
+    { FA_TAG_FORMAT_APE, "AlbumArtist", FA_TAG_ALBUM_ARTIST }, { FA_TAG_FORMAT_APE, "Composer", FA_TAG_COMPOSER },
+    { FA_TAG_FORMAT_APE, "Genre", FA_TAG_GENRE }, { FA_TAG_FORMAT_APE, "Year", FA_TAG_DATE },
+    { FA_TAG_FORMAT_APE, "Track", FA_TAG_TRACK | MAP_SPLIT }, { FA_TAG_FORMAT_APE, "Disc", FA_TAG_DISC | MAP_SPLIT },
+    { FA_TAG_FORMAT_APE, "Comment", FA_TAG_COMMENT }, { FA_TAG_FORMAT_APE, "Lyrics", FA_TAG_LYRICS },
+    { FA_TAG_FORMAT_APE, "Copyright", FA_TAG_COPYRIGHT }, { FA_TAG_FORMAT_APE, "Encoder", FA_TAG_ENCODER },
+    { FA_TAG_FORMAT_APE, "BPM", FA_TAG_BPM },
+
+    { FA_TAG_FORMAT_VORBIS, "TITLE", FA_TAG_TITLE }, { FA_TAG_FORMAT_VORBIS, "ARTIST", FA_TAG_ARTIST },
+    { FA_TAG_FORMAT_VORBIS, "ALBUM", FA_TAG_ALBUM }, { FA_TAG_FORMAT_VORBIS, "ALBUMARTIST", FA_TAG_ALBUM_ARTIST },
+    { FA_TAG_FORMAT_VORBIS, "ALBUM ARTIST", FA_TAG_ALBUM_ARTIST }, { FA_TAG_FORMAT_VORBIS, "COMPOSER", FA_TAG_COMPOSER },
+    { FA_TAG_FORMAT_VORBIS, "GENRE", FA_TAG_GENRE }, { FA_TAG_FORMAT_VORBIS, "DATE", FA_TAG_DATE },
+    { FA_TAG_FORMAT_VORBIS, "YEAR", FA_TAG_DATE }, { FA_TAG_FORMAT_VORBIS, "TRACKNUMBER", FA_TAG_TRACK | MAP_SPLIT },
+    { FA_TAG_FORMAT_VORBIS, "TRACKTOTAL", FA_TAG_TRACK_TOTAL }, { FA_TAG_FORMAT_VORBIS, "TOTALTRACKS", FA_TAG_TRACK_TOTAL },
+    { FA_TAG_FORMAT_VORBIS, "DISCNUMBER", FA_TAG_DISC | MAP_SPLIT }, { FA_TAG_FORMAT_VORBIS, "DISCTOTAL", FA_TAG_DISC_TOTAL },
+    { FA_TAG_FORMAT_VORBIS, "TOTALDISCS", FA_TAG_DISC_TOTAL }, { FA_TAG_FORMAT_VORBIS, "COMMENT", FA_TAG_COMMENT },
+    { FA_TAG_FORMAT_VORBIS, "DESCRIPTION", FA_TAG_COMMENT }, { FA_TAG_FORMAT_VORBIS, "LYRICS", FA_TAG_LYRICS },
+    { FA_TAG_FORMAT_VORBIS, "UNSYNCEDLYRICS", FA_TAG_LYRICS }, { FA_TAG_FORMAT_VORBIS, "COPYRIGHT", FA_TAG_COPYRIGHT },
+    { FA_TAG_FORMAT_VORBIS, "ENCODER", FA_TAG_ENCODER }, { FA_TAG_FORMAT_VORBIS, "BPM", FA_TAG_BPM },
+
+    { FA_TAG_FORMAT_MP4, "\xC2\xA9nam", FA_TAG_TITLE | MAP_EXACT }, { FA_TAG_FORMAT_MP4, "\xC2\xA9" "ART", FA_TAG_ARTIST | MAP_EXACT },
+    { FA_TAG_FORMAT_MP4, "\xC2\xA9" "alb", FA_TAG_ALBUM | MAP_EXACT }, { FA_TAG_FORMAT_MP4, "aART", FA_TAG_ALBUM_ARTIST | MAP_EXACT },
+    { FA_TAG_FORMAT_MP4, "\xC2\xA9wrt", FA_TAG_COMPOSER | MAP_EXACT }, { FA_TAG_FORMAT_MP4, "\xC2\xA9gen", FA_TAG_GENRE | MAP_EXACT },
+    { FA_TAG_FORMAT_MP4, "gnre", FA_TAG_GENRE | MAP_GENRE_PLUS1 | MAP_EXACT }, { FA_TAG_FORMAT_MP4, "\xC2\xA9" "day", FA_TAG_DATE | MAP_EXACT },
+    { FA_TAG_FORMAT_MP4, "trkn", FA_TAG_TRACK | MAP_SPLIT | MAP_EXACT }, { FA_TAG_FORMAT_MP4, "disk", FA_TAG_DISC | MAP_SPLIT | MAP_EXACT },
+    { FA_TAG_FORMAT_MP4, "\xC2\xA9" "cmt", FA_TAG_COMMENT | MAP_EXACT }, { FA_TAG_FORMAT_MP4, "\xC2\xA9lyr", FA_TAG_LYRICS | MAP_EXACT },
+    { FA_TAG_FORMAT_MP4, "cprt", FA_TAG_COPYRIGHT | MAP_EXACT }, { FA_TAG_FORMAT_MP4, "\xC2\xA9too", FA_TAG_ENCODER | MAP_EXACT },
+    { FA_TAG_FORMAT_MP4, "tmpo", FA_TAG_BPM | MAP_EXACT },
+
+    { FA_TAG_FORMAT_ASF, "Title", FA_TAG_TITLE }, { FA_TAG_FORMAT_ASF, "Author", FA_TAG_ARTIST },
+    { FA_TAG_FORMAT_ASF, "WM/AlbumTitle", FA_TAG_ALBUM }, { FA_TAG_FORMAT_ASF, "WM/AlbumArtist", FA_TAG_ALBUM_ARTIST },
+    { FA_TAG_FORMAT_ASF, "WM/Composer", FA_TAG_COMPOSER }, { FA_TAG_FORMAT_ASF, "WM/Genre", FA_TAG_GENRE },
+    { FA_TAG_FORMAT_ASF, "WM/Year", FA_TAG_DATE }, { FA_TAG_FORMAT_ASF, "WM/TrackNumber", FA_TAG_TRACK | MAP_SPLIT },
+    { FA_TAG_FORMAT_ASF, "WM/Track", FA_TAG_TRACK | MAP_PLUS1 }, { FA_TAG_FORMAT_ASF, "WM/PartOfSet", FA_TAG_DISC | MAP_SPLIT },
+    { FA_TAG_FORMAT_ASF, "Description", FA_TAG_COMMENT }, { FA_TAG_FORMAT_ASF, "WM/Lyrics", FA_TAG_LYRICS },
+    { FA_TAG_FORMAT_ASF, "Copyright", FA_TAG_COPYRIGHT }, { FA_TAG_FORMAT_ASF, "WM/ToolName", FA_TAG_ENCODER },
+    { FA_TAG_FORMAT_ASF, "WM/BeatsPerMinute", FA_TAG_BPM },
+
+    { FA_TAG_FORMAT_RIFF, "INAM", FA_TAG_TITLE }, { FA_TAG_FORMAT_RIFF, "IART", FA_TAG_ARTIST },
+    { FA_TAG_FORMAT_RIFF, "IPRD", FA_TAG_ALBUM }, { FA_TAG_FORMAT_RIFF, "IMUS", FA_TAG_COMPOSER },
+    { FA_TAG_FORMAT_RIFF, "IGNR", FA_TAG_GENRE }, { FA_TAG_FORMAT_RIFF, "ICRD", FA_TAG_DATE },
+    { FA_TAG_FORMAT_RIFF, "ITRK", FA_TAG_TRACK | MAP_SPLIT }, { FA_TAG_FORMAT_RIFF, "IPRT", FA_TAG_TRACK | MAP_SPLIT },
+    { FA_TAG_FORMAT_RIFF, "ICMT", FA_TAG_COMMENT }, { FA_TAG_FORMAT_RIFF, "ICOP", FA_TAG_COPYRIGHT },
+    { FA_TAG_FORMAT_RIFF, "ISFT", FA_TAG_ENCODER },
+
+    { FA_TAG_FORMAT_AIFF, "NAME", FA_TAG_TITLE }, { FA_TAG_FORMAT_AIFF, "AUTH", FA_TAG_ARTIST },
+    { FA_TAG_FORMAT_AIFF, "(c) ", FA_TAG_COPYRIGHT }, { FA_TAG_FORMAT_AIFF, "ANNO", FA_TAG_COMMENT },
+
+    { FA_TAG_FORMAT_MATROSKA, "TITLE", FA_TAG_TITLE }, { FA_TAG_FORMAT_MATROSKA, "ARTIST", FA_TAG_ARTIST },
+    { FA_TAG_FORMAT_MATROSKA, "ALBUM/TITLE", FA_TAG_ALBUM }, { FA_TAG_FORMAT_MATROSKA, "ALBUM", FA_TAG_ALBUM },
+    { FA_TAG_FORMAT_MATROSKA, "ALBUM/ARTIST", FA_TAG_ALBUM_ARTIST }, { FA_TAG_FORMAT_MATROSKA, "ALBUM_ARTIST", FA_TAG_ALBUM_ARTIST },
+    { FA_TAG_FORMAT_MATROSKA, "COMPOSER", FA_TAG_COMPOSER }, { FA_TAG_FORMAT_MATROSKA, "GENRE", FA_TAG_GENRE },
+    { FA_TAG_FORMAT_MATROSKA, "ALBUM/GENRE", FA_TAG_GENRE }, { FA_TAG_FORMAT_MATROSKA, "DATE_RELEASED", FA_TAG_DATE },
+    { FA_TAG_FORMAT_MATROSKA, "DATE_RECORDED", FA_TAG_DATE }, { FA_TAG_FORMAT_MATROSKA, "ALBUM/DATE_RELEASED", FA_TAG_DATE },
+    { FA_TAG_FORMAT_MATROSKA, "DATE", FA_TAG_DATE }, { FA_TAG_FORMAT_MATROSKA, "PART_NUMBER", FA_TAG_TRACK | MAP_SPLIT },
+    { FA_TAG_FORMAT_MATROSKA, "TRACK", FA_TAG_TRACK | MAP_SPLIT }, { FA_TAG_FORMAT_MATROSKA, "ALBUM/TOTAL_PARTS", FA_TAG_TRACK_TOTAL },
+    { FA_TAG_FORMAT_MATROSKA, "COMMENT", FA_TAG_COMMENT }, { FA_TAG_FORMAT_MATROSKA, "DESCRIPTION", FA_TAG_COMMENT },
+    { FA_TAG_FORMAT_MATROSKA, "LYRICS", FA_TAG_LYRICS }, { FA_TAG_FORMAT_MATROSKA, "COPYRIGHT", FA_TAG_COPYRIGHT },
+    { FA_TAG_FORMAT_MATROSKA, "ENCODER", FA_TAG_ENCODER }, { FA_TAG_FORMAT_MATROSKA, "BPM", FA_TAG_BPM },
+    { FA_TAG_FORMAT_MATROSKA, "INFO/TITLE", FA_TAG_TITLE },
+
+    { FA_TAG_FORMAT_MIDI, "TITLE", FA_TAG_TITLE }, { FA_TAG_FORMAT_MIDI, "ARTIST", FA_TAG_ARTIST },
+    { FA_TAG_FORMAT_MIDI, "COPYRIGHT", FA_TAG_COPYRIGHT }
+};
+
+static char* dup_n(const char* s, size_t n)
+{
+    char* d = (char*)malloc(n + 1);
+    if (d) { memcpy(d, s, n); d[n] = '\0'; }
+    return d;
+}
+
+static char* dup_str(const char* s) { return dup_n(s, strlen(s)); }
+
+/* The first format to give a field owns it; more values of the same key from that
+ * format (repeated Vorbis comments) are joined with "; ". */
+static void set_field(fa_tags* t, int field, int format, const char* key, const char* value)
+{
+    if (!value[0]) return;
+    if (!t->fields[field]) {
+        t->fields[field] = dup_str(value);
+        t->field_key[field] = dup_str(key);
+        t->field_format[field] = format;
+    } else if (t->field_format[field] == format && t->field_key[field] && ieq(t->field_key[field], key) &&
+               strcmp(t->fields[field], value) != 0) {
+        size_t a = strlen(t->fields[field]), b = strlen(value);
+        char* j = (char*)realloc(t->fields[field], a + b + 3);
+        if (!j) return;
+        memcpy(j + a, "; ", 2);
+        memcpy(j + a + 2, value, b + 1);
+        t->fields[field] = j;
+    }
+}
+
+static void map_item(fa_tags* t, int format, const char* key, const char* value)
+{
+    size_t i;
+    for (i = 0; i < sizeof(field_maps) / sizeof(field_maps[0]); i++) {
+        const field_map* m = &field_maps[i];
+        int field;
+        if (m->format != format) continue;
+        if ((m->field & MAP_EXACT) ? strcmp(m->key, key) != 0 : !ieq(m->key, key)) continue;
+        field = m->field & 0xFF;
+        if (m->field & MAP_SPLIT) {
+            /* "3/12": number and total. */
+            const char* slash = strchr(value, '/');
+            if (slash) {
+                char* no = dup_n(value, (size_t)(slash - value));
+                if (no) { set_field(t, field, format, key, no); free(no); }
+                set_field(t, field + 1, format, key, slash + 1);
+            } else {
+                set_field(t, field, format, key, value);
+            }
+        } else if (m->field & (MAP_GENRE | MAP_GENRE_PLUS1)) {
+            char g[256];
+            genre_name(value, (m->field & MAP_GENRE_PLUS1) ? 1 : 0, g, sizeof(g));
+            set_field(t, field, format, key, g);
+        } else if (m->field & MAP_PLUS1) {
+            char num[24];
+            if (!all_digits(value, strlen(value))) return;
+            snprintf(num, sizeof(num), "%d", atoi(value) + 1);
+            set_field(t, field, format, key, num);
+        } else {
+            set_field(t, field, format, key, value);
+        }
+        return;
+    }
+}
+
+static void collect_text(fa_tag_sink* sink, int format, const char* key, const char* value)
+{
+    fa_tags* t = (fa_tags*)sink;
+    tag_item_store* it;
+    if (!value[0]) return;
+    if (t->nitems == t->cap_items) {
+        uint32_t cap = t->cap_items ? t->cap_items * 2 : 16;
+        tag_item_store* p = (tag_item_store*)realloc(t->items, sizeof(*p) * cap);
+        if (!p) return;
+        t->items = p;
+        t->cap_items = cap;
+    }
+    it = &t->items[t->nitems];
+    it->key = dup_str(key);
+    it->value = dup_str(value);
+    it->format = format;
+    if (!it->key || !it->value) { free(it->key); free(it->value); return; }
+    t->nitems++;
+    map_item(t, format, key, value);
+}
+
+static void collect_picture(fa_tag_sink* sink, int format, int type, const char* mime, const char* description,
+                            const uint8_t* data, size_t size)
+{
+    fa_tags* t = (fa_tags*)sink;
+    tag_picture_store* p;
+    if (size == 0) return;
+    if (t->npics == t->cap_pics) {
+        uint32_t cap = t->cap_pics ? t->cap_pics * 2 : 4;
+        tag_picture_store* q = (tag_picture_store*)realloc(t->pics, sizeof(*q) * cap);
+        if (!q) return;
+        t->pics = q;
+        t->cap_pics = cap;
+    }
+    p = &t->pics[t->npics];
+    /* A MIME type that is missing or not one ("jpg", "-->" links) is taken from the data. */
+    if (!mime || !strchr(mime, '/')) mime = fa_tags_image_mime(data, size);
+    if (strcmp(mime, "-->") == 0) return;
+    p->type = type >= 0 && type <= 20 ? type : FA_PICTURE_OTHER;
+    p->format = format;
+    p->mime = dup_str(mime);
+    p->description = dup_str(description ? description : "");
+    p->data = (uint8_t*)malloc(size);
+    p->size = size;
+    if (!p->mime || !p->description || !p->data) { free(p->mime); free(p->description); free(p->data); return; }
+    memcpy(p->data, data, size);
+    t->npics++;
+}
+
+static fa_tags* tags_new(uint32_t flags)
+{
+    fa_tags* t = (fa_tags*)calloc(1, sizeof(fa_tags));
+    if (!t) return NULL;
+    t->sink.text = collect_text;
+    t->sink.picture = (flags & FA_TAGS_NO_PICTURES) ? NULL : collect_picture;
+    t->sink.max_text = FA_TAGS_MAX_TEXT;
+    return t;
+}
+
+FA_API void FA_CALL fa_tags_close(fa_tags* t)
+{
+    uint32_t i;
+    if (!t) return;
+    for (i = 0; i < t->nitems; i++) { free(t->items[i].key); free(t->items[i].value); }
+    for (i = 0; i < t->npics; i++) { free(t->pics[i].mime); free(t->pics[i].description); free(t->pics[i].data); }
+    for (i = 0; i < FA_TAG_FIELD_COUNT; i++) { free(t->fields[i]); free(t->field_key[i]); }
+    free(t->items);
+    free(t->pics);
+    free(t);
+}
+
+/* Tags and (unless FA_TAGS_NO_INFO) the properties of the file in `src`. With
+ * `audio_only`, a file no decoder recognises is skipped (returns 0) before any of
+ * its tags are taken. */
+static int read_source(fa_tags* t, fa_source* src, const char* name, uint32_t flags, int audio_only)
+{
+    if (audio_only || !(flags & FA_TAGS_NO_INFO)) {
+        fa_decoder dec;
+        fa_source_seek(src, 0);
+        if (fa_decoder_open(&dec, src, name, NULL, -1, NULL) == FA_OK) {
+            if (!(flags & FA_TAGS_NO_INFO)) {
+                fa_decoder_get_info(&dec, &t->info);
+                t->have_info = 1;
+            }
+            fa_decoder_close(&dec);
+        } else if (audio_only) {
+            return 0;
+        }
+        fa_source_seek(src, 0);
+    }
+    fa_tags_collect(src, &t->sink);
+    return 1;
+}
+
+/* A karaoke ZIP: the audio entry (the one named like the .cdg first). */
+static fa_result read_zip(fa_tags* t, const uint8_t* zip, size_t size, uint32_t flags)
+{
+    fa_zip_entry* e;
+    uint32_t count, i, pass;
+    int cdg = -1, ok;
+    fa_result r = fa_zip_list(zip, size, &e, &count);
+    if (r != FA_OK) return FA_OK;        /* not readable: no tags */
+    for (i = 0; i < count && cdg < 0; i++) if (fa_cdg_is_cdg_name(e[i].name)) cdg = (int)i;
+    for (pass = 0; pass < 2; pass++) {
+        for (i = 0; i < count; i++) {
+            uint8_t* audio;
+            fa_source src;
+            size_t stem = cdg >= 0 ? strlen(e[cdg].name) - 4 : 0;
+            int preferred = cdg >= 0 && strncmp(e[i].name, e[cdg].name, stem) == 0 && e[i].name[stem] == '.';
+            if ((int)i == cdg || fa_cdg_is_cdg_name(e[i].name) || preferred != (pass == 0) || e[i].size == 0) continue;
+            if (fa_zip_extract(zip, size, &e[i], &audio) != FA_OK) continue;
+            fa_source_open_memory_ref(&src, audio, (size_t)e[i].size);
+            /* Not audio (a text file in the archive): the next entry. */
+            ok = read_source(t, &src, e[i].name, flags, 1);
+            fa_source_close(&src);
+            free(audio);
+            if (!ok) continue;
+            if (t->have_info) { t->info.has_cdg = cdg >= 0; t->info.file_size = (int64_t)size; }
+            free(e);
+            return FA_OK;
+        }
+    }
+    free(e);
+    return FA_OK;
+}
+
+static fa_result read_any(fa_tags* t, fa_source* src, const char* path, uint32_t flags)
+{
+    const uint8_t* head;
+    size_t n = fa_source_peek(src, &head);
+    if (fa_zip_probe(head, n)) {
+        uint8_t* bytes = NULL;
+        size_t size = 0;
+        fa_result r;
+        if (src->kind == FA_SOURCE_MEMORY) return read_zip(t, src->mem, src->mem_size, flags);
+        r = fa_source_read_all(src, FA_ZIP_MAX_BYTES, &bytes, &size);
+        if (r != FA_OK) return FA_OK;
+        r = read_zip(t, bytes, size, flags);
+        free(bytes);
+        return r;
+    }
+    read_source(t, src, path, flags, 0);
+    if (t->have_info && path) {
+        fa_cdg_data* g = fa_cdg_find_sibling(path);
+        t->info.has_cdg = g != NULL;
+        fa_cdg_data_free(g);
+    }
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_tags_read_path(const char* path, uint32_t flags, fa_tags** out_tags)
+{
+    fa_source src;
+    fa_tags* t;
+    fa_result r;
+    if (out_tags) *out_tags = NULL;
+    if (!path || !out_tags) return FA_ERROR_INVALID_ARG;
+    r = fa_source_open_path(&src, path);
+    if (r != FA_OK) return r;
+    t = tags_new(flags);
+    if (!t) { fa_source_close(&src); return FA_ERROR_OUT_OF_MEMORY; }
+    r = read_any(t, &src, path, flags);
+    fa_source_close(&src);
+    if (r != FA_OK) { fa_tags_close(t); return r; }
+    *out_tags = t;
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_tags_read_memory(const void* data, size_t size, uint32_t flags, fa_tags** out_tags)
+{
+    fa_source src;
+    fa_tags* t;
+    fa_result r;
+    if (out_tags) *out_tags = NULL;
+    if (!data || size == 0 || !out_tags) return FA_ERROR_INVALID_ARG;
+    r = fa_source_open_memory_ref(&src, data, size);
+    if (r != FA_OK) return r;
+    t = tags_new(flags);
+    if (!t) { fa_source_close(&src); return FA_ERROR_OUT_OF_MEMORY; }
+    r = read_any(t, &src, NULL, flags);
+    fa_source_close(&src);
+    if (r != FA_OK) { fa_tags_close(t); return r; }
+    *out_tags = t;
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_tags(fa_stream* stream, uint32_t flags, fa_tags** out_tags)
+{
+    fa_tags* t;
+    fa_result r = FA_OK;
+    if (out_tags) *out_tags = NULL;
+    if (!stream || !out_tags) return FA_ERROR_INVALID_ARG;
+    t = tags_new(flags);
+    if (!t) return FA_ERROR_OUT_OF_MEMORY;
+    /* The file is read again through a source of its own: the stream's source
+     * belongs to its decode thread. Memory blocks stay fixed while the stream is open. */
+    if (stream->path || stream->source.kind == FA_SOURCE_MEMORY) {
+        fa_source src;
+        r = stream->path ? fa_source_open_path(&src, stream->path)
+                         : fa_source_open_memory_ref(&src, stream->source.mem, stream->source.mem_size);
+        if (r == FA_OK) {
+            /* A ZIP (MP3+G) gives the tags of the audio file inside it. */
+            r = read_any(t, &src, NULL, flags | FA_TAGS_NO_INFO);
+            fa_source_close(&src);
+        }
+    }
+    if (stream->midi) {
+        fa_midi_info mi;
+        if (fa_stream_get_midi_info(stream, &mi) == FA_OK) {
+            collect_text(&t->sink, FA_TAG_FORMAT_MIDI, "TITLE", mi.title);
+            collect_text(&t->sink, FA_TAG_FORMAT_MIDI, "ARTIST", mi.artist);
+            collect_text(&t->sink, FA_TAG_FORMAT_MIDI, "COPYRIGHT", mi.copyright);
+        }
+    }
+    if (!(flags & FA_TAGS_NO_INFO) && fa_stream_get_info(stream, &t->info) == FA_OK) t->have_info = 1;
+    if (r != FA_OK) { fa_tags_close(t); return r; }
+    *out_tags = t;
+    return FA_OK;
+}
+
+FA_API const char* FA_CALL fa_tags_get(const fa_tags* tags, fa_tag_field field)
+{
+    if (!tags || (int)field < 0 || field >= FA_TAG_FIELD_COUNT || !tags->fields[field]) return "";
+    return tags->fields[field];
+}
+
+FA_API uint32_t FA_CALL fa_tags_get_item_count(const fa_tags* tags) { return tags ? tags->nitems : 0; }
+
+FA_API fa_result FA_CALL fa_tags_get_item(const fa_tags* tags, uint32_t index, fa_tag_item* out_item)
+{
+    if (out_item) memset(out_item, 0, sizeof(*out_item));
+    if (!tags || !out_item) return FA_ERROR_INVALID_ARG;
+    if (index >= tags->nitems) return FA_ERROR_NOT_FOUND;
+    out_item->key = tags->items[index].key;
+    out_item->value = tags->items[index].value;
+    out_item->format = tags->items[index].format;
+    return FA_OK;
+}
+
+FA_API uint32_t FA_CALL fa_tags_get_picture_count(const fa_tags* tags) { return tags ? tags->npics : 0; }
+
+FA_API fa_result FA_CALL fa_tags_get_picture(const fa_tags* tags, uint32_t index, fa_tag_picture* out_picture)
+{
+    const tag_picture_store* p;
+    if (out_picture) memset(out_picture, 0, sizeof(*out_picture));
+    if (!tags || !out_picture) return FA_ERROR_INVALID_ARG;
+    if (index >= tags->npics) return FA_ERROR_NOT_FOUND;
+    p = &tags->pics[index];
+    out_picture->type = p->type;
+    out_picture->mime = p->mime;
+    out_picture->description = p->description;
+    out_picture->data = p->data;
+    out_picture->size = p->size;
+    out_picture->format = p->format;
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_tags_get_cover(const fa_tags* tags, fa_tag_picture* out_picture)
+{
+    uint32_t i;
+    if (out_picture) memset(out_picture, 0, sizeof(*out_picture));
+    if (!tags || !out_picture) return FA_ERROR_INVALID_ARG;
+    for (i = 0; i < tags->npics; i++)
+        if (tags->pics[i].type == FA_PICTURE_FRONT_COVER) return fa_tags_get_picture(tags, i, out_picture);
+    return fa_tags_get_picture(tags, 0, out_picture);
+}
+
+FA_API fa_result FA_CALL fa_tags_get_info(const fa_tags* tags, fa_stream_info* out_info)
+{
+    if (out_info) memset(out_info, 0, sizeof(*out_info));
+    if (!tags || !out_info) return FA_ERROR_INVALID_ARG;
+    if (!tags->have_info) return FA_ERROR_NOT_FOUND;
+    *out_info = tags->info;
+    return FA_OK;
 }

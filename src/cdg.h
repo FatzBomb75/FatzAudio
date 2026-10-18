@@ -15,6 +15,8 @@ typedef struct fa_zip_entry {
     uint64_t header_offset;  /* of the local file header */
 } fa_zip_entry;
 
+#define FA_ZIP_MAX_BYTES ((size_t)1 << 30)   /* archives are read into memory */
+
 /* 1 when `data` starts like a ZIP archive. */
 int fa_zip_probe(const uint8_t* data, size_t size);
 /* Reads the central directory. *out_entries is malloc'ed (free it), directories are

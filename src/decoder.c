@@ -50,6 +50,47 @@ static const char* extension_of(const char* path)
     return dot + 1;
 }
 
+/* Elementary-stream files (MP3, AAC, AC-3, FLAC) are all audio but their tags
+ * and FLAC's metadata blocks. Read on a local source only, with the source put
+ * back where the decoder left it. */
+static void whole_file_size(fa_decoder* dec)
+{
+    fa_source* src = dec->src;
+    const char* c = dec->container;
+    int64_t start, end, at;
+    uint32_t bits;
+    if (dec->audio_bytes >= 0 || !src->seekable || src->remote || src->length <= 0) return;
+    if (strcmp(c, "mp3") != 0 && strcmp(c, "adts") != 0 && strcmp(c, "ac3") != 0 && strcmp(c, "ec3") != 0 &&
+        strcmp(c, "flac") != 0)
+        return;
+    at = fa_source_tell(src);
+    fa_tags_audio_span(src, &start, &end, &bits);
+    fa_source_seek(src, at);
+    dec->audio_bytes = end - start;
+    if (bits && !dec->bits_per_sample) dec->bits_per_sample = bits;
+}
+
+void fa_decoder_get_info(const fa_decoder* d, fa_stream_info* out)
+{
+    memset(out, 0, sizeof(*out));
+    out->format = d->format;
+    snprintf(out->codec, sizeof(out->codec), "%s", d->codec);
+    snprintf(out->container, sizeof(out->container), "%s", d->container);
+    out->length_frames = d->length >= 0 ? d->length : -1;
+    out->duration = (d->length >= 0 && d->format.sample_rate > 0)
+        ? (fa_time)((double)d->length * 1e9 / (double)d->format.sample_rate + 0.5) : -1;
+    out->seekable = d->seekable;
+    out->audio_track_count = d->track_count > 0 ? d->track_count : 1;
+    out->file_size = d->file_size > 0 ? d->file_size : -1;
+    out->audio_bytes = d->audio_bytes > 0 ? d->audio_bytes : -1;
+    out->bits_per_sample = d->bits_per_sample;
+    out->bitrate = d->bitrate;
+    if (d->audio_bytes > 0 && d->length > 0 && d->format.sample_rate > 0) {
+        double bps = (double)d->audio_bytes * 8.0 * d->format.sample_rate / (double)d->length;
+        if (bps < 4294967295.0) out->bitrate = (uint32_t)(bps + 0.5);
+    }
+}
+
 fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint, const char* mime_hint,
                           int32_t audio_track, const fa_decoder_env* env)
 {
@@ -111,6 +152,8 @@ fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint
         dec->vt = fa_decoder_registry[best];
         dec->src = src;
         dec->length = -1;
+        dec->audio_bytes = -1;
+        dec->file_size = src->length;
         dec->audio_track = audio_track < 0 ? -1 : audio_track;
         if (fa_source_seek(src, 0) != FA_OK) return FA_ERROR_NOT_SEEKABLE;
         r = dec->vt->open(dec);
@@ -125,6 +168,7 @@ fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint
             dec->format.sample_format = FA_FORMAT_F32;
             if (!dec->codec[0]) snprintf(dec->codec, sizeof(dec->codec), "%s", dec->vt->name);
             if (!dec->container[0]) snprintf(dec->container, sizeof(dec->container), "%s", dec->vt->name);
+            whole_file_size(dec);
             return FA_OK;
         }
         /* Definite answers: the data is this format, but the track is missing, the

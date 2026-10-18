@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using FatzAudio.Native;
 
 namespace FatzAudio;
@@ -215,9 +216,31 @@ public sealed record StreamLevels(float[] Peak, float[] Rms);
 /// <param name="CanSeek">True when <see cref="AudioStream.Position"/> can be set.</param>
 /// <param name="AudioTrackCount">Number of audio tracks in the container.</param>
 /// <param name="HasCdg">True when a CD+G graphics side stream is present.</param>
+/// <param name="FileSize">Bytes of the file (of the ZIP for an MP3+G archive), or null when unknown (live web streams).</param>
+/// <param name="AudioBytes">
+/// Bytes of this audio stream's coded data, without tags, headers and other tracks, or null when unknown. Exact
+/// for WAV, AIFF, CD and MP4; close for MP3, AAC, AC-3, FLAC, Ogg and single-track Matroska.
+/// </param>
+/// <param name="Bitrate">Average bits per second (<see cref="AudioBytes"/> over the duration, else the codec's nominal rate); 0 when unknown.</param>
+/// <param name="BitsPerSample">Bit depth of PCM and lossless sources (WAV, AIFF, FLAC, ALAC, CD); 0 for lossy codecs.</param>
 public sealed record StreamInfo(
     AudioFormat Format, string Codec, string Container, TimeSpan? Duration, long LengthFrames,
-    bool CanSeek, int AudioTrackCount, bool HasCdg);
+    bool CanSeek, int AudioTrackCount, bool HasCdg, long? FileSize = null, long? AudioBytes = null, int Bitrate = 0, int BitsPerSample = 0)
+{
+    internal static unsafe StreamInfo FromNative(in Native.FaStreamInfo n)
+    {
+        TimeSpan? duration = n.Duration >= 0 ? TimeConvert.FromNanoseconds(n.Duration) : null;
+        fixed (byte* codec = n.Codec)
+        fixed (byte* container = n.Container)
+            return new StreamInfo(
+                AudioFormat.FromNative(n.Format),
+                Marshal.PtrToStringUTF8((nint)codec) ?? "",
+                Marshal.PtrToStringUTF8((nint)container) ?? "",
+                duration, n.LengthFrames, n.Seekable != 0, n.AudioTrackCount, n.HasCdg != 0,
+                n.FileSize >= 0 ? n.FileSize : null, n.AudioBytes >= 0 ? n.AudioBytes : null,
+                (int)Math.Min(n.Bitrate, int.MaxValue), (int)n.BitsPerSample);
+    }
+}
 
 /// <summary>Options for opening a stream. All properties are optional.</summary>
 /// <example>

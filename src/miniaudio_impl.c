@@ -95,6 +95,14 @@ static uint64_t read_pcm_direct(ma_dr_wav* w, float* out, uint64_t frames, uint3
     return got;
 }
 
+void fa_drwav_props(void* impl, uint32_t* out_bits, int64_t* out_data_bytes)
+{
+    ma_dr_wav* w = (ma_dr_wav*)impl;
+    int pcm = w->translatedFormatTag == MA_DR_WAVE_FORMAT_PCM || w->translatedFormatTag == MA_DR_WAVE_FORMAT_IEEE_FLOAT;
+    *out_bits = pcm ? w->bitsPerSample : 0;
+    *out_data_bytes = w->dataChunkDataSize > 0 ? (int64_t)w->dataChunkDataSize : -1;
+}
+
 uint64_t fa_drwav_read(void* impl, float* out, uint64_t frames)
 {
     ma_dr_wav* w = (ma_dr_wav*)impl;

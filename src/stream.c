@@ -202,7 +202,6 @@ static void stream_opened(struct fa_stream* s)
         fa_stream_start_analysis(s);
 }
 
-#define FA_ZIP_MAX_BYTES ((size_t)1 << 30)
 
 static int source_is_zip(fa_source* src)
 {
@@ -228,6 +227,7 @@ static fa_result open_zip(struct fa_stream* s, uint8_t* zip, size_t size, const 
     int cdg = -1;
     fa_result r = fa_zip_list(zip, size, &entries, &count);
     if (r != FA_OK) { free(zip); return r; }
+    s->zip_size = (int64_t)size;
     for (i = 0; i < count && cdg < 0; i++)
         if (fa_cdg_is_cdg_name(entries[i].name)) cdg = (int)i;
     r = FA_ERROR_UNSUPPORTED_FORMAT;
@@ -602,18 +602,9 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
 
 FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* out_info)
 {
-    const fa_decoder* d;
     if (!stream || !out_info) return FA_ERROR_INVALID_ARG;
-    memset(out_info, 0, sizeof(*out_info));
-    d = &stream->decoder; /* fixed after open */
-    out_info->format = d->format;
-    snprintf(out_info->codec, sizeof(out_info->codec), "%s", d->codec);
-    snprintf(out_info->container, sizeof(out_info->container), "%s", d->container);
-    out_info->length_frames = d->length >= 0 ? d->length : -1;
-    out_info->duration = (d->length >= 0 && d->format.sample_rate > 0)
-        ? (fa_time)((double)d->length * 1e9 / (double)d->format.sample_rate + 0.5) : -1;
-    out_info->seekable = d->seekable;
-    out_info->audio_track_count = d->track_count > 0 ? d->track_count : 1;
+    fa_decoder_get_info(&stream->decoder, out_info); /* fixed after open */
+    if (stream->zip_size > 0) out_info->file_size = stream->zip_size;
     out_info->has_cdg = fa_stream_cdg_present(stream);
     return FA_OK;
 }
