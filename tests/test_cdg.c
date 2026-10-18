@@ -663,6 +663,266 @@ static void test_zip_lean(void)
     free(wav.p); free(cdg.p);
 }
 
+/* ---- ZIP64 ---------------------------------------------------------------------- */
+
+static void le64(buf* b, uint64_t v) { le32(b, (uint32_t)v); le32(b, (uint32_t)(v >> 32)); }
+
+typedef struct z64_file { const char* name; const buf* data; int deflate; uint64_t gap; } z64_file;
+typedef struct z64_layout { size_t cd_at, first_extra, z64_end, locator, end; } z64_layout;
+
+/* A ZIP64 archive. `n_empty` empty entries come first (to pass 65,535 entries);
+ * `wide` writes every file entry with 0xFFFFFFFF fields and ZIP64 extra fields, else
+ * only the end records are ZIP64. A file's `gap` is a stretch of zeros that is not in
+ * the returned bytes (the entry's data is `gap` bytes long): offsets after it count
+ * it, so the archive can be bigger than 4 GB without being written. */
+static buf make_zip64(const z64_file* files, int count, int n_empty, int wide, uint64_t* gap_at, z64_layout* lay)
+{
+    buf z = { 0 }, cd = { 0 };
+    uint64_t skipped = 0, cd_offset;
+    int i;
+    char name[32];
+    memset(lay, 0, sizeof(*lay));
+    for (i = -n_empty; i < count; i++) {
+        const z64_file* f = i >= 0 ? &files[i] : NULL;
+        buf body = { 0 };
+        const char* nm = name;
+        uint64_t size = 0, csize = 0, offset = (uint64_t)z.n + skipped;
+        uint32_t crc = 0, name_len;
+        if (f) {
+            nm = f->name;
+            if (f->gap) { size = csize = f->gap; }
+            else {
+                body = f->deflate ? stored_deflate(f->data) : *f->data;
+                size = f->data->n; csize = body.n;
+                crc = fa_crc32(f->data->p, f->data->n);
+            }
+        } else {
+            snprintf(name, sizeof(name), "e%d.txt", i + n_empty);
+        }
+        name_len = (uint32_t)strlen(nm);
+        le32(&z, 0x04034b50); le16(&z, 45); le16(&z, 0); le16(&z, f && f->deflate ? 8 : 0);
+        le16(&z, 0); le16(&z, 0); le32(&z, crc);
+        le32(&z, f && wide ? 0xFFFFFFFFu : (uint32_t)csize); le32(&z, f && wide ? 0xFFFFFFFFu : (uint32_t)size);
+        le16(&z, name_len); le16(&z, f && wide ? 20 : 0);
+        put(&z, nm, name_len);
+        if (f && wide) { le16(&z, 1); le16(&z, 16); le64(&z, size); le64(&z, csize); }
+        if (f && f->gap) { if (gap_at) *gap_at = z.n; skipped = f->gap; }
+        else put(&z, body.p, body.n);
+        if (f && f->deflate) free(body.p);
+        le32(&cd, 0x02014b50); le16(&cd, 45); le16(&cd, 45); le16(&cd, 0); le16(&cd, f && f->deflate ? 8 : 0);
+        le16(&cd, 0); le16(&cd, 0); le32(&cd, crc);
+        le32(&cd, f && wide ? 0xFFFFFFFFu : (uint32_t)csize); le32(&cd, f && wide ? 0xFFFFFFFFu : (uint32_t)size);
+        le16(&cd, name_len); le16(&cd, f && wide ? 28 : (offset > 0xFFFFFFFEu ? 12 : 0)); le16(&cd, 0); le16(&cd, 0);
+        le16(&cd, 0); le32(&cd, 0);
+        le32(&cd, f && (wide || offset > 0xFFFFFFFEu) ? 0xFFFFFFFFu : (uint32_t)offset);
+        put(&cd, nm, name_len);
+        if (f && wide) {
+            if (!lay->first_extra) lay->first_extra = cd.n;   /* in the directory */
+            le16(&cd, 1); le16(&cd, 24); le64(&cd, size); le64(&cd, csize); le64(&cd, offset);
+        } else if (f && offset > 0xFFFFFFFEu) {
+            le16(&cd, 1); le16(&cd, 8); le64(&cd, offset);
+        }
+    }
+    cd_offset = (uint64_t)z.n + skipped;
+    lay->cd_at = z.n;
+    put(&z, cd.p, cd.n);
+    lay->z64_end = z.n;
+    le32(&z, 0x06064b50); le64(&z, 44); le16(&z, 45); le16(&z, 45); le32(&z, 0); le32(&z, 0);
+    le64(&z, (uint64_t)(count + n_empty)); le64(&z, (uint64_t)(count + n_empty));
+    le64(&z, cd.n); le64(&z, cd_offset);
+    lay->locator = z.n;
+    le32(&z, 0x07064b50); le32(&z, 0); le64(&z, cd_offset + cd.n); le32(&z, 1);
+    lay->end = z.n;
+    le32(&z, 0x06054b50); le16(&z, 0); le16(&z, 0); le16(&z, 0xFFFF); le16(&z, 0xFFFF);
+    le32(&z, 0xFFFFFFFFu); le32(&z, 0xFFFFFFFFu); le16(&z, 0);
+    free(cd.p);
+    return z;
+}
+
+static void open_and_decode(const buf* zip, int64_t frames)
+{
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_stream_info info;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    CHECK_EQ(fa_stream_open_memory(g_engine, zip->p, zip->n, &o, &s), FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK_EQ(info.has_cdg, 1);
+    CHECK_EQ(decode_all(s), frames);
+    fa_stream_close(s);
+}
+
+static void test_zip64_basic(void)
+{
+    buf wav = make_wav(8000, 4000), cdg = small_cdg(), zip;
+    z64_file files[2];
+    z64_layout lay;
+    fa_source zs;
+    fa_zip_entry* e = NULL;
+    uint32_t count = 0;
+    int wide, deflate;
+    files[0].name = "Song.cdg"; files[0].data = &cdg; files[0].deflate = 0; files[0].gap = 0;
+    files[1].name = "Song.wav"; files[1].data = &wav; files[1].gap = 0;
+    for (wide = 0; wide < 2; wide++) {
+        for (deflate = 0; deflate < 2; deflate++) {
+            buf sd = stored_deflate(&wav);
+            files[1].deflate = deflate;
+            zip = make_zip64(files, 2, 0, wide, NULL, &lay);
+            open_and_decode(&zip, 4000);
+            fa_source_open_memory_ref(&zs, zip.p, zip.n);
+            CHECK_EQ(fa_zip_list(&zs, &e, &count), FA_OK);
+            CHECK_EQ(count, 2);
+            CHECK_EQ(e[1].size, wav.n);
+            CHECK_EQ(e[1].compressed_size, deflate ? sd.n : wav.n);
+            free(e); e = NULL;
+            free(sd.p);
+            free(zip.p);
+        }
+    }
+    free(wav.p); free(cdg.p);
+}
+
+static void test_zip64_many_entries(void)
+{
+    buf wav = make_wav(8000, 2000), cdg = small_cdg(), zip;
+    z64_file files[2];
+    z64_layout lay;
+    fa_source zs;
+    fa_zip_entry* e = NULL;
+    uint32_t count = 0;
+    files[0].name = "Song.cdg"; files[0].data = &cdg; files[0].deflate = 0; files[0].gap = 0;
+    files[1].name = "Song.wav"; files[1].data = &wav; files[1].deflate = 0; files[1].gap = 0;
+    zip = make_zip64(files, 2, 70000, 0, NULL, &lay);   /* the end record's own count stops at 65,535 */
+    fa_source_open_memory_ref(&zs, zip.p, zip.n);
+    CHECK_EQ(fa_zip_list(&zs, &e, &count), FA_OK);
+    CHECK_EQ(count, 70002);
+    CHECK(strcmp(e[69999].name, "e69999.txt") == 0);
+    CHECK(strcmp(e[70001].name, "Song.wav") == 0);
+    free(e);
+    open_and_decode(&zip, 2000);
+    free(zip.p); free(wav.p); free(cdg.p);
+}
+
+/* An archive of 4.5 GB that is mostly one stored entry of zeros: a virtual file made
+ * of the generated bytes around the gap. The song after it starts past 4 GB. */
+typedef struct big_io { const buf* b; uint64_t gap_at, gap; int64_t pos; } big_io;
+static int64_t FA_CALL big_read(void* u, void* dst, size_t n)
+{
+    big_io* m = (big_io*)u;
+    int64_t total = (int64_t)(m->b->n + m->gap), done = 0;
+    uint8_t* out = (uint8_t*)dst;
+    while ((size_t)done < n && m->pos < total) {
+        uint64_t pos = (uint64_t)m->pos, chunk;
+        if (pos < m->gap_at) {
+            chunk = m->gap_at - pos;
+            if (chunk > n - (size_t)done) chunk = n - (size_t)done;
+            memcpy(out + done, m->b->p + pos, (size_t)chunk);
+        } else if (pos < m->gap_at + m->gap) {
+            chunk = m->gap_at + m->gap - pos;
+            if (chunk > n - (size_t)done) chunk = n - (size_t)done;
+            memset(out + done, 0, (size_t)chunk);
+        } else {
+            chunk = (uint64_t)total - pos;
+            if (chunk > n - (size_t)done) chunk = n - (size_t)done;
+            memcpy(out + done, m->b->p + (pos - m->gap), (size_t)chunk);
+        }
+        done += (int64_t)chunk;
+        m->pos += (int64_t)chunk;
+    }
+    return done;
+}
+static fa_result FA_CALL big_seek(void* u, int64_t off)
+{
+    big_io* m = (big_io*)u;
+    if (off < 0 || off > (int64_t)(m->b->n + m->gap)) return FA_ERROR_IO;
+    m->pos = off;
+    return FA_OK;
+}
+static int64_t FA_CALL big_length(void* u) { big_io* m = (big_io*)u; return (int64_t)(m->b->n + m->gap); }
+static void FA_CALL big_close(void* u) { (void)u; }
+
+static void test_zip64_over_4gb(void)
+{
+    buf wav = make_wav(8000, 6000), cdg = small_cdg(), zip;
+    z64_file files[3];
+    z64_layout lay;
+    uint64_t gap_at = 0;
+    big_io m;
+    fa_io_callbacks io;
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_stream_info info;
+    fa_tags* t = NULL;
+    int wide;
+    files[0].name = "pad.bin"; files[0].data = NULL; files[0].deflate = 0; files[0].gap = 4500000000ull;
+    files[1].name = "Song.cdg"; files[1].data = &cdg; files[1].deflate = 0; files[1].gap = 0;
+    files[2].name = "Song.wav"; files[2].data = &wav; files[2].deflate = 0; files[2].gap = 0;
+    memset(&io, 0, sizeof(io));
+    io.read = big_read; io.seek = big_seek; io.length = big_length; io.close = big_close;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    for (wide = 0; wide < 2; wide++) {
+        zip = make_zip64(files, 3, 0, wide, &gap_at, &lay);
+        memset(&m, 0, sizeof(m));
+        m.b = &zip; m.gap_at = gap_at; m.gap = files[0].gap;
+        CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_OK);
+        CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+        CHECK_EQ(info.has_cdg, 1);
+        CHECK_EQ(info.length_frames, 6000);
+        CHECK_EQ(info.file_size, (int64_t)(zip.n + files[0].gap));
+        CHECK_EQ(decode_all(s), 6000);
+        CHECK_EQ(fa_stream_seek(s, 3000), FA_OK);
+        CHECK_EQ(decode_all(s), 3000);
+        CHECK_EQ(fa_stream_get_tags(s, 0, &t), FA_OK);
+        fa_tags_close(t);
+        fa_stream_close(s);
+        free(zip.p);
+    }
+    free(wav.p); free(cdg.p);
+}
+
+/* Damaged ZIP64 records are refused (never read out of bounds: run under ASan). */
+static void test_zip64_damaged(void)
+{
+    buf wav = make_wav(8000, 400), cdg = small_cdg(), zip;
+    z64_file files[2];
+    z64_layout lay;
+    fa_source zs;
+    fa_zip_entry* e = NULL;
+    uint32_t count = 0;
+    int k;
+    files[0].name = "Song.cdg"; files[0].data = &cdg; files[0].deflate = 0; files[0].gap = 0;
+    files[1].name = "Song.wav"; files[1].data = &wav; files[1].deflate = 0; files[1].gap = 0;
+    for (k = 0; k < 9; k++) {
+        zip = make_zip64(files, 2, 0, 1, NULL, &lay);
+        lay.first_extra += lay.cd_at;
+        switch (k) {
+        case 0: zip.p[lay.locator] ^= 0xFF; break;                       /* locator signature */
+        case 1: zip.p[lay.z64_end] ^= 0xFF; break;                       /* ZIP64 end signature */
+        case 2: zip.p[lay.locator + 8] += 1; break;                      /* locator points elsewhere */
+        case 3: zip.p[lay.locator + 15] = 0x7F; break;                   /* ...past the end */
+        case 4: zip.p[lay.z64_end + 24] = 3; break;                      /* entries on this disk differ */
+        case 5: zip.p[lay.first_extra] = 2; break;                       /* no ZIP64 field in the extra */
+        case 6: zip.p[lay.first_extra + 2] = 0x40; break;                /* field longer than the extra */
+        case 7: zip.p[lay.first_extra + 2] = 8; break;                   /* field too short for its sizes */
+        default: zip.p[lay.z64_end + 16] = 1; break;                     /* ZIP64 end on another disk */
+        }
+        fa_source_open_memory_ref(&zs, zip.p, zip.n);
+        CHECK_EQ(fa_zip_list(&zs, &e, &count), FA_ERROR_UNSUPPORTED_FORMAT);
+        CHECK(e == NULL);
+        free(zip.p);
+    }
+    /* Cut anywhere: an error, never a crash */
+    zip = make_zip64(files, 2, 0, 1, NULL, &lay);
+    for (k = 1; k < (int)zip.n; k += 3) {
+        fa_source_open_memory_ref(&zs, zip.p, (size_t)k);
+        if (fa_zip_list(&zs, &e, &count) == FA_OK) free(e);
+        e = NULL;
+    }
+    free(zip.p); free(wav.p); free(cdg.p);
+}
+
 /* Compressed audio past the memory limit: an error without a temp directory, a
  * temp file (gone when the stream closes) with one. */
 static void test_zip_over_limit(void)
@@ -1612,6 +1872,10 @@ int main(void)
     RUN(test_inflate_streaming);
     RUN(test_zip_lean);
     RUN(test_zip_over_limit);
+    RUN(test_zip64_basic);
+    RUN(test_zip64_many_entries);
+    RUN(test_zip64_over_4gb);
+    RUN(test_zip64_damaged);
     RUN(test_decoder_basics);
     RUN(test_xor_and_repeats);
     RUN(test_scrolling);

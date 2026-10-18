@@ -221,7 +221,7 @@ The graphics carry checkpoints, the decoder state every 10 s of packs, shared by
 
 ## ZIP archives
 
-`fa_stream_open_path`, `fa_stream_open_memory` and `fa_stream_open_io` recognise a ZIP by its content. Inside, the first `.cdg` is the graphics, and the audio is the entry with the same name (`Song.mp3` next to `Song.cdg`), else the first other entry FatzAudio can decode. Stored and deflate-compressed entries are read (the decompressor is built in). A damaged `.cdg` entry leaves a playable song without graphics. ZIP64, encrypted and multi-part archives are not supported (`FA_ERROR_UNSUPPORTED_FORMAT`); karaoke downloads never use them.
+`fa_stream_open_path`, `fa_stream_open_memory` and `fa_stream_open_io` recognise a ZIP by its content. Inside, the first `.cdg` is the graphics, and the audio is the entry with the same name (`Song.mp3` next to `Song.cdg`), else the first other entry FatzAudio can decode. Stored and deflate-compressed entries are read (the decompressor is built in). A damaged `.cdg` entry leaves a playable song without graphics. ZIP64 archives (larger than 4 GB, entries or offsets past 4 GB, or more than 65,535 entries) open the same way; the directory may be up to 16 MB. Encrypted entries are skipped and multi-part archives are not supported (`FA_ERROR_UNSUPPORTED_FORMAT`).
 
 Only what is needed is read: the archive's directory at the end of the file, then the entries used. The whole file is never loaded.
 

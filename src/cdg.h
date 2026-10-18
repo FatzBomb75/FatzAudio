@@ -23,8 +23,8 @@ typedef struct fa_zip_entry {
 int fa_zip_probe(const uint8_t* data, size_t size);
 /* Reads the central directory of the archive `src` (seekable, known length): the
  * end of the file and the directory only. *out_entries is malloc'ed (free it),
- * directories are skipped. FA_ERROR_UNSUPPORTED_FORMAT for damaged, encrypted or
- * ZIP64 archives, FA_ERROR_NOT_SEEKABLE for a source that cannot seek. */
+ * directories are skipped. FA_ERROR_UNSUPPORTED_FORMAT for damaged or multi-part
+ * archives (ZIP64 is read), FA_ERROR_NOT_SEEKABLE for a source that cannot seek. */
 fa_result fa_zip_list(fa_source* src, fa_zip_entry** out_entries, uint32_t* out_count);
 /* Where entry `e`'s data starts in `src`, after checking its local header. */
 fa_result fa_zip_entry_offset(fa_source* src, const fa_zip_entry* e, int64_t* out_offset);

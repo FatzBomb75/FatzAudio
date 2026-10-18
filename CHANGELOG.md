@@ -56,6 +56,7 @@ The first packaged version (NuGet `FatzAudio` with `win-x64` and `linux-x64` nat
   `fa_stream_set_midi_effects` / `fa_stream_get_midi_effects` (.NET `AudioStream.MidiEffects`) turn them off.
 - Levels and spectrum (FFT) for streams and devices (`fa_stream_get_levels`, `fa_stream_get_spectrum`,
   `fa_device_get_levels`, `fa_device_get_spectrum`; .NET `GetLevels`, `GetSpectrum`).
+- ZIP64 archives (over 4 GB, or more than 65,535 entries) open like any other karaoke ZIP.
 - Everything else built so far: decoding (MP3, AAC, ALAC, FLAC, Opus, Vorbis, AC-3/E-AC-3, WMA on Windows,
   MIDI), web streams and HLS, crossfades, markers, buses, R128 normalization, tempo and pitch, CD+G,
   disc playback, encoding (WAV, FLAC, MP3 via LAME) and the FFmpeg packet hand-off. See
