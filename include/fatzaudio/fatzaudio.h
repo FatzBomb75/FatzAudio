@@ -181,7 +181,10 @@ typedef struct fa_device_info {
 FA_API fa_result FA_CALL fa_device_count(fa_engine* engine, fa_device_type type, uint32_t* out_count);
 FA_API fa_result FA_CALL fa_device_get_info(fa_engine* engine, fa_device_type type, uint32_t index, fa_device_info* out_info);
 
-/* device_id NULL = system default; follows default-device changes automatically. */
+/* device_id NULL = system default; follows default-device changes where the system
+ * reroutes (WASAPI, Core Audio). A started device that goes away (unplugged) is
+ * reopened on the default at the same rate, its streams playing on; every stream
+ * on it gets FA_EVENT_DEVICE_CHANGED (value 0 = rerouted, 1 = reopened). */
 FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id, fa_device** out_device);
 /* Detaches every stream still attached (they keep their position) and closes the device. */
 FA_API void FA_CALL fa_device_close(fa_device* device);
@@ -1591,7 +1594,7 @@ FA_API fa_result FA_CALL fa_stream_get_midi_channel_mute(fa_stream* stream, uint
  * FA_EVENT_STALLED         position               0
  * FA_EVENT_RESUMED         position               0
  * FA_EVENT_DECODE_ERROR    position               the fa_result of the error
- * FA_EVENT_DEVICE_CHANGED  position               0
+ * FA_EVENT_DEVICE_CHANGED  position               0 = moved to the new default, 1 = device lost, reopened on the default
  * FA_EVENT_LOUDNESS_FINAL  position               0
  * FA_EVENT_RAMP_DONE       position               fa_ramp.tag of the finished ramp
  * FA_EVENT_STARTED         position               0
@@ -1600,7 +1603,7 @@ FA_API fa_result FA_CALL fa_stream_get_midi_channel_mute(fa_stream* stream, uint
  * FA_EVENT_CDG_CHANGED     CD+G packs now shown   what changed: FA_CDG_CHANGE_* (CD+G above)
  * FA_EVENT_SEEK_FAILED     the target not reached the fa_result (fa_stream_seek_async)
  *
- * Delivered today: ENDED, MARKER, LOOPED, CDG_CHANGED (when asked for), LOUDNESS_FINAL, RAMP_DONE, STARTED and SEEK_FAILED; MIDI_TEXT from MIDI
+ * Delivered today: ENDED, MARKER, LOOPED, CDG_CHANGED (when asked for), LOUDNESS_FINAL, RAMP_DONE, STARTED, SEEK_FAILED and DEVICE_CHANGED; MIDI_TEXT from MIDI
  * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); METADATA from web
  * streams; STALLED and RESUMED from push, packet and web streams; DECODE_ERROR from packet
  * and disc streams. The others are raised by the features that produce them as those land (see docs/features). */

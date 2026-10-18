@@ -716,8 +716,26 @@ struct fa_device {
     float mute_level;            /* audio thread: 0 = audible .. 1 = silent */
     fa_atomic_ptr encoders;      /* fa_enc_list* recording the output (encode.c) */
     fa_atomic_ptr tap;           /* fa_tap*, the output after the limiter (analysis.c) */
+    /* Device changes. `life_lock` guards `device` (ma_device) whenever it may be
+     * reopened: the event thread holds it to reopen, the API calls that use it hold it. */
+    fa_mutex life_lock;
+    int device_ok;               /* life_lock: `device` is initialized */
+    float volume;                /* life_lock: master volume, set again on a reopened device */
+    fa_atomic32 want_started;    /* between fa_device_start and stop: a stop nobody asked for = lost */
+    fa_atomic32 lost;            /* the device went away: the event thread reopens the default */
+    fa_atomic64 lost_at;         /* when: the backend gets a moment to reroute a default device itself */
+    fa_atomic32 rerouted;        /* the event thread reads the new latency */
+    fa_atomic32 reopening;       /* stop notifications of the old device are expected */
+    fa_atomic32 closing;
+    fa_atomic32 changed;         /* 1 + value of the FA_EVENT_DEVICE_CHANGED the next callback raises */
+    fa_atomic64 latency_ns;      /* output latency of `device`, readable without life_lock */
+    int64_t retry_at;            /* event thread: when to try reopening again */
     struct fa_device* next;      /* engine->devices */
 };
+
+/* Event thread: reopens devices that went away on the system default. */
+void fa_devices_service(fa_engine* e);
+void fa_device_simulate(fa_device* d, int lost);   /* tests: a reroute (0) or a removal (1) */
 
 /* Mute level (0 = audible, 1 = silent) after `n` frames gliding toward `target`:
  * a full mute or unmute takes 5 ms, like a volume change. */

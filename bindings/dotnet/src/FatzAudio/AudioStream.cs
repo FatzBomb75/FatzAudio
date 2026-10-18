@@ -1367,7 +1367,13 @@ public unsafe class AudioStream : IDisposable
     /// audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.
     /// </summary>
     public event EventHandler<StreamEventArgs>? SeekFailed;
-    /// <summary>Raised when the output device changed. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
+
+    /// <summary>
+    /// Raised when the stream's output changed: <see cref="StreamEventArgs.Value"/> 0 when the system moved it to the
+    /// new default device (a headset plugged in), 1 when the device went away (unplugged) and the output was reopened
+    /// on the default. The stream stays attached and plays on. Raised on the engine's event thread (never the audio
+    /// thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.
+    /// </summary>
     public event EventHandler<StreamEventArgs>? DeviceChanged;
 
     /// <summary>

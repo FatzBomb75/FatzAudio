@@ -102,7 +102,16 @@ using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true
 | `fa_device_stop` with streams playing | Output goes silent. Streams keep their state and position, and continue on the next start |
 | `fa_device_close` with streams attached | Streams are detached, keep their position, and can be attached to another device |
 
+## When the device changes or goes away
+
+| What happens | What FatzAudio does |
+|---|---|
+| The system default changes (a headset plugged in) and the device was opened as the default (`device_id` NULL, .NET `OpenOutput()`) | Windows (WASAPI) and macOS/iOS (Core Audio) move the output to the new default by themselves; every stream on it gets `FA_EVENT_DEVICE_CHANGED` with value 0 (.NET `DeviceChanged`). On Linux, PulseAudio and PipeWire move the stream themselves without telling apps, so no event; plain ALSA doesn't follow |
+| The device is unplugged or disabled while started (a chosen USB interface, or the default on a system that doesn't reroute) | The engine reopens the output on the system default at the same mix rate. Streams stay attached and play on from where they were, the device clock keeps counting, and every stream gets `FA_EVENT_DEVICE_CHANGED` with value 1. The `fa_device*` stays valid: from then on it is the default device, with the master volume you set (`fa_device_set_volume`). The system gets about 0.3 s to reroute a default device itself first, so a default output is never reopened twice |
+| No output is available at all | Silence; the engine tries again every second, and the device starts by itself once an output appears (`fa_device_is_started` keeps reporting what you asked for, and `fa_device_set_volume` still takes a volume for it) |
+
+The latency can differ on the new output; `fa_device_get_latency` and the presentation clock pick it up at once. A device that comes back (the USB interface plugged in again) is not switched back to: reopen it with `fa_device_open` and move the streams with `fa_stream_attach` if you want it.
+
 ## Pitfalls
 
 - Close every stream and device before `fa_engine_destroy`. In .NET the handles do this for you in any dispose order.
-- Following the default device when it changes (headset plugged in) is planned with R14 and isn't wired up yet.
