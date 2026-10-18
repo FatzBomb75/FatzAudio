@@ -130,6 +130,15 @@ void fa_device_render_at(fa_device* dev, float* out, uint32_t frames, int64_t no
         }
         for (i = 0; i < list->count; i++) fa_stream_mix(list->items[i], dev, out, frames);
     }
+    {
+        /* The output moved (fa_devices_service, or the system rerouted it): every
+         * stream on it hears about it, as its audio is mixed. */
+        int32_t changed = fa_load32(&dev->changed) ? fa_exchange32(&dev->changed, 0) : 0;
+        if (changed && list)
+            for (i = 0; i < list->count; i++)
+                fa_audio_post_event(dev, list->items[i], FA_EVENT_DEVICE_CHANGED,
+                                    fa_stream_position_now(list->items[i]), changed - 1);
+    }
     if (!dev->xf_busy) fa_mutex_unlock(&dev->xf_lock);   /* commands taken */
     fa_buses_end(dev, frames);
     fa_limiter_process(&dev->limiter, out, frames,
@@ -167,6 +176,131 @@ static void data_callback(ma_device* d, void* output, const void* input, ma_uint
     fa_fetch_add64(&dev->epoch, 1);
     fa_device_render(dev, (float*)output, frames);
     fa_fetch_add64(&dev->epoch, 1);
+}
+
+/* Output latency of the open ma_device (life_lock held, or nobody else can see it yet). */
+static void store_latency(fa_device* d)
+{
+    ma_uint32 rate = d->device.playback.internalSampleRate;
+    fa_store64(&d->latency_ns, rate == 0 ? 0 :
+               (int64_t)((double)d->device.playback.internalPeriodSizeInFrames *
+                         (double)d->device.playback.internalPeriods * 1e9 / (double)rate));
+}
+
+/* miniaudio's thread (or the audio thread): only flags here, the event thread acts. */
+static void notification_callback(const ma_device_notification* n)
+{
+    fa_device* dev = (fa_device*)n->pDevice->pUserData;
+    if (!dev || fa_load32(&dev->reopening) || fa_load32(&dev->closing)) return;
+    if (n->type == ma_device_notification_type_rerouted) {
+        /* The system moved a default-device stream to the new default by itself (after
+         * stopping it when the old one went away: that was no loss then). */
+        fa_store32(&dev->lost, 0);
+        fa_store32(&dev->rerouted, 1);
+        fa_store32(&dev->changed, 1);
+        fa_cond_broadcast(&dev->engine->event_cond);
+    } else if (n->type == ma_device_notification_type_stopped && fa_load32(&dev->want_started)) {
+        /* Stopped without fa_device_stop: unplugged or disabled. */
+        fa_store64(&dev->lost_at, fa_monotonic_ns());
+        fa_store32(&dev->lost, 1);
+        fa_cond_broadcast(&dev->engine->event_cond);
+    }
+}
+
+static ma_device_config device_config(fa_device* d, const ma_device_id* pid, uint32_t rate)
+{
+    fa_engine* engine = d->engine;
+    ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
+    cfg.playback.pDeviceID = pid;
+    cfg.playback.format = ma_format_f32;
+    cfg.playback.channels = FA_DEVICE_CHANNELS;
+    cfg.sampleRate = rate; /* 0 = native */
+    cfg.periodSizeInMilliseconds = engine->config.period_ms;
+    cfg.dataCallback = data_callback;
+    cfg.notificationCallback = notification_callback;
+    cfg.pUserData = d;
+    cfg.noPreSilencedOutputBuffer = MA_TRUE;  /* the callback clears the buffer itself */
+    cfg.wasapi.usage = ma_wasapi_usage_pro_audio; /* MMCSS "Pro Audio" scheduling on Windows */
+    /* Shared-mode WASAPI runs the system mixer every 10 ms; two periods ahead of it
+     * is enough with the callback only mixing decoded audio, and one period (10 ms)
+     * less latency than miniaudio's default of three. A larger period_ms buys margin. */
+    if (engine->context.backend == ma_backend_wasapi) cfg.periods = 2;
+    return cfg;
+}
+
+/* Reopens a device that went away on the system default, at the same mix rate, so
+ * the streams on it keep their chains, positions and clock. Caller holds life_lock. */
+static void reopen_default_locked(fa_device* d, int64_t now)
+{
+    ma_device_config cfg;
+    if (fa_load32(&d->closing)) return;
+    cfg = device_config(d, NULL, d->rate);
+    fa_store32(&d->reopening, 1);
+    if (d->device_ok) {
+        ma_device_uninit(&d->device);   /* waits for its callback: none runs after this */
+        d->device_ok = 0;
+    }
+    if (ma_device_init(&d->engine->context, &cfg, &d->device) != MA_SUCCESS) {
+        d->retry_at = now + 1000000000;   /* no output at all right now: try again in a second */
+        fa_store32(&d->reopening, 0);
+        return;
+    }
+    d->device_ok = 1;                    /* from now on it follows the default */
+    store_latency(d);
+    if (d->volume != 1.0f) ma_device_set_master_volume(&d->device, d->volume);
+    fa_store32(&d->lost, 0);
+    fa_store32(&d->reopening, 0);
+    fa_store32(&d->changed, 2);          /* FA_EVENT_DEVICE_CHANGED, value 1 */
+    if (fa_load32(&d->want_started) && ma_device_start(&d->device) != MA_SUCCESS) {
+        fa_store32(&d->lost, 1);
+        d->retry_at = now + 1000000000;
+    }
+}
+
+/* How long a backend gets to reroute a default device itself before it counts as lost
+ * (WASAPI stops the stream when the default goes, then restarts it on the new one). */
+#define FA_REROUTE_GRACE_NS 300000000
+
+static int needs_service(fa_device* d, int64_t now)
+{
+    if (fa_load32(&d->rerouted)) return 1;
+    return fa_load32(&d->lost) && now >= d->retry_at && now >= fa_load64(&d->lost_at) + FA_REROUTE_GRACE_NS;
+}
+
+/* Event thread (it looks every few milliseconds). */
+void fa_devices_service(fa_engine* e)
+{
+    int64_t now = fa_monotonic_ns();
+    for (;;) {
+        fa_device* d;
+        fa_device* pick = NULL;
+        fa_mutex_lock(&e->list_lock);
+        for (d = e->devices; d; d = d->next)
+            /* Only tried: fa_device_close holds it while it takes the device away. */
+            if (needs_service(d, now) && fa_mutex_trylock(&d->life_lock)) { pick = d; break; }
+        fa_mutex_unlock(&e->list_lock);
+        if (!pick) return;
+        if (fa_exchange32(&pick->rerouted, 0) && pick->device_ok) store_latency(pick);
+        if (needs_service(pick, now)) {
+            if (pick->device_ok && ma_device_is_started(&pick->device)) fa_store32(&pick->lost, 0); /* rerouted meanwhile */
+            else reopen_default_locked(pick, now);
+            if (fa_load32(&pick->lost) && pick->retry_at <= now) pick->retry_at = now + 1000000000;
+        }
+        fa_mutex_unlock(&pick->life_lock);
+    }
+}
+
+/* Tests: what a backend does when the device goes away or the default changes. */
+void fa_device_simulate(fa_device* d, int lost)
+{
+    ma_device_notification n;
+    memset(&n, 0, sizeof(n));
+    n.pDevice = &d->device;
+    n.type = lost ? ma_device_notification_type_stopped : ma_device_notification_type_rerouted;
+    fa_mutex_lock(&d->life_lock);           /* the backend is done with it before a reopen */
+    if (lost && d->device_ok) ma_device_stop(&d->device);   /* as the backend does; want_started stays set */
+    notification_callback(&n);
+    fa_mutex_unlock(&d->life_lock);
 }
 
 void fa_device_wait_quiescent(fa_device* dev)
@@ -247,31 +381,25 @@ FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id
     d->engine = engine;
     if (fa_mutex_init(&d->lock) != 0) { free(d); return FA_ERROR_GENERIC; }
     if (fa_mutex_init(&d->xf_lock) != 0) { fa_mutex_destroy(&d->lock); free(d); return FA_ERROR_GENERIC; }
+    if (fa_mutex_init(&d->life_lock) != 0) {
+        fa_mutex_destroy(&d->xf_lock); fa_mutex_destroy(&d->lock); free(d); return FA_ERROR_GENERIC;
+    }
+    d->volume = 1.0f;
 
-    cfg = ma_device_config_init(ma_device_type_playback);
-    cfg.playback.pDeviceID = pid;
-    cfg.playback.format = ma_format_f32;
-    cfg.playback.channels = FA_DEVICE_CHANNELS;
-    cfg.sampleRate = engine->config.mix_sample_rate; /* 0 = native */
-    cfg.periodSizeInMilliseconds = engine->config.period_ms;
-    cfg.dataCallback = data_callback;
-    cfg.pUserData = d;
-    cfg.noPreSilencedOutputBuffer = MA_TRUE;  /* the callback clears the buffer itself */
-    cfg.wasapi.usage = ma_wasapi_usage_pro_audio; /* MMCSS "Pro Audio" scheduling on Windows */
-    /* Shared-mode WASAPI runs the system mixer every 10 ms; two periods ahead of it
-     * is enough with the callback only mixing decoded audio, and one period (10 ms)
-     * less latency than miniaudio's default of three. A larger period_ms buys margin. */
-    if (engine->context.backend == ma_backend_wasapi) cfg.periods = 2;
-
+    cfg = device_config(d, pid, engine->config.mix_sample_rate);
     if (ma_device_init(&engine->context, &cfg, &d->device) != MA_SUCCESS) {
+        fa_mutex_destroy(&d->life_lock);
         fa_mutex_destroy(&d->xf_lock);
         fa_mutex_destroy(&d->lock);
         free(d);
         return FA_ERROR_DEVICE;
     }
+    d->device_ok = 1;
+    store_latency(d);
     d->rate = d->device.sampleRate;
     if (fa_limiter_init(&d->limiter, d->rate, FA_DEVICE_CHANNELS) != FA_OK) {
         ma_device_uninit(&d->device);
+        fa_mutex_destroy(&d->life_lock);
         fa_mutex_destroy(&d->xf_lock);
         fa_mutex_destroy(&d->lock);
         free(d);
@@ -292,59 +420,92 @@ FA_API void FA_CALL fa_device_close(fa_device* device)
     fa_voice_list* list;
     if (!device) return;
     fa_encode_device_closing(device);
-    ma_device_stop(&device->device);
+    fa_mutex_lock(&device->life_lock);     /* waits for a reopen in progress; none starts after */
+    fa_store32(&device->closing, 1);
+    fa_store32(&device->want_started, 0);
+    if (device->device_ok) ma_device_stop(&device->device);
+    fa_mutex_unlock(&device->life_lock);
     for (;;) {
         list = (fa_voice_list*)fa_load_ptr(&device->voices);
         if (!list || list->count == 0) break;
         fa_stream_detach(list->items[0]);
     }
-    ma_device_uninit(&device->device);       /* no more audio callbacks */
+    if (device->device_ok) ma_device_uninit(&device->device);   /* no more audio callbacks */
     /* Hand events still queued (ENDED, RAMP_DONE) to the engine before the queue goes. */
     fa_mutex_lock(&device->engine->list_lock);
     for (pp = &device->engine->devices; *pp; pp = &(*pp)->next)
         if (*pp == device) { *pp = device->next; break; }
     fa_event_rescue_device(device->engine, device);
     fa_mutex_unlock(&device->engine->list_lock);
+    /* The event thread may have picked it before the unlink: wait until it lets go. */
+    fa_mutex_lock(&device->life_lock);
+    fa_mutex_unlock(&device->life_lock);
     fa_limiter_free(&device->limiter);
     fa_buses_free_all(device);
     free(fa_load_ptr(&device->voices));
     fa_tap_free((fa_tap*)fa_load_ptr(&device->tap));
+    fa_mutex_destroy(&device->life_lock);
     fa_mutex_destroy(&device->xf_lock);
     fa_mutex_destroy(&device->lock);
     free(device);
 }
 
+/* Started means "wanted started": while a lost device waits to be reopened, it
+ * starts again by itself once there is an output. */
 FA_API fa_result FA_CALL fa_device_start(fa_device* device)
 {
+    fa_result r = FA_OK;
     if (!device) return FA_ERROR_INVALID_ARG;
-    if (ma_device_is_started(&device->device)) return FA_OK;
-    return ma_device_start(&device->device) == MA_SUCCESS ? FA_OK : FA_ERROR_DEVICE;
+    fa_mutex_lock(&device->life_lock);
+    fa_store32(&device->want_started, 1);
+    if (device->device_ok && !fa_load32(&device->lost) && !ma_device_is_started(&device->device) &&
+        ma_device_start(&device->device) != MA_SUCCESS) {
+        fa_store32(&device->want_started, 0);
+        fa_store32(&device->lost, 0);       /* a stop notification from the failed start is no loss */
+        r = FA_ERROR_DEVICE;
+    }
+    fa_mutex_unlock(&device->life_lock);
+    return r;
 }
 
 FA_API fa_result FA_CALL fa_device_stop(fa_device* device)
 {
+    fa_result r = FA_OK;
     if (!device) return FA_ERROR_INVALID_ARG;
-    if (!ma_device_is_started(&device->device)) return FA_OK;
-    return ma_device_stop(&device->device) == MA_SUCCESS ? FA_OK : FA_ERROR_DEVICE;
+    fa_mutex_lock(&device->life_lock);
+    fa_store32(&device->want_started, 0);
+    if (device->device_ok && ma_device_is_started(&device->device) && ma_device_stop(&device->device) != MA_SUCCESS)
+        r = FA_ERROR_DEVICE;
+    fa_mutex_unlock(&device->life_lock);
+    return r;
 }
 
 FA_API fa_result FA_CALL fa_device_is_started(fa_device* device, int32_t* out_started)
 {
     if (!device || !out_started) return FA_ERROR_INVALID_ARG;
-    *out_started = ma_device_is_started(&device->device) ? 1 : 0;
+    *out_started = fa_load32(&device->want_started);
     return FA_OK;
 }
 
 FA_API fa_result FA_CALL fa_device_set_volume(fa_device* device, float volume)
 {
+    fa_result r = FA_OK;
     if (!device || volume < 0.0f) return FA_ERROR_INVALID_ARG;
-    return ma_device_set_master_volume(&device->device, volume) == MA_SUCCESS ? FA_OK : FA_ERROR_DEVICE;
+    fa_mutex_lock(&device->life_lock);
+    /* Kept while no output is open, and set again on a reopened one. */
+    if (device->device_ok && ma_device_set_master_volume(&device->device, volume) != MA_SUCCESS) r = FA_ERROR_DEVICE;
+    else device->volume = volume;
+    fa_mutex_unlock(&device->life_lock);
+    return r;
 }
 
 FA_API fa_result FA_CALL fa_device_get_volume(fa_device* device, float* out_volume)
 {
     if (!device || !out_volume) return FA_ERROR_INVALID_ARG;
-    return ma_device_get_master_volume(&device->device, out_volume) == MA_SUCCESS ? FA_OK : FA_ERROR_DEVICE;
+    fa_mutex_lock(&device->life_lock);
+    *out_volume = device->volume;
+    fa_mutex_unlock(&device->life_lock);
+    return FA_OK;
 }
 
 FA_API fa_result FA_CALL fa_device_set_mute(fa_device* device, int32_t muted)
@@ -363,12 +524,9 @@ FA_API fa_result FA_CALL fa_device_get_mute(fa_device* device, int32_t* out_mute
 
 FA_API fa_result FA_CALL fa_device_get_latency(fa_device* device, fa_time* out_latency)
 {
-    ma_uint32 rate;
     if (!device || !out_latency) return FA_ERROR_INVALID_ARG;
-    rate = device->device.playback.internalSampleRate;
-    if (rate == 0) { *out_latency = 0; return FA_OK; }
-    *out_latency = (fa_time)((double)device->device.playback.internalPeriodSizeInFrames *
-                             (double)device->device.playback.internalPeriods * 1e9 / (double)rate);
+    *out_latency = fa_load64(&device->latency_ns);   /* the clock reads it: no lock */
+    if (*out_latency == 0) return FA_OK;
     if (device->rate) *out_latency += (fa_time)((double)device->limiter.delay * 1e9 / (double)device->rate);
     return FA_OK;
 }
