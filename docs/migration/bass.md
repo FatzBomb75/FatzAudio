@@ -42,6 +42,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_Pause | `fa_device_stop` (streams keep their position) | `device.Stop()` | ✅ |
 | BASS_IsStarted | `fa_device_is_started` | `device.IsStarted` | ✅ |
 | BASS_SetVolume / BASS_GetVolume | `fa_device_set_volume` / `get_volume` | `device.Volume` | ✅ |
+| Mute by saving the volume, setting BASS_ATTRIB_VOL (or BASS_SetVolume) to 0 and restoring it | `fa_stream_set_mute` / `fa_device_set_mute`: the volume is kept, fades keep running, 5 ms glide | `stream.Muted`, `device.Muted` | ✅ |
 | BASS_SetConfig / GetConfig (+Ptr) | `fa_engine_config` fields at creation; per-stream options | `AudioEngineOptions` | ✅ partially (rate, period, threads, cache dir) |
 | BASS_CONFIG_BUFFER | `fa_open_options.buffer_ms` per stream, default 500 ms ([playback](../features/playback.md#buffer-length)) | `StreamOptions.BufferLength` | ✅ |
 | BASS_CONFIG_NET_TIMEOUT / NET_READTIMEOUT | `fa_net_options.timeout_ms` per stream: connecting, and the longest the server may stay silent ([web streams](../features/web-streams.md#connection-settings)) | `NetworkOptions.Timeout` | ✅ |
@@ -128,7 +129,8 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_ChannelGetTags `BASS_TAG_META` (ICY StreamTitle) | `fa_stream_get_metadata`: the title heard now, split into artist and title ([song titles](../features/web-streams.md#song-titles-icy-metadata)) | `stream.Metadata` | ✅ |
 | BASS_ChannelGetTags `BASS_TAG_ICY` / `BASS_TAG_HTTP` | `fa_stream_get_metadata` (station, genre, bitrate, ...) or any header by name with `fa_stream_get_http_header` | `stream.Metadata`, `GetHttpHeader(name)` | ✅ |
 | BASS_ChannelGetTags `BASS_TAG_HLS_*` | `fa_stream_get_info` (container `hls`, codec) and `fa_stream_get_net_status` (`is_hls`, media playlist URL) | `Info`, `NetworkStatus` | ✅ |
-| BASS_ChannelFlags (loop) | `FA_OPEN_LOOP`, looping between the cue-in and cue-out markers; runtime toggle planned | | ✅ open-time only |
+| BASS_ChannelFlags (BASS_SAMPLE_LOOP), at open or while playing | `FA_OPEN_LOOP` at open, `fa_stream_set_loop` at any time; loops between the cue-in and cue-out markers | `StreamOptions.Loop`, `stream.Loop` | ✅ |
+| BASS_SYNC_END on a looping channel, to notice a loop | `FA_EVENT_LOOPED` for each jump (raised as it is mixed, like markers): frame = the loop end it left, value = where it went | `stream.Looped` | ✅ |
 | BASS_POS_LOOP / BASS_POS_END (loop start, end position) | `FA_MARKER_CUE_IN` / `FA_MARKER_CUE_OUT` | `Markers.CueIn` / `Markers.CueOut` | ✅ |
 | BASS_ChannelSetLink / RemoveLink | `fa_stream_play_at` with the same time starts streams on the same frame; a bus ([buses](../features/buses.md)) groups their volume and pan | `PlayAt`, `MixBus` | ✅ |
 | BASS_ChannelLock | Not needed: parameter changes are applied atomically per buffer | — | ➖ (by design) |

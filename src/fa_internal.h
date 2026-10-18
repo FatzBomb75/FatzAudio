@@ -669,9 +669,20 @@ struct fa_device {
     fa_atomic32 spilled;         /* 1 = some stream on this device used its spill slots */
     fa_atomic32 publishing;      /* audio thread is between taking a sequence number and publishing */
     fa_limiter limiter;          /* audio thread only */
+    fa_atomic32 muted;           /* fa_device_set_mute */
+    float mute_level;            /* audio thread: 0 = audible .. 1 = silent */
     fa_atomic_ptr encoders;      /* fa_enc_list* recording the output (encode.c) */
     struct fa_device* next;      /* engine->devices */
 };
+
+/* Mute level (0 = audible, 1 = silent) after `n` frames gliding toward `target`:
+ * a full mute or unmute takes 5 ms, like a volume change. */
+static inline float fa_mute_glide(float level, float target, int64_t n, uint32_t rate)
+{
+    float step = rate ? (float)n / ((float)rate * 0.005f) : 1.0f;
+    if (level < target) return level + step < target ? level + step : target;
+    return level - step > target ? level - step : target;
+}
 
 /* ---- Parameter lanes (lane.c) --------------------------------------------
  * One automatable value (stream volume, pan, crossfade gain; bus volume, pan).
@@ -781,9 +792,18 @@ struct fa_stream {
     fa_atomic64 position;        /* source frames, when not attached */
     fa_atomic64 markers[FA_MARKER_COUNT];  /* read by the worker and the audio thread */
     fa_shape_atomic fade_shape[2];         /* FA_FADE_IN, FA_FADE_OUT */
+    fa_atomic32 loop;            /* 1 = loops (FA_OPEN_LOOP, fa_stream_set_loop); changed
+                                    under decode_lock, or while the mixer skips the stream */
+    fa_atomic32 muted;           /* fa_stream_set_mute */
+    float mute_level;            /* audio thread: 0 = audible .. 1 = silent, glides to `muted` */
+    int64_t mute_next;           /* audio thread: device frame right after the last one mixed */
 
     /* Decode-ahead, valid while attached. Worker-owned under decode_lock. */
     fa_device* device;           /* written under api_lock */
+    /* The device for fa_stream_get_clock, which takes no lock: set once the voice is
+     * live, cleared first on detach, which then waits for clock_readers to drain. */
+    fa_atomic_ptr clock_device;
+    fa_atomic32 clock_readers;
     fa_atomic_ptr bus;           /* fa_bus*, NULL = master; read by the audio thread */
     uint32_t dev_rate;
     fa_ring ring;
@@ -877,6 +897,7 @@ struct fa_stream {
     uint32_t tempo_latency_ms;
     fa_tempo* tempo;             /* NULL until a parameter first leaves neutral */
     int tempo_drained;           /* the chain gave back its tail at the end of the source */
+    int jumped_back;             /* a loop jumped back since the last restart (decode side) */
     int64_t tempo_frames;        /* chain output frames since the last restart */
     fa_tmap tmap;
     fa_atomic32 tempo_live;      /* the chain is engaged: decode-ahead is kept short */
