@@ -118,6 +118,10 @@ void fa_sleep_ms(uint32_t ms);
 FILE* fa_fopen_utf8(const char* path, const char* mode);
 int fa_mkdir_utf8(const char* path);                     /* 0 if created or already there */
 int fa_replace_file(const char* from, const char* to);   /* rename over an existing file; 0 on success */
+/* Where the OS keeps its MIDI instruments (gm.dls, gs_instruments.dls, a GM .sf2),
+ * in the order to try: the `index`th path in UTF-8, 0 past the last one. */
+int fa_system_soundfont_path(int index, char* out, size_t cap);
+
 /* A new file in `folder` ("w+b") that the system deletes when it is closed, also
  * if the process dies; NULL on failure. */
 FILE* fa_temp_file_create(const char* folder);

@@ -167,6 +167,12 @@ static fa_result stream_open_decoder(struct fa_stream* s, const char* name_hint,
     fa_decoder_env env;
     fa_result r;
     env.dynamic_range = &s->dynamic_range;
+    if (!s->soundfont) {
+        /* A MIDI file and no soundfont from the app: the OS's own instruments. */
+        const uint8_t* head;
+        size_t n = fa_source_peek(&s->source, &head);
+        if (fa_probe_midi(head, n, 0)) s->soundfont = fa_engine_system_soundfont(s->engine);
+    }
     env.soundfont = s->soundfont;
     env.midi_rate = fa_engine_midi_rate(s->engine);
     r = fa_decoder_open(&s->decoder, &s->source, name_hint, options ? options->mime_hint : NULL,

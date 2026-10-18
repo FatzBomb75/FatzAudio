@@ -311,6 +311,9 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_soundfont_open_memory(void* data, nuint size, out nint font);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_soundfont_open_system(out nint font);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial void fa_soundfont_close(nint font);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

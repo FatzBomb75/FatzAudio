@@ -551,6 +551,14 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
     if (!j->path) { job_free(j); return FA_ERROR_OUT_OF_MEMORY; }
     j->name_hint = j->path;
     j->env.soundfont = fa_engine_soundfont(engine);
+    if (!j->env.soundfont) {
+        /* A MIDI file and no soundfont from the app: the OS's own instruments, as a stream would play it. */
+        uint8_t head[64];
+        size_t n = 0;
+        FILE* f = fa_fopen_utf8(path, "rb");
+        if (f) { n = fread(head, 1, sizeof(head), f); fclose(f); }
+        if (fa_probe_midi(head, n, 0)) j->env.soundfont = fa_engine_system_soundfont(engine);
+    }
     enqueue(engine, j);
 
     /* The calling thread scans too, so a standalone scan uses every core. */

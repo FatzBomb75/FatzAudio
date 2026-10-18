@@ -38,6 +38,9 @@ against untrusted files and add what the decoder needs:
 - RIFF sizes clamped to the buffer (`tsf_load_memory` passes the real size); chunk size
   checks that cannot overflow; a LIST shorter than 4 bytes rejected; a duplicate hydra
   chunk fails the load.
+- The `initialAttenuation` cap is 144 dB instead of 14.4 dB (the 0.01 dB per unit scale
+  is kept, so SoundFont 2 banks sound as before). DLS banks are converted with ten units per
+  centibel to reach the spec's level.
 - `tsf_hydra_valid`: minimum record counts, and every bag/generator/instrument/sample
   index checked monotonic and in range; out-of-range sample IDs and instrument indices
   skipped; sample offsets and loop points clamped inside the sample.

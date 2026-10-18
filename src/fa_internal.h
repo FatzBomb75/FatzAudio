@@ -229,6 +229,9 @@ int fa_probe_mp3_header(const uint8_t* data, size_t size, size_t start, uint32_t
 #define FA_MIDI_BUFFER_MS 150       /* default decode-ahead of MIDI streams (live controls) */
 
 /* Soundfont references: retain returns `f` (NULL-safe); the last release frees it. */
+/* DLS banks (dls.c), turned into a SoundFont 2 image the synthesizer loads. */
+int fa_dls_probe(const uint8_t* data, size_t size);
+fa_result fa_dls_to_sf2(const uint8_t* data, size_t size, uint8_t** out_sf2, size_t* out_size);
 struct fa_soundfont* fa_soundfont_retain(struct fa_soundfont* f);
 void fa_soundfont_release(struct fa_soundfont* f);
 /* A fingerprint of the soundfont's content, for the loudness cache. */
@@ -236,6 +239,9 @@ uint64_t fa_soundfont_key(const struct fa_soundfont* f);
 uint64_t fa_fnv1a(uint64_t h, const uint8_t* p, size_t n);   /* scan.c */
 /* The engine's soundfont, retained (release it), or NULL. */
 struct fa_soundfont* fa_engine_soundfont(fa_engine* engine);
+/* The OS's bank (fa_soundfont_open_system), loaded once per engine, retained, or
+ * NULL (none, or FA_ENGINE_NO_SYSTEM_SOUNDFONT). */
+struct fa_soundfont* fa_engine_system_soundfont(fa_engine* engine);
 /* The MIDI rate of streams of `engine`. */
 uint32_t fa_engine_midi_rate(const fa_engine* engine);
 
@@ -645,6 +651,12 @@ struct fa_engine {
     int scan_started;
 
     struct fa_soundfont* soundfont; /* fa_engine_set_soundfont, under list_lock */
+    /* The OS's bank for MIDI streams without a soundfont: loaded by the first one
+     * that needs it, under system_soundfont_lock (later ones wait for it);
+     * system_soundfont_tried once it was found or found missing. */
+    fa_mutex system_soundfont_lock;
+    struct fa_soundfont* system_soundfont;
+    int system_soundfont_tried;
 };
 
 typedef struct fa_voice_list {

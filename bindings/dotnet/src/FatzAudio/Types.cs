@@ -409,6 +409,11 @@ public sealed record AudioEngineOptions
     /// tests, build servers without audio hardware, and headless services.
     /// </summary>
     public bool NullOutput { get; init; }
+    /// <summary>
+    /// MIDI files opened without a soundfont throw <see cref="ErrorCode.NoSoundFont"/> instead of playing with the
+    /// OS's instruments (<see cref="SoundFont.FromSystem"/>).
+    /// </summary>
+    public bool NoSystemSoundFont { get; init; }
 }
 
 /// <summary>A format the built-in decoder registry can open (see <see cref="AudioEngine.SupportedFormats"/>).</summary>
