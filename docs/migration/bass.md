@@ -48,7 +48,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_CONFIG_NET_BUFFER | Not needed: each web stream keeps up to 4 MB, at most 2 MB ahead of playback | — | ➖ (by design) |
 | BASS_CONFIG_NET_PREBUF / NET_PREBUF_WAIT | `fa_net_options.prebuffer_ms` (default 1 s), used at the start and after every stall; opening never waits for it | `NetworkOptions.Prebuffer` | ✅ |
 | BASS_CONFIG_NET_AGENT | `fa_net_options.user_agent` | `NetworkOptions.UserAgent` | ✅ |
-| BASS_CONFIG_NET_PROXY | `fa_net_options.proxy`: `NULL` = system settings and environment, `""` = direct, or `"user:pass@host:port"` | `NetworkOptions.Proxy` | ✅ |
+| BASS_CONFIG_NET_PROXY | `fa_net_options.proxy`: `NULL` = system settings (Windows, macOS, Android) and environment, `""` = direct, or `"user:pass@host:port"` | `NetworkOptions.Proxy` | ✅ |
 | BASS_CONFIG_NET_PLAYLIST | Always on: `.pls` and `.m3u` are followed to their first entry, `.m3u8` plays as HLS | automatic | ✅ |
 | BASS_CONFIG_NET_META | Always asks for ICY titles; `FA_NET_NO_ICY` turns it off | `NetworkOptions.SongTitles = false` | ✅ |
 | BASS_CONFIG_NET_RESTRATE | Not needed: the download only runs 2 MB ahead of playback, so it's paced by playback anyway | — | ➖ (by design) |
@@ -68,6 +68,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_StreamCreateFile (memory) | `fa_stream_open_memory` | `engine.OpenMemory(bytes)` | ✅ |
 | BASS_StreamCreateFileUser | `fa_stream_open_io`; `close` is called once by `fa_stream_close`, never on a failed open ([custom I/O](../features/streams.md#custom-io-your-own-reader)) | `engine.OpenStream(System.IO.Stream)` | ✅ |
 | BASS_StreamCreateURL | `fa_stream_open_url`: HTTP/HTTPS files with range seeking, Icecast/Shoutcast radio, HLS, `.pls`/`.m3u`; reconnects by itself ([web streams](../features/web-streams.md)) | `engine.OpenUrl(url)` | ✅ WAV/FLAC/MP3/OGG/Opus/AAC/AC-3 built in |
+| BASS_StreamCreateURL with `https://` on Android | The system's HTTPS (`HttpURLConnection` on the app's Java VM): no SSL library to ship. Android 12+ and .NET for Android need nothing; Java/Kotlin apps on Android 7 to 11 call `fa_android_set_java_vm` once ([web streams](../features/web-streams.md#android)) | automatic (`AudioEngine.SetAndroidJavaVM` if needed) | ✅ |
 | BASS_StreamCreateURL `DOWNLOADPROC` (raw bytes to save a station) | Planned | | 🗓️ |
 | BASS_StreamCreateURL `BASS_STREAM_BLOCK` | Not needed: memory per web stream is bounded (4 MB) and seeking still works | — | ➖ (by design) |
 | BASS_StreamCreateURL `BASS_STREAM_STATUS` (+ `BASS_TAG_HTTP` during connect) | `fa_stream_get_http_header` and `fa_stream_get_net_status` after the open | `GetHttpHeader`, `NetworkStatus` | ✅ |

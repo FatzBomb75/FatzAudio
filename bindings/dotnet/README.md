@@ -23,7 +23,7 @@ song.Ramp(AudioParameter.Volume, 0f, TimeSpan.FromSeconds(3), Curve.EqualPower);
 
 | Type | Purpose |
 | --- | --- |
-| `AudioEngine` | Entry point. `OutputDevices`, `InputDevices`, `OpenOutput`, `OpenFile`, `OpenMemory`, `OpenStream`, `OpenUrl`, `CreatePushStream`, `OpenPackets`, `DefaultSoundFont`. |
+| `AudioEngine` | Entry point. `OutputDevices`, `InputDevices`, `OpenOutput`, `OpenFile`, `OpenMemory`, `OpenStream`, `OpenUrl`, `CreatePushStream`, `OpenPackets`, `DefaultSoundFont`, `SetAndroidJavaVM` (Android HTTPS, rarely needed). |
 | `OutputDevice` | Opened playback device: `Volume`, `Latency`, `Time` (the device clock), `CreateBus()`, `Start()`, `Stop()`. |
 | `MixBus` | A group of streams with its own `Volume`, `Pan` and `Ramp`: decks, a DJ crossfader. |
 | `AudioStream` | Any playable / decodable source: `PlayOn`, `Pause`, `Stop`, `Position`, `Volume`, `Pan`, `Rate`, `Tempo`, `Pitch`, `Ramp`, `PlayAt`, `Markers`, `CrossfadeTo`, `QueueNext`, `SetMatrix`, `Read`, `GetLevels`, `Clock`, events. Web streams add `Metadata`, `NetworkStatus` and `GetHttpHeader`. Karaoke: `HasCdg`, `LoadCdg`, `CdgOffset`, `CreateCdgSurface`. MIDI: `MidiInfo`, `MidiTexts`, `MidiTextReached`, `MidiTranspose`, `SetMidiChannelMuted`. |

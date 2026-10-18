@@ -10,6 +10,9 @@
 #  define _DARWIN_C_SOURCE   /* INADDR_LOOPBACK and friends, hidden by _POSIX_C_SOURCE */
 #endif
 #include "net.h"
+#if defined(__ANDROID__)
+#  include "net_tls_android.h"
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -605,7 +608,11 @@ static void server_stop(void)
     fa_mutex_destroy(&g_conn_lock);
 }
 
-static void url_of(char* out, size_t cap, const char* path) { snprintf(out, cap, "http://127.0.0.1:%d%s", g_port, path); }
+/* Android runs the URL tests a second time over HTTPS (net_tls_android.c). */
+static const char* g_scheme = "http";
+static int g_url_port;
+
+static void url_of(char* out, size_t cap, const char* path) { snprintf(out, cap, "%s://127.0.0.1:%d%s", g_scheme, g_url_port, path); }
 
 /* ---- helpers ------------------------------------------------------------------- */
 
@@ -1482,6 +1489,7 @@ static void test_stall_and_resume(void)
     int64_t t0;
     int saw_buffering = 0;
     fa_stream_state st = FA_STATE_STOPPED;
+    fa_store32(&g_stall_served, 0);
     CHECK_EQ(fa_device_open(g_engine, NULL, &dev), FA_OK);
     s = open_url("/stall.wav", 0, &r);
     CHECK_EQ(r, FA_OK);
@@ -1741,6 +1749,50 @@ static void test_close_while_streaming(void)
     fa_device_close(dev);
 }
 
+#if defined(__ANDROID__)
+/* HTTPS through HttpURLConnection: the transport, then the URL stream tests again
+ * over HTTPS. Needs a Java VM, which the test starts itself; skipped where none
+ * can run. */
+static void test_android_https(void)
+{
+    int port = 0, before;
+    void* vm = NULL;
+    fetch_result f;
+    CHECK_EQ(fa_android_set_java_vm(NULL), FA_ERROR_INVALID_ARG);
+    /* No Java VM in the process yet: https is missing, http still works. */
+    g_scheme = "https";
+    CHECK_EQ(fetch("/tone.wav", &f), FA_ERROR_PROVIDER_MISSING);
+    g_scheme = "http";
+    if (tls_front_start(FA_TEST_DATA_DIR "/net/tls", g_port, &port, &vm) != 0) { printf("  skipped (no Java VM here)\n"); return; }
+    printf("  https front on 127.0.0.1:%d\n", port);
+    g_scheme = "https";
+    g_url_port = port;
+    /* Found by itself (JNI_GetCreatedJavaVMs) ... */
+    CHECK_EQ(fetch("/tone.wav", &f), FA_OK);
+    CHECK_EQ(f.bytes, g_wav_n);
+    /* ... or set by the app. */
+    CHECK_EQ(fa_android_set_java_vm(vm), FA_OK);
+    before = g_failures;
+    test_http_fetch();
+    test_wav_over_http();
+    test_mp3_over_http();
+    test_no_ranges_and_chunked();
+    test_redirect_and_errors();
+    test_reconnect_resumes();
+    test_icy_radio_decode_only();
+    test_playlist_file_is_followed();   /* the playlist names an http:// station */
+    test_stall_and_resume();
+    test_hls_vod();
+    test_hls_retry_and_byteranges();
+    test_seek_after_giving_up();
+    test_long_user_agent();
+    test_close_while_streaming();
+    g_scheme = "http";
+    g_url_port = g_port;
+    CHECK_EQ(g_failures, before);
+}
+#endif
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -1775,6 +1827,7 @@ int main(void)
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) { fprintf(stderr, "engine create failed\n"); return 1; }
     if (server_start() != 0) { fprintf(stderr, "server start failed\n"); return 1; }
     printf("test server on 127.0.0.1:%d\n", g_port);
+    g_url_port = g_port;
 
     RUN(test_url_parse);
     RUN(test_url_resolve);
@@ -1804,9 +1857,15 @@ int main(void)
     RUN(test_long_user_agent);
     RUN(test_close_while_streaming);
     RUN(test_https_optional);
+#if defined(__ANDROID__)
+    RUN(test_android_https);
+#endif
 
     fa_engine_destroy(g_engine);
     server_stop();
+#if defined(__ANDROID__)
+    tls_front_stop();
+#endif
     for (i = 0; i < HLS_SEGS; i++) { free(g_seg[i].p); free(g_aseg[i].p); }
     free(g_ac3_seg[0].p);
     free(g_ac3_seg[1].p);
