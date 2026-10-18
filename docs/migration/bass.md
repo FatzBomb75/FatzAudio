@@ -76,7 +76,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_StreamPutData(h, NULL, 0) to read the queued amount | `fa_stream_get_buffered` (queued + decoded ahead + device buffer, as a duration) | `Buffered` | ✅ |
 | BASS_StreamPutData with BASS_STREAMPROC_END | `fa_stream_push_end` | `End()` | ✅ |
 | BASS_ChannelSetPosition(h, 0, ...) to clear a push stream after the app seeks | `fa_stream_push_flush`: drops everything queued at once; the clock holds until the new audio plays | `Flush()` | ✅ |
-| Decode compressed audio yourself (FFmpeg) and push PCM | `fa_stream_open_packets` + `fa_stream_push_packet`: packets straight from `av_read_frame`; PCM and MP3 built in, other codecs through the app's own FFmpeg, loaded at runtime | `engine.OpenPackets(params)`, `PushPacket(...)` | ✅ |
+| Decode compressed audio yourself (FFmpeg) and push PCM | `fa_stream_open_packets` + `fa_stream_push_packet`: packets straight from `av_read_frame`; PCM, MP3, AAC, AC-3, E-AC-3, Opus, Vorbis, FLAC, ALAC (and WMA on Windows) built in; for other codecs decode with your FFmpeg and push frames (`fa_stream_push_frame`) | `engine.OpenPackets(params)`, `PushPacket(...)` | ✅ |
 | BASS_StreamCreate (STREAMPROC callback) | Planned pull-callback source | | 🗓️ |
 | BASS_StreamPutFileData | `fa_stream_open_io` with `seek = NULL` (forward-only source fed from your own buffer) | `engine.OpenStream(stream)` with a non-seekable stream | ✅ |
 | BASS_StreamGetFilePosition (web streams) | `fa_stream_get_net_status`: `BASS_FILEPOS_DOWNLOAD` → `downloaded`, `BUFFER` → `buffered_bytes` (and `buffered` as time), `END`/`SIZE` → `content_length`, `CONNECTED` → `connected`, `BUFFERING` → `FA_STATE_BUFFERING` ([web streams](../features/web-streams.md#status-and-headers)) | `NetworkStatus` | ✅ |
@@ -307,11 +307,11 @@ FLAC is a built-in format wherever it appears: `.flac` files, Ogg FLAC, FLAC tra
 
 ### basswma (Windows Media Audio)
 
-WMA plays through the ordinary open calls: a built-in ASF demuxer, decoded by Windows' own Media Foundation decoders on Windows and by the app's FFmpeg elsewhere ([WMA](../features/streams.md#wma)). Only playback is replaced; basswma's encoder and its Windows Media server functions are not.
+WMA plays through the ordinary open calls: a built-in ASF demuxer, decoded by Windows' own Media Foundation decoders. On macOS, iOS, Linux and Android WMA is not supported (`FA_ERROR_UNSUPPORTED_FORMAT`); an app that needs it there can decode it with its own FFmpeg and push the frames ([WMA](../features/streams.md#wma)). Only playback is replaced; basswma's encoder and its Windows Media server functions are not.
 
 | basswma | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
-| BASS_WMA_StreamCreateFile (file or memory) | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ (FFmpeg outside Windows) |
+| BASS_WMA_StreamCreateFile (file or memory) | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ on Windows; ➖ elsewhere (unsupported) |
 | BASS_WMA_StreamCreateFileUser | `fa_stream_open_io` (forward-only when `seek` is NULL) | `engine.OpenStream` | ✅ |
 | BASS_StreamCreateURL / BASS_WMA_StreamCreateFile on an `http://` WMA/ASF file | `fa_stream_open_url` | `engine.OpenUrl` | ✅ |
 | BASS_WMA_StreamCreateFileAuth (DRM licence) | Protected files return `FA_ERROR_PROTECTED_CONTENT` | `ErrorCode.ProtectedContent` | ➖ (only Windows' DRM components can decrypt them) |
@@ -443,9 +443,9 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | bassflac.dll | Built-in: `.flac` files, Ogg FLAC (`.oga`), FLAC tracks in MP4 and Matroska, FLAC web streams and FLAC packets through `fa_stream_open_packets`, all with the same decoder ([bassflac](#bassflac)) | ✅ |
 | basshls.dll (if used) | Built-in: `fa_stream_open_url` plays `.m3u8` (MPEG-TS, fMP4, AES-128) | ✅ |
 | bassopus.dll | Built-in: `.opus` files, Opus web radio, Opus in WebM/MKV/MP4, and raw packets through `fa_stream_open_packets` ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
-| basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM, MP3, AAC, AC-3, Opus and Vorbis tracks built in, others through the app's FFmpeg ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ |
+| basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM, MP3, AAC, AC-3, E-AC-3, Opus, Vorbis, FLAC and ALAC tracks built in, others unsupported ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ |
 | OGG Vorbis in bass.dll | Built-in: `.ogg` files, chained files, Ogg radio with song titles ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
-| basswma.dll | Built-in ASF demuxer (`.wma`, `.asf`, `.wmv` audio; files, memory, your own reader, HTTP), decoded by Media Foundation on Windows and the app's FFmpeg elsewhere; ReplayGain attributes for normalization ([WMA](../features/streams.md#wma)) | ✅ playback; ➖ encoding (record to MP3, FLAC or WAV with `fa_encoder_*` instead), MMS, broadcasting and DRM |
+| basswma.dll | Built-in ASF demuxer (`.wma`, `.asf`, `.wmv` audio; files, memory, your own reader, HTTP), decoded by Media Foundation on Windows (unsupported elsewhere); ReplayGain attributes for normalization ([WMA](../features/streams.md#wma)) | ✅ playback; ➖ encoding (record to MP3, FLAC or WAV with `fa_encoder_*` instead), MMS, broadcasting and DRM |
 | bassenc.dll, bassenc_mp3.dll, bassenc_flac.dll (if added later) | Built in: `fa_encoder_*` writes WAV and FLAC itself and MP3 through the app's LAME ([recording and encoding](../features/recording-encoding.md)) | ✅ WAV/FLAC/MP3, 🗓️ Opus/AAC/casting |
 | bassmidi.dll | Built-in SoundFont 2 synthesizer for `.mid`, `.kar` and `.rmi`: engine-wide or per-stream soundfont, lyrics and text events, transpose and channel mute ([MIDI](../features/midi.md)) | ✅ (SF3, SFZ and MIDI input 🗓️) |
 | bass_fx.dll | Tempo/pitch/rate params on every stream ([tempo and pitch](../features/tempo-pitch.md)); reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | ✅ tempo/pitch/rate and level control, 🗓️ reverse and BPM |

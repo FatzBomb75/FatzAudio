@@ -32,7 +32,7 @@ public enum ErrorCode
     EndOfStream = -11,
     /// <summary>The native library does not implement this function yet.</summary>
     NotImplemented = -12,
-    /// <summary>An optional provider (for example FFmpeg or LAME) could not be found at runtime.</summary>
+    /// <summary>An optional provider (LAME for MP3 encoding, libcurl for HTTPS on Linux) could not be found at runtime.</summary>
     ProviderMissing = -13,
     /// <summary>The CD drive has no disc, its tray is open, or the disc was changed under an open stream.</summary>
     NoDisc = -14,

@@ -889,7 +889,7 @@ static fa_result hls_open_inner(hls_dec* h)
     fa_source_open_io(&h->src, &io, h->net);
     h->src.remote = 1;
     r = fa_decoder_open(&h->inner, &h->src, NULL, NULL, -1, &h->env);   /* -1: the default track */
-    if (r != FA_OK) return r == FA_ERROR_PROVIDER_MISSING ? r : FA_ERROR_UNSUPPORTED_FORMAT;  /* needs FFmpeg: say so */
+    if (r != FA_OK) return r == FA_ERROR_PROTECTED_CONTENT || r == FA_ERROR_PROVIDER_MISSING ? r : FA_ERROR_UNSUPPORTED_FORMAT;
     h->inner_ready = 1;
     return FA_OK;
 }

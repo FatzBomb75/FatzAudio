@@ -9,14 +9,14 @@ For apps that already read the file themselves, usually with FFmpeg because of t
 | Interleaved PCM | `fa_stream_push_pcm` (.NET `Push`) | Plays it |
 | A video renderer to keep in sync | `fa_stream_get_clock` (.NET `Clock`) | Reports the pts of the audio leaving the speaker right now, in your own timeline |
 
-FatzAudio never links or ships FFmpeg. Packet streams decode PCM, MP3, AAC (LC, HE-AAC, HE-AAC v2, Main and LTP, see [AAC](streams.md#aac)), AC-3 and E-AC-3 (Dolby Digital and Dolby Digital Plus, see [Dolby Digital](dolby.md)), Opus, Vorbis, FLAC and ALAC themselves and use the FFmpeg your app already loaded for everything else: DTS, TrueHD and so on. Some codecs go to the operating system's own decoders first, so they play without FFmpeg, and FFmpeg is only the fallback when the system turns the stream down:
+FatzAudio never links or ships FFmpeg. Packet streams decode PCM, MP3, AAC (LC, HE-AAC, HE-AAC v2, Main and LTP, see [AAC](streams.md#aac)), AC-3 and E-AC-3 (Dolby Digital and Dolby Digital Plus, see [Dolby Digital](dolby.md)), Opus, Vorbis, FLAC and ALAC themselves; FatzAudio never loads or uses FFmpeg. Two codecs go to the operating system's own decoders:
 
 | Codec | Windows | macOS, iOS | Android | Linux |
 |---|---|---|---|---|
 | xHE-AAC (`aac` with a USAC configuration) | Media Foundation where the system has it | AudioToolbox where the system has it | MediaCodec where the system has it | Unsupported |
-| WMA (`wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`) | Media Foundation | FFmpeg | FFmpeg | FFmpeg |
+| WMA (`wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`) | Media Foundation | Unsupported | Unsupported | Unsupported |
 
-AAC never goes to FFmpeg: xHE-AAC without a system decoder returns `FA_ERROR_UNSUPPORTED_FORMAT`, and an app that must play it can decode it with its own FFmpeg and push the frames (`fa_stream_push_frame`). Give AAC its AudioSpecificConfig as `extradata` (`codecpar->extradata` from MP4 or Matroska); whole ADTS frames (from MPEG-TS) need none. ALAC needs its 24-byte configuration or the `alac` box that holds it. WMA needs `extradata` (the bytes after the WAVEFORMATEX) and `block_align`. A system decoder's audio matches FFmpeg's to within a decoder's rounding, not to the bit. HE-AAC comes out at twice the rate the stream states, which the stream's format reports.
+Every other codec (DTS, TrueHD, xHE-AAC or WMA where the system has no decoder, ...) returns `FA_ERROR_UNSUPPORTED_FORMAT` from `fa_stream_open_packets`. If your app needs one of those, we recommend decoding it with your own FFmpeg and pushing the frames instead ([decoded frames](#decoded-frames-instead-c)): the clock and everything else work the same. Give AAC its AudioSpecificConfig as `extradata` (`codecpar->extradata` from MP4 or Matroska); whole ADTS frames (from MPEG-TS) need none. ALAC needs its 24-byte configuration or the `alac` box that holds it. WMA needs `extradata` (the bytes after the WAVEFORMATEX) and `block_align`. A system decoder's audio matches FFmpeg's to within a decoder's rounding, not to the bit. HE-AAC comes out at twice the rate the stream states, which the stream's format reports.
 
 FLAC packets (`codec = "flac"`) take FFmpeg's extradata as it is: the 34-byte STREAMINFO, with or without a `fLaC` marker and block header in front. Without extradata the frame headers and the `sample_rate`, `channels` and `bits_per_coded_sample` you give are enough.
 
@@ -157,28 +157,11 @@ fa_stream_push_flush(audio);
 
 Pushing never blocks. More than 256 MB queued returns `FA_ERROR_BUSY`.
 
-## Loading FFmpeg
-
-When a packet stream needs a codec it has no decoder of its own for, FatzAudio looks for libavcodec and libavutil:
-
-1. the ones already loaded in your process (your app's FFmpeg), then
-2. the ones the system loader finds (next to the executable, `PATH`, the library path).
-
-`fa_ffmpeg_load(directory)` (.NET `FFmpeg.Load(folder)`) loads them from a folder instead; call it before opening packet streams. `fa_ffmpeg_get_info` (`FFmpeg.Info`) says which version is in use and where it was found. FFmpeg 4.0 to 8.x (libavcodec 58 to 62) are supported. FatzAudio reads no FFmpeg struct layouts beyond the parts that have been stable since 4.0, so an FFmpeg upgrade doesn't need a new FatzAudio build.
-
-```c
-if (fa_ffmpeg_load("C:\\MyApp\\ffmpeg") != FA_OK) { /* only PCM and MP3 packets will work */ }
-fa_ffmpeg_info info;
-fa_ffmpeg_get_info(&info);
-printf("libavcodec %u.%u from %s\n", info.avcodec_version >> 16, (info.avcodec_version >> 8) & 255, info.avcodec_path);
-```
-
 ## Errors
 
 | Result | Meaning |
 |---|---|
-| `FA_ERROR_PROVIDER_MISSING` from `fa_stream_open_packets` | The codec needs FFmpeg and none was found |
-| `FA_ERROR_UNSUPPORTED_FORMAT` | FFmpeg has no decoder for the codec, or the frame's sample format isn't supported |
+| `FA_ERROR_UNSUPPORTED_FORMAT` | FatzAudio does not decode the codec (decode it yourself and push frames), or the frame's sample format isn't supported |
 | `FA_ERROR_INVALID_ARG` | No codec name, a rate or channel count of 0, `FA_OPEN_LOOP`, or `push_frame` on a packet stream |
 | `FA_EVENT_DECODE_ERROR` (`DecodeError`) | A packet failed to decode. It is skipped and playback continues |
 

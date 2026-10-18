@@ -1253,7 +1253,13 @@ static void check_asf_url(const char* path, const uint8_t* file, size_t file_n, 
     fa_frames n = 0, ref_n = 0, i, rd = 0;
     float *got, *ref, buf[1024 * 2];
     uint32_t ch;
-    if (r == FA_ERROR_PROVIDER_MISSING) { printf("  %s (skipped: FFmpeg not found)\n", path); return; }
+#ifndef _WIN32
+    if (strstr(path, ".wma")) {                     /* WMA decodes on Windows only */
+        CHECK_EQ(r, FA_ERROR_UNSUPPORTED_FORMAT);
+        if (s) fa_stream_close(s);
+        return;
+    }
+#endif
     CHECK_EQ(r, FA_OK);
     if (!s) return;
     fa_stream_get_info(s, &info);

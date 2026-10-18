@@ -914,9 +914,10 @@ void fa_buses_begin(fa_device* dev);                  /* takes new bus commands 
 void fa_buses_end(fa_device* dev, uint32_t frames);   /* advances bus ramps */
 void fa_buses_free_all(fa_device* dev);               /* fa_device_close, no callbacks running */
 
-/* ---- Packet codecs (codec.c, ffmpeg.c) ----------------------------------------
- * Decode one compressed packet at a time into interleaved F32. Built-in codecs
- * (PCM, MP3, AC-3, Opus, Vorbis, FLAC) come first; FFmpeg, loaded at runtime, does the rest. */
+/* ---- Packet codecs (codec.c) -----------------------------------------------------
+ * Decode one compressed packet at a time into interleaved F32: the built-in codecs
+ * (PCM, MP3, AAC, AC-3, E-AC-3, Opus, Vorbis, FLAC, ALAC), then the systems' own
+ * decoders (WMA on Windows, xHE-AAC). Nothing else is decoded. */
 
 typedef struct fa_codec fa_codec;
 
@@ -944,8 +945,7 @@ struct fa_codec {
     int trails;
 };
 
-/* Opens a decoder for `p` (validated). FA_ERROR_PROVIDER_MISSING: needs FFmpeg,
- * which is not available; FA_ERROR_UNSUPPORTED_FORMAT: nobody decodes it. */
+/* Opens a decoder for `p` (validated). FA_ERROR_UNSUPPORTED_FORMAT: nobody decodes it. */
 fa_result fa_codec_open(fa_codec* c, const fa_codec_params* p);
 void fa_codec_close(fa_codec* c);
 /* Makes room for `frames` more frames in c->out (keeping what is there). */
@@ -977,23 +977,21 @@ void fa_convert_to_f32(const void* const* planes, int kind, int planar, int big_
 /* fa_sample_format -> FA_SAMPLE_* and planar; -1 if invalid. */
 int fa_sample_kind(fa_sample_format f, int* out_planar);
 
-/* ffmpeg.c */
-fa_result fa_ffmpeg_open_codec(fa_codec* c, const fa_codec_params* p);
 #ifdef _WIN32
 /* codec_mf.c: Windows Media Audio (wmav1, wmav2, wmapro, wmalossless, wmavoice),
  * and AAC (LC, HE, HE v2) through Media Foundation's
  * decoders. FA_ERROR_UNSUPPORTED_FORMAT for any other codec, or when Media
- * Foundation or the decoder is not there (Windows N): FFmpeg is tried next. */
+ * Foundation or the decoder is not there (Windows N). */
 fa_result fa_mf_codec_open(fa_codec* c, const fa_codec_params* p);
 #endif
 #ifdef __APPLE__
 /* codec_at.c: AAC (LC, HE, HE v2, xHE where the system has it) through
- * AudioToolbox's AudioConverter. FA_ERROR_UNSUPPORTED_FORMAT: FFmpeg next. */
+ * AudioToolbox's AudioConverter. */
 fa_result fa_at_codec_open(fa_codec* c, const fa_codec_params* p);
 #endif
 #ifdef __ANDROID__
 /* codec_mediacodec.c: AAC through the NDK's AMediaCodec (libmediandk.so,
- * loaded at run time). FA_ERROR_UNSUPPORTED_FORMAT: FFmpeg next. */
+ * loaded at run time). */
 fa_result fa_mc_codec_open(fa_codec* c, const fa_codec_params* p);
 #endif
 
@@ -1018,9 +1016,6 @@ size_t fa_aac_esds(const uint8_t* asc, size_t n, uint8_t* out, size_t cap);
 /* From Core Audio channel labels to the library's channel order: src_of_dst[i] is the
  * decoder's channel for the library's channel i; 1 if it is not the identity. */
 int fa_os_channel_map(const uint32_t* labels, uint32_t n, uint32_t* src_of_dst);
-/* Sets a decoder option (AVOption, searched in the decoder's own options too) on
- * a codec fa_ffmpeg_open_codec opened. */
-void fa_ffmpeg_codec_option(fa_codec* c, const char* name, const char* value);
 
 /* codec_flac.c: the built-in FLAC codec (dr_flac), one frame per packet.
  * FA_ERROR_UNSUPPORTED_FORMAT without STREAMINFO or usable parameters. */
@@ -1051,7 +1046,6 @@ fa_result fa_aac_codec_open(fa_codec* c, const fa_codec_params* p);
  * samples in an AC-3 or E-AC-3 packet from its frame headers (-1 if none). */
 fa_result fa_ac3_codec_open(fa_codec* c, const fa_codec_params* p);
 int64_t fa_ac3_packet_samples(const uint8_t* d, size_t n, uint32_t* out_rate);
-int fa_ffmpeg_available(void);   /* loads FFmpeg on first use; 1 if usable */
 
 /* ---- Push streams (push.c) ------------------------------------------------------ */
 

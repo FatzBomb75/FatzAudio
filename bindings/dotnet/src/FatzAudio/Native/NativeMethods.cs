@@ -108,12 +108,6 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_buffered(StreamHandle stream, out long duration);
 
-    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
-    public static partial int fa_ffmpeg_load(string? directory);
-
-    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
-    public static partial int fa_ffmpeg_get_info(out FaFfmpegInfo info);
-
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial void fa_stream_close(nint stream);
 

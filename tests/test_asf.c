@@ -27,7 +27,13 @@ static int g_failures = 0;
 #define CHECK_STR(a, b) do { const char* va_ = (a); const char* vb_ = (b); if (strcmp(va_, vb_) != 0) { \
     fprintf(stderr, "  FAIL %s:%d: %s == %s (\"%s\" vs \"%s\")\n", __FILE__, __LINE__, #a, #b, va_, vb_); g_failures++; return; } } while (0)
 #define RUN(t) do { int before_ = g_failures; printf("%s\n", #t); t(); if (g_failures == before_) printf("  ok\n"); } while (0)
-#define SKIP_NO_FFMPEG(r) do { if ((r) == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); return; } } while (0)
+/* WMA decodes through Media Foundation on Windows; everywhere else it is unsupported. */
+#ifdef _WIN32
+#define FA_HAVE_WMA 1
+#else
+#define FA_HAVE_WMA 0
+#endif
+#define SKIP_NO_WMA(r) do { if (!FA_HAVE_WMA) { CHECK_EQ((r), FA_ERROR_UNSUPPORTED_FORMAT); printf("  (WMA decodes on Windows only)\n"); return; } } while (0)
 
 static fa_engine* g_engine;
 
@@ -334,7 +340,7 @@ static void test_tracks(void)
 
     /* Track 1: WMA 1, 1000 Hz stereo. */
     r = open_file("av_tracks.asf", 1, &s);
-    SKIP_NO_FFMPEG(r);
+    SKIP_NO_WMA(r);
     CHECK_EQ(r, FA_OK);
     fa_stream_get_info(s, &info);
     CHECK_STR(info.codec, "wmav1");
@@ -372,7 +378,7 @@ static void test_wmav2(void)
     double worst;
     static const int64_t targets[] = { 0, 44100, 2048, 10000, 70000, 20480, 1 };
     r = open_file("tone.wma", -1, &s);
-    SKIP_NO_FFMPEG(r);
+    SKIP_NO_WMA(r);
     CHECK_EQ(r, FA_OK);
     fa_stream_get_info(s, &info);
     CHECK_STR(info.container, "asf");
@@ -406,7 +412,7 @@ static void test_wmav2_forward_only(void)
     int seekable = -1;
     CHECK(d != NULL);
     r = open_memory(d, size, -1, &s);
-    if (r == FA_ERROR_PROVIDER_MISSING) { printf("  (skipped: FFmpeg not found)\n"); free(d); return; }
+    if (!FA_HAVE_WMA) { CHECK_EQ(r, FA_ERROR_UNSUPPORTED_FORMAT); printf("  (WMA decodes on Windows only)\n"); free(d); return; }
     CHECK_EQ(r, FA_OK);
     a = read_all(s, 2, &na);
     fa_stream_close(s);
@@ -724,7 +730,6 @@ int main(void)
     cfg.flags = FA_ENGINE_NULL_OUTPUT;
     cfg.worker_threads = 2;
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) { fprintf(stderr, "engine create failed\n"); return 1; }
-    printf("FFmpeg %s\n", fa_ffmpeg_load(NULL) == FA_OK ? "found" : "not found: WMA tracks are skipped");
 
     RUN(test_registry_and_probe);
     RUN(test_pcm_exact);

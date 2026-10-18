@@ -126,7 +126,7 @@ typedef struct fa_lazy_mutex { fa_atomic32 state; fa_mutex m; } fa_lazy_mutex;
 void fa_lazy_mutex_lock(fa_lazy_mutex* l);
 void fa_lazy_mutex_unlock(fa_lazy_mutex* l);
 
-/* Shared libraries of the app loaded at runtime (FFmpeg, LAME); dynlib.c.
+/* Shared libraries of the app loaded at runtime (LAME, libcurl); dynlib.c.
  * `already_loaded_only`: only a library already in the process (pinned there on
  * Windows, as LoadLibrary would). A path with a folder loads from that folder. */
 void* fa_lib_open(const char* path, int already_loaded_only);

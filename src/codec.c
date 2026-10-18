@@ -4,8 +4,9 @@
  * nothing else. The operating system's decoders come next: Media Foundation on
  * Windows for Windows Media Audio (codec_mf.c), and for xHE-AAC, which aac.c does
  * not decode, AudioToolbox on macOS and iOS (codec_at.c) and MediaCodec on Android
- * (codec_mediacodec.c). Every other codec, and these where the system cannot, goes
- * to the app's FFmpeg, loaded at runtime (ffmpeg.c). */
+ * (codec_mediacodec.c). Every other codec is unsupported (FA_ERROR_UNSUPPORTED_FORMAT):
+ * an app with its own decoder for it pushes the decoded frames instead
+ * (fa_stream_push_frame). */
 #include "fa_internal.h"
 #include "demux.h"
 #include <stdio.h>
@@ -446,55 +447,33 @@ static fa_result os_codec_open(fa_codec* c, const fa_codec_params* p)
 fa_result fa_codec_open(fa_codec* c, const fa_codec_params* p)
 {
     size_t i;
-    fa_result r;
+    fa_result r = FA_ERROR_UNSUPPORTED_FORMAT;
     memset(c, 0, sizeof(*c));
     snprintf(c->name, sizeof(c->name), "%s", p->codec);
-    for (i = 0; i < sizeof(pcm_layouts) / sizeof(pcm_layouts[0]); i++) {
-        if (strcmp(p->codec, pcm_layouts[i].name) == 0) {
-            r = pcm_open(c, p, &pcm_layouts[i]);
-            if (r != FA_ERROR_UNSUPPORTED_FORMAT) return r;
-            break;                         /* more channels than ours: FFmpeg may take it */
+    for (i = 0; i < sizeof(pcm_layouts) / sizeof(pcm_layouts[0]); i++)
+        if (strcmp(p->codec, pcm_layouts[i].name) == 0) break;
+    if (i < sizeof(pcm_layouts) / sizeof(pcm_layouts[0])) r = pcm_open(c, p, &pcm_layouts[i]);
+    else if (strcmp(p->codec, "mp3") == 0) r = mp3_open(c, p);
+    else if (strcmp(p->codec, "ac3") == 0 || strcmp(p->codec, "eac3") == 0) r = fa_ac3_codec_open(c, p);
+    else if (strcmp(p->codec, "flac") == 0) r = fa_flac_codec_open(c, p);
+    else if (strcmp(p->codec, "opus") == 0 || strcmp(p->codec, "vorbis") == 0) r = fa_xiph_codec_open(c, p);
+    else if (strcmp(p->codec, "alac") == 0) r = fa_alac_codec_open(c, p);
+    else {
+        /* AAC is built in: AAC-LC, HE-AAC, HE-AAC v2, Main and LTP, in ADTS or after
+         * an AudioSpecificConfig. */
+        if (strcmp(p->codec, "aac") == 0) {
+            r = fa_aac_codec_open(c, p);
+            if (r == FA_ERROR_UNSUPPORTED_FORMAT) {
+                memset(c, 0, sizeof(*c));
+                snprintf(c->name, sizeof(c->name), "%s", p->codec);
+            }
         }
-    }
-    if (strcmp(p->codec, "mp3") == 0) return mp3_open(c, p);
-    if (strcmp(p->codec, "ac3") == 0 || strcmp(p->codec, "eac3") == 0) return fa_ac3_codec_open(c, p);
-    if (strcmp(p->codec, "flac") == 0) {
-        /* Built in; without STREAMINFO or usable parameters it goes to FFmpeg. */
-        r = fa_flac_codec_open(c, p);
-        if (r != FA_ERROR_UNSUPPORTED_FORMAT) return r;
-        memset(c, 0, sizeof(*c));
-        snprintf(c->name, sizeof(c->name), "%s", p->codec);
-    }
-    if (strcmp(p->codec, "opus") == 0 || strcmp(p->codec, "vorbis") == 0) {
-        /* Built in; what libopus cannot set up alone (Opus projection) goes to FFmpeg. */
-        r = fa_xiph_codec_open(c, p);
-        if (r != FA_ERROR_UNSUPPORTED_FORMAT) return r;
-        memset(c, 0, sizeof(*c));
-        snprintf(c->name, sizeof(c->name), "%s", p->codec);
-    }
-    if (strcmp(p->codec, "alac") == 0) return fa_alac_codec_open(c, p);
-    if (strcmp(p->codec, "aac") == 0) {
-        /* Built in: AAC-LC, HE-AAC, HE-AAC v2, Main and LTP, in ADTS or after an
-         * AudioSpecificConfig. The system's decoders take what it does not (xHE-AAC),
-         * where the system has one; otherwise it is unsupported. */
-        r = fa_aac_codec_open(c, p);
-        if (r != FA_ERROR_UNSUPPORTED_FORMAT) return r;
-        memset(c, 0, sizeof(*c));
-        snprintf(c->name, sizeof(c->name), "%s", p->codec);
-    }
-    /* The system's own decoders: Windows Media Audio, and xHE-AAC where the
-     * system has it. What they do not take (or a system without them) goes to FFmpeg. */
+        /* The system's own decoders: Windows Media Audio, and xHE-AAC where the
+         * system has it. Anything else is unsupported. */
 #if FA_OS_CODECS
-    r = os_codec_open(c, p);
-#else
-    r = FA_ERROR_UNSUPPORTED_FORMAT;
+        if (r == FA_ERROR_UNSUPPORTED_FORMAT) r = os_codec_open(c, p);
 #endif
-    if (r != FA_ERROR_UNSUPPORTED_FORMAT) return r;
-    memset(c, 0, sizeof(*c));
-    snprintf(c->name, sizeof(c->name), "%s", p->codec);
-    /* AAC never goes to FFmpeg: what neither decoder takes is unsupported. */
-    if (strcmp(p->codec, "aac") == 0) return FA_ERROR_UNSUPPORTED_FORMAT;
-    r = fa_ffmpeg_open_codec(c, p);
+    }
     if (r != FA_OK) {
         free(c->out);
         memset(c, 0, sizeof(*c));

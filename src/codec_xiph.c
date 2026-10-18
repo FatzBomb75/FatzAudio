@@ -87,7 +87,7 @@ static int parse_opus_head(const uint8_t* p, size_t n, opus_head* h)
         h->mapping[1] = 1;
         return 1;
     }
-    /* Family 3 (projection) needs its demixing matrix: FFmpeg's job. */
+    /* Family 3 (projection) needs its demixing matrix: unsupported. */
     if (h->family == 3 || n < 21 + (size_t)h->channels) return 0;
     h->streams = p[19];
     h->coupled = p[20];
