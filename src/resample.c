@@ -10,11 +10,11 @@
 #include <stddef.h>
 #include <string.h>
 
-#define VS_HALF 48                 /* taps on each side at ratio <= 1 */
+#define VS_HALF FA_VARISPEED_HALF  /* taps on each side at ratio <= 1 */
 #define VS_PHASES 256              /* table steps per tap */
 #define VS_CUTOFF 0.94             /* fraction of Nyquist */
 #define VS_BETA 9.0                /* Kaiser window: ~ -90 dB sidelobes */
-#define VS_MAX_RATIO 80.0          /* widest kernel kept in the history: pitch +36 (x8) at rate 10 */
+#define VS_MAX_RATIO FA_VARISPEED_MAX_RATIO /* widest kernel kept in the history: pitch +36 (x8) at rate 10 */
 #define VS_KEEP ((int64_t)(VS_HALF * VS_MAX_RATIO) + 2)
 
 /* Modified Bessel function of the first kind, order 0 (series). */
@@ -122,11 +122,17 @@ static void taps(const fa_varispeed* v, const float* x, int64_t avail, int dir, 
     }
 }
 
+int64_t fa_varispeed_width(double ratio)
+{
+    double scale = ratio > 1.0 ? 1.0 / ratio : 1.0;
+    return (int64_t)ceil((double)VS_HALF / scale);
+}
+
 int64_t fa_varispeed_read(fa_varispeed* v, double ratio, float* out, int64_t max_frames)
 {
     uint32_t ch = v->channels, c;
     double scale = ratio > 1.0 ? 1.0 / ratio : 1.0;
-    int64_t width = (int64_t)ceil((double)VS_HALF / scale), n = 0;
+    int64_t width = fa_varispeed_width(ratio), n = 0;
     float steps = (float)(VS_PHASES * scale);
     while (n < max_frames) {
         int64_t i0 = (int64_t)floor(v->pos);

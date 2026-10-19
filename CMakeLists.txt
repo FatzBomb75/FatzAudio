@@ -98,6 +98,7 @@ set(FA_SOURCES
     src/zip.c
     src/tempo.c
     src/resample.c
+    src/resample_device.c
     src/stretch.cpp
     src/encode.c
     src/enc_wav.c

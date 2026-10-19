@@ -27,6 +27,8 @@ extern "C" {
 
 #define FA_TEMPO_PI 3.14159265358979323846
 #define FA_TEMPO_MAX_CHANNELS 32
+#define FA_VARISPEED_HALF 48     /* sinc taps on each side at ratio <= 1 (resample.c) */
+#define FA_VARISPEED_MAX_RATIO 80.0  /* widest kernel the history keeps (ratio = input/output) */
 
 /* ---- Stretcher (stretch.cpp, Signalsmith Stretch) ------------------------ */
 
@@ -71,6 +73,9 @@ fa_result fa_varispeed_write(fa_varispeed* v, const float* in, int64_t frames);
 /* Output frames at `ratio` input frames per output frame, as far as the input
  * reaches (the kernel looks ahead). */
 int64_t fa_varispeed_read(fa_varispeed* v, double ratio, float* out, int64_t max_frames);
+/* Input frames the kernel reaches past the output time at `ratio`: an output at
+ * input time t needs frames up to floor(t) + width. */
+int64_t fa_varispeed_width(double ratio);
 /* Input frames written but not yet reached by the output (fractional). */
 double fa_varispeed_pending(const fa_varispeed* v);
 /* History frames priming needs, and the lookahead to flush at the end. */
