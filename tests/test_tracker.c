@@ -273,7 +273,7 @@ static void test_live_settings(void)
     CHECK_EQ(fa_stream_get_tracker_param(s, FA_TRACKER_VOLUME_RAMPING, &v), FA_OK);
     CHECK_EQ(v, -1);
     CHECK_EQ(fa_stream_get_tracker_param(s, FA_TRACKER_AMIGA_RESAMPLER, &v), FA_OK);
-    CHECK_EQ(v, 1);
+    CHECK_EQ(v, 0);
     CHECK_EQ(fa_stream_set_tracker_param(s, FA_TRACKER_INTERPOLATION, 3), FA_ERROR_INVALID_ARG);
     CHECK_EQ(fa_stream_set_tracker_param(s, FA_TRACKER_STEREO_SEPARATION, 201), FA_ERROR_INVALID_ARG);
     CHECK_EQ(fa_stream_set_tracker_param(s, FA_TRACKER_VOLUME_RAMPING, 11), FA_ERROR_INVALID_ARG);

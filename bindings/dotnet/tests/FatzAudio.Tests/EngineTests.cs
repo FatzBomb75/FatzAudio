@@ -174,6 +174,19 @@ public class EngineTests
     }
 
     [Fact]
+    public void Info_IsCachedWhileUnchanged()
+    {
+        using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true });
+        using var s = engine.OpenMemory(TestAudio.SineWav(1.0, 22050, 440.0), new StreamOptions { DecodeOnly = true });
+        var first = s.Info;
+        Assert.Same(first, s.Info);
+        Assert.Equal(22050, first.Format.SampleRate);
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 1000; i++) _ = s.Info;
+        Assert.True(GC.GetAllocatedBytesForCurrentThread() - before < 1024);
+    }
+
+    [Fact]
     public void LevelsAndSpectrum_FollowPlayback()
     {
         using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true });
@@ -208,6 +221,15 @@ public class EngineTests
         Assert.False(s.HasCdg);
         Assert.Throws<FatzAudioException>(() => s.GetSpectrum(1000));
         Assert.Throws<FatzAudioException>(() => s.GetSpectrum(4097));
+        // The span overload of a stream matches the array version and does not allocate.
+        Span<float> sbins = stackalloc float[2048];
+        float hz = s.GetSpectrum(sbins);
+        Assert.Equal(spectrum.BinHz, hz);
+        Assert.Throws<FatzAudioException>(() => s.GetSpectrum(new float[1000]));
+        s.GetSpectrum(sbins);
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 100; i++) { s.GetSpectrum(sbins); output.GetSpectrum(bins); }
+        Assert.True(GC.GetAllocatedBytesForCurrentThread() - before < 1024);
         s.Pause();
         Assert.Equal(0f, s.GetLevels().Peak[0]);
     }

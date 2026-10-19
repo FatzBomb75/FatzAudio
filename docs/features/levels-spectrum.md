@@ -81,7 +81,7 @@ int channels = song.GetLevels(peak, rms);          // 1 for a mono file, else 2
 output.GetLevels(peak, rms);                       // always left and right
 ```
 
-`OutputDevice.GetLevels` always gives left and right. `AudioStream.GetLevels` gives one value for a mono file and two otherwise. The overloads that take a `Span<float>` (levels and spectrum) write into your buffers and allocate nothing; the others allocate a small result per call, which is fine for an occasional read.
+`OutputDevice.GetLevels` always gives left and right. `AudioStream.GetLevels` gives one value for a mono file and two otherwise. The overloads that take a `Span<float>` (levels and spectrum) write into your buffers and allocate nothing; the others allocate a small result per call, which is fine for an occasional read. `AudioStream.Info` is also allocation-free after the first read while the stream is unchanged.
 
 ## Threads
 

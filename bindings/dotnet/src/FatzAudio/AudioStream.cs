@@ -147,7 +147,48 @@ public unsafe class AudioStream : IDisposable
         return n;
     }
 
-    private StreamInfo ReadInfo() => StreamInfo.FromNative(ReadNativeInfo());
+    // The last info built, with the raw values it came from. Info compares the fresh native values against
+    // these (cheap, no allocation) and only builds a new StreamInfo when something changed, so a stale
+    // duration, length or bitrate (web and growing streams) is never returned.
+    private sealed class InfoSnapshot
+    {
+        public InfoSnapshot(FaStreamInfo raw, StreamInfo info) { Raw = raw; Info = info; }
+        public FaStreamInfo Raw;
+        public readonly StreamInfo Info;
+    }
+
+    private InfoSnapshot? _infoSnapshot;
+
+    private StreamInfo ReadInfo()
+    {
+        var n = ReadNativeInfo();
+        var snap = _infoSnapshot;
+        if (snap is not null && SameInfo(ref n, ref snap.Raw)) return snap.Info;
+        var info = StreamInfo.FromNative(n);
+        _infoSnapshot = new InfoSnapshot(n, info);
+        return info;
+    }
+
+    private static unsafe bool SameInfo(ref FaStreamInfo a, ref FaStreamInfo b)
+    {
+        if (a.Format.SampleFormat != b.Format.SampleFormat || a.Format.SampleRate != b.Format.SampleRate ||
+            a.Format.Channels != b.Format.Channels || a.Format.ChannelMask != b.Format.ChannelMask) return false;
+        if (a.LengthFrames != b.LengthFrames || a.Seekable != b.Seekable || a.AudioTrackCount != b.AudioTrackCount ||
+            a.HasCdg != b.HasCdg || a.Duration != b.Duration || a.FileSize != b.FileSize || a.AudioBytes != b.AudioBytes ||
+            a.Bitrate != b.Bitrate || a.BitsPerSample != b.BitsPerSample) return false;
+        fixed (byte* ac = a.Codec, bc = b.Codec, ak = a.Container, bk = b.Container)
+            return CStringEquals(ac, bc) && CStringEquals(ak, bk);
+    }
+
+    private static unsafe bool CStringEquals(byte* a, byte* b)
+    {
+        for (int i = 0; i < 32; i++)
+        {
+            if (a[i] != b[i]) return false;
+            if (a[i] == 0) return true;
+        }
+        return true;
+    }
 
     /// <summary>
     /// Information about the decoded stream: the source's own format, codec, container and duration.
@@ -699,8 +740,8 @@ public unsafe class AudioStream : IDisposable
     }
 
     /// <summary>
-    /// Tracker modules: Amiga MOD files sound as on an Amiga's Paula chip (true, the default) or with the ordinary
-    /// resampler. Live.
+    /// Tracker modules: Amiga MOD files sound as on an Amiga's Paula chip (true; about 19 times the CPU on those
+    /// files) or with the ordinary resampler (false, the default). Live.
     /// </summary>
     /// <exception cref="FatzAudioException">The stream is not a module.</exception>
     /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
@@ -1414,12 +1455,7 @@ public unsafe class AudioStream : IDisposable
     public Spectrum GetSpectrum(int size = 2048, SpectrumOptions options = SpectrumOptions.None)
     {
         var bins = new float[Math.Max(1, size / 2)];
-        float hz;
-        fixed (float* p = bins)
-        {
-            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_spectrum(Handle, (uint)Math.Max(0, size), (uint)options, p, &hz));
-        }
-        return new Spectrum(bins, hz);
+        return new Spectrum(bins, GetSpectrumCore((uint)Math.Max(0, size), bins, options));
     }
 
     /// <summary>Like <see cref="GetSpectrum(int, SpectrumOptions)"/>, into your own buffer (no allocation per call).</summary>
@@ -1429,10 +1465,15 @@ public unsafe class AudioStream : IDisposable
     /// <exception cref="FatzAudioException">An invalid length, or a decode-only stream (<see cref="ErrorCode.InvalidArgument"/>).</exception>
     public float GetSpectrum(Span<float> magnitudes, SpectrumOptions options = SpectrumOptions.None)
     {
+        return GetSpectrumCore((uint)magnitudes.Length * 2, magnitudes, options);
+    }
+
+    private unsafe float GetSpectrumCore(uint size, Span<float> bins, SpectrumOptions options)
+    {
         float hz;
-        fixed (float* p = magnitudes)
+        fixed (float* p = bins)
         {
-            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_spectrum(Handle, (uint)magnitudes.Length * 2, (uint)options, p, &hz));
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_spectrum(Handle, size, (uint)options, p, &hz));
         }
         return hz;
     }

@@ -557,18 +557,19 @@ static fa_result tracker_open(fa_decoder* dec)
     log_new_run(t, 0);
     t->log_after = 1;
 
-    /* Defaults, as libopenmpt has them. */
+    /* Defaults, as libopenmpt has them (the Amiga resampler off: it costs about
+     * 19 times as much on MOD files). */
     t->interpolation_now = 0;
     t->separation_now = 100;
     t->ramping_now = -1;
-    t->amiga_now = 1;
-    openmpt_module_ctl_set_boolean(t->mod, "render.resampler.emulate_amiga", 1);
+    t->amiga_now = 0;
+    openmpt_module_ctl_set_boolean(t->mod, "render.resampler.emulate_amiga", 0);
     /* A seek also puts every playing sample where it would be, not at its start. */
     openmpt_module_ctl_set_boolean(t->mod, "seek.sync_samples", 1);
     fa_store32(&t->interpolation, 0);
     fa_store32(&t->separation, 100);
     fa_store32(&t->ramping, -1);
-    fa_store32(&t->amiga, 1);
+    fa_store32(&t->amiga, 0);
     fa_store64(&t->mute, 0);
 
     t->info.struct_size = sizeof(t->info);
