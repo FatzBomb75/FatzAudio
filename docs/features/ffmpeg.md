@@ -5,7 +5,7 @@ For apps that already read the file themselves, usually with FFmpeg because of t
 | You have | Use | What FatzAudio does |
 |---|---|---|
 | Compressed packets from `av_read_frame` | `fa_stream_open_packets` + `fa_stream_push_packet` (.NET `OpenPackets`, `PushPacket`) | Decodes them on its worker threads. Your app does no audio decoding at all |
-| Decoded `AVFrame`s from your own decoder | `fa_stream_open_push` + `fa_stream_push_frame` (.NET `CreatePushStream`, `PushFrame`) | Takes them as they are (planar or interleaved, any sample format, any rate) and converts on a worker thread. No swresample step |
+| Decoded `AVFrame`s from your own decoder | `fa_stream_open_push` + `fa_stream_push_frame` (.NET `CreatePushStream`, `PushFrame`) | Takes them as they are (planar or interleaved, any sample format, any rate) and converts on a worker thread, with the same windowed-sinc resampler as playback. No swresample step |
 | Interleaved PCM | `fa_stream_push_pcm` (.NET `Push`) | Plays it |
 | A video renderer to keep in sync | `fa_stream_get_clock` (.NET `Clock`) | Reports the pts of the audio leaving the speaker right now, in your own timeline |
 

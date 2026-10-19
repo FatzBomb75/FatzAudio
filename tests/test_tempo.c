@@ -1011,6 +1011,23 @@ static float* render_quality(gen_fn gen, double seconds, fa_stretch_quality q, f
     return y;
 }
 
+/* One hit, 50 ms before the end of a 2 s file. */
+static float late_hit(double t, int c)
+{
+    return t >= 1.95 ? hits_sig(t - 1.7, c) : 0.0f;
+}
+
+/* Pre-echo (dB below the peak) before the one hit in y. */
+static double late_echo(const float* y, int64_t n)
+{
+    int64_t ms = RATE / 1000, i, on = -1;
+    float peak = 0.0f, before = 0.0f;
+    for (i = 0; i < n; i++) peak = fmaxf(peak, fabsf(y[i * 2]));
+    for (i = 0; i < n && on < 0; i++) if (fabsf(y[i * 2]) >= 0.5f * peak) on = i;
+    for (i = on - 28 * ms; i < on - 3 * ms; i++) if (i >= 0) before = fmaxf(before, fabsf(y[i * 2]));
+    return 20.0 * log10((before + 1e-9) / (peak + 1e-9));
+}
+
 static void test_transient_mode(void)
 {
     const float tempos[2] = { 0.8f, 1.25f };
@@ -1029,6 +1046,20 @@ static void test_transient_mode(void)
                tempos[k], e_best, e_tr, t_best, t_tr);
         CHECK(e_tr < -40.0 && e_tr < e_best - 10.0);
         CHECK(t_tr < 1.5);
+        free(y1);
+        free(y2);
+    }
+    /* A hit in the stretcher's last output (it comes out at the end, from its
+     * latency) is spliced too. */
+    for (k = 0; k < 2; k++) {
+        int64_t n1 = 0, n2 = 0;
+        float* y1 = render_quality(late_hit, 2.0, FA_STRETCH_BEST, tempos[k], &n1);
+        float* y2 = render_quality(late_hit, 2.0, FA_STRETCH_TRANSIENTS, tempos[k], &n2);
+        CHECK(y1 && y2);
+        CHECK_EQ(n1, n2);
+        printf("  hit in the last 50 ms at tempo %.2f: pre-echo %.1f dB -> %.1f dB\n", tempos[k],
+               late_echo(y1, n1), late_echo(y2, n2));
+        CHECK(late_echo(y2, n2) < -40.0);
         free(y1);
         free(y2);
     }

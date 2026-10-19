@@ -55,7 +55,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_CONFIG_NET_RESTRATE | Not needed: the download only runs 2 MB ahead of playback, so it's paced by playback anyway | — | ➖ (by design) |
 | BASS_CONFIG_NET_PASSIVE (FTP) | FTP isn't supported | — | ➖ |
 | BASS_CONFIG_DEV_PERIOD / BASS_CONFIG_DEV_BUFFER | `fa_engine_config.period_ms` (0 = the system's default, 10 ms on Windows); the device buffer is two periods on Windows, the system's default elsewhere. `fa_device_get_latency` reports what the system gave | `AudioEngineOptions.Period` | ✅ |
-| BASS_ATTRIB_SRC / BASS_CONFIG_SRC / BASS_CONFIG_SRC_SAMPLE (resampling quality) | Not needed: conversion to the device rate is always windowed sinc (about -90 dB of aliasing), above BASS's best setting | — | ➖ (by design) |
+| BASS_ATTRIB_SRC / BASS_CONFIG_SRC / BASS_CONFIG_SRC_SAMPLE (resampling quality) | Not needed: conversion to the device rate, and of pushed frames to the push stream's rate, is always windowed sinc (about -90 dB of aliasing), above BASS's best setting | — | ➖ (by design) |
 | BASS_CONFIG_UPDATETHREADS / UPDATEPERIOD | `fa_engine_config.worker_threads`; workers refill the emptiest buffer first, nothing to tune | `AudioEngineOptions.WorkerThreads` | ✅ |
 | BASS_Update / BASS_ChannelUpdate | Not needed: worker threads keep buffers full | — | ➖ (by design) |
 | BASS_GetCPU | Planned `fa_engine_get_stats` | | 🗓️ |
@@ -75,7 +75,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_StreamCreateURL `BASS_STREAM_BLOCK` | Not needed: memory per web stream is bounded (4 MB) and seeking still works | — | ➖ (by design) |
 | BASS_StreamCreateURL `BASS_STREAM_STATUS` (+ `BASS_TAG_HTTP` during connect) | `fa_stream_get_http_header` and `fa_stream_get_net_status` after the open | `GetHttpHeader`, `NetworkStatus` | ✅ |
 | BASS_StreamCreate (STREAMPROC_PUSH) + BASS_StreamPutData | `fa_stream_open_push` + `fa_stream_push_pcm`, with an optional pts per push ([FFmpeg hand-off](../features/ffmpeg.md)) | `engine.CreatePushStream(format)`, `Push(samples, pts)` | ✅ |
-| BASS_StreamPutData of PCM converted from another format (swresample first) | `fa_stream_push_frame`: any sample format, planar or interleaved, any rate; converted on a worker thread | `PushFrame(format, (nint)frame->extended_data, ...)` | ✅ |
+| BASS_StreamPutData of PCM converted from another format (swresample first) | `fa_stream_push_frame`: any sample format, planar or interleaved, any rate; converted on a worker thread (windowed-sinc resampling) | `PushFrame(format, (nint)frame->extended_data, ...)` | ✅ |
 | BASS_StreamPutData(h, NULL, 0) to read the queued amount | `fa_stream_get_buffered` (queued + decoded ahead + device buffer, as a duration) | `Buffered` | ✅ |
 | BASS_StreamPutData with BASS_STREAMPROC_END | `fa_stream_push_end` | `End()` | ✅ |
 | BASS_ATTRIB_TEMPO / FREQ on a push stream (BASS_FX_TempoCreate over STREAMPROC_PUSH) | `FA_PARAM_TEMPO` / `FA_PARAM_RATE` on the push or packet stream itself; the clock keeps your pts and runs at that speed, so the video follows ([tempo and pitch](../features/tempo-pitch.md)) | `Tempo`, `Rate` | ✅ |

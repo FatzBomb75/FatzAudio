@@ -132,52 +132,116 @@ fa_result fa_float_reserve(float** buf, fa_frames* cap, fa_frames frames, uint32
     return FA_OK;
 }
 
+/* Runs `frames` frames of `in` through the converter, writing from (*buf)[done]. */
+static fa_result conv_run(fa_pcm_conv* c, const float* in, fa_frames frames, uint32_t out_channels, float** buf,
+                          fa_frames* cap, fa_frames* done)
+{
+    ma_uint64 expect = 0;
+    fa_frames done_in = 0;
+    fa_result r;
+    ma_data_converter_get_expected_output_frame_count(&c->conv, (ma_uint64)frames, &expect);
+    r = fa_float_reserve(buf, cap, *done + (fa_frames)expect + 64, out_channels);
+    if (r != FA_OK) return r;
+    while (done_in < frames) {
+        ma_uint64 in_n = (ma_uint64)(frames - done_in);
+        ma_uint64 out_n = (ma_uint64)(*cap / out_channels - *done);
+        if (out_n == 0) {
+            r = fa_float_reserve(buf, cap, *done * 2 + 64, out_channels);
+            if (r != FA_OK) return r;
+            continue;
+        }
+        ma_data_converter_process_pcm_frames(&c->conv, in + (size_t)done_in * c->channels, &in_n,
+                                             *buf + (size_t)*done * out_channels, &out_n);
+        done_in += (fa_frames)in_n;
+        *done += (fa_frames)out_n;
+        if (in_n == 0 && out_n == 0) break;
+    }
+    if (frames > 0) c->pending = 1;
+    return FA_OK;
+}
+
+/* Gets the frames the resampler still holds out (its look-ahead) by feeding it
+ * its input latency in silence, writing from (*buf)[done]; then starts it over. */
+static fa_result conv_drain(fa_pcm_conv* c, uint32_t out_channels, float** buf, fa_frames* cap, fa_frames* done)
+{
+    static const float zeros[1024];
+    fa_frames left, step;
+    fa_result r = FA_OK;
+    if (!c->ready || !c->pending) return FA_OK;
+    step = (fa_frames)(sizeof(zeros) / sizeof(zeros[0]) / c->channels);
+    /* More channels than a frame of the zeros holds: the tail is dropped. */
+    left = step > 0 ? (fa_frames)ma_data_converter_get_input_latency(&c->conv) : 0;
+    while (left > 0 && r == FA_OK) {
+        fa_frames n = left < step ? left : step;
+        r = conv_run(c, zeros, n, out_channels, buf, cap, done);
+        left -= n;
+    }
+    ma_data_converter_reset(&c->conv);
+    c->pending = 0;
+    return r;
+}
+
 fa_result fa_pcm_convert(fa_pcm_conv* c, const float* in, fa_frames frames, uint32_t rate, uint32_t channels,
                          uint32_t out_rate, uint32_t out_channels, float** buf, fa_frames* cap, fa_frames* out_frames)
 {
-    ma_uint64 expect = 0;
-    fa_frames done_in = 0, done_out = 0;
+    fa_frames done = 0;
     fa_result r;
     *out_frames = 0;
+    /* What the converter holds of the previous format comes out first. */
+    if (c->ready && (c->rate != rate || c->channels != channels || (rate == out_rate && channels == out_channels))) {
+        r = conv_drain(c, out_channels, buf, cap, &done);
+        if (r != FA_OK) return r;
+    }
+    if (rate == out_rate && channels == out_channels) {
+        r = fa_float_reserve(buf, cap, done + frames, out_channels);
+        if (r != FA_OK) return r;
+        memcpy(*buf + (size_t)done * out_channels, in, (size_t)frames * channels * sizeof(float));
+        *out_frames = done + frames;
+        return FA_OK;
+    }
     if (!c->ready || c->rate != rate || c->channels != channels) {
         ma_data_converter_config cc;
         if (c->ready) { ma_data_converter_uninit(&c->conv, NULL); c->ready = 0; }
         cc = ma_data_converter_config_init(ma_format_f32, ma_format_f32, channels, out_channels, rate, out_rate);
-        if (ma_data_converter_init(&cc, NULL, &c->conv) != MA_SUCCESS) return FA_ERROR_OUT_OF_MEMORY;
+        cc.resampling.algorithm = ma_resample_algorithm_custom;   /* the sinc resampler (resample_device.c) */
+        cc.resampling.pBackendVTable = &fa_sinc_resampler;
+        if (ma_data_converter_init(&cc, NULL, &c->conv) != MA_SUCCESS) {
+            /* Beyond its widest ratio: miniaudio's linear one. */
+            cc.resampling.algorithm = ma_resample_algorithm_linear;
+            cc.resampling.pBackendVTable = NULL;
+            if (ma_data_converter_init(&cc, NULL, &c->conv) != MA_SUCCESS) return FA_ERROR_OUT_OF_MEMORY;
+        }
         c->ready = 1;
+        c->pending = 0;
         c->rate = rate;
         c->channels = channels;
     }
-    ma_data_converter_get_expected_output_frame_count(&c->conv, (ma_uint64)frames, &expect);
-    r = fa_float_reserve(buf, cap, (fa_frames)expect + 64, out_channels);
-    if (r != FA_OK) return r;
-    while (done_in < frames) {
-        ma_uint64 in_n = (ma_uint64)(frames - done_in);
-        ma_uint64 out_n = (ma_uint64)(*cap / out_channels - done_out);
-        if (out_n == 0) {
-            r = fa_float_reserve(buf, cap, done_out * 2 + 64, out_channels);
-            if (r != FA_OK) return r;
-            continue;
-        }
-        ma_data_converter_process_pcm_frames(&c->conv, in + (size_t)done_in * channels, &in_n,
-                                             *buf + (size_t)done_out * out_channels, &out_n);
-        done_in += (fa_frames)in_n;
-        done_out += (fa_frames)out_n;
-        if (in_n == 0 && out_n == 0) break;
-    }
-    *out_frames = done_out;
-    return FA_OK;
+    r = conv_run(c, in, frames, out_channels, buf, cap, &done);
+    *out_frames = done;
+    return r;
+}
+
+fa_result fa_pcm_conv_flush(fa_pcm_conv* c, uint32_t out_channels, float** buf, fa_frames* cap, fa_frames* out_frames)
+{
+    return conv_drain(c, out_channels, buf, cap, out_frames);
+}
+
+fa_frames fa_pcm_conv_held(fa_pcm_conv* c)
+{
+    return c->ready && c->pending ? (fa_frames)ma_data_converter_get_output_latency(&c->conv) : 0;
 }
 
 void fa_pcm_conv_reset(fa_pcm_conv* c)
 {
     if (c->ready) ma_data_converter_reset(&c->conv);
+    c->pending = 0;
 }
 
 void fa_pcm_conv_free(fa_pcm_conv* c)
 {
     if (c->ready) ma_data_converter_uninit(&c->conv, NULL);
     c->ready = 0;
+    c->pending = 0;
 }
 
 void fa_codec_close(fa_codec* c)

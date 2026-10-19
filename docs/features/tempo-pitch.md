@@ -81,7 +81,7 @@ In practice: sustained notes and chords stay steady instead of warbling or phasi
 
 ### Transient mode
 
-`FA_STRETCH_TRANSIENTS` removes that smear. It finds onsets in the audio (a jump in short-term energy: drum hits, plucks, hard consonants) and, from 24 ms before each onset to 12 ms after it, plays the original audio at its own speed instead of the stretched sound, lined up so that the onset lands exactly where it belongs, with 4 ms crossfades on each side. Measured on the same drum hits:
+`FA_STRETCH_TRANSIENTS` removes that smear. It finds onsets in the audio (a jump in short-term energy: drum hits, plucks, hard consonants) and, from 24 ms before each onset to 12 ms after it, plays the original audio at its own speed instead of the stretched sound, lined up so that the onset lands exactly where it belongs, with 4 ms crossfades on each side. That includes a hit in the last moments of a track. Measured on the same drum hits:
 
 | Test (tempo 0.8, 1.25, pitch -3) | Best | Transients |
 |---|---|---|

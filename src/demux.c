@@ -268,11 +268,15 @@ static fa_frames packet_frames(const fa_track* t, const uint8_t* d, size_t n)
 /* ---- the track decoder -------------------------------------------------------------- */
 
 /* The codec's output in a format other than the one reported at open (a stream
- * that changes mid-way): converted with miniaudio, into t->tmp. */
-static fa_result convert(fa_track* t, const float** data, fa_frames* frames)
+ * that changes mid-way): converted into t->tmp. The resampler holds back its
+ * look-ahead; that comes out with the next block, or here when the packet ends
+ * the audio (`last`: its trim must cut the true end). */
+static fa_result convert(fa_track* t, const float** data, fa_frames* frames, int last)
 {
+    uint32_t ch = t->dec->format.channels;
     fa_result r = fa_pcm_convert(&t->conv, *data, *frames, t->codec.rate, t->codec.channels,
-                                 t->dec->format.sample_rate, t->dec->format.channels, &t->tmp, &t->tmp_cap, frames);
+                                 t->dec->format.sample_rate, ch, &t->tmp, &t->tmp_cap, frames);
+    if (r == FA_OK && last) r = fa_pcm_conv_flush(&t->conv, ch, &t->tmp, &t->tmp_cap, frames);
     *data = t->tmp;
     return r;
 }
@@ -313,13 +317,14 @@ static fa_result emit(fa_track* t, const fa_demux_packet* pk)
     fa_decoder* dec = t->dec;
     uint32_t ch = dec->format.channels;
     const float* data = t->codec.out;
-    fa_frames m = t->codec.out_frames, d, dc, pos, lo, hi, zlo = 0, zhi = 0;
+    fa_frames m = t->codec.out_frames, d, dc, pos, lo, hi, zlo = 0, zhi = 0, held = 0;
     int placing = t->place;
     fa_result r;
 
-    if (t->codec.rate != dec->format.sample_rate || t->codec.channels != ch) {
-        r = convert(t, &data, &m);
+    if (t->codec.rate != dec->format.sample_rate || t->codec.channels != ch || t->conv.pending) {
+        r = convert(t, &data, &m, pk->trim_end > 0 && !t->trails);   /* a trailing decoder still holds audio */
         if (r != FA_OK) return r;
+        held = fa_pcm_conv_held(&t->conv);   /* this packet's, still in the resampler */
     }
     /* The packet's duration: the codec's own count where it has one (exact), else
      * the container's if that is exact. */
@@ -344,7 +349,7 @@ static fa_result emit(fa_track* t, const fa_demux_packet* pk)
             }
             /* Fewer frames than the packet holds: the codec dropped its start
              * (Opus pre-skip applied by the decoder itself). */
-            if (d > m) pos += d - m;
+            if (d > m + held) pos += d - m - held;
         } else {
             pos = t->next_pos;
         }
@@ -389,6 +394,24 @@ static fa_result emit(fa_track* t, const fa_demux_packet* pk)
     }
     t->count = (zhi - zlo) + (hi - lo);
     t->off = 0;
+    return FA_OK;
+}
+
+/* The frames the resampler still holds at the end of the track, after the last ones. */
+static fa_result emit_tail(fa_track* t)
+{
+    uint32_t ch = t->dec->format.channels;
+    fa_frames n = 0, pos = t->next_pos, lo, hi;
+    fa_result r = fa_pcm_conv_flush(&t->conv, ch, &t->tmp, &t->tmp_cap, &n);
+    t->count = t->off = 0;
+    if (r != FA_OK || n == 0) return r;
+    t->next_pos = pos + n;
+    lo = pos > t->drop_before ? pos : t->drop_before;
+    hi = pos + n;
+    if (t->p.clip_to_end && t->length >= 0 && hi > t->length) hi = t->length;
+    if (hi < lo) hi = lo;
+    t->view = hi > lo ? t->tmp + (size_t)(lo - pos) * ch : NULL;
+    t->count = hi - lo;
     return FA_OK;
 }
 
@@ -449,6 +472,12 @@ static fa_result fill(fa_track* t)
                 r = emit(t, &pk);
                 if (r != FA_OK) return r;
                 continue;
+            }
+            /* Then the resampler's last frames. */
+            if (t->conv.pending && t->format_known && !t->place) {
+                r = emit_tail(t);
+                if (r != FA_OK) return r;
+                if (t->count > 0) continue;
             }
             /* The odd-sized packet was the last one: the grid holds. */
             if (t->grid_state == 2) t->grid_state = 1;
