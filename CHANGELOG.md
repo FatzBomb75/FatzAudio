@@ -64,6 +64,15 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   32 KB less history; web streams no longer keep a 256 KB read-ahead on top of their download window; idle
   engine workers wake 20 times less; Windows (MSVC) builds read atomics with plain loads instead of locked
   compare-exchanges. .NET: `HasCdg` and the `Tags` lookups (`Cover`, the indexer) no longer allocate.
+- Less memory per stream, same sound (memory review, part 2): a web stream that can't seek (radio, HLS, a server
+  without byte ranges) keeps only the 2 MB ahead of playback, not a 4 MB window (about 2.1 MB less per radio
+  stream); push and other forward-only streams reserve the tempo chain's half second of history only once tempo,
+  pitch or rate is used (188 KB at 48 kHz stereo); decoded audio is converted straight into the decode-ahead
+  buffer (16 KB less); a stream's own state is 14 KB instead of 24 KB (its tempo map, equalizer, push timestamps
+  and the unused true-peak meter are made only when used); levels and spectrum keep 1 s plus the device's latency
+  and callbacks instead of about 2.7 s (512 KB instead of 1 MiB at 44.1 and 48 kHz on most devices); HE-AAC keeps
+  about 75 KB less SBR state per stereo element and 190 KB less for HE-AACv2 (parametric stereo); CD+G checkpoints
+  take half the memory.
 - HE-AAC decodes about 35% faster (its QMF analysis bank uses a fast DCT-IV; 16 KB less per decoder) and ALAC
   up to 30% faster (faster bit reading). The output is unchanged.
 - Less engine CPU, same output: the mixer mixes a stream whose gains hold steady in one pass instead of every 16

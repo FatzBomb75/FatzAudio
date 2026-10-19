@@ -185,6 +185,7 @@ static void store_latency(fa_device* d)
     fa_store64(&d->latency_ns, rate == 0 ? 0 :
                (int64_t)((double)d->device.playback.internalPeriodSizeInFrames *
                          (double)d->device.playback.internalPeriods * 1e9 / (double)rate));
+    fa_store32(&d->period_frames, (int32_t)d->device.playback.internalPeriodSizeInFrames);
 }
 
 /* miniaudio's thread (or the audio thread): only flags here, the event thread acts. */

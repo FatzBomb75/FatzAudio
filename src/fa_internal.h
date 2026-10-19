@@ -301,6 +301,10 @@ void fa_ring_free(fa_ring* r);
 int64_t fa_ring_readable(fa_ring* r);
 int64_t fa_ring_writable(fa_ring* r);
 void fa_ring_write(fa_ring* r, const float* src, int64_t frames); /* frames <= writable */
+/* Producer, writing in place: the writable frames up to the wrap (*out_frames of
+ * them), then publishing the first `frames` written there. */
+float* fa_ring_write_region(fa_ring* r, int64_t* out_frames);
+void fa_ring_commit(fa_ring* r, int64_t frames);
 /* Consumer: up to two contiguous regions holding `frames` readable frames. */
 void fa_ring_regions(fa_ring* r, int64_t frames, const float** p1, int64_t* n1, const float** p2, int64_t* n2);
 void fa_ring_advance_read(fa_ring* r, int64_t frames);
@@ -354,7 +358,15 @@ typedef struct fa_ptsmap {
     int cur_src_ok;               /* 0 = not looked up yet for this anchor */
 } fa_ptsmap;
 
-void fa_ptsmap_reset(fa_ptsmap* m);                           /* both sides kept out */
+/* A push stream's pts map, and the source frames at which the app's timeline
+ * restarted, so audio kept across a detach (carry) keeps its timestamps (under
+ * decode_lock). Made at open; other streams have none. */
+typedef struct fa_push_times {
+    fa_ptsmap map;
+    int64_t anchor_pos[FA_SRC_ANCHORS], anchor_pts[FA_SRC_ANCHORS];
+} fa_push_times;
+
+void fa_ptsmap_reset(fa_ptsmap* m);                           /* both sides kept out; NULL = none */
 void fa_ptsmap_add(fa_ptsmap* m, int64_t idx, int64_t pts);   /* drops it when full */
 /* Audio thread: pts at ring frame `idx` (rate: ns_per_frame per ring frame), and in
  * *out_next the next anchor after `idx` (INT64_MAX = none). */
@@ -439,6 +451,7 @@ typedef struct fa_tmap {
     fa_atomic64 write, read;
 } fa_tmap;
 
+/* `m` may be NULL everywhere but in fa_tmap_add: no segments, the base applies. */
 void fa_tmap_reset(fa_tmap* m);
 int fa_tmap_full(fa_tmap* m);
 void fa_tmap_add(fa_tmap* m, int64_t at, double src, double slope);
@@ -485,11 +498,16 @@ void fa_truepeak_flush(fa_truepeak* tp);
  * audio thread only; read without locks. */
 typedef struct fa_tap {
     float* buf;               /* `frames` stereo frames, a ring by device frame */
-    uint32_t frames;          /* power of two, about 2 s at the device rate */
+    uint32_t frames;          /* power of two: 1 s plus the device's latency and callbacks */
     fa_atomic64 start;        /* first device frame written since the last jump */
     fa_atomic64 end;          /* device frame after the newest one written */
 } fa_tap;
-fa_tap* fa_tap_get(fa_atomic_ptr* slot, uint32_t rate);
+/* The tap in `slot`, made on first use for `device` (NULL = not attached yet). */
+fa_tap* fa_tap_get(fa_atomic_ptr* slot, fa_device* device);
+/* A stream's tap, made bigger when it can't hold a 1 s window on `device` (its
+ * latency and callbacks). Caller holds the stream's api_lock, which every reader
+ * holds; the audio thread may be writing it. */
+void fa_tap_fit(fa_atomic_ptr* slot, fa_device* device);
 /* `n` frames played from device frame `at`; skipped frames are silence. */
 void fa_tap_write(fa_tap* t, int64_t at, const float* frames, int64_t n);
 void fa_tap_free(fa_tap* t);
@@ -507,7 +525,7 @@ typedef struct fa_meter {
     int ring;
     int64_t skip;               /* frames to filter without measuring (warm-up) */
     int with_peak;
-    fa_truepeak tp;
+    fa_truepeak* tp;            /* with_peak only */
 } fa_meter;
 
 /* ring_subs > 0 keeps only the newest ring_subs sub-blocks (running estimate). */
@@ -774,6 +792,7 @@ struct fa_device {
     fa_atomic32 closing;
     fa_atomic32 changed;         /* 1 + value of the FA_EVENT_DEVICE_CHANGED the next callback raises */
     fa_atomic64 latency_ns;      /* output latency of `device`, readable without life_lock */
+    fa_atomic32 period_frames;   /* its period (frames per callback, about), the same */
     int64_t retry_at;            /* event thread: when to try reopening again */
     struct fa_device* next;      /* engine->devices */
 };
@@ -816,6 +835,12 @@ typedef struct fa_eq_state {     /* audio thread only */
     uint32_t blocks;             /* fa_eq_process calls, paces redesigns while gliding */
     fa_eq_bandstate band[FA_EQ_MAX_BANDS];
 } fa_eq_state;
+
+/* A stream's equalizer, made by the first EQ call on it (eq.c). */
+typedef struct fa_stream_eq {
+    fa_eq_shared shared;
+    fa_eq_state st;              /* audio thread */
+} fa_stream_eq;
 
 void fa_eq_shared_init(fa_eq_shared* sh);
 void fa_eq_reset(fa_eq_state* st);
@@ -976,8 +1001,6 @@ struct fa_stream {
     float* carry;
     fa_frames carry_count, carry_offset;
     int draining;                /* the source ended; in_buf holds silence that flushes the resampler */
-    float* out_buf;
-    fa_frames out_cap;
     float* mat_buf;              /* matrix output, 2 channels */
     float* matrix;               /* in x FA_DEVICE_CHANNELS weights, NULL = default; under
                                     api_lock + decode_lock */
@@ -992,19 +1015,15 @@ struct fa_stream {
 
     /* Presentation clock (clock.c); pts map and push queue of push streams (push.c). */
     fa_clock clock;
-    fa_ptsmap ptsmap;
+    fa_push_times* ptimes;       /* push streams, set at open; NULL for the others */
     struct fa_push* push;        /* NULL for file, memory and I/O streams */
     fa_atomic64 played_audible;  /* frames played since the last flush (stall events) */
     int stalled;                 /* audio thread: FA_EVENT_STALLED raised, RESUMED owed */
-    fa_eq_shared eq_shared;
-    fa_eq_state eq;              /* audio thread */
+    fa_atomic_ptr eq;            /* fa_stream_eq*, NULL until an EQ call (flat); kept until freed */
     fa_atomic32 eq_restart;      /* 1 = the timeline restarted: clear the EQ's memory */
     fa_atomic_ptr dsps;          /* fa_dsp_list*, read by whoever decodes (under decode_lock) */
     uint32_t dsp_next_id;        /* under api_lock */
-    /* Push streams, under decode_lock: the source frames at which the app's timeline
-     * restarted, so audio kept across a detach (carry) keeps its timestamps. */
-    int64_t anchor_pos[FA_SRC_ANCHORS], anchor_pts[FA_SRC_ANCHORS];
-    int64_t anchors;             /* written since the last flush */
+    int64_t anchors;             /* push streams: ptimes anchors written since the last flush */
     fa_atomic32 staged;          /* in_buf or carry hold frames not in the ring yet */
 
     /* Parameters */
@@ -1070,10 +1089,15 @@ struct fa_stream {
     int tempo_fast, tempo_formants, tempo_transients;
     uint32_t tempo_latency_ms;
     fa_tempo* tempo;             /* NULL until a parameter first leaves neutral */
+    uint32_t tempo_posts;        /* under tempo_lock: tempo, pitch and rate commands so far */
+    int chain_failed;            /* decode side: the chain could not be made (out of memory) ... */
+    uint32_t chain_failed_posts; /* ... with tempo_posts at this; tried again once it moves */
+    int hist_chain;              /* decode side: `hist` also covers what the chain holds */
     int tempo_drained;           /* the chain gave back its tail at the end of the source */
     int jumped_back;             /* a loop jumped back since the last restart (decode side) */
     int64_t tempo_frames;        /* chain output frames since the last restart */
-    fa_tmap tmap;
+    fa_atomic_ptr tmap;          /* fa_tmap*, made with the first chain (NULL = no segments);
+                                    kept until the stream is freed */
     fa_atomic32 tempo_live;      /* the chain is engaged: decode-ahead is kept short */
     /* Decode-only streams: chain output not yet read */
     float* rd_in;

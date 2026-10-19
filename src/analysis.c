@@ -19,22 +19,55 @@
 #define FA_SPECTRUM_MAX_LOG2 14   /* 16384 */
 #define FA_TWO_PI 6.283185307179586
 
-fa_tap* fa_tap_get(fa_atomic_ptr* slot, uint32_t rate)
+/* Frames for 1 s windows on `dev`: a window ends at the speaker, up to the latency
+ * and a callback behind the newest frame written, and stays a guard of two
+ * callbacks clear of what the next ones write (view_open). */
+static uint32_t tap_frames(fa_device* dev)
 {
-    fa_tap* t = (fa_tap*)fa_load_ptr(slot);
-    uint32_t frames = 65536;
-    if (t) return t;
-    while (frames < 2u * rate && frames < (1u << 22)) frames <<= 1;   /* 1 s windows plus latency */
-    t = (fa_tap*)calloc(1, sizeof(*t));
+    uint32_t rate = dev ? dev->rate : 48000, frames = 65536, cb = 0;
+    int64_t need = rate, latency = 0;
+    if (dev) {
+        cb = (uint32_t)fa_load32(&dev->period_frames);
+        if (dev->cb_prev_frames > cb) cb = dev->cb_prev_frames;   /* the callbacks seen, if bigger */
+        latency = (int64_t)((double)fa_load64(&dev->latency_ns) * rate / 1e9 + 0.5);
+    }
+    need += latency + 3 * (int64_t)cb + 1024;
+    while ((int64_t)frames < need && frames < (1u << 22)) frames <<= 1;
+    return frames;
+}
+
+static fa_tap* tap_new(uint32_t frames)
+{
+    fa_tap* t = (fa_tap*)calloc(1, sizeof(*t));
     if (!t) return NULL;
     t->frames = frames;
     t->buf = (float*)calloc((size_t)frames * FA_DEVICE_CHANNELS, sizeof(float));
     if (!t->buf) { free(t); return NULL; }
+    return t;
+}
+
+fa_tap* fa_tap_get(fa_atomic_ptr* slot, fa_device* device)
+{
+    fa_tap* t = (fa_tap*)fa_load_ptr(slot);
+    if (t) return t;
+    t = tap_new(tap_frames(device));
+    if (!t) return NULL;
     if (!fa_cas_ptr(slot, NULL, t)) {   /* another thread made one first */
         fa_tap_free(t);
         t = (fa_tap*)fa_load_ptr(slot);
     }
     return t;
+}
+
+void fa_tap_fit(fa_atomic_ptr* slot, fa_device* device)
+{
+    fa_tap* t = (fa_tap*)fa_load_ptr(slot), *bigger;
+    if (!t || t->frames >= tap_frames(device)) return;
+    bigger = tap_new(tap_frames(device));
+    if (!bigger) return;   /* windows are shortened to what fits */
+    fa_exchange_ptr(slot, bigger);
+    fa_device_wait_quiescent(device);   /* a callback still writing the old one is done */
+    fa_tap_free(t);
 }
 
 void fa_tap_free(fa_tap* t)
@@ -305,8 +338,11 @@ static fa_result stream_measure(struct fa_stream* s, const measure* m)
     fa_mutex_lock(&s->api_lock);
     dev = s->device;
     {
-        /* Made also before the stream is attached, so a meter set up first sees it start. */
-        fa_tap* t = fa_tap_get(&s->tap, dev ? dev->rate : 48000);
+        /* Made also before the stream is attached, so a meter set up first sees it start;
+         * made bigger when the device's latency or callbacks grew past what it holds. */
+        fa_tap* t;
+        if (dev) fa_tap_fit(&s->tap, dev);
+        t = fa_tap_get(&s->tap, dev);
         if (!t) r = FA_ERROR_OUT_OF_MEMORY;
         else if (dev && fa_load32(&s->state) == FA_STATE_PLAYING) r = run_measure(m, t, dev, 0);
     }
@@ -317,7 +353,7 @@ static fa_result stream_measure(struct fa_stream* s, const measure* m)
 
 static fa_result device_measure(fa_device* dev, const measure* m)
 {
-    fa_tap* t = fa_tap_get(&dev->tap, dev->rate);
+    fa_tap* t = fa_tap_get(&dev->tap, dev);
     fa_result r;
     if (!t) return FA_ERROR_OUT_OF_MEMORY;
     r = run_measure(m, t, dev, 1);

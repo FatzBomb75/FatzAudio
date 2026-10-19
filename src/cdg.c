@@ -47,10 +47,10 @@
 #define CDG_ALL_FLAGS (FA_CDG_NO_BORDER | FA_CDG_TRANSPARENT | FA_CDG_PREMULTIPLIED | FA_CDG_SMOOTH | \
                        FA_CDG_TRANSPARENT_BACKGROUND_ONLY | FA_CDG_HIDE_UNTIL_PRESET | \
                        FA_CDG_BACKGROUND_COLOR | FA_CDG_BACKGROUND_OPACITY)
-#define CDG_MAX_CHECKPOINTS 180   /* ~12 MB; longer graphics space them out further */
+#define CDG_MAX_CHECKPOINTS 180   /* ~6 MB; longer graphics space them out further */
 /* fa_event.value of FA_EVENT_CDG_CHANGED; the header's FA_CDG_CHANGE_* take it apart. */
 #define FA_CDG_CHANGE_MAKE(x, y, w, h, pal) \
-    ((int64_t)(x) | ((int64_t)(y) << 12) | ((int64_t)(w) << 24) | ((int64_t)(h) << 36) | ((int64_t)((pal) != 0) << 48))   /* ~12 MB; longer graphics space them out further */
+    ((int64_t)(x) | ((int64_t)(y) << 12) | ((int64_t)(w) << 24) | ((int64_t)(h) << 36) | ((int64_t)((pal) != 0) << 48))
 
 typedef struct cdg_state {
     uint8_t screen[FA_CDG_HEIGHT][FA_CDG_WIDTH];  /* colour indices */
@@ -65,10 +65,22 @@ typedef struct cdg_state {
     int dx0, dy0, dx1, dy1;       /* screen area changed since the last render; empty if dx0 >= dx1 */
 } cdg_state;
 
+/* A saved cdg_state: colour indices are 4 bits, so two share a byte (the left one in
+ * the low nibble), half the memory of a full state. The changed area is not kept. */
+typedef struct cdg_checkpoint {
+    uint8_t screen[FA_CDG_HEIGHT][FA_CDG_WIDTH / 2];
+    uint8_t rgb[16][3];
+    uint8_t transparency[16];
+    uint8_t bg, hoff, voff;
+    int8_t preset, border;
+    int clean;
+    size_t next;
+} cdg_checkpoint;
+
 /* Checkpoints of one fa_cdg_data, under the stream's cdg_lock once attached. */
 struct fa_cdg_index {
     size_t step;                  /* packs between checkpoints */
-    cdg_state* at;                /* [k] = state after (k + 1) * step packs */
+    cdg_checkpoint* at;           /* [k] = state after (k + 1) * step packs */
     size_t count;                 /* valid checkpoints */
     size_t cap;
     cdg_state build;              /* discs: the decoder running over the packs written */
@@ -365,6 +377,49 @@ static void apply_pack(cdg_state* st, const uint8_t* pack)
 
 /* ---- checkpoints ------------------------------------------------------------------ */
 
+static void checkpoint_save(cdg_checkpoint* c, const cdg_state* st)
+{
+    int y, x;
+    for (y = 0; y < FA_CDG_HEIGHT; y++)
+        for (x = 0; x < FA_CDG_WIDTH / 2; x++)
+            c->screen[y][x] = (uint8_t)(st->screen[y][2 * x] | st->screen[y][2 * x + 1] << 4);
+    memcpy(c->rgb, st->rgb, sizeof(c->rgb));
+    memcpy(c->transparency, st->transparency, sizeof(c->transparency));
+    c->bg = st->bg;
+    c->hoff = st->hoff;
+    c->voff = st->voff;
+    c->preset = st->preset;
+    c->border = st->border;
+    c->clean = st->clean;
+    c->next = st->next;
+}
+
+static void checkpoint_row(const cdg_checkpoint* c, int y, uint8_t* row)
+{
+    int x;
+    for (x = 0; x < FA_CDG_WIDTH / 2; x++) {
+        row[2 * x] = c->screen[y][x] & 0x0F;
+        row[2 * x + 1] = c->screen[y][x] >> 4;
+    }
+}
+
+/* The state saved in `c`, with nothing marked as changed. */
+static void checkpoint_load(const cdg_checkpoint* c, cdg_state* st)
+{
+    int y;
+    for (y = 0; y < FA_CDG_HEIGHT; y++) checkpoint_row(c, y, st->screen[y]);
+    memcpy(st->rgb, c->rgb, sizeof(st->rgb));
+    memcpy(st->transparency, c->transparency, sizeof(st->transparency));
+    st->bg = c->bg;
+    st->hoff = c->hoff;
+    st->voff = c->voff;
+    st->preset = c->preset;
+    st->border = c->border;
+    st->clean = c->clean;
+    st->next = c->next;
+    st->dx0 = st->dy0 = st->dx1 = st->dy1 = 0;
+}
+
 static void index_free(struct fa_cdg_index* ix)
 {
     if (!ix) return;
@@ -386,7 +441,7 @@ static struct fa_cdg_index* index_new(size_t count)
     ix->step = index_step(count);
     ix->cap = count / ix->step;
     if (ix->cap) {
-        ix->at = (cdg_state*)malloc(ix->cap * sizeof(cdg_state));
+        ix->at = (cdg_checkpoint*)malloc(ix->cap * sizeof(cdg_checkpoint));
         if (!ix->at) { free(ix); return NULL; }
     }
     state_reset(&ix->build);
@@ -402,7 +457,7 @@ static void index_advance(struct fa_cdg_index* ix, const fa_cdg_data* d, size_t 
         st->next++;
         if (st->next % ix->step == 0 && st->next / ix->step == ix->count + 1 && ix->count < ix->cap) {
             st->dx0 = st->dy0 = st->dx1 = st->dy1 = 0;
-            ix->at[ix->count++] = *st;
+            checkpoint_save(&ix->at[ix->count++], st);
         }
     }
 }
@@ -432,7 +487,7 @@ static void index_written(fa_cdg_data* d, size_t first, size_t n, int changed)
     if (changed && first < ix->build.next) {
         size_t keep = first / ix->step;
         if (keep < ix->count) ix->count = keep;
-        if (ix->count) ix->build = ix->at[ix->count - 1]; else state_reset(&ix->build);
+        if (ix->count) checkpoint_load(&ix->at[ix->count - 1], &ix->build); else state_reset(&ix->build);
     }
     if (first + n > ix->high) ix->high = first + n;
     upto = first + n > ix->build.next ? first + n : ix->build.next;
@@ -924,15 +979,16 @@ static size_t packs_at(fa_time time, size_t count)
 
 /* Replaces the surface's state with `from` (NULL = the start), marking only the
  * screen area that differs, so a seek uploads no more than it has to. */
-static void restore(fa_cdg_surface* f, const cdg_state* from)
+static void restore(fa_cdg_surface* f, const cdg_checkpoint* from)
 {
     cdg_state* st = &f->st;
     int x0 = st->dx0, y0 = st->dy0, x1 = st->dx1, y1 = st->dy1, y;
-    static const uint8_t zero_row[FA_CDG_WIDTH];
+    uint8_t b[FA_CDG_WIDTH];
+    if (!from) memset(b, 0, sizeof(b));
     for (y = 0; y < FA_CDG_HEIGHT; y++) {
         const uint8_t* a = st->screen[y];
-        const uint8_t* b = from ? from->screen[y] : zero_row;
         int l = 0, r = FA_CDG_WIDTH;
+        if (from) checkpoint_row(from, y, b);
         if (memcmp(a, b, FA_CDG_WIDTH) == 0) continue;
         while (a[l] == b[l]) l++;
         while (a[r - 1] == b[r - 1]) r--;
@@ -942,7 +998,7 @@ static void restore(fa_cdg_surface* f, const cdg_state* from)
         if (y < y0) y0 = y;
         if (y + 1 > y1) y1 = y + 1;
     }
-    if (from) *st = *from; else state_reset(st);
+    if (from) checkpoint_load(from, st); else state_reset(st);
     st->dx0 = st->dy0 = st->dx1 = st->dy1 = 0;
     if (x0 < x1) mark(st, x0, y0, x1, y1);
 }
