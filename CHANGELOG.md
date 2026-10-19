@@ -41,6 +41,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   `TrackerRowReached`).
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
+### Changed
+
+- A tempo, pitch or rate ramp's `FA_EVENT_RAMP_DONE` now comes when the ramp's end is heard, not up to the
+  decode-ahead latency (150 ms) earlier when it was decoded, matching volume ramps. See
+  [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md).
+
 ## 0.2.0 (2026-10-18)
 
 The first packaged version (NuGet `FatzAudio` with `win-x64` and `linux-x64` natives).

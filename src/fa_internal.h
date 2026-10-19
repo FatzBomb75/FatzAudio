@@ -391,6 +391,7 @@ void fa_shape_load(fa_shape_atomic* a, fa_shape* out);
  * end of the decode-ahead buffer), and ramps advance with the frames it makes. */
 
 #define FA_TEMPO_PARAMS 3            /* FA_PARAM_RATE, FA_PARAM_TEMPO, FA_PARAM_PITCH */
+#define FA_HEARD_RAMPS 8             /* ramp ends waiting to be heard (more: raised at once) */
 #define FA_TPARAM_NOW INT64_MIN      /* a ramp start: wherever the chain is when it is first evaluated */
 
 typedef struct fa_tparam {
@@ -410,8 +411,8 @@ void fa_tparam_init(fa_tparam* p, float value);
 int fa_tparam_post(fa_tparam* p, float target, int64_t len, const fa_shape* shape, int64_t tag, int notify,
                    int64_t start, int64_t* old_tag);
 /* The value at chain frame `at`. Returns 1 when a ramp finished and owes its
- * RAMP_DONE (tag in *done_tag). */
-int fa_tparam_eval(fa_tparam* p, int64_t at, float* out_value, int64_t* done_tag);
+ * RAMP_DONE (tag in *done_tag, the chain frame it ended at in *done_at). */
+int fa_tparam_eval(fa_tparam* p, int64_t at, float* out_value, int64_t* done_tag, int64_t* done_at);
 /* The chain's frame count starts again from 0 at what was chain frame `base`:
  * keeps a running or scheduled ramp on the same playback time. */
 void fa_tparam_rebase(fa_tparam* p, int64_t base);
@@ -1040,6 +1041,14 @@ struct fa_stream {
      * the chain and its staging under decode_lock. */
     fa_mutex tempo_lock;
     fa_tparam tparams[FA_TEMPO_PARAMS];
+    /* Tempo, pitch and rate ramps that ended in the decode-ahead audio: their
+     * RAMP_DONE waits until playback reaches `at` (a played frame). state: 0 free,
+     * 1 being written (by the decode side, under decode_lock), 2 waiting, 3 being
+     * raised (by whoever claimed it: the audio thread, or a seek or detach). */
+    struct {
+        fa_atomic32 state;
+        int64_t at, tag;
+    } heard_ramps[FA_HEARD_RAMPS];
     int tempo_fast, tempo_formants;
     uint32_t tempo_latency_ms;
     fa_tempo* tempo;             /* NULL until a parameter first leaves neutral */
