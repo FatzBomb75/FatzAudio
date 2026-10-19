@@ -57,6 +57,8 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   32 KB less history; web streams no longer keep a 256 KB read-ahead on top of their download window; idle
   engine workers wake 20 times less; Windows (MSVC) builds read atomics with plain loads instead of locked
   compare-exchanges. .NET: `HasCdg` and the `Tags` lookups (`Cover`, the indexer) no longer allocate.
+- HE-AAC decodes about 35% faster (its QMF analysis bank uses a fast DCT-IV; 16 KB less per decoder) and ALAC
+  up to 30% faster (faster bit reading). The output is unchanged.
 - A tempo, pitch or rate ramp's `FA_EVENT_RAMP_DONE` now comes when the ramp's end is heard, not up to the
   decode-ahead latency (150 ms) earlier when it was decoded, matching volume ramps. See
   [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md).
