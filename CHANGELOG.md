@@ -43,6 +43,9 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- A tempo, pitch or rate ramp's `FA_EVENT_RAMP_DONE` now comes when the ramp's end is heard, not up to the
+  decode-ahead latency (150 ms) earlier when it was decoded, matching volume ramps. See
+  [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md).
 - Playback at another rate than the device's (a 44.1 kHz file on a 48 kHz device) is resampled with the windowed-sinc
   resampler that rate and pitch use, instead of miniaudio's linear one: about -90 dB of aliasing and imaging, and
   high frequencies no longer dulled. See [docs/features/playback.md](docs/features/playback.md).

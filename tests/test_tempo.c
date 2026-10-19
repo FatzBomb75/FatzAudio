@@ -374,7 +374,7 @@ typedef struct recorder {
     fa_mutex lock;
     int ended, ramp_done, markers;
     int64_t last_tag;
-    fa_frames ended_at;
+    fa_frames ended_at, ramp_done_at;
 } recorder;
 
 static void FA_CALL on_event(const fa_event* ev, void* user)
@@ -382,7 +382,7 @@ static void FA_CALL on_event(const fa_event* ev, void* user)
     recorder* r = (recorder*)user;
     fa_mutex_lock(&r->lock);
     if (ev->type == FA_EVENT_ENDED) { r->ended++; r->ended_at = ev->frame; }
-    if (ev->type == FA_EVENT_RAMP_DONE) { r->ramp_done++; r->last_tag = ev->value; }
+    if (ev->type == FA_EVENT_RAMP_DONE) { r->ramp_done++; r->last_tag = ev->value; r->ramp_done_at = ev->frame; }
     if (ev->type == FA_EVENT_MARKER) r->markers++;
     fa_mutex_unlock(&r->lock);
 }
@@ -638,6 +638,59 @@ static void test_ramp_reaches_target_with_event(void)
     CHECK_EQ(fa_stream_set_param(s, FA_PARAM_PITCH, 0.0f), FA_OK);
     CHECK(wait_for(&rec, &rec.ramp_done, 2));
     CHECK_EQ(rec.last_tag, 78);
+    fa_stream_set_event_callback(s, NULL, NULL);
+    fa_stream_close(s);
+    fa_mutex_destroy(&rec.lock);
+    free(out);
+}
+
+/* RAMP_DONE comes when the ramp's end is heard, not when it is decoded (up to the
+ * decode-ahead latency earlier). 1 -> 1.5 over 0.5 s with an S-curve plays 0.625 s
+ * of the source. */
+static void test_ramp_done_when_heard(void)
+{
+    fa_stream* s = open_attached(20 * RATE, sine440, 0);
+    float* out = (float*)malloc(1024 * 2 * sizeof(float));
+    recorder rec;
+    fa_ramp ramp;
+    int i, early = 0;
+    CHECK(s != NULL);
+    memset(&rec, 0, sizeof(rec));
+    fa_mutex_init(&rec.lock);
+    fa_stream_set_event_callback(s, on_event, &rec);
+    memset(&ramp, 0, sizeof(ramp));
+    ramp.curve = FA_CURVE_SCURVE;
+    ramp.tag = 91;
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    CHECK_EQ(fa_stream_ramp_param(s, FA_PARAM_TEMPO, 1.5f, 500000000, 0, &ramp), FA_OK);
+    for (i = 0; i < 60; i++) {
+        render(s, out, 1024);
+        /* Not before half a second of output has been played. */
+        if ((i + 1) * 1024 < RATE / 2 - 1024) {
+            fa_sleep_ms(2);
+            fa_mutex_lock(&rec.lock);
+            early += rec.ramp_done;
+            fa_mutex_unlock(&rec.lock);
+        }
+    }
+    CHECK_EQ(early, 0);
+    CHECK(wait_for(&rec, &rec.ramp_done, 1));
+    CHECK_EQ(rec.last_tag, 91);
+    CHECK_NEAR((double)rec.ramp_done_at, 0.625 * RATE, 1024 * 1.5 + 64);
+    /* A seek with a ramp end still unheard keeps it, once, after the same
+     * playing time on the new timeline. */
+    ramp.tag = 92;
+    CHECK_EQ(fa_stream_ramp_param(s, FA_PARAM_PITCH, 2.0f, 50000000, 0, &ramp), FA_OK);
+    for (i = 0; i < 4; i++) render(s, out, 1024);
+    CHECK_EQ(fa_stream_seek(s, 2 * RATE), FA_OK);
+    for (i = 0; i < 10; i++) render(s, out, 1024);
+    CHECK(wait_for(&rec, &rec.ramp_done, 2));
+    CHECK_EQ(rec.last_tag, 92);
+    for (i = 0; i < 20; i++) render(s, out, 1024);
+    fa_sleep_ms(20);
+    fa_mutex_lock(&rec.lock);
+    CHECK_EQ(rec.ramp_done, 2);
+    fa_mutex_unlock(&rec.lock);
     fa_stream_set_event_callback(s, NULL, NULL);
     fa_stream_close(s);
     fa_mutex_destroy(&rec.lock);
@@ -905,6 +958,7 @@ int main(void)
     RUN(test_clock_runs_at_tempo);
     RUN(test_cue_out_ends_exactly);
     RUN(test_ramp_reaches_target_with_event);
+    RUN(test_ramp_done_when_heard);
     RUN(test_scheduled_ramp_as_first_change);
     RUN(test_engaging_mid_play_is_smooth);
     RUN(test_loop_with_tempo_wraps);

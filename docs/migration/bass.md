@@ -112,7 +112,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_ChannelIsSliding | `FA_EVENT_RAMP_DONE` (one per ramp, tagged) instead of polling | `RampAsync` task, `RampCompleted` event | ✅ |
 | BASS_ChannelSetSync / RemoveSync | `fa_stream_set_event_callback`; one callback receives every event type ([events](../features/events.md)) | `Ended`, `RampCompleted`, … events | ✅ |
 | BASS_SYNC_END | `FA_EVENT_ENDED` | `Ended` | ✅ |
-| BASS_SYNC_SLIDE | `FA_EVENT_RAMP_DONE` | `RampCompleted` / `RampAsync` | ✅ |
+| BASS_SYNC_SLIDE | `FA_EVENT_RAMP_DONE`, raised when the end is heard (volume, pan, tempo, pitch and rate alike; BASS raises it when the slide ends in the mix) | `RampCompleted` / `RampAsync` | ✅ |
 | BASS_SYNC_META | `FA_EVENT_METADATA`, raised when the new song is heard rather than when it is downloaded ([song titles](../features/web-streams.md#song-titles-icy-metadata)) | `MetadataChanged` (carries the new `Metadata`) | ✅ |
 | BASS_SYNC_STALL | `FA_EVENT_STALLED` and `FA_EVENT_RESUMED` (two events instead of one with a flag) | `Stalled`, `Resumed` | ✅ |
 | BASS_SYNC_DOWNLOAD | `fa_net_status.finished` | `NetworkStatus.Finished` | ✅ (polled, no event) |
