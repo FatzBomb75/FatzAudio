@@ -867,7 +867,7 @@ static int tempo_values(struct fa_stream* s, int64_t at, double* tempo, double* 
 static fa_tempo* tempo_chain(struct fa_stream* s, uint32_t channels, double src)
 {
     fa_tempo* t;
-    int fast, formants;
+    int fast, formants, transients;
     if (s->tempo) return s->tempo;
     t = (fa_tempo*)calloc(1, sizeof(*t));
     if (!t) return NULL;
@@ -878,8 +878,9 @@ static fa_tempo* tempo_chain(struct fa_stream* s, uint32_t channels, double src)
     fa_mutex_lock(&s->tempo_lock);
     fast = s->tempo_fast;
     formants = s->tempo_formants;
+    transients = s->tempo_transients;
     fa_mutex_unlock(&s->tempo_lock);
-    fa_tempo_configure(t, fast, formants);
+    fa_tempo_configure(t, fast, formants, transients);
     fa_tempo_reset(t, src);
     s->tempo = t;
     return t;
@@ -907,13 +908,14 @@ static void timeline_reset(struct fa_stream* s, fa_frames pos)
     s->chain_buf = NULL;
     s->rd_count = s->rd_off = 0;
     if (s->tempo) {
-        int fast, formants;
+        int fast, formants, transients;
         fa_mutex_lock(&s->tempo_lock);
         fast = s->tempo_fast;
         formants = s->tempo_formants;
+        transients = s->tempo_transients;
         fa_mutex_unlock(&s->tempo_lock);
         fa_tempo_reset(s->tempo, (double)pos);
-        fa_tempo_configure(s->tempo, fast, formants);
+        fa_tempo_configure(s->tempo, fast, formants, transients);
     }
     fa_store32(&s->tempo_live, tempo_wanted(s));
 }
@@ -2106,7 +2108,7 @@ FA_API void FA_CALL fa_tempo_options_init(fa_tempo_options* options)
 FA_API fa_result FA_CALL fa_stream_set_tempo_options(fa_stream* stream, const fa_tempo_options* options)
 {
     fa_tempo_options o;
-    int fast, rebuild;
+    int fast, transients, rebuild;
     uint32_t lat;
     if (!stream) return FA_ERROR_INVALID_ARG;
     fa_tempo_options_init(&o);
@@ -2117,20 +2119,23 @@ FA_API fa_result FA_CALL fa_stream_set_tempo_options(fa_stream* stream, const fa
         if (options->struct_size >= offsetof(fa_tempo_options, latency_ms) + sizeof(options->latency_ms))
             o.latency_ms = options->latency_ms;
     }
-    if (o.quality != FA_STRETCH_BEST && o.quality != FA_STRETCH_FAST) return FA_ERROR_INVALID_ARG;
+    if (o.quality != FA_STRETCH_BEST && o.quality != FA_STRETCH_FAST && o.quality != FA_STRETCH_TRANSIENTS)
+        return FA_ERROR_INVALID_ARG;
     fast = o.quality == FA_STRETCH_FAST;
+    transients = o.quality == FA_STRETCH_TRANSIENTS;
     lat = o.latency_ms ? o.latency_ms : FA_TEMPO_LATENCY_MS;
     if (lat < 50) lat = 50;
     if (lat > stream->buffer_ms) lat = stream->buffer_ms;
     fa_mutex_lock(&stream->api_lock);
     fa_mutex_lock(&stream->tempo_lock);
-    rebuild = fast != stream->tempo_fast;
+    rebuild = fast != stream->tempo_fast || transients != stream->tempo_transients;
     stream->tempo_fast = fast;
+    stream->tempo_transients = transients;
     stream->tempo_formants = o.keep_formants != 0;
     stream->tempo_latency_ms = lat;
     fa_mutex_unlock(&stream->tempo_lock);
     fa_mutex_lock(&stream->decode_lock);
-    if (stream->tempo) fa_tempo_configure(stream->tempo, fast, o.keep_formants);
+    if (stream->tempo) fa_tempo_configure(stream->tempo, fast, o.keep_formants, transients);
     rebuild = rebuild && stream->tempo && stream->tempo->st_on;
     fa_mutex_unlock(&stream->decode_lock);
     /* Another stretcher: start it from where the stream is heard. */
@@ -2145,7 +2150,7 @@ FA_API fa_result FA_CALL fa_stream_get_tempo_options(fa_stream* stream, fa_tempo
     if (!stream || !out_options) return FA_ERROR_INVALID_ARG;
     fa_tempo_options_init(out_options);
     fa_mutex_lock(&stream->tempo_lock);
-    out_options->quality = stream->tempo_fast ? FA_STRETCH_FAST : FA_STRETCH_BEST;
+    out_options->quality = stream->tempo_fast ? FA_STRETCH_FAST : stream->tempo_transients ? FA_STRETCH_TRANSIENTS : FA_STRETCH_BEST;
     out_options->keep_formants = stream->tempo_formants;
     out_options->latency_ms = stream->tempo_latency_ms;
     fa_mutex_unlock(&stream->tempo_lock);

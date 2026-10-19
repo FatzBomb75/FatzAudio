@@ -1011,7 +1011,11 @@ FA_API fa_result FA_CALL fa_stream_ramp_param(fa_stream* stream, fa_param param,
 /* How tempo and pitch are processed (see FA_PARAM_TEMPO). */
 typedef enum fa_stretch_quality {
     FA_STRETCH_BEST = 0,   /* default: 120 ms analysis blocks, the cleanest sound */
-    FA_STRETCH_FAST        /* 100 ms blocks, about a third less CPU, slightly less clean */
+    FA_STRETCH_FAST,       /* 100 ms blocks, about a third less CPU, slightly less clean */
+    FA_STRETCH_TRANSIENTS  /* BEST, with the input itself played around each onset (drum
+                              hits, plucks): no pre-echo before hits, which stay sharp
+                              and on time; for drum-heavy material. Notes starting under
+                              a held chord can get a faint seam */
 } fa_stretch_quality;
 
 typedef struct fa_tempo_options {

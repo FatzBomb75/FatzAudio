@@ -2,7 +2,7 @@
  * into a 32-bit float WAV, for listening tests and tools/tempo-compare/compare.py.
  *
  *   fa_tempo_render in.wav out.wav [--tempo 1.25] [--pitch -3] [--rate 1]
- *                   [--fast] [--formants]
+ *                   [--fast] [--transients] [--formants]
  *
  * Any format FatzAudio opens works as input. */
 #include "fatzaudio/fatzaudio.h"
@@ -37,7 +37,7 @@ int main(int argc, char** argv)
     fa_result r;
     int i;
     if (argc < 3) {
-        fprintf(stderr, "usage: %s in out.wav [--tempo x] [--pitch semitones] [--rate x] [--fast] [--formants]\n", argv[0]);
+        fprintf(stderr, "usage: %s in out.wav [--tempo x] [--pitch semitones] [--rate x] [--fast] [--transients] [--formants]\n", argv[0]);
         return 2;
     }
     fa_tempo_options_init(&topts);
@@ -46,6 +46,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--pitch") && i + 1 < argc) pitch = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--rate") && i + 1 < argc) rate = (float)atof(argv[++i]);
         else if (!strcmp(argv[i], "--fast")) topts.quality = FA_STRETCH_FAST;
+        else if (!strcmp(argv[i], "--transients")) topts.quality = FA_STRETCH_TRANSIENTS;
         else if (!strcmp(argv[i], "--formants")) topts.keep_formants = 1;
         else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
     }

@@ -55,6 +55,8 @@ public class TempoTests
         Assert.Equal(80, s.TempoOptions.Latency.TotalMilliseconds);
         s.TempoOptions = null;
         Assert.Equal(new TempoOptions(), s.TempoOptions);
+        s.TempoOptions = new TempoOptions { Quality = StretchQuality.Transients };
+        Assert.Equal(StretchQuality.Transients, s.TempoOptions.Quality);
         Assert.Throws<ArgumentException>(() => s.TempoOptions = new TempoOptions { Quality = (StretchQuality)7 });
     }
 

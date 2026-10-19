@@ -45,7 +45,7 @@ song.TempoOptions = new TempoOptions { KeepFormants = true, Latency = TimeSpan.F
 
 | `fa_tempo_options` | .NET `TempoOptions` | Default | Meaning |
 |---|---|---|---|
-| `quality` | `Quality` | `FA_STRETCH_BEST` | `FA_STRETCH_FAST` uses shorter analysis blocks: about a third less CPU, slightly less clean. Best is the right choice on any desktop |
+| `quality` | `Quality` | `FA_STRETCH_BEST` | `FA_STRETCH_FAST` uses shorter analysis blocks: about a third less CPU, slightly less clean. Best is the right choice on any desktop. `FA_STRETCH_TRANSIENTS` (.NET `Transients`) is Best plus transient preservation (below): for drum-heavy material |
 | `keep_formants` | `KeepFormants` | off | A pitch change keeps the character of voices, so a key change for a singer doesn't sound like a chipmunk or a giant. Affects `PITCH` only |
 | `latency_ms` | `Latency` | 150 | How far ahead the stream is decoded while any of the three is in use, so how soon a change is heard. Clamped to 50 … the stream's `buffer_ms` |
 
@@ -78,6 +78,18 @@ Measured with `tools/tempo-compare` against bass_fx 2.4 (the legacy app's DLL, t
 | Pre-echo before drum hits | -24 … -28 dB | none | none | -9 … -13 dB |
 
 In practice: sustained notes and chords stay steady instead of warbling or phasing, and beats stay on time. The trade-off of any phase vocoder is a faint smear just before sharp hits (the pre-echo row); bass_fx and SoundTouch avoid it by splicing whole chunks of audio, which is why their hits drift and their chords phase.
+
+### Transient mode
+
+`FA_STRETCH_TRANSIENTS` removes that smear. It finds onsets in the audio (a jump in short-term energy: drum hits, plucks, hard consonants) and, from 24 ms before each onset to 12 ms after it, plays the original audio at its own speed instead of the stretched sound, lined up so that the onset lands exactly where it belongs, with 4 ms crossfades on each side. Measured on the same drum hits:
+
+| Test (tempo 0.8, 1.25, pitch -3) | Best | Transients |
+|---|---|---|
+| Pre-echo before drum hits | -24 … -28 dB | -48 … -52 dB (none at pitch -3) |
+| Drum hits moved from their time | 0.1 … 0.6 ms | 0.1 … 0.5 ms |
+| Sine, chord, held vowel | as above | identical (no onsets, nothing changed) |
+
+The cost is that those 40 ms around an onset are not stretched. When a note starts under a held chord, the chord can show a faint seam there, because the two crossfaded versions of it don't line up exactly. That is why it is an option and not the default. It adds no latency and next to no CPU. With `keep_formants` and a pitch change, onsets are left to the stretcher (the original audio would not have the corrected formants). A new `quality` applies from the next restart of the processing, like the other qualities.
 
 ## Comparing by ear against bass_fx
 

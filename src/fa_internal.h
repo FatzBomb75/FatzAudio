@@ -1040,7 +1040,7 @@ struct fa_stream {
      * the chain and its staging under decode_lock. */
     fa_mutex tempo_lock;
     fa_tparam tparams[FA_TEMPO_PARAMS];
-    int tempo_fast, tempo_formants;
+    int tempo_fast, tempo_formants, tempo_transients;
     uint32_t tempo_latency_ms;
     fa_tempo* tempo;             /* NULL until a parameter first leaves neutral */
     int tempo_drained;           /* the chain gave back its tail at the end of the source */
