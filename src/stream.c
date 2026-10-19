@@ -1417,7 +1417,14 @@ static fa_result build_chain_locked(struct fa_stream* s, fa_device* dev)
     release_chain(s);
     cc = ma_data_converter_config_init(ma_format_f32, ma_format_f32, s->matrix ? FA_DEVICE_CHANNELS : ch,
                                        FA_DEVICE_CHANNELS, s->decoder.format.sample_rate, dev->rate);
-    if (ma_data_converter_init(&cc, NULL, &s->converter) != MA_SUCCESS) return FA_ERROR_OUT_OF_MEMORY;
+    cc.resampling.algorithm = ma_resample_algorithm_custom;   /* the sinc resampler (resample_device.c) */
+    cc.resampling.pBackendVTable = &fa_sinc_resampler;
+    if (ma_data_converter_init(&cc, NULL, &s->converter) != MA_SUCCESS) {
+        /* Beyond its widest ratio: miniaudio's linear one. */
+        cc.resampling.algorithm = ma_resample_algorithm_linear;
+        cc.resampling.pBackendVTable = NULL;
+        if (ma_data_converter_init(&cc, NULL, &s->converter) != MA_SUCCESS) return FA_ERROR_OUT_OF_MEMORY;
+    }
     s->converter_ready = 1;
     s->in_cap = FA_DECODE_CHUNK;
     s->out_cap = FA_DECODE_CHUNK * 2;
