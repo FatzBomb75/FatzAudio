@@ -137,8 +137,9 @@ void fa_mutex_unlock(fa_mutex* m);
 int fa_cond_init(fa_cond* c);
 void fa_cond_destroy(fa_cond* c);
 /* Waits until signalled or `timeout_ms` passed; spurious wakeups are possible. */
-void fa_cond_wait_ms(fa_cond* c, fa_mutex* m, uint32_t timeout_ms);
+void fa_cond_wait_ms(fa_cond* c, fa_mutex* m, uint32_t timeout_ms);   /* UINT32_MAX: no timeout */
 void fa_cond_broadcast(fa_cond* c);
+void fa_cond_signal(fa_cond* c);   /* wakes one waiter */
 
 int fa_thread_create(fa_thread* t, fa_thread_proc proc, void* arg);
 void fa_thread_join(fa_thread* t);

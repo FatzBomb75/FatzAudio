@@ -68,9 +68,12 @@ void fa_engine_track_stream(fa_engine* e, struct fa_stream* s, int add)
 /* Each worker repeatedly takes the attached stream with the emptiest buffer that
  * nobody else is decoding (try-lock on its decode lock) and tops it up. A stream
  * another worker is busy with is skipped, so one slow source never keeps idle
- * workers from the others. With nothing to do a worker sleeps until woken or
- * 5 ms pass (100 ms while the engine has no streams at all: adding one wakes
- * it); the audio thread never has to signal anything. */
+ * workers from the others. The audio thread never has to signal anything: of the
+ * workers with nothing to do, one polls every 5 ms (100 ms while the engine has no
+ * streams at all: adding one wakes it), and the others sleep until it, or an API
+ * call with work for them (a push, a seek, a new stream), wakes them. A worker that
+ * finds more streams wanting decoding than the one it takes wakes one more, which
+ * does the same, so busy moments still get every worker. */
 static void worker_main(void* arg)
 {
     fa_engine* e = (fa_engine*)arg;
@@ -79,10 +82,12 @@ static void worker_main(void* arg)
         struct fa_stream* s;
         struct fa_stream* pick = NULL;
         double best = 2.0;
+        int wanted = 0;
         fa_event_collect_locked(e);  /* keeps the audio thread's event queues drained */
         for (s = e->streams; s; s = s->next) {
             double fill;
             if (!fa_stream_needs_work(s)) continue;
+            wanted++;
             /* A pending seek first: its buffer is stale, however full. */
             fill = fa_load64(&s->seek_pending) >= 0 ? -1.0 : (double)fa_ring_readable(&s->ring) / (double)s->ring.capacity;
             if (fill >= best || !fa_mutex_trylock(&s->decode_lock)) continue;
@@ -91,6 +96,10 @@ static void worker_main(void* arg)
             pick = s;
         }
         if (pick) {
+            /* Others want work too (or are some other worker's already): one more.
+             * The poller taking work wakes one too, which then polls in its place, so
+             * a slow source never leaves the others unwatched. */
+            if ((wanted > 1 || !e->work_poller) && e->workers_idle > 0) fa_cond_signal(&e->work_cond);
             fa_mutex_unlock(&e->list_lock);
             /* Top up to full, in turns of at most half a buffer so one stream
              * cannot starve the others. */
@@ -101,7 +110,15 @@ static void worker_main(void* arg)
             if (busy) fa_cond_wait_ms(&e->work_cond, &e->list_lock, 1);
             continue;
         }
-        fa_cond_wait_ms(&e->work_cond, &e->list_lock, e->streams ? 5 : 100);
+        e->workers_idle++;
+        if (!e->work_poller) {
+            e->work_poller = 1;
+            fa_cond_wait_ms(&e->work_cond, &e->list_lock, e->streams ? 5 : 100);
+            e->work_poller = 0;
+        } else {
+            fa_cond_wait_ms(&e->work_cond, &e->list_lock, UINT32_MAX);   /* until woken */
+        }
+        e->workers_idle--;
     }
     fa_mutex_unlock(&e->list_lock);
 }

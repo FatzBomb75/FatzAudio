@@ -689,6 +689,8 @@ struct fa_engine {
 
     fa_thread workers[FA_MAX_WORKERS];
     uint32_t worker_count;
+    uint32_t workers_idle;       /* list_lock: workers waiting on work_cond */
+    int work_poller;             /* list_lock: one idle worker waits with a timeout (worker_main) */
     fa_thread event_thread;
     fa_atomic64 event_thread_id;
     fa_atomic32 event_seq;       /* next fa_qevent.seq */
@@ -741,6 +743,7 @@ struct fa_device {
      * the next callback (later ones can't be a crossfade's). */
     fa_mutex xf_lock;
     int xf_busy;                 /* audio thread only */
+    fa_atomic32 mix_blockwise;   /* tests: mix every stream block by block (no steady-gain pass) */
     fa_atomic_ptr voices;        /* fa_voice_list*, read by the audio callback */
     fa_atomic_ptr buses;         /* fa_bus_list*, read by the audio callback */
     fa_atomic64 clock;           /* frames mixed so far (start of the next callback) */

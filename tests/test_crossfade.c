@@ -125,8 +125,8 @@ static void render(int64_t frames)
     while (frames > 0) {
         uint32_t n = frames < PERIOD ? (uint32_t)frames : PERIOD, i;
         fa_voice_list* list = (fa_voice_list*)fa_load_ptr(&g_dev->voices);
-        int tries;
-        for (tries = 0; list && tries < 2000; tries++) {
+        int64_t deadline = fa_monotonic_ns() + 10000000000LL;   /* a bound for a hang, not a wait */
+        while (list && fa_monotonic_ns() < deadline) {
             int ready = 1;
             for (i = 0; i < list->count; i++) {
                 fa_stream* s = list->items[i];
@@ -905,6 +905,69 @@ static void test_cue_on_second_device(void)
     fa_device_close(cue);
 }
 
+/* One scene for test_steady_gain_pass: two streams through steady stretches and
+ * every kind of gain change (a dezippered set, a pan, a mute and unmute, a
+ * scheduled ramp, a marker fade, loop wraps, the equalizer), into out. */
+static int steady_scene(int blockwise, float* out, int64_t frames)
+{
+    fa_stream* a = open_wav(48000, 1, FA_OPEN_LOOP, 1);
+    fa_stream* b = open_wav(48000, 3, 0, 1);
+    fa_eq_band band;
+    fa_time now;
+    int ok = a && b;
+    fa_store32(&g_dev->mix_blockwise, blockwise);
+    band.type = FA_EQ_PEAK; band.frequency_hz = 1000.0f; band.q = 1.0f; band.gain_db = 4.0f;
+    ok = ok && fa_stream_set_marker(a, FA_MARKER_CUE_IN, 700) == FA_OK && fa_stream_set_marker(a, FA_MARKER_CUE_OUT, 5300) == FA_OK;
+    ok = ok && fa_stream_set_marker(a, FA_MARKER_FADE_IN_END, 1500) == FA_OK;
+    ok = ok && fa_stream_set_eq(b, &band, 1) == FA_OK && fa_stream_set_param(b, FA_PARAM_VOLUME, 0.5f) == FA_OK;
+    render(2048);                                           /* the limiter settles on silence */
+    rec_reset();
+    ok = ok && fa_stream_play(a) == FA_OK && fa_stream_play(b) == FA_OK;
+    render(4000);                                           /* the fade in, then steady */
+    ok = ok && fa_stream_set_param(a, FA_PARAM_VOLUME, 0.7f) == FA_OK;
+    render(3000);
+    ok = ok && fa_stream_set_param(b, FA_PARAM_PAN, -0.3f) == FA_OK && fa_stream_set_mute(a, 1) == FA_OK;
+    render(2500);
+    ok = ok && fa_stream_set_mute(a, 0) == FA_OK;
+    render(3000);
+    fa_device_get_time(g_dev, &now);
+    ok = ok && fa_stream_ramp_param(b, FA_PARAM_VOLUME, 0.2f, frames_to_ns(1200), now + frames_to_ns(700), NULL) == FA_OK;
+    render(frames - 12500);
+    memcpy(out, g_rec, (size_t)frames * 2 * sizeof(float));
+    fa_store32(&g_dev->mix_blockwise, 0);
+    fa_stream_close(a);
+    fa_stream_close(b);
+    return ok;
+}
+
+/* Steady gains are mixed in one pass (stream_mix's steady-gain path): the output
+ * is bit for bit what mixing block by block gives, through changes as well. */
+static void test_steady_gain_pass(void)
+{
+    const int64_t frames = 20000;
+    float* blocks = (float*)malloc((size_t)frames * 2 * sizeof(float));
+    float* steady = (float*)malloc((size_t)frames * 2 * sizeof(float));
+    fa_stream* s;
+    int64_t i;
+    CHECK(blocks && steady);
+    CHECK(steady_scene(1, blocks, frames));
+    CHECK(steady_scene(0, steady, frames));
+    for (i = 0; i < frames * 2; i++)
+        if (memcmp(&blocks[i], &steady[i], sizeof(float)) != 0) { CHECK_EQ(i, -1); }
+    /* And steady is the source times the gain, exactly. */
+    s = open_wav(20000, 1, 0, 1);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_VOLUME, 0.5f), FA_OK);
+    rec_reset();
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(8000);
+    for (i = 2000; i < 8000; i++)
+        if (L(i) != expected(1, (uint32_t)i) * 0.5f || R(i) != L(i)) { CHECK_EQ(i, -1); }
+    fa_stream_close(s);
+    free(blocks);
+    free(steady);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -938,6 +1001,7 @@ int main(void)
     RUN(test_queue_in_first_callback);
     RUN(test_levels_and_spectrum);
     RUN(test_cue_on_second_device);
+    RUN(test_steady_gain_pass);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

@@ -1210,6 +1210,110 @@ static void test_surface_options(void)
     free(c.p);
 }
 
+/* The smooth scaler, worked out pixel by pixel from the window's colour indices
+ * (a native indexed surface) and the frame's palette: bilinear on premultiplied
+ * colour in 8-bit fixed point, pixel centres on pixel centres. */
+static void smooth_reference(const fa_cdg_frame* ix, const fa_cdg_frame* fr, uint32_t flags, uint8_t* out)
+{
+    uint32_t pm[16][4], ox, oy, i, k, w = ix->width, h = ix->height;
+    for (i = 0; i < 16; i++) {
+        pm[i][3] = fr->palette[i][3];
+        for (k = 0; k < 3; k++) pm[i][k] = (fr->palette[i][k] * pm[i][3] + 127) / 255;
+    }
+    for (oy = 0; oy < fr->height; oy++) {
+        int64_t fy = ((int64_t)(2 * oy + 1) * h * 256) / (2 * fr->height) - 128;
+        uint32_t y0, y1, ty;
+        if (fy < 0) fy = 0;
+        y0 = (uint32_t)(fy >> 8); ty = (uint32_t)(fy & 255);
+        if (y0 >= h - 1) { y0 = h - 1; ty = 0; }
+        y1 = y0 + 1 < h ? y0 + 1 : y0;
+        for (ox = 0; ox < fr->width; ox++) {
+            int64_t fx = ((int64_t)(2 * ox + 1) * w * 256) / (2 * fr->width) - 128;
+            uint32_t x0, x1, tx, acc[4];
+            uint8_t* p = out + ((size_t)oy * fr->width + ox) * 4;
+            if (fx < 0) fx = 0;
+            x0 = (uint32_t)(fx >> 8); tx = (uint32_t)(fx & 255);
+            if (x0 >= w - 1) { x0 = w - 1; tx = 0; }
+            x1 = x0 + 1 < w ? x0 + 1 : x0;
+            for (k = 0; k < 4; k++) {
+                uint32_t top = pm[*px(ix, x0, y0)][k] * (256 - tx) + pm[*px(ix, x1, y0)][k] * tx;
+                uint32_t bottom = pm[*px(ix, x0, y1)][k] * (256 - tx) + pm[*px(ix, x1, y1)][k] * tx;
+                acc[k] = (top * (256 - ty) + bottom * ty + 32768) >> 16;
+            }
+            if (!(flags & FA_CDG_PREMULTIPLIED)) {
+                uint32_t a = acc[3];
+                for (k = 0; k < 3; k++) {
+                    if (a == 0) acc[k] = 0;
+                    else if (a < 255) acc[k] = (acc[k] * 255 + a / 2) / a;
+                    if (acc[k] > 255) acc[k] = 255;
+                }
+            }
+            if (fr->pixel_format == FA_CDG_PIXELS_BGRA32) { p[0] = (uint8_t)acc[2]; p[1] = (uint8_t)acc[1]; p[2] = (uint8_t)acc[0]; }
+            else { p[0] = (uint8_t)acc[0]; p[1] = (uint8_t)acc[1]; p[2] = (uint8_t)acc[2]; }
+            p[3] = (uint8_t)acc[3];
+        }
+    }
+}
+
+static void test_smooth_matches_reference(void)
+{
+    static const uint32_t sizes[][2] = { { 1920, 1080 }, { 450, 324 }, { 301, 217 }, { 640, 200 }, { 37, 29 } };
+    static const uint32_t flag_sets[] = { 0, FA_CDG_NO_BORDER, FA_CDG_TRANSPARENT, FA_CDG_TRANSPARENT | FA_CDG_PREMULTIPLIED,
+                                          FA_CDG_BACKGROUND_COLOR | FA_CDG_BACKGROUND_OPACITY };
+    buf c = { 0 };
+    fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    uint8_t* want = (uint8_t*)malloc((size_t)1920 * 1080 * 4);
+    uint32_t seed = 7, i, f, z, step;
+    int r, col;
+    CHECK(s && want);
+    colors(&c, 0, k_low);
+    preset(&c, 1, 0);
+    border(&c, 2);
+    for (r = 0; r < 18; r++)        /* text-like rows and noise, so flat areas and edges */
+        for (col = 0; col < 50; col++) {
+            seed = seed * 1103515245u + 12345u;
+            if (r % 3 == 0 && (seed >> 20) % 4) continue;
+            tile(&c, (int)(seed >> 9) & 1, (int)(seed >> 12) & 7, (int)(seed >> 16) & 7, r, col, (uint8_t)((seed >> 22) & 0x3f));
+        }
+    transparent(&c, 5, 32);
+    transparent(&c, 3, 50);
+    step = (uint32_t)(c.n / FA_CDG_PACK_BYTES);   /* shown at t_packs(step) */
+    scroll(&c, 0, 0, 0, 3, 0, 7);                 /* then smooth offsets 3 / 7 */
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    for (z = 0; z < 2; z++)
+        for (f = 0; f < sizeof(flag_sets) / sizeof(flag_sets[0]); f++)
+            for (i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+                fa_cdg_surface *ix = NULL, *sm = NULL;
+                fa_cdg_surface_config cfg;
+                fa_cdg_frame fi, fs;
+                uint32_t y;
+                fa_cdg_surface_config_init(&cfg);
+                cfg.flags = flag_sets[f];
+                cfg.background_color = 0x80336699u;
+                cfg.background_opacity = 60;
+                cfg.pixel_format = FA_CDG_PIXELS_INDEXED8;
+                CHECK_EQ(fa_cdg_surface_create(s, &cfg, &ix), FA_OK);
+                cfg.flags |= FA_CDG_SMOOTH;
+                cfg.width = sizes[i][0];
+                cfg.height = sizes[i][1];
+                cfg.pixel_format = (i & 1) ? FA_CDG_PIXELS_RGBA32 : FA_CDG_PIXELS_BGRA32;
+                CHECK_EQ(fa_cdg_surface_create(s, &cfg, &sm), FA_OK);
+                CHECK_EQ(fa_cdg_surface_update_at(ix, t_packs(step + z), &fi), FA_OK);
+                CHECK_EQ(fa_cdg_surface_update_at(sm, t_packs(step + z), &fs), FA_OK);
+                smooth_reference(&fi, &fs, cfg.flags, want);
+                for (y = 0; y < fs.height; y++)
+                    if (memcmp(px(&fs, 0, y), want + (size_t)y * fs.width * 4, (size_t)fs.width * 4) != 0) {
+                        fprintf(stderr, "  %ux%u flags 0x%x offsets %u: row %u differs\n", fs.width, fs.height, cfg.flags, z, y);
+                        CHECK(0);
+                    }
+                fa_cdg_surface_destroy(ix);
+                fa_cdg_surface_destroy(sm);
+            }
+    fa_stream_close(s);
+    free(want);
+    free(c.p);
+}
+
 static void test_extreme_times(void)
 {
     buf c = basic_cdg();
@@ -1880,6 +1984,7 @@ int main(void)
     RUN(test_xor_and_repeats);
     RUN(test_scrolling);
     RUN(test_surface_options);
+    RUN(test_smooth_matches_reference);
     RUN(test_extreme_times);
     RUN(test_palette_changes);
     RUN(test_offset_and_replace);

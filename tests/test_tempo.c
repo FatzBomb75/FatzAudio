@@ -527,26 +527,29 @@ static float* play_resampled(uint32_t rate, uint32_t frames, gen_fn gen, int64_t
  * (fa_varispeed_read_phased): the same output as working the kernel out per frame
  * (fa_varispeed_read), up to float rounding, from the very first frame (the
  * kernel reaching back before the start) and across the history being dropped
- * (it keeps only the kernel's width). */
+ * (it keeps only the kernel's width). Several channels (summed in vectors) give
+ * each channel what one channel alone gives. */
 static void test_device_rate_phases_match(void)
 {
     static const uint32_t pairs[4][2] = { { 44100, 48000 }, { 48000, 44100 }, { 22050, 48000 }, { 96000, 48000 } };
-    static const uint32_t chans[3] = { 1, 2, 6 };
+    static const uint32_t chans[6] = { 1, 2, 3, 5, 6, 8 };
     const int64_t n = 20000;
     uint32_t p, c;
-    float* in = (float*)malloc((size_t)n * 6 * sizeof(float));
-    float* a = (float*)malloc((size_t)(n * 3 + 64) * 6 * sizeof(float));
-    float* b = (float*)malloc((size_t)(n * 3 + 64) * 6 * sizeof(float));
+    float* in = (float*)malloc((size_t)n * 8 * sizeof(float));
+    float* a = (float*)malloc((size_t)(n * 3 + 64) * 8 * sizeof(float));
+    float* b = (float*)malloc((size_t)(n * 3 + 64) * 8 * sizeof(float));
+    float* mono_in = (float*)malloc((size_t)n * sizeof(float));
+    float* mono = (float*)malloc((size_t)(n * 3 + 64) * sizeof(float));
     int64_t i;
     srand(11);
-    for (i = 0; i < n * 6; i++) in[i] = (float)rand() / (float)RAND_MAX * 2.0f - 1.0f;
+    for (i = 0; i < n * 8; i++) in[i] = (float)rand() / (float)RAND_MAX * 2.0f - 1.0f;
     CHECK(fa_varispeed_phases(44100, 48000) == fa_varispeed_phases(88200, 96000));   /* one table per ratio */
     CHECK(fa_varispeed_phases(1, 4999) == NULL);                                      /* too many phases */
     for (p = 0; p < 4; p++) {
         const fa_vs_phases* ph = fa_varispeed_phases(pairs[p][0], pairs[p][1]);
         double ratio = (double)pairs[p][0] / (double)pairs[p][1];
         CHECK(ph != NULL);
-        for (c = 0; c < 3; c++) {
+        for (c = 0; c < 6; c++) {
             fa_varispeed va, vb;
             uint32_t ch = chans[c], phase = 0;
             int64_t at = 0, na = 0, nb = 0;
@@ -574,11 +577,32 @@ static void test_device_rate_phases_match(void)
             CHECK(worst < 1e-5);
             fa_varispeed_free(&va);
             fa_varispeed_free(&vb);
+            if (ch > 1) {
+                uint32_t k;
+                for (k = 0; k < ch; k++) {
+                    fa_varispeed vm;
+                    int64_t got;
+                    uint32_t mph = 0;
+                    for (i = 0; i < n; i++) mono_in[i] = in[i * ch + k];
+                    CHECK_EQ(fa_varispeed_init(&vm, 1), FA_OK);
+                    CHECK_EQ(fa_varispeed_write(&vm, mono_in, n), FA_OK);
+                    got = fa_varispeed_read_phased(&vm, ph, &mph, mono, n * 3);
+                    CHECK_EQ(got, nb);
+                    for (i = 0; i < got; i++) {
+                        if (fabs((double)mono[i] - a[i * ch + k]) > worst) worst = fabs((double)mono[i] - a[i * ch + k]);
+                        if (fabs((double)mono[i] - b[i * ch + k]) > worst) worst = fabs((double)mono[i] - b[i * ch + k]);
+                    }
+                    fa_varispeed_free(&vm);
+                }
+                CHECK(worst < 1e-5);
+            }
         }
     }
     free(in);
     free(a);
     free(b);
+    free(mono_in);
+    free(mono);
 }
 
 static void test_device_rate_is_sinc(void)
