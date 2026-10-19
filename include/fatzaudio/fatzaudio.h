@@ -1623,7 +1623,9 @@ typedef struct fa_tracker_info {
     char artist[128];
     uint32_t channels, orders, patterns, instruments, samples, subsongs;
     int32_t restart_order, restart_row;   /* where the song's own loop goes back to */
-    double duration;             /* seconds, played once */
+    double duration;             /* seconds, played once (the subsong playing) */
+    /* Added after the first version: an older, shorter struct is filled up to here. */
+    int32_t subsong;             /* the subsong playing: fa_open_options.audio_track, 0 by default */
 } fa_tracker_info;
 
 FA_API fa_result FA_CALL fa_stream_get_tracker_info(fa_stream* stream, fa_tracker_info* out_info);
@@ -1657,15 +1659,24 @@ FA_API fa_result FA_CALL fa_stream_seek_tracker(fa_stream* stream, uint32_t orde
  * FA_TRACKER_STEREO_SEPARATION   percent, 0 (mono) .. 200; 100 by default
  * FA_TRACKER_VOLUME_RAMPING      -1 default, 0 off (may click), 1..10 softer
  * FA_TRACKER_AMIGA_RESAMPLER     1 (default): Amiga MOD files sound as on an Amiga's Paula chip; 0 off
+ * FA_TRACKER_ROW_EVENTS          0 (default) none; 1 FA_EVENT_TRACKER_ROW for every row heard;
+ *                                2 only for the first row of each order
  * FA_ERROR_INVALID_ARG for other values and for streams that are not modules. */
 typedef enum fa_tracker_param {
     FA_TRACKER_INTERPOLATION = 0,
     FA_TRACKER_STEREO_SEPARATION = 1,
     FA_TRACKER_VOLUME_RAMPING = 2,
-    FA_TRACKER_AMIGA_RESAMPLER = 3
+    FA_TRACKER_AMIGA_RESAMPLER = 3,
+    FA_TRACKER_ROW_EVENTS = 4
 } fa_tracker_param;
 FA_API fa_result FA_CALL fa_stream_set_tracker_param(fa_stream* stream, fa_tracker_param param, int32_t value);
 FA_API fa_result FA_CALL fa_stream_get_tracker_param(fa_stream* stream, fa_tracker_param param, int32_t* out_value);
+
+/* The order and row heard right now (at fa_stream_get_clock), to within about
+ * 2 ms of the row's start. FA_ERROR_NOT_FOUND while that audio is not decoded
+ * yet (a stream that was never played or read, or just after a seek). Cheap and
+ * lock-free, like the clock: fine to call every video frame. */
+FA_API fa_result FA_CALL fa_stream_get_tracker_position(fa_stream* stream, uint32_t* out_order, uint32_t* out_row);
 
 /* Mutes or unmutes channel 0..channels-1 (the first 64), live.
  * FA_ERROR_NOT_IMPLEMENTED if libopenmpt offers no channel control for the module. */
@@ -1693,9 +1704,11 @@ FA_API fa_result FA_CALL fa_stream_get_tracker_channel_mute(fa_stream* stream, u
  * FA_EVENT_LOOPED          loop end it left       loop start it went to (CUE_IN or 0)
  * FA_EVENT_CDG_CHANGED     CD+G packs now shown   what changed: FA_CDG_CHANGE_* (CD+G above)
  * FA_EVENT_SEEK_FAILED     the target not reached the fa_result (fa_stream_seek_async)
+ * FA_EVENT_TRACKER_ROW     the row's first frame  order << 16 | row (FA_TRACKER_ROW_EVENTS)
  *
  * Delivered today: ENDED, MARKER, LOOPED, CDG_CHANGED (when asked for), LOUDNESS_FINAL, RAMP_DONE, STARTED, SEEK_FAILED and DEVICE_CHANGED; MIDI_TEXT from MIDI
- * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); METADATA from web
+ * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); TRACKER_ROW from
+ * tracker modules played on a device (when asked for); METADATA from web
  * streams; STALLED and RESUMED from push, packet and web streams; DECODE_ERROR from packet
  * and disc streams. The others are raised by the features that produce them as those land (see docs/features). */
 typedef enum fa_event_type {
@@ -1713,7 +1726,8 @@ typedef enum fa_event_type {
     FA_EVENT_MIDI_TEXT,       /* a MIDI lyric or other text event is heard */
     FA_EVENT_LOOPED,          /* a looping stream jumped back to its loop start */
     FA_EVENT_CDG_CHANGED,     /* the CD+G picture heard now changed (fa_stream_set_cdg_events) */
-    FA_EVENT_SEEK_FAILED      /* fa_stream_seek_async could not reach `frame` (value = the fa_result) */
+    FA_EVENT_SEEK_FAILED,     /* fa_stream_seek_async could not reach `frame` (value = the fa_result) */
+    FA_EVENT_TRACKER_ROW      /* a tracker module row is heard (FA_TRACKER_ROW_EVENTS) */
 } fa_event_type;
 
 typedef struct fa_event {

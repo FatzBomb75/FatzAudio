@@ -30,7 +30,9 @@ No libopenmpt symbol is exported from `fatzaudio`.
 
 ## Altered source
 
-One local patch, in `libopenmpt/libopenmpt_config.h`: when `FA_OPENMPT_STATIC` is defined (the
+Two local patches. The first, in `libopenmpt/libopenmpt_config.h`: when `FA_OPENMPT_STATIC` is defined (the
 cmake file defines it for everything that links `fa_openmpt`), `LIBOPENMPT_API` and the C++ API
 macros become the header's *local* visibility helpers, so the API symbols are hidden instead of
-being exported or imported. Each change carries a `FatzAudio` comment. Nothing else is modified.
+being exported or imported. The second, in `libopenmpt/libopenmpt_impl.cpp`: `module_impl::get_time_at_position`
+returns -1 (no such row) for a row found in a different subsong than the one selected, so the tracker time and
+seek calls reject rows of other subsongs. Each change carries a `FatzAudio` comment. Nothing else is modified.

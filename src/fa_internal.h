@@ -266,6 +266,14 @@ uint32_t fa_engine_midi_rate(const fa_engine* engine);
 struct fa_midi* fa_midi_of(fa_decoder* dec);
 /* The decoder's tracker state, or NULL when it is not a tracker module. */
 struct fa_tracker* fa_tracker_of(fa_decoder* dec);
+/* The row log (dec_tracker.c), lock-free for any thread: the row playing at a
+ * source frame (0 when that frame is not decoded), and the rows starting in
+ * [from, to) that FA_TRACKER_ROW_EVENTS asks for (frames and order << 16 | row
+ * values, at most cap). */
+int fa_tracker_row_at(const struct fa_tracker* t, fa_frames frame, uint32_t* order, uint32_t* row);
+int fa_tracker_row_events_on(const struct fa_tracker* t);   /* FA_TRACKER_ROW_EVENTS is not 0 */
+uint32_t fa_tracker_rows_in(const struct fa_tracker* t, fa_frames from, fa_frames to, fa_frames* frames,
+                            int64_t* values, uint32_t cap);
 /* Frames of the text events, sorted, fixed while the decoder is open (read by the
  * audio thread to raise FA_EVENT_MIDI_TEXT). */
 const fa_frames* fa_midi_text_frames(const struct fa_midi* m, uint32_t* out_count);
