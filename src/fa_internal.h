@@ -391,7 +391,7 @@ void fa_shape_load(fa_shape_atomic* a, fa_shape* out);
  * end of the decode-ahead buffer), and ramps advance with the frames it makes. */
 
 #define FA_TEMPO_PARAMS 3            /* FA_PARAM_RATE, FA_PARAM_TEMPO, FA_PARAM_PITCH */
-#define FA_HEARD_RAMPS 8             /* ramp ends waiting to be heard (more: raised at once) */
+#define FA_HEARD_RAMPS 16            /* ramp ends waiting to be heard (more: raised at once) */
 #define FA_TPARAM_NOW INT64_MIN      /* a ramp start: wherever the chain is when it is first evaluated */
 
 typedef struct fa_tparam {
@@ -1049,6 +1049,7 @@ struct fa_stream {
         fa_atomic32 state;
         int64_t at, tag;
     } heard_ramps[FA_HEARD_RAMPS];
+    fa_atomic32 heard_waiting;   /* slots in state 2 or about to be */
     int tempo_fast, tempo_formants;
     uint32_t tempo_latency_ms;
     fa_tempo* tempo;             /* NULL until a parameter first leaves neutral */

@@ -577,11 +577,13 @@ static void test_ramp_done_when_heard(void)
     CHECK(wait_for(&rec, &rec.ramp_done, 1));
     CHECK_EQ(rec.last_tag, 91);
     CHECK_NEAR((double)rec.ramp_done_at, 0.625 * RATE, 1024 * 1.5 + 64);
-    /* Seeking with a ramp end still unheard raises it then, once. */
+    /* A seek with a ramp end still unheard keeps it, once, after the same
+     * playing time on the new timeline. */
     ramp.tag = 92;
     CHECK_EQ(fa_stream_ramp_param(s, FA_PARAM_PITCH, 2.0f, 50000000, 0, &ramp), FA_OK);
     for (i = 0; i < 4; i++) render(s, out, 1024);
     CHECK_EQ(fa_stream_seek(s, 2 * RATE), FA_OK);
+    for (i = 0; i < 10; i++) render(s, out, 1024);
     CHECK(wait_for(&rec, &rec.ramp_done, 2));
     CHECK_EQ(rec.last_tag, 92);
     for (i = 0; i < 20; i++) render(s, out, 1024);
