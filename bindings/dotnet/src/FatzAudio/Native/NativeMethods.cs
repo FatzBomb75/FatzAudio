@@ -368,6 +368,9 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_stream_get_tracker_param(StreamHandle stream, int param, out int value);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_tracker_position(StreamHandle stream, out uint order, out uint row);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_set_tracker_channel_mute(StreamHandle stream, uint channel, int muted);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

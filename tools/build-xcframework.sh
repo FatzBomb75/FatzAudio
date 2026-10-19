@@ -10,6 +10,7 @@ set -euo pipefail
 src=$(cd "$(dirname "$0")/.." && pwd)
 out=${1:-$src/build-ios}
 min=${FA_IOS_MIN:-13.0}
+jobs=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 build() {   # build <sdk> <architectures>
     # A single-config generator, so the frameworks land in bin/ (not bin/Release/).
@@ -19,7 +20,9 @@ build() {   # build <sdk> <architectures>
         -DCMAKE_OSX_ARCHITECTURES="$2" \
         -DCMAKE_OSX_DEPLOYMENT_TARGET="$min" \
         -DCMAKE_BUILD_TYPE=Release
-    cmake --build "$out/$1" --config Release --parallel
+    # An explicit job count: a bare --parallel lets make start every compile at
+    # once (500 clang processes for libopenmpt), which thrashes for hours.
+    cmake --build "$out/$1" --config Release --parallel "$jobs"
 }
 build iphoneos arm64
 build iphonesimulator "arm64;x86_64"

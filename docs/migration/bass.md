@@ -211,7 +211,8 @@ MOD, S3M, XM, IT, MPTM and many more play through the statically linked libopenm
 | BASS_MUSIC_FLOAT / BASS_MUSIC_STEREO / BASS_MUSIC_MONO | Always stereo 32-bit float at the mix rate; mix down with the channel matrix | — | ➖ |
 | BASS_MUSIC_NOSAMPLE, BASS_MUSIC_AUTOFREE, BASS_MUSIC_CALCLEN | No counterpart: samples are always loaded, you close the stream yourself, the length is always calculated | — | ➖ |
 | BASS_ChannelGetLength(BASS_POS_MUSIC_ORDER) (number of orders) | `fa_tracker_info.orders` from `fa_stream_get_tracker_info` | `TrackerInfo.Orders` | ✅ |
-| BASS_ChannelGetPosition(BASS_POS_MUSIC_ORDER) (the order and row being played) | Not yet: only the position in time is known | — | 🗓️ planned |
+| BASS_ChannelGetPosition(BASS_POS_MUSIC_ORDER) (the order and row being played) | `fa_stream_get_tracker_position`: the order and row heard now (at the clock), within about 2 ms of the row start; `FA_ERROR_NOT_FOUND` until that audio is decoded | `TrackerPosition` | ✅ |
+| Playing another subsong (BASS: seek to its first order with BASS_POS_MUSIC_ORDER) | `fa_open_options.audio_track`; `fa_stream_info.audio_track_count` is the count; a subsong past the last gives `FA_ERROR_NOT_FOUND` | `StreamOptions.AudioTrack`, `TrackerInfo.Subsong` | ✅ |
 | BASS_ChannelSetPosition with `MAKELONG(order, row)` | `fa_stream_seek_tracker(stream, order, row)`; `fa_stream_get_tracker_time` gives its time (`FA_ERROR_NOT_FOUND` for a row the song never plays) | `SeekTracker(order, row)`, `GetTrackerTime(order, row)` | ✅ |
 | BASS_ChannelGetInfo for a music (`BASS_CHANNELINFO.ctype`, plugin type strings) | `fa_tracker_info.type` and `type_name` | `TrackerInfo.Type`, `TypeName` | ✅ |
 | BASS_ChannelGetTags(BASS_TAG_MUSIC_NAME) | `fa_tracker_info.title`; `fa_tags_*` `FA_TAG_TITLE` | `TrackerInfo.Title`, `GetTags().Title` | ✅ |
@@ -228,7 +229,7 @@ MOD, S3M, XM, IT, MPTM and many more play through the statically linked libopenm
 | BASS_ATTRIB_MUSIC_VOL_CHAN + n (channel volume) | `fa_stream_set_tracker_channel_mute` mutes a channel (0 or full); a volume per channel is not exposed | `SetTrackerChannelMuted`, `IsTrackerChannelMuted` | ✅ mute; volume 🗓️ planned |
 | BASS_ATTRIB_MUSIC_VOL_INST + n (instrument volume) | Not exposed | — | 🗓️ planned |
 | BASS_ATTRIB_MUSIC_ACTIVE (voices in use) | Not exposed | — | ➖ |
-| BASS_SYNC_MUSICPOS (row reached) | Not yet. A marker at the time from `fa_stream_get_tracker_time(order, row)` fires when that row first plays ([crossfade.md](../features/crossfade.md)) | `Markers` + `GetTrackerTime` | 🗓️ planned (markers meanwhile) |
+| BASS_SYNC_MUSICPOS (row reached) | `FA_TRACKER_ROW_EVENTS` (1 every row, 2 first row of each order) raises `FA_EVENT_TRACKER_ROW` (value = order << 16 \| row). BASS lets you pick one position; here you filter in the handler ([trackers.md](../features/trackers.md#row-events)) | `TrackerRowEvents`, `TrackerRowReached` | ✅ |
 | BASS_SYNC_MUSICINST (instrument played) | Not available | — | 🗓️ planned |
 | BASS_SYNC_MUSICFX (effect `Zxx`/sync command hit) | Not available | — | 🗓️ planned |
 | BASS_SYNC_END | `FA_EVENT_ENDED` | `Ended` | ✅ |

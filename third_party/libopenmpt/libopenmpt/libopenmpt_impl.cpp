@@ -1094,10 +1094,20 @@ double module_impl::get_duration_seconds() const {
 
 double module_impl::get_time_at_position( std::int32_t order, std::int32_t row ) const {
 	const auto t = m_sndFile->GetLength( OpenMPT::eNoAdjust, OpenMPT::GetLengthTarget( static_cast<OpenMPT::ORDERINDEX>( order ), static_cast<OpenMPT::ROWINDEX>( row ) ) ).back();
-	if ( t.targetReached )
-		return t.duration;
-	else
+	if ( !t.targetReached )
 		return -1.0;
+	// FatzAudio: the time is from the start of the subsong the row is in; a row of
+	// another subsong than the one selected has no time in this one.
+	if ( m_current_subsong != all_subsongs ) {
+		std::unique_ptr<subsongs_type> subsongs_temp = has_subsongs_inited() ? std::unique_ptr<subsongs_type>() : std::make_unique<subsongs_type>( get_subsongs() );
+		const subsongs_type & subsongs = has_subsongs_inited() ? m_subsongs : *subsongs_temp;
+		if ( m_current_subsong < static_cast<std::int32_t>( subsongs.size() ) ) {
+			const subsong_data & cur = subsongs[m_current_subsong];
+			if ( static_cast<std::int32_t>( t.startOrder ) != cur.start_order || static_cast<std::int32_t>( t.startRow ) != cur.start_row )
+				return -1.0;
+		}
+	}
+	return t.duration;
 }
 
 void module_impl::select_subsong( std::int32_t subsong ) {

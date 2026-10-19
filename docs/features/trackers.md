@@ -7,7 +7,8 @@ FatzAudio plays tracker modules itself, with [libopenmpt](https://lib.openmpt.or
 | Formats | MOD, S3M, XM, IT, MPTM, MTM, UMX (Unreal music), 669, AMF, AMS, DBM, DIGI, DMF, DSM, FAR, GDM, IMF, J2B, MDL, MED, MO3, MT2, OKT, PLM, PSM, PTM, SFX, STM, ULT, WOW and the other formats libopenmpt reads |
 | Module information | Format, tracker program, title, artist, song message, channel, order, pattern, instrument, sample and subsong counts, restart position, duration |
 | Names | Song message, instrument, sample, channel, pattern and subsong names (UTF-8) |
-| Order and row | The time a row first plays, and seeking to an order and row |
+| Subsongs | Choosing the subsong to play, the subsong count and names |
+| Order and row | The time a row first plays, seeking to an order and row, the order and row heard now, and an event for each row (or each order) |
 | Live controls | Interpolation, stereo separation, volume ramping, Amiga resampler emulation, channel mute, plus every stream parameter (volume, tempo, pitch) |
 | Tags | Title, artist and song message as `FA_TAG_FORMAT_TRACKER` items |
 
@@ -17,7 +18,7 @@ MO3 files whose samples are MP3 or Ogg Vorbis compressed are not supported (`FA_
 
 ## Playing and looping
 
-A module plays **once**. The length is libopenmpt's duration of the song (capped at 6 hours), and the stream plays exactly that many frames. The module's own loop (the jump back to its restart position at the end) is not followed, so the length is always known and seeking, `FA_EVENT_ENDED`, crossfades and queues work as for a file. A module with several subsongs plays its first subsong; the others are listed by name but cannot be selected yet. To repeat the song, use the stream's loop toggle: it starts the whole song again from the beginning (`fa_stream_set_loop`, .NET `Loop`), not at the module's restart order. The restart position is reported in the module information if you want to build that yourself with an order/row seek.
+A module plays **once**. The length is libopenmpt's duration of the song (capped at 6 hours), and the stream plays exactly that many frames. The module's own loop (the jump back to its restart position at the end) is not followed, so the length is always known and seeking, `FA_EVENT_ENDED`, crossfades and queues work as for a file. A module with several subsongs plays its first subsong unless you pick another (see [Subsongs](#subsongs)). To repeat the song, use the stream's loop toggle: it starts the whole song again from the beginning (`fa_stream_set_loop`, .NET `Loop`), not at the module's restart order. The restart position is reported in the module information if you want to build that yourself with an order/row seek.
 
 Seeking is exact to the frame. libopenmpt restores the state at the row that holds the target (playing samples included) and the engine renders on to the frame without playing it. The result is very close to playing through but not always identical: an effect that depends on everything before it, such as a long pitch slide, may sound slightly different for a moment.
 
@@ -51,7 +52,10 @@ song.Loop = true;
 | `title`, `artist` | UTF-8, `""` when the file has none |
 | `channels`, `orders`, `patterns`, `instruments`, `samples`, `subsongs` | Counts. MOD has samples but no instruments; XM and IT have both |
 | `restart_order`, `restart_row` | Where the song's own loop goes back to |
-| `duration` | Seconds, the song played once |
+| `duration` | Seconds, the subsong played once |
+| `subsong` | The subsong playing: the `audio_track` the stream was opened with, 0 by default |
+
+`subsong` was added at the end of the struct: a shorter, older `struct_size` is still accepted and filled up to `duration`.
 
 The longer texts come from `fa_stream_get_tracker_text`: the type picks the list and the index the entry. The text is UTF-8, cut at a character boundary to fit the buffer, and `out_length` is its full length in bytes, so a call with capacity 0 asks for the size. An index out of range returns `FA_ERROR_NOT_FOUND`.
 
@@ -98,7 +102,7 @@ if (song.TrackerInfo is { } t)
 
 ## Order and row
 
-A module is a list of orders (each names a pattern) of rows. `fa_stream_get_tracker_time` gives the time, in seconds from the start, where the song first plays a row; `fa_stream_seek_tracker` seeks there. Both count from 0. `FA_ERROR_NOT_FOUND` means the song never plays that row: an order that is skipped by a jump, a row past the end of that order's pattern, or an order that belongs to a later subsong (.NET: `GetTrackerTime` returns `null`, `SeekTracker` throws).
+A module is a list of orders (each names a pattern) of rows. `fa_stream_get_tracker_time` gives the time, in seconds from the start, where the song first plays a row; `fa_stream_seek_tracker` seeks there. Both count from 0. `FA_ERROR_NOT_FOUND` means the song never plays that row: an order that is skipped by a jump, a row past the end of that order's pattern, or an order that belongs to another subsong than the one playing (.NET: `GetTrackerTime` returns `null`, `SeekTracker` throws).
 
 ```c
 double t;
@@ -112,7 +116,66 @@ TimeSpan? at = song.GetTrackerTime(4, 0);     // null when the song never plays 
 song.SeekTracker(4, 16);
 ```
 
-This is a map from the order list to time, for building a pattern jump list or a seek bar with order marks. Which order and row is being **heard** at this moment is not available yet 🗓️, nor are events raised at each row 🗓️ (planned: a "current position" call driven by the device clock, and a row sync event like `BASS_SYNC_MUSICPOS`). Until then you can follow the position yourself: build a table of `GetTrackerTime` for every order, and find the order with the clock.
+This is a map from the order list to time, for building a pattern jump list or a seek bar with order marks. The times count from the start of the subsong that plays; a row of another subsong returns `FA_ERROR_NOT_FOUND` (see [Subsongs](#subsongs)).
+
+### The order and row heard now
+
+`fa_stream_get_tracker_position` gives the order and row that are **heard** at this moment, that is at `fa_stream_get_clock`, not where the decoder has got to (it runs ahead of the speaker). It is accurate to within about 2 ms of the row start (`FA_TRACKER_STEP`, 64 frames), cheap and lock-free like the clock, so it is fine to call every video frame. It returns `FA_ERROR_NOT_FOUND` while that audio is not decoded yet: a stream that was never played or read, or just after a seek.
+
+```c
+uint32_t order, row;
+if (fa_stream_get_tracker_position(song, &order, &row) == FA_OK)
+    printf("order %u, row %u\n", order, row);
+```
+
+```csharp
+if (song.TrackerPosition is { } pos)               // null while not known
+    Console.WriteLine($"order {pos.Order}, row {pos.Row}");
+```
+
+### Row events
+
+Set `FA_TRACKER_ROW_EVENTS` to have `FA_EVENT_TRACKER_ROW` raised as rows are heard: 1 for every row, 2 for the first row of each order, 0 (the default) for none. The event's `frame` is the row's first frame and `value` is `order << 16 | row`. Like markers, the events are raised as the audio is mixed and are best effort (see [events](events.md)): a display that must follow every row should read the position above each frame instead. This is the `BASS_SYNC_MUSICPOS` equivalent; BASS lets you pick one position, here you filter in the handler.
+
+A row counts as the first of its order when the order changes or the song jumps back to row 0 of the same order. A row that repeats itself in place (a pattern loop on a single row, such as `E6x` on that row) raises one event, not one per pass.
+
+```c
+fa_stream_set_tracker_param(song, FA_TRACKER_ROW_EVENTS, 1);     /* every row */
+/* in the event callback */
+if (ev->type == FA_EVENT_TRACKER_ROW) {
+    uint32_t order = (uint32_t)(ev->value >> 16), row = (uint32_t)(ev->value & 0xFFFF);
+    if (order == 4 && row == 0) { /* the chorus starts */ }
+}
+```
+
+```csharp
+song.TrackerRowEvents = TrackerRowEvents.EveryRow;     // Off, EveryRow, Orders
+song.TrackerRowReached += (_, e) =>
+{
+    if (e.Position.Order == 4 && e.Position.Row == 0)   // also e.Time, e.Frame
+        Console.WriteLine("the chorus starts");
+};
+```
+
+## Subsongs
+
+Some modules hold several songs. They are the stream's audio tracks: `fa_stream_info.audio_track_count` is the subsong count, and `fa_open_options.audio_track` (.NET `StreamOptions.AudioTrack`) picks the one to play (0 by default). A subsong past the last returns `FA_ERROR_NOT_FOUND` from the open. `fa_tracker_info.subsong` (.NET `TrackerInfo.Subsong`) says which one plays, the names are in `FA_TRACKER_TEXT_SUBSONG` (.NET `TrackerInfo.Subsongs`), and the restart position and the duration are the playing subsong's.
+
+Orders and rows count in the module as a whole, but times count from the start of the playing subsong. `fa_stream_get_tracker_time` and `fa_stream_seek_tracker` return `FA_ERROR_NOT_FOUND` for a row that belongs to another subsong.
+
+```c
+fa_open_options opts;
+fa_open_options_init(&opts);
+opts.audio_track = 2;               /* the third subsong */
+fa_stream* song = NULL;
+if (fa_stream_open_path(engine, "multi.it", &opts, &song) == FA_ERROR_NOT_FOUND)
+    puts("the module has fewer than three subsongs");
+```
+
+```csharp
+using var song = engine.OpenFile("multi.it", new StreamOptions { AudioTrack = 2 });
+Console.WriteLine($"subsong {song.TrackerInfo!.Subsong} of {song.TrackerInfo.Subsongs.Count}");
+```
 
 ## Render settings
 
@@ -124,6 +187,7 @@ Settings change while the song plays and are heard after the decode-ahead buffer
 | `FA_TRACKER_STEREO_SEPARATION` | `TrackerStereoSeparation` | percent, 0 (mono) to 200 | 100 |
 | `FA_TRACKER_VOLUME_RAMPING` | `TrackerVolumeRamping` | -1 default, 0 off (may click), 1 to 10 softer ramps | -1 |
 | `FA_TRACKER_AMIGA_RESAMPLER` | `TrackerAmigaResampler` | 1 Amiga MOD files sound as on an Amiga's Paula chip, 0 off (the ordinary interpolation) | 1 (on) |
+| `FA_TRACKER_ROW_EVENTS` | `TrackerRowEvents` | 0 none, 1 an event for every row, 2 only the first row of each order (see [Row events](#row-events)) | 0 |
 
 ```c
 fa_stream_set_tracker_param(song, FA_TRACKER_INTERPOLATION, 2);         /* linear */
@@ -170,4 +234,4 @@ Console.WriteLine($"{tags.Title} / {tags.Artist}");
 - Output is always stereo; there is no surround mode.
 - Streams that are not modules return `FA_ERROR_INVALID_ARG` from every tracker call.
 - libopenmpt renders differently from BASS's own MOD player (resampling, filtering, levels), so a song does not sound bit for bit as it did.
-- Not available yet 🗓️: the order and row being heard, row sync events, and the live module controls BASS has as `BASS_ATTRIB_MUSIC_*` (tempo, speed, per-channel and per-instrument volume). See the [BASS migration table](../migration/bass.md#tracker-music).
+- Not available yet 🗓️: the live module controls BASS has as `BASS_ATTRIB_MUSIC_*` (tempo, speed, per-channel and per-instrument volume). See the [BASS migration table](../migration/bass.md#tracker-music).

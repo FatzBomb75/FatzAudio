@@ -435,6 +435,7 @@ internal unsafe struct FaTrackerInfo
     public uint Channels, Orders, Patterns, Instruments, Samples, Subsongs;
     public int RestartOrder, RestartRow;
     public double Duration;
+    public int Subsong;
 }
 
 [StructLayout(LayoutKind.Sequential)]
