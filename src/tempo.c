@@ -8,6 +8,18 @@
 
 #define FA_TEMPO_XFADE 256   /* frames of crossfade from the dry signal when the stretcher engages */
 
+/* Transient mode (all in output time, ms): the input replaces the stretcher's
+ * output from PRE before an onset to POST after it, with FADE-long crossfades.
+ * PRE covers the stretcher's pre-echo (it smears up to about a block ahead). */
+#define FA_TR_PRE_MS 24.0
+#define FA_TR_POST_MS 12.0
+#define FA_TR_FADE_MS 4.0
+#define FA_TR_HOP 128           /* onset detector hop, frames */
+#define FA_TR_RISE 8.0f         /* an onset: a hop this many times the energy of the hops before */
+#define FA_TR_FLOOR 3e-6f       /* and at least this energy (about -55 dB) */
+#define FA_TR_MIN_HISTORY 4     /* hops seen before the first onset can be found */
+#define FA_TR_GAP_MS 60.0       /* onsets closer than this are one */
+
 static fa_result grow(float** buf, int64_t* cap, int64_t frames, uint32_t channels)
 {
     float* b;
@@ -42,6 +54,7 @@ void fa_tempo_free(fa_tempo* t)
     free(t->sbuf);
     free(t->tail);
     free(t->obuf);
+    free(t->raw);
     memset(t, 0, sizeof(*t));
 }
 
@@ -58,10 +71,11 @@ void fa_tempo_reset(fa_tempo* t, double src)
     t->produced = 0;
 }
 
-void fa_tempo_configure(fa_tempo* t, int fast, int keep_formants)
+void fa_tempo_configure(fa_tempo* t, int fast, int keep_formants, int transients)
 {
     t->fast = fast != 0;
     t->keep_formants = keep_formants != 0;
+    t->transients = transients != 0;
 }
 
 int fa_tempo_engaged(const fa_tempo* t) { return t->st_on || t->vs_on; }
@@ -113,6 +127,119 @@ static void xfade_in(fa_tempo* t, float* out, int64_t n)
     }
 }
 
+/* ---- transient mode ------------------------------------------------------ */
+
+/* Appends the stretcher's input (n frames) and looks for onsets in it. What no
+ * splice can reach any more (it reads at most PRE + FADE behind an onset still
+ * ahead of the output) is dropped first. */
+static fa_result raw_push(fa_tempo* t, const float* in, int64_t n)
+{
+    uint32_t ch = t->channels, c;
+    double ms = t->rate / 1000.0, ratio = t->last_tempo > 0.0 ? t->last_tempo : 1.0;
+    double window = (FA_TR_PRE_MS + FA_TR_POST_MS + 2.0 * FA_TR_FADE_MS) * ms, gap = FA_TR_GAP_MS * ms;
+    int64_t keep_from = (int64_t)floor(t->st_src) - (int64_t)(4.0 * window * (ratio > 1.0 ? ratio : 1.0)) - 1;
+    int64_t drop = keep_from - t->raw_base, i;
+    fa_result r;
+    if (drop > 0 && t->raw_n + n > t->raw_cap) {
+        if (drop > t->raw_n) drop = t->raw_n;
+        memmove(t->raw, t->raw + (size_t)drop * ch, (size_t)(t->raw_n - drop) * ch * sizeof(float));
+        t->raw_n -= drop;
+        t->raw_base += drop;
+    }
+    /* Twice what is kept, so the move above is rare. */
+    r = grow(&t->raw, &t->raw_cap, 2 * (t->raw_n + n), ch);
+    if (r != FA_OK) return r;
+    memcpy(t->raw + (size_t)t->raw_n * ch, in, (size_t)n * ch * sizeof(float));
+    /* Windows must not overlap in the output: at a speed-up they come closer. */
+    if (gap < window * ratio) gap = window * ratio;
+    for (i = 0; i < n; i++) {
+        const float* f = in + (size_t)i * ch;
+        double e = 0.0;
+        for (c = 0; c < ch; c++) e += (double)f[c] * f[c];
+        t->hop_e += e / ch;
+        if (++t->hop_fill < FA_TR_HOP) continue;
+        {
+            float hop = (float)(t->hop_e / FA_TR_HOP), before = 0.0f;
+            int64_t at = t->raw_base + t->raw_n + i + 1 - FA_TR_HOP;
+            int k, m = t->hop_count < FA_TR_HISTORY ? t->hop_count : FA_TR_HISTORY;
+            for (k = 0; k < m; k++) before += t->hop_hist[k];
+            before = m ? before / (float)m : 0.0f;
+            /* A few hops of history at least (about 10 ms), so engaging mid-note is no onset. */
+            if (m >= FA_TR_MIN_HISTORY && hop > FA_TR_RISE * before + FA_TR_FLOOR &&
+                (double)(at - t->last_onset) > gap && t->onset_n < FA_TR_ONSETS) {
+                t->onsets[t->onset_n].u = at;
+                t->onsets[t->onset_n].fixed = 0;
+                t->onset_n++;
+                t->last_onset = at;
+            }
+            t->hop_hist[t->hop_count % FA_TR_HISTORY] = hop;
+            t->hop_count++;
+            t->hop_e = 0.0;
+            t->hop_fill = 0;
+        }
+    }
+    t->raw_n += n;
+    return FA_OK;
+}
+
+static float tr_weight(double d, double pre, double post, double fade)
+{
+    if (d < -pre - fade || d > post + fade) return 0.0f;
+    if (d < -pre) return (float)(0.5 - 0.5 * cos(FA_TEMPO_PI * (d + pre + fade) / fade));
+    if (d > post) return (float)(0.5 + 0.5 * cos(FA_TEMPO_PI * (d - post) / fade));
+    return 1.0f;
+}
+
+/* The stretcher's output `out` (nout frames; the first at source position src0,
+ * then `ratio` source frames per frame): around each onset, the input itself at
+ * its own speed. Where an onset lands in the output is fixed once, as its window
+ * comes in reach, so the input then advances exactly a frame per output frame
+ * even while the tempo ramps. */
+static void splice_transients(fa_tempo* t, float* out, int64_t nout, double src0, double ratio)
+{
+    uint32_t ch = t->channels, c;
+    double ms = t->rate / 1000.0, pre = FA_TR_PRE_MS * ms, post = FA_TR_POST_MS * ms, fade = FA_TR_FADE_MS * ms;
+    double out0 = (double)t->st_out;
+    int k = 0, n;
+    if (nout <= 0 || ratio <= 0.0) return;
+    for (n = 0; n < t->onset_n; n++) {
+        int64_t u = t->onsets[n].u, j, j0, j1;
+        if (!t->onsets[n].fixed) {
+            double v = out0 + ((double)u - src0) / ratio;
+            if (v - pre - fade >= out0 + (double)nout) continue;         /* not in reach yet */
+            t->onsets[n].v = v;
+            t->onsets[n].fixed = 1;
+            /* The whole window's input must be there, or the splice would start
+             * or stop without its crossfade: skip this onset then. */
+            if (v - pre - fade < out0 || (double)u - pre - fade < (double)t->raw_base ||
+                (double)u + post + fade + 2.0 >= (double)(t->raw_base + t->raw_n)) {
+                t->onsets[n].v = -1e300;
+                continue;
+            }
+        }
+        j0 = (int64_t)ceil(t->onsets[n].v - pre - fade - out0);
+        j1 = (int64_t)floor(t->onsets[n].v + post + fade - out0);
+        if (j0 < 0) j0 = 0;
+        if (j1 >= nout) j1 = nout - 1;
+        for (j = j0; j <= j1; j++) {
+            double d = out0 + (double)j - t->onsets[n].v, q = (double)u + d - (double)t->raw_base;
+            int64_t i = (int64_t)floor(q);
+            float w = tr_weight(d, pre, post, fade), fr = (float)(q - (double)i);
+            const float* r0;
+            if (w <= 0.0f || i < 0 || i + 1 >= t->raw_n) continue;
+            r0 = t->raw + (size_t)i * ch;
+            for (c = 0; c < ch; c++) {
+                float dry = r0[c] + (r0[c + ch] - r0[c]) * fr;
+                out[(size_t)j * ch + c] += (dry - out[(size_t)j * ch + c]) * w;
+            }
+        }
+    }
+    /* Keep the onsets the next output can still reach. */
+    for (n = 0; n < t->onset_n; n++)
+        if (!t->onsets[n].fixed || t->onsets[n].v + post + fade >= out0 + (double)nout) t->onsets[k++] = t->onsets[n];
+    t->onset_n = k;
+}
+
 static fa_result engage_stretcher(fa_stretch** st, fa_tempo* t, double tempo)
 {
     if (*st && t->st_fast != t->fast) {    /* made for the other quality */
@@ -134,6 +261,14 @@ static fa_result engage_stretcher(fa_stretch** st, fa_tempo* t, double tempo)
     t->xfade = t->produced > 0 ? FA_TEMPO_XFADE : 0;
     t->xfade_pos = 0;
     t->xfade_ratio = tempo;
+    /* Transient mode: the input from prime[0] on (the first output frame). */
+    t->raw_n = 0;
+    t->raw_base = (int64_t)floor(t->prime_src + 0.5);
+    t->hop_e = 0.0;
+    t->hop_fill = t->hop_count = t->onset_n = 0;
+    t->last_onset = INT64_MIN / 2;
+    t->st_out = 0;
+    t->st_transients = t->transients;   /* a change applies when it next engages */
     return FA_OK;
 }
 
@@ -143,7 +278,7 @@ static fa_result stage_one(fa_tempo* t, const float* in, int64_t n, double tempo
                            const float** a, int64_t* na)
 {
     uint32_t ch = t->channels;
-    double exact;
+    double exact, src0;
     int64_t nout;
     fa_result r;
     *a = in;
@@ -162,6 +297,10 @@ static fa_result stage_one(fa_tempo* t, const float* in, int64_t n, double tempo
         fa_stretch_set_formants(t->st, formants);
         t->formants = formants;
     }
+    if (t->st_transients && n > 0) {
+        r = raw_push(t, in, n);
+        if (r != FA_OK) return r;
+    }
     if (t->priming) {
         r = grow(&t->prime, &t->prime_cap, t->prime_n + n, ch);
         if (r != FA_OK) return r;
@@ -178,14 +317,18 @@ static fa_result stage_one(fa_tempo* t, const float* in, int64_t n, double tempo
         n = t->prime_n - t->prime_need;
         if (n == 0) return FA_OK;
     }
+    src0 = t->st_src - t->frac * tempo;   /* the next output frame (see head) */
     exact = t->frac + (double)n / tempo;
     nout = (int64_t)exact;
     t->frac = exact - (double)nout;
     r = grow(&t->sbuf, &t->scap, nout > 0 ? nout : 1, ch);
     if (r != FA_OK) return r;
     if (!fa_stretch_process(t->st, in, (int)n, t->sbuf, (int)nout)) return FA_ERROR_OUT_OF_MEMORY;
-    t->st_src += (double)n;
     if (t->xfade > 0) xfade_in(t, t->sbuf, nout);
+    /* With formants kept, the input is not what the stretcher's output sounds like. */
+    if (t->st_transients && nout > 0 && formants == 1.0) splice_transients(t, t->sbuf, nout, src0, tempo);
+    t->st_out += nout;
+    t->st_src += (double)n;
     *a = t->sbuf;
     *na = nout;
     return FA_OK;

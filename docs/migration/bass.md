@@ -415,6 +415,7 @@ bass_fx needs a decode stream wrapped in a separate tempo stream; FatzAudio puts
 | BASS_ATTRIB_TEMPO_OPTION_USE_QUICKALGO | `fa_tempo_options.quality = FA_STRETCH_FAST` | `TempoOptions.Quality` | ✅ |
 | BASS_ATTRIB_TEMPO_OPTION_USE_AA_FILTER / AA_FILTER_LENGTH | Not needed: the resampler is always band-limited (windowed sinc, about -90 dB) | — | ➖ (by design) |
 | BASS_ATTRIB_TEMPO_OPTION_SEQUENCE_MS / SEEKWINDOW_MS / OVERLAP_MS / PREVENT_CLICK | Not needed: no splicing to tune. The stretcher is a phase vocoder; `quality` picks its block size | — | ➖ (by design) |
+| Tuning SEQUENCE_MS / SEEKWINDOW_MS short to keep drums crisp | `fa_tempo_options.quality = FA_STRETCH_TRANSIENTS`: hits played as they are, no pre-echo, on time ([transient mode](../features/tempo-pitch.md#transient-mode)) | `TempoOptions.Quality = StretchQuality.Transients` | ✅ |
 | Formant-preserving pitch (not in bass_fx) | `fa_tempo_options.keep_formants = 1` | `TempoOptions.KeepFormants` | ✅ |
 | Keeping the buffer short so tempo changes respond quickly | `fa_tempo_options.latency_ms` (default 150) | `TempoOptions.Latency` | ✅ |
 | Converting positions back with BASS_FX_TempoGetRateRatio | Not needed: positions, markers, the clock and CD+G stay in song time | — | ➖ (by design) |

@@ -15,6 +15,7 @@ SoundTouch (and wrappers around it such as NAudio's `SoundTouchWaveProvider` or 
 | `SETTING_USE_AA_FILTER`, `SETTING_AA_FILTER_LENGTH` | Not needed: the resampler is always band-limited | — |
 | `SETTING_SEQUENCE_MS`, `SETTING_SEEKWINDOW_MS`, `SETTING_OVERLAP_MS` | Not needed: nothing to tune | — |
 | `numUnprocessedSamples`, `getInputOutputSampleRatio` to correct positions | Not needed: positions and the clock are in song time | `stream.Position`, `stream.Clock` |
+| Short sequence settings to keep drums crisp | `fa_tempo_options.quality = FA_STRETCH_TRANSIENTS` ([transient mode](../features/tempo-pitch.md#transient-mode)) | `TempoOptions.Quality = StretchQuality.Transients` |
 | (not available) | Formant-preserving key changes: `fa_tempo_options.keep_formants` | `TempoOptions.KeepFormants` |
 | (not available) | Ramps with curves and exact start times | `Ramp`, `RampAsync` |
 

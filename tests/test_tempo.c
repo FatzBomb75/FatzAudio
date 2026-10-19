@@ -903,6 +903,10 @@ static void test_params_and_options_api(void)
     CHECK_EQ(o.quality, FA_STRETCH_FAST);
     CHECK_EQ(o.keep_formants, 1);
     CHECK_EQ(o.latency_ms, 50);
+    o.quality = FA_STRETCH_TRANSIENTS;
+    CHECK_EQ(fa_stream_set_tempo_options(s, &o), FA_OK);
+    CHECK_EQ(fa_stream_get_tempo_options(s, &o), FA_OK);
+    CHECK_EQ(o.quality, FA_STRETCH_TRANSIENTS);
     o.quality = (fa_stretch_quality)7;
     CHECK_EQ(fa_stream_set_tempo_options(s, &o), FA_ERROR_INVALID_ARG);
     CHECK_EQ(fa_stream_set_tempo_options(s, NULL), FA_OK);           /* defaults */
@@ -937,6 +941,132 @@ static void test_fast_and_formants(void)
     free(y);
 }
 
+/* Drum-like hits: a noise burst decaying in 60 ms every 0.5 s (from 0.25 s), silence between. */
+static float hits_sig(double t, int c)
+{
+    double k = floor((t - 0.25) / 0.5), at = t - 0.25 - k * 0.5;
+    uint32_t seed = (uint32_t)(t * RATE + 0.5) * 2654435761u;
+    (void)c;
+    if (t < 0.25 || at > 0.3) return 0.0f;
+    seed ^= seed >> 15;
+    return (float)(0.8 * exp(-at / 0.015) * ((double)(seed & 0xffff) / 32768.0 - 1.0));
+}
+
+/* Median pre-echo (dB below the hit) and timing error (ms) of the hits in y at
+ * `tempo`, measured like tools/tempo-compare. */
+static void measure_hits(const float* y, int64_t n, double tempo, double* echo_db, double* timing_ms)
+{
+    int64_t ms = RATE / 1000, k, i;
+    double echoes[64], times[64];
+    int m = 0, a, b;
+    float* env = (float*)calloc((size_t)n, sizeof(float));
+    for (i = ms; i < n - ms; i++) {
+        double e = 0.0;
+        int64_t j;
+        for (j = -ms / 2; j < ms / 2; j++) e += (double)y[(i + j) * 2] * y[(i + j) * 2];
+        env[i] = (float)sqrt(e / (double)ms);
+    }
+    for (k = 0; m < 64; k++) {
+        int64_t want = (int64_t)((0.25 + 0.5 * (double)k) / tempo * RATE), lo = want - 40 * ms, hi = want + 40 * ms, on = -1;
+        float peak = 0.0f, before = 0.0f;
+        if (hi + 30 * ms >= n) break;
+        for (i = lo; i < hi + 30 * ms; i++) if (env[i] > peak) peak = env[i];
+        for (i = lo; i < hi && on < 0; i++) if (env[i] >= 0.5f * peak) on = i;
+        for (i = on - 28 * ms; i < on - 3 * ms; i++) if (env[i] > before) before = env[i];
+        echoes[m] = 20.0 * log10((before + 1e-9) / (peak + 1e-9));
+        times[m] = fabs((double)(on - want)) * 1000.0 / RATE;
+        m++;
+    }
+    free(env);
+    for (a = 0; a < m; a++)       /* sort both for the medians */
+        for (b = a + 1; b < m; b++) {
+            double t;
+            if (echoes[b] < echoes[a]) { t = echoes[a]; echoes[a] = echoes[b]; echoes[b] = t; }
+            if (times[b] < times[a]) { t = times[a]; times[a] = times[b]; times[b] = t; }
+        }
+    *echo_db = m ? echoes[m / 2] : 0.0;
+    *timing_ms = m ? times[m / 2] : 99.0;
+}
+
+/* Tone bursts: 0.2 s of 440 Hz (88 whole cycles, so from and back to zero) every 0.5 s. */
+static float bursts(double t, int c)
+{
+    double at = fmod(t, 0.5);
+    (void)c;
+    return at < 0.2 ? (float)(0.5 * sin(2 * PI * 440.0 * at)) : 0.0f;
+}
+
+static float* render_quality(gen_fn gen, double seconds, fa_stretch_quality q, float tempo, int64_t* n)
+{
+    fa_stream* s = open_wav((uint32_t)(seconds * RATE), gen, FA_OPEN_DECODE_ONLY);
+    fa_tempo_options o;
+    float* y;
+    if (!s) return NULL;
+    fa_tempo_options_init(&o);
+    o.quality = q;
+    fa_stream_set_tempo_options(s, &o);
+    fa_stream_set_param(s, FA_PARAM_TEMPO, tempo);
+    y = read_all(s, n);
+    fa_stream_close(s);
+    return y;
+}
+
+static void test_transient_mode(void)
+{
+    const float tempos[2] = { 0.8f, 1.25f };
+    double f = 440.0;
+    int k;
+    for (k = 0; k < 2; k++) {
+        double e_best, t_best, e_tr, t_tr;
+        int64_t n1 = 0, n2 = 0;
+        float* y1 = render_quality(hits_sig, 6.0, FA_STRETCH_BEST, tempos[k], &n1);
+        float* y2 = render_quality(hits_sig, 6.0, FA_STRETCH_TRANSIENTS, tempos[k], &n2);
+        CHECK(y1 && y2);
+        CHECK_EQ(n1, n2);
+        measure_hits(y1, n1, tempos[k], &e_best, &t_best);
+        measure_hits(y2, n2, tempos[k], &e_tr, &t_tr);
+        printf("  hits at tempo %.2f: pre-echo %.1f dB -> %.1f dB, timing %.1f -> %.1f ms\n",
+               tempos[k], e_best, e_tr, t_best, t_tr);
+        CHECK(e_tr < -40.0 && e_tr < e_best - 10.0);
+        CHECK(t_tr < 1.5);
+        free(y1);
+        free(y2);
+    }
+    /* While the tempo ramps, the input played around an onset still runs at
+     * exactly its own speed: no jumps, so no larger steps than BEST has. */
+    {
+        double step[2] = { 0.0, 0.0 };
+        int q;
+        for (q = 0; q < 2; q++) {
+            fa_stream* s = open_wav(6 * RATE, bursts, FA_OPEN_DECODE_ONLY);
+            fa_tempo_options o;
+            float* y;
+            int64_t n = 0, i;
+            CHECK(s != NULL);
+            fa_tempo_options_init(&o);
+            o.quality = q ? FA_STRETCH_TRANSIENTS : FA_STRETCH_BEST;
+            fa_stream_set_tempo_options(s, &o);
+            CHECK_EQ(fa_stream_ramp_param(s, FA_PARAM_TEMPO, 1.6f, 3000000000, 0, NULL), FA_OK);
+            y = read_all(s, &n);
+            fa_stream_close(s);
+            for (i = 1; i < n; i++) step[q] = fmax(step[q], fabs((double)y[i * 2] - y[(i - 1) * 2]));
+            free(y);
+        }
+        printf("  tone bursts under a tempo ramp: largest step %.4f (best %.4f)\n", step[1], step[0]);
+        CHECK(step[1] < step[0] * 1.05 + 0.002);
+    }
+    /* A held tone has no onsets: the same sound as BEST. */
+    {
+        int64_t n1 = 0, n2 = 0;
+        float* y1 = render_quality(sine440, 4.0, FA_STRETCH_BEST, 1.15f, &n1);
+        float* y2 = render_quality(sine440, 4.0, FA_STRETCH_TRANSIENTS, 1.15f, &n2);
+        CHECK(y1 && y2);
+        CHECK_NEAR(tone_score(y2, n2, &f, 1), tone_score(y1, n1, &f, 1), 0.5);
+        free(y1);
+        free(y2);
+    }
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -968,6 +1098,7 @@ int main(void)
     RUN(test_fast_and_formants);
     RUN(test_device_rate_is_sinc);
     RUN(test_device_rate_timing_and_end);
+    RUN(test_transient_mode);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

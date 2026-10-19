@@ -83,6 +83,9 @@ int64_t fa_varispeed_tail(void);
 
 /* ---- The chain (tempo.c) -------------------------------------------------- */
 
+#define FA_TR_HISTORY 8            /* transient mode: hops of energy an onset is compared with */
+#define FA_TR_ONSETS 16            /* onsets waiting to be played (more are dropped) */
+
 typedef struct fa_tempo {
     uint32_t channels, rate;
     int fast, keep_formants;
@@ -115,6 +118,25 @@ typedef struct fa_tempo {
     double last_tempo;          /* source frames per stage-one frame, last run */
     double formants;            /* the stretcher's formant factor, last run */
     int64_t produced;           /* output frames since the last reset */
+
+    /* Transient mode: the input around each onset replaces the stretcher's output
+     * there, so hits keep their attack with no pre-echo (tempo.c). */
+    int transients;
+    int st_transients;          /* transients as the stretcher engaged (state below is for it) */
+    float* raw;                 /* the stretcher's input, from source position raw_base */
+    int64_t raw_n, raw_cap, raw_base;
+    double hop_e;               /* onset detector: energy of the hop being summed */
+    int hop_fill;
+    float hop_hist[FA_TR_HISTORY];   /* the last hops' energies */
+    int hop_count;
+    struct {
+        int64_t u;              /* source position of the onset */
+        double v;               /* output frame (since engaging) it lands on; once fixed */
+        int fixed;
+    } onsets[FA_TR_ONSETS];     /* onsets not yet passed */
+    int onset_n;
+    int64_t last_onset;
+    int64_t st_out;             /* stage-one output frames since engaging */
 } fa_tempo;
 
 fa_result fa_tempo_init(fa_tempo* t, uint32_t channels, uint32_t rate);
@@ -123,7 +145,7 @@ void fa_tempo_free(fa_tempo* t);
 void fa_tempo_reset(fa_tempo* t, double src);
 /* keep_formants applies at once; a new quality when the stretcher next engages
  * (after a reset). */
-void fa_tempo_configure(fa_tempo* t, int fast, int keep_formants);
+void fa_tempo_configure(fa_tempo* t, int fast, int keep_formants, int transients);
 /* Is any stage engaged? Until then fa_tempo_run hands back its input. */
 int fa_tempo_engaged(const fa_tempo* t);
 /* Runs `frames` input frames at tempo (multiplier), pitch (semitones) and rate

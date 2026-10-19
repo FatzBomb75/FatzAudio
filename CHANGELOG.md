@@ -18,6 +18,9 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- Transient mode for tempo and pitch: `FA_STRETCH_TRANSIENTS` (.NET `StretchQuality.Transients`) plays the original
+  audio around each onset, so drum hits have no pre-echo (-50 dB instead of -25 dB) and stay on time. See
+  [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md#transient-mode).
 - Tracker modules: MOD, XM, S3M, IT, MPTM and the other formats libopenmpt reads (MTM, UMX, 669, AMF, DBM, MED,
   PSM and more) open with the ordinary `fa_stream_open_*` calls and play once (loop with the stream's loop
   toggle). libopenmpt 0.8.9 is built in (`third_party/libopenmpt`, BSD-3-Clause), so a C++17 compiler is

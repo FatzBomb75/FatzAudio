@@ -131,6 +131,10 @@ public enum StretchQuality
     Best = 0,
     /// <summary>100 ms blocks, about a third less CPU, slightly less clean.</summary>
     Fast = 1,
+    /// <summary><see cref="Best"/> with the original audio played around each onset (drum hits, plucks): no pre-echo
+    /// before hits, which stay sharp and on time. For drum-heavy material; a note starting under a held chord can get
+    /// a faint seam.</summary>
+    Transients = 2,
 }
 
 /// <summary>How a stream processes <see cref="AudioParameter.Tempo"/>, <see cref="AudioParameter.Pitch"/> and <see cref="AudioParameter.Rate"/>.</summary>

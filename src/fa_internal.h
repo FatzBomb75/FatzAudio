@@ -1050,7 +1050,7 @@ struct fa_stream {
         int64_t at, tag;
     } heard_ramps[FA_HEARD_RAMPS];
     fa_atomic32 heard_waiting;   /* slots in state 2 or about to be */
-    int tempo_fast, tempo_formants;
+    int tempo_fast, tempo_formants, tempo_transients;
     uint32_t tempo_latency_ms;
     fa_tempo* tempo;             /* NULL until a parameter first leaves neutral */
     int tempo_drained;           /* the chain gave back its tail at the end of the source */
