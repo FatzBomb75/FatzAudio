@@ -107,5 +107,5 @@ output.Muted = true;
 
 ## Pitfalls
 
-- Resampling to the device rate currently uses miniaudio's linear resampler with a low-pass filter. The windowed-sinc resampler (R12) now exists for rate and pitch ([tempo and pitch](tempo-pitch.md)); moving the device-rate conversion onto it is planned (see the engineering notes).
+- Resampling to the device rate (a 44.1 kHz file on a 48 kHz device, say) uses the same windowed-sinc resampler as rate and pitch ([tempo and pitch](tempo-pitch.md)): Kaiser window, about -90 dB of aliasing and imaging, 96 taps when converting up and wider by the ratio when converting down (192 for 96 kHz on a 48 kHz device). A 17 kHz tone played from 44.1 kHz on a 48 kHz device measures 108 dB signal-to-error (miniaudio's linear resampler, used before, measured 8 dB on the same test). It adds no delay, and its look-ahead is flushed at the end of the stream so the last frames are heard. It runs on a decode worker (one multiply-add per tap and sample), nothing on the audio thread. Ratios above 80 to 1 (a 768 kHz source on an 8 kHz device) fall back to a linear resampler.
 - Decode-only streams (`FA_OPEN_DECODE_ONLY`) don't use workers or buffers: `fa_stream_read` decodes on your thread.

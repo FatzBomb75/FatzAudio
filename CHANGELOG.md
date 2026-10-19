@@ -41,6 +41,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   `TrackerRowReached`).
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
+### Changed
+
+- Playback at another rate than the device's (a 44.1 kHz file on a 48 kHz device) is resampled with the windowed-sinc
+  resampler that rate and pitch use, instead of miniaudio's linear one: about -90 dB of aliasing and imaging, and
+  high frequencies no longer dulled. See [docs/features/playback.md](docs/features/playback.md).
+
 ## 0.2.0 (2026-10-18)
 
 The first packaged version (NuGet `FatzAudio` with `win-x64` and `linux-x64` natives).

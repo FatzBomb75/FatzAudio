@@ -481,6 +481,106 @@ static void test_clock_runs_at_tempo(void)
     fa_stream_close(s);
 }
 
+/* ---- device-rate conversion (the sinc resampler, resample_device.c) ----------- */
+
+#define SRC_RATE 44100
+
+static float sine17k(double t, int c) { (void)c; return (float)(0.5 * sin(2 * PI * 17000.0 * t)); }
+static float sine30k(double t, int c) { (void)c; return (float)(0.5 * sin(2 * PI * 30000.0 * t)); }
+
+static fa_stream* open_attached_at(uint32_t rate, uint32_t frames, gen_fn gen)
+{
+    size_t n;
+    uint8_t* wav = make_wav(rate, frames, gen, &n);
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_open_options_init(&o);
+    if (fa_stream_open_memory(g_engine, wav, n, &o, &s) != FA_OK) s = NULL;
+    free(wav);
+    if (s && fa_stream_attach(s, g_dev, NULL) != FA_OK) { fa_stream_close(s); s = NULL; }
+    return s;
+}
+
+/* Plays a source at `rate` on the 48 kHz device to its end; the output, malloc'd. */
+static float* play_resampled(uint32_t rate, uint32_t frames, gen_fn gen, int64_t* out_frames, fa_frames* end_pos)
+{
+    fa_stream* s = open_attached_at(rate, frames, gen);
+    int64_t n = 0, cap = (int64_t)frames * 2 + 8192;
+    float* out;
+    int i;
+    *out_frames = 0;
+    if (!s) return NULL;
+    out = (float*)calloc((size_t)cap * 2, sizeof(float));
+    fa_stream_play(s);
+    for (i = 0; i < 400 && n + 1024 <= cap; i++) {
+        render(s, out + n * 2, 1024);
+        n += 1024;
+        if (fa_load32(&s->eof) && fa_ring_readable(&s->ring) == 0) break;
+    }
+    fa_stream_get_position(s, end_pos);
+    fa_stream_close(s);
+    *out_frames = n;
+    return out;
+}
+
+static void test_device_rate_is_sinc(void)
+{
+    const double f1k = 1000.0, f17k = 17000.0;
+    int64_t n = 0;
+    fa_frames end = 0;
+    float* y;
+    if (g_dev->rate != RATE) { printf("  skipped (device at %u Hz)\n", g_dev->rate); return; }
+    /* A tone near the top of the band: linear interpolation leaves images (at
+     * 44.1 - 17 = 27.1 kHz, folding to 20.9 kHz) at about -40 dB. */
+    y = play_resampled(SRC_RATE, 3 * SRC_RATE, sine17k, &n, &end);
+    CHECK(y != NULL);
+    {
+        double snr = tone_score(y, 2 * RATE, &f17k, 1);
+        printf("  17 kHz, 44.1 -> 48 kHz: %.1f dB\n", snr);
+        CHECK(snr > 80.0);
+    }
+    free(y);
+    y = play_resampled(SRC_RATE, 3 * SRC_RATE, sine1k, &n, &end);
+    CHECK(y != NULL);
+    {
+        double snr = tone_score(y, 2 * RATE, &f1k, 1);
+        printf("  1 kHz, 44.1 -> 48 kHz: %.1f dB\n", snr);
+        CHECK(snr > 90.0);
+    }
+    free(y);
+    /* Down from 96 kHz: a 30 kHz tone is above the device's band and must go,
+     * not fold back to 18 kHz. */
+    y = play_resampled(96000, 2 * 96000, sine30k, &n, &end);
+    CHECK(y != NULL);
+    {
+        double e = 0.0, db;
+        int64_t k;
+        for (k = RATE / 4; k < RATE * 3 / 2; k++) e += (double)y[k * 2] * y[k * 2];
+        db = 10.0 * log10(e / (double)(RATE * 5 / 4) / 0.125 + 1e-30);  /* against the tone's 0.125 power */
+        printf("  30 kHz from 96 kHz, folded back: %.1f dB\n", db);
+        CHECK(db < -80.0);
+    }
+    free(y);
+}
+
+static void test_device_rate_timing_and_end(void)
+{
+    int64_t n = 0, k, last = 0;
+    fa_frames end = 0;
+    float* y;
+    if (g_dev->rate != RATE) { printf("  skipped (device at %u Hz)\n", g_dev->rate); return; }
+    /* value = time * 0.01: output frame k is source time k / 48000 (no delay). */
+    y = play_resampled(SRC_RATE, SRC_RATE, ramp_sig, &n, &end);
+    CHECK(y != NULL);
+    for (k = 1000; k < 47000; k += 997) CHECK_NEAR(y[k * 2], (double)k / RATE * 0.01, 0.00002);
+    /* Every source frame comes out (the drain), then silence. */
+    for (k = 0; k < n; k++)
+        if (fabsf(y[k * 2]) > 0.001f) last = k;
+    CHECK_NEAR((double)last, 47999.0, 3.0);
+    CHECK_EQ(end, SRC_RATE);
+    free(y);
+}
+
 static void test_cue_out_ends_exactly(void)
 {
     fa_stream* s = open_attached(4 * RATE, ramp_sig, 0);
@@ -812,6 +912,8 @@ int main(void)
     RUN(test_push_stream_tempo_timeline_jump);
     RUN(test_params_and_options_api);
     RUN(test_fast_and_formants);
+    RUN(test_device_rate_is_sinc);
+    RUN(test_device_rate_timing_and_end);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

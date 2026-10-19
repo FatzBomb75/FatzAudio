@@ -1172,6 +1172,10 @@ void fa_codec_close(fa_codec* c);
 /* Makes room for `frames` more frames in c->out (keeping what is there). */
 fa_result fa_codec_reserve(fa_codec* c, fa_frames frames, uint32_t channels);
 
+/* Device-rate conversion: the windowed-sinc resampler (resample.c) as a custom
+ * backend for miniaudio's data converter (resample_device.c). */
+extern ma_resampling_backend_vtable fa_sinc_resampler;
+
 /* Float PCM from one rate and channel count to another (miniaudio's converter),
  * set up again whenever the input format changes. */
 typedef struct fa_pcm_conv {
