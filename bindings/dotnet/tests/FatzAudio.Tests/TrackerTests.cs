@@ -137,7 +137,7 @@ public class TrackerTests
         Assert.Equal(TrackerInterpolation.Linear, s.TrackerInterpolation);
         Assert.Equal(100, s.TrackerStereoSeparation);
         Assert.Throws<ArgumentOutOfRangeException>(() => s.TrackerStereoSeparation = 201);
-        Assert.True(s.TrackerAmigaResampler);
+        Assert.False(s.TrackerAmigaResampler);
         s.Position = TimeSpan.Zero;
         var muted = ReadAll(s, (long)(32 * RowSeconds * Rate));
         Assert.True(Rms(muted, 1.0, 1.4, 0) + Rms(muted, 1.0, 1.4, 1) < 1e-4);

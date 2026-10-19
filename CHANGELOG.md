@@ -48,6 +48,9 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Tracker modules no longer use the Amiga resampler by default (`FA_TRACKER_AMIGA_RESAMPLER` 0, .NET
+  `TrackerAmigaResampler` false), as in libopenmpt: it cost about 19 times the CPU on MOD files. MOD files now sound
+  cleaner and brighter; set it to 1 for the Paula sound.
 - Less CPU and memory, same sound (memory and speed review): device-rate conversion (44.1 kHz on a 48 kHz device)
   works its kernels out once per ratio, about five times cheaper (a resampled stream went from about 3.4% to
   0.6% of one core); the output limiter measures true peaks several frames at a time and skips quiet blocks

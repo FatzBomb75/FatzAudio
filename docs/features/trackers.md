@@ -186,7 +186,7 @@ Settings change while the song plays and are heard after the decode-ahead buffer
 | `FA_TRACKER_INTERPOLATION` | `TrackerInterpolation` | 0 libopenmpt's default (8-tap sinc), 1 none (zero-order hold, the crunchy sound of early trackers), 2 linear, 4 cubic, 8 sinc | 0 |
 | `FA_TRACKER_STEREO_SEPARATION` | `TrackerStereoSeparation` | percent, 0 (mono) to 200 | 100 |
 | `FA_TRACKER_VOLUME_RAMPING` | `TrackerVolumeRamping` | -1 default, 0 off (may click), 1 to 10 softer ramps | -1 |
-| `FA_TRACKER_AMIGA_RESAMPLER` | `TrackerAmigaResampler` | 1 Amiga MOD files sound as on an Amiga's Paula chip, 0 off (the ordinary interpolation) | 1 (on) |
+| `FA_TRACKER_AMIGA_RESAMPLER` | `TrackerAmigaResampler` | 1 Amiga MOD files sound as on an Amiga's Paula chip (about 19 times the CPU on those files), 0 off (the ordinary interpolation) | 0 (off, as in libopenmpt) |
 | `FA_TRACKER_ROW_EVENTS` | `TrackerRowEvents` | 0 none, 1 an event for every row, 2 only the first row of each order (see [Row events](#row-events)) | 0 |
 
 ```c
@@ -200,7 +200,7 @@ fa_stream_get_tracker_param(song, FA_TRACKER_VOLUME_RAMPING, &ramping);
 song.TrackerInterpolation = TrackerInterpolation.Cubic;   // Default, None, Linear, Cubic, Sinc
 song.TrackerStereoSeparation = 50;
 song.TrackerVolumeRamping = 5;
-song.TrackerAmigaResampler = false;
+song.TrackerAmigaResampler = true;      // the vintage Paula sound
 ```
 
 ## Channel mute

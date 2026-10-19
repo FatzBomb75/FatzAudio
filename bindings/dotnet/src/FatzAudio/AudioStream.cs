@@ -699,8 +699,8 @@ public unsafe class AudioStream : IDisposable
     }
 
     /// <summary>
-    /// Tracker modules: Amiga MOD files sound as on an Amiga's Paula chip (true, the default) or with the ordinary
-    /// resampler. Live.
+    /// Tracker modules: Amiga MOD files sound as on an Amiga's Paula chip (true; about 19 times the CPU on those
+    /// files) or with the ordinary resampler (false, the default). Live.
     /// </summary>
     /// <exception cref="FatzAudioException">The stream is not a module.</exception>
     /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>

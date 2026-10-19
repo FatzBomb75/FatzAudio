@@ -1662,7 +1662,8 @@ FA_API fa_result FA_CALL fa_stream_seek_tracker(fa_stream* stream, uint32_t orde
  * FA_TRACKER_INTERPOLATION       0 libopenmpt's default (8-tap sinc), 1 none, 2 linear, 4 cubic, 8 sinc
  * FA_TRACKER_STEREO_SEPARATION   percent, 0 (mono) .. 200; 100 by default
  * FA_TRACKER_VOLUME_RAMPING      -1 default, 0 off (may click), 1..10 softer
- * FA_TRACKER_AMIGA_RESAMPLER     1 (default): Amiga MOD files sound as on an Amiga's Paula chip; 0 off
+ * FA_TRACKER_AMIGA_RESAMPLER     0 (default) off; 1 Amiga MOD files sound as on an Amiga's Paula chip
+ *                                (about 19 times the CPU on those files)
  * FA_TRACKER_ROW_EVENTS          0 (default) none; 1 FA_EVENT_TRACKER_ROW for every row heard;
  *                                2 only for the first row of each order
  * FA_ERROR_INVALID_ARG for other values and for streams that are not modules. */
