@@ -209,7 +209,10 @@ public sealed record Loudness(double IntegratedLufs, double RangeLu, double True
 /// <summary>Peak and RMS levels per channel, linear 0..1.</summary>
 /// <param name="Peak">Peak level per channel: left and right, or one value for both.</param>
 /// <param name="Rms">RMS level per channel.</param>
-public sealed record StreamLevels(float[] Peak, float[] Rms);
+public sealed record StreamLevels(float[] Peak, float[] Rms)
+{
+    internal static readonly TimeSpan DefaultWindow = TimeSpan.FromMilliseconds(50);
+}
 
 /// <summary>Options for <see cref="AudioStream.GetSpectrum(int, SpectrumOptions)"/> and <see cref="OutputDevice.GetSpectrum(int, SpectrumOptions)"/>.</summary>
 [Flags]

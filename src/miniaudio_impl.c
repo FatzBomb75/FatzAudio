@@ -254,15 +254,61 @@ void fa_drmp3_close(void* impl)
 
 /* ---- dr_flac glue for codec_flac.c ------------------------------------------ */
 
-int64_t fa_drflac_decode_memory(const void* data, size_t size, float* out, uint64_t max_frames,
-                                uint32_t* out_channels, uint32_t* out_rate)
+/* dr_flac allocates its decoder and one block's samples in one go: the first
+ * allocation gets the cached block, anything else the heap. */
+static void* flac_cache_malloc(size_t sz, void* user)
 {
-    ma_dr_flac* f = ma_dr_flac_open_memory(data, size, NULL);
+    fa_drflac_cache* c = (fa_drflac_cache*)user;
+    if (c->used) return malloc(sz);
+    if (sz > c->cap) {
+        void* p = realloc(c->block, sz);
+        if (!p) return NULL;
+        c->block = p;
+        c->cap = sz;
+    }
+    c->used = 1;
+    return c->block;
+}
+
+static void* flac_cache_realloc(void* p, size_t sz, void* user)
+{
+    fa_drflac_cache* c = (fa_drflac_cache*)user;
+    if (!p) return flac_cache_malloc(sz, user);
+    if (p == c->block) {
+        if (sz > c->cap) {
+            void* q = realloc(c->block, sz);
+            if (!q) return NULL;
+            c->block = q;
+            c->cap = sz;
+        }
+        return c->block;
+    }
+    return realloc(p, sz);
+}
+
+static void flac_cache_free(void* p, void* user)
+{
+    fa_drflac_cache* c = (fa_drflac_cache*)user;
+    if (p && p == c->block) c->used = 0;
+    else free(p);
+}
+
+int64_t fa_drflac_decode_memory(const void* data, size_t size, float* out, uint64_t max_frames,
+                                uint32_t* out_channels, uint32_t* out_rate, fa_drflac_cache* cache)
+{
+    ma_allocation_callbacks alloc;
+    ma_dr_flac* f;
     int64_t n;
+    alloc.pUserData = cache;
+    alloc.onMalloc = flac_cache_malloc;
+    alloc.onRealloc = flac_cache_realloc;
+    alloc.onFree = flac_cache_free;
+    f = ma_dr_flac_open_memory(data, size, cache ? &alloc : NULL);
     if (!f) return -1;
     *out_channels = f->channels;
     *out_rate = f->sampleRate;
     n = f->channels == 0 ? -1 : (int64_t)ma_dr_flac_read_pcm_frames_f32(f, max_frames, out);
     ma_dr_flac_close(f);
+    if (cache) cache->used = 0;   /* nothing of this decode lives on, whatever got the block */
     return n;
 }

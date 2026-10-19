@@ -73,12 +73,15 @@ rightMeter.Value = levels.Peak.Length > 1 ? levels.Peak[1] : levels.Peak[0];   /
 var spectrum = output.GetSpectrum(2048);           // allocates a new array
 visualizer.Draw(spectrum.Magnitudes, spectrum.BinHz);
 
-// 60 fps without garbage: reuse your own buffer.
+// 60 fps without garbage: reuse your own buffers.
 float[] bins = new float[1024];
 float binHz = song.GetSpectrum(bins, SpectrumOptions.Left);
+float[] peak = new float[2], rms = new float[2];
+int channels = song.GetLevels(peak, rms);          // 1 for a mono file, else 2
+output.GetLevels(peak, rms);                       // always left and right
 ```
 
-`OutputDevice.GetLevels` always gives left and right. `AudioStream.GetLevels` gives one value for a mono file and two otherwise.
+`OutputDevice.GetLevels` always gives left and right. `AudioStream.GetLevels` gives one value for a mono file and two otherwise. The overloads that take a `Span<float>` (levels and spectrum) write into your buffers and allocate nothing; the others allocate a small result per call, which is fine for an occasional read.
 
 ## Threads
 

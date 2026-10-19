@@ -136,16 +136,18 @@ public unsafe class AudioStream : IDisposable
 
     private void RefreshFormat()
     {
-        var info = ReadInfo();
-        _sampleRate = info.Format.SampleRate;
-        _channels = info.Format.Channels;
+        var n = ReadNativeInfo();
+        _sampleRate = (int)n.Format.SampleRate;
+        _channels = (int)n.Format.Channels;
     }
 
-    private StreamInfo ReadInfo()
+    private FaStreamInfo ReadNativeInfo()
     {
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_info(Handle, out FaStreamInfo n));
-        return StreamInfo.FromNative(n);
+        return n;
     }
+
+    private StreamInfo ReadInfo() => StreamInfo.FromNative(ReadNativeInfo());
 
     /// <summary>
     /// Information about the decoded stream: the source's own format, codec, container and duration.
@@ -467,7 +469,7 @@ public unsafe class AudioStream : IDisposable
     /// file, a <c>.cdg</c> inside a ZIP archive, or graphics loaded with <see cref="LoadCdg(string)"/>.
     /// </summary>
     /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
-    public bool HasCdg => Info.HasCdg;
+    public bool HasCdg => ReadNativeInfo().HasCdg != 0;   // no StreamInfo built: cheap to poll per frame
 
     /// <summary>Attaches CD+G graphics from a <c>.cdg</c> file to this stream, replacing any it had.</summary>
     /// <param name="path">The <c>.cdg</c> file; it is read in full.</param>
@@ -1375,18 +1377,35 @@ public unsafe class AudioStream : IDisposable
         int ch = _channels == 1 ? 1 : 2;
         var peak = new float[ch];
         var rms = new float[ch];
+        GetLevels(peak, rms, window);
+        return new StreamLevels(peak, rms);
+    }
+
+    /// <summary>Like <see cref="GetLevels(TimeSpan?)"/>, into your own buffers (no allocation per call).</summary>
+    /// <param name="peak">Receives the peaks: one value for a mono stream, else left and right (room for 2 always fits).</param>
+    /// <param name="rms">Receives the RMS values, as many as the peaks.</param>
+    /// <param name="window">Length of the measurement window; defaults to 50 ms, at most about 1 s.</param>
+    /// <returns>The number of channels written: 1 for a mono stream, else 2.</returns>
+    /// <exception cref="ArgumentException">A span shorter than the stream's channels (1 or 2).</exception>
+    /// <exception cref="FatzAudioException">A decode-only stream (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public int GetLevels(Span<float> peak, Span<float> rms, TimeSpan? window = null)
+    {
+        var handle = Handle;
+        int ch = _channels == 1 ? 1 : 2;
+        if (peak.Length < ch || rms.Length < ch) throw new ArgumentException($"Room for {ch} channel(s) is needed.", peak.Length < ch ? nameof(peak) : nameof(rms));
         fixed (float* pp = peak)
         fixed (float* pr = rms)
         {
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_levels(
-                Handle, TimeConvert.ToNanoseconds(window ?? TimeSpan.FromMilliseconds(50)), pp, pr, (uint)ch));
+                handle, TimeConvert.ToNanoseconds(window ?? StreamLevels.DefaultWindow), pp, pr, (uint)ch));
         }
-        return new StreamLevels(peak, rms);
+        return ch;
     }
 
     /// <summary>
     /// The magnitude spectrum of the stream's audio being heard now, for a visualizer (same source and timing
-    /// as <see cref="GetLevels"/>). All zeros while the stream is not playing.
+    /// as <see cref="GetLevels(TimeSpan?)"/>). All zeros while the stream is not playing.
     /// </summary>
     /// <param name="size">Transform size: a power of two from 64 to 16384. 2048 at 48 kHz is 23.4 Hz per bin over 43 ms.</param>
     /// <param name="options">Channel and window.</param>

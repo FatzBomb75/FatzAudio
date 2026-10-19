@@ -3077,7 +3077,7 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
     /* The filters' memory belongs to the audio just before: clear it when the
      * timeline restarted, or when this mix doesn't continue the last one. */
     eq_on = fa_eq_begin(&s->eq, &s->eq_shared, dev->rate,
-                        fa_exchange32(&s->eq_restart, 0) | (s->mute_next != clock + off));
+                        (fa_load32(&s->eq_restart) && fa_exchange32(&s->eq_restart, 0)) | (s->mute_next != clock + off));
 
     while (done < n && !ended) {
         /* Blocks of FA_RAMP_BLOCK frames: gains are exact at block edges and

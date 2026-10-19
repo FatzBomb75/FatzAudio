@@ -18,6 +18,8 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- .NET: `AudioStream.GetLevels(Span<float> peak, Span<float> rms)` and `OutputDevice.GetLevels(peak, rms)`, which
+  write into your own buffers and allocate nothing (a VU meter at 60 Hz made about 180 small objects a second).
 - Transient mode for tempo and pitch: `FA_STRETCH_TRANSIENTS` (.NET `StretchQuality.Transients`) plays the original
   audio around each onset, so drum hits have no pre-echo (-50 dB instead of -25 dB) and stay on time. See
   [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md#transient-mode).
@@ -46,6 +48,15 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Less CPU and memory, same sound (memory and speed review): device-rate conversion (44.1 kHz on a 48 kHz device)
+  works its kernels out once per ratio, about five times cheaper (a resampled stream went from about 3.4% to
+  0.6% of one core); the output limiter measures true peaks several frames at a time and skips quiet blocks
+  (bit-identical, about 2x); the equalizer runs all bands frame by frame, left and right together (bit-identical,
+  about 2x); Ogg Opus streams no longer hold a 184 KB buffer; FLAC in Matroska, MP4 and Ogg holds output for its
+  own channels (not 8) and stops allocating per packet (about 190 KB less per stream); a resampled stream keeps
+  32 KB less history; web streams no longer keep a 256 KB read-ahead on top of their download window; idle
+  engine workers wake 20 times less; Windows (MSVC) builds read atomics with plain loads instead of locked
+  compare-exchanges. .NET: `HasCdg` and the `Tags` lookups (`Cover`, the indexer) no longer allocate.
 - A tempo, pitch or rate ramp's `FA_EVENT_RAMP_DONE` now comes when the ramp's end is heard, not up to the
   decode-ahead latency (150 ms) earlier when it was decoded, matching volume ramps. See
   [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md).

@@ -670,7 +670,7 @@ int64_t fa_tmap_frames_to(fa_tmap* m, int64_t at, double target, double base_src
 
 void fa_tmap_release(fa_tmap* m, int64_t at)
 {
-    int64_t r = fa_load64(&m->read), w = fa_load64(&m->write);
+    int64_t r0 = fa_load64(&m->read), r = r0, w = fa_load64(&m->write);
     while (r + 1 < w && m->at[(r + 1) % FA_TMAP_SIZE] <= at) r++;
-    fa_store64(&m->read, r);
+    if (r != r0) fa_store64(&m->read, r);   /* a locked store only when it moved */
 }
