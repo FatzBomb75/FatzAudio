@@ -52,12 +52,14 @@ typedef struct sbr_chan {
     uint8_t harmonic_last[64];          /* S_IndexMapped of the last envelope, per subband */
     int have_last;
     /* signal */
-    float ana[320];                     /* analysis delay line, newest first */
-    float syn[1280];                    /* synthesis delay line v */
+    float ana[320];                     /* analysis delay line, newest first from ana_pos (a ring) */
+    float syn[1280];                    /* synthesis delay line v, from syn_pos (a ring) */
+    int ana_pos, syn_pos;
     float xlow[SLOTS + HFGEN][32][2];   /* low band: 8 slots of history, then this frame */
-    float y[2][SLOTS + 8][64][2];       /* high band, this frame [1] and the previous [0] */
-    float g_hist[5][64], q_hist[5][64]; /* smoothing history: last 4 slots plus current */
-    int hist_valid;
+    float y[2][SLOTS + 8][64][2];       /* high band, the previous frame [y_old] and this one */
+    int y_old;
+    float g_hist[5][64], q_hist[5][64]; /* smoothing history: current, then the last 4 slots, from hist_pos (a ring) */
+    int hist_pos, hist_valid;
     int index_noise, index_sine;
 } sbr_chan;
 
@@ -132,6 +134,7 @@ void fa_aac_sbr_reset(fa_aac_sbr* s)
         memset(ch->syn, 0, sizeof(ch->syn));
         memset(ch->xlow, 0, sizeof(ch->xlow));
         memset(ch->y, 0, sizeof(ch->y));
+        ch->ana_pos = ch->syn_pos = ch->y_old = 0;
         ch->have_last = 0;
         ch->hist_valid = 0;
         ch->t_last = 16;
@@ -801,14 +804,20 @@ static void qmf_analysis(const fa_aac_sbr* s, sbr_chan* ch, const float* in, flo
 {
     const float scale = 2.0f * 32768.0f;
     float u[64], v[64], c[64];
-    int n, k;
-    memmove(ch->ana + 32, ch->ana, sizeof(float) * 288);
-    for (n = 0; n < 32; n++) ch->ana[n] = in[31 - n];
-    for (n = 0; n < 64; n++) {
-        float sum = 0.0f;
+    int n, k, h, pos;
+    /* The line moves by 32 a slot: the ring's start steps back instead, so each
+     * run of 32 is contiguous. */
+    pos = ch->ana_pos = ch->ana_pos ? ch->ana_pos - 32 : 288;
+    for (n = 0; n < 32; n++) ch->ana[pos + n] = in[31 - n];
+    for (h = 0; h < 64; h += 32) {
+        const float* a[5];
         int j;
-        for (j = 0; j < 5; j++) sum += ch->ana[n + 64 * j] * fa_aac_sbr_qmf_window[2 * (n + 64 * j)];
-        u[n] = sum * scale;
+        for (j = 0; j < 5; j++) a[j] = ch->ana + (pos + h + 64 * j) % 320;
+        for (n = 0; n < 32; n++) {
+            float sum = 0.0f;
+            for (j = 0; j < 5; j++) sum += a[j][n] * fa_aac_sbr_qmf_window[2 * (h + n + 64 * j)];
+            u[h + n] = sum * scale;
+        }
     }
     v[0] = u[0];                                  /* q = -1 */
     for (n = 1; n <= 32; n++) v[2 * n - 1] = u[n];  /* q = 3 .. 127 */
@@ -827,11 +836,14 @@ static void qmf_analysis(const fa_aac_sbr* s, sbr_chan* ch, const float* in, flo
  * (C[127-n] + S[127-n]) / 64 above. S[j] = (-1)^j DCT-IV(imaginary parts reversed)[j]. */
 static void qmf_synthesis(const fa_aac_sbr* s, sbr_chan* ch, float (*in)[2], float* out)
 {
-    float* v = ch->syn;
+    float* v;
+    const float* w[10];
     float re[64], im[64], c[64], d[64];
     const float scale = 1.0f / (64.0f * 32768.0f);
-    int n, k;
-    memmove(v + 128, v, sizeof(float) * 1152);
+    int n, k, pos;
+    /* v moves by 128 a slot, as a ring of runs of 128 (see qmf_analysis). */
+    pos = ch->syn_pos = ch->syn_pos ? ch->syn_pos - 128 : 1152;
+    v = ch->syn + pos;
     for (k = 0; k < 64; k++) {
         re[k] = in[k][0] * scale;
         im[63 - k] = in[k][1] * scale;
@@ -843,11 +855,16 @@ static void qmf_synthesis(const fa_aac_sbr* s, sbr_chan* ch, float (*in)[2], flo
         v[n] = d[n] - c[n];
         v[127 - n] = c[n] + d[n];
     }
+    /* v[256n + k] and v[256n + 192 + k] for k below 64. */
+    for (n = 0; n < 5; n++) {
+        w[2 * n] = ch->syn + (pos + 256 * n) % 1280;
+        w[2 * n + 1] = ch->syn + (pos + 256 * n + 128) % 1280 + 64;
+    }
     for (k = 0; k < 64; k++) {
         float sum = 0.0f;
         for (n = 0; n < 5; n++) {
-            sum += v[256 * n + k] * fa_aac_sbr_qmf_window[128 * n + k];
-            sum += v[256 * n + 192 + k] * fa_aac_sbr_qmf_window[128 * n + 64 + k];
+            sum += w[2 * n][k] * fa_aac_sbr_qmf_window[128 * n + k];
+            sum += w[2 * n + 1][k] * fa_aac_sbr_qmf_window[128 * n + 64 + k];
         }
         out[k] = sum;
     }
@@ -865,26 +882,47 @@ static float new_bw(int mode, int prev)
     }
 }
 
-/* Linear prediction coefficients of each low subband (covariance method). */
+/* Linear prediction coefficients of each low subband (covariance method). With
+ * x[t] the subband's slot t (rows 0 to 39 of xlow), phi[i][j] sums
+ * x[n - i + 2] conj(x[n - j + 2]) over n = 0 to 37, so the five used share their
+ * products: phi22 and phi11 are the |x[t]|^2 of t = 0..37 and 1..38, phi12 and
+ * phi01 the x[t + 1] conj(x[t]) of the same t, phi02 x[t + 2] conj(x[t]) of t =
+ * 0..37. One pass makes them all, each summed in the same order as on its own. */
 static void lpc(const sbr_chan* ch, int k, float a0[2], float a1[2])
 {
     double phi[3][3][2];
-    int i, j, n;
+    double e11 = 0.0, e22 = 0.0, c01r = 0.0, c01i = 0.0, c12r = 0.0, c12i = 0.0, c02r = 0.0, c02i = 0.0;
+    int t;
     double d, re, im;
-    memset(phi, 0, sizeof(phi));
-    for (i = 0; i < 3; i++)
-        for (j = i; j < 3; j++) {
-            double sr = 0.0, si = 0.0;
-            for (n = 0; n < SLOTS + 6; n++) {
-                const float* x = ch->xlow[n - i + HFADJ][k];
-                const float* y = ch->xlow[n - j + HFADJ][k];
-                /* x * conj(y) */
-                sr += (double)x[0] * y[0] + (double)x[1] * y[1];
-                si += (double)x[1] * y[0] - (double)x[0] * y[1];
-            }
-            phi[i][j][0] = sr;
-            phi[i][j][1] = si;
+    for (t = 0; t < SLOTS + 7; t++) {
+        const float* x = ch->xlow[t][k];
+        const float* x1 = ch->xlow[t + 1][k];
+        /* x * conj(x), x1 * conj(x) */
+        double e = (double)x[0] * x[0] + (double)x[1] * x[1];
+        double cr = (double)x1[0] * x[0] + (double)x1[1] * x[1];
+        double ci = (double)x1[1] * x[0] - (double)x1[0] * x[1];
+        if (t < SLOTS + 6) {
+            const float* x2 = ch->xlow[t + 2][k];
+            e22 += e;
+            c12r += cr;
+            c12i += ci;
+            c02r += (double)x2[0] * x[0] + (double)x2[1] * x[1];
+            c02i += (double)x2[1] * x[0] - (double)x2[0] * x[1];
         }
+        if (t > 0) {
+            e11 += e;
+            c01r += cr;
+            c01i += ci;
+        }
+    }
+    phi[1][1][0] = e11;
+    phi[2][2][0] = e22;
+    phi[0][1][0] = c01r;
+    phi[0][1][1] = c01i;
+    phi[1][2][0] = c12r;
+    phi[1][2][1] = c12i;
+    phi[0][2][0] = c02r;
+    phi[0][2][1] = c02i;
     d = phi[2][2][0] * phi[1][1][0] - (phi[1][2][0] * phi[1][2][0] + phi[1][2][1] * phi[1][2][1]) / (1.0 + 1e-6);
     a1[0] = a1[1] = 0.0f;
     if (d != 0.0) {
@@ -1049,17 +1087,26 @@ static void hf_adjust(fa_aac_sbr* s, sbr_chan* ch, float (*xhigh)[64][2], float 
         /* Assembly, slot by slot. */
         for (i = lo; i < hi; i++) {
             int smooth = h_sl && l != ch->l_A && l != l_A_prev_end;
-            int j;
-            memmove(ch->g_hist[1], ch->g_hist[0], sizeof(float) * 64 * 4);
-            memmove(ch->q_hist[1], ch->q_hist[0], sizeof(float) * 64 * 4);
-            memcpy(ch->g_hist[0], g, sizeof(float) * (size_t)M);
-            memcpy(ch->q_hist[0], qm, sizeof(float) * (size_t)M);
+            int j, prev = ch->hist_pos, cur = ch->hist_pos = prev ? prev - 1 : 4;
+            const float* gh[5];
+            const float* qh[5];
+            /* The history moves on by one: the oldest slot of the ring becomes the
+             * current one, which keeps the last current's values above M (as a
+             * shift of the whole history would). */
+            memcpy(ch->g_hist[cur], g, sizeof(float) * (size_t)M);
+            memcpy(ch->q_hist[cur], qm, sizeof(float) * (size_t)M);
+            memcpy(ch->g_hist[cur] + M, ch->g_hist[prev] + M, sizeof(float) * (size_t)(64 - M));
+            memcpy(ch->q_hist[cur] + M, ch->q_hist[prev] + M, sizeof(float) * (size_t)(64 - M));
             if (!ch->hist_valid) {
                 for (j = 1; j < 5; j++) {
-                    memcpy(ch->g_hist[j], g, sizeof(float) * (size_t)M);
-                    memcpy(ch->q_hist[j], qm, sizeof(float) * (size_t)M);
+                    memcpy(ch->g_hist[(cur + j) % 5], g, sizeof(float) * (size_t)M);
+                    memcpy(ch->q_hist[(cur + j) % 5], qm, sizeof(float) * (size_t)M);
                 }
                 ch->hist_valid = 1;
+            }
+            for (j = 0; j < 5; j++) {
+                gh[j] = ch->g_hist[(cur + j) % 5];
+                qh[j] = ch->q_hist[(cur + j) % 5];
             }
             for (m = 0; m < M; m++) {
                 float gf, qf;
@@ -1069,8 +1116,8 @@ static void hf_adjust(fa_aac_sbr* s, sbr_chan* ch, float (*xhigh)[64][2], float 
                     gf = 0.0f;
                     qf = 0.0f;
                     for (j = 0; j <= 4; j++) {
-                        gf += ch->g_hist[j][m] * h_smooth[j];
-                        qf += ch->q_hist[j][m] * h_smooth[j];
+                        gf += gh[j][m] * h_smooth[j];
+                        qf += qh[j][m] * h_smooth[j];
                     }
                 } else {
                     gf = g[m];
@@ -1112,8 +1159,8 @@ int fa_aac_sbr_apply(fa_aac_sbr* s, const float* const in[2], float* out[2])
     for (c = 0; c < s->nch; c++) {
         sbr_chan* ch = &s->ch[c];
         float (*x)[64][2] = s->x[c];
-        float (*ycur)[64][2] = ch->y[1];
-        float (*yold)[64][2] = ch->y[0];
+        float (*ycur)[64][2] = ch->y[!ch->y_old];
+        float (*yold)[64][2] = ch->y[ch->y_old];
         int kx = data ? s->kx : s->kx_last, M = data ? s->M : 0;
         int t_old = 2 * ch->t_last - SLOTS;                   /* slots the last frame's envelopes reach into this one */
         if (t_old < 0) t_old = 0;
@@ -1121,7 +1168,7 @@ int fa_aac_sbr_apply(fa_aac_sbr* s, const float* const in[2], float* out[2])
         memmove(ch->xlow[0], ch->xlow[SLOTS], sizeof(float) * HFGEN * 32 * 2);
         for (l = 0; l < SLOTS; l++) qmf_analysis(s, ch, in[c] + 32 * l, ch->xlow[HFGEN + l]);
         /* This frame's high band. */
-        memset(ycur, 0, sizeof(ch->y[1]));
+        memset(ycur, 0, sizeof(ch->y[0]));
         if (data) {
             hf_generate(s, ch, s->xhigh);
             hf_adjust(s, ch, s->xhigh, ycur);
@@ -1148,8 +1195,8 @@ int fa_aac_sbr_apply(fa_aac_sbr* s, const float* const in[2], float* out[2])
                 }
             }
         }
-        /* The overhang into the next frame stays in y[0]. */
-        memcpy(yold, ycur, sizeof(ch->y[1]));
+        /* The overhang into the next frame stays in this frame's half. */
+        ch->y_old = !ch->y_old;
         if (data) {
             ch->t_last = ch->t_E[ch->L_E];
             ch->L_E_last = ch->L_E;

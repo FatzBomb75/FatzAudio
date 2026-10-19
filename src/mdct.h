@@ -7,8 +7,8 @@
 
 typedef struct fa_mdct {
     int m;                 /* coefficients in, 2m samples out */
-    const float* twiddle;  /* m/2 complex rotations before the FFT */
-    const float* post;     /* and after it */
+    const float* twiddle;  /* m/2 rotations before the FFT: m/2 real parts, then the imaginary ones */
+    const float* post;     /* and after it, the same way */
     const float* fft_tw;   /* FFT roots, per radix-4 pass */
     const int* rev;        /* bit reversal of m/2 */
     float* work;           /* m/2 complex, this transform's own */

@@ -71,6 +71,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   every 5 ms (one polls and wakes the others when there is work: about 320 wake-ups a second instead of 200 per
   worker); device-rate conversion of 5.1 and 7.1 sums its channels with SSE2, about 3x faster (per channel now
   cheaper than stereo); CD+G smooth scaling redraws 1080p 2.5 to 6 times faster (pixel-identical).
+- Faster codecs, same output (bit-identical on x86-64; on ARM, where compilers fuse multiply-adds differently, within
+  float rounding): the inverse MDCT's rotations run four at a time (SSE on x86, NEON on ARM), about 13%
+  off AC-3 and AAC decoding; HE-AAC's high band works out its linear prediction in one pass and keeps its filter
+  bank delay lines as rings instead of moving them every slot (with the MDCT, HE-AAC about 25% faster); ALAC sums
+  its predictor in 32 bits where that gives the same result, as Apple's decoder does (about 10%); the FLAC encoder
+  is about 1.7x faster with byte-identical files (32-bit residuals, a table CRC, all autocorrelation lags at once,
+  the 5-bit Rice method skipped where it cannot win); the MIDI chorus turns its LFO instead of calling `sin` four
+  times a frame (about 10% off MIDI rendering, within 4e-9 of before).
 - A tempo, pitch or rate ramp's `FA_EVENT_RAMP_DONE` now comes when the ramp's end is heard, not up to the
   decode-ahead latency (150 ms) earlier when it was decoded, matching volume ramps. See
   [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md).
