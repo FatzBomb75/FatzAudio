@@ -9,7 +9,7 @@ FatzAudio measures what is being heard, for VU meters and visualizers: peak and 
 
 Both read the audio being heard now: the window ends at the device's latency behind the mix, so meters line up with the sound. They give zeros while the stream is not playing (stopped, paused, buffering, detached) or the device is stopped.
 
-Nothing is recorded until the first call: once something asks, a stream or device keeps its last 2 s or so (1 MB at 48 kHz), so streams you never measure cost nothing. The first call therefore reads silence. Ask once when the meter is created, or just let the first frame of the meter show zero. Moments the stream did not play (an underrun, a pause) read as silence.
+Nothing is recorded until the first call: once something asks, a stream or device keeps its last second plus the device's latency, rounded up (512 KB at 44.1 and 48 kHz on most devices, twice that with large callbacks or Bluetooth latency), so streams you never measure cost nothing. The first call therefore reads silence. Ask once when the meter is created, or just let the first frame of the meter show zero. Moments the stream did not play (an underrun, a pause) read as silence.
 
 ## Levels
 

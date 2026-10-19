@@ -20,6 +20,7 @@
 #include <string.h>
 
 #define FA_DECODE_CHUNK 1024
+#define FA_CONVERT_CHUNK (FA_DECODE_CHUNK * 2)   /* most device frames one converter call makes */
 #define FA_DEFAULT_BUFFER_MS 500
 #define FA_PREFILL_MS 100
 #define FA_DEZIPPER_NS 5000000   /* plain parameter changes glide over 5 ms */
@@ -42,6 +43,16 @@ FA_API void FA_CALL fa_open_options_init(fa_open_options* options)
 
 static int is_attached(struct fa_stream* s) { return s->device != NULL; }
 
+/* A push stream's timestamps: made at open for every stream with `push`, and only
+ * for those, so the sites below that run for push streams only never see NULL. */
+static fa_push_times* ptimes_of(struct fa_stream* s) { return s->ptimes; }
+
+/* A push stream's pts map, NULL for other streams. */
+static fa_ptsmap* ptsmap_of(struct fa_stream* s) { return ptimes_of(s) ? &ptimes_of(s)->map : NULL; }
+
+/* The tempo position map, NULL until the stream's first chain was made. */
+static fa_tmap* tmap_of(struct fa_stream* s) { return (fa_tmap*)fa_load_ptr(&s->tmap); }
+
 /* The user DSP chain, on whichever thread decodes (caller holds decode_lock). */
 static void run_dsps(struct fa_stream* s, float* buf, fa_frames n, uint32_t channels, uint32_t rate)
 {
@@ -58,6 +69,9 @@ static fa_frames marker(struct fa_stream* s, int m) { return fa_load64(&s->marke
 void fa_stream_free_memory(struct fa_stream* s)
 {
     free(s->carry);
+    free(tmap_of(s));
+    free(fa_load_ptr(&s->eq));
+    free(s->ptimes);
     free(fa_load_ptr(&s->dsps));
     fa_tap_free((fa_tap*)fa_load_ptr(&s->tap));
     fa_mutex_destroy(&s->tempo_lock);
@@ -74,10 +88,11 @@ static void release_chain(struct fa_stream* s)
     if (s->converter_ready) { ma_data_converter_uninit(&s->converter, NULL); s->converter_ready = 0; }
     fa_ring_free(&s->ring);
     free(s->in_buf); s->in_buf = NULL;
-    free(s->out_buf); s->out_buf = NULL;
     free(s->mat_buf); s->mat_buf = NULL;
     free(s->hist); s->hist = NULL;
     s->hist_cap = 0;
+    s->hist_chain = 0;
+    s->chain_failed = 0;
     if (s->tempo) { fa_tempo_free(s->tempo); free(s->tempo); s->tempo = NULL; }
     free(s->rd_in); s->rd_in = NULL;
     s->rd_out = NULL;
@@ -86,7 +101,7 @@ static void release_chain(struct fa_stream* s)
     s->tempo_drained = 0;
     s->jumped_back = 0;
     fa_store32(&s->tempo_live, 0);
-    s->in_cap = s->out_cap = s->in_count = s->in_offset = 0;
+    s->in_cap = s->in_count = s->in_offset = 0;
     s->decoded = 0;
     s->draining = 0;
 }
@@ -135,14 +150,11 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
     }
     for (i = 0; i < FA_TEMPO_PARAMS; i++) fa_tparam_init(&s->tparams[i], FA_PARAM_RATE + i == FA_PARAM_PITCH ? 0.0f : 1.0f);
     s->tempo_latency_ms = FA_TEMPO_LATENCY_MS;
-    fa_tmap_reset(&s->tmap);
     s->engine = engine;
     s->flags = options ? options->flags : 0;
     fa_store32(&s->loop, (s->flags & FA_OPEN_LOOP) ? 1 : 0);
     s->mute_next = -1;               /* nothing mixed yet: the mute starts as set */
     fa_store64(&s->seek_pending, -1);
-    fa_eq_shared_init(&s->eq_shared);
-    fa_eq_reset(&s->eq);
     s->buffer_ms = FA_DEFAULT_BUFFER_MS;
     if (options && options->struct_size >= offsetof(fa_open_options, buffer_ms) + sizeof(options->buffer_ms) &&
         options->buffer_ms) {
@@ -523,6 +535,8 @@ FA_API fa_result FA_CALL fa_stream_open_io(fa_engine* engine, const fa_io_callba
 /* Push and packet streams: no source, the push decoder instead (push.c). */
 static fa_result open_pushed(struct fa_stream* s)
 {
+    s->ptimes = (fa_push_times*)calloc(1, sizeof(*s->ptimes));   /* an empty map */
+    if (!s->ptimes) return FA_ERROR_OUT_OF_MEMORY;
     s->decoder_ready = 1;
     if (!(s->flags & FA_OPEN_DECODE_ONLY) &&
         fa_meter_init(&s->run_meter, s->decoder.format.sample_rate, s->decoder.format.channels, 0, FA_RUNNING_SUBS) == FA_OK)
@@ -919,6 +933,28 @@ static int tempo_values(struct fa_stream* s, int64_t at, double* tempo, double* 
     return wanted;
 }
 
+/* Makes the history of a forward-only stream `more` frames longer, keeping what it
+ * holds where hist_write expects it. Returns 0 if out of memory (nothing changes).
+ * Caller holds decode_lock. */
+static int hist_grow(struct fa_stream* s, fa_frames more)
+{
+    uint32_t ch = s->decoder.format.channels;
+    fa_frames old = s->hist_cap, cap = old + more, i;
+    float* h = (float*)malloc((size_t)cap * ch * sizeof(float));
+    if (!h) return 0;
+    for (i = s->decoded > old ? s->decoded - old : 0; i < s->decoded;) {
+        fa_frames a = i % old, b = i % cap, n = s->decoded - i;
+        if (old - a < n) n = old - a;
+        if (cap - b < n) n = cap - b;
+        memcpy(h + (size_t)b * ch, s->hist + (size_t)a * ch, (size_t)n * ch * sizeof(float));
+        i += n;
+    }
+    free(s->hist);
+    s->hist = h;
+    s->hist_cap = cap;
+    return 1;
+}
+
 /* The chain, created on first use with the input starting at source position
  * `src`. NULL when it cannot be made (out of memory, too many channels): the
  * audio then plays unprocessed. Caller holds decode_lock. */
@@ -926,22 +962,43 @@ static fa_tempo* tempo_chain(struct fa_stream* s, uint32_t channels, double src)
 {
     fa_tempo* t;
     int fast, formants, transients;
+    uint32_t posts;
     if (s->tempo) return s->tempo;
-    t = (fa_tempo*)calloc(1, sizeof(*t));
-    if (!t) return NULL;
-    if (fa_tempo_init(t, channels, s->decoder.format.sample_rate) != FA_OK) {
-        free(t);
-        return NULL;
-    }
     fa_mutex_lock(&s->tempo_lock);
+    posts = s->tempo_posts;
     fast = s->tempo_fast;
     formants = s->tempo_formants;
     transients = s->tempo_transients;
     fa_mutex_unlock(&s->tempo_lock);
+    /* Out of memory last time: unprocessed until the next tempo, pitch or rate command,
+     * rather than trying again on every chunk. */
+    if (s->chain_failed && posts == s->chain_failed_posts) return NULL;
+    /* A forward-only stream's history also covers what the chain holds (once). */
+    if (s->hist && !s->hist_chain) {
+        if (!hist_grow(s, s->decoder.format.sample_rate / 2)) goto fail;
+        s->hist_chain = 1;
+    }
+    if (!tmap_of(s)) {
+        /* Readers take the map when it appears: empty, as with no map. */
+        fa_tmap* m = (fa_tmap*)calloc(1, sizeof(*m));
+        if (!m) goto fail;
+        fa_exchange_ptr(&s->tmap, m);
+    }
+    t = (fa_tempo*)calloc(1, sizeof(*t));
+    if (!t) goto fail;
+    if (fa_tempo_init(t, channels, s->decoder.format.sample_rate) != FA_OK) {
+        free(t);
+        goto fail;
+    }
     fa_tempo_configure(t, fast, formants, transients);
     fa_tempo_reset(t, src);
     s->tempo = t;
+    s->chain_failed = 0;
     return t;
+fail:
+    s->chain_failed = 1;
+    s->chain_failed_posts = posts;
+    return NULL;
 }
 
 /* Restarts the map from played frames to source positions at `pos`, with the
@@ -959,7 +1016,7 @@ static void timeline_reset(struct fa_stream* s, fa_frames pos)
     fa_mutex_unlock(&s->tempo_lock);
     fa_store64(&s->played, 0);
     fa_store64(&s->seek_base, pos);
-    fa_tmap_reset(&s->tmap);
+    fa_tmap_reset(tmap_of(s));
     s->tempo_frames = 0;
     s->tempo_drained = 0;
     s->jumped_back = 0;
@@ -984,7 +1041,7 @@ static void tempo_note(struct fa_stream* s, int64_t frames, double src0, double 
 {
     double sr = (double)s->decoder.format.sample_rate, dr = (double)s->dev_rate;
     if (frames > 0 && fa_tempo_engaged(s->tempo))
-        fa_tmap_add(&s->tmap, (int64_t)floor((double)s->tempo_frames * dr / sr + 0.5), src0,
+        fa_tmap_add(tmap_of(s), (int64_t)floor((double)s->tempo_frames * dr / sr + 0.5), src0,
                     (src1 - src0) / (double)frames * sr / dr);
     s->tempo_frames += frames;
 }
@@ -1057,7 +1114,7 @@ int fa_stream_needs_work(struct fa_stream* s)
     if (!s->ring.data || fa_load32(&s->eof) || fa_load32(&s->flushing)) return 0;
     if (s->push && !fa_push_has_input(s->push) && !fa_load32(&s->staged)) return 0;   /* nothing pushed yet */
     if (fa_ring_readable(&s->ring) > fill_target(s) * 3 / 4) return 0;
-    if (fa_tmap_full(&s->tmap)) return 0;   /* waits for playback to catch up */
+    if (fa_tmap_full(tmap_of(s))) return 0;   /* waits for playback to catch up */
     /* Web streams: only once the bytes are downloaded, so a worker never waits. */
     return !s->net || fa_net_can_decode(s->net, NULL);
 }
@@ -1188,14 +1245,15 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
     while (produced < max_frames) {
         ma_uint64 in_n, out_n;
         const float* conv_in;
-        int64_t room = fa_ring_writable(&s->ring), target = fill_target(s) - fa_ring_readable(&s->ring);
+        float* dst;
+        int64_t contig, room = fa_ring_writable(&s->ring), target = fill_target(s) - fa_ring_readable(&s->ring);
         if (target < room) room = target;
         if (room <= 0) break;
         if (s->in_count == 0) {
             fa_frames got = 0, want = s->in_cap, end = end_frame(s);
             const float* chunk;
             if (s->tempo && fa_tempo_engaged(s->tempo)) {
-                if (fa_tmap_full(&s->tmap)) break;
+                if (fa_tmap_full(tmap_of(s))) break;
                 fa_frames step = tempo_step(s);
                 if (want > step) want = step;   /* ramps step finely */
             }
@@ -1230,9 +1288,9 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 /* The ring's very first frames are the resampler's start-up, ahead of
                  * this chunk: they start the timeline too (at its pts, never at 0 or
                  * before the clock's hold). */
-                fa_ptsmap_add(&s->ptsmap, at == 0 && fa_load64(&s->ptsmap.write) == 0 ? 0 : at + lat, s->decoder.anchor_pts);
-                s->anchor_pos[s->anchors % FA_SRC_ANCHORS] = s->src_pos;
-                s->anchor_pts[s->anchors % FA_SRC_ANCHORS] = s->decoder.anchor_pts;
+                fa_ptsmap_add(ptsmap_of(s), at == 0 && fa_load64(&ptsmap_of(s)->write) == 0 ? 0 : at + lat, s->decoder.anchor_pts);
+                ptimes_of(s)->anchor_pos[s->anchors % FA_SRC_ANCHORS] = s->src_pos;
+                ptimes_of(s)->anchor_pts[s->anchors % FA_SRC_ANCHORS] = s->decoder.anchor_pts;
                 s->anchors++;
             }
             if (s->hist) hist_write(s, s->in_buf, got);
@@ -1289,14 +1347,17 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
             s->in_count = got;
             if (got == 0) continue;               /* the stretcher is gathering its start */
         }
+        /* Converted straight into the ring, up to its wrap; published once the DSPs ran. */
+        dst = fa_ring_write_region(&s->ring, &contig);
+        if (contig < room) room = contig;
         conv_in = s->chain_buf ? s->chain_buf : s->matrix ? s->mat_buf : s->in_buf;
         in_n = (ma_uint64)s->in_count;
-        out_n = (ma_uint64)(room < s->out_cap ? room : s->out_cap);
+        out_n = (ma_uint64)(room < FA_CONVERT_CHUNK ? room : FA_CONVERT_CHUNK);
         ma_data_converter_process_pcm_frames(&s->converter, conv_in + (size_t)s->in_offset * conv_ch, &in_n,
-                                             s->out_buf, &out_n);
+                                             dst, &out_n);
         if (out_n > 0) {
-            run_dsps(s, s->out_buf, (fa_frames)out_n, FA_DEVICE_CHANNELS, s->dev_rate);
-            fa_ring_write(&s->ring, s->out_buf, (int64_t)out_n);
+            run_dsps(s, dst, (fa_frames)out_n, FA_DEVICE_CHANNELS, s->dev_rate);
+            fa_ring_commit(&s->ring, (int64_t)out_n);
         }
         s->in_offset += (fa_frames)in_n;
         s->in_count -= (fa_frames)in_n;
@@ -1311,14 +1372,14 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
 /* Source position (not wrapped) after `played` device frames since seek_base. */
 static double linear_position(struct fa_stream* s, int64_t played)
 {
-    return fa_tmap_pos(&s->tmap, played, (double)fa_load64(&s->seek_base),
+    return fa_tmap_pos(tmap_of(s), played, (double)fa_load64(&s->seek_base),
                        (double)s->decoder.format.sample_rate / (double)s->dev_rate, NULL, NULL);
 }
 
 /* Device frames from `played` until the linear source position reaches `target`. */
 static int64_t frames_until(struct fa_stream* s, int64_t played, double target)
 {
-    return fa_tmap_frames_to(&s->tmap, played, target, (double)fa_load64(&s->seek_base),
+    return fa_tmap_frames_to(tmap_of(s), played, target, (double)fa_load64(&s->seek_base),
                              (double)s->decoder.format.sample_rate / (double)s->dev_rate);
 }
 
@@ -1382,7 +1443,7 @@ static fa_result restart_expecting_locked(struct fa_stream* s, fa_frames frame, 
     fa_store64(&s->position, frame);
     s->src_pos = frame;
     timeline_reset(s, frame);
-    fa_ptsmap_reset(&s->ptsmap);
+    fa_ptsmap_reset(ptsmap_of(s));
     fa_clock_reset(&s->clock, hold);
     if (s->net) {
         fa_net_meta_reset_frames(s->net, frame);
@@ -1429,17 +1490,15 @@ static fa_result build_chain_locked(struct fa_stream* s, fa_device* dev)
     }
     s->converter_ready = 1;
     s->in_cap = FA_DECODE_CHUNK;
-    s->out_cap = FA_DECODE_CHUNK * 2;
     s->in_buf = (float*)malloc((size_t)s->in_cap * ch * sizeof(float));
-    s->out_buf = (float*)malloc((size_t)s->out_cap * FA_DEVICE_CHANNELS * sizeof(float));
     if (s->matrix) s->mat_buf = (float*)malloc((size_t)s->in_cap * FA_DEVICE_CHANNELS * sizeof(float));
     if (!s->decoder.seekable) {
-        /* Everything not yet heard: the ring, the input chunk and the resampler's delay. */
+        /* Everything not yet heard: the ring, the input chunk and the resampler's delay
+         * (and what the tempo chain holds, added when the chain is made). */
         s->hist_cap = (fa_frames)((double)capacity * s->decoder.format.sample_rate / dev->rate) + 2 * s->in_cap + 256;
-        s->hist_cap += s->decoder.format.sample_rate / 2;  /* what the tempo chain holds */
         s->hist = (float*)malloc((size_t)s->hist_cap * ch * sizeof(float));
     }
-    if (!s->in_buf || !s->out_buf || (s->matrix && !s->mat_buf) || (!s->decoder.seekable && !s->hist) ||
+    if (!s->in_buf || (s->matrix && !s->mat_buf) || (!s->decoder.seekable && !s->hist) ||
         fa_ring_init(&s->ring, FA_DEVICE_CHANNELS, capacity) != FA_OK) {
         release_chain(s);
         return FA_ERROR_OUT_OF_MEMORY;
@@ -1523,10 +1582,10 @@ static int64_t source_pts(struct fa_stream* s, int64_t pos, int* ok)
     int64_t k, lo = s->anchors > FA_SRC_ANCHORS ? s->anchors - FA_SRC_ANCHORS : 0;
     double sr = (double)s->decoder.format.sample_rate;
     for (k = s->anchors - 1; k >= lo; k--) {
-        int64_t ap = s->anchor_pos[k % FA_SRC_ANCHORS];
+        int64_t ap = ptimes_of(s)->anchor_pos[k % FA_SRC_ANCHORS];
         if (ap <= pos) {
             *ok = 1;
-            return s->anchor_pts[k % FA_SRC_ANCHORS] + (int64_t)((double)(pos - ap) * 1e9 / sr + 0.5);
+            return ptimes_of(s)->anchor_pts[k % FA_SRC_ANCHORS] + (int64_t)((double)(pos - ap) * 1e9 / sr + 0.5);
         }
     }
     *ok = 0;
@@ -1553,12 +1612,12 @@ static int64_t carry_timeline(struct fa_stream* s, uint32_t dev_rate)
     if (s->carry_count <= 0) return fa_push_next_pts(s->push);
     ratio /= speed_now(s, 0, 0);   /* the chain plays it at that speed */
     first = carry_first_pts(s);
-    fa_ptsmap_add(&s->ptsmap, 0, first);
+    fa_ptsmap_add(ptsmap_of(s), 0, first);
     lo = s->anchors > FA_SRC_ANCHORS ? s->anchors - FA_SRC_ANCHORS : 0;
     for (k = lo; k < s->anchors; k++) {
-        int64_t ap = s->anchor_pos[k % FA_SRC_ANCHORS];
+        int64_t ap = ptimes_of(s)->anchor_pos[k % FA_SRC_ANCHORS];
         if (ap > pos && ap < end)
-            fa_ptsmap_add(&s->ptsmap, (int64_t)((double)(ap - pos) * ratio + 0.5), s->anchor_pts[k % FA_SRC_ANCHORS]);
+            fa_ptsmap_add(ptsmap_of(s), (int64_t)((double)(ap - pos) * ratio + 0.5), ptimes_of(s)->anchor_pts[k % FA_SRC_ANCHORS]);
     }
     return first;
 }
@@ -1608,7 +1667,7 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
         timeline_reset(stream, pos);
         fa_store32(&stream->eof, 0);
         fa_store32(&stream->flushing, 0);
-        fa_ptsmap_reset(&stream->ptsmap);
+        fa_ptsmap_reset(ptsmap_of(stream));
         if (stream->push) {
             int64_t first = carry_timeline(stream, device->rate);
             fa_push_restart_timeline(stream->push);
@@ -1622,6 +1681,7 @@ FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, 
     if (r == FA_OK) {
         stream->device = device;
         fa_exchange_ptr(&stream->bus, bus);
+        fa_tap_fit(&stream->tap, device);   /* a meter set up before, for another device */
         /* Track it first: from the moment the voice is live, events it spills must be found. */
         fa_engine_track_stream(stream->engine, stream, 1);
         r = fa_device_add_voice(device, stream);
@@ -1978,7 +2038,7 @@ FA_API fa_result FA_CALL fa_stream_push_flush(fa_stream* stream)
         stream->src_pos = pos;
     }
     fa_store64(&stream->played_audible, 0);
-    fa_ptsmap_reset(&stream->ptsmap);
+    fa_ptsmap_reset(ptsmap_of(stream));
     fa_clock_reset(&stream->clock, hold);
     fa_mutex_unlock(&stream->decode_lock);
     fa_store32(&stream->flushing, 0);
@@ -2085,6 +2145,7 @@ static fa_result post_tempo_locked(struct fa_stream* s, fa_param param, float ta
     if (held) fa_mutex_lock(&s->decode_lock);
     fa_mutex_lock(&s->tempo_lock);
     replaced = fa_tparam_post(&s->tparams[tempo_slot(param)], target, len, shape, tag, notify, start, &old_tag);
+    s->tempo_posts++;
     wanted = tempo_wanted_locked(s);
     fa_mutex_unlock(&s->tempo_lock);
     if (replaced) tempo_ramp_done(s, old_tag);
@@ -2935,19 +2996,19 @@ static int64_t pts_at_played(struct fa_stream* s, int64_t played, int64_t* out_n
     if (s->push) {
         /* The app's timestamp at the last timeline restart, plus the source audio
          * heard since then (tempo and rate included, from the position map). */
-        fa_ptsmap* m = &s->ptsmap;
+        fa_ptsmap* m = ptsmap_of(s);
         double base = (double)fa_load64(&s->seek_base);
         int64_t anchor = fa_ptsmap_pts(m, played, 0.0, out_next), next;
         if (!m->cur_src_ok) {
-            m->cur_src = fa_tmap_pos(&s->tmap, m->cur_idx, base, sr / dr, NULL, NULL);
+            m->cur_src = fa_tmap_pos(tmap_of(s), m->cur_idx, base, sr / dr, NULL, NULL);
             m->cur_src_ok = 1;
         }
-        lin = fa_tmap_pos(&s->tmap, played, base, sr / dr, &slope, &next);
+        lin = fa_tmap_pos(tmap_of(s), played, base, sr / dr, &slope, &next);
         if (next < *out_next) *out_next = next;
         *out_ns = slope * 1e9 / sr;
         return anchor + (int64_t)((lin - m->cur_src) * 1e9 / sr + 0.5);
     }
-    lin = fa_tmap_pos(&s->tmap, played, (double)fa_load64(&s->seek_base), sr / dr, &slope, out_next);
+    lin = fa_tmap_pos(tmap_of(s), played, (double)fa_load64(&s->seek_base), sr / dr, &slope, out_next);
     *out_ns = slope * 1e9 / sr;
     pos = fade_position(s, played);
     end = end_frame(s);
@@ -3027,9 +3088,10 @@ static int steady_gain(struct fa_stream* s, const mix_markers* mk, struct fa_bus
 
 /* stream_mix's loop for steady gains (steady_gain): the same samples, mixed in one
  * pass, with the ring, the play count and the tempo map moved once. The equalizer
- * still runs in blocks of FA_RAMP_BLOCK, as its glides and state go by block. */
+ * still runs in blocks of FA_RAMP_BLOCK, as its glides and state go by block (eq is
+ * NULL when it is off). */
 static void mix_steady(struct fa_stream* s, fa_device* dev, float* out, int64_t now, int64_t off, int64_t played, int64_t n,
-                       float norm_lin, float mute, const mix_markers* mk, struct fa_bus* bus, int eq_on, fa_tap* tap)
+                       float norm_lin, float mute, const mix_markers* mk, struct fa_bus* bus, fa_stream_eq* eq, fa_tap* tap)
 {
     float g, l, r, bl = 1.0f, br = 1.0f;
     const float *p1, *p2;
@@ -3042,7 +3104,7 @@ static void mix_steady(struct fa_stream* s, fa_device* dev, float* out, int64_t 
         l *= bl; r *= br;
     }
     fa_ring_regions(&s->ring, n, &p1, &n1, &p2, &n2);
-    if (eq_on) {
+    if (eq) {
         for (done = 0; done < n;) {
             float eqb[FA_RAMP_BLOCK * FA_DEVICE_CHANNELS];
             int64_t blk = n - done < FA_RAMP_BLOCK ? n - done : FA_RAMP_BLOCK, k = 0;
@@ -3053,7 +3115,7 @@ static void mix_steady(struct fa_stream* s, fa_device* dev, float* out, int64_t 
             if (k < blk)
                 memcpy(eqb + k * FA_DEVICE_CHANNELS, p2 + (done + k - n1) * FA_DEVICE_CHANNELS,
                        (size_t)(blk - k) * FA_DEVICE_CHANNELS * sizeof(float));
-            fa_eq_process(&s->eq, eqb, blk);
+            fa_eq_process(&eq->st, eqb, blk);
             if (tap) fa_tap_write(tap, now + done, eqb, blk);
             mix_region(out + done * 2, eqb, blk, l, r, l, r);
             done += blk;
@@ -3068,7 +3130,7 @@ static void mix_steady(struct fa_stream* s, fa_device* dev, float* out, int64_t 
     }
     fa_ring_advance_read(&s->ring, n);
     fa_fetch_add64(&s->played, n);
-    fa_tmap_release(&s->tmap, played + n);
+    fa_tmap_release(tmap_of(s), played + n);
 }
 
 /* Mixes `s` into `out`; *mixed_off and *mixed_n say which frames of the callback
@@ -3084,6 +3146,7 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
     mix_markers mk;
     struct fa_bus* bus;
     int eq_on;
+    fa_stream_eq* eq;
     fa_tap* tap;
     *mixed_off = 0;
     *mixed_n = 0;
@@ -3148,12 +3211,13 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
     mute0 = s->mute_next == clock + off ? s->mute_level : mute_target;
     /* The filters' memory belongs to the audio just before: clear it when the
      * timeline restarted, or when this mix doesn't continue the last one. */
-    eq_on = fa_eq_begin(&s->eq, &s->eq_shared, dev->rate,
-                        (fa_load32(&s->eq_restart) && fa_exchange32(&s->eq_restart, 0)) | (s->mute_next != clock + off));
+    eq = (fa_stream_eq*)fa_load_ptr(&s->eq);
+    eq_on = eq && fa_eq_begin(&eq->st, &eq->shared, dev->rate,
+                              (fa_load32(&s->eq_restart) && fa_exchange32(&s->eq_restart, 0)) | (s->mute_next != clock + off));
 
     if (n > 0 && !fa_load32(&dev->mix_blockwise) && mute0 == mute_target && s->norm_db == norm_target &&
         steady_gain(s, &mk, bus, played0, n, looping, loop_end)) {
-        mix_steady(s, dev, out + off * 2, clock + off, off, played0, n, norm_lin, mute0, &mk, bus, eq_on, tap);
+        mix_steady(s, dev, out + off * 2, clock + off, off, played0, n, norm_lin, mute0, &mk, bus, eq_on ? eq : NULL, tap);
         done = n;
     }
     while (done < n && !ended) {
@@ -3222,7 +3286,7 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
             float eqb[FA_RAMP_BLOCK * FA_DEVICE_CHANNELS];
             memcpy(eqb, p1, (size_t)n1 * FA_DEVICE_CHANNELS * sizeof(float));
             if (n2 > 0) memcpy(eqb + n1 * FA_DEVICE_CHANNELS, p2, (size_t)n2 * FA_DEVICE_CHANNELS * sizeof(float));
-            fa_eq_process(&s->eq, eqb, blk);
+            fa_eq_process(&eq->st, eqb, blk);
             if (tap) fa_tap_write(tap, now, eqb, blk);
             mix_region(out + (off + done) * 2, eqb, blk, l0, r0, l1, r1);
         } else {
@@ -3237,7 +3301,7 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
         }
         fa_ring_advance_read(&s->ring, blk);
         fa_fetch_add64(&s->played, blk);
-        fa_tmap_release(&s->tmap, pl + blk);
+        fa_tmap_release(tmap_of(s), pl + blk);
         done += blk;
 
         for (p = 0; p < FA_STREAM_LANES; p++) {

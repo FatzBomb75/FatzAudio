@@ -131,6 +131,7 @@ int64_t fa_clock_mixed_end(fa_clock* c)
 
 void fa_ptsmap_reset(fa_ptsmap* m)
 {
+    if (!m) return;
     fa_store64(&m->write, 0);
     fa_store64(&m->read, 0);
     m->cur_idx = 0;

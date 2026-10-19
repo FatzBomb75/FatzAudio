@@ -35,6 +35,19 @@ void fa_ring_write(fa_ring* r, const float* src, int64_t frames)
     fa_store64(&r->write, w + frames); /* publishes the samples to the consumer */
 }
 
+float* fa_ring_write_region(fa_ring* r, int64_t* out_frames)
+{
+    int64_t w = fa_load64(&r->write);
+    int64_t at = w % r->capacity, room = fa_ring_writable(r);
+    *out_frames = r->capacity - at < room ? r->capacity - at : room;
+    return r->data + (size_t)at * r->channels;
+}
+
+void fa_ring_commit(fa_ring* r, int64_t frames)
+{
+    fa_store64(&r->write, fa_load64(&r->write) + frames); /* publishes the samples to the consumer */
+}
+
 void fa_ring_regions(fa_ring* r, int64_t frames, const float** p1, int64_t* n1, const float** p2, int64_t* n2)
 {
     int64_t rd = fa_load64(&r->read);

@@ -567,13 +567,14 @@ void fa_tparam_rebase(fa_tparam* p, int64_t base)
 
 void fa_tmap_reset(fa_tmap* m)
 {
+    if (!m) return;
     fa_store64(&m->write, 0);
     fa_store64(&m->read, 0);
 }
 
 int fa_tmap_full(fa_tmap* m)
 {
-    return fa_load64(&m->write) - fa_load64(&m->read) >= FA_TMAP_SIZE - FA_TMAP_SLACK;
+    return m && fa_load64(&m->write) - fa_load64(&m->read) >= FA_TMAP_SIZE - FA_TMAP_SLACK;
 }
 
 void fa_tmap_add(fa_tmap* m, int64_t at, double src, double slope)
@@ -634,7 +635,7 @@ static void tmap_segment(fa_tmap* m, int64_t i, int64_t lo, int64_t w, double ba
 
 double fa_tmap_pos(fa_tmap* m, int64_t at, double base_src, double base_slope, double* out_slope, int64_t* out_next)
 {
-    int64_t w = fa_load64(&m->write), lo = 0, a0, end;
+    int64_t w = m ? fa_load64(&m->write) : 0, lo = 0, a0, end;
     double s0, k;
     int64_t i = w > 0 ? tmap_find(m, at, w, &lo) : -1;
     if (w == 0) lo = 0;
@@ -646,7 +647,7 @@ double fa_tmap_pos(fa_tmap* m, int64_t at, double base_src, double base_slope, d
 
 int64_t fa_tmap_frames_to(fa_tmap* m, int64_t at, double target, double base_src, double base_slope)
 {
-    int64_t w = fa_load64(&m->write), lo = 0, i = -1, a0, end;
+    int64_t w = m ? fa_load64(&m->write) : 0, lo = 0, i = -1, a0, end;
     double s0, k;
     if (w > 0) i = tmap_find(m, at, w, &lo);
     for (;;) {
@@ -670,7 +671,11 @@ int64_t fa_tmap_frames_to(fa_tmap* m, int64_t at, double target, double base_src
 
 void fa_tmap_release(fa_tmap* m, int64_t at)
 {
-    int64_t r0 = fa_load64(&m->read), r = r0, w = fa_load64(&m->write);
+    int64_t r0, r, w;
+    if (!m) return;
+    r0 = fa_load64(&m->read);
+    r = r0;
+    w = fa_load64(&m->write);
     while (r + 1 < w && m->at[(r + 1) % FA_TMAP_SIZE] <= at) r++;
     if (r != r0) fa_store64(&m->read, r);   /* a locked store only when it moved */
 }

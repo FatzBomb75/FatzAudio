@@ -8,6 +8,7 @@
  * nothing. */
 #include "fa_internal.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #  include <emmintrin.h>
@@ -42,8 +43,23 @@ static void write_band(fa_eq_shared* sh, uint32_t i, const fa_eq_band* b)
     fa_store_float(&sh->gain[i], clampf(b->gain_db, -EQ_MAX_DB, EQ_MAX_DB));
 }
 
+/* The stream's EQ, made on first use: a stream that never sets one carries none.
+ * Caller holds api_lock. NULL if out of memory. */
+static fa_stream_eq* eq_make_locked(fa_stream* stream)
+{
+    fa_stream_eq* eq = (fa_stream_eq*)fa_load_ptr(&stream->eq);
+    if (eq) return eq;
+    eq = (fa_stream_eq*)calloc(1, sizeof(*eq));
+    if (!eq) return NULL;
+    fa_eq_shared_init(&eq->shared);
+    fa_eq_reset(&eq->st);
+    fa_exchange_ptr(&stream->eq, eq);   /* complete before the audio thread can see it */
+    return eq;
+}
+
 FA_API fa_result FA_CALL fa_stream_set_eq(fa_stream* stream, const fa_eq_band* bands, uint32_t count)
 {
+    fa_stream_eq* eq;
     uint32_t i;
     if (!stream || count > FA_EQ_MAX_BANDS || (count > 0 && !bands)) return FA_ERROR_INVALID_ARG;
     for (i = 0; i < count; i++)
@@ -52,22 +68,28 @@ FA_API fa_result FA_CALL fa_stream_set_eq(fa_stream* stream, const fa_eq_band* b
             !(bands[i].q == bands[i].q))
             return FA_ERROR_INVALID_ARG;   /* unknown type or NaN */
     fa_mutex_lock(&stream->api_lock);
-    begin_write(&stream->eq_shared);
-    for (i = 0; i < count; i++) write_band(&stream->eq_shared, i, &bands[i]);
-    fa_store32(&stream->eq_shared.count, (int32_t)count);
-    end_write(&stream->eq_shared);
+    /* No bands on a stream without an EQ changes nothing: it stays without one. */
+    eq = count == 0 ? (fa_stream_eq*)fa_load_ptr(&stream->eq) : eq_make_locked(stream);
+    if (eq) {
+        begin_write(&eq->shared);
+        for (i = 0; i < count; i++) write_band(&eq->shared, i, &bands[i]);
+        fa_store32(&eq->shared.count, (int32_t)count);
+        end_write(&eq->shared);
+    }
     fa_mutex_unlock(&stream->api_lock);
-    return FA_OK;
+    return eq || count == 0 ? FA_OK : FA_ERROR_OUT_OF_MEMORY;
 }
 
 FA_API fa_result FA_CALL fa_stream_get_eq(fa_stream* stream, fa_eq_band* out_bands, uint32_t capacity, uint32_t* out_count)
 {
+    fa_stream_eq* eq;
     fa_eq_shared* sh;
-    uint32_t i, n;
+    uint32_t i, n = 0;
     if (!stream || !out_count || (capacity > 0 && !out_bands)) return FA_ERROR_INVALID_ARG;
-    sh = &stream->eq_shared;
     fa_mutex_lock(&stream->api_lock);   /* keeps writers out; the audio thread sees no change */
-    n = (uint32_t)fa_load32(&sh->count);
+    eq = (fa_stream_eq*)fa_load_ptr(&stream->eq);
+    sh = eq ? &eq->shared : NULL;
+    if (sh) n = (uint32_t)fa_load32(&sh->count);
     for (i = 0; i < n && i < capacity; i++) {
         out_bands[i].type = (fa_eq_type)fa_load32(&sh->type[i]);
         out_bands[i].frequency_hz = fa_load_float(&sh->freq[i]);
@@ -82,13 +104,15 @@ FA_API fa_result FA_CALL fa_stream_get_eq(fa_stream* stream, fa_eq_band* out_ban
 FA_API fa_result FA_CALL fa_stream_set_eq_gain(fa_stream* stream, uint32_t band, float gain_db)
 {
     fa_result r = FA_OK;
+    fa_stream_eq* eq;
     if (!stream || !(gain_db == gain_db)) return FA_ERROR_INVALID_ARG;
     fa_mutex_lock(&stream->api_lock);
-    if (band >= (uint32_t)fa_load32(&stream->eq_shared.count)) r = FA_ERROR_INVALID_ARG;
+    eq = (fa_stream_eq*)fa_load_ptr(&stream->eq);
+    if (!eq || band >= (uint32_t)fa_load32(&eq->shared.count)) r = FA_ERROR_INVALID_ARG;
     else {
-        begin_write(&stream->eq_shared);
-        fa_store_float(&stream->eq_shared.gain[band], clampf(gain_db, -EQ_MAX_DB, EQ_MAX_DB));
-        end_write(&stream->eq_shared);
+        begin_write(&eq->shared);
+        fa_store_float(&eq->shared.gain[band], clampf(gain_db, -EQ_MAX_DB, EQ_MAX_DB));
+        end_write(&eq->shared);
     }
     fa_mutex_unlock(&stream->api_lock);
     return r;
@@ -96,19 +120,26 @@ FA_API fa_result FA_CALL fa_stream_set_eq_gain(fa_stream* stream, uint32_t band,
 
 FA_API fa_result FA_CALL fa_stream_set_eq_enabled(fa_stream* stream, int32_t enabled)
 {
+    fa_stream_eq* eq;
     if (!stream) return FA_ERROR_INVALID_ARG;
     fa_mutex_lock(&stream->api_lock);
-    begin_write(&stream->eq_shared);
-    fa_store32(&stream->eq_shared.enabled, enabled ? 1 : 0);
-    end_write(&stream->eq_shared);
+    /* A stream without an EQ reads as enabled: enabling it changes nothing. */
+    eq = enabled ? (fa_stream_eq*)fa_load_ptr(&stream->eq) : eq_make_locked(stream);
+    if (eq) {
+        begin_write(&eq->shared);
+        fa_store32(&eq->shared.enabled, enabled ? 1 : 0);
+        end_write(&eq->shared);
+    }
     fa_mutex_unlock(&stream->api_lock);
-    return FA_OK;
+    return eq || enabled ? FA_OK : FA_ERROR_OUT_OF_MEMORY;
 }
 
 FA_API fa_result FA_CALL fa_stream_get_eq_enabled(fa_stream* stream, int32_t* out_enabled)
 {
+    fa_stream_eq* eq;
     if (!stream || !out_enabled) return FA_ERROR_INVALID_ARG;
-    *out_enabled = fa_load32(&stream->eq_shared.enabled);
+    eq = (fa_stream_eq*)fa_load_ptr(&stream->eq);
+    *out_enabled = eq ? fa_load32(&eq->shared.enabled) : 1;   /* none yet: on, with no bands */
     return FA_OK;
 }
 

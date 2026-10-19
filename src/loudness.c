@@ -413,7 +413,8 @@ fa_result fa_meter_init(fa_meter* m, uint32_t rate, uint32_t channels, int with_
     if (!m->z || !m->weight || !m->subs) { fa_meter_free(m); return FA_ERROR_OUT_OF_MEMORY; }
     for (c = 0; c < channels; c++) m->weight[c] = channel_weight(channels, c);
     if (with_peak) {
-        if (fa_truepeak_init(&m->tp, rate, channels) != FA_OK) { fa_meter_free(m); return FA_ERROR_OUT_OF_MEMORY; }
+        m->tp = (fa_truepeak*)calloc(1, sizeof(*m->tp));
+        if (!m->tp || fa_truepeak_init(m->tp, rate, channels) != FA_OK) { fa_meter_free(m); return FA_ERROR_OUT_OF_MEMORY; }
         m->with_peak = 1;
     }
     return FA_OK;
@@ -424,7 +425,8 @@ void fa_meter_free(fa_meter* m)
     free(m->z);
     free(m->weight);
     free(m->subs);
-    if (m->with_peak) fa_truepeak_free(&m->tp);
+    if (m->with_peak) fa_truepeak_free(m->tp);
+    free(m->tp);
     memset(m, 0, sizeof(*m));
 }
 
@@ -491,7 +493,7 @@ fa_result fa_meter_process(fa_meter* m, const float* x, int64_t frames)
         if (m->skip > 0) {
             if (n > m->skip) n = m->skip;
             for (c = 0; c < m->channels; c++) filter_channel(m, x, n, c);
-            if (m->with_peak) tp_process(&m->tp, x, n, 0);
+            if (m->with_peak) tp_process(m->tp, x, n, 0);
             m->skip -= n;
         } else {
             if (n > m->sublen - m->subfill) n = m->sublen - m->subfill;
@@ -499,7 +501,7 @@ fa_result fa_meter_process(fa_meter* m, const float* x, int64_t frames)
                 double e = filter_channel(m, x, n, c);
                 if (m->weight[c] != 0.0) m->subacc += m->weight[c] * e;
             }
-            if (m->with_peak) tp_process(&m->tp, x, n, 1);
+            if (m->with_peak) tp_process(m->tp, x, n, 1);
             m->subfill += n;
             if (m->subfill == m->sublen) {
                 if (!push_sub(m, m->subacc / (double)m->sublen)) return FA_ERROR_OUT_OF_MEMORY;
@@ -599,5 +601,5 @@ double fa_meter_running_lufs(const fa_meter* m)
 double fa_meter_peak_dbtp(const fa_meter* m)
 {
     if (!m->with_peak) return NAN;
-    return m->tp.peak > 0.0f ? 20.0 * log10((double)m->tp.peak) : -HUGE_VAL;
+    return m->tp->peak > 0.0f ? 20.0 * log10((double)m->tp->peak) : -HUGE_VAL;
 }

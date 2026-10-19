@@ -92,7 +92,7 @@ static void measure(const float* x, int64_t frames, uint32_t rate, uint32_t ch, 
     fa_meter m;
     fa_meter_init(&m, rate, ch, 1, 0);
     fa_meter_process(&m, x, frames);
-    fa_truepeak_flush(&m.tp);
+    fa_truepeak_flush(m.tp);
     *i_lufs = fa_loudness_integrated(m.subs, m.nsubs);
     if (lra) *lra = fa_loudness_range(m.subs, m.nsubs);
     if (tp) *tp = fa_meter_peak_dbtp(&m);

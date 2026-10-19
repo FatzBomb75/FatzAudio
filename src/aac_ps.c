@@ -47,8 +47,8 @@ struct fa_aac_ps {
     int is34, is34_last;
     ps_config cfg[2];
     float in_hist[5][6][2];                  /* the last 6 slots of the split QMF bands */
-    float delay[MAX_BANDS][MAX_DELAY + SLOTS][2];
-    float ap_delay[MAX_BANDS][AP_LINKS][MAX_AP_DELAY + SLOTS][2];
+    float delay[MAX_BANDS][MAX_DELAY][2];    /* the last slots of each band's delay line */
+    float ap_delay[MAX_BANDS][AP_LINKS][MAX_AP_DELAY][2];
     float peak_decay[MAX_PAR], power_smooth[MAX_PAR], peak_diff_smooth[MAX_PAR];
     float h_last[4][MAX_PAR][2];             /* mixing matrix at the end of the last envelope (re, im) */
     uint8_t ipd_hist[MAX_PAR], opd_hist[MAX_PAR];
@@ -60,6 +60,8 @@ struct fa_aac_ps {
     /* work */
     float s[MAX_BANDS][SLOTS][2], d[MAX_BANDS][SLOTS][2];
     float hybrid_in[5][6 + 38][2];
+    float dl[MAX_DELAY + SLOTS][2];          /* one band's delay line: its history, then this frame */
+    float ap[AP_LINKS][MAX_AP_DELAY + SLOTS][2];   /* and its all-pass links' */
 };
 
 static const int8_t k_to_i_20[71] = {
@@ -532,11 +534,12 @@ static void decorrelate(fa_aac_ps* p, int top)
         }
     }
     for (k = 0; k < cf->nbands; k++) {
-        float (*dl)[2] = p->delay[k];
+        float (*dl)[2] = p->dl;
         i = cf->k_to_i[k];
         /* The input goes into the delay line after MAX_DELAY slots of history. */
-        memmove(dl, dl + SLOTS, sizeof(float) * 2 * MAX_DELAY);
+        memcpy(dl, p->delay[k], sizeof(p->delay[k]));
         memcpy(dl + MAX_DELAY, p->s[k], sizeof(float) * 2 * SLOTS);
+        memcpy(p->delay[k], dl + SLOTS, sizeof(p->delay[k]));
         if (k < cf->allpass_bands) {
             float slope = k > cf->decay_cutoff ? 1.0f - 0.05f * (float)(k - cf->decay_cutoff) : 1.0f;
             float ag[AP_LINKS];
@@ -544,7 +547,7 @@ static void decorrelate(fa_aac_ps* p, int top)
             if (slope < 0.0f) slope = 0.0f;
             for (m = 0; m < AP_LINKS; m++) {
                 ag[m] = a_link[m] * slope;
-                memmove(p->ap_delay[k][m], p->ap_delay[k][m] + SLOTS, sizeof(float) * 2 * MAX_AP_DELAY);
+                memcpy(p->ap[m], p->ap_delay[k][m], sizeof(p->ap_delay[k][m]));
             }
             for (n = 0; n < SLOTS; n++) {
                 /* z^-2 and the fractional delay */
@@ -553,17 +556,18 @@ static void decorrelate(fa_aac_ps* p, int top)
                 float im = x[0] * phi[1] + x[1] * phi[0];
                 for (m = 0; m < AP_LINKS; m++) {
                     const float* q = p->q_fract[p->is34][k][m];
-                    const float* w = p->ap_delay[k][m][MAX_AP_DELAY + n - d_link[m]];
+                    const float* w = p->ap[m][MAX_AP_DELAY + n - d_link[m]];
                     float ar = w[0] * q[0] - w[1] * q[1] - ag[m] * re;
                     float ai = w[0] * q[1] + w[1] * q[0] - ag[m] * im;
-                    p->ap_delay[k][m][MAX_AP_DELAY + n][0] = re + ag[m] * ar;
-                    p->ap_delay[k][m][MAX_AP_DELAY + n][1] = im + ag[m] * ai;
+                    p->ap[m][MAX_AP_DELAY + n][0] = re + ag[m] * ar;
+                    p->ap[m][MAX_AP_DELAY + n][1] = im + ag[m] * ai;
                     re = ar;
                     im = ai;
                 }
                 p->d[k][n][0] = re * gain[i][n];
                 p->d[k][n][1] = im * gain[i][n];
             }
+            for (m = 0; m < AP_LINKS; m++) memcpy(p->ap_delay[k][m], p->ap[m] + SLOTS, sizeof(p->ap_delay[k][m]));
         } else {
             int delay = k < cf->short_delay_band ? MAX_DELAY : 1;
             for (n = 0; n < SLOTS; n++) {

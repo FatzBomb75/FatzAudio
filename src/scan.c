@@ -312,11 +312,11 @@ static void run_chunk(fa_scan_job* j, int k)
     }
     free(buf);
     /* The file's last chunk measures the peaks between its final samples too. */
-    if (r == FA_OK && k == j->nchunks - 1 && !fa_load32(&j->cancel)) fa_truepeak_flush(&m.tp);
+    if (r == FA_OK && k == j->nchunks - 1 && !fa_load32(&j->cancel)) fa_truepeak_flush(m.tp);
     if (r == FA_OK) {
         c->subs = m.subs;          /* take the list; the meter must not free it */
         c->nsubs = m.nsubs;
-        c->peak = m.tp.peak;
+        c->peak = m.tp->peak;
         m.subs = NULL;
     }
     c->r = r;

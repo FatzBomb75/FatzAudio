@@ -1,7 +1,8 @@
 /* The download buffer behind every URL stream.
  *
  * One download thread per stream fetches the resource into a sliding window of
- * bytes (FA_NET_WINDOW, of which at most half is read ahead). The decoder reads
+ * bytes (FA_NET_WINDOW, of which at most half is read ahead; a stream that can't
+ * seek keeps only the part ahead, FA_NET_AHEAD plus one write). The decoder reads
  * the window through ordinary fa_io_callbacks. A seek inside the window costs
  * nothing; outside it, the thread reconnects with a Range request at the new
  * position. A connection that drops is re-established for reconnect_ms: files
@@ -20,6 +21,8 @@
 #include <string.h>
 
 #define FA_NET_WINDOW (4 * 1024 * 1024)
+#define FA_NET_AHEAD (FA_NET_WINDOW / 2)
+#define FA_NET_PIECE 65536                /* most bytes one window write adds */
 #define FA_NET_PLAYLIST_MAX (2 * 1024 * 1024)
 #define FA_NET_RESTART_GAP (256 * 1024)   /* forward seeks closer than this just wait for the data */
 #define FA_NET_PLAYLIST_HOPS 4
@@ -55,11 +58,34 @@ void fa_net_request(fa_net* n, fa_http_request* req, const char* url)
 
 /* ---- the window ------------------------------------------------------------ */
 
+/* The decoder can seek in the window (fa_net_io): a seek back may land behind the
+ * read position. Known from the first response's headers on, before any audio is
+ * written (HLS: from the playlist on). Caller holds the lock. */
+static int seekable_locked(const fa_net* n)
+{
+    return n->ranges && n->length >= 0 && !n->live && !n->hls;
+}
+
 /* Appends audio bytes, waiting while the reader is far enough behind.
  * Caller does not hold the lock. Returns 1 to stop the transfer. */
 static int window_write(fa_net* n, const uint8_t* data, size_t size)
 {
     fa_mutex_lock(&n->lock);
+    if (!n->buf) {
+        /* Made with the first audio, once it is known whether the decoder can seek:
+         * radio and other streams that can't never read behind the read position,
+         * so they keep only the part ahead (it can't fall behind it, see below). */
+        int64_t cap = seekable_locked(n) ? FA_NET_WINDOW : n->ahead_limit + FA_NET_PIECE;
+        n->buf = (uint8_t*)malloc((size_t)cap);
+        if (!n->buf) {
+            if (n->error == FA_OK) n->error = FA_ERROR_OUT_OF_MEMORY;
+            n->quit = 1;                      /* the open fails with it */
+            fa_cond_broadcast(&n->cond);
+            fa_mutex_unlock(&n->lock);
+            return 1;
+        }
+        n->cap = cap;
+    }
     while (size > 0) {
         int64_t piece, at, first;
         if (n->skip > 0) {                    /* the server ignored our Range: drop the head */
@@ -75,7 +101,7 @@ static int window_write(fa_net* n, const uint8_t* data, size_t size)
         /* Never more than the window can take without overwriting unread bytes. */
         piece = n->cap - n->ahead_limit;
         if (piece > (int64_t)size) piece = (int64_t)size;
-        if (piece > 65536) piece = 65536;
+        if (piece > FA_NET_PIECE) piece = FA_NET_PIECE;
         if (n->win_end + piece - n->win_start > n->cap) n->win_start = n->win_end + piece - n->cap;
         at = n->win_end % n->cap;
         first = n->cap - at < piece ? n->cap - at : piece;
@@ -503,15 +529,13 @@ fa_result fa_net_open(const fa_net_config* cfg, fa_net** out)
     n = (fa_net*)calloc(1, sizeof(*n));
     if (!n) { fa_net_config c = *cfg; free_config(&c); return FA_ERROR_OUT_OF_MEMORY; }
     n->cfg = *cfg;
-    n->cap = FA_NET_WINDOW;
-    n->ahead_limit = FA_NET_WINDOW / 2;
+    n->ahead_limit = FA_NET_AHEAD;
     n->length = -1;
     n->meta_len = -1;
     n->starving = 1;
     n->hls_duration = -1;
-    n->buf = (uint8_t*)malloc((size_t)n->cap);
-    if (!n->buf || fa_mutex_init(&n->lock) != 0) { free(n->buf); free_config(&n->cfg); free(n); return FA_ERROR_OUT_OF_MEMORY; }
-    if (fa_cond_init(&n->cond) != 0) { fa_mutex_destroy(&n->lock); free(n->buf); free_config(&n->cfg); free(n); return FA_ERROR_OUT_OF_MEMORY; }
+    if (fa_mutex_init(&n->lock) != 0) { free_config(&n->cfg); free(n); return FA_ERROR_OUT_OF_MEMORY; }
+    if (fa_cond_init(&n->cond) != 0) { fa_mutex_destroy(&n->lock); free_config(&n->cfg); free(n); return FA_ERROR_OUT_OF_MEMORY; }
     if (fa_thread_create(&n->thread, download_main, n) != 0) { fa_net_close(n); return FA_ERROR_GENERIC; }
     n->thread_started = 1;
 
@@ -634,7 +658,9 @@ void fa_net_io(fa_net* n, fa_io_callbacks* out)
 {
     memset(out, 0, sizeof(*out));
     out->read = io_read;
-    out->seek = (n->ranges && n->length >= 0 && !n->live && !n->hls) ? io_seek : NULL;
+    fa_mutex_lock(&n->lock);
+    out->seek = seekable_locked(n) ? io_seek : NULL;
+    fa_mutex_unlock(&n->lock);
     out->length = n->hls ? NULL : io_length;
 }
 
@@ -712,7 +738,7 @@ void fa_net_get_status(fa_net* n, fa_net_status* out)
     out->http_status = n->http_status;
     out->is_live = n->live || (n->hls && n->hls_duration < 0);
     out->is_hls = n->hls;
-    out->seekable = n->hls ? n->hls_duration >= 0 : (n->ranges && n->length >= 0 && !n->live);
+    out->seekable = n->hls ? n->hls_duration >= 0 : seekable_locked(n);
     out->finished = n->finished;
     out->content_length = n->hls ? -1 : n->length;
     out->downloaded = n->downloaded;

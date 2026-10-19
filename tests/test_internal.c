@@ -835,6 +835,52 @@ static void test_forward_only_detach_position(void)
     free(wav);
 }
 
+/* A forward-only stream's history grows when the tempo chain is made, after it
+ * has wrapped: the audio kept at a detach is still the audio not yet heard. */
+static void test_forward_only_history_grows_with_chain(void)
+{
+    size_t n;
+    uint8_t* wav = make_wav(g_dev->rate, g_dev->rate * 6, 1, &n);
+    fwd_io io_state = { 0 };
+    fa_io_callbacks io = { fwd_read, NULL, NULL, NULL };
+    fa_stream* s = NULL;
+    fa_frames pos = 0, cap0, cap1 = 0, decoded;
+    float out[2 * 256];
+    uint32_t i, k;
+    int made;
+    io_state.p = wav; io_state.n = n;
+    CHECK_EQ(fa_stream_open_io(g_engine, &io, &io_state, NULL, &s), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    for (k = 0; k < g_dev->rate / 256; k++) render(s, out, 256);   /* 1 s */
+    fa_mutex_lock(&s->decode_lock);
+    cap0 = s->hist_cap;
+    decoded = s->decoded;
+    fa_mutex_unlock(&s->decode_lock);
+    CHECK(decoded > cap0);                            /* the history wrapped */
+    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_TEMPO, 1.25f), FA_OK);
+    for (k = 0, made = 0; k < 400 && !made; k++) {  /* until a worker made the chain */
+        render(s, out, 256);
+        fa_mutex_lock(&s->decode_lock);
+        made = s->tempo != NULL;
+        cap1 = s->hist_cap;
+        fa_mutex_unlock(&s->decode_lock);
+    }
+    CHECK(made);
+    CHECK_EQ(cap1, cap0 + g_dev->rate / 2);           /* what the chain holds */
+    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_TEMPO, 1.0f), FA_OK);
+    for (k = 0; k < 20; k++) render(s, out, 256);
+    fa_sleep_ms(50);
+    CHECK_EQ(fa_stream_detach(s), FA_OK);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);   /* no chain now: plays unchanged */
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render(s, out, 256);
+    for (i = 0; i < 256; i++) CHECK(out[i * 2] == expected(1, (uint32_t)pos + i));
+    fa_stream_close(s);
+    free(wav);
+}
+
 /* Plays a forward-only stream at another rate than the device's to the end, 16
  * frames per callback, optionally detaching and reattaching after `detach_at`.
  * Returns how many frames it produced. */
@@ -1517,8 +1563,12 @@ static void test_eq_memory_cleared_on_seek(void)
     for (i = 0; i < 20; i++) render_on(a, oa, 480);   /* settled, ringing at 1 kHz */
     CHECK_EQ(fa_stream_seek(a, 12345), FA_OK);
     CHECK_EQ(fa_stream_seek(b, 12345), FA_OK);
-    b->eq = a->eq;                                     /* same glide state, filters at rest */
-    for (i = 0; i < FA_EQ_MAX_BANDS; i++) memset(b->eq.band[i].z, 0, sizeof(b->eq.band[i].z));
+    {
+        fa_stream_eq* ea = (fa_stream_eq*)fa_load_ptr(&a->eq);
+        fa_stream_eq* eb = (fa_stream_eq*)fa_load_ptr(&b->eq);
+        eb->st = ea->st;                               /* same glide state, filters at rest */
+        for (i = 0; i < FA_EQ_MAX_BANDS; i++) memset(eb->st.band[i].z, 0, sizeof(eb->st.band[i].z));
+    }
     CHECK_EQ(fa_stream_play(b), FA_OK);
     render_on(a, oa, 480);
     b->mute_next = a->mute_next - 480;                    /* b continues "its" last mix too */
@@ -1564,7 +1614,51 @@ static void test_eq_flat_is_free(void)
     CHECK_EQ(fa_stream_play(s), FA_OK);
     render_on(s, out, 480);
     for (i = 0; i < 480; i++) CHECK(out[i * 2] == expected(1, i));
-    CHECK(!s->eq.active);
+    CHECK(!((fa_stream_eq*)fa_load_ptr(&s->eq))->st.active);
+    fa_stream_close(s);
+}
+
+/* Clearing the bands or enabling an EQ that was never set makes none. */
+static void test_eq_noop_makes_none(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 1, 0);
+    int32_t on = 0;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_eq(s, NULL, 0), FA_OK);
+    CHECK_EQ(fa_stream_set_eq_enabled(s, 1), FA_OK);
+    CHECK(fa_load_ptr(&s->eq) == NULL);
+    CHECK_EQ(fa_stream_get_eq_enabled(s, &on), FA_OK);
+    CHECK_EQ(on, 1);
+    CHECK_EQ(fa_stream_set_eq_enabled(s, 0), FA_OK);   /* a real change makes one */
+    CHECK(fa_load_ptr(&s->eq) != NULL);
+    fa_stream_close(s);
+}
+
+/* A levels tap holds a 1 s window on a device with big callbacks and Bluetooth-like
+ * latency (4096-frame periods, 200 ms), made bigger at the attach to it, and stays
+ * small on an ordinary device. */
+static void test_levels_tap_fits_latency(void)
+{
+    int32_t period = fa_load32(&g_dev->period_frames);
+    int64_t latency = fa_load64(&g_dev->latency_ns);
+    int64_t need = (int64_t)g_dev->rate + (int64_t)g_dev->rate / 5 + 3 * 4096 + 1024;
+    float peak[2], rms[2];
+    fa_stream* s = open_attached(g_dev->rate, 1, 0);
+    fa_tap* t;
+    fa_result r;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_get_levels(s, 1000000000, peak, rms, 2), FA_OK);
+    t = (fa_tap*)fa_load_ptr(&s->tap);
+    CHECK(t != NULL && t->frames <= 65536u * (g_dev->rate > 52000 ? 2u : 1u));   /* this null device */
+    CHECK_EQ(fa_stream_detach(s), FA_OK);
+    fa_store32(&g_dev->period_frames, 4096);
+    fa_store64(&g_dev->latency_ns, 200000000);
+    r = fa_stream_attach(s, g_dev, NULL);
+    t = (fa_tap*)fa_load_ptr(&s->tap);
+    fa_store32(&g_dev->period_frames, period);     /* restored before any check returns */
+    fa_store64(&g_dev->latency_ns, latency);
+    CHECK_EQ(r, FA_OK);
+    CHECK((int64_t)t->frames >= need);
     fa_stream_close(s);
 }
 
@@ -1664,6 +1758,7 @@ int main(void)
     RUN(test_move_keeps_playing);
     RUN(test_resampled_end_is_complete);
     RUN(test_forward_only_detach_position);
+    RUN(test_forward_only_history_grows_with_chain);
     RUN(test_forward_only_detach_resampled);
     RUN(test_forward_only_loop_flag_ends);
     RUN(test_consecutive_sets_glide_from_heard);
@@ -1685,6 +1780,8 @@ int main(void)
     RUN(test_eq_memory_cleared_on_seek);
     RUN(test_eq_presets);
     RUN(test_eq_flat_is_free);
+    RUN(test_eq_noop_makes_none);
+    RUN(test_levels_tap_fits_latency);
     RUN(test_dsp_order_and_remove);
     RUN(test_dsp_on_decode_only);
 

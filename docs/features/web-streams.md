@@ -141,7 +141,7 @@ A URL that isn't an absolute http or https URL throws `ArgumentException`. Other
 
 ## Buffering, stalls and reconnects
 
-- The download thread keeps up to 4 MB per stream, at most 2 MB ahead of playback. Decoding only starts on data that's already downloaded, so neither the audio thread nor the decode workers ever wait for the network.
+- The download thread keeps up to 4 MB per stream, at most 2 MB ahead of playback. A stream that can't seek (radio, HLS, a server without byte ranges) keeps only the part ahead, about 2 MB. Decoding only starts on data that's already downloaded, so neither the audio thread nor the decode workers ever wait for the network.
 - After `fa_stream_play` the stream stays silent, in `FA_STATE_BUFFERING`, until `prebuffer_ms` of audio are in, then plays. No event is raised for that first fill.
 - When the network can't keep up and the buffer runs dry, the stream goes to `FA_STATE_BUFFERING` and raises `FA_EVENT_STALLED`. Once `prebuffer_ms` are buffered again it plays on from where it stopped and raises `FA_EVENT_RESUMED`. Pause, stop and seek work in either state.
 - A dropped connection is re-established by itself, with waits growing from 250 ms to 4 s, for up to `reconnect_ms`. A file continues at the byte where it stopped (with a Range request; if the server ignores ranges, the bytes already played are skipped). Radio picks up the live stream. If reconnecting fails for that long, the stream plays what it has and ends with `FA_EVENT_ENDED`.
