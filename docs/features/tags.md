@@ -110,7 +110,8 @@ string? gain = tags["REPLAYGAIN_TRACK_GAIN"];
 foreach (var item in tags.Items)
     Console.WriteLine($"{item.Format} {item.Key} = {item.Value}");
 
-// Faster scans:
+// Faster scans (a library scan should always pass NoPictures: the default copies every
+// embedded picture into a new array, which lands on the large object heap):
 var quick = Tags.Read(path, TagReadOptions.NoPictures);
 var textOnly = Tags.Read(path, TagReadOptions.NoPictures | TagReadOptions.NoInfo);
 

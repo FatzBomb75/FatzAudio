@@ -127,12 +127,7 @@ public sealed class OutputDevice : IDisposable
     public unsafe Spectrum GetSpectrum(int size = 2048, SpectrumOptions options = SpectrumOptions.None)
     {
         var bins = new float[Math.Max(1, size / 2)];
-        float hz;
-        fixed (float* p = bins)
-        {
-            FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_get_spectrum(Handle, (uint)Math.Max(0, size), (uint)options, p, &hz));
-        }
-        return new Spectrum(bins, hz);
+        return new Spectrum(bins, GetSpectrumCore((uint)Math.Max(0, size), bins, options));
     }
 
     /// <summary>Like <see cref="GetSpectrum(int, SpectrumOptions)"/>, into your own buffer (no allocation per call).</summary>
@@ -142,10 +137,15 @@ public sealed class OutputDevice : IDisposable
     /// <exception cref="FatzAudioException">An invalid length (<see cref="ErrorCode.InvalidArgument"/>).</exception>
     public unsafe float GetSpectrum(Span<float> magnitudes, SpectrumOptions options = SpectrumOptions.None)
     {
+        return GetSpectrumCore((uint)magnitudes.Length * 2, magnitudes, options);
+    }
+
+    private unsafe float GetSpectrumCore(uint size, Span<float> bins, SpectrumOptions options)
+    {
         float hz;
-        fixed (float* p = magnitudes)
+        fixed (float* p = bins)
         {
-            FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_get_spectrum(Handle, (uint)magnitudes.Length * 2, (uint)options, p, &hz));
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_get_spectrum(Handle, size, (uint)options, p, &hz));
         }
         return hz;
     }

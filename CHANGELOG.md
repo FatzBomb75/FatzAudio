@@ -47,6 +47,10 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
 ### Changed
+- .NET: `AudioStream.Info` no longer allocates on every read: the last `StreamInfo` is reused while the native values
+  are unchanged (a changed duration, length or bitrate still gives a fresh one), and `GetSpectrum(int)` on streams
+  and devices shares one code path with the `Span<float>` overload. For library scans, `Tags.Read(path,
+  TagReadOptions.NoPictures)` skips the cover art (the default still copies it).
 
 - Tracker modules no longer use the Amiga resampler by default (`FA_TRACKER_AMIGA_RESAMPLER` 0, .NET
   `TrackerAmigaResampler` false), as in libopenmpt: it cost about 19 times the CPU on MOD files. MOD files now sound
