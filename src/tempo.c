@@ -518,7 +518,7 @@ int fa_tparam_post(fa_tparam* p, float target, int64_t len, const fa_shape* shap
     return replaced;
 }
 
-int fa_tparam_eval(fa_tparam* p, int64_t at, float* out_value, int64_t* done_tag)
+int fa_tparam_eval(fa_tparam* p, int64_t at, float* out_value, int64_t* done_tag, int64_t* done_at)
 {
     double t;
     if (!p->active) {
@@ -538,6 +538,7 @@ int fa_tparam_eval(fa_tparam* p, int64_t at, float* out_value, int64_t* done_tag
         p->active = 0;
         *out_value = p->value;
         *done_tag = p->tag;
+        *done_at = p->start + p->len;
         return p->notify;
     }
     p->value = p->from + (p->target - p->from) * fa_shape_eval(&p->shape, (float)t, p->target > p->from);

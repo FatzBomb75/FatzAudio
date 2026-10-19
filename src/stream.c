@@ -820,6 +820,64 @@ static void tempo_ramp_done(struct fa_stream* s, int64_t tag)
     fa_engine_post_event(s->engine, &ev);
 }
 
+static double linear_position(struct fa_stream* s, int64_t played);
+static fa_frames wrap_position(struct fa_stream* s, fa_frames pos);
+
+/* Raises RAMP_DONE for the waiting ramp ends playback reached (`played` or, with
+ * `all`, every one): from the audio thread (dev set, the event's frame the
+ * position heard at `played`) or from a detach or a full table (dev NULL). */
+static void heard_ramps_due(struct fa_stream* s, fa_device* dev, int64_t played, int all)
+{
+    int i;
+    if (fa_load32(&s->heard_waiting) == 0) return;   /* the audio thread's usual case */
+    for (i = 0; i < FA_HEARD_RAMPS; i++) {
+        int64_t tag;
+        if (fa_load32(&s->heard_ramps[i].state) != 2 || (!all && s->heard_ramps[i].at > played)) continue;
+        if (!fa_cas32(&s->heard_ramps[i].state, 2, 3)) continue;
+        tag = s->heard_ramps[i].tag;
+        fa_store32(&s->heard_ramps[i].state, 0);
+        fa_fetch_add32(&s->heard_waiting, -1);
+        if (dev) fa_audio_post_event(dev, s, FA_EVENT_RAMP_DONE, wrap_position(s, (fa_frames)(linear_position(s, played) + 0.5)), tag);
+        else tempo_ramp_done(s, tag);
+    }
+}
+
+/* A ramp that ended at chain frame `at` in audio decoded ahead: its RAMP_DONE
+ * waits until that frame is heard (heard_ramps_due). Played frames count device
+ * frames from the same start as chain frames (timeline_reset), so the chain frame
+ * converts by the rates. Caller holds decode_lock (the only writer). */
+static void ramp_done_when_heard(struct fa_stream* s, int64_t at, int64_t tag)
+{
+    int i;
+    if (!s->dev_rate) {   /* decode-only: heard as it is read */
+        tempo_ramp_done(s, tag);
+        return;
+    }
+    for (i = 0; i < FA_HEARD_RAMPS; i++) {
+        if (!fa_cas32(&s->heard_ramps[i].state, 0, 1)) continue;
+        s->heard_ramps[i].at = (int64_t)floor((double)at * (double)s->dev_rate / (double)s->decoder.format.sample_rate + 0.5);
+        s->heard_ramps[i].tag = tag;
+        fa_fetch_add32(&s->heard_waiting, 1);
+        fa_store32(&s->heard_ramps[i].state, 2);
+        return;
+    }
+    /* The table is full (many short ramps within the decode-ahead): the waiting
+     * ones and this one are raised now, early but in order. */
+    heard_ramps_due(s, NULL, 0, 1);
+    tempo_ramp_done(s, tag);
+}
+
+/* The played-frame count restarts from 0 at `played` (timeline_reset): waiting
+ * ramp ends move with it, and those already reached are raised. Caller holds
+ * decode_lock with the audio thread kept out. */
+static void heard_ramps_rebase(struct fa_stream* s, int64_t played)
+{
+    int i;
+    for (i = 0; i < FA_HEARD_RAMPS; i++)
+        if (fa_load32(&s->heard_ramps[i].state) == 2) s->heard_ramps[i].at -= played;
+    heard_ramps_due(s, NULL, 0, 0);
+}
+
 /* Does anything need the chain: a value off neutral, or a ramp? Caller holds tempo_lock. */
 static int tempo_wanted_locked(struct fa_stream* s)
 {
@@ -844,17 +902,17 @@ static int tempo_wanted(struct fa_stream* s)
 static int tempo_values(struct fa_stream* s, int64_t at, double* tempo, double* pitch, double* rate)
 {
     float v[FA_TEMPO_PARAMS];
-    int64_t tags[FA_TEMPO_PARAMS];
+    int64_t tags[FA_TEMPO_PARAMS], ends[FA_TEMPO_PARAMS];
     int done[FA_TEMPO_PARAMS], i, wanted;
     fa_mutex_lock(&s->tempo_lock);
     for (i = 0; i < FA_TEMPO_PARAMS; i++) {
         tags[i] = 0;
-        done[i] = fa_tparam_eval(&s->tparams[i], at, &v[i], &tags[i]);
+        done[i] = fa_tparam_eval(&s->tparams[i], at, &v[i], &tags[i], &ends[i]);
     }
     wanted = tempo_wanted_locked(s);
     fa_mutex_unlock(&s->tempo_lock);
     for (i = 0; i < FA_TEMPO_PARAMS; i++)
-        if (done[i]) tempo_ramp_done(s, tags[i]);
+        if (done[i]) ramp_done_when_heard(s, ends[i], tags[i]);
     *rate = v[tempo_slot(FA_PARAM_RATE)];
     *tempo = v[tempo_slot(FA_PARAM_TEMPO)];
     *pitch = v[tempo_slot(FA_PARAM_PITCH)];
@@ -893,6 +951,7 @@ static void timeline_reset(struct fa_stream* s, fa_frames pos)
     /* Ramps count chain frames from here on, starting at what is heard now. */
     int64_t heard = s->tempo_frames;
     int i;
+    heard_ramps_rebase(s, fa_load64(&s->played));
     if (is_attached(s) && s->dev_rate)
         heard = (int64_t)((double)fa_load64(&s->played) * (double)s->decoder.format.sample_rate / (double)s->dev_rate + 0.5);
     fa_mutex_lock(&s->tempo_lock);
@@ -1433,6 +1492,7 @@ static void detach_locked(struct fa_stream* s)
     fa_device_remove_voice(dev, s);          /* waits until the audio thread let go */
     fa_engine_track_stream(s->engine, s, 0);
     fa_mutex_lock(&s->decode_lock);          /* waits for a worker still filling it */
+    heard_ramps_due(s, NULL, 0, 1);          /* the next attach starts at their end values */
     pos = target_position(s);                /* a pending fa_stream_seek_async included */
     fa_store64(&s->seek_pending, -1);
     s->dev_rate = 0;
@@ -2728,6 +2788,7 @@ static void frame_events(struct fa_stream* s, fa_device* dev, int64_t played0, i
 
 static void heard_events(struct fa_stream* s, fa_device* dev, int64_t played0, int64_t played1, int ended)
 {
+    heard_ramps_due(s, dev, played1, ended);
     if (s->midi) frame_events(s, dev, played0, played1, ended, post_midi_texts);
     if (s->tracker && fa_tracker_row_events_on(s->tracker)) frame_events(s, dev, played0, played1, ended, post_tracker_rows);
 }
@@ -2740,6 +2801,7 @@ static void end_stream(struct fa_stream* s, fa_device* dev)
 {
     fa_param_voice* v = &s->lanes[FA_LANE_FADE].v;
     if (!fa_cas32(&s->state, FA_STATE_PLAYING, FA_STATE_ENDED)) return;
+    heard_ramps_due(s, dev, fa_load64(&s->played), 1);
     if (v->active) {
         if (v->notify) push_event(dev, s, FA_EVENT_RAMP_DONE, v->tag);
         v->active = 0;
