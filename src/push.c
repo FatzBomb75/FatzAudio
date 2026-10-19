@@ -60,7 +60,7 @@ struct fa_push {
     int hold_pending;            /* ... and sets the clock's hold value */
     fa_atomic64 out_pts;         /* next_pts, readable by any thread */
     fa_atomic64 out_buffered;    /* frames in buf, readable by any thread */
-    int drained;                 /* the codec was told the input ended and gave back the rest */
+    int drained;                 /* the input ended and the codec and resampler gave back the rest */
 };
 
 static int64_t to_ns(int64_t v, fa_rational tb)
@@ -298,14 +298,6 @@ void fa_push_restart_timeline(struct fa_push* p)
 /* Puts `frames` frames of `in` (rate, channels) into buf, in the stream's format. */
 static fa_result convert_into_buf(struct fa_push* p, const float* in, fa_frames frames, uint32_t rate, uint32_t channels)
 {
-    fa_result r;
-    if (rate == p->rate && channels == p->channels) {
-        r = fa_float_reserve(&p->buf, &p->buf_cap, frames, channels);
-        if (r != FA_OK) return r;
-        memcpy(p->buf, in, (size_t)frames * channels * sizeof(float));
-        p->buf_count = frames;
-        return FA_OK;
-    }
     return fa_pcm_convert(&p->conv, in, frames, rate, channels, p->rate, p->channels, &p->buf, &p->buf_cap, &p->buf_count);
 }
 
@@ -324,7 +316,11 @@ static void take_block(struct fa_push* p, const float* pcm, fa_frames n, uint32_
 {
     p->buf_count = p->buf_off = 0;
     if (n > 0 && rate > 0 && ch > 0) {
+        /* The resampler's held frames come out ahead of this block, so the
+         * block's first frame is heard that much after its own pts. */
+        fa_frames held = fa_pcm_conv_held(&p->conv);
         if (convert_into_buf(p, pcm, n, rate, ch) != FA_OK) p->buf_count = 0;
+        if (pts != FA_PTS_NONE && held > 0) pts -= (int64_t)((double)held * 1e9 / (double)p->rate + 0.5);
     }
     if (p->buf_count > 0) {
         /* Does this chunk continue the timeline or start a new piece of it? */
@@ -354,10 +350,18 @@ static int refill(struct fa_push* p)
     fa_mutex_unlock(&p->lock);
     if (!it) {
         /* The end: the codec gives back what it still holds (delayed output). */
-        if (p->codec_ready && !p->drained && fa_load32(&p->ended) && fa_load32(&p->count) == 0) {
+        if (!p->drained && fa_load32(&p->ended) && fa_load32(&p->count) == 0) {
+            fa_frames n = 0;
             /* One block per call until the codec has nothing left. */
-            if (p->codec.vt->decode(&p->codec, NULL, 0) == FA_OK && p->codec.out_frames > 0) {
+            if (p->codec_ready && p->codec.vt->decode(&p->codec, NULL, 0) == FA_OK && p->codec.out_frames > 0) {
                 take_block(p, p->codec.out, p->codec.out_frames, p->codec.rate, p->codec.channels, FA_PTS_NONE);
+                return 1;
+            }
+            /* Then the resampler's last frames. */
+            p->buf_count = p->buf_off = 0;
+            if (fa_pcm_conv_flush(&p->conv, p->channels, &p->buf, &p->buf_cap, &n) == FA_OK && n > 0) {
+                p->buf_count = n;
+                fa_store32(&p->has_buffered, 1);
                 return 1;
             }
             p->drained = 1;

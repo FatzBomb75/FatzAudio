@@ -5,6 +5,7 @@
  * Speeding up (ratio > 1) widens the kernel by the ratio, which lowers the cutoff
  * to the output's Nyquist frequency, so nothing aliases. */
 #include "tempo.h"
+#include "fa_platform.h"
 #include <math.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -30,26 +31,43 @@ static double bessel_i0(double x)
     return sum;
 }
 
-fa_result fa_varispeed_init(fa_varispeed* v, uint32_t channels)
+/* The kernel table is the same for every resampler: built once, shared, kept
+ * for the life of the process. */
+static fa_atomic_ptr shared_table;
+
+static const float* kernel_table(void)
 {
     int i, n = VS_HALF * VS_PHASES + 2;
-    double i0b = bessel_i0(VS_BETA);
-    memset(v, 0, sizeof(*v));
-    v->channels = channels;
-    v->table = (float*)malloc((size_t)n * sizeof(float));
-    if (!v->table) return FA_ERROR_OUT_OF_MEMORY;
+    double i0b;
+    float* t = (float*)fa_load_ptr(&shared_table);
+    if (t) return t;
+    t = (float*)malloc((size_t)n * sizeof(float));
+    if (!t) return NULL;
+    i0b = bessel_i0(VS_BETA);
     for (i = 0; i < n; i++) {
-        double t = (double)i / VS_PHASES, x = VS_CUTOFF * t, sinc, w, r = t / VS_HALF;
+        double p = (double)i / VS_PHASES, x = VS_CUTOFF * p, sinc, w, r = p / VS_HALF;
         sinc = x == 0.0 ? 1.0 : sin(FA_TEMPO_PI * x) / (FA_TEMPO_PI * x);
         w = r >= 1.0 ? 0.0 : bessel_i0(VS_BETA * sqrt(1.0 - r * r)) / i0b;
-        v->table[i] = (float)(VS_CUTOFF * sinc * w);
+        t[i] = (float)(VS_CUTOFF * sinc * w);
     }
-    return FA_OK;
+    /* Two threads building it at once: the first one in is kept. */
+    if (!fa_cas_ptr(&shared_table, NULL, t)) {
+        free(t);
+        t = (float*)fa_load_ptr(&shared_table);
+    }
+    return t;
+}
+
+fa_result fa_varispeed_init(fa_varispeed* v, uint32_t channels)
+{
+    memset(v, 0, sizeof(*v));
+    v->channels = channels;
+    v->table = kernel_table();
+    return v->table ? FA_OK : FA_ERROR_OUT_OF_MEMORY;
 }
 
 void fa_varispeed_free(fa_varispeed* v)
 {
-    free(v->table);
     free(v->buf);
     memset(v, 0, sizeof(*v));
 }

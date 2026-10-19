@@ -1186,17 +1186,26 @@ fa_result fa_codec_reserve(fa_codec* c, fa_frames frames, uint32_t channels);
  * backend for miniaudio's data converter (resample_device.c). */
 extern ma_resampling_backend_vtable fa_sinc_resampler;
 
-/* Float PCM from one rate and channel count to another (miniaudio's converter),
- * set up again whenever the input format changes. */
+/* Float PCM from one rate and channel count to another (miniaudio's converter
+ * with the sinc resampler), set up again whenever the input format changes. The
+ * resampler holds back its look-ahead (about a millisecond), which comes out with
+ * the next block, before the first block of another format, or on a flush. */
 typedef struct fa_pcm_conv {
     ma_data_converter conv;
     int ready;
+    int pending;                  /* audio went in since the last flush or reset */
     uint32_t rate, channels;      /* the input it is set up for */
 } fa_pcm_conv;
 /* Converts `frames` frames of `in` (rate, channels) to out_rate / out_channels into
- * *buf from its start, growing it (*cap counts floats); *out_frames = frames written. */
+ * *buf from its start, growing it (*cap counts floats); *out_frames = frames written.
+ * Input already in the output format is copied (after what the converter held). */
 fa_result fa_pcm_convert(fa_pcm_conv* c, const float* in, fa_frames frames, uint32_t rate, uint32_t channels,
                          uint32_t out_rate, uint32_t out_channels, float** buf, fa_frames* cap, fa_frames* out_frames);
+/* The end of the input: appends the frames the converter still holds to the
+ * *out_frames frames already in *buf, and adds them to *out_frames. */
+fa_result fa_pcm_conv_flush(fa_pcm_conv* c, uint32_t out_channels, float** buf, fa_frames* cap, fa_frames* out_frames);
+/* Output frames the converter holds back now (they come out after the next input). */
+fa_frames fa_pcm_conv_held(fa_pcm_conv* c);
 void fa_pcm_conv_reset(fa_pcm_conv* c);
 void fa_pcm_conv_free(fa_pcm_conv* c);
 /* Makes *buf hold at least `frames` frames of `channels`, keeping its contents (*cap counts floats). */

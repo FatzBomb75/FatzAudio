@@ -456,6 +456,18 @@ fa_result fa_tempo_drain(fa_tempo* t, double tempo, double pitch, double rate,
         if (!fa_stretch_process(t->st, t->obuf, (int)lat, t->sbuf, (int)m1)) return FA_ERROR_OUT_OF_MEMORY;
         if (!fa_stretch_flush(t->st, t->sbuf + (size_t)m1 * ch, (int)fl, ratio)) return FA_ERROR_OUT_OF_MEMORY;
         if (t->xfade > 0) xfade_in(t, t->sbuf, want);
+        if (t->st_transients && want > 0 && t->formants == 1.0) {
+            /* The last onsets too: past the end the input is silence, enough of
+             * it for a splice window after a hit in the last frames. */
+            double ms = t->rate / 1000.0, src_out = t->st_src - t->frac * ratio;
+            int64_t pad = (int64_t)ceil((FA_TR_POST_MS + FA_TR_FADE_MS) * ms) + 2;
+            r = grow(&t->obuf, &t->ocap, pad > lat ? pad : lat, ch);
+            if (r != FA_OK) return r;
+            memset(t->obuf, 0, (size_t)pad * ch * sizeof(float));
+            r = raw_push(t, t->obuf, pad);
+            if (r != FA_OK) return r;
+            splice_transients(t, t->sbuf, want, src_out, ratio);
+        }
         a = t->sbuf;
         na = want;
         t->st_on = 0;

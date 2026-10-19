@@ -55,7 +55,7 @@ int fa_stretch_flush(fa_stretch* s, float* out, int frames, double ratio);
 
 typedef struct fa_varispeed {
     uint32_t channels;
-    float* table;       /* half the windowed-sinc kernel, VS_PHASES steps per tap */
+    const float* table; /* half the windowed-sinc kernel, VS_PHASES steps per tap (shared) */
     float* buf;         /* input frames, interleaved */
     int64_t cap, count;
     double pos;         /* input time of the next output frame */

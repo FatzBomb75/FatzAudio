@@ -268,6 +268,75 @@ static void test_push_frame_converts_any_format(void)
     fa_stream_close(s);
 }
 
+/* Level (dB) of frequency f in channel 0 of x[from, to) (Goertzel, Hann window). */
+static double level_db(const float* x, int64_t from, int64_t to, uint32_t channels, double f, double rate)
+{
+    double w = 2.0 * 3.14159265358979323846 * f / rate, c = 2.0 * cos(w), s1 = 0.0, s2 = 0.0, len = (double)(to - from);
+    int64_t i;
+    for (i = from; i < to; i++) {
+        double h = 0.5 - 0.5 * cos(2.0 * 3.14159265358979323846 * (double)(i - from) / len);
+        double s0 = (double)x[i * channels] * h + c * s1 - s2;
+        s2 = s1;
+        s1 = s0;
+    }
+    return 10.0 * log10((s1 * s1 + s2 * s2 - c * s1 * s2) / (len * len) + 1e-30);
+}
+
+/* Frames pushed at another rate go through the sinc resampler: a 17 kHz tone at
+ * 44.1 kHz into a 48 kHz stream leaves no image (20.9 kHz) the linear one left,
+ * and every frame comes out at the end, also the resampler's look-ahead and the
+ * look-ahead still held when the frames switch to the stream's own rate. */
+static void test_push_frames_resampled_cleanly(void)
+{
+    fa_audio_format f;
+    fa_open_options o;
+    fa_stream* s = NULL;
+    float* in = (float*)malloc(sizeof(float) * 1100 * 2);
+    const void* planes[1];
+    fa_audio_frame fr;
+    int64_t i, k, n = 0;
+    float* out;
+    double tone, image;
+    memset(&f, 0, sizeof(f));
+    f.sample_format = FA_FORMAT_F32;
+    f.sample_rate = 48000;
+    f.channels = 2;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    CHECK_EQ(fa_stream_open_push(g_engine, &f, &o, &s), FA_OK);
+    planes[0] = in;
+    memset(&fr, 0, sizeof(fr));
+    fr.format.sample_format = FA_FORMAT_F32;
+    fr.format.channels = 2;
+    fr.data = planes;
+    fr.frames = 1000;
+    for (k = 0; k < 49; k++) {          /* 44.1 kHz for 44100 frames, then 4800 at 48 kHz */
+        int native = k >= 44;
+        fr.format.sample_rate = native ? 48000 : 44100;
+        fr.frames = native ? 960 : k == 43 ? 1100 : 1000;
+        fr.pts = FA_PTS_NONE;
+        for (i = 0; i < fr.frames; i++) {
+            float v = native ? 0.0f : (float)(0.5 * sin(2.0 * 3.14159265358979323846 * 17000.0 * (double)(k * 1000 + i) / 44100.0));
+            in[i * 2] = v;
+            in[i * 2 + 1] = -v;
+        }
+        CHECK_EQ(fa_stream_push_frame(s, &fr), FA_OK);
+    }
+    free(in);
+    CHECK_EQ(fa_stream_push_end(s), FA_OK);
+    out = read_all(s, 2, &n);
+    fa_stream_close(s);
+    CHECK_NEAR((double)n, 48000.0 + 4800.0, 1.0);   /* the output time is a running sum */
+    tone = level_db(out, 4800, 43200, 2, 17000.0, 48000.0);
+    image = level_db(out, 4800, 43200, 2, 48000.0 - (44100.0 - 17000.0), 48000.0);
+    printf("  17 kHz pushed at 44.1 kHz: image %.1f dB below the tone\n", tone - image);
+    CHECK(tone - image > 80.0);
+    /* The tone reaches its last input frame and stops there. */
+    CHECK(rms(out, 47900, 47990, 2) > 0.3);
+    CHECK(rms(out, 48010, 48000 + 4800, 2) < 1e-3);
+    free(out);
+}
+
 static void test_clock_follows_the_speaker(void)
 {
     fa_stream* s = open_push_s16p();
@@ -987,6 +1056,7 @@ int main(void)
 
     RUN(test_push_pcm_plays_exactly);
     RUN(test_push_frame_converts_any_format);
+    RUN(test_push_frames_resampled_cleanly);
     RUN(test_cue_out_before_kept_audio);
     RUN(test_clock_follows_the_speaker);
     RUN(test_clock_follows_timestamp_jumps);

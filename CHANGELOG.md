@@ -52,6 +52,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Playback at another rate than the device's (a 44.1 kHz file on a 48 kHz device) is resampled with the windowed-sinc
   resampler that rate and pitch use, instead of miniaudio's linear one: about -90 dB of aliasing and imaging, and
   high frequencies no longer dulled. See [docs/features/playback.md](docs/features/playback.md).
+- Frames pushed at another rate than their push stream's (`fa_stream_push_frame`), and tracks whose rate changes
+  partway (chained Ogg), are resampled with the same windowed-sinc resampler (a 17 kHz tone pushed at 44.1 kHz into
+  a 48 kHz stream: its image went from 8 dB to 126 dB below the tone).
+
+### Fixed
+
+- Transient mode (`FA_STRETCH_TRANSIENTS`) now also removes the pre-echo of a hit in the last ~100 ms of a track
+  (-49 dB instead of -20 dB).
 
 ## 0.2.0 (2026-10-18)
 
