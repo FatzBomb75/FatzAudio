@@ -10,6 +10,10 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#  include <emmintrin.h>
+#  define VS_SSE 1
+#endif
 
 #define VS_HALF FA_VARISPEED_HALF  /* taps on each side at ratio <= 1 */
 #define VS_PHASES 256              /* table steps per tap */
@@ -130,6 +134,66 @@ fa_result fa_varispeed_write(fa_varispeed* v, const float* in, int64_t frames)
     return FA_OK;
 }
 
+#if VS_SSE
+/* The first `n` (1 to 4) floats at f, the rest of the vector 0 (unaligned loads). */
+static inline __m128 load_upto4(const float* f, uint32_t n)
+{
+    if (n >= 4) return _mm_loadu_ps(f);
+    if (n == 3) return _mm_movelh_ps(_mm_castsi128_ps(_mm_loadl_epi64((const __m128i*)(const void*)f)), _mm_load_ss(f + 2));
+    if (n == 2) return _mm_castsi128_ps(_mm_loadl_epi64((const __m128i*)(const void*)f));
+    return _mm_load_ss(f);
+}
+
+/* Stores the first `n` (0 to 4) floats of v at f. */
+static inline void store_upto4(float* f, uint32_t n, __m128 v)
+{
+    if (n >= 4) { _mm_storeu_ps(f, v); return; }
+    if (n >= 2) { _mm_storel_epi64((__m128i*)(void*)f, _mm_castps_si128(v)); f += 2; n -= 2; v = _mm_movehl_ps(v, v); }
+    if (n == 1) _mm_store_ss(f, v);
+}
+
+/* 3 to 8 channels: acc[c] = sum of x[k * ch + c] * h[k] for k < m, the channels
+ * in two vectors (0-3, 4-7). Two frames per step, so the adds overlap. With a
+ * constant `ch` (the callers' switch) the loads are straight-line code. */
+static inline void dot_frames(const float* x, const float* h, int64_t m, uint32_t ch, float* acc)
+{
+    const uint32_t lo = ch < 4 ? ch : 4, hi = ch - lo;
+    __m128 a0 = _mm_setzero_ps(), a1 = _mm_setzero_ps(), b0 = _mm_setzero_ps(), b1 = _mm_setzero_ps();
+    int64_t k;
+    for (k = 0; k + 1 < m; k += 2) {
+        const float* f = x + k * ch;
+        __m128 h0 = _mm_set1_ps(h[k]), h1 = _mm_set1_ps(h[k + 1]);
+        a0 = _mm_add_ps(a0, _mm_mul_ps(load_upto4(f, lo), h0));
+        b0 = _mm_add_ps(b0, _mm_mul_ps(load_upto4(f + ch, lo), h1));
+        if (hi) {
+            a1 = _mm_add_ps(a1, _mm_mul_ps(load_upto4(f + 4, hi), h0));
+            b1 = _mm_add_ps(b1, _mm_mul_ps(load_upto4(f + ch + 4, hi), h1));
+        }
+    }
+    if (k < m) {
+        const float* f = x + k * ch;
+        __m128 h0 = _mm_set1_ps(h[k]);
+        a0 = _mm_add_ps(a0, _mm_mul_ps(load_upto4(f, lo), h0));
+        if (hi) a1 = _mm_add_ps(a1, _mm_mul_ps(load_upto4(f + 4, hi), h0));
+    }
+    store_upto4(acc, lo, _mm_add_ps(a0, b0));
+    store_upto4(acc + 4, hi, _mm_add_ps(a1, b1));
+}
+
+/* dot_frames with `ch` a constant in each call, so each is compiled for its count. */
+static void dot_frames_ch(const float* x, const float* h, int64_t m, uint32_t ch, float* acc)
+{
+    switch (ch) {
+    case 3: dot_frames(x, h, m, 3, acc); break;
+    case 4: dot_frames(x, h, m, 4, acc); break;
+    case 5: dot_frames(x, h, m, 5, acc); break;
+    case 6: dot_frames(x, h, m, 6, acc); break;
+    case 7: dot_frames(x, h, m, 7, acc); break;
+    default: dot_frames(x, h, m, 8, acc); break;
+    }
+}
+#endif
+
 /* Adds the taps on one side of the output time: input frames x, x - step, ...
  * (step -1 or +1 frame) at kernel positions t, t + dt, ... until the kernel ends. */
 static void taps(const fa_varispeed* v, const float* x, int64_t avail, int dir, float t, float dt, float scale, float* acc)
@@ -138,6 +202,23 @@ static void taps(const fa_varispeed* v, const float* x, int64_t avail, int dir, 
     uint32_t ch = v->channels, c;
     const float end = (float)(VS_HALF * VS_PHASES);
     int64_t m;
+#if VS_SSE
+    if (ch >= 3 && ch <= 8) {
+        /* The channels in two vectors (as dot_frames), added to acc at the end. */
+        const uint32_t lo = ch < 4 ? ch : 4, hi = ch - lo;
+        __m128 a0 = _mm_setzero_ps(), a1 = _mm_setzero_ps();
+        for (m = 0; m < avail && t < end; m++, t += dt) {
+            int32_t ti = (int32_t)t;
+            __m128 h = _mm_set1_ps((table[ti] + (table[ti + 1] - table[ti]) * (t - (float)ti)) * scale);
+            const float* f = x + (ptrdiff_t)dir * m * (ptrdiff_t)ch;
+            a0 = _mm_add_ps(a0, _mm_mul_ps(load_upto4(f, lo), h));
+            if (hi) a1 = _mm_add_ps(a1, _mm_mul_ps(load_upto4(f + 4, hi), h));
+        }
+        store_upto4(acc, lo, _mm_add_ps(a0, load_upto4(acc, lo)));
+        if (hi) store_upto4(acc + 4, hi, _mm_add_ps(a1, load_upto4(acc + 4, hi)));
+        return;
+    }
+#endif
     for (m = 0; m < avail && t < end; m++, t += dt) {
         int32_t ti = (int32_t)t;
         float h = (table[ti] + (table[ti + 1] - table[ti]) * (t - (float)ti)) * scale;
@@ -276,6 +357,10 @@ static void phased_frame(const fa_varispeed* v, const fa_vs_phases* p, uint32_t 
         }
         for (; k < m; k++) a0 += x[k] * row[k];
         o[0] = (a0 + a1) + (a2 + a3);
+#if VS_SSE
+    } else if (ch <= 8) {
+        dot_frames_ch(x, row, m, ch, o);
+#endif
     } else {
         float acc[FA_TEMPO_MAX_CHANNELS];
         for (c = 0; c < ch; c++) acc[c] = 0.0f;

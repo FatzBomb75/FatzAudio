@@ -2999,6 +2999,78 @@ static void net_title_heard(struct fa_stream* s, fa_device* dev)
     if (seq > was && fa_cas64(&s->meta_announced, was, seq)) push_event(dev, s, FA_EVENT_METADATA, seq);
 }
 
+/* Whether the gains stay the same over the `n` frames from `played`: no lane or
+ * bus ramp (none due either), no mute or normalization glide, and the marker fades
+ * out of reach. A looping stream must not wrap in them either, as blocks end at the
+ * loop end (where the fades jump, and where the equalizer's blocks restart). */
+static int steady_gain(struct fa_stream* s, const mix_markers* mk, struct fa_bus* bus, int64_t played, int64_t n,
+                       int looping, fa_frames loop_end)
+{
+    double pos0, lin0, pos1;
+    int p;
+    for (p = 0; p < FA_STREAM_LANES; p++) if (s->lanes[p].v.active) return 0;
+    if (bus) for (p = 0; p < FA_MIX_PARAMS; p++) if (bus->lanes[p].v.active) return 0;
+    if (!looping && mk->fade_in_to < 0 && mk->fade_out_to < 0) return 1;
+    pos0 = fade_position(s, played);
+    lin0 = linear_position(s, played);
+    if (looping) {
+        int64_t to_end = frames_until(s, played, lin0 + ((double)loop_end - pos0));
+        if (to_end <= n) return 0;
+    }
+    /* Positions only grow until the wrap; a frame of margin covers the rounding of
+     * the block-by-block sums. */
+    pos1 = pos0 + (linear_position(s, played + n) - lin0);
+    if (mk->fade_in_to >= 0 && pos0 < (double)mk->fade_in_to) return 0;
+    if (mk->fade_out_to >= 0 && pos1 + 1.0 > (double)mk->fade_out_from) return 0;
+    return 1;
+}
+
+/* stream_mix's loop for steady gains (steady_gain): the same samples, mixed in one
+ * pass, with the ring, the play count and the tempo map moved once. The equalizer
+ * still runs in blocks of FA_RAMP_BLOCK, as its glides and state go by block. */
+static void mix_steady(struct fa_stream* s, fa_device* dev, float* out, int64_t now, int64_t off, int64_t played, int64_t n,
+                       float norm_lin, float mute, const mix_markers* mk, struct fa_bus* bus, int eq_on, fa_tap* tap)
+{
+    float g, l, r, bl = 1.0f, br = 1.0f;
+    const float *p1, *p2;
+    int64_t n1, n2, done;
+    g = s->lanes[FA_PARAM_VOLUME].v.value * s->lanes[FA_LANE_FADE].v.value * marker_gain(mk, fade_position(s, played));
+    g *= 1.0f - mute;
+    stereo_gains(g * norm_lin, s->lanes[FA_PARAM_PAN].v.value, &l, &r);
+    if (bus) {
+        fa_bus_gains_at(bus, dev, off, 1, &bl, &br);
+        l *= bl; r *= br;
+    }
+    fa_ring_regions(&s->ring, n, &p1, &n1, &p2, &n2);
+    if (eq_on) {
+        for (done = 0; done < n;) {
+            float eqb[FA_RAMP_BLOCK * FA_DEVICE_CHANNELS];
+            int64_t blk = n - done < FA_RAMP_BLOCK ? n - done : FA_RAMP_BLOCK, k = 0;
+            if (done < n1) {
+                k = n1 - done < blk ? n1 - done : blk;
+                memcpy(eqb, p1 + done * FA_DEVICE_CHANNELS, (size_t)k * FA_DEVICE_CHANNELS * sizeof(float));
+            }
+            if (k < blk)
+                memcpy(eqb + k * FA_DEVICE_CHANNELS, p2 + (done + k - n1) * FA_DEVICE_CHANNELS,
+                       (size_t)(blk - k) * FA_DEVICE_CHANNELS * sizeof(float));
+            fa_eq_process(&s->eq, eqb, blk);
+            if (tap) fa_tap_write(tap, now + done, eqb, blk);
+            mix_region(out + done * 2, eqb, blk, l, r, l, r);
+            done += blk;
+        }
+    } else {
+        if (tap) {
+            fa_tap_write(tap, now, p1, n1);
+            if (n2 > 0) fa_tap_write(tap, now + n1, p2, n2);
+        }
+        mix_region(out, p1, n1, l, r, l, r);
+        if (n2 > 0) mix_region(out + n1 * 2, p2, n2, l, r, l, r);
+    }
+    fa_ring_advance_read(&s->ring, n);
+    fa_fetch_add64(&s->played, n);
+    fa_tmap_release(&s->tmap, played + n);
+}
+
 /* Mixes `s` into `out`; *mixed_off and *mixed_n say which frames of the callback
  * carried its audio. */
 static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t frames, int64_t* mixed_off,
@@ -3079,6 +3151,11 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
     eq_on = fa_eq_begin(&s->eq, &s->eq_shared, dev->rate,
                         (fa_load32(&s->eq_restart) && fa_exchange32(&s->eq_restart, 0)) | (s->mute_next != clock + off));
 
+    if (n > 0 && !fa_load32(&dev->mix_blockwise) && mute0 == mute_target && s->norm_db == norm_target &&
+        steady_gain(s, &mk, bus, played0, n, looping, loop_end)) {
+        mix_steady(s, dev, out + off * 2, clock + off, off, played0, n, norm_lin, mute0, &mk, bus, eq_on, tap);
+        done = n;
+    }
     while (done < n && !ended) {
         /* Blocks of FA_RAMP_BLOCK frames: gains are exact at block edges and
          * interpolated linearly inside, so ramps and changes are click-free. Blocks

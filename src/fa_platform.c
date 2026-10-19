@@ -48,6 +48,7 @@ void fa_cond_wait_ms(fa_cond* c, fa_mutex* m, uint32_t timeout_ms)
     SleepConditionVariableSRW((CONDITION_VARIABLE*)c->impl, (SRWLOCK*)m->impl, timeout_ms, 0);
 }
 void fa_cond_broadcast(fa_cond* c) { WakeAllConditionVariable((CONDITION_VARIABLE*)c->impl); }
+void fa_cond_signal(fa_cond* c) { WakeConditionVariable((CONDITION_VARIABLE*)c->impl); }
 
 typedef struct { fa_thread_proc proc; void* arg; } thread_start;
 
@@ -251,6 +252,10 @@ void fa_cond_wait_ms(fa_cond* c, fa_mutex* m, uint32_t timeout_ms)
     /* Wall-clock deadline: a clock jump only causes an early or late wakeup,
      * which every caller tolerates (they all re-check state in a loop). */
     struct timespec ts;
+    if (timeout_ms == UINT32_MAX) {   /* until woken, as INFINITE on Windows */
+        pthread_cond_wait((pthread_cond_t*)c->impl, (pthread_mutex_t*)m->impl);
+        return;
+    }
     clock_gettime(CLOCK_REALTIME, &ts);
     ts.tv_sec += timeout_ms / 1000;
     ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
@@ -258,6 +263,7 @@ void fa_cond_wait_ms(fa_cond* c, fa_mutex* m, uint32_t timeout_ms)
     pthread_cond_timedwait((pthread_cond_t*)c->impl, (pthread_mutex_t*)m->impl, &ts);
 }
 void fa_cond_broadcast(fa_cond* c) { pthread_cond_broadcast((pthread_cond_t*)c->impl); }
+void fa_cond_signal(fa_cond* c) { pthread_cond_signal((pthread_cond_t*)c->impl); }
 
 typedef struct { fa_thread_proc proc; void* arg; } thread_start;
 

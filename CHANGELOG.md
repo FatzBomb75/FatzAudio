@@ -66,6 +66,11 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   compare-exchanges. .NET: `HasCdg` and the `Tags` lookups (`Cover`, the indexer) no longer allocate.
 - HE-AAC decodes about 35% faster (its QMF analysis bank uses a fast DCT-IV; 16 KB less per decoder) and ALAC
   up to 30% faster (faster bit reading). The output is unchanged.
+- Less engine CPU, same output: the mixer mixes a stream whose gains hold steady in one pass instead of every 16
+  frames (bit-identical; 16 playing streams mix in about half the time); idle decode workers no longer each poll
+  every 5 ms (one polls and wakes the others when there is work: about 320 wake-ups a second instead of 200 per
+  worker); device-rate conversion of 5.1 and 7.1 sums its channels with SSE2, about 3x faster (per channel now
+  cheaper than stereo); CD+G smooth scaling redraws 1080p 2.5 to 6 times faster (pixel-identical).
 - A tempo, pitch or rate ramp's `FA_EVENT_RAMP_DONE` now comes when the ramp's end is heard, not up to the
   decode-ahead latency (150 ms) earlier when it was decoded, matching volume ramps. See
   [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md).

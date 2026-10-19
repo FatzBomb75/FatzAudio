@@ -96,6 +96,8 @@ struct fa_cdg_surface {
     uint32_t bg_opacity;          /* config.background_opacity, % */
     uint16_t* xmap;               /* output column -> window column (sharp scaling) */
     uint16_t* ymap;               /* output row -> window row */
+    uint32_t* xlerp;              /* smooth scaling: output column -> lerp_map */
+    uint32_t* ylerp;              /* output row -> lerp_map */
     cdg_state st;
     size_t stale_from;            /* packs from here were rewritten (SIZE_MAX = none), under cdg_lock */
 };
@@ -505,10 +507,27 @@ static void store_pixel(const fa_cdg_surface* f, uint8_t* px, uint32_t r, uint32
     px[3] = (uint8_t)a;
 }
 
+/* Smooth scaling's source position for output pixel `o` of `n` (a window of `w`):
+ * window pixel << 8 | the weight of the next one, in 8-bit fixed point. Pixel
+ * centres map to pixel centres. */
+static uint32_t lerp_map(uint32_t o, uint32_t n, uint32_t w)
+{
+    int64_t fp = ((int64_t)(2 * o + 1) * w * 256) / (2 * n) - 128;
+    uint32_t p, t;
+    if (fp < 0) fp = 0;
+    p = (uint32_t)(fp >> 8);
+    t = (uint32_t)(fp & 255);
+    if (p >= w - 1) { p = w - 1; t = 0; }
+    return p << 8 | t;
+}
+
 static void render_rect(fa_cdg_surface* f, const uint8_t pal[16][4], uint32_t ox0, uint32_t oy0, uint32_t ox1, uint32_t oy1)
 {
     uint32_t pm[16][4];   /* premultiplied palette */
-    uint32_t ox, oy, i;
+    uint32_t ox, oy, i, cy0 = UINT32_MAX, cy1 = UINT32_MAX;
+    uint8_t flat[16][4], r0[FA_CDG_WIDTH], r1[FA_CDG_WIDTH];   /* smooth: output pixels, window rows cy0, cy1 */
+    int have_flat = 0;
+    if (ox0 >= ox1 || oy0 >= oy1) return;
     for (i = 0; i < 16; i++) {
         pm[i][3] = pal[i][3];
         pm[i][0] = (pal[i][0] * pm[i][3] + 127) / 255;
@@ -534,33 +553,36 @@ static void render_rect(fa_cdg_surface* f, const uint8_t pal[16][4], uint32_t ox
             for (ox = ox0; ox < ox1; ox++)
                 memcpy(row + ox * 4, lut[window_index(f, f->xmap[ox], wy)], 4);
         } else {
-            /* Bilinear on premultiplied colour, in 8-bit fixed point. Pixel centres
-             * map to pixel centres. */
-            int64_t fy = ((int64_t)(2 * oy + 1) * f->win_h * 256) / (2 * f->height) - 128;
-            int32_t y0, y1, ty;
-            if (fy < 0) fy = 0;
-            y0 = (int32_t)(fy >> 8);
-            ty = (int32_t)(fy & 255);
-            if ((uint32_t)y0 >= f->win_h - 1) { y0 = (int32_t)f->win_h - 1; ty = 0; }
-            y1 = (uint32_t)y0 + 1 < f->win_h ? y0 + 1 : y0;
+            /* Bilinear on premultiplied colour, in 8-bit fixed point (lerp_map).
+             * Where all four source pixels are one colour the blend is that colour,
+             * so those pixels (most of a picture) come straight from `flat`. */
+            uint32_t y0 = f->ylerp[oy] >> 8, ty = f->ylerp[oy] & 255, y1 = y0 + 1 < f->win_h ? y0 + 1 : y0;
+            if (!have_flat) {
+                for (i = 0; i < 16; i++) store_pixel(f, flat[i], pm[i][0], pm[i][1], pm[i][2], pm[i][3]);
+                have_flat = 1;
+            }
+            if (y0 != cy0 || y1 != cy1) {
+                /* Only the window columns this rectangle reads; the row below becomes
+                 * the row above as the output moves down. */
+                uint32_t xa = f->xlerp[ox0] >> 8, xb = (f->xlerp[ox1 - 1] >> 8) + 1;
+                if (xb > f->win_w - 1) xb = f->win_w - 1;
+                if (y0 == cy1) memcpy(r0 + xa, r1 + xa, xb - xa + 1);
+                else for (i = xa; i <= xb; i++) r0[i] = window_index(f, i, y0);
+                for (i = xa; i <= xb; i++) r1[i] = y1 == y0 ? r0[i] : window_index(f, i, y1);
+                cy0 = y0;
+                cy1 = y1;
+            }
             for (ox = ox0; ox < ox1; ox++) {
-                int64_t fx = ((int64_t)(2 * ox + 1) * f->win_w * 256) / (2 * f->width) - 128;
-                int32_t x0, x1, tx, k;
+                uint32_t x0 = f->xlerp[ox] >> 8, tx = f->xlerp[ox] & 255, x1 = x0 + 1 < f->win_w ? x0 + 1 : x0, k;
                 uint32_t acc[4];
+                uint8_t ia = r0[x0], ib = r0[x1], ic = r1[x0], id = r1[x1];
                 const uint32_t *a, *b, *c, *d;
-                if (fx < 0) fx = 0;
-                x0 = (int32_t)(fx >> 8);
-                tx = (int32_t)(fx & 255);
-                if ((uint32_t)x0 >= f->win_w - 1) { x0 = (int32_t)f->win_w - 1; tx = 0; }
-                x1 = (uint32_t)x0 + 1 < f->win_w ? x0 + 1 : x0;
-                a = pm[window_index(f, (uint32_t)x0, (uint32_t)y0)];
-                b = pm[window_index(f, (uint32_t)x1, (uint32_t)y0)];
-                c = pm[window_index(f, (uint32_t)x0, (uint32_t)y1)];
-                d = pm[window_index(f, (uint32_t)x1, (uint32_t)y1)];
+                if (ia == ib && ia == ic && ia == id) { memcpy(row + ox * 4, flat[ia], 4); continue; }
+                a = pm[ia]; b = pm[ib]; c = pm[ic]; d = pm[id];
                 for (k = 0; k < 4; k++) {
-                    uint32_t top = a[k] * (uint32_t)(256 - tx) + b[k] * (uint32_t)tx;
-                    uint32_t bottom = c[k] * (uint32_t)(256 - tx) + d[k] * (uint32_t)tx;
-                    acc[k] = (top * (uint32_t)(256 - ty) + bottom * (uint32_t)ty + 32768) >> 16;
+                    uint32_t top = a[k] * (256 - tx) + b[k] * tx;
+                    uint32_t bottom = c[k] * (256 - tx) + d[k] * tx;
+                    acc[k] = (top * (256 - ty) + bottom * ty + 32768) >> 16;
                 }
                 store_pixel(f, row + ox * 4, acc[0], acc[1], acc[2], acc[3]);
             }
@@ -738,6 +760,8 @@ static void surface_free(fa_cdg_surface* f)
 {
     free(f->xmap);
     free(f->ymap);
+    free(f->xlerp);
+    free(f->ylerp);
     free(f->pixels);
     free(f);
 }
@@ -852,6 +876,13 @@ FA_API fa_result FA_CALL fa_cdg_surface_create(fa_stream* stream, const fa_cdg_s
     if (!f->pixels || !f->xmap || !f->ymap) { surface_free(f); return FA_ERROR_OUT_OF_MEMORY; }
     for (i = 0; i < f->width; i++) f->xmap[i] = (uint16_t)((uint64_t)i * f->win_w / f->width);
     for (i = 0; i < f->height; i++) f->ymap[i] = (uint16_t)((uint64_t)i * f->win_h / f->height);
+    if (f->flags & FA_CDG_SMOOTH) {
+        f->xlerp = (uint32_t*)malloc(f->width * sizeof(uint32_t));
+        f->ylerp = (uint32_t*)malloc(f->height * sizeof(uint32_t));
+        if (!f->xlerp || !f->ylerp) { surface_free(f); return FA_ERROR_OUT_OF_MEMORY; }
+        for (i = 0; i < f->width; i++) f->xlerp[i] = lerp_map(i, f->width, f->win_w);
+        for (i = 0; i < f->height; i++) f->ylerp[i] = lerp_map(i, f->height, f->win_h);
+    }
     state_reset(&f->st);
     f->stale_from = SIZE_MAX;
     fa_mutex_lock(&stream->cdg_lock);
