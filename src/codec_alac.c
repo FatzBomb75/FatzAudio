@@ -146,6 +146,40 @@ static int residuals(bits* b, int32_t* out, uint32_t n, int size, uint32_t mult,
     return left(b);
 }
 
+/* The coefficients move against the residual's sign, oldest sample first, until
+ * the residual is used up. p points at the most recent of the `order` samples,
+ * base at the one before them. */
+static __inline void adapt(int16_t* coefs, const int32_t* p, int32_t base, int32_t err, int order, int shift)
+{
+    int sign = err > 0 ? 1 : -1, j;
+    if (err == 0) return;
+    for (j = order - 1; j >= 0 && (sign > 0 ? err > 0 : err < 0); j--) {
+        int64_t d = (int64_t)base - p[-j];
+        int step = ((d > 0) - (d < 0)) * sign;
+        coefs[j] = (int16_t)(coefs[j] - step);
+        err = (int32_t)((uint32_t)err - (uint32_t)(int32_t)((d * step) >> shift) * (uint32_t)(order - j));
+    }
+}
+
+/* The predictor from sample i on with the sum in 32 bits, as the reference
+ * decoder does it: wrapped, the sum still has the low 32 bits of the exact one,
+ * and only `size` bits of it shifted are used, its bits shift .. shift + size -
+ * 1, so where those are within 32 the result is the same as predict's. Inline,
+ * so the calls with the usual orders 4 and 8 get their own unrolled copies. */
+static __inline void predict32(int32_t* s, uint32_t i, uint32_t n, int16_t* coefs, int order, int shift, int size)
+{
+    int j;
+    for (; i < n; i++) {
+        const int32_t* p = s + i - 1;
+        int32_t base = s[i - order - 1], err = s[i];
+        uint32_t acc = 0;
+        for (j = 0; j < order; j++) acc += ((uint32_t)p[-j] - (uint32_t)base) * (uint32_t)(int32_t)coefs[j];
+        if (shift > 0) acc += 1u << (shift - 1);
+        s[i] = sext(((uint32_t)((int32_t)acc >> shift)) + (uint32_t)base + (uint32_t)err, size);
+        adapt(coefs, p, base, err, order, shift);
+    }
+}
+
 /* The adaptive FIR predictor, in place: residuals in, samples out. `coefs`
  * applies to the `order` previous samples, the most recent first; it adapts as it
  * goes. Order 31 is the plain first-order predictor. */
@@ -159,26 +193,20 @@ static void predict(int32_t* s, uint32_t n, int16_t* coefs, int order, int shift
         return;
     }
     for (i = 1; i <= (uint32_t)order && i < n; i++) s[i] = sext((uint32_t)s[i - 1] + (uint32_t)s[i], size);
+    if (size + shift <= 32 && size < 32) {
+        if (order == 4) predict32(s, i, n, coefs, 4, shift, size);
+        else if (order == 8) predict32(s, i, n, coefs, 8, shift, size);
+        else predict32(s, i, n, coefs, order, shift, size);
+        return;
+    }
     for (; i < n; i++) {
-        int32_t base = s[i - order - 1];
+        const int32_t* p = s + i - 1;
+        int32_t base = s[i - order - 1], err = s[i];
         int64_t acc = 0;
-        int32_t err = s[i], v;
-        for (j = 0; j < order; j++) acc += ((int64_t)s[i - 1 - j] - base) * coefs[j];
+        for (j = 0; j < order; j++) acc += ((int64_t)p[-j] - base) * coefs[j];
         if (shift > 0) acc = (acc + ((int64_t)1 << (shift - 1))) >> shift;
-        v = sext((uint32_t)(int32_t)acc + (uint32_t)base + (uint32_t)err, size);
-        s[i] = v;
-        /* The coefficients move against the residual's sign, oldest sample first,
-         * until the residual is used up. */
-        if (err != 0) {
-            int sign = err > 0 ? 1 : -1;
-            for (j = order - 1; j >= 0 && (int64_t)err * sign > 0; j--) {
-                int64_t d = (int64_t)base - s[i - 1 - j];
-                int ds = (d > 0) - (d < 0);
-                int step = ds * sign;
-                coefs[j] = (int16_t)(coefs[j] - step);
-                err = (int32_t)((uint32_t)err - (uint32_t)(int32_t)((d * step) >> shift) * (uint32_t)(order - j));
-            }
-        }
+        s[i] = sext((uint32_t)(int32_t)acc + (uint32_t)base + (uint32_t)err, size);
+        adapt(coefs, p, base, err, order, shift);
     }
 }
 

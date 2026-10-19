@@ -50,10 +50,10 @@ static int build_tables(mdct_tables* s, int m)
     for (i = 0; i < q; i++) {
         double a = M_PI * (4.0 * i + 1.0) / (4.0 * m);
         int r = 0, b;
-        s->twiddle[2 * i] = (float)cos(a);
-        s->twiddle[2 * i + 1] = (float)-sin(a);
-        s->post[2 * i] = (float)cos(M_PI * i / m);
-        s->post[2 * i + 1] = (float)-sin(M_PI * i / m);
+        s->twiddle[i] = (float)cos(a);
+        s->twiddle[q + i] = (float)-sin(a);
+        s->post[i] = (float)cos(M_PI * i / m);
+        s->post[q + i] = (float)-sin(M_PI * i / m);
         for (b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b);
         s->rev[i] = r;
     }
@@ -221,13 +221,136 @@ static void fft(const fa_mdct* t, float* z, int q)
     }
 }
 
+#if defined(FA_FFT_SSE)
+/* The rotations before the FFT of k .. k + 3: (in[2k], in[m - 1 - 2k]) times the
+ * twiddles (cr, ci), as the plain loop in fa_mdct_dct4 does them. */
+static void pre4(const float* in, int m, int k, const float* cr, const float* ci, __m128* zr, __m128* zi)
+{
+    __m128 a = _mm_loadu_ps(in + 2 * k), b = _mm_loadu_ps(in + 2 * k + 4);
+    __m128 c = _mm_loadu_ps(in + m - 8 - 2 * k), d = _mm_loadu_ps(in + m - 4 - 2 * k);
+    __m128 re = _mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0));
+    __m128 im = _mm_shuffle_ps(d, c, _MM_SHUFFLE(1, 3, 1, 3));
+    __m128 wr = _mm_loadu_ps(cr + k), wi = _mm_loadu_ps(ci + k);
+    *zr = _mm_sub_ps(_mm_mul_ps(re, wr), _mm_mul_ps(im, wi));
+    *zi = _mm_add_ps(_mm_mul_ps(re, wi), _mm_mul_ps(im, wr));
+}
+
+/* The rotations after it of z[k .. k + 3]. */
+static void post4(const float* z, int k, const float* cr, const float* ci, __m128* yr, __m128* yi)
+{
+    __m128 a = _mm_loadu_ps(z + 2 * k), b = _mm_loadu_ps(z + 2 * k + 4);
+    __m128 re = _mm_shuffle_ps(a, b, _MM_SHUFFLE(2, 0, 2, 0)), im = _mm_shuffle_ps(a, b, _MM_SHUFFLE(3, 1, 3, 1));
+    __m128 wr = _mm_loadu_ps(cr + k), wi = _mm_loadu_ps(ci + k);
+    *yr = _mm_sub_ps(_mm_mul_ps(re, wr), _mm_mul_ps(im, wi));
+    *yi = _mm_add_ps(_mm_mul_ps(re, wi), _mm_mul_ps(im, wr));
+}
+
+/* -x[3], -x[2], -x[1], -x[0] (the sign flipped as by unary minus). */
+static __m128 neg_rev(__m128 x)
+{
+    return _mm_xor_ps(_mm_shuffle_ps(x, x, _MM_SHUFFLE(0, 1, 2, 3)), _mm_set1_ps(-0.0f));
+}
+#elif defined(FA_FFT_NEON)
+static float32x4_t rev4(float32x4_t x)
+{
+    float32x4_t r = vrev64q_f32(x);
+    return vcombine_f32(vget_high_f32(r), vget_low_f32(r));
+}
+
+static void pre4(const float* in, int m, int k, const float* cr, const float* ci, float32x4_t* zr, float32x4_t* zi)
+{
+    float32x4_t re = vld2q_f32(in + 2 * k).val[0], im = rev4(vld2q_f32(in + m - 8 - 2 * k).val[1]);
+    float32x4_t wr = vld1q_f32(cr + k), wi = vld1q_f32(ci + k);
+    *zr = vsubq_f32(vmulq_f32(re, wr), vmulq_f32(im, wi));
+    *zi = vaddq_f32(vmulq_f32(re, wi), vmulq_f32(im, wr));
+}
+
+static void post4(const float* z, int k, const float* cr, const float* ci, float32x4_t* yr, float32x4_t* yi)
+{
+    float32x4x2_t v = vld2q_f32(z + 2 * k);
+    float32x4_t wr = vld1q_f32(cr + k), wi = vld1q_f32(ci + k);
+    *yr = vsubq_f32(vmulq_f32(v.val[0], wr), vmulq_f32(v.val[1], wi));
+    *yi = vaddq_f32(vmulq_f32(v.val[0], wi), vmulq_f32(v.val[1], wr));
+}
+#endif
+
 void fa_mdct_dct4(const fa_mdct* t, const float* in, float* u)
 {
     int m = t->m, q = m / 2, k;
     float* z = t->work;
+    const float* tr = t->twiddle;
+    const float* ti = t->twiddle + q;
+    const float* pr = t->post;
+    const float* pi = t->post + q;
+#if defined(FA_FFT_SSE) || defined(FA_FFT_NEON)
+    if (q >= 8) {
+        /* Four rotations at a time, the same arithmetic as the plain loops below
+         * (the same bits on x86; on ARM compilers may fuse the plain loops' multiply
+         * and add, so the two can differ in the last bit).
+         * Before the FFT, k and k + q/2 land side by side (the bit reversal of
+         * k + q/2 is rev[k] + 1), so they go out together; after it, the values
+         * of k .. k + 3 and of their mirror q - 4 - k .. q - 1 - k fill u[2k ..
+         * 2k + 7] and u[m - 8 - 2k .. m - 1 - 2k] between them. */
+        int h = q / 2;
+        for (k = 0; k < h; k += 4) {
+            const int* r = t->rev + k;
+#if defined(FA_FFT_SSE)
+            __m128 ar, ai, br, bi, lo_a, hi_a, lo_b, hi_b;
+            pre4(in, m, k, tr, ti, &ar, &ai);
+            pre4(in, m, k + h, tr, ti, &br, &bi);
+            lo_a = _mm_unpacklo_ps(ar, ai);
+            hi_a = _mm_unpackhi_ps(ar, ai);
+            lo_b = _mm_unpacklo_ps(br, bi);
+            hi_b = _mm_unpackhi_ps(br, bi);
+            _mm_storeu_ps(z + 2 * r[0], _mm_movelh_ps(lo_a, lo_b));
+            _mm_storeu_ps(z + 2 * r[1], _mm_movehl_ps(lo_b, lo_a));
+            _mm_storeu_ps(z + 2 * r[2], _mm_movelh_ps(hi_a, hi_b));
+            _mm_storeu_ps(z + 2 * r[3], _mm_movehl_ps(hi_b, hi_a));
+#else
+            float32x4_t ar, ai, br, bi;
+            float32x4x2_t a, b;
+            pre4(in, m, k, tr, ti, &ar, &ai);
+            pre4(in, m, k + h, tr, ti, &br, &bi);
+            a = vzipq_f32(ar, ai);
+            b = vzipq_f32(br, bi);
+            vst1q_f32(z + 2 * r[0], vcombine_f32(vget_low_f32(a.val[0]), vget_low_f32(b.val[0])));
+            vst1q_f32(z + 2 * r[1], vcombine_f32(vget_high_f32(a.val[0]), vget_high_f32(b.val[0])));
+            vst1q_f32(z + 2 * r[2], vcombine_f32(vget_low_f32(a.val[1]), vget_low_f32(b.val[1])));
+            vst1q_f32(z + 2 * r[3], vcombine_f32(vget_high_f32(a.val[1]), vget_high_f32(b.val[1])));
+#endif
+        }
+        fft(t, z, q);
+        for (k = 0; k < h; k += 4) {
+            int j = q - 4 - k;
+#if defined(FA_FFT_SSE)
+            __m128 ar, ai, br, bi, na, nb;
+            post4(z, k, pr, pi, &ar, &ai);
+            post4(z, j, pr, pi, &br, &bi);
+            na = neg_rev(ai);
+            nb = neg_rev(bi);
+            _mm_storeu_ps(u + 2 * k, _mm_unpacklo_ps(ar, nb));
+            _mm_storeu_ps(u + 2 * k + 4, _mm_unpackhi_ps(ar, nb));
+            _mm_storeu_ps(u + 2 * j, _mm_unpacklo_ps(br, na));
+            _mm_storeu_ps(u + 2 * j + 4, _mm_unpackhi_ps(br, na));
+#else
+            float32x4_t ar, ai, br, bi;
+            float32x4x2_t v;
+            post4(z, k, pr, pi, &ar, &ai);
+            post4(z, j, pr, pi, &br, &bi);
+            v.val[0] = ar;
+            v.val[1] = vnegq_f32(rev4(bi));
+            vst2q_f32(u + 2 * k, v);
+            v.val[0] = br;
+            v.val[1] = vnegq_f32(rev4(ai));
+            vst2q_f32(u + 2 * j, v);
+#endif
+        }
+        return;
+    }
+#endif
     for (k = 0; k < q; k++) {
         float re = in[2 * k], im = in[m - 1 - 2 * k];
-        float wr = t->twiddle[2 * k], wi = t->twiddle[2 * k + 1];
+        float wr = tr[k], wi = ti[k];
         int r = t->rev[k];
         z[2 * r] = re * wr - im * wi;
         z[2 * r + 1] = re * wi + im * wr;
@@ -235,7 +358,7 @@ void fa_mdct_dct4(const fa_mdct* t, const float* in, float* u)
     fft(t, z, q);
     for (k = 0; k < q; k++) {
         float re = z[2 * k], im = z[2 * k + 1];
-        float wr = t->post[2 * k], wi = t->post[2 * k + 1];
+        float wr = pr[k], wi = pi[k];
         float yr = re * wr - im * wi, yi = re * wi + im * wr;
         u[2 * k] = yr;
         u[m - 1 - 2 * k] = -yi;

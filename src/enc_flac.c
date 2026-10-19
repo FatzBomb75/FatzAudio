@@ -15,6 +15,9 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 #define FLAC_MAX_LPC 12
 #define FLAC_MAX_PART 8
@@ -150,15 +153,38 @@ static uint8_t crc8(const uint8_t* p, size_t n)
     return c;
 }
 
+/* A byte at a time, through the CRC of each byte value (polynomial 0x8005, MSB
+ * first). */
+static const uint16_t crc16_table[256] = {
+    0x0000, 0x8005, 0x800f, 0x000a, 0x801b, 0x001e, 0x0014, 0x8011, 0x8033, 0x0036, 0x003c, 0x8039,
+    0x0028, 0x802d, 0x8027, 0x0022, 0x8063, 0x0066, 0x006c, 0x8069, 0x0078, 0x807d, 0x8077, 0x0072,
+    0x0050, 0x8055, 0x805f, 0x005a, 0x804b, 0x004e, 0x0044, 0x8041, 0x80c3, 0x00c6, 0x00cc, 0x80c9,
+    0x00d8, 0x80dd, 0x80d7, 0x00d2, 0x00f0, 0x80f5, 0x80ff, 0x00fa, 0x80eb, 0x00ee, 0x00e4, 0x80e1,
+    0x00a0, 0x80a5, 0x80af, 0x00aa, 0x80bb, 0x00be, 0x00b4, 0x80b1, 0x8093, 0x0096, 0x009c, 0x8099,
+    0x0088, 0x808d, 0x8087, 0x0082, 0x8183, 0x0186, 0x018c, 0x8189, 0x0198, 0x819d, 0x8197, 0x0192,
+    0x01b0, 0x81b5, 0x81bf, 0x01ba, 0x81ab, 0x01ae, 0x01a4, 0x81a1, 0x01e0, 0x81e5, 0x81ef, 0x01ea,
+    0x81fb, 0x01fe, 0x01f4, 0x81f1, 0x81d3, 0x01d6, 0x01dc, 0x81d9, 0x01c8, 0x81cd, 0x81c7, 0x01c2,
+    0x0140, 0x8145, 0x814f, 0x014a, 0x815b, 0x015e, 0x0154, 0x8151, 0x8173, 0x0176, 0x017c, 0x8179,
+    0x0168, 0x816d, 0x8167, 0x0162, 0x8123, 0x0126, 0x012c, 0x8129, 0x0138, 0x813d, 0x8137, 0x0132,
+    0x0110, 0x8115, 0x811f, 0x011a, 0x810b, 0x010e, 0x0104, 0x8101, 0x8303, 0x0306, 0x030c, 0x8309,
+    0x0318, 0x831d, 0x8317, 0x0312, 0x0330, 0x8335, 0x833f, 0x033a, 0x832b, 0x032e, 0x0324, 0x8321,
+    0x0360, 0x8365, 0x836f, 0x036a, 0x837b, 0x037e, 0x0374, 0x8371, 0x8353, 0x0356, 0x035c, 0x8359,
+    0x0348, 0x834d, 0x8347, 0x0342, 0x03c0, 0x83c5, 0x83cf, 0x03ca, 0x83db, 0x03de, 0x03d4, 0x83d1,
+    0x83f3, 0x03f6, 0x03fc, 0x83f9, 0x03e8, 0x83ed, 0x83e7, 0x03e2, 0x83a3, 0x03a6, 0x03ac, 0x83a9,
+    0x03b8, 0x83bd, 0x83b7, 0x03b2, 0x0390, 0x8395, 0x839f, 0x039a, 0x838b, 0x038e, 0x0384, 0x8381,
+    0x0280, 0x8285, 0x828f, 0x028a, 0x829b, 0x029e, 0x0294, 0x8291, 0x82b3, 0x02b6, 0x02bc, 0x82b9,
+    0x02a8, 0x82ad, 0x82a7, 0x02a2, 0x82e3, 0x02e6, 0x02ec, 0x82e9, 0x02f8, 0x82fd, 0x82f7, 0x02f2,
+    0x02d0, 0x82d5, 0x82df, 0x02da, 0x82cb, 0x02ce, 0x02c4, 0x82c1, 0x8243, 0x0246, 0x024c, 0x8249,
+    0x0258, 0x825d, 0x8257, 0x0252, 0x0270, 0x8275, 0x827f, 0x027a, 0x826b, 0x026e, 0x0264, 0x8261,
+    0x0220, 0x8225, 0x822f, 0x022a, 0x823b, 0x023e, 0x0234, 0x8231, 0x8213, 0x0216, 0x021c, 0x8219,
+    0x0208, 0x820d, 0x8207, 0x0202
+};
+
 static uint16_t crc16(const uint8_t* p, size_t n)
 {
     uint16_t c = 0;
     size_t i;
-    int k;
-    for (i = 0; i < n; i++) {
-        c ^= (uint16_t)(p[i] << 8);
-        for (k = 0; k < 8; k++) c = (uint16_t)((c & 0x8000) ? (c << 1) ^ 0x8005 : c << 1);
-    }
+    for (i = 0; i < n; i++) c = (uint16_t)((c << 8) ^ crc16_table[(c >> 8) ^ p[i]]);
     return c;
 }
 
@@ -172,24 +198,34 @@ typedef struct rice_plan {
     uint64_t bits;
 } rice_plan;
 
+/* Bits needed for u (0 for 0), in one instruction where the compiler has one. */
 static int bitlen64(uint64_t u)
 {
+#if defined(__GNUC__) || defined(__clang__)
+    return u ? 64 - __builtin_clzll(u) : 0;
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_ARM64))
+    unsigned long i;
+    return _BitScanReverse64(&i, u) ? (int)i + 1 : 0;
+#else
     int n = 0;
     while (u) { n++; u >>= 1; }
     return n;
+#endif
 }
 
-static uint64_t zigzag(int64_t r) { return ((uint64_t)r << 1) ^ (uint64_t)(r >> 63); }
+static uint32_t zigzag(int32_t r) { return ((uint32_t)r << 1) ^ (uint32_t)(r >> 31); }
 
 /* Cheapest coding of one partition of `n` samples whose zigzag values sum to `sum`
- * (largest `umax`): Rice parameter, or an escape with raw bits. */
-static uint64_t part_cost(uint64_t n, uint64_t sum, uint64_t umax, int method, uint8_t* out_k, uint8_t* out_esc)
+ * (largest `umax`): Rice parameter, or an escape with raw bits. *wide is set when
+ * a parameter above 14 was in reach (only then can the 5-bit method win). */
+static uint64_t part_cost(uint64_t n, uint64_t sum, uint64_t umax, int method, uint8_t* out_k, uint8_t* out_esc, int* wide)
 {
     int kmax = method ? 30 : 14, pbits = method ? 5 : 4, k, k0, best_k = 0;
     uint64_t best = UINT64_MAX, esc;
     int raw;
     if (n == 0) { *out_k = 0; *out_esc = 0; return (uint64_t)pbits; }
-    k0 = sum > n ? bitlen64(sum / n) - 1 : 0;
+    k0 = sum > n ? bitlen64((n & (n - 1)) == 0 ? sum >> (bitlen64(n) - 1) : sum / n) - 1 : 0;
+    if (k0 + 1 > 14) *wide = 1;
     for (k = k0 - 1; k <= k0 + 1; k++) {
         uint64_t c;
         if (k < 0 || k > kmax) continue;
@@ -209,7 +245,7 @@ static uint64_t part_cost(uint64_t n, uint64_t sum, uint64_t umax, int method, u
 
 /* Plans the residual r[pred_order .. n) (with r stored from index 0 for the whole
  * block; the first pred_order entries are warm-up and ignored). */
-static void plan_residual(const int64_t* r, int n, int pred_order, int max_part, rice_plan* best)
+static void plan_residual(const int32_t* r, int n, int pred_order, int max_part, rice_plan* best)
 {
     uint64_t sums[1 << FLAC_MAX_PART], maxs[1 << FLAC_MAX_PART];
     int top = 0, p, i, method;
@@ -219,9 +255,10 @@ static void plan_residual(const int64_t* r, int n, int pred_order, int max_part,
         int parts = 1 << top, psize = n >> top, j;
         for (j = 0; j < parts; j++) {
             int start = j == 0 ? pred_order : j * psize, end = (j + 1) * psize;
-            uint64_t s = 0, m = 0;
+            uint64_t s = 0;
+            uint32_t m = 0;
             for (i = start; i < end; i++) {
-                uint64_t u = zigzag(r[i]);
+                uint32_t u = zigzag(r[i]);
                 s += u;
                 if (u > m) m = u;
             }
@@ -231,28 +268,30 @@ static void plan_residual(const int64_t* r, int n, int pred_order, int max_part,
     }
     best->bits = UINT64_MAX;
     for (p = top; p >= 0; p--) {
-        int parts = 1 << p, psize = n >> p, j;
+        int parts = 1 << p, psize = n >> p, j, wide = 0;
         if (p < top) {
             for (j = 0; j < parts; j++) {
                 sums[j] = sums[2 * j] + sums[2 * j + 1];
                 maxs[j] = maxs[2 * j] > maxs[2 * j + 1] ? maxs[2 * j] : maxs[2 * j + 1];
             }
         }
-        for (method = 0; method < 2; method++) {
+        /* Where every partition's parameters stay within 14, the 5-bit method picks
+         * the same ones at a bit more each, so it cannot win. */
+        for (method = 0; method < 2 && (method == 0 || wide); method++) {
             rice_plan cand;
             cand.method = method;
             cand.order = p;
             cand.bits = 6;   /* method + partition order */
             for (j = 0; j < parts; j++) {
                 uint64_t cnt = (uint64_t)(j == 0 ? psize - pred_order : psize);
-                cand.bits += part_cost(cnt, sums[j], maxs[j], method, &cand.param[j], &cand.escape_bits[j]);
+                cand.bits += part_cost(cnt, sums[j], maxs[j], method, &cand.param[j], &cand.escape_bits[j], &wide);
             }
             if (cand.bits < best->bits) *best = cand;
         }
     }
 }
 
-static void write_residual(bitw* w, const int64_t* r, int n, int pred_order, const rice_plan* pl)
+static void write_residual(bitw* w, const int32_t* r, int n, int pred_order, const rice_plan* pl)
 {
     int parts = 1 << pl->order, psize = n >> pl->order, j, i, pbits = pl->method ? 5 : 4;
     put(w, (uint32_t)pl->method, 2);
@@ -300,8 +339,8 @@ typedef struct flac_state {
     int32_t* pcm;                /* blocksize x channels, interleaved: the block being filled */
     int fill;
     int32_t* sig[4];             /* per signal: L, R, M, S (or one per channel) */
-    int64_t* res;                /* residual scratch */
-    int64_t* best_res[4];        /* residual of the chosen subframe per signal */
+    int32_t* res;                /* residual scratch */
+    int32_t* best_res[4];        /* residual of the chosen subframe per signal */
     double* win;                 /* Tukey window */
     double* wbuf;
     subframe sub[8];
@@ -310,33 +349,62 @@ typedef struct flac_state {
     uint8_t* md5buf;
 } flac_state;
 
-static void residual_fixed(const int32_t* x, int n, int order, int64_t* r)
+/* The residuals fit 32 bits: samples have at most 25 (24-bit side), and the
+ * order 4 predictor's coefficients add up to 16 in size (choose_subframe checks
+ * the sample size). */
+static void residual_fixed(const int32_t* x, int n, int order, int32_t* r)
 {
     int i;
     for (i = 0; i < order && i < n; i++) r[i] = 0;
     switch (order) {
     case 0: for (i = 0; i < n; i++) r[i] = x[i]; break;
-    case 1: for (i = 1; i < n; i++) r[i] = (int64_t)x[i] - x[i - 1]; break;
-    case 2: for (i = 2; i < n; i++) r[i] = (int64_t)x[i] - 2 * (int64_t)x[i - 1] + x[i - 2]; break;
-    case 3: for (i = 3; i < n; i++) r[i] = (int64_t)x[i] - 3 * (int64_t)x[i - 1] + 3 * (int64_t)x[i - 2] - x[i - 3]; break;
+    case 1: for (i = 1; i < n; i++) r[i] = x[i] - x[i - 1]; break;
+    case 2: for (i = 2; i < n; i++) r[i] = x[i] - 2 * x[i - 1] + x[i - 2]; break;
+    case 3: for (i = 3; i < n; i++) r[i] = x[i] - 3 * x[i - 1] + 3 * x[i - 2] - x[i - 3]; break;
     default:
-        for (i = 4; i < n; i++)
-            r[i] = (int64_t)x[i] - 4 * (int64_t)x[i - 1] + 6 * (int64_t)x[i - 2] - 4 * (int64_t)x[i - 3] + x[i - 4];
+        for (i = 4; i < n; i++) r[i] = x[i] - 4 * x[i - 1] + 6 * x[i - 2] - 4 * x[i - 3] + x[i - 4];
         break;
     }
 }
 
-/* 1 when the residual fits the 32-bit range decoders use. */
-static int residual_lpc(const int32_t* x, int n, int order, const int32_t* q, int shift, int64_t* r)
+/* 1 when the residual fits the 32-bit range decoders use. xmax: the largest
+ * |x[i]|; when the coefficients' sizes times it stay below 2^31, every partial
+ * sum fits 32 bits and is summed so (the same values, faster). */
+static int residual_lpc(const int32_t* x, int n, int order, const int32_t* q, int shift, int64_t xmax, int32_t* r)
 {
+    int64_t qsum = 0;
     int i, j;
-    for (i = 0; i < order; i++) r[i] = 0;
+    for (i = 0; i < order; i++) {
+        r[i] = 0;
+        qsum += q[i] < 0 ? -(int64_t)q[i] : q[i];
+    }
+    if (qsum * xmax < ((int64_t)1 << 31)) {
+        /* Each order on its own, so the compiler can unroll the sum. */
+#define LPC32(o)                                                         \
+        case o:                                                          \
+            for (i = o; i < n; i++) {                                    \
+                int32_t sum = 0;                                         \
+                int64_t v;                                               \
+                for (j = 0; j < o; j++) sum += q[j] * x[i - j - 1];      \
+                v = (int64_t)x[i] - (sum >> shift);                      \
+                if (v > INT32_MAX || v < INT32_MIN) return 0;            \
+                r[i] = (int32_t)v;                                       \
+            }                                                            \
+            break;
+        switch (order) {
+        LPC32(1) LPC32(2) LPC32(3) LPC32(4) LPC32(5) LPC32(6)
+        LPC32(7) LPC32(8) LPC32(9) LPC32(10) LPC32(11) LPC32(12)
+        default: return 0;
+        }
+#undef LPC32
+        return 1;
+    }
     for (i = order; i < n; i++) {
         int64_t sum = 0, v;
         for (j = 0; j < order; j++) sum += (int64_t)q[j] * x[i - j - 1];
         v = (int64_t)x[i] - (sum >> shift);
         if (v > INT32_MAX || v < INT32_MIN) return 0;
-        r[i] = v;
+        r[i] = (int32_t)v;
     }
     return 1;
 }
@@ -366,13 +434,16 @@ static int quantize_lpc(const double* lpc, int order, int precision, int32_t* q,
     return 1;
 }
 
-/* Best subframe for signal x (bps bits per sample); its residual goes to `keep`. */
-static void choose_subframe(flac_state* st, const int32_t* x, int n, int bps, subframe* best, int64_t* keep)
+/* Best subframe for signal x (bps bits per sample); its residual ends up in
+ * *keep. Each better candidate's buffer trades places with *keep, so nothing is
+ * copied. */
+static void choose_subframe(flac_state* st, const int32_t* x, int n, int bps, subframe* best, int32_t** keep)
 {
     int i, order;
-    int64_t* r = st->res;
+    int32_t* r = st->res;
     subframe cand;
     int all_same = 1;
+    int64_t xmax = 0;
     for (i = 1; i < n; i++)
         if (x[i] != x[0]) { all_same = 0; break; }
     memset(best, 0, sizeof(*best));
@@ -383,6 +454,9 @@ static void choose_subframe(flac_state* st, const int32_t* x, int n, int bps, su
     }
     best->type = SUB_VERBATIM;
     best->bits = 8 + (uint64_t)n * bps;
+    /* The 32-bit residuals below need at most 25 bits a sample (24-bit side);
+     * flac_check takes only 16 and 24 bits. */
+    if (bps > 25) return;
 
     for (order = 0; order <= 4 && order < n; order++) {
         memset(&cand, 0, sizeof(cand));
@@ -393,7 +467,9 @@ static void choose_subframe(flac_state* st, const int32_t* x, int n, int bps, su
         cand.bits = 8 + (uint64_t)order * bps + cand.plan.bits;
         if (cand.bits < best->bits) {
             *best = cand;
-            memcpy(keep, r, (size_t)n * sizeof(int64_t));
+            st->res = *keep;
+            *keep = r;
+            r = st->res;
         }
     }
 
@@ -404,12 +480,18 @@ static void choose_subframe(flac_state* st, const int32_t* x, int n, int bps, su
         double* w = st->wbuf;
         const double* win = st->win;
         int whole = n == st->blocksize;
-        for (i = 0; i < n; i++) w[i] = (double)x[i] * (whole ? win[i] : 1.0);
-        for (lag = 0; lag <= maxo; lag++) {
-            double s = 0.0;
-            for (i = lag; i < n; i++) s += w[i] * w[i - lag];
-            ac[lag] = s;
+        for (i = 0; i < n; i++) {
+            int64_t a = x[i] < 0 ? -(int64_t)x[i] : x[i];
+            if (a > xmax) xmax = a;
+            w[i] = (double)x[i] * (whole ? win[i] : 1.0);
         }
+        /* Every lag at once: each sum still adds its terms in order, but the
+         * sums no longer wait for one another. */
+        for (lag = 0; lag <= maxo; lag++) ac[lag] = 0.0;
+        for (i = 0; i < maxo && i < n; i++)
+            for (lag = 0; lag <= i; lag++) ac[lag] += w[i] * w[i - lag];
+        for (; i < n; i++)
+            for (lag = 0; lag <= maxo; lag++) ac[lag] += w[i] * w[i - lag];
         if (ac[0] <= 0.0) return;
         ac[0] *= 1.0 + 1e-9;   /* a little white noise: keeps the recursion stable */
         /* Levinson-Durbin: the coefficients of every order */
@@ -432,19 +514,21 @@ static void choose_subframe(flac_state* st, const int32_t* x, int n, int bps, su
                 cand.order = order;
                 cand.precision = p;
                 if (!quantize_lpc(lpc[order - 1], order, p, cand.coef, &cand.shift)) continue;
-                if (!residual_lpc(x, n, order, cand.coef, cand.shift, r)) continue;
+                if (!residual_lpc(x, n, order, cand.coef, cand.shift, xmax, r)) continue;
                 plan_residual(r, n, order, st->max_part, &cand.plan);
                 cand.bits = 8 + (uint64_t)order * bps + 4 + 5 + (uint64_t)order * p + cand.plan.bits;
                 if (cand.bits < best->bits) {
                     *best = cand;
-                    memcpy(keep, r, (size_t)n * sizeof(int64_t));
+                    st->res = *keep;
+                    *keep = r;
+                    r = st->res;
                 }
             }
         }
     }
 }
 
-static void write_subframe(bitw* w, const int32_t* x, int n, int bps, const subframe* sf, const int64_t* res)
+static void write_subframe(bitw* w, const int32_t* x, int n, int bps, const subframe* sf, const int32_t* res)
 {
     int i;
     switch (sf->type) {
@@ -534,7 +618,7 @@ static fa_result encode_frame(flac_state* st, fa_enc_sink* s)
             S[i] = l - rr;
         }
         for (c = 0; c < 4; c++) {
-            choose_subframe(st, st->sig[c], n, c == 3 ? bps + 1 : bps, &sub[c], st->best_res[c]);
+            choose_subframe(st, st->sig[c], n, c == 3 ? bps + 1 : bps, &sub[c], &st->best_res[c]);
             cost[c] = sub[c].bits;
         }
         /* 0: L/R, 8: L/S, 9: S/R, 10: M/S */
@@ -547,7 +631,7 @@ static fa_result encode_frame(flac_state* st, fa_enc_sink* s)
          * once channel 0 is written (below). */
         for (c = 0; c < ch && c < 4; c++) {
             for (i = 0; i < n; i++) st->sig[c][i] = st->pcm[i * ch + c];
-            choose_subframe(st, st->sig[c], n, bps, &sub[c], st->best_res[c]);
+            choose_subframe(st, st->sig[c], n, bps, &sub[c], &st->best_res[c]);
         }
     }
 
@@ -584,7 +668,7 @@ static fa_result encode_frame(flac_state* st, fa_enc_sink* s)
         for (c = 0; c < ch; c++) {
             if (c >= 4) {
                 for (i = 0; i < n; i++) st->sig[0][i] = st->pcm[i * ch + c];
-                choose_subframe(st, st->sig[0], n, bps, &sub[0], st->best_res[0]);
+                choose_subframe(st, st->sig[0], n, bps, &sub[0], &st->best_res[0]);
                 write_subframe(&w, st->sig[0], n, bps, &sub[0], st->best_res[0]);
             } else {
                 write_subframe(&w, st->sig[c], n, bps, &sub[c], st->best_res[c]);
@@ -691,10 +775,10 @@ static fa_result flac_begin(void** impl, const fa_enc_format* f, const fa_enc_ta
     st->pcm = (int32_t*)malloc((size_t)bs * f->channels * sizeof(int32_t));
     for (i = 0; i < 4; i++) {
         st->sig[i] = (int32_t*)malloc((size_t)bs * sizeof(int32_t));
-        st->best_res[i] = (int64_t*)malloc((size_t)bs * sizeof(int64_t));
+        st->best_res[i] = (int32_t*)malloc((size_t)bs * sizeof(int32_t));
         if (!st->sig[i] || !st->best_res[i]) return FA_ERROR_OUT_OF_MEMORY;
     }
-    st->res = (int64_t*)malloc((size_t)bs * sizeof(int64_t));
+    st->res = (int32_t*)malloc((size_t)bs * sizeof(int32_t));
     st->win = (double*)malloc((size_t)bs * sizeof(double));
     st->wbuf = (double*)malloc((size_t)bs * sizeof(double));
     /* the worst case is verbatim (+1 bit for side) plus headers */

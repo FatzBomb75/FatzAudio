@@ -34,6 +34,7 @@
 #define FX_CHORUS_DEPTH_MS 3.0
 #define FX_CHORUS_RATE_HZ 0.4
 #define FX_CHORUS_TAPS 2
+#define FX_LFO_SEED 256                 /* frames between exact values of the chorus LFO */
 
 static const int comb_tuning[FX_COMBS] = { 1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617 };
 static const int allpass_tuning[FX_ALLPASSES] = { 556, 441, 341, 225 };
@@ -49,6 +50,9 @@ struct fa_midi_fx {
     fa_frames reverb_span;              /* the longest path through the delay lines */
     float* chorus_buf[2];
     int chorus_len, chorus_pos;
+    double lfo_cos, lfo_sin;            /* the chorus LFO's turn in one frame */
+    double lfo_s, lfo_c;                /* the LFO's sine and cosine at frame lfo_next */
+    fa_frames lfo_next;                 /* -1: not running */
     fa_frames chorus_quiet;             /* frames since the chorus input was last non-zero */
     float* mem;                         /* every delay line, one allocation */
 };
@@ -78,6 +82,8 @@ fa_midi_fx* fa_midi_fx_new(uint32_t rate)
         if (span > fx->reverb_span) fx->reverb_span = span;
     }
     fx->chorus_len = (int)ceil((FX_CHORUS_DELAY_MS + FX_CHORUS_DEPTH_MS) * rate / 1000.0) + 2;
+    fx->lfo_cos = cos(2.0 * 3.14159265358979323846 * FX_CHORUS_RATE_HZ / rate);
+    fx->lfo_sin = sin(2.0 * 3.14159265358979323846 * FX_CHORUS_RATE_HZ / rate);
     total += 2 * (size_t)fx->chorus_len;
     fx->mem = p = (float*)calloc(total, sizeof(float));
     if (!p) { free(fx); return NULL; }
@@ -123,6 +129,7 @@ void fa_midi_fx_reset(fa_midi_fx* fx)
     memset(fx->chorus_buf[0], 0, 2 * (size_t)fx->chorus_len * sizeof(float));
     fx->chorus_pos = 0;
     fx->chorus_quiet = fx->chorus_len;
+    fx->lfo_next = -1;
 }
 
 static int all_zero(const float* x, int n)
@@ -173,7 +180,7 @@ static void chorus_process(fa_midi_fx* fx, const float* in, float* out, int fram
 {
     const double base = FX_CHORUS_DELAY_MS * fx->rate / 1000.0, depth = FX_CHORUS_DEPTH_MS * fx->rate / 1000.0;
     const double step = FX_CHORUS_RATE_HZ / fx->rate;
-    double phase0;
+    double s, c;
     int f, ch, t;
     if (all_zero(in, frames * 2)) {
         if (fx->chorus_quiet >= fx->chorus_len) return;   /* the lines hold only zeros */
@@ -181,17 +188,47 @@ static void chorus_process(fa_midi_fx* fx, const float* in, float* out, int fram
     } else {
         fx->chorus_quiet = 0;
     }
-    phase0 = fmod((double)song_frame * step, 1.0);
+    /* The LFO is turned on frame by frame from exact values at every multiple of
+     * FX_LFO_SEED song frames, so each frame's value depends only on the frame
+     * (not on how the song is cut into blocks), and the rounding that adds up in
+     * between stays far below a float's. Away from where it left off (a seek,
+     * a silent stretch) it starts again from the last such frame. */
+    if (fx->lfo_next != song_frame) {
+        fa_frames g = song_frame - song_frame % FX_LFO_SEED;
+        double ph = 2.0 * 3.14159265358979323846 * fmod((double)g * step, 1.0);
+        s = sin(ph);
+        c = cos(ph);
+        for (; g < song_frame; g++) {
+            double s1 = s * fx->lfo_cos + c * fx->lfo_sin;
+            c = c * fx->lfo_cos - s * fx->lfo_sin;
+            s = s1;
+        }
+    } else {
+        s = fx->lfo_s;
+        c = fx->lfo_c;
+    }
     for (f = 0; f < frames; f++) {
         int w = fx->chorus_pos;
+        fa_frames g = song_frame + f;
+        double lfo[2], s1;
+        if (g % FX_LFO_SEED == 0) {
+            double ph = 2.0 * 3.14159265358979323846 * fmod((double)g * step, 1.0);
+            s = sin(ph);
+            c = cos(ph);
+        }
+        /* Taps half a cycle apart (the sine's sign flips); the right channel a
+         * quarter cycle on (the cosine). */
+        lfo[0] = s;
+        lfo[1] = c;
+        s1 = s * fx->lfo_cos + c * fx->lfo_sin;
+        c = c * fx->lfo_cos - s * fx->lfo_sin;
+        s = s1;
         fx->chorus_buf[0][w] = in[f * 2];
         fx->chorus_buf[1][w] = in[f * 2 + 1];
         for (ch = 0; ch < 2; ch++) {
             float y = 0.0f;
             for (t = 0; t < FX_CHORUS_TAPS; t++) {
-                /* Taps half a cycle apart; the right channel a quarter cycle on. */
-                double ph = phase0 + f * step + t * 0.5 + ch * 0.25;
-                double delay = base + depth * sin(2.0 * 3.14159265358979323846 * ph);
+                double delay = base + depth * (t ? -lfo[ch] : lfo[ch]);
                 double rp = w - delay;
                 int i0, i1;
                 float fr;
@@ -206,6 +243,9 @@ static void chorus_process(fa_midi_fx* fx, const float* in, float* out, int fram
         }
         if (++fx->chorus_pos == fx->chorus_len) fx->chorus_pos = 0;
     }
+    fx->lfo_s = s;
+    fx->lfo_c = c;
+    fx->lfo_next = song_frame + frames;
 }
 
 void fa_midi_fx_process(fa_midi_fx* fx, const float* reverb_in, const float* chorus_in, float* out, int frames, fa_frames song_frame)
