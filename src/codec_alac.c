@@ -18,6 +18,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _MSC_VER
+#include <intrin.h>
+#endif
 
 #define ALAC_MAX_FRAME 65536
 #define ALAC_MAX_COEFS 32
@@ -42,8 +45,16 @@ static uint32_t peek(const bits* b, int k)
     size_t byte = b->pos >> 3;
     int i, have;
     if (k == 0) return 0;
-    for (i = 0; i < 5; i++) v = (v << 8) | (byte + i < (b->n >> 3) ? b->p[byte + i] : 0);
-    have = 40 - (int)(b->pos & 7);
+    if (byte + 8 <= (b->n >> 3)) {
+        /* Away from the end: eight bytes in one go. */
+        const uint8_t* q = b->p + byte;
+        v = ((uint64_t)q[0] << 56) | ((uint64_t)q[1] << 48) | ((uint64_t)q[2] << 40) | ((uint64_t)q[3] << 32) |
+            ((uint64_t)q[4] << 24) | ((uint64_t)q[5] << 16) | ((uint64_t)q[6] << 8) | (uint64_t)q[7];
+        have = 64 - (int)(b->pos & 7);
+    } else {
+        for (i = 0; i < 5; i++) v = (v << 8) | (byte + i < (b->n >> 3) ? b->p[byte + i] : 0);
+        have = 40 - (int)(b->pos & 7);
+    }
     return (uint32_t)((v >> (have - k)) & ((k == 32) ? 0xFFFFFFFFu : ((1u << k) - 1)));
 }
 
@@ -63,19 +74,31 @@ static int32_t sext(uint32_t v, int k)
     return (int32_t)(v ^ (1u << (k - 1))) - (int32_t)(1u << (k - 1));
 }
 
-static int ilog2(uint32_t v)
+/* The index of the highest set bit of a nonzero value (floor of log2), in one
+ * instruction where the compiler has one. */
+static int top_bit(uint32_t v)
 {
+#if defined(__GNUC__) || defined(__clang__)
+    return 31 - __builtin_clz(v);
+#elif defined(_MSC_VER)
+    unsigned long i;
+    _BitScanReverse(&i, v);
+    return (int)i;
+#else
     int n = 0;
     while (v >>= 1) n++;
     return n;
+#endif
 }
 
 /* One Golomb-coded value: a unary prefix of up to 9 ones, then k bits or, past
  * that, the value verbatim in `size` bits. */
 static uint32_t golomb(bits* b, int k, int size)
 {
-    uint32_t x = 0, extra;
-    while (x < 9 && get(b, 1)) x++;
+    uint32_t x, extra, zeros = ~peek(b, 9) & 0x1FF;
+    /* The prefix: the ones before the first zero (which ends it and is read too). */
+    x = zeros ? 8 - (uint32_t)top_bit(zeros) : 9;
+    b->pos += x + (x < 9);
     if (x > 8) return get(b, size);
     if (k == 1) return x;
     x = (x << k) - x;
@@ -96,7 +119,7 @@ static int residuals(bits* b, int32_t* out, uint32_t n, int size, uint32_t mult,
     int zero_run_after = 0;
     for (i = 0; i < n; i++) {
         uint32_t x;
-        int k = ilog2((history >> 9) + 3);
+        int k = top_bit((history >> 9) + 3);
         if (k > (int)st->kb) k = (int)st->kb;
         if (!left(b)) return 0;
         x = golomb(b, k, size) + (uint32_t)zero_run_after;
@@ -108,7 +131,7 @@ static int residuals(bits* b, int32_t* out, uint32_t n, int size, uint32_t mult,
         if (history < 128 && i + 1 < n) {
             uint32_t run;
             /* 8 for a history of 0, as the reference's leading-zero count makes it. */
-            k = (history ? 7 - ilog2(history) : 8) + (int)((history + 16) >> 6);
+            k = (history ? 7 - top_bit(history) : 8) + (int)((history + 16) >> 6);
             if (k > (int)st->kb) k = (int)st->kb;
             run = golomb(b, k, 16);
             if (run > 0) {

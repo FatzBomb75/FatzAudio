@@ -15,10 +15,6 @@
 #include <stdio.h>
 #endif
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 #define SLOTS 32           /* QMF slots per frame (numTimeSlots 16 * RATE 2) */
 #define HFGEN 8            /* t_HFGen: slots of low band history */
 #define HFADJ 2            /* t_HFAdj */
@@ -88,23 +84,13 @@ struct fa_aac_sbr {
 /* ---- setup ------------------------------------------------------------------------------- */
 
 struct fa_aac_qmf {
-    float ana_cos[32][64], ana_sin[32][64];
-    fa_mdct dct4;                       /* 64 points, for the synthesis */
+    fa_mdct dct4;                       /* 64 points, for the analysis and the synthesis */
 };
 
 fa_aac_qmf* fa_aac_qmf_create(void)
 {
     fa_aac_qmf* q = (fa_aac_qmf*)malloc(sizeof(*q));
-    int k, n;
     if (!q) return NULL;
-    for (k = 0; k < 32; k++)
-        for (n = 0; n < 64; n++) {
-            double a = M_PI / 64.0 * (k + 0.5) * (2.0 * n - 0.5);
-            /* The QMF domain works on the standard's 16-bit sample scale (its
-             * energies and the "1 +" terms of the gain formulas assume it). */
-            q->ana_cos[k][n] = (float)(2.0 * 32768.0 * cos(a));
-            q->ana_sin[k][n] = (float)(2.0 * 32768.0 * sin(a));
-        }
     if (fa_imdct_init(&q->dct4, 64) != FA_OK) {
         free(q);
         return NULL;
@@ -802,10 +788,19 @@ void fa_aac_sbr_parse(fa_aac_sbr* s, fa_aac_bits* b, int bits, int crc)
 
 /* ---- QMF banks (4.6.18.4) ------------------------------------------------------------------ */
 
-/* 32 new samples into 32 complex subbands. */
+/* 32 new samples into 32 complex subbands. The matrixing
+ *   X[k] = 2 sum_n u[n] exp(i pi/64 (k + 1/2)(2n - 1/2)), k = 0..31, n = 0..63,
+ * is one 64-point DCT-IV C of u folded: the angle is pi/256 (2k + 1) q with
+ * q = 4n - 1, and q's odd values fold onto the DCT's 2m + 1 = |q| below 128 and
+ * 256 - q above (with a sign flip there, cos(pi (2k+1) - a) = -cos a). So
+ * Re X[k] = C[k], and as 2(63 - k) + 1 = 128 - (2k + 1) and q is odd,
+ * Im X[k] = -C[63 - k]. The QMF domain works on the standard's 16-bit sample
+ * scale (its energies and the "1 +" terms of the gain formulas assume it), which
+ * goes into the fold. */
 static void qmf_analysis(const fa_aac_sbr* s, sbr_chan* ch, const float* in, float (*out)[2])
 {
-    float u[64];
+    const float scale = 2.0f * 32768.0f;
+    float u[64], v[64], c[64];
     int n, k;
     memmove(ch->ana + 32, ch->ana, sizeof(float) * 288);
     for (n = 0; n < 32; n++) ch->ana[n] = in[31 - n];
@@ -813,16 +808,15 @@ static void qmf_analysis(const fa_aac_sbr* s, sbr_chan* ch, const float* in, flo
         float sum = 0.0f;
         int j;
         for (j = 0; j < 5; j++) sum += ch->ana[n + 64 * j] * fa_aac_sbr_qmf_window[2 * (n + 64 * j)];
-        u[n] = sum;
+        u[n] = sum * scale;
     }
+    v[0] = u[0];                                  /* q = -1 */
+    for (n = 1; n <= 32; n++) v[2 * n - 1] = u[n];  /* q = 3 .. 127 */
+    for (n = 33; n < 64; n++) v[128 - 2 * n] = -u[n];   /* q = 131 .. 251 */
+    fa_mdct_dct4(&s->qmf->dct4, v, c);
     for (k = 0; k < 32; k++) {
-        float re = 0.0f, im = 0.0f;
-        for (n = 0; n < 64; n++) {
-            re += u[n] * s->qmf->ana_cos[k][n];
-            im += u[n] * s->qmf->ana_sin[k][n];
-        }
-        out[k][0] = re;
-        out[k][1] = im;
+        out[k][0] = c[k];
+        out[k][1] = -c[63 - k];
     }
 }
 
