@@ -9,6 +9,9 @@
 #include "fa_internal.h"
 #include <math.h>
 #include <string.h>
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#  include <emmintrin.h>
+#endif
 
 #define EQ_GLIDE_S 0.010f       /* time constant of a change */
 #define EQ_MIN_HZ 10.0f
@@ -262,17 +265,77 @@ static float glide(float cur, float target, float k, float snap)
     return (d < snap && d > -snap) ? target : cur + d * k;
 }
 
-void fa_eq_process(fa_eq_state* st, float* buf, int64_t n)
+/* Filters n stereo frames through the `nb` active bands, one frame through every
+ * band before the next frame (the bands' recursions overlap instead of each
+ * waiting on its own last result), left and right side by side in one vector. The
+ * arithmetic per channel is the scalar loop's, in the same order. */
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+static void filter_bands(fa_eq_bandstate** act, uint32_t nb, float* buf, int64_t n)
+{
+    __m128 b0[FA_EQ_MAX_BANDS], b1[FA_EQ_MAX_BANDS], b2[FA_EQ_MAX_BANDS], a1[FA_EQ_MAX_BANDS], a2[FA_EQ_MAX_BANDS];
+    __m128 z0[FA_EQ_MAX_BANDS], z1[FA_EQ_MAX_BANDS];
+    uint32_t i;
+    int64_t j;
+    for (i = 0; i < nb; i++) {
+        const fa_eq_bandstate* b = act[i];
+        b0[i] = _mm_set1_ps(b->b0); b1[i] = _mm_set1_ps(b->b1); b2[i] = _mm_set1_ps(b->b2);
+        a1[i] = _mm_set1_ps(b->a1); a2[i] = _mm_set1_ps(b->a2);
+        z0[i] = _mm_setr_ps(b->z[0][0], b->z[1][0], 0.0f, 0.0f);
+        z1[i] = _mm_setr_ps(b->z[0][1], b->z[1][1], 0.0f, 0.0f);
+    }
+    for (j = 0; j < n; j++) {
+        __m128 x = _mm_castpd_ps(_mm_load_sd((const double*)(const void*)(buf + j * 2)));
+        for (i = 0; i < nb; i++) {
+            __m128 y = _mm_add_ps(_mm_mul_ps(b0[i], x), z0[i]);
+            z0[i] = _mm_add_ps(_mm_sub_ps(_mm_mul_ps(b1[i], x), _mm_mul_ps(a1[i], y)), z1[i]);
+            z1[i] = _mm_sub_ps(_mm_mul_ps(b2[i], x), _mm_mul_ps(a2[i], y));
+            x = y;
+        }
+        _mm_store_sd((double*)(void*)(buf + j * 2), _mm_castps_pd(x));
+    }
+    for (i = 0; i < nb; i++) {
+        float lo[4], hi[4];
+        _mm_storeu_ps(lo, z0[i]);
+        _mm_storeu_ps(hi, z1[i]);
+        act[i]->z[0][0] = lo[0]; act[i]->z[1][0] = lo[1];
+        act[i]->z[0][1] = hi[0]; act[i]->z[1][1] = hi[1];
+    }
+}
+#else
+static void filter_bands(fa_eq_bandstate** act, uint32_t nb, float* buf, int64_t n)
 {
     uint32_t i;
+    for (i = 0; i < nb; i++) {
+        fa_eq_bandstate* b = act[i];
+        const float b0 = b->b0, b1 = b->b1, b2 = b->b2, a1 = b->a1, a2 = b->a2;
+        float z00 = b->z[0][0], z01 = b->z[0][1], z10 = b->z[1][0], z11 = b->z[1][1];
+        int64_t j;
+        for (j = 0; j < n; j++) {
+            float x0 = buf[j * 2], x1 = buf[j * 2 + 1];
+            float y0 = b0 * x0 + z00, y1 = b0 * x1 + z10;
+            z00 = b1 * x0 - a1 * y0 + z01;
+            z01 = b2 * x0 - a2 * y0;
+            z10 = b1 * x1 - a1 * y1 + z11;
+            z11 = b2 * x1 - a2 * y1;
+            buf[j * 2] = y0;
+            buf[j * 2 + 1] = y1;
+        }
+        b->z[0][0] = z00; b->z[0][1] = z01; b->z[1][0] = z10; b->z[1][1] = z11;
+    }
+}
+#endif
+
+void fa_eq_process(fa_eq_state* st, float* buf, int64_t n)
+{
+    uint32_t i, nb = 0;
+    float k = -1.0f;                     /* the glide step, worked out when a band glides */
+    fa_eq_bandstate* act[FA_EQ_MAX_BANDS];
     st->blocks++;
-    float k = 1.0f - expf(-(float)n / (EQ_GLIDE_S * (float)st->rate));
     for (i = 0; i < FA_EQ_MAX_BANDS; i++) {
         fa_eq_bandstate* b = &st->band[i];
-        int64_t j;
-        float z00, z01, z10, z11;
         if (b->g == 0.0f && b->tg == 0.0f) continue;
         if (b->g != b->tg || b->f != b->tf || b->q != b->tq) {
+            if (k < 0.0f) k = 1.0f - expf(-(float)n / (EQ_GLIDE_S * (float)st->rate));
             b->g = glide(b->g, b->tg, k, 0.001f);
             b->f = glide(b->f, b->tf, k, b->tf * 0.0001f);
             b->q = glide(b->q, b->tq, k, 0.0001f);
@@ -285,21 +348,14 @@ void fa_eq_process(fa_eq_state* st, float* buf, int64_t n)
         /* While gliding, redesign every fourth call (64 frames): smooth enough, and
          * the trig stays off most blocks. */
         if (b->dirty && (b->g == b->tg || (st->blocks & 3) == 0)) { design(b, st->rate); b->dirty = 0; }
-        z00 = b->z[0][0]; z01 = b->z[0][1]; z10 = b->z[1][0]; z11 = b->z[1][1];
-        for (j = 0; j < n; j++) {
-            float x0 = buf[j * 2], x1 = buf[j * 2 + 1];
-            float y0 = b->b0 * x0 + z00, y1 = b->b0 * x1 + z10;
-            z00 = b->b1 * x0 - b->a1 * y0 + z01;
-            z01 = b->b2 * x0 - b->a2 * y0;
-            z10 = b->b1 * x1 - b->a1 * y1 + z11;
-            z11 = b->b2 * x1 - b->a2 * y1;
-            buf[j * 2] = y0;
-            buf[j * 2 + 1] = y1;
-        }
-        /* Flush denormals so a long silence doesn't slow the audio thread down. */
-        b->z[0][0] = fabsf(z00) < 1e-20f ? 0.0f : z00;
-        b->z[0][1] = fabsf(z01) < 1e-20f ? 0.0f : z01;
-        b->z[1][0] = fabsf(z10) < 1e-20f ? 0.0f : z10;
-        b->z[1][1] = fabsf(z11) < 1e-20f ? 0.0f : z11;
+        act[nb++] = b;
+    }
+    if (nb == 0) return;
+    filter_bands(act, nb, buf, n);
+    /* Flush denormals so a long silence doesn't slow the audio thread down. */
+    for (i = 0; i < nb; i++) {
+        float* z = &act[i]->z[0][0];
+        int c;
+        for (c = 0; c < 4; c++) if (fabsf(z[c]) < 1e-20f) z[c] = 0.0f;
     }
 }

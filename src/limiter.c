@@ -66,65 +66,93 @@ void fa_limiter_free(fa_limiter* l)
     memset(l, 0, sizeof(*l));
 }
 
+/* One frame of gain smoothing and delay, for a frame whose true peak needs gain
+ * `need`. Returns the gain applied to the frame going out. */
+static float limit_frame(fa_limiter* l, float* frame, float need, float ceiling, float target)
+{
+    uint32_t c, ch = l->channels;
+    float* slot;
+    float gmin, box_avg, g, ge, limit;
+    int tail;
+
+    /* Sliding minimum over the last `window` frames (monotonic deque). The
+     * indices wrap by comparison: head < dq_cap and count <= dq_cap. */
+    for (;;) {
+        if (l->dq_count == 0) break;
+        tail = l->dq_head + l->dq_count - 1;
+        if (tail >= l->dq_cap) tail -= l->dq_cap;
+        if (l->dq_val[tail] < need) break;
+        l->dq_count--;
+    }
+    tail = l->dq_head + l->dq_count;
+    if (tail >= l->dq_cap) tail -= l->dq_cap;
+    l->dq_idx[tail] = l->n;
+    l->dq_val[tail] = need;
+    l->dq_count++;
+    while (l->dq_idx[l->dq_head] <= l->n - l->window) {
+        if (++l->dq_head == l->dq_cap) l->dq_head = 0;
+        l->dq_count--;
+    }
+    gmin = l->dq_val[l->dq_head];
+
+    /* Box average over `attack` minima. */
+    l->box_sum += (double)gmin - (double)l->box[l->bpos];
+    l->box[l->bpos] = gmin;
+    if (++l->bpos == l->attack) l->bpos = 0;
+    if ((l->n & 0xffff) == 0) {       /* re-sum now and then so rounding cannot drift */
+        int k;
+        l->box_sum = 0.0;
+        for (k = 0; k < l->attack; k++) l->box_sum += l->box[k];
+    }
+    box_avg = (float)(l->box_sum / (double)l->attack);
+    if (box_avg > 1.0f) box_avg = 1.0f;
+
+    /* Instant into reduction, smooth release out of it. */
+    g = box_avg < l->gain ? box_avg : box_avg + (l->gain - box_avg) * l->release;
+    l->gain = g;
+
+    /* Fade between bypass and limiting when switched. */
+    if (l->mix < target) { l->mix += l->mix_step; if (l->mix > target) l->mix = target; }
+    else if (l->mix > target) { l->mix -= l->mix_step; if (l->mix < target) l->mix = target; }
+    ge = l->mix >= 1.0f ? g : 1.0f + l->mix * (g - 1.0f);
+
+    /* Delay line of `delay` frames: the frame from `delay` frames ago goes out,
+     * limited to the ceiling it was measured against. */
+    slot = l->audio + (size_t)l->apos * ch;
+    limit = l->ceil_line[l->apos];
+    for (c = 0; c < ch; c++) {
+        float in = frame[c], out = slot[c] * ge;
+        if (l->mix >= 1.0f) {          /* guard against float rounding at the edge */
+            if (out > limit) out = limit;
+            else if (out < -limit) out = -limit;
+        }
+        slot[c] = in;
+        frame[c] = out;
+    }
+    l->ceil_line[l->apos] = ceiling;
+    if (++l->apos == l->delay) l->apos = 0;
+    l->n++;
+    return ge;
+}
+
 void fa_limiter_process(fa_limiter* l, float* x, uint32_t count, float ceiling, int on)
 {
-    uint32_t i, c, ch = l->channels;
+    uint32_t i, at, ch = l->channels;
     float least = 1.0f, target = on ? 1.0f : 0.0f;
+    float peaks[FA_TP_PUSH_BLOCK];
     if (!l->audio) return;
     if (l->mix < 0.0f) l->mix = target;
-    for (i = 0; i < count; i++) {
-        float* frame = x + (size_t)i * ch;
-        float* slot;
-        float need = 1.0f, gmin, box_avg, g, ge, limit;
-        float p = fa_truepeak_push(&l->tp, frame);
-        if (p > ceiling) need = ceiling / p;
-
-        /* Sliding minimum over the last `window` frames (monotonic deque). */
-        while (l->dq_count > 0 && l->dq_val[(l->dq_head + l->dq_count - 1) % l->dq_cap] >= need) l->dq_count--;
-        l->dq_idx[(l->dq_head + l->dq_count) % l->dq_cap] = l->n;
-        l->dq_val[(l->dq_head + l->dq_count) % l->dq_cap] = need;
-        l->dq_count++;
-        while (l->dq_idx[l->dq_head] <= l->n - l->window) { l->dq_head = (l->dq_head + 1) % l->dq_cap; l->dq_count--; }
-        gmin = l->dq_val[l->dq_head];
-
-        /* Box average over `attack` minima. */
-        l->box_sum += (double)gmin - (double)l->box[l->bpos];
-        l->box[l->bpos] = gmin;
-        l->bpos = (l->bpos + 1) % l->attack;
-        if ((l->n & 0xffff) == 0) {       /* re-sum now and then so rounding cannot drift */
-            int k;
-            l->box_sum = 0.0;
-            for (k = 0; k < l->attack; k++) l->box_sum += l->box[k];
+    /* True peaks a block at a time (the same values as frame by frame); a block
+     * that cannot reach the ceiling needs no reduction anywhere. */
+    for (at = 0; at < count; at += FA_TP_PUSH_BLOCK) {
+        uint32_t n = count - at < FA_TP_PUSH_BLOCK ? count - at : FA_TP_PUSH_BLOCK;
+        float* b = x + (size_t)at * ch;
+        int measured = fa_truepeak_push_block(&l->tp, b, n, peaks, ceiling);
+        for (i = 0; i < n; i++) {
+            float need = measured && peaks[i] > ceiling ? ceiling / peaks[i] : 1.0f;
+            float ge = limit_frame(l, b + (size_t)i * ch, need, ceiling, target);
+            if (ge < least) least = ge;
         }
-        box_avg = (float)(l->box_sum / (double)l->attack);
-        if (box_avg > 1.0f) box_avg = 1.0f;
-
-        /* Instant into reduction, smooth release out of it. */
-        g = box_avg < l->gain ? box_avg : box_avg + (l->gain - box_avg) * l->release;
-        l->gain = g;
-
-        /* Fade between bypass and limiting when switched. */
-        if (l->mix < target) { l->mix += l->mix_step; if (l->mix > target) l->mix = target; }
-        else if (l->mix > target) { l->mix -= l->mix_step; if (l->mix < target) l->mix = target; }
-        ge = l->mix >= 1.0f ? g : 1.0f + l->mix * (g - 1.0f);
-        if (ge < least) least = ge;
-
-        /* Delay line of `delay` frames: the frame from `delay` frames ago goes out,
-         * limited to the ceiling it was measured against. */
-        slot = l->audio + (size_t)l->apos * ch;
-        limit = l->ceil_line[l->apos];
-        for (c = 0; c < ch; c++) {
-            float in = frame[c], out = slot[c] * ge;
-            if (l->mix >= 1.0f) {          /* guard against float rounding at the edge */
-                if (out > limit) out = limit;
-                else if (out < -limit) out = -limit;
-            }
-            slot[c] = in;
-            frame[c] = out;
-        }
-        l->ceil_line[l->apos] = ceiling;
-        l->apos = (l->apos + 1) % l->delay;
-        l->n++;
     }
     l->reduction = least;
 }

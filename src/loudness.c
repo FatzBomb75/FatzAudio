@@ -219,6 +219,112 @@ static float tp_block(const fa_truepeak* tp, const float* lin, int n)
     return m;
 }
 
+/* For each of the n samples lin[TAPS - 1 + j] of one channel: raises peaks[j] to
+ * the largest |value| among the sample and the points interpolated up to it,
+ * summed as tp_push sums them, so peaks[j] is what tp_push returns for that frame.
+ * Four samples per SIMD vector, as in tp_block. */
+static void tp_each(const fa_truepeak* tp, const float* lin, int n, float* peaks)
+{
+    int j = 0, p;
+    float v[4];
+    if (tp->phases > 1) {
+#if defined(FA_TP_SSE)
+        const float* wide = tp->wide;
+        int t;
+        const __m128 sign = _mm_set1_ps(-0.0f);
+        for (; j + 4 <= n; j += 4) {
+            __m128 a0 = _mm_setzero_ps(), a1 = a0, a2 = a0, a3 = a0, m;
+            for (t = 0; t < FA_TP_TAPS; t++) {
+                __m128 x = _mm_loadu_ps(lin + j + t);
+                const float* c = wide + t * FA_TP_PHASES * 4;
+                a0 = _mm_add_ps(a0, _mm_mul_ps(_mm_loadu_ps(c), x));
+                a1 = _mm_add_ps(a1, _mm_mul_ps(_mm_loadu_ps(c + 4), x));
+                a2 = _mm_add_ps(a2, _mm_mul_ps(_mm_loadu_ps(c + 8), x));
+                a3 = _mm_add_ps(a3, _mm_mul_ps(_mm_loadu_ps(c + 12), x));
+            }
+            m = _mm_max_ps(_mm_max_ps(_mm_andnot_ps(sign, a0), _mm_andnot_ps(sign, a1)),
+                           _mm_max_ps(_mm_andnot_ps(sign, a2), _mm_andnot_ps(sign, a3)));
+            m = _mm_max_ps(m, _mm_andnot_ps(sign, _mm_loadu_ps(lin + FA_TP_TAPS - 1 + j)));
+            _mm_storeu_ps(peaks + j, _mm_max_ps(_mm_loadu_ps(peaks + j), m));
+        }
+#elif defined(FA_TP_NEON)
+        const float* wide = tp->wide;
+        int t;
+        for (; j + 4 <= n; j += 4) {
+            float32x4_t a0 = vdupq_n_f32(0.0f), a1 = a0, a2 = a0, a3 = a0, m;
+            for (t = 0; t < FA_TP_TAPS; t++) {
+                float32x4_t x = vld1q_f32(lin + j + t);
+                const float* c = wide + t * FA_TP_PHASES * 4;
+                a0 = vaddq_f32(a0, vmulq_f32(vld1q_f32(c), x));
+                a1 = vaddq_f32(a1, vmulq_f32(vld1q_f32(c + 4), x));
+                a2 = vaddq_f32(a2, vmulq_f32(vld1q_f32(c + 8), x));
+                a3 = vaddq_f32(a3, vmulq_f32(vld1q_f32(c + 12), x));
+            }
+            m = vmaxq_f32(vmaxq_f32(vabsq_f32(a0), vabsq_f32(a1)), vmaxq_f32(vabsq_f32(a2), vabsq_f32(a3)));
+            m = vmaxq_f32(m, vabsq_f32(vld1q_f32(lin + FA_TP_TAPS - 1 + j)));
+            vst1q_f32(peaks + j, vmaxq_f32(vld1q_f32(peaks + j), m));
+        }
+#endif
+    }
+    /* The rest (and every sample without SIMD). */
+    for (; j < n; j++) {
+        float m = fabsf(lin[FA_TP_TAPS - 1 + j]);
+        if (tp->phases > 1) {
+            tp_phases((const float (*)[FA_TP_PHASES])tp->coef, lin + j, v);
+            for (p = 0; p < tp->phases; p++) { float a = fabsf(v[p]); if (a > m) m = a; }
+        }
+        if (m > peaks[j]) peaks[j] = m;
+    }
+}
+
+/* Keeps the last TAPS of `n` interleaved frames as the history. */
+static void tp_keep(fa_truepeak* tp, const float* x, int64_t n)
+{
+    uint32_t ch = tp->channels, c;
+    int64_t i;
+    for (i = n > FA_TP_TAPS ? n - FA_TP_TAPS : 0; i < n; i++) {
+        tp->pos = (tp->pos + 1) % FA_TP_TAPS;
+        for (c = 0; c < ch; c++) {
+            float* h = tp->hist + (size_t)c * FA_TP_TAPS * 2;
+            h[tp->pos] = h[tp->pos + FA_TP_TAPS] = x[(size_t)i * ch + c];
+        }
+    }
+}
+
+/* The largest |value| among the n frames and the TAPS frames before them (the
+ * history): no interpolated point in the block can exceed `bound` x that. */
+static float tp_input_max(const fa_truepeak* tp, const float* x, int64_t n)
+{
+    uint32_t c;
+    size_t k;
+    float in_max = 0.0f;
+    for (k = 0; k < (size_t)n * tp->channels; k++) { float a = fabsf(x[k]); if (a > in_max) in_max = a; }
+    for (c = 0; c < tp->channels; c++) {
+        const float* h = tp->hist + (size_t)c * FA_TP_TAPS * 2 + tp->pos + 1;   /* the last TAPS */
+        for (k = 0; k < FA_TP_TAPS; k++) { float a = fabsf(h[k]); if (a > in_max) in_max = a; }
+    }
+    return in_max;
+}
+
+int fa_truepeak_push_block(fa_truepeak* tp, const float* x, uint32_t frames, float* peaks, float floor_level)
+{
+    uint32_t ch = tp->channels, c, i;
+    float lin[FA_TP_TAPS - 1 + FA_TP_PUSH_BLOCK];
+    /* A margin over `bound` for the rounding of the sums. */
+    if (tp_input_max(tp, x, frames) * tp->bound * 1.0001f <= floor_level) {
+        tp_keep(tp, x, frames);
+        return 0;
+    }
+    memset(peaks, 0, (size_t)frames * sizeof(float));
+    for (c = 0; c < ch; c++) {
+        memcpy(lin, tp->hist + (size_t)c * FA_TP_TAPS * 2 + tp->pos + 2, sizeof(float) * (FA_TP_TAPS - 1));
+        for (i = 0; i < frames; i++) lin[FA_TP_TAPS - 1 + i] = x[(size_t)i * ch + c];
+        tp_each(tp, lin, (int)frames, peaks);
+    }
+    tp_keep(tp, x, frames);
+    return 1;
+}
+
 /* Measures `frames` interleaved frames. With `measure` 0 the samples only fill
  * the history (warm-up). Blocks of FA_TP_BLOCK frames that cannot beat the peak
  * found so far are skipped: no interpolated point can exceed `bound` x the
@@ -234,16 +340,7 @@ static void tp_process(fa_truepeak* tp, const float* x, int64_t frames, int meas
         const float* b = x + (size_t)at * ch;
         int skip = !measure;
         uint32_t c;
-        if (measure) {
-            size_t k;
-            float in_max = 0.0f;
-            for (k = 0; k < (size_t)n * ch; k++) { float a = fabsf(b[k]); if (a > in_max) in_max = a; }
-            for (c = 0; c < ch; c++) {
-                const float* h = tp->hist + (size_t)c * FA_TP_TAPS * 2 + tp->pos + 1;   /* the last TAPS */
-                for (k = 0; k < FA_TP_TAPS; k++) { float a = fabsf(h[k]); if (a > in_max) in_max = a; }
-            }
-            skip = in_max * tp->bound <= tp->peak;
-        }
+        if (measure) skip = tp_input_max(tp, b, n) * tp->bound <= tp->peak;
         if (!skip) {
             float lin[FA_TP_TAPS - 1 + FA_TP_BLOCK];
             for (c = 0; c < ch; c++) {
@@ -254,14 +351,7 @@ static void tp_process(fa_truepeak* tp, const float* x, int64_t frames, int meas
                 if (m > tp->peak) tp->peak = m;
             }
         }
-        /* Only the last TAPS frames matter for what comes next. */
-        for (i = n > FA_TP_TAPS ? n - FA_TP_TAPS : 0; i < n; i++) {
-            tp->pos = (tp->pos + 1) % FA_TP_TAPS;
-            for (c = 0; c < ch; c++) {
-                float* h = tp->hist + (size_t)c * FA_TP_TAPS * 2;
-                h[tp->pos] = h[tp->pos + FA_TP_TAPS] = b[(size_t)i * ch + c];
-            }
-        }
+        tp_keep(tp, b, n);   /* only the last TAPS frames matter for what comes next */
         at += n;
     }
 }

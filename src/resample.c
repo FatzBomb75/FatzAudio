@@ -62,8 +62,14 @@ fa_result fa_varispeed_init(fa_varispeed* v, uint32_t channels)
 {
     memset(v, 0, sizeof(*v));
     v->channels = channels;
+    v->keep = VS_KEEP;
     v->table = kernel_table();
     return v->table ? FA_OK : FA_ERROR_OUT_OF_MEMORY;
+}
+
+void fa_varispeed_set_keep(fa_varispeed* v, int64_t frames)
+{
+    v->keep = frames < VS_KEEP ? frames : VS_KEEP;
 }
 
 void fa_varispeed_free(fa_varispeed* v)
@@ -84,8 +90,8 @@ static fa_result reserve(fa_varispeed* v, int64_t frames)
     int64_t cap;
     if (v->count + frames <= v->cap) return FA_OK;
     /* Drop what no output can reach any more first. */
-    if (v->pos > (double)VS_KEEP) {
-        int64_t drop = (int64_t)v->pos - VS_KEEP;
+    if (v->pos > (double)v->keep) {
+        int64_t drop = (int64_t)v->pos - v->keep;
         if (drop > v->count) drop = v->count;
         memmove(v->buf, v->buf + (size_t)drop * v->channels, (size_t)(v->count - drop) * v->channels * sizeof(float));
         v->count -= drop;
@@ -164,6 +170,136 @@ int64_t fa_varispeed_read(fa_varispeed* v, double ratio, float* out, int64_t max
         n++;
         v->pos += ratio;
     }
+    return n;
+}
+
+/* ---- fixed ratios (device-rate conversion) ---------------------------------- */
+
+#define VS_MAX_PHASES 1024          /* 44.1 <-> 48 kHz take 160 and 147 */
+#define VS_MAX_TABLE (512u * 1024u) /* bytes of coefficients per ratio */
+
+static fa_atomic_ptr phase_tables;  /* fa_vs_phases list, pushed with a CAS */
+
+static uint32_t gcd_u32(uint32_t a, uint32_t b)
+{
+    while (b) { uint32_t t = a % b; a = b; b = t; }
+    return a;
+}
+
+/* The kernel at table position t (VS_PHASES steps per tap), as taps() reads it. */
+static double kernel_at(const float* table, double t)
+{
+    int32_t ti;
+    if (t >= (double)(VS_HALF * VS_PHASES)) return 0.0;
+    ti = (int32_t)t;
+    return (double)table[ti] + ((double)table[ti + 1] - (double)table[ti]) * (t - (double)ti);
+}
+
+static fa_vs_phases* build_phases(uint32_t num, uint32_t den)
+{
+    const float* table = kernel_table();
+    double ratio = (double)num / (double)den, scale = ratio > 1.0 ? 1.0 / ratio : 1.0;
+    double steps = VS_PHASES * scale;
+    int64_t w = fa_varispeed_width(ratio), k;
+    uint32_t ph;
+    fa_vs_phases* p;
+    if (!table || (size_t)den * (size_t)(2 * w) * sizeof(float) > VS_MAX_TABLE) return NULL;
+    p = (fa_vs_phases*)calloc(1, sizeof(*p));
+    if (!p) return NULL;
+    p->coef = (float*)malloc((size_t)den * (size_t)(2 * w) * sizeof(float));
+    if (!p->coef) { free(p); return NULL; }
+    p->num = num;
+    p->den = den;
+    p->width = w;
+    for (ph = 0; ph < den; ph++) {
+        double frac = (double)ph / (double)den;
+        float* row = p->coef + (size_t)ph * (size_t)(2 * w);
+        for (k = 0; k < 2 * w; k++) {
+            /* Input i0 - m at or before the output time, or i0 + 1 + m after it. */
+            double t = k < w ? (frac + (double)(w - 1 - k)) * steps : (1.0 - frac + (double)(k - w)) * steps;
+            row[k] = (float)(kernel_at(table, t) * scale);
+        }
+    }
+    return p;
+}
+
+const fa_vs_phases* fa_varispeed_phases(uint32_t rate_in, uint32_t rate_out)
+{
+    uint32_t g, num, den;
+    fa_vs_phases *p, *head;
+    if (rate_in == 0 || rate_out == 0) return NULL;
+    g = gcd_u32(rate_in, rate_out);
+    num = rate_in / g;
+    den = rate_out / g;
+    if (den > VS_MAX_PHASES || (double)num / (double)den > VS_MAX_RATIO) return NULL;
+    for (p = (fa_vs_phases*)fa_load_ptr(&phase_tables); p; p = p->next)
+        if (p->num == num && p->den == den) return p;
+    p = build_phases(num, den);
+    if (!p) return NULL;
+    /* Two threads building the same one: both are kept, both are right. */
+    do {
+        head = (fa_vs_phases*)fa_load_ptr(&phase_tables);
+        p->next = head;
+    } while (!fa_cas_ptr(&phase_tables, head, p));
+    return p;
+}
+
+/* One output frame at input time i0 + ph / den into o. */
+static void phased_frame(const fa_varispeed* v, const fa_vs_phases* p, uint32_t ph, int64_t i0, float* o)
+{
+    const uint32_t ch = v->channels;
+    const int64_t w = p->width, taps = 2 * w;
+    const float* row = p->coef + (size_t)ph * (size_t)taps;
+    int64_t first = i0 - w + 1, from = first < 0 ? -first : 0, m = taps - from, k;   /* before the start: nothing */
+    const float* x = v->buf + (first + from) * (int64_t)ch;
+    uint32_t c;
+    row += from;
+    if (ch == 2) {
+        /* Two sums per channel, so the adds overlap. */
+        float l0 = 0.0f, r0 = 0.0f, l1 = 0.0f, r1 = 0.0f;
+        for (k = 0; k + 1 < m; k += 2) {
+            l0 += x[k * 2] * row[k];
+            r0 += x[k * 2 + 1] * row[k];
+            l1 += x[k * 2 + 2] * row[k + 1];
+            r1 += x[k * 2 + 3] * row[k + 1];
+        }
+        if (k < m) { l0 += x[k * 2] * row[k]; r0 += x[k * 2 + 1] * row[k]; }
+        o[0] = l0 + l1;
+        o[1] = r0 + r1;
+    } else if (ch == 1) {
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        for (k = 0; k + 3 < m; k += 4) {
+            a0 += x[k] * row[k];
+            a1 += x[k + 1] * row[k + 1];
+            a2 += x[k + 2] * row[k + 2];
+            a3 += x[k + 3] * row[k + 3];
+        }
+        for (; k < m; k++) a0 += x[k] * row[k];
+        o[0] = (a0 + a1) + (a2 + a3);
+    } else {
+        float acc[FA_TEMPO_MAX_CHANNELS];
+        for (c = 0; c < ch; c++) acc[c] = 0.0f;
+        for (k = 0; k < m; k++) {
+            const float h = row[k], *f = x + k * ch;
+            for (c = 0; c < ch; c++) acc[c] += f[c] * h;
+        }
+        for (c = 0; c < ch; c++) o[c] = acc[c];
+    }
+}
+
+int64_t fa_varispeed_read_phased(fa_varispeed* v, const fa_vs_phases* p, uint32_t* phase, float* out, int64_t max_frames)
+{
+    int64_t i0 = (int64_t)floor(v->pos), n = 0;
+    uint32_t ph = *phase;
+    while (n < max_frames && i0 + p->width < v->count) {   /* else it needs input further ahead */
+        if (out) phased_frame(v, p, ph, i0, out + (size_t)n * v->channels);
+        n++;
+        ph += p->num;
+        i0 += ph / p->den;
+        ph %= p->den;
+    }
+    v->pos = (double)i0 + (double)ph / (double)p->den;
+    *phase = ph;
     return n;
 }
 

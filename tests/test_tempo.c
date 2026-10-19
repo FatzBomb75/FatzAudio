@@ -523,6 +523,64 @@ static float* play_resampled(uint32_t rate, uint32_t frames, gen_fn gen, int64_t
     return out;
 }
 
+/* Device-rate conversion reads a fixed ratio through kernels worked out once
+ * (fa_varispeed_read_phased): the same output as working the kernel out per frame
+ * (fa_varispeed_read), up to float rounding, from the very first frame (the
+ * kernel reaching back before the start) and across the history being dropped
+ * (it keeps only the kernel's width). */
+static void test_device_rate_phases_match(void)
+{
+    static const uint32_t pairs[4][2] = { { 44100, 48000 }, { 48000, 44100 }, { 22050, 48000 }, { 96000, 48000 } };
+    static const uint32_t chans[3] = { 1, 2, 6 };
+    const int64_t n = 20000;
+    uint32_t p, c;
+    float* in = (float*)malloc((size_t)n * 6 * sizeof(float));
+    float* a = (float*)malloc((size_t)(n * 3 + 64) * 6 * sizeof(float));
+    float* b = (float*)malloc((size_t)(n * 3 + 64) * 6 * sizeof(float));
+    int64_t i;
+    srand(11);
+    for (i = 0; i < n * 6; i++) in[i] = (float)rand() / (float)RAND_MAX * 2.0f - 1.0f;
+    CHECK(fa_varispeed_phases(44100, 48000) == fa_varispeed_phases(88200, 96000));   /* one table per ratio */
+    CHECK(fa_varispeed_phases(1, 4999) == NULL);                                      /* too many phases */
+    for (p = 0; p < 4; p++) {
+        const fa_vs_phases* ph = fa_varispeed_phases(pairs[p][0], pairs[p][1]);
+        double ratio = (double)pairs[p][0] / (double)pairs[p][1];
+        CHECK(ph != NULL);
+        for (c = 0; c < 3; c++) {
+            fa_varispeed va, vb;
+            uint32_t ch = chans[c], phase = 0;
+            int64_t at = 0, na = 0, nb = 0;
+            double worst = 0.0;
+            CHECK_EQ(fa_varispeed_init(&va, ch), FA_OK);
+            CHECK_EQ(fa_varispeed_init(&vb, ch), FA_OK);
+            fa_varispeed_set_keep(&vb, fa_varispeed_width(ratio) + 2);
+            while (at < n) {
+                int64_t m = n - at < 777 ? n - at : 777;
+                CHECK_EQ(fa_varispeed_write(&va, in + at * ch, m), FA_OK);
+                CHECK_EQ(fa_varispeed_write(&vb, in + at * ch, m), FA_OK);
+                for (;;) {   /* everything this input reaches, in pieces */
+                    int64_t ga = fa_varispeed_read(&va, ratio, a + na * ch, 1000);
+                    int64_t gb = fa_varispeed_read_phased(&vb, ph, &phase, b + nb * ch, 1000);
+                    CHECK_EQ(ga, gb);
+                    na += ga;
+                    nb += gb;
+                    if (ga == 0) break;
+                }
+                at += m;
+            }
+            CHECK_EQ(na, nb);
+            CHECK(vb.cap < va.cap);                   /* less history kept */
+            for (i = 0; i < na * ch; i++) if (fabs((double)a[i] - b[i]) > worst) worst = fabs((double)a[i] - b[i]);
+            CHECK(worst < 1e-5);
+            fa_varispeed_free(&va);
+            fa_varispeed_free(&vb);
+        }
+    }
+    free(in);
+    free(a);
+    free(b);
+}
+
 static void test_device_rate_is_sinc(void)
 {
     const double f1k = 1000.0, f17k = 17000.0;
@@ -1128,6 +1186,7 @@ int main(void)
     RUN(test_params_and_options_api);
     RUN(test_fast_and_formants);
     RUN(test_device_rate_is_sinc);
+    RUN(test_device_rate_phases_match);
     RUN(test_device_rate_timing_and_end);
     RUN(test_transient_mode);
 

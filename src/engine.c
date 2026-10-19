@@ -69,7 +69,8 @@ void fa_engine_track_stream(fa_engine* e, struct fa_stream* s, int add)
  * nobody else is decoding (try-lock on its decode lock) and tops it up. A stream
  * another worker is busy with is skipped, so one slow source never keeps idle
  * workers from the others. With nothing to do a worker sleeps until woken or
- * 5 ms pass; the audio thread never has to signal anything. */
+ * 5 ms pass (100 ms while the engine has no streams at all: adding one wakes
+ * it); the audio thread never has to signal anything. */
 static void worker_main(void* arg)
 {
     fa_engine* e = (fa_engine*)arg;
@@ -100,7 +101,7 @@ static void worker_main(void* arg)
             if (busy) fa_cond_wait_ms(&e->work_cond, &e->list_lock, 1);
             continue;
         }
-        fa_cond_wait_ms(&e->work_cond, &e->list_lock, 5);
+        fa_cond_wait_ms(&e->work_cond, &e->list_lock, e->streams ? 5 : 100);
     }
     fa_mutex_unlock(&e->list_lock);
 }

@@ -26,12 +26,40 @@ typedef struct { _Alignas(8) volatile int64_t v; } fa_atomic64;
 typedef struct { void* volatile v; } fa_atomic_ptr;
 
 #if defined(FA_MSVC_ATOMICS)
+#if defined(_M_X64) || defined(_M_IX86)
+/* x86: an aligned load is already acquire and seq_cst stores are locked (xchg),
+ * so a seq_cst load is a plain load the compiler must not move (as MSVC's own
+ * <atomic> does it), not a locked compare-exchange that takes the cache line. */
+static __inline int32_t fa_load32(fa_atomic32* a)
+{
+    int32_t v;
+    _ReadWriteBarrier();
+    v = (int32_t)__iso_volatile_load32((const volatile __int32*)&a->v);
+    _ReadWriteBarrier();
+    return v;
+}
+#else
 static __inline int32_t fa_load32(fa_atomic32* a) { return (int32_t)_InterlockedCompareExchange((volatile long*)&a->v, 0, 0); }
+#endif
 static __inline void fa_store32(fa_atomic32* a, int32_t x) { _InterlockedExchange((volatile long*)&a->v, (long)x); }
 static __inline int32_t fa_fetch_add32(fa_atomic32* a, int32_t d) { return (int32_t)_InterlockedExchangeAdd((volatile long*)&a->v, (long)d); }
 static __inline int32_t fa_exchange32(fa_atomic32* a, int32_t x) { return (int32_t)_InterlockedExchange((volatile long*)&a->v, (long)x); }
 static __inline int fa_cas32(fa_atomic32* a, int32_t expected, int32_t desired)
 { return _InterlockedCompareExchange((volatile long*)&a->v, (long)desired, (long)expected) == (long)expected; }
+#if defined(_M_X64)
+static __inline int64_t fa_load64(fa_atomic64* a)
+{
+    int64_t v;
+    _ReadWriteBarrier();
+    v = (int64_t)__iso_volatile_load64((const volatile __int64*)&a->v);
+    _ReadWriteBarrier();
+    return v;
+}
+static __inline void fa_store64(fa_atomic64* a, int64_t x) { _InterlockedExchange64((volatile __int64*)&a->v, x); }
+static __inline int64_t fa_fetch_add64(fa_atomic64* a, int64_t d) { return _InterlockedExchangeAdd64((volatile __int64*)&a->v, d); }
+static __inline int64_t fa_exchange64(fa_atomic64* a, int64_t x) { return _InterlockedExchange64((volatile __int64*)&a->v, x); }
+#else
+/* 32-bit x86 (no plain 64-bit load or exchange) and ARM64: compare-exchange loops. */
 static __inline int64_t fa_load64(fa_atomic64* a) { return _InterlockedCompareExchange64((volatile __int64*)&a->v, 0, 0); }
 static __inline void fa_store64(fa_atomic64* a, int64_t x)
 {
@@ -48,9 +76,16 @@ static __inline int64_t fa_exchange64(fa_atomic64* a, int64_t x)
     __int64 old = a->v;
     for (;;) { __int64 seen = _InterlockedCompareExchange64((volatile __int64*)&a->v, x, old); if (seen == old) return old; old = seen; }
 }
+#endif
 static __inline int fa_cas64(fa_atomic64* a, int64_t expected, int64_t desired)
 { return _InterlockedCompareExchange64((volatile __int64*)&a->v, desired, expected) == expected; }
+#if defined(_M_X64)
+static __inline void* fa_load_ptr(fa_atomic_ptr* a) { return (void*)fa_load64((fa_atomic64*)(void*)a); }
+#elif defined(_M_IX86)
+static __inline void* fa_load_ptr(fa_atomic_ptr* a) { return (void*)(intptr_t)fa_load32((fa_atomic32*)(void*)a); }
+#else
 static __inline void* fa_load_ptr(fa_atomic_ptr* a) { return _InterlockedCompareExchangePointer((void* volatile*)&a->v, NULL, NULL); }
+#endif
 static __inline void* fa_exchange_ptr(fa_atomic_ptr* a, void* x) { return _InterlockedExchangePointer((void* volatile*)&a->v, x); }
 static __inline int fa_cas_ptr(fa_atomic_ptr* a, void* expected, void* desired)
 { return _InterlockedCompareExchangePointer((void* volatile*)&a->v, desired, expected) == expected; }

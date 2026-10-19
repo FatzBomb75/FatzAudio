@@ -196,6 +196,16 @@ public class EngineTests
         Assert.InRange(output.GetLevels().Peak[0], 0.3f, 0.6f);
         Span<float> bins = stackalloc float[1024];
         Assert.True(output.GetSpectrum(bins, SpectrumOptions.Left) > 0);
+        // The span overloads: same values, no allocation.
+        Span<float> peak = stackalloc float[2], rms = stackalloc float[2];
+        Assert.Equal(1, s.GetLevels(peak, rms, TimeSpan.FromMilliseconds(100)));   // a mono file
+        Assert.InRange(peak[0], 0.45f, 0.55f);
+        Assert.InRange(rms[0], 0.30f, 0.40f);
+        output.GetLevels(peak, rms);
+        Assert.InRange(peak[0], 0.3f, 0.6f);
+        Assert.Throws<ArgumentException>(() => output.GetLevels(new float[1], new float[2]));
+        Assert.Throws<ArgumentException>(() => s.GetLevels(Span<float>.Empty, Span<float>.Empty));
+        Assert.False(s.HasCdg);
         Assert.Throws<FatzAudioException>(() => s.GetSpectrum(1000));
         Assert.Throws<FatzAudioException>(() => s.GetSpectrum(4097));
         s.Pause();

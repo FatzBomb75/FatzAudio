@@ -8,7 +8,12 @@
  * kernel looks ahead `width` input frames, which is the input latency the
  * stream feeds as silence at the end to get the last frames out. Ratios above
  * FA_VARISPEED_MAX_RATIO (a 768 kHz source on an 8 kHz device) are refused: the
- * stream then falls back to miniaudio's linear resampler. */
+ * stream then falls back to miniaudio's linear resampler.
+ *
+ * Speed: a ratio of two rates with at most 1024 output phases (every usual pair:
+ * 44.1 -> 48 kHz has 160) reads through its kernels worked out once
+ * (fa_varispeed_phases), about five times faster than working the kernel out per
+ * frame; the output differs from that only by float rounding (-130 dB). */
 #include "fa_internal.h"
 #include <math.h>
 #include <stdlib.h>
@@ -17,6 +22,8 @@ typedef struct sinc_backend {
     fa_varispeed vs;
     double ratio;               /* input frames per output frame */
     int64_t width;              /* input frames the kernel reaches past the output time */
+    const fa_vs_phases* phases; /* the kernels of this ratio worked out once (NULL: per frame) */
+    uint32_t phase;             /* with phases: the output time's fraction, in 1/den */
 } sinc_backend;
 
 static int set_ratio(sinc_backend* b, ma_uint32 rate_in, ma_uint32 rate_out)
@@ -27,6 +34,14 @@ static int set_ratio(sinc_backend* b, ma_uint32 rate_in, ma_uint32 rate_out)
     if (ratio > FA_VARISPEED_MAX_RATIO) return 0;   /* wider than the history keeps */
     b->ratio = ratio;
     b->width = fa_varispeed_width(ratio);
+    b->phases = fa_varispeed_phases(rate_in, rate_out);
+    /* The output time's fraction in the new phases (it is 0 at the start). */
+    if (b->phases) {
+        double f = b->vs.pos - floor(b->vs.pos);
+        b->phase = (uint32_t)lround(f * b->phases->den);   /* rounded: f holds ph / den inexactly */
+        if (b->phase >= b->phases->den) b->phase = b->phases->den - 1;
+        b->vs.pos = floor(b->vs.pos) + (double)b->phase / (double)b->phases->den;
+    }
     return 1;
 }
 
@@ -71,6 +86,9 @@ static ma_result sinc_init(void* user, const ma_resampler_config* config, void* 
         free(b);
         return MA_OUT_OF_MEMORY;
     }
+    /* One ratio: the kernel reaches `width` frames back at most, so only that much
+     * history is kept, not the widest FA_PARAM_RATE one. */
+    fa_varispeed_set_keep(&b->vs, b->width + 2);
     *out = b;
     return MA_SUCCESS;
 }
@@ -97,7 +115,9 @@ static ma_result sinc_process(void* user, ma_resampling_backend* backend, const 
     take = input_for(b, *out_count);
     if (take > *in_count) take = *in_count;
     if (take > 0 && fa_varispeed_write(&b->vs, (const float*)in, (int64_t)take) != FA_OK) return MA_OUT_OF_MEMORY;
-    if (out) {
+    if (b->phases) {   /* out NULL: nobody wants the samples, only the output time moves */
+        made = (ma_uint64)fa_varispeed_read_phased(&b->vs, b->phases, &b->phase, (float*)out, (int64_t)*out_count);
+    } else if (out) {
         made = (ma_uint64)fa_varispeed_read(&b->vs, b->ratio, (float*)out, (int64_t)*out_count);
     } else {
         /* Nobody wants the samples: only move the output time along. */
@@ -113,8 +133,11 @@ static ma_result sinc_process(void* user, ma_resampling_backend* backend, const 
 
 static ma_result sinc_set_rate(void* user, ma_resampling_backend* backend, ma_uint32 rate_in, ma_uint32 rate_out)
 {
+    sinc_backend* b = (sinc_backend*)backend;
     (void)user;
-    return set_ratio((sinc_backend*)backend, rate_in, rate_out) ? MA_SUCCESS : MA_INVALID_ARGS;
+    if (!set_ratio(b, rate_in, rate_out)) return MA_INVALID_ARGS;
+    if (b->width + 2 > b->vs.keep) fa_varispeed_set_keep(&b->vs, b->width + 2);   /* from here on */
+    return MA_SUCCESS;
 }
 
 /* The silence to feed at the end to get the last frames out. */
@@ -154,6 +177,7 @@ static ma_result sinc_reset(void* user, ma_resampling_backend* backend)
 {
     (void)user;
     fa_varispeed_reset(&((sinc_backend*)backend)->vs);
+    ((sinc_backend*)backend)->phase = 0;
     return MA_SUCCESS;
 }
 

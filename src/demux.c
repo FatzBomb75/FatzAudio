@@ -14,10 +14,11 @@
 
 /* ---- buffered reader ----------------------------------------------------------- */
 
-/* Read-ahead: up to 256 KB over the network and from the app's callbacks (which
- * may be the network too), 16 KB from files and memory, where reads are cheap and
- * the OS caches. The buffer grows with the read-ahead, so a stream that only
- * reads headers, or one jumping around, stays small. */
+/* Read-ahead: up to 256 KB from the app's callbacks (which may be the network),
+ * 16 KB from files, memory and web streams, where reads are cheap: the OS caches
+ * files, and a web stream reads from its download window, which already is the
+ * read-ahead. The buffer grows with the read-ahead, so a stream that only reads
+ * headers, or one jumping around, stays small. */
 #define BR_CAP_SLOW (256u * 1024u)
 #define BR_CAP_FAST (16u * 1024u)
 #define BR_MIN 512u     /* after a jump: enough for the next headers */
@@ -30,7 +31,7 @@ fa_result fa_br_init(fa_br* b, fa_source* src)
     if (!b->buf) return FA_ERROR_OUT_OF_MEMORY;
     b->src = src;
     b->cap = BR_MIN;
-    b->max = src->remote || src->kind == FA_SOURCE_IO ? BR_CAP_SLOW : BR_CAP_FAST;
+    b->max = src->kind == FA_SOURCE_IO && !src->remote ? BR_CAP_SLOW : BR_CAP_FAST;
     b->chunk = BR_MIN;
     b->base = fa_source_tell(src);
     return FA_OK;

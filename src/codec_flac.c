@@ -18,6 +18,7 @@ typedef struct flac_state {
     uint8_t* buf;                       /* FLAC_HEAD, then the frame */
     size_t cap;
     uint32_t max_block;
+    fa_drflac_cache cache;
 } flac_state;
 
 void fa_flac_streaminfo_format(const uint8_t* si, uint32_t* rate, uint32_t* channels, uint32_t* bits)
@@ -59,7 +60,7 @@ static fa_result flac_pkt_decode(fa_codec* c, const uint8_t* data, size_t size)
     flac_state* st = (flac_state*)c->impl;
     fa_result r;
     int64_t n;
-    uint32_t channels = 0, rate = 0;
+    uint32_t channels = 0, rate = 0, bits;
     c->out_frames = 0;
     if (!data || size == 0) return FA_OK;           /* nothing held back */
     if (size < 4 || data[0] != 0xFF || (data[1] & 0xFE) != 0xF8) return FA_ERROR_UNSUPPORTED_FORMAT;
@@ -72,10 +73,12 @@ static fa_result flac_pkt_decode(fa_codec* c, const uint8_t* data, size_t size)
     }
     follow_frame(st->buf + FLAC_SI, data, size);
     memcpy(st->buf + FLAC_HEAD, data, size);
-    /* Room for the most channels a frame can name. */
-    r = fa_codec_reserve(c, st->max_block, 8);
+    /* Room for STREAMINFO's channels (the frame's own, just copied in). */
+    fa_flac_streaminfo_format(st->buf + FLAC_SI, &rate, &channels, &bits);
+    r = fa_codec_reserve(c, st->max_block, channels);
     if (r != FA_OK) return r;
-    n = fa_drflac_decode_memory(st->buf, FLAC_HEAD + size, c->out, st->max_block, &channels, &rate);
+    channels = rate = 0;
+    n = fa_drflac_decode_memory(st->buf, FLAC_HEAD + size, c->out, st->max_block, &channels, &rate, &st->cache);
     if (n < 0 || channels == 0) return FA_ERROR_UNSUPPORTED_FORMAT;
     c->channels = channels;
     if (rate) c->rate = rate;
@@ -93,6 +96,7 @@ static void flac_pkt_close(fa_codec* c)
     flac_state* st = (flac_state*)c->impl;
     if (st) {
         free(st->buf);
+        free(st->cache.block);
         free(st);
     }
     c->impl = NULL;

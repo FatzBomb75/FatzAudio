@@ -105,44 +105,49 @@ typedef struct opus_state {
     opus_head head;
     uint32_t skip;                   /* pre-skip frames still to drop */
     int reorder;                     /* family 1: Vorbis channel order */
-    float pcm[OPUS_MAX_FRAME * 8];   /* decoded, before reordering (families 0 and 1) */
-    float* wide;                     /* more than 8 channels: decoded straight to here */
-    size_t wide_cap;
+    float* pcm;                      /* reordered streams: decoded, before reordering */
+    fa_frames pcm_cap;
 } opus_state;
 
 static fa_result opus_pkt_decode(fa_codec* c, const uint8_t* data, size_t size)
 {
     opus_state* st = (opus_state*)c->impl;
     uint32_t in = st->head.channels;
-    float* pcm = st->pcm;
-    int n;
+    float* pcm;
+    int n, frames;
     fa_result r;
     c->out_frames = 0;
     if (!data || size == 0) return FA_OK;           /* nothing held back */
     if (size > 0x7FFFFFFF) return FA_ERROR_UNSUPPORTED_FORMAT;
-    if (in > 8) {
-        size_t need = (size_t)OPUS_MAX_FRAME * in;
-        if (need > st->wide_cap) {
-            float* w = (float*)realloc(st->wide, need * sizeof(float));
-            if (!w) return FA_ERROR_OUT_OF_MEMORY;
-            st->wide = w;
-            st->wide_cap = need;
-        }
-        pcm = st->wide;
+    /* Buffers sized to the packet (usually 20 ms), not to the largest frame at 8
+     * channels: the 120 ms room is only taken by a stream that sends such packets. */
+    frames = opus_packet_get_nb_samples(data, (opus_int32)size, 48000);
+    if (frames <= 0 || frames > OPUS_MAX_FRAME) frames = OPUS_MAX_FRAME;
+    for (;;) {
+        /* Decoded straight into the output unless the channels are reordered. */
+        r = st->reorder ? fa_float_reserve(&st->pcm, &st->pcm_cap, frames, in) : fa_codec_reserve(c, frames, in);
+        if (r != FA_OK) return r;
+        pcm = st->reorder ? st->pcm : c->out;
+        n = opus_multistream_decode_float(st->dec, data, (opus_int32)size, pcm, frames, 0);
+        /* A multistream packet whose later streams run longer than the first's TOC
+         * says: retried with the largest frame instead of being dropped. */
+        if (n != OPUS_BUFFER_TOO_SMALL || frames == OPUS_MAX_FRAME) break;
+        frames = OPUS_MAX_FRAME;
     }
-    n = opus_multistream_decode_float(st->dec, data, (opus_int32)size, pcm, OPUS_MAX_FRAME, 0);
     if (n < 0) return FA_ERROR_UNSUPPORTED_FORMAT;  /* corrupt packet: skipped */
     if (st->skip > 0) {
         uint32_t k = st->skip < (uint32_t)n ? st->skip : (uint32_t)n;
         st->skip -= k;
-        pcm += (size_t)k * in;
         n -= (int)k;
+        if (st->reorder) pcm += (size_t)k * in;
+        else if (n > 0) memmove(c->out, c->out + (size_t)k * in, (size_t)n * in * sizeof(float));
     }
     if (n == 0) return FA_OK;
-    r = fa_codec_reserve(c, n, c->channels);
-    if (r != FA_OK) return r;
-    if (st->reorder) xiph_reorder(NULL, pcm, in, n, c->out);
-    else memcpy(c->out, pcm, (size_t)n * in * sizeof(float));
+    if (st->reorder) {
+        r = fa_codec_reserve(c, n, c->channels);
+        if (r != FA_OK) return r;
+        xiph_reorder(NULL, pcm, in, n, c->out);
+    }
     c->out_frames = n;
     return FA_OK;
 }
@@ -158,7 +163,7 @@ static void opus_pkt_close(fa_codec* c)
     opus_state* st = (opus_state*)c->impl;
     if (!st) return;
     opus_multistream_decoder_destroy(st->dec);
-    free(st->wide);
+    free(st->pcm);
     free(st);
     c->impl = NULL;
 }

@@ -172,10 +172,18 @@ uint64_t fa_drmp3_read(void* impl, float* out, uint64_t frames);
 fa_result fa_drmp3_restart(void* impl);
 void fa_drmp3_lag(void* impl, int64_t* out_bytes, int64_t* out_frames);
 void fa_drmp3_close(void* impl);
+/* dr_flac's decoder set-up, kept from one packet to the next instead of a malloc
+ * and free per FLAC frame (codec_flac.c). */
+typedef struct fa_drflac_cache {
+    void* block;
+    size_t cap;
+    int used;
+} fa_drflac_cache;
 /* One FLAC stream held in memory ("fLaC", STREAMINFO, a frame), decoded into `out`
- * (room for max_frames at up to 8 channels). Frames decoded, -1 if it is not FLAC. */
+ * (room for max_frames at STREAMINFO's channel count, which dr_flac holds every
+ * frame to). Frames decoded, -1 if it is not FLAC. */
 int64_t fa_drflac_decode_memory(const void* data, size_t size, float* out, uint64_t max_frames,
-                                uint32_t* out_channels, uint32_t* out_rate);
+                                uint32_t* out_channels, uint32_t* out_rate, fa_drflac_cache* cache);
 /* dr_mp3's frame decoder (minimp3) lives in miniaudio_impl.c, where its API is
  * visible. fa_mp3dec_decode decodes the first frame in data[0..size); returns the
  * bytes used (0 = needs more data) and writes up to 1152 interleaved frames to
@@ -463,6 +471,12 @@ fa_result fa_truepeak_init(fa_truepeak* tp, uint32_t rate, uint32_t channels);
 void fa_truepeak_free(fa_truepeak* tp);
 /* One interleaved frame in; the largest |interpolated value| it completes out. */
 float fa_truepeak_push(fa_truepeak* tp, const float* frame);
+/* Up to FA_TP_PUSH_BLOCK frames at once: peaks[i] = what fa_truepeak_push would
+ * return for frame i, computed several frames at a time. When no value in the
+ * block can exceed `floor_level`, only the history is updated and 0 is returned
+ * (peaks untouched); else 1. */
+#define FA_TP_PUSH_BLOCK 256
+int fa_truepeak_push_block(fa_truepeak* tp, const float* x, uint32_t frames, float* peaks, float floor_level);
 void fa_truepeak_flush(fa_truepeak* tp);
 
 /* ---- Analysis taps (analysis.c) ------------------------------------------

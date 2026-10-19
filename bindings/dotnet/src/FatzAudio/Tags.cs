@@ -265,7 +265,16 @@ public sealed class Tags
     public IReadOnlyList<TagPicture> Pictures { get; }
 
     /// <summary>The front cover, else the first picture; null when there is none.</summary>
-    public TagPicture? Cover => Pictures.FirstOrDefault(p => p.Type == PictureType.FrontCover) ?? Pictures.FirstOrDefault();
+    public TagPicture? Cover
+    {
+        get
+        {
+            var pictures = Pictures;
+            for (int i = 0; i < pictures.Count; i++)
+                if (pictures[i].Type == PictureType.FrontCover) return pictures[i];
+            return pictures.Count > 0 ? pictures[0] : null;
+        }
+    }
 
     /// <summary>
     /// The file's properties (codec, duration, bitrate, sizes, ...), as <see cref="AudioStream.Info"/> gives them
@@ -295,7 +304,16 @@ public sealed class Tags
 
     /// <summary>The value of the first item with this key (case-insensitive), or null.</summary>
     /// <param name="key">The format's own key, such as <c>TXXX</c> description, <c>REPLAYGAIN_TRACK_GAIN</c> or <c>WM/Mood</c>.</param>
-    public string? this[string key] => Items.FirstOrDefault(i => string.Equals(i.Key, key, StringComparison.OrdinalIgnoreCase))?.Value;
+    public string? this[string key]
+    {
+        get
+        {
+            var items = Items;
+            for (int i = 0; i < items.Count; i++)
+                if (string.Equals(items[i].Key, key, StringComparison.OrdinalIgnoreCase)) return items[i].Value;
+            return null;
+        }
+    }
 
     private enum TagField
     {

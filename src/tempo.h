@@ -58,10 +58,14 @@ typedef struct fa_varispeed {
     const float* table; /* half the windowed-sinc kernel, VS_PHASES steps per tap (shared) */
     float* buf;         /* input frames, interleaved */
     int64_t cap, count;
+    int64_t keep;       /* input frames kept behind the output time (fa_varispeed_set_keep) */
     double pos;         /* input time of the next output frame */
 } fa_varispeed;
 
 fa_result fa_varispeed_init(fa_varispeed* v, uint32_t channels);
+/* History kept behind the output time: by default enough for the widest ratio
+ * (FA_PARAM_RATE moves it); a resampler at one fixed ratio needs only its width. */
+void fa_varispeed_set_keep(fa_varispeed* v, int64_t frames);
 void fa_varispeed_free(fa_varispeed* v);
 void fa_varispeed_reset(fa_varispeed* v);
 /* Starts over with `history` (the frames just before the next input) as the past:
@@ -76,6 +80,23 @@ int64_t fa_varispeed_read(fa_varispeed* v, double ratio, float* out, int64_t max
 /* Input frames the kernel reaches past the output time at `ratio`: an output at
  * input time t needs frames up to floor(t) + width. */
 int64_t fa_varispeed_width(double ratio);
+/* A fixed ratio rate_in / rate_out = num / den read through precomputed kernels:
+ * one row of 2 x width coefficients per output phase (output time i0 + k / den),
+ * for inputs i0 - width + 1 .. i0 + width, oldest first. The same kernel as
+ * fa_varispeed_read, worked out once instead of per output frame. Shared by every
+ * resampler at that ratio; kept for the life of the process. */
+typedef struct fa_vs_phases {
+    uint32_t num, den;
+    int64_t width;
+    float* coef;
+    struct fa_vs_phases* next;
+} fa_vs_phases;
+/* NULL when the ratio has too many phases (or no memory): use fa_varispeed_read. */
+const fa_vs_phases* fa_varispeed_phases(uint32_t rate_in, uint32_t rate_out);
+/* Like fa_varispeed_read at ratio num / den; `phase` (0 .. den - 1) is the
+ * fraction of the output time the caller keeps between calls (with v->pos's
+ * whole part). `out` NULL only moves the output time along. */
+int64_t fa_varispeed_read_phased(fa_varispeed* v, const fa_vs_phases* p, uint32_t* phase, float* out, int64_t max_frames);
 /* Input frames written but not yet reached by the output (fractional). */
 double fa_varispeed_pending(const fa_varispeed* v);
 /* History frames priming needs, and the lookahead to flush at the end. */

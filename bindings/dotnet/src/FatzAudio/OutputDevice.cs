@@ -93,17 +93,30 @@ public sealed class OutputDevice : IDisposable
     /// <param name="window">Length of the measurement window; defaults to 50 ms, at most about 1 s.</param>
     /// <returns>Levels for left and right.</returns>
     /// <exception cref="ObjectDisposedException">The device was disposed.</exception>
-    public unsafe StreamLevels GetLevels(TimeSpan? window = null)
+    public StreamLevels GetLevels(TimeSpan? window = null)
     {
         var peak = new float[2];
         var rms = new float[2];
+        GetLevels(peak, rms, window);
+        return new StreamLevels(peak, rms);
+    }
+
+    /// <summary>Like <see cref="GetLevels(TimeSpan?)"/>, into your own buffers (no allocation per call).</summary>
+    /// <param name="peak">Receives the left and right peaks (at least 2 values).</param>
+    /// <param name="rms">Receives the left and right RMS values (at least 2 values).</param>
+    /// <param name="window">Length of the measurement window; defaults to 50 ms, at most about 1 s.</param>
+    /// <exception cref="ArgumentException">A span shorter than 2.</exception>
+    /// <exception cref="ObjectDisposedException">The device was disposed.</exception>
+    public unsafe void GetLevels(Span<float> peak, Span<float> rms, TimeSpan? window = null)
+    {
+        var handle = Handle;
+        if (peak.Length < 2 || rms.Length < 2) throw new ArgumentException("Room for left and right is needed.", peak.Length < 2 ? nameof(peak) : nameof(rms));
         fixed (float* pp = peak)
         fixed (float* pr = rms)
         {
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_get_levels(
-                Handle, TimeConvert.ToNanoseconds(window ?? TimeSpan.FromMilliseconds(50)), pp, pr, 2));
+                handle, TimeConvert.ToNanoseconds(window ?? StreamLevels.DefaultWindow), pp, pr, 2));
         }
-        return new StreamLevels(peak, rms);
     }
 
     /// <summary>The magnitude spectrum of the device's whole output being heard now, for a visualizer.</summary>

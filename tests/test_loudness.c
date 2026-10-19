@@ -748,6 +748,54 @@ static void test_limiter(void)
     CHECK_EQ(fa_engine_set_limiter(g_engine, FA_LIMITER_AUTO, -1.0), FA_OK);
 }
 
+/* The limiter measures true peaks a block at a time: each frame's value must be
+ * exactly what pushing frame by frame gives, at every oversampling (4, 2 and 1
+ * phases) and channel count, on odd block sizes, and a block skipped as unable to
+ * reach the floor must really stay at or below it. */
+static void test_truepeak_block_matches_push(void)
+{
+    static const uint32_t rates[3] = { 48000, 96000, 192000 }, chans[3] = { 1, 2, 6 };
+    static const uint32_t sizes[6] = { 1, 3, 7, 113, 256, 64 };
+    float floor_level = (float)pow(10.0, -1.0 / 20.0);
+    uint32_t r, c, n = 4000;
+    float* x = (float*)malloc((size_t)n * 6 * sizeof(float));
+    float peaks[FA_TP_PUSH_BLOCK];
+    srand(7);
+    for (r = 0; r < 3; r++) {
+        for (c = 0; c < 3; c++) {
+            fa_truepeak a, b;
+            uint32_t ch = chans[c], i, at = 0, k = 0, measured = 0, skipped = 0;
+            /* Loud noise, then quiet passages the block test can skip, then loud again. */
+            for (i = 0; i < n * ch; i++) {
+                uint32_t f = i / ch;
+                float amp = f < 1000 ? 1.4f : f < 3000 ? 0.05f : 0.9f;
+                x[i] = amp * ((float)rand() / (float)RAND_MAX * 2.0f - 1.0f);
+            }
+            CHECK_EQ(fa_truepeak_init(&a, rates[r], ch), FA_OK);
+            CHECK_EQ(fa_truepeak_init(&b, rates[r], ch), FA_OK);
+            while (at < n) {
+                uint32_t m = sizes[k++ % 6];
+                int got;
+                if (m > n - at) m = n - at;
+                got = fa_truepeak_push_block(&b, x + (size_t)at * ch, m, peaks, floor_level);
+                for (i = 0; i < m; i++) {
+                    float want = fa_truepeak_push(&a, x + (size_t)(at + i) * ch);
+                    if (got) CHECK(peaks[i] == want);
+                    else CHECK(want <= floor_level);
+                }
+                measured += got;
+                skipped += !got;
+                at += m;
+            }
+            CHECK(measured > 0);
+            CHECK(skipped > 0);
+            fa_truepeak_free(&a);
+            fa_truepeak_free(&b);
+        }
+    }
+    free(x);
+}
+
 /* Largest step between neighbouring output samples (channel 0). */
 static double max_step(const float* x, uint32_t from, uint32_t to)
 {
@@ -833,6 +881,7 @@ int main(void)
     RUN(test_running_estimate_for_io);
     RUN(test_close_during_scan);
     RUN(test_limiter);
+    RUN(test_truepeak_block_matches_push);
     RUN(test_limiter_switching_is_smooth);
     RUN(test_scan_release_races);
     RUN(test_latency_includes_limiter);
