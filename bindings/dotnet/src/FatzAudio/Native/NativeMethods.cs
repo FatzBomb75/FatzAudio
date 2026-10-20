@@ -380,6 +380,9 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_stream_get_midi_info(StreamHandle stream, FaMidiInfo* info);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_midi_credits(StreamHandle stream, FaMidiCredits* credits);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_midi_text(StreamHandle stream, uint index, FaMidiText* text);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

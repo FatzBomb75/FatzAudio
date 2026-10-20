@@ -67,6 +67,7 @@ internal unsafe struct FaOpenOptions
     public FaNetOptions* Net;
     public int DynamicRange;
     public nint SoundFont;
+    public int TextCodePage;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -436,6 +437,23 @@ internal unsafe struct FaTrackerInfo
     public int RestartOrder, RestartRow;
     public double Duration;
     public int Subsong;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaMidiCredits
+{
+    public uint StructSize;
+    public int CodePage;
+    public fixed byte Title[256];
+    public fixed byte Artist[256];
+    public fixed byte Writer[256];
+    public fixed byte Lyricist[256];
+    public fixed byte Year[32];
+    public fixed byte Copyright[256];
+    public fixed byte Key[32];
+    public fixed byte Tempo[32];
+    public fixed byte TimeSignature[32];
+    public fixed byte Other[1024];
 }
 
 [StructLayout(LayoutKind.Sequential)]

@@ -194,6 +194,67 @@ public class MidiTests
         Assert.Equal(TimeSpan.FromSeconds(1.5), lyrics[2].Position);
     }
 
+    private static byte[] OneTrack(List<byte> t)
+    {
+        Ev(t, 0, 0xFF, 0x2F, 0);
+        var f = new List<byte>();
+        f.AddRange("MThd"u8.ToArray()); f.AddRange(new byte[] { 0, 0, 0, 6, 0, 0, 0, 1, 480 >> 8, 480 & 255 });
+        f.AddRange("MTrk"u8.ToArray());
+        f.AddRange(new[] { (byte)(t.Count >> 24), (byte)(t.Count >> 16), (byte)(t.Count >> 8), (byte)t.Count });
+        f.AddRange(t);
+        return f.ToArray();
+    }
+
+    private static void MetaBytes(List<byte> t, int delta, byte type, byte[] b)
+    {
+        VarLen(t, delta); t.Add(0xFF); t.Add(type); VarLen(t, b.Length); t.AddRange(b);
+    }
+
+    [Fact]
+    public void ShiftJisLyrics_AreDetectedOrForced()
+    {
+        var t = new List<byte>();
+        MetaBytes(t, 0, 0x05, [0x82, 0xB3, 0x82, 0xAD, 0x82, 0xE7]);   // さくら
+        MetaBytes(t, 240, 0x05, [0x83, 0x5C, 0x95, 0x5C]);              // ソ表 (trail bytes 0x5C are not "\" marks)
+        var song = OneTrack(t);
+        using var engine = CreateHeadless();
+        using var font = SoundFont.FromMemory(SineSoundFont());
+        using (var s = engine.OpenMemory(song, DecodeOnly with { SoundFont = font }))
+        {
+            Assert.Equal(new[] { "さくら", "ソ表" }, s.MidiTexts.Where(x => x.Type == MidiTextType.Lyric).Select(x => x.Text));
+            Assert.Equal(TextCodePage.ShiftJis, s.MidiCredits!.CodePage);
+        }
+        using (var s = engine.OpenMemory(song, DecodeOnly with { SoundFont = font, TextCodePage = TextCodePage.Windows1252 }))
+        {
+            Assert.Equal(TextCodePage.Windows1252, s.MidiCredits!.CodePage);
+            Assert.StartsWith("\u201A\u00B3", s.MidiTexts.First(x => x.Type == MidiTextType.Lyric).Text);
+        }
+    }
+
+    [Fact]
+    public void Credits_FromKaraokeHeaderLines()
+    {
+        var t = new List<byte>();
+        Meta(t, 0, 0x01, "@KMIDI KARAOKE FILE");
+        Meta(t, 0, 0x01, "@TThe Title");
+        Meta(t, 0, 0x01, "@TThe Artist");
+        Meta(t, 0, 0x01, "@IWritten by: Ann Writer");
+        Meta(t, 0, 0x01, "@I1987");
+        Meta(t, 0, 0x01, "@IArranged for karaoke");
+        Ev(t, 0, 0xFF, 0x51, 3, 0x07, 0xA1, 0x20);
+        using var engine = CreateHeadless();
+        using var font = SoundFont.FromMemory(SineSoundFont());
+        using var s = engine.OpenMemory(OneTrack(t), DecodeOnly with { SoundFont = font });
+        var c = s.MidiCredits!;
+        Assert.Equal("The Title", c.Title);
+        Assert.Equal("The Artist", c.Artist);
+        Assert.Equal("Ann Writer", c.Writer);
+        Assert.Equal("1987", c.Year);
+        Assert.Equal("120 bpm", c.Tempo);
+        Assert.Equal(new[] { "Arranged for karaoke" }, c.Other);
+        Assert.Equal(TextCodePage.Utf8, c.CodePage);
+    }
+
     [Fact]
     public void TempoAndSignatures_AreListedWithTheirNumbers()
     {
@@ -321,6 +382,7 @@ public class MidiTests
         using var engine = CreateHeadless();
         using var s = engine.OpenMemory(TestAudio.SineWav(), DecodeOnly);
         Assert.Null(s.MidiInfo);
+        Assert.Null(s.MidiCredits);
         Assert.Empty(s.MidiTexts);
         var ex = Assert.Throws<FatzAudioException>(() => s.MidiTranspose = 2);
         Assert.Equal(ErrorCode.InvalidArgument, ex.ErrorCode);

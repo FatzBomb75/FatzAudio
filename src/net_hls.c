@@ -904,6 +904,7 @@ static fa_result hls_open(fa_decoder* dec)
     h->env.dynamic_range = dec->dynamic_range;
     h->env.soundfont = NULL;              /* MIDI is never an HLS segment format */
     h->env.midi_rate = dec->midi_rate;
+    h->env.text_code_page = dec->text_code_page;
     r = hls_open_inner(h);
     if (r != FA_OK) { fa_source_close(&h->src); free(h); return r; }
     dec->impl = h;

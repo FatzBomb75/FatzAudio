@@ -18,6 +18,11 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- MIDI song credits: `fa_stream_get_midi_credits` (.NET `AudioStream.MidiCredits`) gives title, artist, writer,
+  lyricist, year, copyright, key, tempo, time signature and other header lines, gathered from `.kar` `@T`/`@I` lines
+  and labelled text events. See [docs/features/midi.md](docs/features/midi.md#song-credits).
+- MIDI text code page: Shift-JIS (Japanese) text is detected and decoded; `fa_open_options.text_code_page`
+  (.NET `StreamOptions.TextCodePage`) forces UTF-8, Windows-1252 or Shift-JIS.
 - .NET: `AudioStream.GetLevels(Span<float> peak, Span<float> rms)` and `OutputDevice.GetLevels(peak, rms)`, which
   write into your own buffers and allocate nothing (a VU meter at 60 Hz made about 180 small objects a second).
 - Transient mode for tempo and pitch: `FA_STRETCH_TRANSIENTS` (.NET `StretchQuality.Transients`) plays the original

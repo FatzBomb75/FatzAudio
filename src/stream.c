@@ -172,6 +172,10 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
         s->soundfont = fa_soundfont_retain(options->soundfont);
     else
         s->soundfont = fa_engine_soundfont(engine);
+    if (options && options->struct_size >= offsetof(fa_open_options, text_code_page) + sizeof(options->text_code_page) &&
+        (options->text_code_page == FA_CODE_PAGE_UTF8 || options->text_code_page == FA_CODE_PAGE_WINDOWS_1252 ||
+         options->text_code_page == FA_CODE_PAGE_SHIFT_JIS))
+        s->text_code_page = options->text_code_page;
     s->loud.integrated_lufs = s->loud.range_lu = s->loud.true_peak_dbtp = NAN;
     fa_store_float(&s->norm_track, NAN);
     fa_store_float(&s->norm_album, NAN);
@@ -205,6 +209,7 @@ static fa_result stream_open_decoder(struct fa_stream* s, const char* name_hint,
     }
     env.soundfont = s->soundfont;
     env.midi_rate = fa_engine_midi_rate(s->engine);
+    env.text_code_page = s->text_code_page;
     r = fa_decoder_open(&s->decoder, &s->source, name_hint, options ? options->mime_hint : NULL,
                         options ? options->audio_track : -1, &env);
     if (r != FA_OK) return r;

@@ -213,6 +213,283 @@ static fa_stream* open_bytes(const buf* b, uint32_t flags, fa_soundfont* font, f
     return r == FA_OK ? s : NULL;
 }
 
+static fa_stream* open_bytes_cp(const buf* b, int32_t code_page)
+{
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    o.text_code_page = code_page;
+    return fa_stream_open_memory(g_engine, b->d, b->n, &o, &s) == FA_OK ? s : NULL;
+}
+
+/* The lyric syllables of a stream, "|" between them, with "/" before a new line
+ * and "\" before a new paragraph. */
+static void lyric_string(fa_stream* s, char* out, size_t cap)
+{
+    fa_midi_info info;
+    fa_midi_text t;
+    uint32_t i;
+    out[0] = '\0';
+    if (fa_stream_get_midi_info(s, &info) != FA_OK) return;
+    for (i = 0; i < info.text_count; i++) {
+        size_t n = strlen(out);
+        if (fa_stream_get_midi_text(s, i, &t) != FA_OK || t.type != FA_MIDI_LYRIC) continue;
+        snprintf(out + n, cap - n, "%s%s%s", n ? "|" : "",
+                 (t.flags & FA_MIDI_NEW_PARAGRAPH) ? "\\" : (t.flags & FA_MIDI_NEW_LINE) ? "/" : "", t.text);
+    }
+}
+
+/* Shift-JIS lyrics are found and read as such (whatever their trail bytes look
+ * like: "\x83\x5c" is a katakana, not a "\" mark); Windows-1252 accents that pair
+ * up as Shift-JIS are not; the app can force either; a UTF-8 byte order mark goes. */
+static void test_text_encoding(void)
+{
+    buf f = { 0 }, t = { 0 };
+    fa_stream* s;
+    fa_midi_credits c;
+    char got[512];
+    mthd(&f, 0, 1, 480);
+    meta(&t, 0, 0x05, "\x82\xb3\x82\xad\x82\xe7");      /* さくら */
+    meta(&t, 240, 0x05, " \x8d\xe7\x82\xad");           /* " 咲く" */
+    meta(&t, 240, 0x05, "/\x83\x5c\x95\x5c");           /* new line, "ソ表" */
+    meta(&t, 240, 0x05, "\xf0\x40\x82\xa0");             /* a user-defined character, "あ" */
+    ev3(&t, 0, 0x90, 69, 100);
+    ev3(&t, 480, 0x80, 69, 0);
+    eot(&t, 0);
+    mtrk(&f, &t);
+    s = open_bytes_cp(&f, 0);
+    CHECK(s);
+    lyric_string(s, got, sizeof(got));
+    CHECK(strcmp(got, "\xe3\x81\x95\xe3\x81\x8f\xe3\x82\x89| \xe5\x92\xb2\xe3\x81\x8f|/\xe3\x82\xbd\xe8\xa1\xa8|\xef\xbf\xbd\xe3\x81\x82") == 0);
+    memset(&c, 0, sizeof(c));
+    c.struct_size = sizeof(c);
+    CHECK_EQ(fa_stream_get_midi_credits(s, &c), FA_OK);
+    CHECK_EQ(c.code_page, FA_CODE_PAGE_SHIFT_JIS);
+    fa_stream_close(s);
+    /* Forced Windows-1252: the same bytes as accented Latin. */
+    s = open_bytes_cp(&f, FA_CODE_PAGE_WINDOWS_1252);
+    CHECK(s);
+    lyric_string(s, got, sizeof(got));
+    CHECK(strncmp(got, "\xe2\x80\x9a\xc2\xb3", 5) == 0);   /* 0x82 = U+201A, 0xB3 = U+00B3 */
+    CHECK_EQ(fa_stream_get_midi_credits(s, &c), FA_OK);
+    CHECK_EQ(c.code_page, FA_CODE_PAGE_WINDOWS_1252);
+    fa_stream_close(s);
+    free(f.d);
+    memset(&f, 0, sizeof(f));
+
+    /* Accented Windows-1252 ("é" + a letter is a valid Shift-JIS kanji pair). */
+    mthd(&f, 0, 1, 480);
+    meta(&t, 0, 0x05, "Caf\xe9s ");
+    meta(&t, 240, 0x05, "\xe0 ");
+    meta(&t, 240, 0x05, "No\xebl");
+    meta(&t, 240, 0x05, "\xef\xbb\xbfoui");                 /* a byte order mark */
+    eot(&t, 0);
+    mtrk(&f, &t);
+    s = open_bytes_cp(&f, 0);
+    CHECK(s);
+    lyric_string(s, got, sizeof(got));
+    CHECK(strcmp(got, "Caf\xc3\xa9s |\xc3\xa0 |No\xc3\xabl|oui") == 0);
+    CHECK_EQ(fa_stream_get_midi_credits(s, &c), FA_OK);
+    CHECK_EQ(c.code_page, FA_CODE_PAGE_WINDOWS_1252);
+    fa_stream_close(s);
+    /* Forced Shift-JIS reads it as such; an unknown code page is detection. */
+    s = open_bytes_cp(&f, FA_CODE_PAGE_SHIFT_JIS);
+    CHECK(s);
+    CHECK_EQ(fa_stream_get_midi_credits(s, &c), FA_OK);
+    CHECK_EQ(c.code_page, FA_CODE_PAGE_SHIFT_JIS);
+    fa_stream_close(s);
+    s = open_bytes_cp(&f, 12345);
+    CHECK(s);
+    CHECK_EQ(fa_stream_get_midi_credits(s, &c), FA_OK);
+    CHECK_EQ(c.code_page, FA_CODE_PAGE_WINDOWS_1252);
+    fa_stream_close(s);
+    free(f.d);
+    memset(&f, 0, sizeof(f));
+
+    /* All UTF-8. */
+    mthd(&f, 0, 1, 480);
+    meta(&t, 0, 0x05, "Gr\xc3\xbc\xc3\x9f");
+    eot(&t, 0);
+    mtrk(&f, &t);
+    s = open_bytes_cp(&f, 0);
+    CHECK(s);
+    lyric_string(s, got, sizeof(got));
+    CHECK(strcmp(got, "Gr\xc3\xbc\xc3\x9f") == 0);
+    CHECK_EQ(fa_stream_get_midi_credits(s, &c), FA_OK);
+    CHECK_EQ(c.code_page, FA_CODE_PAGE_UTF8);
+    fa_stream_close(s);
+    free(f.d); free(t.d);
+}
+
+/* Karaoke files: "/" and "\" anywhere in a syllable, a Solton "<" line start,
+ * chord lines kept out of the lyrics. */
+static void test_lyric_marks(void)
+{
+    buf f = { 0 }, t = { 0 };
+    fa_stream* s;
+    fa_midi_info info;
+    fa_midi_text x;
+    char got[512];
+    uint32_t i, chords = 0;
+    mthd(&f, 1, 2, 480);
+    meta(&t, 0, 0x01, "@KMIDI KARAOKE FILE");
+    eot(&t, 0);
+    mtrk(&f, &t);
+    meta(&t, 0, 0x03, "Words");
+    meta(&t, 0, 0x01, "Hel");
+    meta(&t, 120, 0x01, "lo/");           /* the mark at the end: the next syllable starts a line */
+    meta(&t, 120, 0x01, "world/next ");   /* in the middle: two syllables at one time */
+    meta(&t, 120, 0x01, "%Am");           /* Tune1000 chord */
+    meta(&t, 120, 0x01, "<C G Am>");      /* Solton chord line */
+    meta(&t, 120, 0x01, "<New line");     /* Solton line start */
+    meta(&t, 120, 0x01, "\\end\r");
+    meta(&t, 120, 0x01, "last");
+    eot(&t, 0);
+    mtrk(&f, &t);
+    s = open_bytes(&f, FA_OPEN_DECODE_ONLY, NULL, NULL);
+    CHECK(s);
+    lyric_string(s, got, sizeof(got));
+    CHECK(strcmp(got, "Hel|lo|/world|/next |\\New line|\\end|/last") == 0);
+    CHECK_EQ(fa_stream_get_midi_info(s, &info), FA_OK);
+    CHECK_EQ(info.lyric_count, 7);
+    for (i = 0; i < info.text_count; i++) {
+        CHECK_EQ(fa_stream_get_midi_text(s, i, &x), FA_OK);
+        if (strcmp(x.text, "world") == 0) CHECK_EQ(x.frame, RATE / 4);
+        if (strcmp(x.text, "next ") == 0) CHECK_EQ(x.frame, RATE / 4);
+        if (x.text[0] == '%' || x.text[0] == '<') { CHECK_EQ(x.type, FA_MIDI_TEXT); chords++; }
+    }
+    CHECK_EQ(chords, 2);
+    fa_stream_close(s);
+    free(f.d);
+    memset(&f, 0, sizeof(f));
+
+    /* Outside karaoke files a "/" inside a lyric is text ("AC/DC"). */
+    mthd(&f, 0, 1, 480);
+    meta(&t, 0, 0x05, "/AC/DC");
+    eot(&t, 0);
+    mtrk(&f, &t);
+    s = open_bytes(&f, FA_OPEN_DECODE_ONLY, NULL, NULL);
+    CHECK(s);
+    lyric_string(s, got, sizeof(got));
+    CHECK(strcmp(got, "/AC/DC") == 0);
+    fa_stream_close(s);
+    free(f.d); free(t.d);
+}
+
+/* Words in text events without karaoke headers or a "Words" track: the track with
+ * plenty of syllable-like text events, even when a few stray lyric events exist;
+ * too few is not lyrics. */
+static void test_text_fallback(void)
+{
+    buf f = { 0 }, t = { 0 };
+    fa_stream* s;
+    fa_midi_info info;
+    fa_midi_text x;
+    int pass, k;
+    for (pass = 0; pass < 2; pass++) {
+        int syllables = pass == 0 ? 20 : 10;
+        mthd(&f, 1, 2, 480);
+        meta(&t, 0, 0x01, "Sequenced by somebody with a long credit line here");
+        meta(&t, 0, 0x05, "stray");
+        eot(&t, 0);
+        mtrk(&f, &t);
+        for (k = 0; k < syllables; k++) meta(&t, k ? 120 : 0, 0x01, k % 2 ? "la " : "la");
+        eot(&t, 0);
+        mtrk(&f, &t);
+        s = open_bytes(&f, FA_OPEN_DECODE_ONLY, NULL, NULL);
+        CHECK(s);
+        CHECK_EQ(fa_stream_get_midi_info(s, &info), FA_OK);
+        if (pass == 0) {
+            CHECK_EQ(info.lyric_count, 20);
+            CHECK_EQ(info.karaoke, 1);
+            CHECK_EQ(fa_stream_get_midi_text(s, 1, &x), FA_OK);   /* the stray lyric event */
+            CHECK(strcmp(x.text, "stray") == 0);
+            CHECK_EQ(x.type, FA_MIDI_TEXT);
+        } else {
+            CHECK_EQ(info.lyric_count, 1);                       /* only the lyric event */
+            CHECK_EQ(info.karaoke, 0);
+        }
+        fa_stream_close(s);
+        free(f.d);
+        memset(&f, 0, sizeof(f));
+    }
+    free(t.d);
+}
+
+/* "@T" and "@I" lines and the file's own events as song credits. */
+static void test_credits(void)
+{
+    buf f = { 0 }, t = { 0 };
+    fa_stream* s;
+    fa_midi_credits c;
+    mthd(&f, 1, 2, 480);
+    tempo(&t, 0, 500000);
+    varlen(&t, 0); put8(&t, 0xFF); put8(&t, 0x58); put8(&t, 4); put8(&t, 3); put8(&t, 2); put8(&t, 24); put8(&t, 8);
+    varlen(&t, 0); put8(&t, 0xFF); put8(&t, 0x59); put8(&t, 2); put8(&t, 1); put8(&t, 1);   /* E minor */
+    meta(&t, 0, 0x01, "@KMIDI KARAOKE FILE");
+    eot(&t, 0);
+    mtrk(&f, &t);
+    meta(&t, 0, 0x03, "Words");
+    meta(&t, 0, 0x01, "@TThe Title");
+    meta(&t, 0, 0x01, "@TThe Artist");
+    meta(&t, 0, 0x01, "@T(c) 1999 Somebody Music");
+    meta(&t, 0, 0x01, "@IWritten by: Ann Writer");
+    meta(&t, 0, 0x01, "@ILyrics by - Bo Lyric");
+    meta(&t, 0, 0x01, "@I1987");
+    meta(&t, 0, 0x01, "@IKey: G");               /* the key signature event wins */
+    meta(&t, 0, 0x01, "@IKeyboards: Cy");        /* not a key */
+    meta(&t, 0, 0x01, "@IArranged for karaoke");
+    meta(&t, 0, 0x01, "@Iarranged FOR KARAOKE");  /* a repeat */
+    meta(&t, 0, 0x01, "@IWritten");               /* a label with nothing after it */
+    meta(&t, 0, 0x01, "la");
+    eot(&t, 0);
+    mtrk(&f, &t);
+    s = open_bytes(&f, FA_OPEN_DECODE_ONLY, NULL, NULL);
+    CHECK(s);
+    memset(&c, 0, sizeof(c));
+    c.struct_size = sizeof(c);
+    CHECK_EQ(fa_stream_get_midi_credits(s, &c), FA_OK);
+    CHECK(strcmp(c.title, "The Title") == 0);
+    CHECK(strcmp(c.artist, "The Artist") == 0);
+    CHECK(strcmp(c.copyright, "(c) 1999 Somebody Music") == 0);
+    CHECK(strcmp(c.writer, "Ann Writer") == 0);
+    CHECK(strcmp(c.lyricist, "Bo Lyric") == 0);
+    CHECK(strcmp(c.year, "1987") == 0);
+    CHECK(strcmp(c.key, "E minor") == 0);
+    CHECK(strcmp(c.tempo, "120 bpm") == 0);
+    CHECK(strcmp(c.time_signature, "3/4") == 0);
+    CHECK(strcmp(c.other, "Keyboards: Cy\nArranged for karaoke\nWritten") == 0);
+    /* An older, shorter struct is filled up to its size. */
+    memset(&c, 0x55, sizeof(c));
+    c.struct_size = (uint32_t)offsetof(fa_midi_credits, artist);
+    CHECK_EQ(fa_stream_get_midi_credits(s, &c), FA_OK);
+    CHECK(strcmp(c.title, "The Title") == 0);
+    CHECK_EQ((uint8_t)c.artist[0], 0x55);
+    c.struct_size = 0;
+    CHECK_EQ(fa_stream_get_midi_credits(s, &c), FA_ERROR_INVALID_ARG);
+    fa_stream_close(s);
+    free(f.d);
+    memset(&f, 0, sizeof(f));
+
+    /* One credit for both, and "Lyrics and ..." is not a lyricist label. */
+    mthd(&f, 0, 1, 480);
+    meta(&t, 0, 0x01, "@IWords and Music by Joe Both");
+    meta(&t, 0, 0x01, "@ILyrics and arrangement: Kim");
+    eot(&t, 0);
+    mtrk(&f, &t);
+    s = open_bytes(&f, FA_OPEN_DECODE_ONLY, NULL, NULL);
+    CHECK(s);
+    memset(&c, 0, sizeof(c));
+    c.struct_size = sizeof(c);
+    CHECK_EQ(fa_stream_get_midi_credits(s, &c), FA_OK);
+    CHECK(strcmp(c.writer, "Joe Both") == 0);
+    CHECK(strcmp(c.lyricist, "Joe Both") == 0);
+    CHECK(strcmp(c.other, "Lyrics and arrangement: Kim") == 0);
+    fa_stream_close(s);
+    free(f.d); free(t.d);
+}
+
 /* Reads up to `frames` stereo frames in reads of `chunk`; returns how many. */
 static fa_frames read_all(fa_stream* s, float* out, fa_frames frames, fa_frames chunk)
 {
@@ -1596,6 +1873,10 @@ int main(void)
     RUN(test_render_and_seek_exact);
     RUN(test_texts);
     RUN(test_karaoke);
+    RUN(test_text_encoding);
+    RUN(test_lyric_marks);
+    RUN(test_text_fallback);
+    RUN(test_credits);
     RUN(test_transpose_and_drums);
     RUN(test_channel_mute);
     RUN(test_sysex);

@@ -532,6 +532,7 @@ internal unsafe ref struct NativeOptions
         o._ptr->Flags = flags;
         o._ptr->AudioTrack = options.AudioTrack;
         o._ptr->DynamicRange = (int)options.DynamicRange;
+        o._ptr->TextCodePage = (int)options.TextCodePage;
         if (options.SoundFont is { } font)
         {
             // Held until the open call returns; the native stream takes its own reference.

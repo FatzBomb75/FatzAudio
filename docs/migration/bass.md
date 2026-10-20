@@ -498,6 +498,8 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | BASS_MIDI_StreamSetFonts(stream, ...) | `fa_open_options.soundfont` when opening | `StreamOptions.SoundFont` | ✅ (one font per stream; no stacks or per-preset mapping) |
 | BASS_MIDI_FontSetVolume | Stream volume (`FA_PARAM_VOLUME`) | `Volume` | ✅ |
 | BASS_MIDI_StreamGetMark (LYRIC, TEXT, MARKER, CUE, COPY, TRACK, INST) | `fa_stream_get_midi_text` (cleaned-up lyrics with line and paragraph flags, UTF-8) and `fa_stream_get_midi_info` | `stream.MidiTexts`, `stream.MidiInfo` | ✅ |
+| BASS_CONFIG_MIDI_KARAOKE / text code page (BASSMIDI returns the raw bytes; the app guesses the code page) | Text comes out as UTF-8, code page detected per file (UTF-8, Shift-JIS, Windows-1252); `fa_open_options.text_code_page` forces one ([MIDI](../features/midi.md#text-encoding)) | `StreamOptions.TextCodePage` | ✅ |
+| Parsing `@T`/`@I` lines and credit text events yourself | `fa_stream_get_midi_credits`: title, artist, writer, lyricist, year, copyright, key, tempo, time signature, other ([MIDI](../features/midi.md#song-credits)) | `stream.MidiCredits` | ✅ |
 | BASS_MIDI_StreamGetMark BASS_MIDI_MARK_KEYSIG / TIMESIG / TEMPO | `fa_stream_get_midi_marks`: type `FA_MIDI_MARK_KEY_SIGNATURE` / `TIME_SIGNATURE` / `TEMPO`, numbers in `value`/`value2`, text like `"3/4"` ([MIDI](../features/midi.md#tempo-time-and-key-signatures)) | `stream.MidiMarks` | ✅ |
 | BASS_SYNC_MIDI_KEYSIG / TIMESIG / TEMPO | Not raised as events: follow the clock through `fa_stream_get_midi_marks` | — | ➖ |
 | BASS_MIDI_MARK_TICK (positions in ticks) | Not provided: positions are frames and nanoseconds | — | ➖ |

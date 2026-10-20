@@ -821,6 +821,27 @@ public unsafe class AudioStream : IDisposable
     }
 
     /// <summary>
+    /// Song credits of a MIDI stream (title, writer, lyricist, year, key, tempo and more, from the .kar header lines and
+    /// the file's own events); null for streams that are not MIDI.
+    /// </summary>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public unsafe MidiCredits? MidiCredits
+    {
+        get
+        {
+            FaMidiCredits n = default;
+            n.StructSize = (uint)sizeof(FaMidiCredits);
+            int rc = NativeMethods.fa_stream_get_midi_credits(Handle, &n);
+            if (rc == (int)ErrorCode.InvalidArgument) return null;
+            FatzAudioException.ThrowIfFailed(rc);
+            string other = Str(n.Other);
+            return new MidiCredits((TextCodePage)n.CodePage, Str(n.Title), Str(n.Artist), Str(n.Writer), Str(n.Lyricist),
+                Str(n.Year), Str(n.Copyright), Str(n.Key), Str(n.Tempo), Str(n.TimeSignature),
+                other.Length == 0 ? [] : other.Split('\n'));
+        }
+    }
+
+    /// <summary>
     /// The lyrics and other text events of a MIDI stream in time order (empty for other streams). While the stream
     /// plays, <see cref="MidiTextReached"/> is raised as each one is heard; a karaoke screen can also follow
     /// <see cref="Clock"/> through this list.

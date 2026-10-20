@@ -31,6 +31,7 @@
 #include "fa_internal.h"
 #include "tsf.h"
 #include "tml.h"
+#include "sjis_table.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -335,33 +336,87 @@ static int valid_utf8(const uint8_t* s, size_t n)
     return 1;
 }
 
-/* Text as UTF-8 into a malloc'ed string: kept if it is valid UTF-8, else read as
- * Windows-1252. Control characters other than CR, LF and tab are dropped. */
-static char* text_utf8(const char* in, size_t n)
+/* How a file's text is read (detected once per file, or forced by the app). AUTO
+ * keeps each event that is valid UTF-8 and reads the others as Windows-1252, as
+ * files of mixed origin need. */
+enum { CONV_AUTO, CONV_1252, CONV_SJIS };
+
+/* Shift-JIS (code page 932) double-byte character, 0 if unassigned. */
+static uint32_t sjis_char(uint32_t lead, uint32_t trail)
+{
+    uint8_t row = sjis_row[lead & 0xFF];
+    if (row == 0xFF) return 0;
+    if (trail >= 0x40 && trail <= 0x7E) return sjis_map[row][trail - 0x40];
+    if (trail >= 0x80 && trail <= 0xFC) return sjis_map[row][trail - 0x80 + 63];
+    return 0;
+}
+
+static size_t put_utf8(char* out, uint32_t c)
+{
+    if (c < 0x80) { out[0] = (char)c; return 1; }
+    if (c < 0x800) { out[0] = (char)(0xC0 | (c >> 6)); out[1] = (char)(0x80 | (c & 0x3F)); return 2; }
+    out[0] = (char)(0xE0 | (c >> 12)); out[1] = (char)(0x80 | ((c >> 6) & 0x3F)); out[2] = (char)(0x80 | (c & 0x3F));
+    return 3;
+}
+
+/* A lead and trail byte at s[i] that make one Shift-JIS character, mapped or not
+ * (an unmapped one, such as a user-defined character, is still two bytes). */
+static int sjis_pair(const uint8_t* s, size_t n, size_t i)
+{
+    uint32_t c = s[i], t = i + 1 < n ? s[i + 1] : 0;
+    return ((c >= 0x81 && c <= 0x9F) || (c >= 0xE0 && c <= 0xFC)) &&
+           ((t >= 0x40 && t <= 0x7E) || (t >= 0x80 && t <= 0xFC));
+}
+
+/* Text as UTF-8 into a malloc'ed string, read as `conv`. A UTF-8 byte order mark
+ * is dropped, and so are control characters other than CR, LF and tab. */
+static char* text_utf8_as(const char* in, size_t n, int conv)
 {
     const uint8_t* s = (const uint8_t*)in;
-    int utf8 = valid_utf8(s, n);
-    char* out = (char*)malloc(n * 3 + 1);
+    int utf8;
+    char* out;
     size_t i, k = 0;
+    if (n >= 3 && s[0] == 0xEF && s[1] == 0xBB && s[2] == 0xBF) { s += 3; n -= 3; }
+    utf8 = conv == CONV_AUTO && valid_utf8(s, n);
+    out = (char*)malloc(n * 3 + 1);
     if (!out) return NULL;
     for (i = 0; i < n; i++) {
         uint32_t c = s[i];
         if (c == 0) break;
         if (c < 0x20 && c != '\r' && c != '\n' && c != '\t') continue;
         if (c < 0x80 || utf8) { out[k++] = (char)c; continue; }
-        if (c < 0xA0) c = cp1252[c - 0x80];
-        if (c < 0x800) { out[k++] = (char)(0xC0 | (c >> 6)); out[k++] = (char)(0x80 | (c & 0x3F)); }
-        else { out[k++] = (char)(0xE0 | (c >> 12)); out[k++] = (char)(0x80 | ((c >> 6) & 0x3F)); out[k++] = (char)(0x80 | (c & 0x3F)); }
+        if (conv == CONV_SJIS) {
+            if (c >= 0xA1 && c <= 0xDF) c = 0xFF61 + (c - 0xA1);       /* half-width katakana */
+            else if (sjis_pair(s, n, i)) { c = sjis_char(c, s[i + 1]); if (!c) c = 0xFFFD; i++; }
+            else c = 0xFFFD;
+        } else if (c < 0xA0) {
+            c = cp1252[c - 0x80];
+        }
+        k += put_utf8(out + k, c);
     }
     out[k] = '\0';
     return out;
 }
 
-static void latin1_to_utf8(const char* in, char* out, size_t cap)
+static char* text_utf8(const char* in, size_t n) { return text_utf8_as(in, n, CONV_AUTO); }
+
+/* Counts, for one text event read as Shift-JIS: double-byte characters, those in the
+ * rows of kana and Japanese punctuation (81-83, most of any Japanese lyric), and
+ * bytes that cannot be Shift-JIS. */
+static void sjis_score(const uint8_t* s, size_t n, uint32_t* pairs, uint32_t* kana, uint32_t* bad)
 {
-    char* u = text_utf8(in, strlen(in));
-    snprintf(out, cap, "%s", u ? u : "");
-    free(u);
+    size_t i;
+    for (i = 0; i < n; i++) {
+        uint32_t c = s[i];
+        if (c < 0x80 || (c >= 0xA1 && c <= 0xDF)) continue;
+        if (sjis_pair(s, n, i)) {
+            (*pairs)++;
+            if (c >= 0x81 && c <= 0x83 && sjis_char(c, s[i + 1])) (*kana)++;
+            i++;
+        } else {
+            (*bad)++;
+        }
+    }
 }
 
 /* Copies UTF-8 `in` into `out` (cap bytes), cutting at a character boundary. */
@@ -374,6 +429,13 @@ static void copy_utf8(char* out, size_t cap, const char* in)
     }
     memcpy(out, in, n);
     out[n] = '\0';
+}
+
+static void latin1_to_utf8(const char* in, char* out, size_t cap)
+{
+    char* u = text_utf8(in, strlen(in));
+    copy_utf8(out, cap, u ? u : "");
+    free(u);
 }
 
 typedef struct midi_text {
@@ -419,6 +481,8 @@ struct fa_midi {
     fa_midi_mark* marks;        /* tempo and signatures */
     uint32_t nmarks, marks_cap;
     fa_midi_info info;
+    fa_midi_credits credits;    /* struct_size unset: the API sets the caller's */
+    int32_t text_code_page;     /* forced by the app (FA_CODE_PAGE_*), 0 = detect */
 
     /* Rendering: blk holds frames [rpos - blk_len, rpos); blk_off of them were read. */
     float blk[FA_MIDI_BLOCK * 2];
@@ -948,9 +1012,6 @@ static fa_result add_text(struct fa_midi* m, uint32_t* cap, fa_frames frame, int
     return FA_OK;
 }
 
-/* Cleans one syllable: "/" or "\" in front (karaoke files) and CR/LF in front
- * break before it; CR/LF at its end break before the next one (*pending). The
- * marks are removed from `t` in place. */
 /* CR (with or without LF) ends a line, LF alone a paragraph (RP-026). */
 static uint32_t break_flags(int cr, int lf)
 {
@@ -958,25 +1019,157 @@ static uint32_t break_flags(int cr, int lf)
     return cr || lf ? FA_MIDI_NEW_LINE : 0;
 }
 
-static uint32_t lyric_flags(char* t, uint32_t* pending)
+/* Chord lines and comments of karaoke files, not words to sing: Tune1000 "%..."
+ * and Solton "<...>". */
+static int is_chord_line(const char* t)
 {
-    uint32_t flags = *pending;
-    size_t n, i = 0;
-    int cr = 0, lf = 0;
-    *pending = 0;
-    for (; t[i] == '\r' || t[i] == '\n'; i++) { if (t[i] == '\r') cr = 1; else lf = 1; }
-    flags |= break_flags(cr, lf);
-    if (t[i] == '/') { flags |= FA_MIDI_NEW_LINE; i++; }
-    else if (t[i] == '\\') { flags |= FA_MIDI_NEW_PARAGRAPH | FA_MIDI_NEW_LINE; i++; }
-    memmove(t, t + i, strlen(t + i) + 1);
+    size_t n;
+    while (*t == '\r' || *t == '\n' || *t == '/' || *t == '\\') t++;
+    if (*t == '%') return 1;
+    if (*t != '<') return 0;
     n = strlen(t);
-    cr = lf = 0;
-    while (n > 0 && (t[n - 1] == '\r' || t[n - 1] == '\n')) {
-        if (t[n - 1] == '\r') cr = 1; else lf = 1;
-        t[--n] = '\0';
+    while (n > 0 && (t[n - 1] == '\r' || t[n - 1] == '\n' || t[n - 1] == ' ')) n--;
+    return n > 1 && t[n - 1] == '>';
+}
+
+/* Adds one lyric event as syllables. Line and paragraph marks are taken out and
+ * given as flags to the syllable after them: CR and LF anywhere, "/" and "\" at the
+ * start and, in karaoke files (`kar`), anywhere, where they split the event into
+ * syllables of the same time ("word/next"), as do a Solton "<" at the start. Marks
+ * with nothing after them go to the next event (*pending). Takes `text`. */
+static fa_result add_lyric(struct fa_midi* m, uint32_t* cap, fa_frames frame, int track, char* text,
+                           uint32_t* pending, int kar)
+{
+    size_t n = strlen(text), j = 0, from = 0;
+    uint32_t flags = *pending;
+    fa_result r = FA_OK;
+    *pending = 0;
+    while (r == FA_OK) {
+        int lead = j == 0, cr = 0, lf = 0;
+        uint32_t marks = 0;
+        size_t k = j;
+        /* A run of marks at k. */
+        for (; k < n; k++) {
+            char c = text[k];
+            if (c == '\r') cr = 1;
+            else if (c == '\n') lf = 1;
+            else if (c == '/' && (lead || kar)) marks |= FA_MIDI_NEW_LINE;
+            else if (c == '\\' && (lead || kar)) marks |= FA_MIDI_NEW_PARAGRAPH | FA_MIDI_NEW_LINE;
+            else if (c == '<' && lead && kar) marks |= FA_MIDI_NEW_PARAGRAPH | FA_MIDI_NEW_LINE;   /* clear screen */
+            else break;
+        }
+        if (k == j && j < n) { j++; continue; }   /* an ordinary character */
+        if (j > from) {
+            /* The syllable before the marks. */
+            char* piece = (char*)malloc(j - from + 1);
+            if (!piece) { r = FA_ERROR_OUT_OF_MEMORY; break; }
+            memcpy(piece, text + from, j - from);
+            piece[j - from] = '\0';
+            r = add_text(m, cap, frame, FA_MIDI_LYRIC, flags, track, piece);
+            if (r != FA_OK) break;
+            m->nlyrics++;
+            flags = 0;
+        }
+        flags |= break_flags(cr, lf) | marks;
+        if (k >= n) { *pending = flags; break; }
+        j = from = k;
+        j++;   /* the first character of the next syllable */
     }
-    *pending = break_flags(cr, lf);
-    return flags;
+    free(text);
+    return r;
+}
+
+/* ---- song credits ("@I" lines) ---- */
+
+static int has_prefix_ci(const char* s, const char* prefix)
+{
+    for (; *prefix; s++, prefix++)
+        if (!*s || (*s | 0x20) != (*prefix | 0x20)) return 0;
+    return 1;
+}
+
+static int contains_ci(const char* s, const char* word)
+{
+    for (; *s; s++) if (has_prefix_ci(s, word)) return 1;
+    return 0;
+}
+
+static int looks_like_copyright(const char* s)
+{
+    return contains_ci(s, "copyright") || contains_ci(s, "(c)") || strstr(s, "\xc2\xa9") != NULL;
+}
+
+/* Adds a line to credits.other unless it is there already (any case). */
+static void add_other(fa_midi_credits* c, const char* line)
+{
+    size_t len = strlen(c->other), n = strlen(line);
+    const char* p = c->other;
+    if (!n) return;
+    while (*p) {
+        const char* e = strchr(p, '\n');
+        size_t l = e ? (size_t)(e - p) : strlen(p);
+        if (l == n && has_prefix_ci(p, line)) return;
+        p += l + (e ? 1 : 0);
+    }
+    if (len + n + 2 > sizeof(c->other)) return;
+    if (len) c->other[len++] = '\n';
+    memcpy(c->other + len, line, n + 1);
+}
+
+/* An "@I" line: "Label: value" into its field, else a year or a copyright by its
+ * look, else credits.other. The longer label of two with the same start comes first. */
+static void add_info_line(fa_midi_credits* c, const char* line)
+{
+    static const struct { const char* label; size_t off, cap; } labels[] = {
+#define F(field) offsetof(fa_midi_credits, field), sizeof(((fa_midi_credits*)0)->field)
+        { "copyright information", F(copyright) }, { "copyright", F(copyright) },
+        { "performed by", F(artist) }, { "performer", F(artist) }, { "artist", F(artist) },
+        { "written by", F(writer) }, { "writer", F(writer) }, { "composer", F(writer) }, { "music by", F(writer) },
+        { "lyrics by", F(lyricist) }, { "lyricist", F(lyricist) }, { "lyrics", F(lyricist) },
+        { "title", F(title) }, { "song", F(title) },
+        { "year", F(year) }, { "date", F(year) },
+        { "key", F(key) },
+        { "tempo", F(tempo) }, { "bpm", F(tempo) },
+        { "time signature", F(time_signature) }, { "timing", F(time_signature) }, { "meter", F(time_signature) },
+#undef F
+    };
+    size_t i, n;
+    while (*line == ' ') line++;
+    /* "Words and music by", "Lyrics & music by", "Music and lyrics by": both. */
+    if ((has_prefix_ci(line, "words") || has_prefix_ci(line, "lyrics") || has_prefix_ci(line, "music")) &&
+        (contains_ci(line, " and ") || contains_ci(line, " & "))) {
+        const char* v = line;
+        for (; *v; v++)
+            if (has_prefix_ci(v, " by ") || has_prefix_ci(v, ":")) break;
+        if (*v && (contains_ci(line, "music") && (contains_ci(line, "lyrics") || contains_ci(line, "words")))) {
+            v += *v == ':' ? 1 : 4;
+            while (*v == ' ') v++;
+            if (*v && !c->writer[0]) copy_utf8(c->writer, sizeof(c->writer), v);
+            if (*v && !c->lyricist[0]) copy_utf8(c->lyricist, sizeof(c->lyricist), v);
+            return;
+        }
+    }
+    for (i = 0; i < sizeof(labels) / sizeof(labels[0]); i++) {
+        size_t l = strlen(labels[i].label);
+        const char* v;
+        char* field;
+        if (!has_prefix_ci(line, labels[i].label)) continue;
+        v = line + l;
+        if (*v && *v != ' ' && *v != ':' && *v != '-' && *v != '=') continue;   /* "keyboards" is not "key" */
+        if (has_prefix_ci(v, " and ") || has_prefix_ci(v, " & ")) continue;     /* "Lyrics and arrangement..." */
+        while (*v == ' ' || *v == ':' || *v == '-' || *v == '=') v++;
+        field = (char*)c + labels[i].off;
+        if (*v && !field[0]) copy_utf8(field, labels[i].cap, v);
+        return;
+    }
+    n = strlen(line);
+    if (looks_like_copyright(line)) { if (!c->copyright[0]) copy_utf8(c->copyright, sizeof(c->copyright), line); return; }
+    if (n == 4 && line[0] >= '1' && line[0] <= '2' && atoi(line) >= 1800 && atoi(line) <= 2200 &&
+        line[1] >= '0' && line[1] <= '9' && line[2] >= '0' && line[2] <= '9' && line[3] >= '0' && line[3] <= '9') {
+        if (!c->year[0]) copy_utf8(c->year, sizeof(c->year), line);
+        return;
+    }
+    add_other(c, line);
 }
 
 /* Builds the event list, the texts and the info from the parsed file. */
@@ -985,42 +1178,84 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
     tml_message* msg;
     size_t nev = 0, k = 0;
     uint32_t cap = 0, i, pending = 0, nsysex = 0;
-    int have_lyrics = 0, words_track = -1, karaoke = 0, ntitle = 0, words_are_text;
+    int words_track = -1, karaoke = 0, ntitle = 0, words_are_text, conv = CONV_AUTO, any_high = 0, all_utf8 = 1;
+    uint32_t nlyric_events = 0, best_syl = 0, best_syl_track = 0, sj_pairs = 0, sj_kana = 0, sj_bad = 0;
     uint32_t* text_per_track;
+    uint32_t* syl_per_track;
     fa_frames last = 0;
     fa_result r = FA_OK;
     double rate = (double)m->rate;
 
     m->info.format = smf[9];
     m->info.tracks = ((uint32_t)smf[10] << 8) | smf[11];
-    text_per_track = (uint32_t*)calloc(m->info.tracks ? m->info.tracks : 1, sizeof(uint32_t));
+    text_per_track = (uint32_t*)calloc(m->info.tracks ? m->info.tracks : 1, 2 * sizeof(uint32_t));
     if (!text_per_track) return FA_ERROR_OUT_OF_MEMORY;
+    syl_per_track = text_per_track + (m->info.tracks ? m->info.tracks : 1);
 
-    /* Which text events are the lyrics: lyric events if the file has any; else, in
-     * a .kar file, the text events of its "Words" track, or of the track with the
-     * most text events. */
+    /* Which text events are the lyrics: lyric events if the file has enough of them;
+     * else, in a .kar file, the text events of its "Words" track, or of the track
+     * with the most text events; else the track with the most syllable-like text
+     * events (short, not "@" headers or chord lines), if it has plenty of them. */
     for (msg = first; msg; msg = msg->next) {
         if (msg->seconds > FA_MIDI_MAX_SECONDS) break;
         if (msg->type == TML_NOTE_ON || msg->type == TML_NOTE_OFF || msg->type == TML_CONTROL_CHANGE ||
             msg->type == TML_PROGRAM_CHANGE || msg->type == TML_PITCH_BEND)
             nev++;
         if (msg->type == TML_SYSEX && msg->text && nsysex < 65535) { nev++; nsysex++; }
-        if (msg->type == TML_LYRIC) have_lyrics = 1;
+        if (msg->type == TML_LYRIC && msg->text_length > 0 && msg->text[0] != '%') nlyric_events++;
         if (msg->type == TML_TRACK_NAME && words_track < 0 && strcmp(msg->text, "Words") == 0) words_track = msg->track;
         if (msg->type == TML_TEXT) {
             if (starts_with(msg->text, "@K") || starts_with(msg->text, "@T")) karaoke = 1;
-            if (msg->text[0] != '@' && msg->track < m->info.tracks) text_per_track[msg->track]++;
+            if (msg->text[0] != '@' && msg->track < m->info.tracks) {
+                text_per_track[msg->track]++;
+                if (msg->text[0] != '%' && msg->text_length <= 32) syl_per_track[msg->track]++;
+            }
+        }
+        if (msg->text && (msg->type == TML_TEXT || msg->type == TML_LYRIC || msg->type == TML_COPYRIGHT ||
+                          msg->type == TML_TRACK_NAME || msg->type == TML_INST_NAME || msg->type == TML_MARKER ||
+                          msg->type == TML_CUE_POINT)) {
+            const uint8_t* t = (const uint8_t*)msg->text;
+            size_t n = (size_t)msg->text_length, i;
+            if (n >= 3 && t[0] == 0xEF && t[1] == 0xBB && t[2] == 0xBF) { t += 3; n -= 3; }
+            for (i = 0; i < n && t[i] < 0x80; i++) {}
+            if (i < n) {
+                any_high = 1;
+                if (!valid_utf8(t, n)) all_utf8 = 0;
+                sjis_score(t, n, &sj_pairs, &sj_kana, &sj_bad);
+            }
         }
     }
+    for (i = 0; i < m->info.tracks; i++)
+        if (syl_per_track[i] > best_syl) { best_syl = syl_per_track[i]; best_syl_track = i; }
     m->info.karaoke = karaoke || words_track >= 0;
-    words_are_text = m->info.karaoke && !have_lyrics;
-    if (words_are_text) {
+    if (nlyric_events == 0 && m->info.karaoke) {
+        words_are_text = 1;
         if (words_track < 0) {
             uint32_t best = 0, t;
             for (t = 0; t < m->info.tracks; t++) if (text_per_track[t] > best) { best = text_per_track[t]; words_track = (int)t; }
         }
+    } else {
+        /* A few stray lyric events don't make a file's lyrics. */
+        words_are_text = best_syl >= 16 && nlyric_events < 8 && best_syl >= 4 * nlyric_events &&
+                         best_syl * 10 >= text_per_track[best_syl_track] * 6;
+        if (words_are_text) { words_track = (int)best_syl_track; m->info.karaoke = 1; }
     }
     free(text_per_track);
+
+    /* The text encoding, for the whole file: what the app says, else UTF-8 if all of
+     * it is, else Shift-JIS when every byte reads as Shift-JIS and enough of it is
+     * kana (Windows-1252 accents often pair up as Shift-JIS kanji, never as kana),
+     * else Windows-1252. */
+    switch (m->text_code_page) {
+    case FA_CODE_PAGE_UTF8: m->credits.code_page = FA_CODE_PAGE_UTF8; break;
+    case FA_CODE_PAGE_WINDOWS_1252: conv = CONV_1252; m->credits.code_page = FA_CODE_PAGE_WINDOWS_1252; break;
+    case FA_CODE_PAGE_SHIFT_JIS: conv = CONV_SJIS; m->credits.code_page = FA_CODE_PAGE_SHIFT_JIS; break;
+    default:
+        if (!any_high || all_utf8) m->credits.code_page = FA_CODE_PAGE_UTF8;
+        else if (sj_bad == 0 && sj_pairs >= 2 && sj_kana * 4 >= sj_pairs) { conv = CONV_SJIS; m->credits.code_page = FA_CODE_PAGE_SHIFT_JIS; }
+        else m->credits.code_page = FA_CODE_PAGE_WINDOWS_1252;
+        break;
+    }
 
     m->ev = (midi_event*)malloc((nev ? nev : 1) * sizeof(midi_event));
     if (!m->ev) return FA_ERROR_OUT_OF_MEMORY;
@@ -1053,10 +1288,10 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
         case TML_LYRIC: case TML_MARKER: case TML_CUE_POINT: {
             int type;
             uint32_t flags = 0;
-            char* text = text_utf8(msg->text, msg->text_length);
+            char* text = text_utf8_as(msg->text, msg->text_length, conv);
             if (!text) { r = FA_ERROR_OUT_OF_MEMORY; break; }
             switch (msg->type) {
-            case TML_LYRIC: type = FA_MIDI_LYRIC; break;
+            case TML_LYRIC: type = words_are_text ? FA_MIDI_TEXT : FA_MIDI_LYRIC; break;
             case TML_TEXT:
                 type = words_are_text && msg->track == words_track && msg->text[0] != '@' ? FA_MIDI_LYRIC : FA_MIDI_TEXT;
                 break;
@@ -1066,15 +1301,21 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
             case TML_INST_NAME: type = FA_MIDI_INSTRUMENT_NAME; break;
             default: type = FA_MIDI_COPYRIGHT; break;
             }
+            if (type == FA_MIDI_LYRIC && is_chord_line(text)) type = FA_MIDI_TEXT;
             if (type == FA_MIDI_LYRIC) {
-                flags = lyric_flags(text, &pending);
-                if (!text[0]) { pending |= flags; free(text); break; }   /* only line marks: they go to the next syllable */
-                m->nlyrics++;
+                r = add_lyric(m, &cap, frame, msg->track, text, &pending, m->info.karaoke);
+                break;
             } else if (type == FA_MIDI_TEXT && starts_with(text, "@T")) {
-                /* .kar header: the first @T is the title, the second the artist. */
+                /* .kar header: the first @T is the title, the second the artist, a
+                 * third the copyright or other information. */
                 if (ntitle == 0) copy_utf8(m->info.title, sizeof(m->info.title), text + 2);
                 else if (ntitle == 1) copy_utf8(m->info.artist, sizeof(m->info.artist), text + 2);
+                else if (ntitle == 2 && looks_like_copyright(text + 2) && !m->credits.copyright[0])
+                    copy_utf8(m->credits.copyright, sizeof(m->credits.copyright), text + 2);
+                else add_other(&m->credits, text + 2);
                 ntitle++;
+            } else if (type == FA_MIDI_TEXT && (starts_with(text, "@I") || starts_with(text, "@i"))) {
+                add_info_line(&m->credits, text + 2);
             } else if (type == FA_MIDI_COPYRIGHT && !m->info.copyright[0]) {
                 copy_utf8(m->info.copyright, sizeof(m->info.copyright), text);
             } else if (type == FA_MIDI_TRACK_NAME && msg->track == 0 && !m->info.title[0] && ntitle == 0) {
@@ -1115,6 +1356,23 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
     m->length = last + (fa_frames)(FA_MIDI_TAIL_S * rate);
     m->info.text_count = m->ntexts;
     m->info.lyric_count = m->nlyrics;
+    /* Credits: the file's own events win over "@I" lines. */
+    {
+        fa_midi_credits* c = &m->credits;
+        int have[3] = { 0, 0, 0 };
+        /* "@T" lines win over "@I", which win over a track name. */
+        if (m->info.title[0] && (ntitle >= 1 || !c->title[0])) copy_utf8(c->title, sizeof(c->title), m->info.title);
+        if (m->info.artist[0]) copy_utf8(c->artist, sizeof(c->artist), m->info.artist);
+        if (m->info.copyright[0]) copy_utf8(c->copyright, sizeof(c->copyright), m->info.copyright);
+        for (i = 0; i < m->nmarks; i++) {
+            const fa_midi_mark* k = &m->marks[i];
+            char* field = k->type == FA_MIDI_MARK_TEMPO ? c->tempo
+                        : k->type == FA_MIDI_MARK_TIME_SIGNATURE ? c->time_signature : c->key;
+            if (k->type < 0 || k->type > 2 || have[k->type]) continue;
+            have[k->type] = 1;
+            copy_utf8(field, 32, k->text);
+        }
+    }
     if (m->ntexts) {
         m->text_frames = (fa_frames*)malloc(m->ntexts * sizeof(fa_frames));
         if (!m->text_frames) return FA_ERROR_OUT_OF_MEMORY;
@@ -1145,6 +1403,7 @@ static fa_result midi_open(fa_decoder* dec)
     if (!m) { tml_free(first); free(bytes); return FA_ERROR_OUT_OF_MEMORY; }
     m->rate = dec->midi_rate ? dec->midi_rate : FA_MIDI_DEFAULT_RATE;
     m->font = fa_soundfont_retain(dec->soundfont);
+    m->text_code_page = dec->text_code_page;
     r = build(m, first, smf);
     tml_free(first);
     free(bytes);
@@ -1181,6 +1440,15 @@ FA_API fa_result FA_CALL fa_stream_get_midi_info(fa_stream* stream, fa_midi_info
     if (out_info) memset(out_info, 0, sizeof(*out_info));
     if (!stream || !out_info || !stream->midi) return FA_ERROR_INVALID_ARG;
     *out_info = stream->midi->info;
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_midi_credits(fa_stream* stream, fa_midi_credits* out_credits)
+{
+    uint32_t size;
+    if (!stream || !out_credits || !stream->midi || out_credits->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+    size = out_credits->struct_size < sizeof(fa_midi_credits) ? out_credits->struct_size : (uint32_t)sizeof(fa_midi_credits);
+    memcpy((char*)out_credits + sizeof(uint32_t), (const char*)&stream->midi->credits + sizeof(uint32_t), size - sizeof(uint32_t));
     return FA_OK;
 }
 

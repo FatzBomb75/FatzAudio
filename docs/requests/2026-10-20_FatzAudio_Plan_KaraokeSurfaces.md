@@ -1,6 +1,6 @@
 # FatzAudio: plan for the karaoke surfaces request
 
-To: FatzBomb.MediaControl and Keith. From: FatzAudio, 2026-10-20. Status: **proposal; MediaControl's answers to the open questions are in (section 11), waiting for Keith's review.**
+To: FatzBomb.MediaControl and Keith. From: FatzAudio, 2026-10-20. Status: **approved by Keith on 2026-10-20 with three changes, which are worked in below (section 12 lists them). Step 0 is under way.**
 Nothing in sections 2 to 9 is built yet. Answers to the three requests in this folder:
 [review](2026-10-20_MediaControl_Review_MidiAndCdg.md),
 [request](2026-10-20_MediaControl_Request_KaraokeSurfaces.md),
@@ -107,7 +107,9 @@ slots, not a full transparent canvas.
 /* Draws the frame for `time` into dst (premultiplied BGRA32, or the CD+G surface's own format when
  * presentation scaling is off). dst must be exactly layout.width x layout.height, else
  * FA_ERROR_SIZE_MISMATCH (new) and nothing is drawn. `dst_revision` is the frame revision dst holds
- * now (0 = unknown): only what changed since then is drawn, otherwise the whole bitmap is. */
+ * now (0 = unknown). It may be any of the last FA_SURFACE_HISTORY (8) revisions, so an app that
+ * rotates 2-3 buffers passes the revision of the one it is about to reuse: only the area that changed
+ * since then is drawn (the union of the dirty areas in between). Older or unknown: a full draw. */
 FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* s, fa_time time, void* dst, int32_t dst_stride,
                                                 uint32_t dst_width, uint32_t dst_height,
                                                 uint64_t dst_revision, fa_surface_frame* out_frame);
@@ -125,13 +127,26 @@ typedef struct fa_surface_frame {
     int64_t  draw_ns;                  /* time this call took */
     int64_t  render_ns;                /* time the frame took to render (on a worker with render-ahead) */
     int32_t  behind;                   /* render-ahead: 1 = this is an older finished frame */
-    /* CD+G only, as in fa_cdg_frame: background_index, border_index, background[4], palette_revision */
+    /* CD+G only, as in fa_cdg_frame: */
+    int32_t  background_index, border_index;
+    uint8_t  background[4];
+    uint8_t  palette[16][4];           /* R, G, B, A (straight): to colour INDEXED8 output on the GPU */
+    uint8_t  transparency[16];         /* from transparent-colour packs, 0 opaque .. 63 invisible */
+    uint64_t palette_revision;
 } fa_surface_frame;
 ```
 
-A frame drawn into your buffer is yours. Dirty-rectangle drawing needs `dst` to still hold the frame it
-had, so a fresh staging texture per frame means passing `dst_revision = 0` and a full draw. A persistent
-CPU buffer that you upload rectangles from gets the cheap path.
+A frame drawn into your buffer is yours: the surface never writes it again unless you pass it to
+`update_into` again. Dirty-rectangle drawing needs `dst` to still hold the frame of `dst_revision`. With
+2-3 rotating buffers, each one comes back holding a frame 2-3 updates old, and the surface draws the
+area that changed since that frame (it keeps the dirty areas of its last 8 revisions). A fresh staging
+texture per frame means `dst_revision = 0` and a full draw.
+
+How the surface does it (Keith's change 1 and 3): with presentation scaling on, and for lyrics, the
+surface keeps its own rendered bitmap (the "master"), renders changes into it, and `update_into` copies
+the changed area since `dst_revision` from the master into `dst`. That copy is the price of accepting
+any recent revision; for a lyric wipe or a few CD+G tiles it is a few kilobytes. With scaling off
+(classic CD+G) the picture is small enough to draw straight into `dst` as today.
 
 ### 2.4 Render-ahead (off by default)
 
@@ -180,6 +195,16 @@ FA_API fa_result FA_CALL fa_cdg_surface_set_presentation(fa_surface* s, const fa
   box of everything drawn other than the background, snapped to the 6x12 tile grid. One crop for the
   whole song. Discs cannot be pre-passed, so Auto and Super fall back to Show there, and the layout
   says so (`safety_zone_resolved = 0`).
+
+### 3.0 Scrolling (Keith's change 3)
+
+A scroll is a shift, not a repaint. Scroll preset and scroll copy move the master bitmap by one tile
+(6N or 12N output pixels) with a memory move, and only the band they expose is rendered, plus the
+effects' reach and the smoothing reach inside the old picture next to it (the outline and contour of a
+shape that now touches the band change). The smooth-scroll offsets (0-5 and 0-11 CD+G pixels) do not
+render anything: the master covers the whole 300x216 screen with its margin, and the offsets only move
+the window that is copied out of it, so an offset change is one copy of the bitmap. At 2160p that is
+about 3-5 ms for a scroll step (memory moves) instead of a 95 ms repaint with effects.
 
 ### 3.1 Smoothness 0 to 10: the methods
 
@@ -408,8 +433,9 @@ One core of a current desktop CPU (about 4 GHz), before render-ahead and before 
 repaint across workers. Every phase publishes the measured table, on Keith's PC and on CI, in
 `docs/features/cdg.md` and `docs/features/lyrics.md`; these are estimates from per-pixel costs.
 
-**CD+G** ("typical" = one update during a lyric wipe, about 4 tiles; "full" = a scroll, a seek, or a
-new layout; a screen clear to a transparent background is a fill and costs almost nothing):
+**CD+G** ("typical" = one update during a lyric wipe, about 4 tiles; "full" = a seek or a new layout; a
+screen clear to a transparent background is a fill and costs almost nothing; a scroll step is a shift
+of the master plus the exposed band, about 1 ms at 1080p and 3-5 ms at 2160p with effects, section 3.0):
 
 | | 1080p (5x) typical | 1080p full | 2160p (10x) typical | 2160p full |
 |---|---|---|---|---|
@@ -506,3 +532,14 @@ and are worked into the sections above:
 
 Still open: lyrics for other formats (LRC, subtitle files) are out of scope for now; the surface takes
 MIDI and `.kar` streams only.
+
+---
+
+## 12. Changes from Keith's review (2026-10-20)
+
+1. **Rotating buffers:** `update_into` accepts any of the last 8 revisions and draws the area changed
+   since then; anything older is a full draw (section 2.3).
+2. **Palette in the frame:** `fa_surface_frame` carries the 16-colour palette and the transparency
+   values for classic INDEXED8 output, so the app colours the indices on the GPU (section 2.3).
+3. **Scrolling as a shift:** scroll steps shift the rendered bitmap and render only the exposed band
+   plus the effects' reach; smooth-scroll offsets only move the copied window (section 3.0).

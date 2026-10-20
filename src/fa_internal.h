@@ -126,6 +126,7 @@ struct fa_decoder {
     /* MIDI, from fa_decoder_open's env (wrapping decoders such as HLS pass both on). */
     struct fa_soundfont* soundfont;   /* borrowed, NULL = none */
     uint32_t midi_rate;               /* MIDI and tracker modules: output rate */
+    int32_t text_code_page;           /* MIDI: FA_CODE_PAGE_*, 0 = detect */
     /* Properties (fa_stream_info), set by the decoder when it knows them;
      * fa_decoder_open fills the rest in for whole-file formats. */
     int64_t audio_bytes;              /* coded audio data, -1 = unknown */
@@ -141,6 +142,7 @@ typedef struct fa_decoder_env {
     struct fa_soundfont* soundfont;   /* MIDI: the instruments (the caller keeps it alive
                                          while the decoder is open), NULL = none */
     uint32_t midi_rate;               /* MIDI and tracker modules: output rate, 0 = FA_MIDI_DEFAULT_RATE */
+    int32_t text_code_page;           /* MIDI: fa_open_options.text_code_page, 0 = detect */
 } fa_decoder_env;
 
 /* Detects the format of `src` and opens the matching decoder. `name_hint` (a path
@@ -1044,6 +1046,7 @@ struct fa_stream {
     char path_name[260];         /* that entry's name, the decoder's hint; "" = none */
     int64_t zip_size;            /* bytes of the ZIP the audio came from, 0 = not a ZIP */
     int32_t audio_track;
+    int32_t text_code_page;      /* fa_open_options.text_code_page (MIDI), 0 = detect */
     fa_mutex norm_lock;          /* scan_job, loud, loud_source */
     fa_scan_job* scan_job;
     int analysis_tried;
