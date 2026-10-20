@@ -22,7 +22,6 @@
 #include <string.h>
 
 #define DLS_MAX_INSTRUMENTS 4096
-#define DLS_MAX_REGIONS 128          /* per instrument */
 #define SF2_PAD 46                    /* zero samples after each sample block */
 #define SF2_MAX_RECORDS 0xFFFF        /* SF2 indexes zones, generators and samples in 16 bits */
 #define HDR_HASH_SIZE 131072u         /* power of two, over twice SF2_MAX_RECORDS */
@@ -543,9 +542,8 @@ static void parse_instrument(conv* cv, const uint8_t* p, uint32_t n)
     {
         const uint8_t* q = lrgn;
         const uint8_t* qe = lrgn + lrgn_n;
-        uint32_t count = 0;
-        while (next_chunk(&q, qe, &c) && count < DLS_MAX_REGIONS && !cv->oom)
-            if (is_list(&c, "rgn ") || is_list(&c, "rgn2")) { parse_region(cv, c.data, c.size, &art); count++; }
+        while (next_chunk(&q, qe, &c) && !cv->oom)
+            if (is_list(&c, "rgn ") || is_list(&c, "rgn2")) parse_region(cv, c.data, c.size, &art);
     }
     pr->zones = cv->nzones - pr->first_zone;
     if (pr->zones) cv->npresets++;

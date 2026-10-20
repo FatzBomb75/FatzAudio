@@ -1691,7 +1691,9 @@ TSFDEF int tsf_note_on(tsf* f, int preset_index, int key, float vel)
 		voice->playingKey = key;
 		voice->playIndex = voicePlayIndex;
 		voice->heldSustain = 0;
-		voice->noteGainDB = f->globalGainDB - region->attenuation - tsf_gainToDecibels(1.0f / vel);
+		// FatzAudio: the SF2 default velocity-to-attenuation modulator (concave, 96 dB), which is
+		// 40*log10(vel) dB, as FluidSynth and DLS synths play it (was 20*log10, half the range)
+		voice->noteGainDB = f->globalGainDB - region->attenuation - 2.0f * tsf_gainToDecibels(1.0f / vel);
 
 		if (f->channels)
 		{

@@ -1757,6 +1757,61 @@ static void test_sf2_attenuation(void)
     free(ref);
 }
 
+/* Velocity follows the SF2 default curve (concave, 96 dB): 40*log10(v/127), so
+ * velocity 64 is 11.9 dB down, as in FluidSynth. */
+static void test_velocity_curve(void)
+{
+    float* x = (float*)malloc(sizeof(float) * 2 * 2 * RATE);
+    buf f = { 0 }, t = { 0 };
+    fa_stream* s;
+    double loud, soft;
+    mthd(&f, 0, 1, 480);
+    ev3(&t, 0, 0x90, 69, 127);
+    ev3(&t, 480, 0x80, 69, 0);
+    ev3(&t, 480, 0x90, 69, 64);
+    ev3(&t, 480, 0x80, 69, 0);
+    eot(&t, 0);
+    mtrk(&f, &t);
+    s = open_bytes(&f, FA_OPEN_DECODE_ONLY, NULL, NULL);
+    CHECK(s);
+    fa_stream_set_midi_effects(s, 0);
+    CHECK_EQ(read_all(s, x, 2 * RATE, 4096), 2 * RATE);
+    loud = rms(x, RATE / 10, RATE * 4 / 10);
+    soft = rms(x, RATE + RATE / 10, RATE + RATE * 4 / 10);
+    CHECK_NEAR(20.0 * log10(soft / loud), 40.0 * log10(64.0 / 127.0), 0.3);
+    fa_stream_close(s);
+    free(f.d); free(t.d); free(x);
+}
+
+/* A program the soundfont lacks plays program 0, not the channel's previous one. */
+static void test_missing_program(void)
+{
+    float* x = (float*)malloc(sizeof(float) * 2 * 2 * RATE);
+    buf dls = make_dls(1), f = { 0 }, t = { 0 };
+    fa_soundfont* font = NULL;
+    fa_stream* s;
+    CHECK_EQ(fa_soundfont_open_memory(dls.d, dls.n, &font), FA_OK);
+    free(dls.d);
+    mthd(&f, 0, 1, 480);
+    varlen(&t, 0); put8(&t, 0xC0); put8(&t, 1);    /* the 220.5 Hz wave at key 69 */
+    ev3(&t, 0, 0x90, 69, 127);
+    ev3(&t, 480, 0x80, 69, 0);
+    varlen(&t, 480); put8(&t, 0xC0); put8(&t, 50); /* not in the bank */
+    ev3(&t, 0, 0x90, 69, 127);
+    ev3(&t, 480, 0x80, 69, 0);
+    eot(&t, 0);
+    mtrk(&f, &t);
+    s = open_bytes(&f, FA_OPEN_DECODE_ONLY, font, NULL);
+    CHECK(s);
+    fa_stream_set_midi_effects(s, 0);
+    CHECK_EQ(read_all(s, x, 2 * RATE, 4096), 2 * RATE);
+    CHECK_NEAR(frequency(x, RATE / 10, RATE * 4 / 10), 220.5, 2.0);
+    CHECK_NEAR(frequency(x, RATE + RATE / 10, RATE + RATE * 4 / 10), 440.0, 3.0);
+    fa_stream_close(s);
+    fa_soundfont_release(font);
+    free(f.d); free(t.d); free(x);
+}
+
 static void test_dls_bank(void)
 {
     int with_type;
@@ -1894,6 +1949,8 @@ int main(void)
     RUN(test_malformed_soundfont);
     RUN(test_sf2_attenuation);
     RUN(test_dls_bank);
+    RUN(test_velocity_curve);
+    RUN(test_missing_program);
     RUN(test_malformed_dls);
     RUN(test_system_soundfont);
 
