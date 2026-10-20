@@ -1065,7 +1065,14 @@ static void test_xor_and_repeats(void)
     fa_cdg_frame fr;
     fa_cdg_surface_config cfg;
     tile(&c, 1, 0, 1, 1, 1, 0x3F); /* 4: XOR colour 1 over the whole tile: 4^1 = 5, 3^1 = 2 */
-    preset(&c, 1, 1);              /* 5: a repeat of a different colour than... */
+    preset(&c, 1, 1);              /* 5: a copy of the clear at pack 1, after drawing */
+    border(&c, 3);                 /* 6 */
+    preset(&c, 1, 2);              /* 7: another copy, after a border */
+    preset(&c, 1, 1);              /* 8: a count that goes back is a new clear */
+    tile(&c, 0, 3, 4, 1, 1, 0x20); /* 9 */
+    empty_packs_to(&c, 400);
+    preset(&c, 1, 3);              /* 400: over a second after the last clear: a new one */
+    preset(&c, 6, 1);              /* 401: another colour is always a new clear */
     fa_cdg_surface_config_init(&cfg);
     cfg.pixel_format = FA_CDG_PIXELS_INDEXED8;
     CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
@@ -1076,10 +1083,28 @@ static void test_xor_and_repeats(void)
     CHECK_EQ(*px(&fr, 7, 12), 2);
     CHECK_EQ(*px(&fr, 0, 0), 2);
     CHECK_EQ(fr.palette[5][0], 8 * 17);
-    /* ...the screen is no longer clean, so the repeated preset clears it again */
+    /* Repeats are copies of one clear (in case one is damaged on a disc): drawing
+     * between the copies stays. */
     CHECK_EQ(fa_cdg_surface_update_at(surf, t_packs(6), &fr), FA_OK);
+    CHECK_EQ(*px(&fr, 6, 12), 5);
+    CHECK_EQ(*px(&fr, 0, 0), 2);
+    CHECK_EQ(fa_cdg_surface_update_at(surf, t_packs(8), &fr), FA_OK);
+    CHECK_EQ(*px(&fr, 6, 12), 5);
+    CHECK_EQ(*px(&fr, 0, 0), 3);
+    CHECK_EQ(fa_cdg_surface_update_at(surf, t_packs(9), &fr), FA_OK);
     CHECK_EQ(*px(&fr, 6, 12), 1);
     CHECK_EQ(*px(&fr, 0, 0), 1);
+    CHECK_EQ(fa_cdg_surface_update_at(surf, t_packs(400), &fr), FA_OK);
+    CHECK_EQ(*px(&fr, 6, 12), 4);
+    CHECK_EQ(fa_cdg_surface_update_at(surf, t_packs(401), &fr), FA_OK);
+    CHECK_EQ(*px(&fr, 6, 12), 1);
+    CHECK_EQ(*px(&fr, 0, 0), 1);
+    CHECK_EQ(fa_cdg_surface_update_at(surf, t_packs(402), &fr), FA_OK);
+    CHECK_EQ(*px(&fr, 6, 12), 6);
+    /* The same after a seek back through the checkpoints' start. */
+    CHECK_EQ(fa_cdg_surface_update_at(surf, t_packs(8), &fr), FA_OK);
+    CHECK_EQ(*px(&fr, 6, 12), 5);
+    CHECK_EQ(*px(&fr, 0, 0), 3);
     fa_cdg_surface_destroy(surf);
     fa_stream_close(s);
     free(c.p);
@@ -1963,6 +1988,54 @@ static void test_change_events(void)
     free(c.p);
 }
 
+/* A surface updated on one thread while its stream is closed on another: updates
+ * stop with FA_ERROR_INVALID_ARG and never touch the closed stream (ASan/TSan). */
+typedef struct race_arg {
+    fa_cdg_surface* surf;
+    fa_atomic32 started;
+    int64_t updates;
+    fa_result last;              /* checked on the main thread */
+} race_arg;
+
+static void race_updater(void* p)
+{
+    race_arg* a = (race_arg*)p;
+    fa_cdg_frame fr;
+    fa_store32(&a->started, 1);
+    for (;;) {
+        fa_result r = (a->updates & 1) ? fa_cdg_surface_update(a->surf, &fr)
+                                       : fa_cdg_surface_update_at(a->surf, t_packs(a->updates % 4), &fr);
+        a->updates++;
+        a->last = r;
+        if (r != FA_OK) break;
+    }
+}
+
+static void test_close_while_updating(void)
+{
+    buf c = basic_cdg();
+    int round;
+    for (round = 0; round < 40; round++) {
+        fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+        race_arg a;
+        fa_thread t;
+        int64_t deadline;
+        memset(&a, 0, sizeof(a));
+        CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+        CHECK_EQ(fa_cdg_surface_create(s, NULL, &a.surf), FA_OK);
+        CHECK_EQ(fa_thread_create(&t, race_updater, &a), 0);
+        deadline = fa_monotonic_ns() + 2000000000LL;
+        while (!fa_load32(&a.started) && fa_monotonic_ns() < deadline) fa_sleep_ms(0);
+        if (round & 1) fa_sleep_ms(1);
+        fa_stream_close(s);
+        fa_thread_join(&t);
+        CHECK(a.updates > 0);
+        CHECK_EQ(a.last, FA_ERROR_INVALID_ARG);   /* stopped by the close, nothing else */
+        fa_cdg_surface_destroy(a.surf);
+    }
+    free(c.p);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -1997,6 +2070,7 @@ int main(void)
     RUN(test_checkpoints_streamed);
     RUN(test_timing_rule);
     RUN(test_change_events);
+    RUN(test_close_while_updating);
     fa_engine_destroy(g_engine);
     remove("cdg_pair.zip");
     remove("cdg_sibling.wav");

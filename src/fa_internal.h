@@ -1113,6 +1113,7 @@ struct fa_stream {
     struct fa_cdg_data* cdg;     /* NULL = no graphics */
     struct fa_cdg_surface* cdg_surfaces;
     uint32_t cdg_gen;
+    fa_atomic32 cdg_users;       /* surface calls running on this stream (close waits) */
     fa_atomic64 cdg_offset;      /* fa_time */
     /* FA_EVENT_CDG_CHANGED (fa_stream_set_cdg_events): the event thread follows the
      * clock over the packs. cdg_events is read without the lock; the rest under it. */

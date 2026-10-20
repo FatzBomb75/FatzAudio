@@ -100,6 +100,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- CD+G: copies of a memory preset (repeat count above 0) no longer clear the screen again when a border or tiles
+  were drawn between the copies (reported by FatzBomb.MediaControl).
+- CD+G from discs: packs that fail their P/Q parity are corrected (one damaged symbol) or dropped, instead of
+  drawing garbage tiles from a scratched disc. Drives that return no parity are unchanged.
+- CD+G: `fa_cdg_surface_update`, `fa_cdg_surface_update_at` and `fa_cdg_surface_destroy` could touch freed memory
+  when the surface's stream was closed on another thread at the same moment; the close now waits for them.
 - Transient mode (`FA_STRETCH_TRANSIENTS`) now also removes the pre-echo of a hit in the last ~100 ms of a track
   (-49 dB instead of -20 dB).
 

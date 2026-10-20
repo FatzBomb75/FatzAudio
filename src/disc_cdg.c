@@ -11,7 +11,10 @@
  * on the packs as they arrive and keeping the one that turns up CD+G instructions
  * whose parity checks out (the P parity covers all 24 symbols, the swapped ones too,
  * so only the right reading passes where packs differ). A track with no graphics
- * never does, and its subcode stops being read. */
+ * never does, and its subcode stops being read. Once a reading is chosen by its
+ * parity, each pack is checked: one wrong symbol is corrected, a pack with more is
+ * dropped (a scratch would otherwise draw garbage tiles). A drive that returns no
+ * parity gets every pack as read. */
 #include "disc.h"
 #include "cdg.h"
 #include <stdlib.h>
@@ -23,6 +26,8 @@
 #define DECIDE_MIN 12                    /* CD+G instructions needed to decide */
 #define UNDECIDED_MAX (75 * 90 * PACKS_PER_SECTOR)   /* give up after 90 s without any */
 #define NO_PARITY_AFTER (75 * 4 * PACKS_PER_SECTOR)  /* decide without parity after 4 s */
+#define PARITY_LOST 300                  /* this many bad packs in a row: the parity stopped
+                                            coming (another read mode), not a scratch */
 
 /* Readings: a byte layout times an interleave order. */
 enum { LAYOUT_BYTES, LAYOUT_CHANNELS, LAYOUTS };
@@ -46,6 +51,9 @@ struct fa_disc_cdg {
     uint32_t sound[READINGS];            /* ... of them with correct parity */
     size_t looked;                       /* packs judged while undecided */
     uint32_t token;                      /* the stream's CD+G generation of our packs */
+    int checked;                         /* the chosen reading has parity: packs that fail
+                                            it and cannot be corrected are dropped */
+    uint32_t failing;                    /* packs dropped in a row */
 };
 
 static int swap_pos(int n)
@@ -109,6 +117,33 @@ static int rs_ok(const uint8_t* c, int n, int nsyn)
  * 20-23 over the whole pack). */
 static int parity_ok(const uint8_t* p) { return rs_ok(p, 4, 2) && rs_ok(p, PACK, 4); }
 
+/* Repairs a pack with one wrong symbol from its P parity (4 syndromes: one error
+ * located and checked by the other two), in either symbol order; 1 if the pack then
+ * passes both parities. Two wrong symbols are not attempted: the pack is dropped. */
+static int parity_correct(uint8_t* p)
+{
+    int order;
+    for (order = 0; order < 2; order++) {
+        uint8_t syn[4], loc = 1;
+        int j, i, e;
+        for (j = 0; j < 4; j++) {
+            uint8_t root = (uint8_t)(1u << j);
+            syn[j] = 0;
+            for (i = 0; i < PACK; i++) syn[j] = (uint8_t)(gf_mul(syn[j], root) ^ p[order ? PACK - 1 - i : i]);
+        }
+        if (!syn[0]) continue;
+        /* One error of value syn[0] at power e: syn[j] = syn[0] * a^(j*e). */
+        for (e = 0; e < PACK; e++, loc = gf_mul(loc, 2))
+            if (gf_mul(syn[0], loc) == syn[1]) break;
+        if (e == PACK || gf_mul(syn[1], loc) != syn[2] || gf_mul(syn[2], loc) != syn[3]) continue;
+        i = order ? e : PACK - 1 - e;
+        p[i] ^= syn[0];
+        if (parity_ok(p)) return 1;
+        p[i] ^= syn[0];
+    }
+    return 0;
+}
+
 /* A CD+G graphics instruction (what a reading must produce to be the right one). */
 static int is_cdg(const uint8_t* p)
 {
@@ -164,7 +199,15 @@ static void emit(fa_disc_cdg* c, size_t upto)
     while (c->done < upto) {
         size_t n = upto - c->done, i;
         if (n > 64) n = 64;
-        for (i = 0; i < n; i++) decode_pack(c, c->mode, c->done + i, buf + i * PACK);
+        for (i = 0; i < n; i++) {
+            uint8_t* pk = buf + i * PACK;
+            decode_pack(c, c->mode, c->done + i, pk);
+            /* A damaged pack would draw garbage: an all-zero pack does nothing. */
+            if (!c->checked) continue;
+            if (parity_ok(pk) || parity_correct(pk)) { c->failing = 0; continue; }
+            if (++c->failing >= PARITY_LOST) { c->checked = 0; continue; }
+            memset(pk, 0, PACK);
+        }
         if (!fa_stream_cdg_write(c->stream, c->token, first + c->done, buf, n)) { stop(c); return; }
         c->done += n;
     }
@@ -210,6 +253,7 @@ static void judge(fa_disc_cdg* c, size_t upto)
         if (fa_cdg_data_blank((size_t)c->track_sectors * PACKS_PER_SECTOR, &data) != FA_OK) { stop(c); return; }
         data->from_disc = 1;
         data->disc_parity = c->sound[chosen] > 0;   /* fa_cdg_info.disc_parity */
+        c->checked = data->disc_parity;
         if (!fa_stream_cdg_attach_if_none(c->stream, data, &c->token)) {
             stop(c);   /* out of memory, or the app gave the stream graphics of its own */
             return;

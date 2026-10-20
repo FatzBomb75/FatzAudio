@@ -697,6 +697,7 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
     uintptr_t self;
     if (!stream) return;
     e = stream->engine;
+    fa_stream_cdg_detach(stream);   /* CD+G surface calls on other threads finish first */
     /* A worker or an encoder may be waiting in a network read while holding
      * decode_lock: end the download first so the read returns. */
     fa_net_interrupt(stream->net);

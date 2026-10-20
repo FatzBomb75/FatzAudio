@@ -1366,9 +1366,10 @@ typedef struct fa_cdg_info {
                                           song). Discs: as the packs arrive */
     int32_t disc_parity;               /* discs: 1 = the subcode layout was chosen by the
                                           packs' P/Q parity, 0 = by counting instructions
-                                          (drives that zero the parity). Either way the packs
-                                          are applied as read, without correction. -1 for
-                                          other sources */
+                                          (drives that zero the parity). With 1, a pack with
+                                          one damaged symbol is corrected and one with more
+                                          is dropped; with 0 packs are applied as read. -1
+                                          for other sources */
 } fa_cdg_info;
 
 /* Attaches graphics to any stream, replacing what it had. The file or block is read

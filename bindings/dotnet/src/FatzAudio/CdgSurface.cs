@@ -67,7 +67,8 @@ public enum CdgSource
 /// <param name="CheckpointCount">Checkpoints built so far. Files: all of them once the stream's first surface exists.
 /// Discs: as the packs arrive.</param>
 /// <param name="DiscParity">Discs: true when the packs' parity chose the subcode layout, false when instruction counts
-/// did (drives that zero the parity). Either way the packs are applied as read. Null for other sources.</param>
+/// did (drives that zero the parity). When true, a pack with one damaged symbol is corrected and one with more is
+/// dropped; when false the packs are applied as read. Null for other sources.</param>
 public readonly record struct CdgInfo(CdgSource Source, long PackCount, TimeSpan CheckpointInterval, int CheckpointCount, bool? DiscParity);
 
 /// <summary>What changed in the CD+G picture: see <see cref="AudioStream.CdgChanged"/>.</summary>
