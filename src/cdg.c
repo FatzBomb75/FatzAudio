@@ -47,6 +47,7 @@
 #define CDG_ALL_FLAGS (FA_CDG_NO_BORDER | FA_CDG_TRANSPARENT | FA_CDG_PREMULTIPLIED | FA_CDG_SMOOTH | \
                        FA_CDG_TRANSPARENT_BACKGROUND_ONLY | FA_CDG_HIDE_UNTIL_PRESET | \
                        FA_CDG_BACKGROUND_COLOR | FA_CDG_BACKGROUND_OPACITY)
+#define CDG_REPEAT_SPAN 32        /* packs: the copies of one memory preset arrive within this */
 #define CDG_MAX_CHECKPOINTS 180   /* ~6 MB; longer graphics space them out further */
 /* fa_event.value of FA_EVENT_CDG_CHANGED; the header's FA_CDG_CHANGE_* take it apart. */
 #define FA_CDG_CHANGE_MAKE(x, y, w, h, pal) \
@@ -61,6 +62,8 @@ typedef struct cdg_state {
     int8_t preset;                /* a memory preset was applied (bg is real) */
     int8_t border;                /* colour of the last border preset, -1 = none */
     int clean;                    /* nothing drawn since the last memory preset */
+    int8_t repeat;                /* repeat count of the last memory preset */
+    size_t preset_at;             /* pack index of the last memory preset */
     size_t next;                  /* packs applied so far */
     int dx0, dy0, dx1, dy1;       /* screen area changed since the last render; empty if dx0 >= dx1 */
 } cdg_state;
@@ -72,8 +75,9 @@ typedef struct cdg_checkpoint {
     uint8_t rgb[16][3];
     uint8_t transparency[16];
     uint8_t bg, hoff, voff;
-    int8_t preset, border;
+    int8_t preset, border, repeat;
     int clean;
+    size_t preset_at;
     size_t next;
 } cdg_checkpoint;
 
@@ -249,13 +253,24 @@ static void state_reset(cdg_state* st)
 static void memory_preset(cdg_state* st, const uint8_t* d)
 {
     uint8_t color = d[0] & 0x0F;
-    /* Discs repeat the preset (repeat count in d[1]) in case one is damaged; a file
-     * has no damage, so a repeat of a screen that is still clean changes nothing. */
-    if ((d[1] & 0x0F) != 0 && st->preset && st->clean && st->bg == color) return;
+    int8_t repeat = (int8_t)(d[1] & 0x0F);
+    /* Discs send a preset several times (repeat count 0, 1, 2.. in d[1]) in case one
+     * copy is damaged: one clear, not several. A copy of the preset just applied (a
+     * higher count, a few packs later) is skipped even if something was drawn between
+     * the copies; so is any repeat of a screen that is still clean. The window is
+     * short, so a later clear whose first copies were lost on a disc still clears. */
+    if (repeat != 0 && st->preset && st->bg == color &&
+        (st->clean || (repeat > st->repeat && st->next - st->preset_at <= CDG_REPEAT_SPAN))) {
+        st->repeat = repeat;
+        st->preset_at = st->next;
+        return;
+    }
     memset(st->screen, color, sizeof(st->screen));
     st->bg = color;
     st->preset = 1;
     st->clean = 1;
+    st->repeat = repeat;
+    st->preset_at = st->next;
     mark_all(st);
 }
 
@@ -391,6 +406,8 @@ static void checkpoint_save(cdg_checkpoint* c, const cdg_state* st)
     c->preset = st->preset;
     c->border = st->border;
     c->clean = st->clean;
+    c->repeat = st->repeat;
+    c->preset_at = st->preset_at;
     c->next = st->next;
 }
 
@@ -416,6 +433,8 @@ static void checkpoint_load(const cdg_checkpoint* c, cdg_state* st)
     st->preset = c->preset;
     st->border = c->border;
     st->clean = c->clean;
+    st->repeat = c->repeat;
+    st->preset_at = c->preset_at;
     st->next = c->next;
     st->dx0 = st->dy0 = st->dx1 = st->dy1 = 0;
 }
@@ -797,18 +816,48 @@ int fa_stream_cdg_write(struct fa_stream* s, uint32_t token, size_t first, const
 
 static int watch_list(struct fa_stream* s, int on);
 
-void fa_stream_cdg_close(struct fa_stream* s)
+/* A surface's `stream` is read and cleared under g_bind. A surface call holds the
+ * stream (cdg_users) while it runs, and fa_stream_cdg_detach waits for those calls,
+ * so a stream closed on another thread is never torn down under one. */
+static fa_lazy_mutex g_bind;
+
+static struct fa_stream* surface_hold(fa_cdg_surface* f)
+{
+    struct fa_stream* s;
+    fa_lazy_mutex_lock(&g_bind);
+    s = f->stream;
+    if (s) fa_fetch_add32(&s->cdg_users, 1);
+    fa_lazy_mutex_unlock(&g_bind);
+    return s;
+}
+
+static void stream_release(struct fa_stream* s) { fa_fetch_add32(&s->cdg_users, -1); }
+
+void fa_stream_cdg_detach(struct fa_stream* s)
 {
     fa_cdg_surface* f;
-    watch_list(s, 0);
+    fa_lazy_mutex_lock(&g_bind);
     fa_mutex_lock(&s->cdg_lock);
     /* Surfaces belong to the app: they outlive the stream until destroyed, and
      * only refuse to update from now on. */
     for (f = s->cdg_surfaces; f; f = f->next) f->stream = NULL;
     s->cdg_surfaces = NULL;
-    fa_cdg_data_free(s->cdg);
+    fa_mutex_unlock(&s->cdg_lock);
+    fa_lazy_mutex_unlock(&g_bind);
+    /* A call that got the stream before this finishes first (it may read the clock). */
+    while (fa_load32(&s->cdg_users)) fa_sleep_ms(1);
+}
+
+void fa_stream_cdg_close(struct fa_stream* s)
+{
+    fa_cdg_data* d;
+    watch_list(s, 0);
+    fa_stream_cdg_detach(s);
+    fa_mutex_lock(&s->cdg_lock);
+    d = s->cdg;
     s->cdg = NULL;
     fa_mutex_unlock(&s->cdg_lock);
+    fa_cdg_data_free(d);
 }
 
 static void surface_free(fa_cdg_surface* f)
@@ -955,12 +1004,13 @@ FA_API void FA_CALL fa_cdg_surface_destroy(fa_cdg_surface* surface)
     struct fa_stream* s;
     fa_cdg_surface** link;
     if (!surface) return;
-    s = surface->stream;
+    s = surface_hold(surface);
     if (s) {
         fa_mutex_lock(&s->cdg_lock);
         for (link = &s->cdg_surfaces; *link; link = &(*link)->next)
             if (*link == surface) { *link = surface->next; break; }
         fa_mutex_unlock(&s->cdg_lock);
+        stream_release(s);
     }
     surface_free(surface);
 }
@@ -1037,11 +1087,10 @@ static fa_time graphics_time(struct fa_stream* s, fa_time time)
     return time - offset;
 }
 
-static fa_result surface_update(fa_cdg_surface* f, fa_time time, fa_cdg_frame* out)
+/* `s` is the surface's stream, held by the caller. */
+static fa_result surface_update(fa_cdg_surface* f, struct fa_stream* s, fa_time time, fa_cdg_frame* out)
 {
-    struct fa_stream* s = f->stream;
     size_t target;
-    if (!s) return FA_ERROR_INVALID_ARG; /* its stream was closed */
     fa_mutex_lock(&s->cdg_lock);
     time = graphics_time(s, time);
     if (f->gen != s->cdg_gen) {
@@ -1216,16 +1265,26 @@ void fa_stream_cdg_watch(struct fa_stream* s)
 
 FA_API fa_result FA_CALL fa_cdg_surface_update(fa_cdg_surface* surface, fa_cdg_frame* out_frame)
 {
+    struct fa_stream* s;
     fa_time now;
     fa_result r;
-    if (!surface || !out_frame || !surface->stream) return FA_ERROR_INVALID_ARG;
-    r = fa_stream_get_clock(surface->stream, &now);
-    if (r != FA_OK) return r;
-    return surface_update(surface, now, out_frame);
+    if (!surface || !out_frame) return FA_ERROR_INVALID_ARG;
+    s = surface_hold(surface);
+    if (!s) return FA_ERROR_INVALID_ARG; /* its stream was closed */
+    r = fa_stream_get_clock(s, &now);
+    if (r == FA_OK) r = surface_update(surface, s, now, out_frame);
+    stream_release(s);
+    return r;
 }
 
 FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_time time, fa_cdg_frame* out_frame)
 {
+    struct fa_stream* s;
+    fa_result r;
     if (!surface || !out_frame) return FA_ERROR_INVALID_ARG;
-    return surface_update(surface, time, out_frame);
+    s = surface_hold(surface);
+    if (!s) return FA_ERROR_INVALID_ARG; /* its stream was closed */
+    r = surface_update(surface, s, time, out_frame);
+    stream_release(s);
+    return r;
 }

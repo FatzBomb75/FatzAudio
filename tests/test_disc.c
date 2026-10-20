@@ -1198,6 +1198,62 @@ static void test_cdg_image(void)
     free(sub);
 }
 
+/* A scratched disc: a pack with one wrong symbol is repaired from its parity, packs
+ * with two are dropped instead of drawing garbage. Without parity from the drive
+ * the packs are used as read. */
+static void test_cdg_damage(void)
+{
+    uint8_t* packs = (uint8_t*)malloc((size_t)SONG_PACKS * 24);
+    uint8_t* want = (uint8_t*)malloc((size_t)SONG_PACKS * 24);
+    uint8_t* sub = (uint8_t*)malloc((size_t)SONG_PACKS * 24);
+    int pass, i;
+    CHECK(packs && want && sub);
+    for (pass = 0; pass < 2; pass++) {
+        fa_disc* d;
+        fa_stream* s;
+        fa_cdg_surface* f;
+        uint8_t dd[16];
+        g_with_parity = pass == 0;
+        make_song(packs);
+        for (i = 0; i < 16; i++) {         /* at 4 s: a clear to red, every copy damaged */
+            memset(dd, 0, sizeof(dd));
+            dd[0] = 1; dd[1] = (uint8_t)i;
+            put_pack(packs + (1200 + i) * 24, 1, dd);
+        }
+        memcpy(want, packs, (size_t)SONG_PACKS * 24);
+        if (pass == 0) {
+            packs[16 * 24 + 6] ^= 0x15;    /* colour load: one wrong symbol */
+            packs[600 * 24 + 21] ^= 0x2A;  /* a clear's copy: one wrong parity symbol */
+        }
+        for (i = 0; i < 16; i++) {
+            packs[(1200 + i) * 24 + 4] ^= 0x02;   /* colour 1 becomes 3 */
+            packs[(1200 + i) * 24 + 9] ^= 0x11;
+        }
+        if (pass == 0) memset(want + 1200 * 24, 0, 16 * 24);
+        else memcpy(want, packs, (size_t)SONG_PACKS * 24);
+        interleave(1, packs, sub);
+        CHECK(write_cdg_image("disc_cdg_dmg", sub));
+        CHECK_EQ(fa_disc_open("disc_cdg_dmg.cue", NULL, &d), FA_OK);
+        s = open_track(d, 1);
+        CHECK(s);
+        CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
+        CHECK_EQ(play_through(s), FA_OK);
+        CHECK(same_packs(s, want));
+        CHECK_EQ(pixel_at(f, 1000000000LL), 0xFF0000u);
+        CHECK_EQ(pixel_at(f, 3000000000LL), 0x00FF00u);
+        /* With parity the damaged clear is gone; without, colour 3 (black) shows. */
+        CHECK_EQ(pixel_at(f, 5000000000LL), pass == 0 ? 0x00FF00u : 0x000000u);
+        fa_cdg_surface_destroy(f);
+        fa_stream_close(s);
+        fa_disc_close(d);
+        remove_cdg_image("disc_cdg_dmg");
+    }
+    g_with_parity = 1;
+    free(packs);
+    free(want);
+    free(sub);
+}
+
 /* Tracks without graphics get none: no .sub at all, or a subcode of zeros. */
 static void test_cdg_absent(void)
 {
@@ -1417,6 +1473,7 @@ int main(void)
     RUN(test_mmc_os_no_medium);
     RUN(test_mmc_cdtext);
     RUN(test_cdg_image);
+    RUN(test_cdg_damage);
     RUN(test_cdg_absent);
     RUN(test_cdg_mmc);
     RUN(test_cdg_rules);

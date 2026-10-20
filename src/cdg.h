@@ -75,6 +75,9 @@ void fa_stream_cdg_attach(struct fa_stream* s, fa_cdg_data* data);
 fa_result fa_cdg_data_blank(size_t count, fa_cdg_data** out);
 int fa_stream_cdg_attach_if_none(struct fa_stream* s, fa_cdg_data* data, uint32_t* out_token);
 int fa_stream_cdg_write(struct fa_stream* s, uint32_t token, size_t first, const uint8_t* packs, size_t n);
+/* Cuts the stream's surfaces loose and waits for surface calls running on other
+ * threads; first thing in fa_stream_close, before anything they read is torn down. */
+void fa_stream_cdg_detach(struct fa_stream* s);
 void fa_stream_cdg_close(struct fa_stream* s);
 /* The event thread, every round (never with list_lock held: the clock of a push
  * stream takes api_lock): raises FA_EVENT_CDG_CHANGED for a stream whose shown

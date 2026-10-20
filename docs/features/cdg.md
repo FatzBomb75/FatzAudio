@@ -200,7 +200,7 @@ In .NET, subscribing to `song.CdgChanged` turns the events on (`CdgChangedEventA
 
 ### Graphics info
 
-`fa_stream_get_cdg_info` says where a stream's graphics come from (`FA_CDG_SOURCE_FILE` for a `.cdg`, ZIP entry or memory block, `FA_CDG_SOURCE_DISC` for a disc's subcode), how many packs there are, and how far apart the seek checkpoints are. For a disc track, `disc_parity` is 1 when the subcode layout was chosen by the packs' P/Q parity and 0 when it was chosen by counting instructions (drives that return the parity zeroed). Either way the packs are applied as read: there is no error correction. In .NET this is `song.CdgInfo`.
+`fa_stream_get_cdg_info` says where a stream's graphics come from (`FA_CDG_SOURCE_FILE` for a `.cdg`, ZIP entry or memory block, `FA_CDG_SOURCE_DISC` for a disc's subcode), how many packs there are, and how far apart the seek checkpoints are. For a disc track, `disc_parity` is 1 when the subcode layout was chosen by the packs' P/Q parity and 0 when it was chosen by counting instructions (drives that return the parity zeroed). When the layout was chosen by parity, every pack is checked as it arrives: a pack with one damaged symbol is corrected from its P parity, and a pack with more damage is dropped (it would draw garbage tiles) rather than drawn. If the parity stops arriving part-way (300 failing packs in a row, as when a drive changes read mode), the rest of the track is applied as read. With `disc_parity` 0 there is nothing to check against, and the packs are applied as read. In .NET this is `song.CdgInfo`.
 
 ## Sync
 
@@ -253,7 +253,7 @@ using var engine = AudioEngine.Create(new AudioEngineOptions { TempDirectory = P
 
 ## The CD+G format
 
-Every instruction of the CD+G "TV graphics" mode is implemented: memory preset (clear the screen), border preset, tile block in normal and XOR mode, scroll preset and scroll copy (horizontal and vertical, with the smooth-scroll offsets), define transparent colour, and both halves of the colour table. Repeated memory-preset packs (repeat count above 0) are skipped when the screen is still clean in that colour, so they cause no redraws. The palette starts black until the first colour-table load. CD+EG (extended graphics) packs are ignored, and so are packs of other subcode modes.
+Every instruction of the CD+G "TV graphics" mode is implemented: memory preset (clear the screen), border preset, tile block in normal and XOR mode, scroll preset and scroll copy (horizontal and vertical, with the smooth-scroll offsets), define transparent colour, and both halves of the colour table. Repeated memory-preset packs (repeat count above 0) are copies of one clear, sent several times in case one is damaged on a disc: a copy with a higher count than the preset just applied, of the same colour and within 32 packs (about 0.1 s) of it, is skipped even if a border or tiles were drawn between the copies, and so is any repeat while the screen is still clean in that colour. A preset in another colour, or with a count that goes back, is a new clear. The palette starts black until the first colour-table load. CD+EG (extended graphics) packs are ignored, and so are packs of other subcode modes.
 
 ## Threading
 
@@ -261,7 +261,7 @@ Every instruction of the CD+G "TV graphics" mode is implemented: memory preset (
 - Loading or removing graphics while surfaces are being updated is safe: each surface starts over on the new graphics at its next update.
 - An update never waits for the device or decode threads. It shares one short lock per stream with graphics loads, a disc's pack writes and the stream's other surfaces. The one longer hold is building a file's checkpoints, once, in the first `fa_cdg_surface_create` (or the first update after a load): about 5 ms for a song. `fa_cdg_surface_update` also reads `fa_stream_get_clock`; `fa_cdg_surface_update_at` does not.
 - An update with nothing new compares the palette and returns: no pixels are copied, so calling it at 240 Hz costs next to nothing.
-- Destroy every surface you create with `fa_cdg_surface_destroy`, before or after closing its stream (not while `fa_stream_close` is running on another thread). After the stream is closed, updates return `FA_ERROR_INVALID_ARG`. In .NET, disposing the stream also disposes its surfaces, and `Update` then throws `ObjectDisposedException`.
+- Destroy every surface you create with `fa_cdg_surface_destroy`, before or after closing its stream, from any thread: an update or destroy that runs while `fa_stream_close` closes the stream on another thread is safe (the close waits for it to finish). After the stream is closed, updates return `FA_ERROR_INVALID_ARG`. In .NET, disposing the stream also disposes its surfaces, and `Update` then throws `ObjectDisposedException`.
 
 ## Pitfalls
 
