@@ -589,10 +589,15 @@ static int is_drum_channel(const struct fa_midi* m, int ch)
     }
 }
 
+/* The program in the channel's bank, else in bank 0 (drums: the standard kit).
+ * A soundfont without it plays program 0 (drums: kit 0), else its first preset,
+ * rather than whatever the channel played before. */
 static void select_program(struct fa_midi* m, int ch)
 {
     m->drums[ch] = (uint8_t)is_drum_channel(m, ch);
-    tsf_channel_set_presetnumber(m->synth, ch, m->program[ch], m->drums[ch]);
+    if (!tsf_channel_set_presetnumber(m->synth, ch, m->program[ch], m->drums[ch]) &&
+        !tsf_channel_set_presetnumber(m->synth, ch, 0, m->drums[ch]))
+        tsf_channel_set_presetindex(m->synth, ch, 0);
 }
 
 static void sync_bank(struct fa_midi* m, int ch);

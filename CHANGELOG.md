@@ -52,6 +52,10 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
 ### Changed
+- MIDI note velocity now follows the SoundFont 2 default curve, 40·log10(velocity/127) dB (velocity 64 is 11.9 dB
+  down, was 6 dB), which is what FluidSynth and DLS synths play. Songs keep their loudest notes and gain dynamics.
+- MIDI: a program change to a program the soundfont lacks (in the bank and in bank 0) plays program 0 instead of
+  keeping the channel's previous instrument. DLS instruments are no longer cut at 128 regions.
 - .NET: `AudioStream.Info` no longer allocates on every read: the last `StreamInfo` is reused while the native values
   are unchanged (a changed duration, length or bitrate still gives a fresh one), and `GetSpectrum(int)` on streams
   and devices shares one code path with the `Span<float>` overload. For library scans, `Tags.Read(path,
