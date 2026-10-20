@@ -279,7 +279,20 @@ typedef struct fa_open_options {
     fa_soundfont* soundfont; /* MIDI files: the instruments to play them with, NULL = the
                                 engine's (fa_engine_set_soundfont). The stream keeps its
                                 own reference. Other formats ignore it */
+    int32_t text_code_page;  /* MIDI files: how their lyrics and other text are encoded.
+                                0 = detect (default): UTF-8, Shift-JIS or Windows-1252,
+                                decided for the whole file. FA_CODE_PAGE_* forces one;
+                                other values are read as 0. With UTF-8 (detected or
+                                forced) and detected Windows-1252, each event that is
+                                valid UTF-8 stays UTF-8 and the others are read as
+                                Windows-1252; forced Windows-1252 and Shift-JIS read
+                                every event that way */
 } fa_open_options;
+
+/* fa_open_options.text_code_page, and fa_midi_credits.code_page. */
+#define FA_CODE_PAGE_UTF8 65001
+#define FA_CODE_PAGE_WINDOWS_1252 1252
+#define FA_CODE_PAGE_SHIFT_JIS 932
 
 FA_API void FA_CALL fa_open_options_init(fa_open_options* options);
 
@@ -1550,6 +1563,30 @@ typedef struct fa_midi_info {
 
 /* FA_ERROR_INVALID_ARG for streams that are not MIDI. */
 FA_API fa_result FA_CALL fa_stream_get_midi_info(fa_stream* stream, fa_midi_info* out_info);
+
+/* A MIDI file's song information, for intro and ending pages: the .kar "@T" and
+ * "@I" header lines and the file's own copyright, tempo and signature events. Empty
+ * strings for what the file does not say. All UTF-8. */
+typedef struct fa_midi_credits {
+    uint32_t struct_size;        /* sizeof(fa_midi_credits) */
+    int32_t code_page;           /* how the file's text was read: FA_CODE_PAGE_* */
+    char title[256];             /* the first "@T" line, else "@I Title", else the first track name */
+    char artist[256];            /* the second "@T" line, else "@I Artist" / "Performer" */
+    char writer[256];            /* "@I Written by", "Composer", "Music by", "Writer",
+                                    "Words and music by" */
+    char lyricist[256];          /* "@I Lyrics by", "Lyricist", "Lyrics", "Words and music by" */
+    char year[32];               /* "@I Year", "Date", or an unlabelled year 1800..2200 */
+    char copyright[256];         /* the copyright event, else a copyright "@I" or third "@T" line */
+    char key[32];                /* the first key signature ("E minor"), else "@I Key" */
+    char tempo[32];              /* the first tempo ("120 bpm"), else "@I Tempo" / "BPM" */
+    char time_signature[32];     /* the first time signature ("3/4"), else "@I Timing" */
+    char other[1024];            /* other "@I" lines and "@T" lines after the second, one
+                                    per line ("\n"), without repeats */
+} fa_midi_credits;
+
+/* Fills `out_credits` up to its struct_size. FA_ERROR_INVALID_ARG for streams that
+ * are not MIDI. */
+FA_API fa_result FA_CALL fa_stream_get_midi_credits(fa_stream* stream, fa_midi_credits* out_credits);
 /* Text events in time order, index 0 .. text_count - 1 (FA_ERROR_NOT_FOUND past it). */
 FA_API fa_result FA_CALL fa_stream_get_midi_text(fa_stream* stream, uint32_t index, fa_midi_text* out_text);
 

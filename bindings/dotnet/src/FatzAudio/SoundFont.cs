@@ -194,6 +194,24 @@ public sealed record MidiMark(MidiMarkType Type, int Value, int Value2, string T
 /// <param name="IsKaraoke">A karaoke (.kar) file: "@K"/"@T" header lines or a "Words" track.</param>
 public sealed record MidiInfo(string Title, string Artist, string Copyright, int Format, int Tracks, int TextCount, int LyricCount, bool IsKaraoke);
 
+/// <summary>
+/// A MIDI file's song information (<see cref="AudioStream.MidiCredits"/>), for intro and ending pages: the .kar "@T" and
+/// "@I" header lines and the file's own copyright, tempo and signature events. Empty strings for what the file does not say.
+/// </summary>
+/// <param name="CodePage">How the file's text was read.</param>
+/// <param name="Title">The first "@T" line, else "@I Title", else the name of the first track.</param>
+/// <param name="Artist">The second "@T" line, else "@I Artist" or "Performer".</param>
+/// <param name="Writer">"@I Written by", "Composer", "Music by", "Writer", "Words and music by".</param>
+/// <param name="Lyricist">"@I Lyrics by", "Lyricist", "Lyrics", "Words and music by".</param>
+/// <param name="Year">"@I Year", "Date", or an unlabelled year 1800-2200.</param>
+/// <param name="Copyright">The copyright event, else a copyright "@I" line or third "@T" line.</param>
+/// <param name="Key">The first key signature ("E minor"), else "@I Key".</param>
+/// <param name="Tempo">The first tempo ("120 bpm"), else "@I Tempo" or "BPM".</param>
+/// <param name="TimeSignature">The first time signature ("3/4"), else "@I Timing".</param>
+/// <param name="Other">Other "@I" lines and "@T" lines after the second, without repeats.</param>
+public sealed record MidiCredits(TextCodePage CodePage, string Title, string Artist, string Writer, string Lyricist, string Year,
+    string Copyright, string Key, string Tempo, string TimeSignature, IReadOnlyList<string> Other);
+
 /// <summary>Event data for <see cref="AudioStream.MidiTextReached"/>.</summary>
 public sealed class MidiTextEventArgs : EventArgs
 {

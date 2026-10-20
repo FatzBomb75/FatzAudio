@@ -311,6 +311,25 @@ public sealed record StreamOptions
     /// The stream keeps its own reference, so the soundfont may be disposed after the open call. Other formats ignore it.
     /// </summary>
     public SoundFont? SoundFont { get; init; }
+    /// <summary>
+    /// MIDI files: how their lyrics and other text are encoded. <see cref="TextCodePage.Detect"/> (the default) decides
+    /// for the whole file between UTF-8, Shift-JIS and Windows-1252; the others force one. <see cref="MidiCredits.CodePage"/>
+    /// says which was used. Other formats ignore it.
+    /// </summary>
+    public TextCodePage TextCodePage { get; init; } = TextCodePage.Detect;
+}
+
+/// <summary>Text encodings of MIDI files (<see cref="StreamOptions.TextCodePage"/>).</summary>
+public enum TextCodePage
+{
+    /// <summary>Decide from the file's bytes: UTF-8 if all of it is, Shift-JIS if it reads as Japanese, else Windows-1252.</summary>
+    Detect = 0,
+    /// <summary>UTF-8 (text that is not valid UTF-8 is read as Windows-1252).</summary>
+    Utf8 = 65001,
+    /// <summary>Windows-1252 (Western European), for every event.</summary>
+    Windows1252 = 1252,
+    /// <summary>Shift-JIS (Windows code page 932, Japanese).</summary>
+    ShiftJis = 932,
 }
 
 /// <summary>

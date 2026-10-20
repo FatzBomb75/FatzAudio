@@ -99,7 +99,55 @@ using var etude = engine.OpenFile("etude.mid", new StreamOptions { SoundFont = p
 
 Every text event of the file is listed in time order by `fa_stream_get_midi_text` (`AudioStream.MidiTexts`), with its frame, time, type, track and UTF-8 text. While the stream plays on a device, `FA_EVENT_MIDI_TEXT` (`AudioStream.MidiTextReached`) is raised as each one is heard, with `value` = its index.
 
-Lyrics come cleaned up for display. The marks karaoke files use for layout (`/` and `\` before a syllable in `.kar` files; CR and LF in lyric events) are removed from the text and given as `FA_MIDI_NEW_LINE` and `FA_MIDI_NEW_PARAGRAPH` flags on the syllable that starts the new line. A karaoke screen joins the syllables of a line as they are and breaks before the flagged ones. In a `.kar` file the words are `FA_MIDI_LYRIC` and its `@` header lines are `FA_MIDI_TEXT`; `fa_stream_get_midi_info` gives the title and artist from the `@T` lines, and the copyright. Text that isn't valid UTF-8 is read as Windows-1252 (Latin-1), which is what most older files use.
+Lyrics come cleaned up for display. The marks karaoke files use for layout (`/` and `\` before a syllable in `.kar` files; CR and LF in lyric events) are removed from the text and given as `FA_MIDI_NEW_LINE` and `FA_MIDI_NEW_PARAGRAPH` flags on the syllable that starts the new line. A karaoke screen joins the syllables of a line as they are and breaks before the flagged ones. In a `.kar` file the words are `FA_MIDI_LYRIC` and its `@` header lines are `FA_MIDI_TEXT`; `fa_stream_get_midi_info` gives the title and artist from the `@T` lines, and the copyright.
+
+A few more clean-ups make old karaoke files display well:
+
+- In `.kar` files a `/` or `\` anywhere in a word event starts a new line or paragraph there (the event is split into two syllables), and a leading `<` (the Soft Karaoke "clear screen" mark) starts a paragraph.
+- Chord lines (Tune 1000 lines starting with `%`, and lines made of `<...>` chord names) are given as `FA_MIDI_TEXT`, not lyrics.
+- Some files put the whole song in text events and only a handful of words in lyric events. When one track's text events look like syllables (at least 16 short events, four times as many as the file's lyric events, and at least 60% of that track's text events) they are used as the lyrics, and the stray lyric events become `FA_MIDI_TEXT`.
+
+### Text encoding
+
+MIDI files don't say which character set their text uses. FatzAudio picks one per file: UTF-8 when all the text is valid UTF-8 (a byte-order mark is removed); Shift-JIS (code page 932, Japanese) when every non-ASCII byte forms a valid Shift-JIS pair and enough of them are kana or Japanese punctuation; otherwise Windows-1252 (Latin-1), which is what most older Western files use. All text comes out as UTF-8 either way. Files of mixed origin are common, so with UTF-8 (detected or forced) and with detected Windows-1252, each event that is valid UTF-8 is kept as UTF-8 and the others are read as Windows-1252; forced Windows-1252 and Shift-JIS read every event that way. When the guess is wrong, force the code page with `fa_open_options.text_code_page` (`StreamOptions.TextCodePage`): `FA_CODE_PAGE_UTF8`, `FA_CODE_PAGE_WINDOWS_1252` or `FA_CODE_PAGE_SHIFT_JIS`; 0 (the default) detects. Shift-JIS characters with no Unicode mapping (such as user-defined ones) come out as U+FFFD. The code page used is reported in `fa_midi_credits.code_page`.
+
+```c
+fa_open_options o = { sizeof(o) };
+o.text_code_page = FA_CODE_PAGE_SHIFT_JIS;     /* this one is Japanese */
+fa_stream* song = NULL;
+fa_stream_open_file(engine, "enka.kar", &o, &song);
+```
+
+```csharp
+using var song = engine.OpenFile("enka.kar", new StreamOptions { TextCodePage = TextCodePage.ShiftJis });
+```
+
+### Song credits
+
+`fa_stream_get_midi_credits` (`AudioStream.MidiCredits`) gathers the song's credits from the header text that karaoke files carry: the `@T` lines of `.kar` files and their `@I` information lines, labelled (`@ILyrics by ...`, `@IMusic by: ...`, `@IYear=1984`, `@IKey - G`) or not. Each field is UTF-8 and empty when the file doesn't give it:
+
+| Field | From |
+|---|---|
+| `title`, `artist` | The first and second `@T` line; else a `Title` / `Song` / `Artist` / `Performer` / `Performed by` label; else the first track name for the title |
+| `writer` | `Written by`, `Writer`, `Composer`, `Music by`, `Words and music by` labels |
+| `lyricist` | `Lyrics by`, `Lyricist`, `Lyrics`, `Words and music by` labels |
+| `year` | A `Year` / `Date` label, or an `@I` line that is just a year (1800-2200) |
+| `copyright` | The copyright event, else an `@I` line or the third `@T` line containing `(c)`, `©` or `Copyright` |
+| `key`, `tempo`, `time_signature` | The file's first key signature, tempo and time signature (as in `fa_stream_get_midi_marks`), which is what plays; else a `Key` / `Tempo` / `BPM` / `Time signature` / `Timing` / `Meter` label |
+| `other` | Every other `@I` line and `@T` lines after the second (or third, when that is the copyright), one per line, without repeats |
+
+```c
+fa_midi_credits c = { sizeof(c) };
+if (fa_stream_get_midi_credits(song, &c) == FA_OK)
+    printf("%s - %s (%s), words %s, music %s\n", c.artist, c.title, c.year, c.lyricist, c.writer);
+```
+
+```csharp
+if (song.MidiCredits is { } c)
+    Console.WriteLine($"{c.Artist} - {c.Title} ({c.Year}), words {c.Lyricist}, music {c.Writer}");
+```
+
+`fa_stream_get_midi_credits` returns `FA_ERROR_INVALID_ARG` for a stream that isn't MIDI (and `MidiCredits` is `null`).
 
 ### C
 
@@ -244,5 +292,5 @@ Rendering runs on the engine's worker threads like decoding of any other format.
 - DLS banks play their regions, samples, loops, envelopes, LFOs, filter and gains. Articulation scaled by a controller (other than the default mod wheel vibrato) and DLS 2 conditional chunks are ignored.
 - Each instrument's level (`initialAttenuation`) is applied as the SoundFont 2 spec states it, 0.1 dB per unit. FluidSynth applies 0.4 of that (an EMU hardware habit), so a bank tuned by ear in FluidSynth can sound with a wider gap between its quiet and loud instruments here.
 - SFZ soundfonts and MIDI input from devices aren't supported yet. See the [engineering notes](../engineering-notes.md).
-- Shift-JIS lyrics (Japanese files) are read as Windows-1252 and come out garbled.
+- Text in code pages other than UTF-8, Windows-1252 and Shift-JIS (Korean, Chinese, Cyrillic files) comes out as Windows-1252. Shift-JIS user-defined characters (lead bytes F0-F9) come out as U+FFFD.
 - SysEx other than the messages listed [above](#sysex) is ignored: GS and XG effect settings (reverb and chorus type and level, so the reverb and chorus stay the one built-in design), insertion effects, scale tuning and drum setup (per-note drum edits) have no effect.
