@@ -9,6 +9,7 @@
 #include "fatzaudio/fatzaudio.h"
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 typedef struct fa_font fa_font;
 
@@ -23,6 +24,7 @@ typedef struct fa_font_info {
     uint32_t glyph_count;
     char family[128];                  /* UTF-8: typographic family (name 16), else name 1 */
     char style[64];                    /* typographic subfamily (17), else 2 */
+    char legacy_family[128];           /* name 1 (as Windows groups faces: "Arial Black") */
 } fa_font_info;
 
 /* Path commands in font units, y up. A contour starts at each MOVE and is closed. */
@@ -49,6 +51,10 @@ fa_result fa_font_open(const uint8_t* data, size_t size, uint32_t index, int own
 /* Reads the whole file (UTF-8 path) and opens face `index`. */
 fa_result fa_font_open_file(const char* path, uint32_t index, fa_font** out);
 void fa_font_close(fa_font* font);
+/* Reads only face `index`'s names, weight and style from an open file (for
+ * finding fonts without loading them): units, metrics and glyph_count are not
+ * filled in. Sets *face_count (may be NULL) when the file could be read. */
+fa_result fa_font_probe(FILE* fp, uint32_t* face_count, uint32_t index, fa_font_info* out);
 
 const fa_font_info* fa_font_get_info(const fa_font* font);
 /* The glyph for a Unicode code point, 0 (.notdef) when the font has none. */

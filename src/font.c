@@ -1023,7 +1023,8 @@ static void read_info(fa_font* f)
     }
     if (in->descender > 0) in->descender = -in->descender;
     in->monospace = u32(f->post, 12) != 0;
-    if (!read_name(f->name, 16, in->family, sizeof(in->family))) read_name(f->name, 1, in->family, sizeof(in->family));
+    read_name(f->name, 1, in->legacy_family, sizeof(in->legacy_family));
+    if (!read_name(f->name, 16, in->family, sizeof(in->family))) memcpy(in->family, in->legacy_family, sizeof(in->family));
     if (!read_name(f->name, 17, in->style, sizeof(in->style))) read_name(f->name, 2, in->style, sizeof(in->style));
 }
 
@@ -1121,6 +1122,69 @@ fa_result fa_font_open_file(const char* path, uint32_t index, fa_font** out)
     if (fread(data, 1, (size_t)len, fp) != (size_t)len) { fclose(fp); free(data); return FA_ERROR_IO; }
     fclose(fp);
     return fa_font_open(data, (size_t)len, index, 1, out);
+}
+
+/* Reads `len` bytes at `off` of the file into a new buffer (NULL when it cannot). */
+static uint8_t* read_at(FILE* fp, uint32_t off, uint32_t len)
+{
+    uint8_t* b;
+    if (!len || len > 4u * 1024u * 1024u || fseek(fp, (long)off, SEEK_SET) != 0) return NULL;
+    b = (uint8_t*)malloc(len);
+    if (b && fread(b, 1, len, fp) != len) { free(b); b = NULL; }
+    return b;
+}
+
+fa_result fa_font_probe(FILE* fp, uint32_t* face_count, uint32_t index, fa_font_info* out)
+{
+    uint8_t hdr[12], *dir = NULL, *bufs[5] = { NULL, NULL, NULL, NULL, NULL };
+    static const char* want[5] = { "head", "hhea", "OS/2", "name", "post" };
+    view h = { hdr, sizeof(hdr) }, d;
+    uint32_t base = 0, tables, i, k, faces = 1;
+    fa_font tmp;
+    fa_result r = FA_ERROR_UNSUPPORTED_FORMAT;
+    if (fseek(fp, 0, SEEK_SET) != 0 || fread(hdr, 1, 12, fp) != 12) return FA_ERROR_UNSUPPORTED_FORMAT;
+    if (u32(h, 0) == tag("ttcf")) {
+        uint8_t off[4];
+        view o = { off, 4 };
+        faces = u32(h, 8);
+        if (!faces || faces > 4096 || index >= faces) { if (face_count) *face_count = faces; return FA_ERROR_NOT_FOUND; }
+        if (fseek(fp, 12 + (long)index * 4, SEEK_SET) != 0 || fread(off, 1, 4, fp) != 4) return FA_ERROR_UNSUPPORTED_FORMAT;
+        base = u32(o, 0);
+        if (fseek(fp, (long)base, SEEK_SET) != 0 || fread(hdr, 1, 12, fp) != 12) return FA_ERROR_UNSUPPORTED_FORMAT;
+    } else if (index) {
+        return FA_ERROR_NOT_FOUND;
+    }
+    if (face_count) *face_count = faces;
+    if (!is_sfnt(u32(h, 0))) return FA_ERROR_UNSUPPORTED_FORMAT;
+    tables = u16(h, 4);
+    if (!tables || tables > 512) return FA_ERROR_UNSUPPORTED_FORMAT;
+    dir = read_at(fp, base + 12, tables * 16);
+    if (!dir) return FA_ERROR_UNSUPPORTED_FORMAT;
+    d.p = dir;
+    d.n = (size_t)tables * 16;
+    memset(&tmp, 0, sizeof(tmp));
+    for (i = 0; i < tables; i++) {
+        uint32_t t = u32(d, (size_t)i * 16);
+        for (k = 0; k < 5; k++)
+            if (t == tag(want[k]) && !bufs[k]) {
+                uint32_t len = u32(d, (size_t)i * 16 + 12);
+                if (len > 65536 && k != 3) len = 65536;
+                bufs[k] = read_at(fp, u32(d, (size_t)i * 16 + 8), len);
+                if (bufs[k]) {
+                    view v = { bufs[k], len };
+                    if (k == 0) tmp.head = v; else if (k == 1) tmp.hhea = v; else if (k == 2) tmp.os2 = v;
+                    else if (k == 3) tmp.name = v; else tmp.post = v;
+                }
+            }
+    }
+    if (tmp.head.n && tmp.name.n) {
+        read_info(&tmp);
+        *out = tmp.info;
+        r = FA_OK;
+    }
+    for (k = 0; k < 5; k++) free(bufs[k]);
+    free(dir);
+    return r;
 }
 
 void fa_font_close(fa_font* f)

@@ -3,6 +3,7 @@
  * With FA_TEST_FONT_DIR set, every font in that folder is also opened and drawn
  * in full (a local check on real fonts; nothing is compared). */
 #include "font.h"
+#include "font_find.h"
 #include "raster.h"
 #include <math.h>
 #include <stdio.h>
@@ -30,6 +31,11 @@ static int g_failures = 0;
 #endif
 #ifndef FA_TEST_SANITIZED
 #  define FA_TEST_SANITIZED 0
+#endif
+#if FA_TEST_SANITIZED
+/* fontconfig keeps its configuration for the life of the process. */
+const char* __lsan_default_suppressions(void);
+__attribute__((visibility("default"))) const char* __lsan_default_suppressions(void) { return "leak:libfontconfig.so\nleak:libexpat.so\n"; }
 #endif
 
 typedef struct blob {
@@ -342,6 +348,82 @@ static void test_damage(void)
     }
 }
 
+/* Installed fonts: a family every desktop OS here has, by weight and style; a
+ * family nobody has; the UI font; a Japanese font when the system has one. */
+static void check_find(void)
+{
+#if defined(_WIN32) || defined(__APPLE__)
+    const char* family = "Arial";
+    int required = 1;
+#elif defined(__ANDROID__)
+    const char* family = "Roboto";
+    int required = 0;
+#else
+    const char* family = "DejaVu Sans";
+    int required = 0;
+#endif
+    fa_font* f = NULL;
+    fa_result r = fa_font_find(family, 700, 0, &f);
+    if (r == FA_ERROR_NOT_FOUND && !required) {
+        printf("  (%s is not installed)\n", family);
+    } else {
+        const fa_font_info* in;
+        CHECK_EQ(r, FA_OK);
+        in = fa_font_get_info(f);
+        CHECK(!strcmp(in->family, family) || !strcmp(in->legacy_family, family));
+        CHECK(in->weight >= 600 && !in->italic);
+        CHECK(fa_font_glyph(f, 'A') != 0);
+        fa_font_close(f);
+        CHECK_EQ(fa_font_find(family, 400, 1, &f), FA_OK);
+        in = fa_font_get_info(f);
+        printf("  %s: bold and %s %s (weight %d)\n", family, in->family, in->style, in->weight);
+        CHECK(in->weight < 600);
+#if defined(_WIN32) || defined(__APPLE__)
+        CHECK(in->italic);
+#endif
+        fa_font_close(f);
+        /* Case, spaces and hyphens do not matter. */
+        {
+            char odd[64];
+            size_t i, n = strlen(family);
+            for (i = 0; i <= n; i++) odd[i] = (char)(family[i] >= 'a' && family[i] <= 'z' ? family[i] - 32 : family[i] == ' ' ? '-' : family[i]);
+            CHECK_EQ(fa_font_find(odd, 400, 0, &f), FA_OK);
+            fa_font_close(f);
+        }
+    }
+    f = (fa_font*)1;
+    CHECK_EQ(fa_font_find("No Such Family Anywhere 7", 400, 0, &f), FA_ERROR_NOT_FOUND);
+    CHECK(f == NULL);
+    r = fa_font_find(NULL, 400, 0, &f);
+    if (r == FA_OK) {
+        printf("  UI font: %s %s\n", fa_font_get_info(f)->family, fa_font_get_info(f)->style);
+        CHECK(fa_font_glyph(f, 'a') != 0);
+        fa_font_close(f);
+    } else {
+        CHECK(!required);
+    }
+    r = fa_font_find_for_language("ja", 400, 0, &f);
+    if (r == FA_OK) {
+        printf("  Japanese: %s %s\n", fa_font_get_info(f)->family, fa_font_get_info(f)->style);
+        CHECK(fa_font_glyph(f, 0x3042) != 0);          /* hiragana a */
+        fa_font_close(f);
+    } else {
+        printf("  (no Japanese font)\n");
+        CHECK_EQ(r, FA_ERROR_NOT_FOUND);
+    }
+}
+
+static void test_find(void)
+{
+    check_find();
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__ANDROID__)
+    /* The same through the font folders, without fontconfig. */
+    fa_font_find_set_scan_only(1);
+    check_find();
+    fa_font_find_set_scan_only(0);
+#endif
+}
+
 /* Local check: FA_TEST_FONT_DIR=/usr/share/fonts/truetype/dejavu and so on. */
 static void test_font_dir(void)
 {
@@ -388,6 +470,7 @@ int main(void)
     RUN(test_outlines);
     RUN(test_collection);
     RUN(test_damage);
+    RUN(test_find);
     RUN(test_font_dir);
     if (g_failures) { fprintf(stderr, "%d failure(s)\n", g_failures); return 1; }
     printf("all passed\n");
