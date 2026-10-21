@@ -18,6 +18,16 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- CD+G presentation options: `fa_cdg_surface_set_presentation` crops a surface to a safety zone (show, remove, auto
+  from a pre-pass over the song, or a tight box around everything drawn), adds transparent padding, and with
+  presentation scaling draws the picture in premultiplied full colour at the whole-number multiple nearest the
+  presentation size, on a transparent background with a one-pixel transparent margin, at smoothness 0-4 (5-10 draw
+  as 4 for now), with optional edge anti-aliasing (MLAA) and a transparent border. Scrolls move the surface's
+  picture instead of redrawing it, and smooth-scroll offsets only move what is copied out. Also
+  `fa_cdg_surface_get_presentation`, `fa_cdg_presentation_init`, `FA_CDG_TRANSPARENT_BORDER` and
+  `FA_CDG_INDEX_TRANSPARENT` (index 16 in INDEXED8 padding). .NET: `CdgSurface.Presentation`, `CdgPresentation`,
+  `CdgSurface.TransparentIndex`. Surfaces without presentation options draw exactly as before. See
+  [docs/features/cdg.md](docs/features/cdg.md#presentation-options-fa_cdg_surface_set_presentation).
 - Surfaces: `fa_surface_update_into` draws a CD+G surface into a buffer of yours, only the area that changed since the
   frame that buffer holds (any of the last 8 revisions), with up to 8 dirty rectangles and timings, the same pixels
   `fa_cdg_surface_update` gives. Also `fa_surface_get_layout`, `fa_surface_set_presentation_size`,

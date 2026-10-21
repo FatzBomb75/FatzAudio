@@ -95,6 +95,7 @@ set(FA_SOURCES
     src/net_source.c
     src/net_hls.c
     src/cdg.c
+    src/cdg_scale.c
     src/surface.c
     src/zip.c
     src/tempo.c

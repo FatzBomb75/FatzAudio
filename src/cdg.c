@@ -17,7 +17,9 @@
  * millisecond. Updates run on the caller's thread under the stream's cdg_lock; the
  * audio thread never sees any of it. */
 #include "cdg.h"
+#include "cdg_scale.h"
 #include "surface.h"
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,7 +68,8 @@ typedef struct cdg_state {
     int8_t repeat;                /* repeat count of the last memory preset */
     size_t preset_at;             /* pack index of the last memory preset */
     size_t next;                  /* packs applied so far */
-    fa_rects dirty;               /* screen area changed since the last render */
+    fa_rects dirty;               /* screen area changed since the last render, after */
+    int shift_x, shift_y;         /* the whole screen moved this far since then (scrolls) */
 } cdg_state;
 
 /* A saved cdg_state: colour indices are 4 bits, so two share a byte (the left one in
@@ -91,17 +94,38 @@ struct fa_cdg_index {
     cdg_state build;              /* discs: the decoder running over the packs written */
     size_t high;                  /* discs: packs written up to here; the decoder
                                      catches up with it a little at each write */
+    /* The safety-zone pre-pass (files), from the same walk: */
+    uint8_t ink[CDG_ROWS][CDG_COLS]; /* tiles now holding something other than the background */
+    size_t border_ink;            /* 1 + the last pack that left that in a border tile; 0 = none */
+    int box[4];                   /* tiles that ever held it: col0, row0, col1, row1 (empty: 0s) */
 };
+
+/* A surface's layout: what its buffer holds and where (layout_want, layout_apply). */
+typedef struct cdg_layout {
+    uint32_t crop[4];             /* x, y, width, height: the part of the screen shown */
+    int zone, resolved, scaled;
+    uint32_t n;                   /* scaled: the multiple */
+    uint32_t pic_w, pic_h;        /* the picture, in buffer pixels */
+    uint32_t pic_x, pic_y;        /* its top-left in the buffer (padding and margin) */
+    uint32_t buf_w, buf_h;        /* the whole buffer */
+    uint32_t pad;                 /* the padding alone, in buffer pixels */
+} cdg_layout;
 
 struct fa_cdg_surface {
     struct fa_stream* stream;
     struct fa_cdg_surface* next;  /* stream->cdg_surfaces, under cdg_lock */
     fa_cdg_pixel_format format;
     uint32_t flags;
-    uint32_t width, height;       /* output */
-    uint32_t win_x, win_y, win_w, win_h; /* the part of the screen shown */
+    uint32_t cfg_w, cfg_h;        /* the config's output size (0 = the crop's) */
+    int has_pres;                 /* fa_cdg_surface_set_presentation gave options */
+    fa_cdg_presentation pres;
+    int tb;                       /* FA_CDG_TRANSPARENT_BORDER */
+    cdg_layout lay;               /* in use; lay.buf_w 0 before the first */
+    uint64_t layout_revision;
+    uint32_t width, height;       /* the picture's output size (= lay.pic_w, pic_h) */
+    uint32_t win_x, win_y, win_w, win_h; /* the part of the screen shown (= lay.crop) */
     uint8_t* pixels;              /* fa_cdg_surface_update's picture; made by its first call */
-    int32_t stride;               /* of a row of pixels, and the least update_into takes */
+    int32_t stride;               /* of a row of the buffer, and the least update_into takes */
     uint64_t pixels_revision;     /* the revision `pixels` holds (0 = none) */
     uint8_t pixels_palette[16][4]; /* the palette of fa_cdg_surface_update's last frame */
     int pixels_drawn;
@@ -123,6 +147,17 @@ struct fa_cdg_surface {
     uint32_t* ylerp;              /* output row -> lerp_map */
     cdg_state st;
     size_t stale_from;            /* packs from here were rewritten (SIZE_MAX = none), under cdg_lock */
+    /* Presentation scaling: the screen area [mx0, mx0 + mw) x [my0, my0 + mh) drawn at
+     * sc.n (the crop, and what smooth-scroll offsets can bring into it), from which
+     * update_into copies. */
+    cdg_scaler sc;
+    uint8_t* master;
+    size_t master_stride;
+    int mx0, my0, mw, mh;
+    int master_tb;                /* its border was drawn transparent */
+    uint8_t master_pm[CDG_SCALE_COLORS][4]; /* the colours it was drawn with */
+    uint8_t eidx[FA_CDG_HEIGHT][FA_CDG_WIDTH]; /* the screen as drawn: 16 = transparent border */
+    uint16_t* rows;               /* the scaler's scratch rows (cdg_scale_rect) */
 };
 
 /* ---- data --------------------------------------------------------------------- */
@@ -250,7 +285,8 @@ static void state_reset(cdg_state* st)
     mark_all(st);
 }
 
-static void memory_preset(cdg_state* st, const uint8_t* d)
+/* Returns 0 for a repeat that was skipped. */
+static int memory_preset(cdg_state* st, const uint8_t* d)
 {
     uint8_t color = d[0] & 0x0F;
     int8_t repeat = (int8_t)(d[1] & 0x0F);
@@ -263,7 +299,7 @@ static void memory_preset(cdg_state* st, const uint8_t* d)
         (st->clean || (repeat > st->repeat && st->next - st->preset_at <= CDG_REPEAT_SPAN))) {
         st->repeat = repeat;
         st->preset_at = st->next;
-        return;
+        return 0;
     }
     memset(st->screen, color, sizeof(st->screen));
     st->bg = color;
@@ -272,6 +308,7 @@ static void memory_preset(cdg_state* st, const uint8_t* d)
     st->repeat = repeat;
     st->preset_at = st->next;
     mark_all(st);
+    return 1;
 }
 
 static void border_preset(cdg_state* st, const uint8_t* d)
@@ -308,6 +345,26 @@ static void tile(cdg_state* st, const uint8_t* d, int xor_mode)
     }
     st->clean = 0;
     mark(st, x0, y0, x0 + CDG_TILE_W, y0 + CDG_TILE_H);
+}
+
+/* The whole screen moved by (dx, dy): so does what was marked as changed, and the
+ * band that came in is marked. A surface that keeps its picture moves it too. */
+static void moved(cdg_state* st, int dx, int dy)
+{
+    fa_rects old = st->dirty;
+    int i;
+    fa_rects_clear(&st->dirty);
+    for (i = 0; i < old.n; i++) {
+        int x0 = old.r[i][0] + dx, y0 = old.r[i][1] + dy, x1 = old.r[i][2] + dx, y1 = old.r[i][3] + dy;
+        mark(st, x0 < 0 ? 0 : x0, y0 < 0 ? 0 : y0, x1 > FA_CDG_WIDTH ? FA_CDG_WIDTH : x1,
+             y1 > FA_CDG_HEIGHT ? FA_CDG_HEIGHT : y1);
+    }
+    if (dx > 0) mark(st, 0, 0, dx, FA_CDG_HEIGHT);
+    if (dx < 0) mark(st, FA_CDG_WIDTH + dx, 0, FA_CDG_WIDTH, FA_CDG_HEIGHT);
+    if (dy > 0) mark(st, 0, 0, FA_CDG_WIDTH, dy);
+    if (dy < 0) mark(st, 0, FA_CDG_HEIGHT + dy, FA_CDG_WIDTH, FA_CDG_HEIGHT);
+    st->shift_x += dx;
+    st->shift_y += dy;
 }
 
 /* Scroll by a tile: the whole screen moves; what leaves one side comes back on the
@@ -350,7 +407,11 @@ static void scroll(cdg_state* st, const uint8_t* d, int copy)
             else memset(st->screen[FA_CDG_HEIGHT - CDG_TILE_H], color, band);
         }
     }
-    if (hcmd == 1 || hcmd == 2 || vcmd == 1 || vcmd == 2) { st->clean = 0; mark_all(st); }
+    if (hcmd == 1 || hcmd == 2 || vcmd == 1 || vcmd == 2) {
+        st->clean = 0;
+        moved(st, hcmd == 1 ? CDG_TILE_W : hcmd == 2 ? -CDG_TILE_W : 0,
+              vcmd == 1 ? CDG_TILE_H : vcmd == 2 ? -CDG_TILE_H : 0);
+    }
     st->hoff = hoff;
     st->voff = voff;
 }
@@ -369,13 +430,14 @@ static void load_colors(cdg_state* st, const uint8_t* d, int base)
     }
 }
 
-static void apply_pack(cdg_state* st, const uint8_t* pack)
+/* Returns the instruction applied, 0 for none (or a skipped repeat of a clear). */
+static int apply_pack(cdg_state* st, const uint8_t* pack)
 {
     const uint8_t* d = pack + 4; /* command, instruction, 2 parity bytes, 16 data bytes */
-    int i;
-    if ((pack[0] & 0x3F) != CDG_MODE_GRAPHICS) return;
-    switch (pack[1] & 0x3F) {
-    case CDG_MEMORY_PRESET: memory_preset(st, d); break;
+    int i, op = pack[1] & 0x3F;
+    if ((pack[0] & 0x3F) != CDG_MODE_GRAPHICS) return 0;
+    switch (op) {
+    case CDG_MEMORY_PRESET: if (!memory_preset(st, d)) op = 0; break;
     case CDG_BORDER_PRESET: border_preset(st, d); break;
     case CDG_TILE_NORMAL: tile(st, d, 0); break;
     case CDG_TILE_XOR: tile(st, d, 1); break;
@@ -386,8 +448,9 @@ static void apply_pack(cdg_state* st, const uint8_t* pack)
         break;
     case CDG_COLORS_LOW: load_colors(st, d, 0); break;
     case CDG_COLORS_HIGH: load_colors(st, d, 8); break;
-    default: break;
+    default: op = 0; break;
     }
+    return op;
 }
 
 /* ---- checkpoints ------------------------------------------------------------------ */
@@ -437,6 +500,7 @@ static void checkpoint_load(const cdg_checkpoint* c, cdg_state* st)
     st->preset_at = c->preset_at;
     st->next = c->next;
     fa_rects_clear(&st->dirty);
+    st->shift_x = st->shift_y = 0;
 }
 
 static void index_free(struct fa_cdg_index* ix)
@@ -467,15 +531,82 @@ static struct fa_cdg_index* index_new(size_t count)
     return ix;
 }
 
+/* ---- the safety-zone pre-pass ------------------------------------------------------ */
+
+static int border_tile(int row, int col) { return row == 0 || row == CDG_ROWS - 1 || col == 0 || col == CDG_COLS - 1; }
+
+/* Tile (row, col) was drawn, or moved: record whether it holds something other than
+ * the background. */
+static void ink_note(struct fa_cdg_index* ix, int row, int col, int ink)
+{
+    int* b = ix->box;
+    ix->ink[row][col] = (uint8_t)ink;
+    if (!ink) return;
+    if (border_tile(row, col)) ix->border_ink = ix->build.next + 1;
+    if (b[0] >= b[2]) { b[0] = col; b[1] = row; b[2] = col + 1; b[3] = row + 1; return; }
+    if (col < b[0]) b[0] = col;
+    if (row < b[1]) b[1] = row;
+    if (col + 1 > b[2]) b[2] = col + 1;
+    if (row + 1 > b[3]) b[3] = row + 1;
+}
+
+static int tile_ink(const cdg_state* st, int row, int col)
+{
+    int y, x;
+    for (y = row * CDG_TILE_H; y < (row + 1) * CDG_TILE_H; y++)
+        for (x = col * CDG_TILE_W; x < (col + 1) * CDG_TILE_W; x++)
+            if (st->screen[y][x] != st->bg) return 1;
+    return 0;
+}
+
+/* After the index's decoder applied instruction `op` (data `d`): what the AUTO and
+ * SUPER safety zones need. Drawing is tiles and scrolls; a border preset's solid
+ * colour does not count, so tiles are followed rather than pixels compared. */
+static void prepass(struct fa_cdg_index* ix, const cdg_state* st, const uint8_t* d, int op)
+{
+    switch (op) {
+    case CDG_MEMORY_PRESET:
+        memset(ix->ink, 0, sizeof(ix->ink));
+        break;
+    case CDG_TILE_NORMAL:
+    case CDG_TILE_XOR: {
+        int row = d[2] & 0x1F, col = d[3] & 0x3F;
+        if (row < CDG_ROWS && col < CDG_COLS) ink_note(ix, row, col, tile_ink(st, row, col));
+        break;
+    }
+    case CDG_SCROLL_PRESET:
+    case CDG_SCROLL_COPY: {
+        int hcmd = (d[1] >> 4) & 3, vcmd = (d[2] >> 4) & 3, r, c;
+        uint8_t was[CDG_ROWS][CDG_COLS], fill = (uint8_t)((d[0] & 0x0F) != st->bg);
+        if (hcmd != 1 && hcmd != 2 && vcmd != 1 && vcmd != 2) break;
+        memcpy(was, ix->ink, sizeof(was));
+        for (r = 0; r < CDG_ROWS; r++)
+            for (c = 0; c < CDG_COLS; c++) {
+                int fr = vcmd == 1 ? r - 1 : vcmd == 2 ? r + 1 : r, fc = hcmd == 1 ? c - 1 : hcmd == 2 ? c + 1 : c;
+                int wrapped = fr < 0 || fr >= CDG_ROWS || fc < 0 || fc >= CDG_COLS;
+                fr = (fr + CDG_ROWS) % CDG_ROWS;
+                fc = (fc + CDG_COLS) % CDG_COLS;
+                ink_note(ix, r, c, wrapped && op == CDG_SCROLL_PRESET ? fill : was[fr][fc]);
+            }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
 /* Runs the index's decoder over packs [build.next, upto), saving each checkpoint. */
 static void index_advance(struct fa_cdg_index* ix, const fa_cdg_data* d, size_t upto)
 {
     cdg_state* st = &ix->build;
     while (st->next < upto) {
-        apply_pack(st, d->packs + st->next * FA_CDG_PACK_BYTES);
+        const uint8_t* p = d->packs + st->next * FA_CDG_PACK_BYTES;
+        int op = apply_pack(st, p);
+        if (op) prepass(ix, st, p + 4, op);
         st->next++;
         if (st->next % ix->step == 0 && st->next / ix->step == ix->count + 1 && ix->count < ix->cap) {
             fa_rects_clear(&st->dirty);
+            st->shift_x = st->shift_y = 0;
             checkpoint_save(&ix->at[ix->count++], st);
         }
     }
@@ -517,14 +648,22 @@ static void index_written(fa_cdg_data* d, size_t first, size_t n, int changed)
 
 /* ---- rendering ------------------------------------------------------------------- */
 
+static int in_picture_area(uint32_t sx, uint32_t sy)
+{
+    return sx >= CDG_BORDER_X && sx < FA_CDG_WIDTH - CDG_BORDER_X && sy >= CDG_BORDER_Y && sy < FA_CDG_HEIGHT - CDG_BORDER_Y;
+}
+
 /* Colour index of window pixel (x, y): the picture area shows the screen shifted by
- * the smooth-scroll offsets, the border does not move. */
+ * the smooth-scroll offsets, the border does not move (FA_CDG_INDEX_TRANSPARENT with
+ * a transparent border). */
 static uint8_t window_index(const fa_cdg_surface* f, uint32_t x, uint32_t y)
 {
     uint32_t sx = f->win_x + x, sy = f->win_y + y;
-    if (sx >= CDG_BORDER_X && sx < FA_CDG_WIDTH - CDG_BORDER_X && sy >= CDG_BORDER_Y && sy < FA_CDG_HEIGHT - CDG_BORDER_Y) {
+    if (in_picture_area(sx, sy)) {
         sx += f->st.hoff;
         sy += f->st.voff;
+    } else if (f->tb) {
+        return FA_CDG_INDEX_TRANSPARENT;
     }
     return f->st.screen[sy][sx];
 }
@@ -598,11 +737,12 @@ static uint32_t lerp_map(uint32_t o, uint32_t n, uint32_t w)
 static void render_rect(const fa_cdg_surface* f, const uint8_t pal[16][4], uint8_t* dst, int32_t stride,
                         uint32_t ox0, uint32_t oy0, uint32_t ox1, uint32_t oy1)
 {
-    uint32_t pm[16][4];   /* premultiplied palette */
+    uint32_t pm[CDG_SCALE_COLORS][4];   /* premultiplied palette; 16 = transparent */
     uint32_t ox, oy, i, cy0 = UINT32_MAX, cy1 = UINT32_MAX;
-    uint8_t flat[16][4], r0[FA_CDG_WIDTH], r1[FA_CDG_WIDTH];   /* smooth: output pixels, window rows cy0, cy1 */
+    uint8_t flat[CDG_SCALE_COLORS][4], r0[FA_CDG_WIDTH], r1[FA_CDG_WIDTH];   /* smooth: output pixels, window rows cy0, cy1 */
     int have_flat = 0;
     if (ox0 >= ox1 || oy0 >= oy1) return;
+    memset(pm[16], 0, sizeof(pm[16]));
     for (i = 0; i < 16; i++) {
         pm[i][3] = pal[i][3];
         pm[i][0] = (pal[i][0] * pm[i][3] + 127) / 255;
@@ -615,9 +755,10 @@ static void render_rect(const fa_cdg_surface* f, const uint8_t pal[16][4], uint8
             for (ox = ox0; ox < ox1; ox++) row[ox] = window_index(f, f->xmap[ox], f->ymap[oy]);
         } else if (!(f->flags & FA_CDG_SMOOTH) || (f->width == f->win_w && f->height == f->win_h)) {
             /* Sharp pixels: straight from the palette in the output's byte order. */
-            uint8_t lut[16][4];
+            uint8_t lut[CDG_SCALE_COLORS][4];
             uint32_t wy = f->ymap[oy];
             int premul = (f->flags & FA_CDG_PREMULTIPLIED) != 0;
+            memset(lut[16], 0, sizeof(lut[16]));
             for (i = 0; i < 16; i++) {
                 uint32_t r = premul ? pm[i][0] : pal[i][0], g = premul ? pm[i][1] : pal[i][1];
                 uint32_t b = premul ? pm[i][2] : pal[i][2];
@@ -633,7 +774,7 @@ static void render_rect(const fa_cdg_surface* f, const uint8_t pal[16][4], uint8
              * so those pixels (most of a picture) come straight from `flat`. */
             uint32_t y0 = f->ylerp[oy] >> 8, ty = f->ylerp[oy] & 255, y1 = y0 + 1 < f->win_h ? y0 + 1 : y0;
             if (!have_flat) {
-                for (i = 0; i < 16; i++) store_pixel(f, flat[i], pm[i][0], pm[i][1], pm[i][2], pm[i][3]);
+                for (i = 0; i < CDG_SCALE_COLORS; i++) store_pixel(f, flat[i], pm[i][0], pm[i][1], pm[i][2], pm[i][3]);
                 have_flat = 1;
             }
             if (y0 != cy0 || y1 != cy1) {
@@ -665,27 +806,236 @@ static void render_rect(const fa_cdg_surface* f, const uint8_t pal[16][4], uint8
     }
 }
 
-/* Brings the surface's picture up to the decoder state: works out the output pixels
- * that changed since the last call (all of them when the colours of a colour format,
- * the smooth-scroll offsets or nothing yet was drawn), and when any did, takes the
- * next revision and records the area in the history. `pal` gets the colours to draw
- * with. Draws nothing: draw() does, into whichever buffer. */
-static void advance(fa_cdg_surface* f, uint8_t pal[16][4])
+static uint32_t bytes_per_pixel(const fa_cdg_surface* f)
+{
+    return !f->lay.scaled && f->format == FA_CDG_PIXELS_INDEXED8 ? 1 : 4;
+}
+
+/* The pixel format of the buffer: presentation scaling draws colour. */
+static fa_cdg_pixel_format out_format(const fa_cdg_surface* f)
+{
+    if (!f->lay.scaled) return f->format;
+    return f->format == FA_CDG_PIXELS_RGBA32 ? FA_CDG_PIXELS_RGBA32 : FA_CDG_PIXELS_BGRA32;
+}
+
+/* Buffer rectangle r (x0 y0 x1 y1) outside the picture: transparent. */
+static void fill_padding(const fa_cdg_surface* f, uint8_t* dst, int32_t stride, const int r[4])
+{
+    const cdg_layout* l = &f->lay;
+    int x0 = r[0], y0 = r[1], x1 = r[2], y1 = r[3], y;
+    int px0 = (int)l->pic_x, py0 = (int)l->pic_y, px1 = px0 + (int)l->pic_w, py1 = py0 + (int)l->pic_h;
+    uint32_t bpp = bytes_per_pixel(f);
+    int value = bpp == 1 ? FA_CDG_INDEX_TRANSPARENT : 0;
+    if (x0 >= px0 && x1 <= px1 && y0 >= py0 && y1 <= py1) return;
+    for (y = y0; y < y1; y++) {
+        uint8_t* row = dst + (size_t)y * (size_t)stride;
+        if (y < py0 || y >= py1) { memset(row + (size_t)x0 * bpp, value, (size_t)(x1 - x0) * bpp); continue; }
+        if (x0 < px0) memset(row + (size_t)x0 * bpp, value, (size_t)((x1 < px0 ? x1 : px0) - x0) * bpp);
+        if (x1 > px1) { int a = x0 > px1 ? x0 : px1; memset(row + (size_t)a * bpp, value, (size_t)(x1 - a) * bpp); }
+    }
+}
+
+/* ---- presentation scaling ------------------------------------------------------- */
+
+/* The colours the master is drawn with: premultiplied, in the buffer's byte order,
+ * the background transparent, 16 transparent. */
+static void scaled_palette(const fa_cdg_surface* f, const uint8_t pal[16][4], uint8_t pm[CDG_SCALE_COLORS][4])
+{
+    int i, rgba = out_format(f) == FA_CDG_PIXELS_RGBA32;
+    for (i = 0; i < 16; i++) {
+        uint32_t a = i == f->st.bg ? 0 : pal[i][3];
+        uint8_t r = (uint8_t)((pal[i][0] * a + 127) / 255), g = (uint8_t)((pal[i][1] * a + 127) / 255);
+        uint8_t b = (uint8_t)((pal[i][2] * a + 127) / 255);
+        pm[i][0] = rgba ? r : b;
+        pm[i][1] = g;
+        pm[i][2] = rgba ? b : r;
+        pm[i][3] = (uint8_t)a;
+    }
+    memset(pm[16], 0, sizeof(pm[16]));
+}
+
+static void master_add(const fa_cdg_surface* f, fa_rects* m, int x0, int y0, int x1, int y1)
+{
+    if (x0 < f->mx0) x0 = f->mx0;
+    if (y0 < f->my0) y0 = f->my0;
+    if (x1 > f->mx0 + f->mw) x1 = f->mx0 + f->mw;
+    if (y1 > f->my0 + f->mh) y1 = f->my0 + f->mh;
+    fa_rects_add(m, x0, y0, x1, y1);
+}
+
+/* Screen area [x0, x1) x [y0, y1) changed: the master pixels that depend on it. */
+static void master_mark(const fa_cdg_surface* f, fa_rects* m, int x0, int y0, int x1, int y1)
+{
+    int a = f->sc.reach_across, l = f->sc.reach_along;
+    master_add(f, m, x0 - l, y0 - a, x1 + l, y1 + a);
+    if (l != a) master_add(f, m, x0 - a, y0 - l, x1 + a, y1 + l);
+}
+
+/* The screen moved by (dx, dy) CD+G pixels: the master moves with it, and what came
+ * in at its edges is marked for drawing, as is what now lies next to the screen's
+ * own edge (drawn there without a neighbour). */
+static void master_shift(fa_cdg_surface* f, int dx, int dy, fa_rects* m)
+{
+    int n = (int)f->sc.n, dxp = dx * n, dyp = dy * n, w = f->mw * n, h = f->mh * n, y;
+    int mx1 = f->mx0 + f->mw, my1 = f->my0 + f->mh;
+    size_t len = (size_t)(w - (dxp < 0 ? -dxp : dxp)) * 4, to = (size_t)(dxp > 0 ? dxp : 0) * 4;
+    size_t from = (size_t)(dxp < 0 ? -dxp : 0) * 4;
+    if (dyp > 0) {
+        for (y = h - 1; y >= dyp; y--)
+            memmove(f->master + (size_t)y * f->master_stride + to, f->master + (size_t)(y - dyp) * f->master_stride + from, len);
+    } else {
+        for (y = 0; y < h + dyp; y++)
+            memmove(f->master + (size_t)y * f->master_stride + to, f->master + (size_t)(y - dyp) * f->master_stride + from, len);
+    }
+    if (dx > 0) master_mark(f, m, f->mx0, f->my0, f->mx0 + dx, my1);
+    if (dx < 0) master_mark(f, m, mx1 + dx, f->my0, mx1, my1);
+    if (dy > 0) master_mark(f, m, f->mx0, f->my0, mx1, f->my0 + dy);
+    if (dy < 0) master_mark(f, m, f->mx0, my1 + dy, mx1, my1);
+    /* Edge blend treats a run that ends at the screen's edge differently: content that
+     * moved towards an edge is drawn again within reach of it (clipped to the master). */
+    if (dx > 0) master_mark(f, m, FA_CDG_WIDTH - 1, f->my0, FA_CDG_WIDTH, my1);
+    if (dx < 0) master_mark(f, m, 0, f->my0, 1, my1);
+    if (dy > 0) master_mark(f, m, f->mx0, FA_CDG_HEIGHT - 1, mx1, FA_CDG_HEIGHT);
+    if (dy < 0) master_mark(f, m, f->mx0, 0, mx1, 1);
+}
+
+/* The border area, moved by (dx, dy). */
+static void mark_border(const fa_cdg_surface* f, fa_rects* m, int dx, int dy)
+{
+    master_mark(f, m, dx, dy, FA_CDG_WIDTH + dx, CDG_BORDER_Y + dy);
+    master_mark(f, m, dx, FA_CDG_HEIGHT - CDG_BORDER_Y + dy, FA_CDG_WIDTH + dx, FA_CDG_HEIGHT + dy);
+    master_mark(f, m, dx, CDG_BORDER_Y + dy, CDG_BORDER_X + dx, FA_CDG_HEIGHT - CDG_BORDER_Y + dy);
+    master_mark(f, m, FA_CDG_WIDTH - CDG_BORDER_X + dx, CDG_BORDER_Y + dy, FA_CDG_WIDTH + dx, FA_CDG_HEIGHT - CDG_BORDER_Y + dy);
+}
+
+/* View rectangle [x0, x1) x [y0, y1) (window coordinates on the screen), as buffer
+ * pixels, into `area`. */
+static void view_to_buffer(const fa_cdg_surface* f, fa_rects* area, int x0, int y0, int x1, int y1)
+{
+    int n = (int)f->lay.n, cx = (int)f->win_x, cy = (int)f->win_y;
+    if (x0 < cx) x0 = cx;
+    if (y0 < cy) y0 = cy;
+    if (x1 > cx + (int)f->win_w) x1 = cx + (int)f->win_w;
+    if (y1 > cy + (int)f->win_h) y1 = cy + (int)f->win_h;
+    if (x0 >= x1 || y0 >= y1) return;
+    fa_rects_add(area, (int)f->lay.pic_x + (x0 - cx) * n, (int)f->lay.pic_y + (y0 - cy) * n,
+                 (int)f->lay.pic_x + (x1 - cx) * n, (int)f->lay.pic_y + (y1 - cy) * n);
+}
+
+/* advance() with presentation scaling: the master is brought up to the decoder state
+ * (moved for scrolls, the changed areas and what they reach drawn again) and `area`
+ * gets the buffer pixels that changed. */
+static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects* area)
 {
     cdg_state* st = &f->st;
-    fa_rects area;
-    int palette_changed, full, i, bg, border;
-    palette_rgba(f, pal);
-    palette_changed = !f->drawn || memcmp(pal, f->shown_palette, 16 * 4) != 0;
-    /* Indexed pixels do not depend on the palette; colour pixels do. Smooth-scroll
-     * offsets move the whole picture area; so does a scroll while they are set
-     * (rare: redraw all rather than map the shift). */
-    full = !f->drawn || st->hoff != f->shown_hoff || st->voff != f->shown_voff ||
-           (palette_changed && f->format != FA_CDG_PIXELS_INDEXED8) || (st->dirty.n && (st->hoff || st->voff));
-    fa_rects_clear(&area);
+    uint8_t pm[CDG_SCALE_COLORS][4];
+    fa_rects m;
+    int tb = f->tb && !st->hoff && !st->voff, i, y;
+    int moved = st->shift_x || st->shift_y, full, view_full;
+    scaled_palette(f, pal, pm);
+    full = !f->drawn || memcmp(pm, f->master_pm, sizeof(pm)) != 0 || abs(st->shift_x) >= f->mw ||
+           abs(st->shift_y) >= f->mh;
+    fa_rects_clear(&m);
     if (full) {
-        fa_rects_add(&area, 0, 0, (int)f->width, (int)f->height);
+        fa_rects_add(&m, f->mx0, f->my0, f->mx0 + f->mw, f->my0 + f->mh);
     } else {
+        if (moved) master_shift(f, st->shift_x, st->shift_y, &m);
+        for (i = 0; i < st->dirty.n; i++) master_mark(f, &m, st->dirty.r[i][0], st->dirty.r[i][1], st->dirty.r[i][2], st->dirty.r[i][3]);
+        /* A transparent border stays where it is while the picture moves under it, and
+         * the transparent pixels the move carried into the picture are drawn again. */
+        if (tb != f->master_tb || (tb && moved)) mark_border(f, &m, 0, 0);
+        if (f->master_tb && moved) mark_border(f, &m, st->shift_x, st->shift_y);
+    }
+    if (m.n) {
+        memcpy(f->eidx, st->screen, sizeof(f->eidx));
+        if (tb)
+            for (y = 0; y < FA_CDG_HEIGHT; y++) {
+                if (y < CDG_BORDER_Y || y >= FA_CDG_HEIGHT - CDG_BORDER_Y) {
+                    memset(f->eidx[y], FA_CDG_INDEX_TRANSPARENT, FA_CDG_WIDTH);
+                } else {
+                    memset(f->eidx[y], FA_CDG_INDEX_TRANSPARENT, CDG_BORDER_X);
+                    memset(f->eidx[y] + FA_CDG_WIDTH - CDG_BORDER_X, FA_CDG_INDEX_TRANSPARENT, CDG_BORDER_X);
+                }
+            }
+        for (i = 0; i < m.n; i++)
+            cdg_scale_rect(&f->sc, (const uint8_t(*)[CDG_SCALE_W])f->eidx, (const uint8_t(*)[4])pm, f->master,
+                           f->master_stride, f->mx0, f->my0, m.r[i][0], m.r[i][1], m.r[i][2], m.r[i][3], f->rows);
+    }
+    f->master_tb = tb;
+    memcpy(f->master_pm, pm, sizeof(pm));
+    /* A move or new offsets change where everything is shown. */
+    view_full = full || moved || st->hoff != f->shown_hoff || st->voff != f->shown_voff;
+    if (view_full) {
+        fa_rects_add(area, (int)f->lay.pic_x, (int)f->lay.pic_y, (int)(f->lay.pic_x + f->lay.pic_w),
+                     (int)(f->lay.pic_y + f->lay.pic_h));
+        return;
+    }
+    for (i = 0; i < m.n; i++) {
+        /* The screen area is shown as it is in the border, and shifted by the offsets
+         * inside it: both, clipped (more than needed at worst). */
+        view_to_buffer(f, area, m.r[i][0], m.r[i][1], m.r[i][2], m.r[i][3]);
+        if (st->hoff || st->voff)
+            view_to_buffer(f, area, m.r[i][0] - st->hoff, m.r[i][1] - st->voff, m.r[i][2] - st->hoff, m.r[i][3] - st->voff);
+    }
+}
+
+/* Copies buffer rectangle r (x0 y0 x1 y1) from the master: the border as it is on the
+ * screen, the picture area shifted by the smooth-scroll offsets, padding and margin
+ * transparent. A transparent border while the offsets are set is not in the master
+ * (it holds the screen's colours there, which the offsets can bring into view). */
+static void copy_out(const fa_cdg_surface* f, uint8_t* dst, int32_t stride, const int r[4])
+{
+    const cdg_layout* l = &f->lay;
+    int n = (int)l->n, oy, x0 = r[0], x1 = r[2];
+    int a = x0 > (int)l->pic_x ? x0 : (int)l->pic_x;
+    int b = x1 < (int)(l->pic_x + l->pic_w) ? x1 : (int)(l->pic_x + l->pic_w);
+    /* Where the picture area starts and ends in buffer x. */
+    int i0 = (int)l->pic_x + (CDG_BORDER_X - (int)f->win_x) * n, i1 = (int)l->pic_x + (FA_CDG_WIDTH - CDG_BORDER_X - (int)f->win_x) * n;
+    int zero_border = f->tb && (f->st.hoff || f->st.voff);
+    fill_padding(f, dst, stride, r);
+    if (i0 < a) i0 = a;
+    if (i0 > b) i0 = b;
+    if (i1 < i0) i1 = i0;
+    if (i1 > b) i1 = b;
+    if (a >= b) return;
+    for (oy = r[1]; oy < r[3]; oy++) {
+        uint8_t* row = dst + (size_t)oy * (size_t)stride;
+        int vy, sub, seg;
+        if (oy < (int)l->pic_y || oy >= (int)(l->pic_y + l->pic_h)) continue;
+        vy = (int)f->win_y + (oy - (int)l->pic_y) / n;
+        sub = (oy - (int)l->pic_y) % n;
+        for (seg = 0; seg < 3; seg++) {
+            int sa = seg == 0 ? a : seg == 1 ? i0 : i1, sb = seg == 0 ? i0 : seg == 1 ? i1 : b, sy = vy, col;
+            int shifted = seg == 1 && vy >= CDG_BORDER_Y && vy < FA_CDG_HEIGHT - CDG_BORDER_Y;
+            const uint8_t* src;
+            if (sa >= sb) continue;
+            if (!shifted && zero_border) { memset(row + (size_t)sa * 4, 0, (size_t)(sb - sa) * 4); continue; }
+            col = (sa - (int)l->pic_x) + ((int)f->win_x - f->mx0) * n;
+            if (shifted) { sy += f->st.voff; col += f->st.hoff * n; }
+            src = f->master + (size_t)((sy - f->my0) * n + sub) * f->master_stride + (size_t)col * 4;
+            memcpy(row + (size_t)sa * 4, src, (size_t)(sb - sa) * 4);
+        }
+    }
+}
+
+/* ---- updates ------------------------------------------------------------------------ */
+
+/* advance() without presentation scaling: the output pixels the changed screen area
+ * maps to. */
+static void advance_classic(fa_cdg_surface* f, int palette_changed, fa_rects* area)
+{
+    cdg_state* st = &f->st;
+    int i, px = (int)f->lay.pic_x, py = (int)f->lay.pic_y;
+    /* Indexed pixels do not depend on the palette; colour pixels do. Smooth-scroll
+     * offsets move the whole picture area; so does a scroll (the whole screen moves),
+     * and anything drawn while the offsets are set (rare: redraw all rather than map
+     * the shift). */
+    if (st->hoff != f->shown_hoff || st->voff != f->shown_voff || st->shift_x || st->shift_y ||
+        (palette_changed && f->format != FA_CDG_PIXELS_INDEXED8) || (st->dirty.n && (st->hoff || st->voff))) {
+        fa_rects_add(area, px, py, px + (int)f->width, py + (int)f->height);
+        return;
+    }
+    {
         int pad = (f->flags & FA_CDG_SMOOTH) && f->format != FA_CDG_PIXELS_INDEXED8 ? 1 : 0;
         for (i = 0; i < st->dirty.n; i++) {
             const int* d = st->dirty.r[i];
@@ -704,10 +1054,29 @@ static void advance(fa_cdg_surface* f, uint8_t pal[16][4])
             oy1 = (uint32_t)((y1 * f->height + f->win_h - 1) / f->win_h);
             if (ox1 > f->width) ox1 = f->width;
             if (oy1 > f->height) oy1 = f->height;
-            fa_rects_add(&area, (int)ox0, (int)oy0, (int)ox1, (int)oy1);
+            fa_rects_add(area, px + (int)ox0, py + (int)oy0, px + (int)ox1, py + (int)oy1);
         }
     }
+}
+
+/* Brings the surface's picture up to the decoder state: works out the buffer pixels
+ * that changed since the last call (everything when nothing was drawn yet), and when
+ * any did, takes the next revision and records the area in the history. `pal` gets
+ * the colours to draw with. Draws nothing into a buffer: draw() does, into whichever
+ * buffer. */
+static void advance(fa_cdg_surface* f, uint8_t pal[16][4])
+{
+    cdg_state* st = &f->st;
+    fa_rects area;
+    int palette_changed, bg, border;
+    palette_rgba(f, pal);
+    palette_changed = !f->drawn || memcmp(pal, f->shown_palette, 16 * 4) != 0;
+    fa_rects_clear(&area);
+    if (!f->drawn) fa_rects_add(&area, 0, 0, (int)f->lay.buf_w, (int)f->lay.buf_h);
+    if (f->lay.scaled) advance_scaled(f, pal, &area);
+    else advance_classic(f, palette_changed, &area);
     fa_rects_clear(&st->dirty);
+    st->shift_x = st->shift_y = 0;
     f->drawn = 1;
     f->shown_hoff = st->hoff;
     f->shown_voff = st->voff;
@@ -732,14 +1101,28 @@ static void advance(fa_cdg_surface* f, uint8_t pal[16][4])
 static int draw(const fa_cdg_surface* f, const uint8_t pal[16][4], uint8_t* dst, int32_t stride, uint64_t since,
                 fa_rects* drawn)
 {
+    const cdg_layout* l = &f->lay;
     int i, partial = fa_history_since(&f->history, f->revision, since, drawn);
+    uint32_t bpp = bytes_per_pixel(f);
     if (!partial) {
         fa_rects_clear(drawn);
-        fa_rects_add(drawn, 0, 0, (int)f->width, (int)f->height);
+        fa_rects_add(drawn, 0, 0, (int)l->buf_w, (int)l->buf_h);
     }
-    for (i = 0; i < drawn->n; i++)
-        render_rect(f, pal, dst, stride, (uint32_t)drawn->r[i][0], (uint32_t)drawn->r[i][1],
-                    (uint32_t)drawn->r[i][2], (uint32_t)drawn->r[i][3]);
+    for (i = 0; i < drawn->n; i++) {
+        const int* r = drawn->r[i];
+        int x0, y0, x1, y1;
+        if (l->scaled) { copy_out(f, dst, stride, r); continue; }
+        fill_padding(f, dst, stride, r);
+        x0 = r[0] > (int)l->pic_x ? r[0] - (int)l->pic_x : 0;
+        y0 = r[1] > (int)l->pic_y ? r[1] - (int)l->pic_y : 0;
+        x1 = r[2] - (int)l->pic_x;
+        y1 = r[3] - (int)l->pic_y;
+        if (x1 > (int)f->width) x1 = (int)f->width;
+        if (y1 > (int)f->height) y1 = (int)f->height;
+        if (x0 < x1 && y0 < y1)
+            render_rect(f, pal, dst + (size_t)l->pic_y * (size_t)stride + (size_t)l->pic_x * bpp, stride,
+                        (uint32_t)x0, (uint32_t)y0, (uint32_t)x1, (uint32_t)y1);
+    }
     return partial;
 }
 
@@ -761,8 +1144,9 @@ static fa_result render(fa_cdg_surface* f, fa_cdg_frame* out)
     fa_rects drawn;
     int b[4], palette_changed;
     if (!f->pixels) {
-        f->pixels = (uint8_t*)calloc((size_t)f->height, (size_t)f->stride);
+        f->pixels = (uint8_t*)calloc((size_t)f->lay.buf_h, (size_t)f->stride);
         if (!f->pixels) return FA_ERROR_OUT_OF_MEMORY;
+        f->pixels_revision = 0;
     }
     advance(f, pal);
     draw(f, pal, f->pixels, f->stride, f->pixels_revision, &drawn);
@@ -773,10 +1157,10 @@ static fa_result render(fa_cdg_surface* f, fa_cdg_frame* out)
     fa_rects_bounds(&drawn, b);
 
     out->pixels = f->pixels;
-    out->width = f->width;
-    out->height = f->height;
+    out->width = f->lay.buf_w;
+    out->height = f->lay.buf_h;
     out->stride = f->stride;
-    out->pixel_format = f->format;
+    out->pixel_format = out_format(f);
     out->palette_changed = palette_changed;
     out->changed = drawn.n > 0 || palette_changed;
     out->dirty_x = (uint32_t)b[0];
@@ -788,6 +1172,161 @@ static fa_result render(fa_cdg_surface* f, fa_cdg_frame* out)
     out->revision = f->revision;
     out->palette_revision = f->palette_revision;
     return FA_OK;
+}
+
+/* ---- layout ---------------------------------------------------------------------- */
+
+/* The crop of the surface's safety zone; AUTO and SUPER from the stream's pre-pass
+ * (under cdg_lock). */
+static void zone_crop(const fa_cdg_surface* f, const fa_cdg_data* d, cdg_layout* l)
+{
+    static const uint32_t show[4] = { 0, 0, FA_CDG_WIDTH, FA_CDG_HEIGHT };
+    static const uint32_t remove[4] = { CDG_BORDER_X, CDG_BORDER_Y, FA_CDG_PICTURE_WIDTH, FA_CDG_PICTURE_HEIGHT };
+    const struct fa_cdg_index* ix = d && !d->from_disc ? d->index : NULL;
+    int zone = f->has_pres ? (int)f->pres.safety_zone : (f->flags & FA_CDG_NO_BORDER) ? FA_SAFETY_REMOVE : FA_SAFETY_SHOW;
+    l->resolved = 1;
+    if ((zone == FA_SAFETY_AUTO || zone == FA_SAFETY_SUPER) && !ix) {
+        zone = FA_SAFETY_SHOW;
+        l->resolved = 0;
+    }
+    if (zone == FA_SAFETY_AUTO) {
+        double ignore = ceil((double)f->pres.auto_ignore_seconds * FA_CDG_PACKS_PER_SECOND);
+        zone = (double)ix->border_ink > ignore ? FA_SAFETY_SHOW : FA_SAFETY_REMOVE;
+    }
+    l->zone = zone;
+    if (zone == FA_SAFETY_SUPER) {
+        int c0 = ix->box[0], r0 = ix->box[1], c1 = ix->box[2], r1 = ix->box[3];
+        if (c0 >= c1) {   /* nothing drawn: the picture area */
+            memcpy(l->crop, remove, sizeof(remove));
+            return;
+        }
+        if (f->pres.super_centered) {
+            int dc = c0 < CDG_COLS - c1 ? c0 : CDG_COLS - c1, dr = r0 < CDG_ROWS - r1 ? r0 : CDG_ROWS - r1;
+            c0 = dc; c1 = CDG_COLS - dc; r0 = dr; r1 = CDG_ROWS - dr;
+        }
+        l->crop[0] = (uint32_t)(c0 * CDG_TILE_W);
+        l->crop[1] = (uint32_t)(r0 * CDG_TILE_H);
+        l->crop[2] = (uint32_t)((c1 - c0) * CDG_TILE_W);
+        l->crop[3] = (uint32_t)((r1 - r0) * CDG_TILE_H);
+        return;
+    }
+    memcpy(l->crop, zone == FA_SAFETY_REMOVE ? remove : show, sizeof(show));
+}
+
+/* The multiple for presentation scaling: the uniform fit of the crop into the
+ * presentation size, rounded up; smaller when the buffer or the master would get
+ * larger than CDG_MAX_OUTPUT. */
+static uint32_t scale_for(const fa_cdg_surface* f, uint32_t cw, uint32_t ch, uint32_t padding)
+{
+    uint32_t n = 1, nw, nh;
+    if (f->present_w) {
+        nw = (f->present_w + cw - 1) / cw;
+        nh = (f->present_h + ch - 1) / ch;
+        n = nw < nh ? nw : nh;
+    }
+    if (n > CDG_SCALE_MAX_N) n = CDG_SCALE_MAX_N;
+    while (n > 1 && ((cw + 2 * (padding + 1) + CDG_TILE_W) * n > CDG_MAX_OUTPUT ||
+                     (ch + 2 * (padding + 1) + CDG_TILE_H) * n > CDG_MAX_OUTPUT))
+        n--;
+    return n;
+}
+
+/* The layout the surface's settings and the stream's graphics call for (under
+ * cdg_lock: reads the pre-pass). */
+static void layout_want(const fa_cdg_surface* f, const fa_cdg_data* d, cdg_layout* l)
+{
+    uint32_t padding = f->has_pres ? f->pres.padding : 0;
+    memset(l, 0, sizeof(*l));
+    zone_crop(f, d, l);
+    l->scaled = f->has_pres && f->pres.scale;
+    if (l->scaled) {
+        l->n = scale_for(f, l->crop[2], l->crop[3], padding);
+        l->pic_w = l->crop[2] * l->n;
+        l->pic_h = l->crop[3] * l->n;
+        l->pic_x = l->pic_y = (padding + 1) * l->n;
+        l->pad = padding * l->n;
+    } else {
+        l->n = 1;
+        l->pic_w = f->cfg_w ? f->cfg_w : l->crop[2];
+        l->pic_h = f->cfg_h ? f->cfg_h : l->crop[3];
+        l->pic_x = (padding * l->pic_w + l->crop[2] / 2) / l->crop[2];
+        l->pic_y = (padding * l->pic_h + l->crop[3] / 2) / l->crop[3];
+        /* A tight crop drawn large would make the padding huge. */
+        if (l->pic_x > CDG_MAX_OUTPUT / 4) l->pic_x = CDG_MAX_OUTPUT / 4;
+        if (l->pic_y > CDG_MAX_OUTPUT / 4) l->pic_y = CDG_MAX_OUTPUT / 4;
+        l->pad = l->pic_x;
+    }
+    l->buf_w = l->pic_w + 2 * l->pic_x;
+    l->buf_h = l->pic_h + 2 * l->pic_y;
+}
+
+static void free_maps(fa_cdg_surface* f)
+{
+    free(f->xmap);
+    free(f->ymap);
+    free(f->xlerp);
+    free(f->ylerp);
+    free(f->master);
+    free(f->rows);
+    f->xmap = f->ymap = NULL;
+    f->xlerp = f->ylerp = NULL;
+    f->master = NULL;
+    f->rows = NULL;
+}
+
+/* Puts layout `l` in place when it differs from the one in use: new maps or master, a
+ * new layout_revision, and the next draw of any buffer is a full one. The scaler
+ * follows the options either way. On failure the surface keeps no layout (the next
+ * call tries again). */
+static fa_result layout_apply(fa_cdg_surface* f, const cdg_layout* l)
+{
+    int smooth = f->has_pres ? f->pres.smoothness : 0, blend = f->has_pres ? f->pres.edge_blend : 0;
+    uint32_t i;
+    if (l->scaled) cdg_scaler_init(&f->sc, l->n, smooth, blend);
+    if (f->lay.buf_w && memcmp(l, &f->lay, sizeof(*l)) == 0) return FA_OK;
+    free_maps(f);
+    free(f->pixels);
+    f->pixels = NULL;
+    f->lay = *l;
+    f->win_x = l->crop[0];
+    f->win_y = l->crop[1];
+    f->win_w = l->crop[2];
+    f->win_h = l->crop[3];
+    f->width = l->pic_w;
+    f->height = l->pic_h;
+    f->stride = (int32_t)(l->buf_w * bytes_per_pixel(f));
+    memset(&f->history, 0, sizeof(f->history));
+    f->drawn = 0;
+    f->layout_revision++;
+    if (l->scaled) {
+        int x1 = (int)(l->crop[0] + l->crop[2]) + CDG_TILE_W - 1, y1 = (int)(l->crop[1] + l->crop[3]) + CDG_TILE_H - 1;
+        f->mx0 = (int)l->crop[0];
+        f->my0 = (int)l->crop[1];
+        f->mw = (x1 < FA_CDG_WIDTH ? x1 : FA_CDG_WIDTH) - f->mx0;
+        f->mh = (y1 < FA_CDG_HEIGHT ? y1 : FA_CDG_HEIGHT) - f->my0;
+        f->master_stride = (size_t)f->mw * l->n * 4;
+        f->master = (uint8_t*)malloc(f->master_stride * (size_t)f->mh * l->n);
+        f->rows = (uint16_t*)malloc(CDG_SCALE_ROWS_BYTES(l->n));
+        if (!f->master || !f->rows) goto oom;
+        return FA_OK;
+    }
+    f->xmap = (uint16_t*)malloc(f->width * sizeof(uint16_t));
+    f->ymap = (uint16_t*)malloc(f->height * sizeof(uint16_t));
+    if (!f->xmap || !f->ymap) goto oom;
+    for (i = 0; i < f->width; i++) f->xmap[i] = (uint16_t)((uint64_t)i * f->win_w / f->width);
+    for (i = 0; i < f->height; i++) f->ymap[i] = (uint16_t)((uint64_t)i * f->win_h / f->height);
+    if (f->flags & FA_CDG_SMOOTH) {
+        f->xlerp = (uint32_t*)malloc(f->width * sizeof(uint32_t));
+        f->ylerp = (uint32_t*)malloc(f->height * sizeof(uint32_t));
+        if (!f->xlerp || !f->ylerp) goto oom;
+        for (i = 0; i < f->width; i++) f->xlerp[i] = lerp_map(i, f->width, f->win_w);
+        for (i = 0; i < f->height; i++) f->ylerp[i] = lerp_map(i, f->height, f->win_h);
+    }
+    return FA_OK;
+oom:
+    free_maps(f);
+    memset(&f->lay, 0, sizeof(f->lay));
+    return FA_ERROR_OUT_OF_MEMORY;
 }
 
 /* ---- the public API ------------------------------------------------------------------ */
@@ -912,10 +1451,7 @@ void fa_stream_cdg_close(struct fa_stream* s)
 
 static void surface_free(fa_cdg_surface* f)
 {
-    free(f->xmap);
-    free(f->ymap);
-    free(f->xlerp);
-    free(f->ylerp);
+    free_maps(f);
     free(f->pixels);
     free(f);
 }
@@ -994,7 +1530,8 @@ FA_API fa_result FA_CALL fa_cdg_surface_create(fa_stream* stream, const fa_cdg_s
 {
     fa_cdg_surface_config c;
     fa_cdg_surface* f;
-    uint32_t bpp, i;
+    cdg_layout want;
+    fa_result r;
     if (out_surface) *out_surface = NULL;
     if (!stream || !out_surface) return FA_ERROR_INVALID_ARG;
     fa_cdg_surface_config_init(&c);
@@ -1014,33 +1551,18 @@ FA_API fa_result FA_CALL fa_cdg_surface_create(fa_stream* stream, const fa_cdg_s
     f->flags = c.flags;
     f->bg_color = c.background_color;
     f->bg_opacity = c.background_opacity;
-    if (c.flags & FA_CDG_NO_BORDER) {
-        f->win_x = CDG_BORDER_X; f->win_y = CDG_BORDER_Y;
-        f->win_w = FA_CDG_PICTURE_WIDTH; f->win_h = FA_CDG_PICTURE_HEIGHT;
-    } else {
-        f->win_w = FA_CDG_WIDTH; f->win_h = FA_CDG_HEIGHT;
-    }
-    f->width = c.width ? c.width : f->win_w;
-    f->height = c.height ? c.height : f->win_h;
-    bpp = f->format == FA_CDG_PIXELS_INDEXED8 ? 1 : 4;
-    f->stride = (int32_t)(f->width * bpp);
-    f->xmap = (uint16_t*)malloc(f->width * sizeof(uint16_t));
-    f->ymap = (uint16_t*)malloc(f->height * sizeof(uint16_t));
-    if (!f->xmap || !f->ymap) { surface_free(f); return FA_ERROR_OUT_OF_MEMORY; }
-    for (i = 0; i < f->width; i++) f->xmap[i] = (uint16_t)((uint64_t)i * f->win_w / f->width);
-    for (i = 0; i < f->height; i++) f->ymap[i] = (uint16_t)((uint64_t)i * f->win_h / f->height);
-    if (f->flags & FA_CDG_SMOOTH) {
-        f->xlerp = (uint32_t*)malloc(f->width * sizeof(uint32_t));
-        f->ylerp = (uint32_t*)malloc(f->height * sizeof(uint32_t));
-        if (!f->xlerp || !f->ylerp) { surface_free(f); return FA_ERROR_OUT_OF_MEMORY; }
-        for (i = 0; i < f->width; i++) f->xlerp[i] = lerp_map(i, f->width, f->win_w);
-        for (i = 0; i < f->height; i++) f->ylerp[i] = lerp_map(i, f->height, f->win_h);
-    }
+    f->cfg_w = c.width;
+    f->cfg_h = c.height;
     state_reset(&f->st);
     f->stale_from = SIZE_MAX;
     fa_mutex_lock(&stream->cdg_lock);
     index_build(stream->cdg);
     f->gen = stream->cdg_gen;
+    layout_want(f, stream->cdg, &want);
+    fa_mutex_unlock(&stream->cdg_lock);
+    r = layout_apply(f, &want);
+    if (r != FA_OK) { surface_free(f); return r; }
+    fa_mutex_lock(&stream->cdg_lock);
     f->next = stream->cdg_surfaces;
     stream->cdg_surfaces = f;
     fa_mutex_unlock(&stream->cdg_lock);
@@ -1082,7 +1604,7 @@ static void restore(fa_cdg_surface* f, const cdg_checkpoint* from)
 {
     cdg_state* st = &f->st;
     fa_rects keep = st->dirty;
-    int x0 = 0, y0 = 0, x1 = 0, y1 = 0, y;
+    int keep_x = st->shift_x, keep_y = st->shift_y, x0 = 0, y0 = 0, x1 = 0, y1 = 0, y;
     uint8_t b[FA_CDG_WIDTH];
     if (!from) memset(b, 0, sizeof(b));
     for (y = 0; y < FA_CDG_HEIGHT; y++) {
@@ -1099,7 +1621,11 @@ static void restore(fa_cdg_surface* f, const cdg_checkpoint* from)
         if (y + 1 > y1) y1 = y + 1;
     }
     if (from) checkpoint_load(from, st); else state_reset(st);
+    /* What is marked and moved stays: the new screen differs from the moved picture
+     * only there and where it differs from the screen it replaces. */
     st->dirty = keep;
+    st->shift_x = keep_x;
+    st->shift_y = keep_y;
     if (x0 < x1) mark(st, x0, y0, x1, y1);
 }
 
@@ -1138,8 +1664,9 @@ static fa_time graphics_time(struct fa_stream* s, fa_time time)
 }
 
 /* Brings the surface's decoder to `time` on the stream's timeline; returns the
- * graphics time. `s` is the surface's stream, held by the caller. */
-static fa_time sync_state(fa_cdg_surface* f, struct fa_stream* s, fa_time time)
+ * graphics time. `want` gets the layout to apply. `s` is the surface's stream, held
+ * by the caller. */
+static fa_time sync_state(fa_cdg_surface* f, struct fa_stream* s, fa_time time, cdg_layout* want)
 {
     size_t target;
     fa_mutex_lock(&s->cdg_lock);
@@ -1158,16 +1685,19 @@ static fa_time sync_state(fa_cdg_surface* f, struct fa_stream* s, fa_time time)
     }
     target = s->cdg ? packs_at(time, s->cdg->count) : 0;
     decode_to(f, s->cdg, target);
+    layout_want(f, s->cdg, want);
     fa_mutex_unlock(&s->cdg_lock);
     return time;
 }
 
 static fa_result surface_update(fa_cdg_surface* f, struct fa_stream* s, fa_time time, fa_cdg_frame* out)
 {
+    cdg_layout want;
     fa_result r;
-    time = sync_state(f, s, time);
+    time = sync_state(f, s, time, &want);
     /* Drawing uses only this surface's state: other surfaces and loads need not wait. */
-    r = render(f, out);
+    r = layout_apply(f, &want);
+    if (r == FA_OK) r = render(f, out);
     out->time = time;
     return r;
 }
@@ -1357,7 +1887,7 @@ FA_API fa_result FA_CALL fa_surface_set_presentation_size(fa_surface* surface, u
     if (!surface) return FA_ERROR_INVALID_ARG;
     r = fa_presentation_size_clamp(&width, &height);
     if (r != FA_OK) return r;
-    /* The classic picture keeps its output size; the presentation options use it. */
+    /* Used by presentation scaling, at the next update or layout. */
     surface->present_w = width;
     surface->present_h = height;
     return FA_OK;
@@ -1370,24 +1900,56 @@ FA_API fa_result FA_CALL fa_surface_set_render_ahead(fa_surface* surface, int32_
     return FA_OK;
 }
 
+/* The layout the surface's settings call for now, in place. */
+static fa_result layout_refresh(fa_cdg_surface* f)
+{
+    struct fa_stream* s = surface_hold(f);
+    cdg_layout want;
+    if (!s) {
+        /* Its stream was closed: the layout in use, or the one without graphics. */
+        if (f->lay.buf_w) return FA_OK;
+        layout_want(f, NULL, &want);
+        return layout_apply(f, &want);
+    }
+    fa_mutex_lock(&s->cdg_lock);
+    if (f->gen != s->cdg_gen) index_build(s->cdg);   /* graphics loaded since: their pre-pass */
+    layout_want(f, s->cdg, &want);
+    fa_mutex_unlock(&s->cdg_lock);
+    stream_release(s);
+    return layout_apply(f, &want);
+}
+
 FA_API fa_result FA_CALL fa_surface_get_layout(fa_surface* surface, fa_surface_layout* out_layout)
 {
     fa_surface_layout l;
+    const cdg_layout* c;
+    fa_result r;
     if (!surface || !out_layout || out_layout->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+    r = layout_refresh(surface);
+    if (r != FA_OK) return r;
+    c = &surface->lay;
     memset(&l, 0, sizeof(l));
     l.struct_size = out_layout->struct_size < sizeof(l) ? out_layout->struct_size : (uint32_t)sizeof(l);
-    l.width = surface->width;
-    l.height = surface->height;
-    l.content_width = surface->width;
-    l.content_height = surface->height;
-    l.scale = 1.0f;
-    l.crop_x = surface->win_x;
-    l.crop_y = surface->win_y;
-    l.crop_width = surface->win_w;
-    l.crop_height = surface->win_h;
-    l.safety_zone = (surface->flags & FA_CDG_NO_BORDER) ? FA_SAFETY_REMOVE : FA_SAFETY_SHOW;
-    l.safety_zone_resolved = 1;
-    l.layout_revision = 1;
+    l.width = c->buf_w;
+    l.height = c->buf_h;
+    if (c->scaled && surface->present_w) {
+        l.bitmap_x = ((int32_t)surface->present_w - (int32_t)c->buf_w) / 2;
+        l.bitmap_y = ((int32_t)surface->present_h - (int32_t)c->buf_h) / 2;
+    }
+    l.content_x = c->pic_x;
+    l.content_y = c->pic_y;
+    l.content_width = c->pic_w;
+    l.content_height = c->pic_h;
+    l.scale = (float)c->n;
+    l.crop_x = c->crop[0];
+    l.crop_y = c->crop[1];
+    l.crop_width = c->crop[2];
+    l.crop_height = c->crop[3];
+    l.safety_zone = (fa_safety_zone)c->zone;
+    l.safety_zone_resolved = c->resolved;
+    l.margin = c->scaled ? c->n : 0;
+    l.padding = c->pad;
+    l.layout_revision = surface->layout_revision;
     memcpy(out_layout, &l, l.struct_size);
     return FA_OK;
 }
@@ -1406,20 +1968,22 @@ FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* surface, fa_time tim
 {
     struct fa_stream* s;
     fa_surface_frame fr;
+    cdg_layout want;
     uint8_t pal[16][4];
     fa_rects drawn;
     int64_t start = fa_monotonic_ns(), drawing;
     int b[4], i, partial;
     fa_result r = FA_OK;
     if (!surface || !dst || !out_frame || out_frame->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
-    if (dst_width != surface->width || dst_height != surface->height) return FA_ERROR_SIZE_MISMATCH;
-    if (dst_stride < surface->stride) return FA_ERROR_INVALID_ARG;
     s = surface_hold(surface);
     if (!s) return FA_ERROR_INVALID_ARG; /* its stream was closed */
     if (time == FA_SURFACE_NOW) r = fa_stream_get_clock(s, &time);
-    if (r == FA_OK) time = sync_state(surface, s, time);
+    if (r == FA_OK) time = sync_state(surface, s, time, &want);
     stream_release(s);
+    if (r == FA_OK) r = layout_apply(surface, &want);
     if (r != FA_OK) return r;
+    if (dst_width != surface->lay.buf_w || dst_height != surface->lay.buf_h) return FA_ERROR_SIZE_MISMATCH;
+    if (dst_stride < surface->stride) return FA_ERROR_INVALID_ARG;
     advance(surface, pal);
     drawing = fa_monotonic_ns();
     partial = draw(surface, pal, (uint8_t*)dst, dst_stride, dst_revision, &drawn);
@@ -1427,7 +1991,7 @@ FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* surface, fa_time tim
     fr.struct_size = out_frame->struct_size < sizeof(fr) ? out_frame->struct_size : (uint32_t)sizeof(fr);
     fr.revision = surface->revision;
     fr.base_revision = partial ? dst_revision : 0;
-    fr.layout_revision = 1;
+    fr.layout_revision = surface->layout_revision;
     fr.dirty_count = (uint32_t)drawn.n;
     for (i = 0; i < drawn.n; i++) to_rect(drawn.r[i], &fr.dirty[i]);
     fa_rects_bounds(&drawn, b);
@@ -1439,5 +2003,60 @@ FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* surface, fa_time tim
     fr.palette_revision = surface->palette_revision;
     fr.draw_ns = fa_monotonic_ns() - start;
     memcpy(out_frame, &fr, fr.struct_size);
+    return FA_OK;
+}
+
+/* ---- CD+G presentation options ------------------------------------------------------- */
+
+#define CDG_MAX_PADDING 32
+
+FA_API void FA_CALL fa_cdg_presentation_init(fa_cdg_presentation* presentation)
+{
+    if (!presentation) return;
+    memset(presentation, 0, sizeof(*presentation));
+    presentation->struct_size = (uint32_t)sizeof(*presentation);
+    presentation->safety_zone = FA_SAFETY_SHOW;
+}
+
+FA_API fa_result FA_CALL fa_cdg_surface_set_presentation(fa_surface* surface, const fa_cdg_presentation* presentation)
+{
+    fa_cdg_presentation p;
+    if (!surface) return FA_ERROR_INVALID_ARG;
+    if (!presentation) {
+        surface->has_pres = 0;
+        surface->tb = 0;
+        surface->drawn = 0;
+        return FA_OK;
+    }
+    if (presentation->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+    fa_cdg_presentation_init(&p);
+    memcpy(&p, presentation, presentation->struct_size < sizeof(p) ? presentation->struct_size : sizeof(p));
+    if ((p.scale != 0 && p.scale != 1) || (uint32_t)p.safety_zone > FA_SAFETY_SUPER ||
+        !(p.auto_ignore_seconds >= 0.0f && p.auto_ignore_seconds <= 86400.0f) ||
+        (p.super_centered != 0 && p.super_centered != 1) || p.padding > CDG_MAX_PADDING || p.smoothness < 0 ||
+        p.smoothness > 10 || (p.edge_blend != 0 && p.edge_blend != 1) || (p.flags & ~(uint32_t)FA_CDG_TRANSPARENT_BORDER))
+        return FA_ERROR_INVALID_ARG;
+    p.struct_size = (uint32_t)sizeof(p);
+    surface->pres = p;
+    surface->has_pres = 1;
+    surface->tb = (p.flags & FA_CDG_TRANSPARENT_BORDER) != 0;
+    surface->drawn = 0;   /* drawn again in full; a new layout too when it changes */
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_cdg_surface_get_presentation(fa_surface* surface, fa_cdg_presentation* out_presentation)
+{
+    fa_cdg_presentation p;
+    uint32_t size;
+    if (!surface || !out_presentation || out_presentation->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+    if (surface->has_pres) {
+        p = surface->pres;
+    } else {
+        fa_cdg_presentation_init(&p);
+        if (surface->flags & FA_CDG_NO_BORDER) p.safety_zone = FA_SAFETY_REMOVE;
+    }
+    size = out_presentation->struct_size < sizeof(p) ? out_presentation->struct_size : (uint32_t)sizeof(p);
+    p.struct_size = size;
+    memcpy(out_presentation, &p, size);
     return FA_OK;
 }

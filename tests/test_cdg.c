@@ -2274,6 +2274,676 @@ static void test_rect_sets(void)
     CHECK_EQ(fa_history_since(&h, 10, 11, &r), 0);
 }
 
+/* ---- presentation options ---------------------------------------------------------- */
+
+static fa_cdg_presentation pres(int scale, fa_safety_zone zone)
+{
+    fa_cdg_presentation p;
+    fa_cdg_presentation_init(&p);
+    p.scale = scale;
+    p.safety_zone = zone;
+    return p;
+}
+
+static fa_surface_layout layout_of(fa_surface* f)
+{
+    fa_surface_layout l;
+    memset(&l, 0, sizeof(l));
+    l.struct_size = sizeof(l);
+    fa_surface_get_layout(f, &l);
+    return l;
+}
+
+/* A full buffer (dst_revision 0) at pack k, into a fresh malloc'ed buffer. */
+static uint8_t* full_draw(fa_surface* f, int64_t k, uint32_t bpp, fa_surface_layout* l)
+{
+    fa_surface_frame fr;
+    uint8_t* mem;
+    *l = layout_of(f);
+    mem = (uint8_t*)malloc((size_t)l->width * l->height * bpp);
+    memset(&fr, 0, sizeof(fr));
+    fr.struct_size = sizeof(fr);
+    if (fa_surface_update_into(f, t_packs(k), mem, (int32_t)(l->width * bpp), l->width, l->height, 0, &fr) != FA_OK) {
+        free(mem);
+        return NULL;
+    }
+    return mem;
+}
+
+/* Scrolls of every kind with tiles between them, also while smooth-scroll offsets
+ * are set, drawing in the border, colour changes. */
+static buf moves_cdg(void)
+{
+    buf c = { 0 };
+    int i;
+    colors(&c, 0, k_low);
+    preset(&c, 0, 0);
+    border(&c, 5);
+    for (i = 0; i < 24; i++) tile(&c, i % 3 == 2, 1 + i % 4, (i * 3) % 7, 1 + (i * 7) % 16, 1 + (i * 11) % 48, (uint8_t)(0x0C + i));
+    tile(&c, 0, 0, 4, 0, 10, 0x21);           /* in the border */
+    tile(&c, 0, 0, 2, 17, 30, 0x12);
+    scroll(&c, 1, 0, 2, 0, 0, 0);             /* copy left */
+    tile(&c, 0, 3, 1, 5, 5, 0x1E);
+    scroll(&c, 0, 3, 1, 0, 0, 0);             /* preset right, colour 3 */
+    scroll(&c, 1, 0, 0, 0, 2, 0);             /* copy up */
+    tile(&c, 0, 2, 4, 9, 25, 0x33);
+    scroll(&c, 0, 0, 0, 0, 1, 0);             /* preset down */
+    scroll(&c, 1, 0, 1, 0, 1, 0);             /* copy right and down at once */
+    scroll(&c, 0, 0, 0, 2, 0, 5);             /* offsets only */
+    tile(&c, 0, 1, 2, 8, 8, 0x2D);            /* drawn while they are set */
+    scroll(&c, 1, 0, 2, 3, 0, 7);             /* copy left, other offsets */
+    scroll(&c, 0, 0, 0, 5, 2, 11);
+    tile(&c, 1, 0, 3, 16, 47, 0x3F);
+    scroll(&c, 0, 0, 0, 0, 0, 0);             /* offsets back to 0 */
+    tile(&c, 0, 4, 1, 3, 3, 0x0F);
+    transparent(&c, 2, 30);
+    colors(&c, 0, k_low);                     /* same colours: no change */
+    for (i = 0; i < 6; i++) scroll(&c, 1, 0, 2, 0, 0, 0);
+    tile(&c, 0, 2, 3, 12, 40, 0x15);
+    for (i = 0; i < 4; i++) scroll(&c, 1, 0, 0, 0, 1, 0);
+    preset(&c, 4, 0);
+    tile(&c, 0, 1, 2, 6, 6, 0x2A);
+    return c;
+}
+
+/* Drawing inside the picture area only, moved around by scrolls that fill with the
+ * background: SUPER crops it, and the scrolls bring in what was outside the crop. */
+static buf inner_moves_cdg(void)
+{
+    buf c = { 0 };
+    int i;
+    colors(&c, 0, k_low);
+    preset(&c, 0, 0);
+    for (i = 0; i < 16; i++) tile(&c, 0, 0, 1 + i % 4, 4 + i % 8, 8 + (i * 5) % 30, (uint8_t)(0x11 + i * 3));
+    scroll(&c, 0, 0, 1, 0, 0, 0);
+    scroll(&c, 0, 0, 1, 0, 1, 0);
+    tile(&c, 0, 2, 3, 9, 20, 0x2C);
+    scroll(&c, 0, 0, 2, 0, 0, 0);
+    scroll(&c, 0, 0, 2, 0, 2, 0);
+    scroll(&c, 0, 0, 2, 0, 0, 0);
+    scroll(&c, 0, 0, 1, 0, 0, 0);
+    return c;
+}
+
+/* A shape near the right edge, moved right by a scroll and then by an offset: it ends
+ * next to the screen's edge, beyond the end of a REMOVE crop's master. */
+static buf edge_moves_cdg(void)
+{
+    buf c = { 0 };
+    uint8_t d[16];
+    int i;
+    colors(&c, 0, k_low);
+    preset(&c, 0, 0);
+    memset(d, 0, sizeof(d));
+    d[1] = 1; d[2] = 8; d[3] = 48;
+    for (i = 6; i < 12; i++) d[4 + i] = 0x3F;   /* the lower half in colour 1 */
+    pack(&c, 6, d);
+    scroll(&c, 0, 0, 1, 0, 0, 0);
+    scroll(&c, 0, 0, 0, 5, 0, 0);
+    scroll(&c, 0, 0, 0, 0, 1, 0);
+    scroll(&c, 0, 0, 0, 0, 0, 11);
+    return c;
+}
+
+/* Without options a surface draws as before; options that change nothing (scale off,
+ * SHOW, no padding) draw the same; REMOVE equals FA_CDG_NO_BORDER. */
+static void test_presentation_classic(void)
+{
+    buf c = busy_cdg();
+    fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface *plain = NULL, *opts = NULL, *noborder = NULL, *removed = NULL;
+    fa_cdg_surface_config cfg;
+    fa_cdg_presentation p;
+    fa_surface_layout la, lb;
+    size_t packs = c.n / FA_CDG_PACK_BYTES, k;
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    fa_cdg_surface_config_init(&cfg);
+    cfg.pixel_format = FA_CDG_PIXELS_INDEXED8;
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &plain), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &opts), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &removed), FA_OK);
+    cfg.flags = FA_CDG_NO_BORDER;
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &noborder), FA_OK);
+    memset(&p, 0, sizeof(p));
+    p.struct_size = sizeof(p);
+    CHECK_EQ(fa_cdg_surface_get_presentation(noborder, &p), FA_OK);
+    CHECK_EQ(p.safety_zone, FA_SAFETY_REMOVE);
+    CHECK_EQ(p.scale, 0);
+    p = pres(0, FA_SAFETY_SHOW);
+    CHECK_EQ(fa_cdg_surface_set_presentation(opts, &p), FA_OK);
+    p = pres(0, FA_SAFETY_REMOVE);
+    CHECK_EQ(fa_cdg_surface_set_presentation(removed, &p), FA_OK);
+    for (k = 1; k <= packs; k += 3) {
+        uint8_t *a = full_draw(plain, (int64_t)k, 1, &la), *b = full_draw(opts, (int64_t)k, 1, &lb);
+        CHECK(a && b);
+        CHECK_EQ(la.width, lb.width);
+        CHECK(memcmp(a, b, (size_t)la.width * la.height) == 0);
+        free(a);
+        free(b);
+        a = full_draw(noborder, (int64_t)k, 1, &la);
+        b = full_draw(removed, (int64_t)k, 1, &lb);
+        CHECK(a && b);
+        CHECK_EQ(la.width, 288); CHECK_EQ(lb.width, 288);
+        CHECK(memcmp(a, b, (size_t)la.width * la.height) == 0);
+        free(a);
+        free(b);
+    }
+    /* NULL goes back to the config's picture. */
+    CHECK_EQ(fa_cdg_surface_set_presentation(removed, NULL), FA_OK);
+    la = layout_of(removed);
+    CHECK_EQ(la.width, 300);
+    CHECK_EQ(la.layout_revision, 3);
+    /* After the stream is closed the layout is still reported. */
+    fa_stream_close(s);
+    s = NULL;
+    la = layout_of(plain);
+    CHECK_EQ(la.width, 300);
+    fa_surface_destroy(plain);
+    fa_surface_destroy(opts);
+    fa_surface_destroy(noborder);
+    fa_surface_destroy(removed);
+    free(c.p);
+}
+
+/* Scale off: padding around the picture, transparent; a transparent border. */
+static void test_presentation_padding(void)
+{
+    buf c = busy_cdg();
+    fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface *ref = NULL, *ix = NULL, *col = NULL;
+    fa_cdg_surface_config cfg;
+    fa_cdg_presentation p;
+    fa_surface_layout l, lr;
+    uint8_t *a, *b, *r;
+    int64_t k = (int64_t)(c.n / FA_CDG_PACK_BYTES);
+    uint32_t x, y;
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    fa_cdg_surface_config_init(&cfg);
+    cfg.pixel_format = FA_CDG_PIXELS_INDEXED8;
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &ref), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &ix), FA_OK);
+    cfg.pixel_format = FA_CDG_PIXELS_BGRA32;
+    cfg.width = 600;
+    cfg.height = 432;
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &col), FA_OK);
+    p = pres(0, FA_SAFETY_SHOW);
+    p.padding = 4;
+    CHECK_EQ(fa_cdg_surface_set_presentation(ix, &p), FA_OK);
+    l = layout_of(ix);
+    CHECK_EQ(l.width, 308); CHECK_EQ(l.height, 224);
+    CHECK_EQ(l.content_x, 4); CHECK_EQ(l.content_y, 4);
+    CHECK_EQ(l.content_width, 300);
+    CHECK_EQ(l.padding, 4); CHECK_EQ(l.margin, 0);
+    CHECK_EQ(l.layout_revision, 2);
+    a = full_draw(ix, k, 1, &l);
+    r = full_draw(ref, k, 1, &lr);
+    CHECK(a && r);
+    for (y = 0; y < l.height; y++)
+        for (x = 0; x < l.width; x++) {
+            uint8_t v = a[y * l.width + x];
+            if (x < 4 || y < 4 || x >= 304 || y >= 220) { CHECK_EQ(v, FA_CDG_INDEX_TRANSPARENT); }
+            else CHECK_EQ(v, r[(y - 4) * 300 + x - 4]);
+        }
+    free(a);
+    /* A transparent border: index 16 there, the picture area as it is. */
+    p.padding = 0;
+    p.flags = FA_CDG_TRANSPARENT_BORDER;
+    CHECK_EQ(fa_cdg_surface_set_presentation(ix, &p), FA_OK);
+    a = full_draw(ix, k, 1, &l);
+    CHECK(a);
+    for (y = 0; y < 216; y++)
+        for (x = 0; x < 300; x++) {
+            int border = x < 6 || x >= 294 || y < 12 || y >= 204;
+            CHECK_EQ(a[y * 300 + x], border ? FA_CDG_INDEX_TRANSPARENT : r[y * 300 + x]);
+        }
+    free(a);
+    free(r);
+    /* Padding scales with the output size; colour formats get transparent pixels. */
+    p.padding = 3;
+    CHECK_EQ(fa_cdg_surface_set_presentation(col, &p), FA_OK);
+    b = full_draw(col, k, 4, &l);
+    CHECK(b);
+    CHECK_EQ(l.width, 612); CHECK_EQ(l.height, 444);
+    CHECK_EQ(l.content_x, 6);
+    for (x = 0; x < 6; x++) CHECK_EQ(b[(100 * l.width + x) * 4 + 3], 0);
+    CHECK_EQ(b[(6 * l.width + 6) * 4 + 3], 0);       /* border, transparent */
+    CHECK_EQ(b[(100 * l.width + 300) * 4 + 3], 255);  /* picture */
+    free(b);
+    fa_surface_destroy(ref);
+    fa_surface_destroy(ix);
+    fa_surface_destroy(col);
+    fa_stream_close(s);
+    free(c.p);
+}
+
+/* Scale on: the multiple, the buffer around the picture, colours, sharp pixels. */
+static void test_presentation_scaled(void)
+{
+    buf c = busy_cdg();
+    fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface *ref = NULL, *f = NULL, *g = NULL;
+    fa_cdg_surface_config cfg;
+    fa_cdg_presentation p;
+    fa_surface_layout l, lr;
+    fa_surface_frame fr;
+    fa_cdg_frame cf;
+    uint8_t *a, *r;
+    int64_t k = 60;
+    uint32_t x, y, i;
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    fa_cdg_surface_config_init(&cfg);
+    cfg.pixel_format = FA_CDG_PIXELS_INDEXED8;
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &ref), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
+    cfg.pixel_format = FA_CDG_PIXELS_RGBA32;
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &g), FA_OK);
+    p = pres(1, FA_SAFETY_SHOW);
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    l = layout_of(f);
+    CHECK(l.scale == 1.0f);   /* no presentation size: 1x */
+    CHECK_EQ(l.width, 302); CHECK_EQ(l.margin, 1);
+    CHECK_EQ(fa_surface_set_presentation_size(f, 1920, 1080), FA_OK);
+    l = layout_of(f);
+    CHECK(l.scale == 5.0f);
+    CHECK_EQ(l.width, 1510); CHECK_EQ(l.height, 1090);
+    CHECK_EQ(l.content_x, 5); CHECK_EQ(l.content_y, 5);
+    CHECK_EQ(l.content_width, 1500); CHECK_EQ(l.content_height, 1080);
+    CHECK_EQ(l.margin, 5); CHECK_EQ(l.padding, 0);
+    CHECK_EQ(l.bitmap_x, (1920 - 1510) / 2); CHECK_EQ(l.bitmap_y, -5);
+    p.safety_zone = FA_SAFETY_REMOVE;
+    p.padding = 2;
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    l = layout_of(f);
+    CHECK(l.scale == 6.0f);
+    CHECK_EQ(l.content_height, 1152);
+    CHECK_EQ(l.width, (288 + 6) * 6); CHECK_EQ(l.padding, 12); CHECK_EQ(l.margin, 6);
+    CHECK_EQ(l.content_x, 18);
+    /* Sharp pixels: each CD+G pixel an n x n block of its colour, premultiplied, the
+     * background transparent; padding and margin transparent. */
+    p = pres(1, FA_SAFETY_SHOW);
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(f, 900, 648), FA_OK);
+    a = full_draw(f, k, 4, &l);
+    r = full_draw(ref, k, 1, &lr);
+    CHECK(a && r);
+    CHECK(l.scale == 3.0f);
+    memset(&fr, 0, sizeof(fr));
+    fr.struct_size = sizeof(fr);
+    CHECK_EQ(fa_surface_update_into(f, t_packs(k), a, (int32_t)(l.width * 4), l.width, l.height, 0, &fr), FA_OK);
+    for (y = 0; y < l.height; y++)
+        for (x = 0; x < l.width; x++) {
+            const uint8_t* q = a + ((size_t)y * l.width + x) * 4;
+            if (x < 3 || y < 3 || x >= l.width - 3 || y >= l.height - 3) {
+                CHECK(q[0] == 0 && q[1] == 0 && q[2] == 0 && q[3] == 0);
+            } else {
+                uint8_t ci = r[((y - 3) / 3) * 300 + (x - 3) / 3];
+                const uint8_t* pc = fr.palette[ci];
+                uint32_t al = (int)ci == fr.background_index ? 0 : pc[3];
+                CHECK_EQ(q[3], al);
+                CHECK_EQ(q[2], (pc[0] * al + 127) / 255);   /* BGRA */
+                CHECK_EQ(q[0], (pc[2] * al + 127) / 255);
+            }
+        }
+    free(a);
+    /* RGBA config: RGBA order. fa_cdg_surface_update gives the same buffer. */
+    CHECK_EQ(fa_cdg_surface_set_presentation(g, &p), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(g, 900, 648), FA_OK);
+    a = full_draw(g, k, 4, &l);
+    CHECK(a);
+    CHECK_EQ(fa_cdg_surface_update_at(g, t_packs(k), &cf), FA_OK);
+    CHECK_EQ(cf.pixel_format, FA_CDG_PIXELS_RGBA32);
+    CHECK_EQ(cf.width, l.width); CHECK_EQ(cf.height, l.height);
+    for (y = 0; y < l.height; y++) CHECK(memcmp(a + (size_t)y * l.width * 4, (const uint8_t*)cf.pixels + (size_t)y * cf.stride, l.width * 4) == 0);
+    for (i = 3; i < l.width * l.height; i += 997) {
+        const uint8_t* q = a + (size_t)i * 4;
+        CHECK(q[0] <= q[3] && q[1] <= q[3] && q[2] <= q[3]);
+    }
+    free(a);
+    free(r);
+    fa_surface_destroy(ref);
+    fa_surface_destroy(f);
+    fa_surface_destroy(g);
+    fa_stream_close(s);
+    free(c.p);
+}
+
+/* Drawing only what changed (a moved master, offsets, the reach of smoothing and edge
+ * blend) gives the same buffer as drawing everything, for every option, into buffers
+ * in rotation. */
+static void test_presentation_incremental(void)
+{
+    static const struct { fa_safety_zone zone; uint32_t w, h; int smooth, blend, tb, padding, rgba; } cfgs[] = {
+        { FA_SAFETY_SHOW, 600, 432, 0, 0, 0, 0, 0 },
+        { FA_SAFETY_SHOW, 900, 648, 1, 0, 0, 0, 1 },
+        { FA_SAFETY_REMOVE, 600, 432, 2, 1, 0, 2, 0 },
+        { FA_SAFETY_SHOW, 900, 648, 4, 1, 1, 0, 0 },
+        { FA_SAFETY_SHOW, 600, 432, 0, 1, 1, 1, 0 },
+        { FA_SAFETY_SUPER, 900, 648, 3, 1, 0, 0, 0 },
+        { FA_SAFETY_SHOW, 1200, 864, 9, 1, 0, 0, 0 },
+        { FA_SAFETY_SUPER, 900, 648, 0, 0, 0, 0, 0 },
+        { FA_SAFETY_SUPER, 900, 648, 1, 0, 1, 1, 0 },
+        { FA_SAFETY_REMOVE, 1152, 768, 0, 1, 0, 0, 0 },   /* edge blend near an edge the master does not reach */
+        { FA_SAFETY_SHOW, 600, 432, 0, 0, 1, 0, 0 },      /* a transparent border carried in by a scroll */
+        { FA_SAFETY_REMOVE, 600, 432, 0, 0, 1, 0, 0 },
+    };
+    buf data[4];
+    unsigned ci, di;
+    data[0] = moves_cdg();
+    data[1] = busy_cdg();
+    data[2] = inner_moves_cdg();
+    data[3] = edge_moves_cdg();
+    for (di = 0; di < 4; di++)
+        for (ci = 0; ci < sizeof(cfgs) / sizeof(cfgs[0]); ci++) {
+            buf* c = &data[di];
+            fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+            fa_cdg_surface *ref = NULL, *f = NULL;
+            fa_cdg_surface_config cfg;
+            fa_cdg_presentation p;
+            fa_surface_layout l;
+            fa_surface_frame fr;
+            uint8_t* mem[3];
+            uint64_t rev[3] = { 0, 0, 0 };
+            size_t packs = c->n / FA_CDG_PACK_BYTES, n, k, size;
+            uint32_t partial = 0, b, y;
+            int32_t stride;
+            fa_cdg_surface_config_init(&cfg);
+            if (cfgs[ci].rgba) cfg.pixel_format = FA_CDG_PIXELS_RGBA32;
+            CHECK_EQ(fa_stream_load_cdg_memory(s, c->p, c->n), FA_OK);
+            CHECK_EQ(fa_cdg_surface_create(s, &cfg, &ref), FA_OK);
+            CHECK_EQ(fa_cdg_surface_create(s, &cfg, &f), FA_OK);
+            p = pres(1, cfgs[ci].zone);
+            p.smoothness = cfgs[ci].smooth;
+            p.edge_blend = cfgs[ci].blend;
+            p.flags = cfgs[ci].tb ? FA_CDG_TRANSPARENT_BORDER : 0;
+            p.padding = (uint32_t)cfgs[ci].padding;
+            CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+            CHECK_EQ(fa_surface_set_presentation_size(f, cfgs[ci].w, cfgs[ci].h), FA_OK);
+            CHECK_EQ(fa_surface_set_presentation_size(ref, cfgs[ci].w, cfgs[ci].h), FA_OK);
+            l = layout_of(f);
+            stride = (int32_t)(l.width * 4 + 12);
+            size = (size_t)stride * l.height;
+            for (b = 0; b < 3; b++) { mem[b] = (uint8_t*)malloc(size); memset(mem[b], 0xCD, size); }
+            for (n = 0; n < packs + 10; n++) {
+                fa_surface_layout lr;
+                uint8_t* want;
+                b = (uint32_t)(n % 3);
+                k = n < packs ? n + 1 : (n * 37) % (packs + 1);
+                memset(&fr, 0, sizeof(fr));
+                fr.struct_size = sizeof(fr);
+                CHECK_EQ(fa_surface_update_into(f, t_packs((int64_t)k), mem[b], stride, l.width, l.height, rev[b], &fr), FA_OK);
+                if (fr.base_revision) partial++;
+                rev[b] = fr.revision;
+                /* The reference draws its whole master again every time. */
+                CHECK_EQ(fa_cdg_surface_set_presentation(ref, &p), FA_OK);
+                want = full_draw(ref, (int64_t)k, 4, &lr);
+                CHECK(want);
+                CHECK_EQ(lr.width, l.width);
+                for (y = 0; y < l.height; y++)
+                    if (memcmp(mem[b] + (size_t)y * (size_t)stride, want + (size_t)y * l.width * 4, l.width * 4) != 0) {
+                        uint32_t x;
+                        for (x = 0; x < l.width * 4 && mem[b][(size_t)y * stride + x] == want[(size_t)y * l.width * 4 + x]; x++) {}
+                        printf("    data %u config %u, step %u, pack %u, row %u, byte %u\n", di, ci, (unsigned)n,
+                               (unsigned)k, y, x);
+                        free(want);
+                        CHECK(!"drawing only the changes differs from drawing all");
+                    }
+                for (y = 0; y < l.height; y++) CHECK_EQ(mem[b][(size_t)y * stride + l.width * 4], 0xCD);
+                free(want);
+            }
+            CHECK(partial > packs / 2);
+            for (b = 0; b < 3; b++) free(mem[b]);
+            fa_surface_destroy(ref);
+            fa_surface_destroy(f);
+            fa_stream_close(s);
+        }
+    free(data[0].p);
+    free(data[1].p);
+    free(data[2].p);
+    free(data[3].p);
+}
+
+/* The AUTO and SUPER zones from the pre-pass. */
+static void test_safety_zone_prepass(void)
+{
+    fa_stream* s = open_wav_stream(4, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface* f = NULL;
+    fa_cdg_presentation p;
+    fa_surface_layout l;
+    uint64_t rev;
+    buf c = { 0 };
+    colors(&c, 0, k_low);
+    preset(&c, 0, 0);
+    border(&c, 3);                           /* a solid border does not count */
+    tile(&c, 0, 0, 1, 3, 10, 0x3F);
+    tile(&c, 0, 0, 2, 5, 20, 0x01);
+    tile(&c, 0, 1, 1, 4, 15, 0x00);          /* c1 is used where bits are 1: none, all c0 */
+    tile(&c, 0, 0, 0, 8, 30, 0x3F);          /* background only: not drawing */
+
+    /* No graphics yet: SHOW, unresolved. */
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
+    p = pres(0, FA_SAFETY_AUTO);
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    l = layout_of(f);
+    CHECK_EQ(l.safety_zone, FA_SAFETY_SHOW);
+    CHECK_EQ(l.safety_zone_resolved, 0);
+    rev = l.layout_revision;
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    l = layout_of(f);
+    CHECK_EQ(l.safety_zone, FA_SAFETY_REMOVE);
+    CHECK_EQ(l.safety_zone_resolved, 1);
+    CHECK_EQ(l.width, 288);
+    CHECK(l.layout_revision > rev);
+
+    /* SUPER: the tiles drawn, on the tile grid; centred: the same margin both sides. */
+    p.safety_zone = FA_SAFETY_SUPER;
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    l = layout_of(f);
+    CHECK_EQ(l.safety_zone, FA_SAFETY_SUPER);
+    CHECK_EQ(l.crop_x, 60); CHECK_EQ(l.crop_y, 36);
+    CHECK_EQ(l.crop_width, 66); CHECK_EQ(l.crop_height, 36);
+    p.super_centered = 1;
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    l = layout_of(f);
+    CHECK_EQ(l.crop_x, 60); CHECK_EQ(l.crop_width, 300 - 120);
+    CHECK_EQ(l.crop_y, 36); CHECK_EQ(l.crop_height, 216 - 72);
+
+    /* Drawing in the border at 1 s: AUTO shows it, unless told to ignore that long. */
+    empty_packs_to(&c, 300);
+    tile(&c, 0, 0, 4, 17, 25, 0x0C);
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    p = pres(0, FA_SAFETY_AUTO);
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    l = layout_of(f);
+    CHECK_EQ(l.safety_zone, FA_SAFETY_SHOW);
+    CHECK_EQ(l.width, 300);
+    p.auto_ignore_seconds = 0.5f;
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    CHECK_EQ(layout_of(f).safety_zone, FA_SAFETY_SHOW);
+    p.auto_ignore_seconds = 2.0f;
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    CHECK_EQ(layout_of(f).safety_zone, FA_SAFETY_REMOVE);
+    /* Scrolled into the border counts too. */
+    preset(&c, 0, 0);
+    empty_packs_to(&c, 900);
+    tile(&c, 0, 0, 2, 1, 25, 0x0C);
+    scroll(&c, 0, 0, 0, 0, 2, 0);            /* up: row 1 into the border row 0 */
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    CHECK_EQ(layout_of(f).safety_zone, FA_SAFETY_SHOW);
+    p.safety_zone = FA_SAFETY_SUPER;
+    p.super_centered = 0;
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    l = layout_of(f);
+    CHECK_EQ(l.crop_y, 0);
+    CHECK_EQ(l.crop_height, 216);
+
+    /* Settings checked. */
+    p = pres(2, FA_SAFETY_SHOW);
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_ERROR_INVALID_ARG);
+    p = pres(1, (fa_safety_zone)4);
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_ERROR_INVALID_ARG);
+    p = pres(1, FA_SAFETY_SHOW);
+    p.padding = 33;
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_ERROR_INVALID_ARG);
+    p.padding = 0;
+    p.smoothness = 11;
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_ERROR_INVALID_ARG);
+    p.smoothness = 0;
+    p.auto_ignore_seconds = -1.0f;
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_ERROR_INVALID_ARG);
+    p.auto_ignore_seconds = 0.0f;
+    p.flags = 2;
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_ERROR_INVALID_ARG);
+    p.flags = 0;
+    p.struct_size = 0;
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_cdg_surface_set_presentation(NULL, NULL), FA_ERROR_INVALID_ARG);
+    /* An older, shorter struct: the rest takes the defaults. */
+    p = pres(1, FA_SAFETY_REMOVE);
+    p.smoothness = 3;
+    p.struct_size = (uint32_t)offsetof(fa_cdg_presentation, padding);
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    memset(&p, 0x55, sizeof(p));
+    p.struct_size = sizeof(p);
+    CHECK_EQ(fa_cdg_surface_get_presentation(f, &p), FA_OK);
+    CHECK_EQ(p.scale, 1); CHECK_EQ(p.safety_zone, FA_SAFETY_REMOVE); CHECK_EQ(p.smoothness, 0);
+    fa_surface_destroy(f);
+    fa_stream_close(s);
+    free(c.p);
+}
+
+/* Smoothness: every level keeps flat areas as they are and only blends next to a
+ * colour change, more pixels the higher the level; edge blend turns a staircase into
+ * partly covered pixels and leaves a straight edge alone. All in premultiplied colour
+ * between the two colours that meet. */
+static void test_smoothness_and_edge_blend(void)
+{
+    fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface* f = NULL;
+    fa_cdg_presentation p;
+    fa_surface_layout l;
+    buf c = { 0 };
+    uint8_t* a;
+    int level, prev = -1, i;
+    colors(&c, 0, k_low);
+    preset(&c, 0, 0);
+    /* A staircase in red: rows 0..11 of tile (8, 20) hold 1, 2, 3.. pixels; a block
+     * with a straight top edge three tiles wide. */
+    {
+        uint8_t d[16];
+        d[0] = 0; d[1] = 1; d[2] = 8; d[3] = 20;
+        for (i = 0; i < 12; i++) d[4 + i] = (uint8_t)(0x3F << (5 - (i / 2 < 5 ? i / 2 : 5)) & 0x3F);
+        pack(&c, 6, d);
+    }
+    for (i = 0; i < 3; i++) tile(&c, 0, 1, 1, 12, 20 + i, 0x00);
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(f, 2400, 1728), FA_OK);   /* 8x */
+    for (level = 0; level <= 5; level++) {
+        int mixed = 0;
+        uint32_t x, y;
+        p = pres(1, FA_SAFETY_SHOW);
+        p.smoothness = level < 5 ? level : 0;
+        p.edge_blend = level == 5;
+        CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+        a = full_draw(f, 20, 4, &l);
+        CHECK(a);
+        CHECK(l.scale == 8.0f);
+        for (y = 0; y < l.height; y++)
+            for (x = 0; x < l.width; x++) {
+                const uint8_t* q = a + ((size_t)y * l.width + x) * 4;
+                /* Red over transparent: B and G stay 0, R equals A. */
+                CHECK(q[0] == 0 && q[1] == 0 && q[2] == q[3]);
+                if (q[3] != 0 && q[3] != 255) mixed++;
+            }
+        /* Far from any edge: solid red inside the block, transparent outside. */
+        CHECK_EQ(a[(((size_t)(12 * 12 + 6) * 8 + 8) * l.width + (size_t)(21 * 6 + 3) * 8 + 8) * 4 + 3], 255);
+        CHECK_EQ(a[(((size_t)100 * 8 + 8) * l.width + (size_t)100 * 8 + 8) * 4 + 3], 0);
+        if (level >= 1 && level <= 4) CHECK(mixed >= prev);   /* higher is never sharper */
+        if (level == 0) CHECK_EQ(mixed, 0);
+        if (level == 5) {
+            /* The block's straight top edge (row 144, columns well inside it) is not
+             * touched; the staircase is. */
+            uint32_t top = (12 * 12) * 8 + 8, mid = (21 * 6) * 8 + 8;
+            CHECK_EQ(a[((size_t)top * l.width + mid) * 4 + 3], 255);
+            CHECK_EQ(a[((size_t)(top - 1) * l.width + mid) * 4 + 3], 0);
+            CHECK(mixed > 0);
+        }
+        prev = level >= 1 && level <= 4 ? mixed : prev;
+        free(a);
+    }
+    fa_surface_destroy(f);
+    fa_stream_close(s);
+    free(c.p);
+}
+
+/* Prints what presentation scaling costs, for the table in docs/features/cdg.md: a
+ * full redraw of a screen of lyrics, and a typical update while they are coloured in
+ * (four tiles), into buffers in rotation. Checks nothing but that it runs. */
+static void test_presentation_costs(void)
+{
+    static const struct { const char* name; int smooth, blend; } levels[] = {
+        { "smoothness 0", 0, 0 }, { "smoothness 2", 2, 0 }, { "smoothness 4", 4, 0 }, { "smoothness 4 + edge blend", 4, 1 },
+    };
+    static const uint32_t sizes[2][2] = { { 1920, 1080 }, { 3840, 2160 } };
+    buf c = { 0 };
+    fa_stream* s = open_wav_stream(2, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface* f = NULL;
+    int row, col, li, si, k;
+    colors(&c, 0, k_low);
+    preset(&c, 0, 0);
+    /* Six lines of "letters" in white, then 200 tiles coloured in red, four per step. */
+    for (row = 3; row < 15; row += 2)
+        for (col = 3; col < 47; col++) tile(&c, 0, 0, 4, row, col, (uint8_t)(0x15 ^ (col * 7 + row)));
+    for (k = 0; k < 200; k++) tile(&c, 0, 0, 1, 3 + 2 * ((k / 44) % 6), 3 + k % 44, (uint8_t)(0x2A ^ k));
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
+    printf("  %-28s %10s %10s %10s %10s\n", "", "1080p full", "typical", "2160p full", "typical");
+    for (li = 0; li < 4; li++) {
+        double full[2], typical[2];
+        for (si = 0; si < 2; si++) {
+            fa_cdg_presentation p = pres(1, FA_SAFETY_SHOW);
+            fa_surface_layout l;
+            fa_surface_frame fr;
+            uint8_t* mem[3];
+            uint64_t rev[3] = { 0, 0, 0 };
+            int64_t sum = 0, best = INT64_MAX;
+            int32_t stride;
+            uint32_t b;
+            int64_t base = (int64_t)(c.n / FA_CDG_PACK_BYTES) - 200;
+            p.smoothness = levels[li].smooth;
+            p.edge_blend = levels[li].blend;
+            CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+            CHECK_EQ(fa_surface_set_presentation_size(f, sizes[si][0], sizes[si][1]), FA_OK);
+            l = layout_of(f);
+            stride = (int32_t)(l.width * 4);
+            for (b = 0; b < 3; b++) mem[b] = (uint8_t*)calloc((size_t)stride, l.height);
+            for (k = 0; k < 3; k++) {   /* a full redraw: the options set again */
+                CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+                memset(&fr, 0, sizeof(fr));
+                fr.struct_size = sizeof(fr);
+                CHECK_EQ(fa_surface_update_into(f, t_packs(base), mem[0], stride, l.width, l.height, 0, &fr), FA_OK);
+                if (fr.draw_ns < best) best = fr.draw_ns;
+            }
+            rev[0] = fr.revision;
+            full[si] = (double)best / 1e6;
+            for (k = 1; k <= 48; k++) {
+                b = (uint32_t)(k % 3);
+                memset(&fr, 0, sizeof(fr));
+                fr.struct_size = sizeof(fr);
+                CHECK_EQ(fa_surface_update_into(f, t_packs(base + 4 * k), mem[b], stride, l.width, l.height, rev[b], &fr), FA_OK);
+                rev[b] = fr.revision;
+                if (k > 3) sum += fr.draw_ns;
+            }
+            typical[si] = (double)sum / 45 / 1e6;
+            for (b = 0; b < 3; b++) free(mem[b]);
+        }
+        printf("  %-28s %7.2f ms %7.3f ms %7.2f ms %7.3f ms\n", levels[li].name, full[0], typical[0], full[1], typical[1]);
+    }
+    fa_surface_destroy(f);
+    fa_stream_close(s);
+    free(c.p);
+}
+
 static void race_updater(void* p)
 {
     race_arg* a = (race_arg*)p;
@@ -2352,6 +3022,13 @@ int main(void)
     RUN(test_update_into_api);
     RUN(test_presentation_clamp);
     RUN(test_rect_sets);
+    RUN(test_presentation_classic);
+    RUN(test_presentation_padding);
+    RUN(test_presentation_scaled);
+    RUN(test_safety_zone_prepass);
+    RUN(test_smoothness_and_edge_blend);
+    RUN(test_presentation_incremental);
+    RUN(test_presentation_costs);
     fa_engine_destroy(g_engine);
     remove("cdg_pair.zip");
     remove("cdg_sibling.wav");

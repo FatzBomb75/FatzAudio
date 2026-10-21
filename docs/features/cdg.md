@@ -203,7 +203,7 @@ for (uint32_t i = 0; i < fr.dirty_count; i++) upload_rect(b, fr.dirty[i]);   /* 
 | `draw_ns`, `render_ns` | How long the call took, and how much of that was drawing pixels |
 | `background_index`, `border_index`, `background`, `palette`, `transparency`, `palette_revision` | As in `fa_cdg_frame`: the palette for colouring INDEXED8 output on the GPU |
 
-`dst` must be exactly the layout's width x height (`FA_ERROR_SIZE_MISMATCH` otherwise, and nothing is drawn); `dst_stride` is bytes per row and may include padding. `fa_surface_get_layout` describes the picture: its size, the part of the CD+G screen shown (`crop_*`: all 300x216, or the 288x192 picture area with `FA_CDG_NO_BORDER`, reported as `FA_SAFETY_REMOVE`), and a `layout_revision` that goes up when any of it changes (for the classic picture it never does). `fa_surface_set_presentation_size` and `fa_surface_set_render_ahead` are accepted and kept for the CD+G presentation options to come; the classic picture keeps its configured size and draws on the caller's thread. A surface used only through `update_into` never allocates pixels of its own.
+`dst` must be exactly the layout's width x height (`FA_ERROR_SIZE_MISMATCH` otherwise, and nothing is drawn: get the layout again and reallocate); `dst_stride` is bytes per row and may include padding. `fa_surface_get_layout` describes the buffer: its size, where the picture sits in it (`content_*`), the part of the CD+G screen shown (`crop_*`: all 300x216, or the 288x192 picture area with `FA_CDG_NO_BORDER`, reported as `FA_SAFETY_REMOVE`), and a `layout_revision` that goes up when any of it changes. Without presentation options it never changes. `fa_surface_set_render_ahead` is accepted for the version that renders ahead on the engine's workers; today every surface draws on the caller's thread. A surface used only through `update_into` never allocates pixels of its own.
 
 In .NET, `CdgSurface` implements `IKaraokeSurface`:
 
@@ -220,6 +220,74 @@ foreach (var r in update.Dirty) Upload(buffers[b], r);   // PixelRect
 ```
 
 `UpdateInto` also takes a pointer (`nint`) for mapped memory; a buffer of the wrong size throws `FatzAudioException` with `ErrorCode.SizeMismatch`.
+
+### Presentation options (`fa_cdg_surface_set_presentation`)
+
+On top of its config, a surface can crop the screen to a safety zone, add transparent padding, and draw the picture in full colour at a whole-number multiple of its size, smoothed and anti-aliased, for a big screen. A surface without them (the default) draws exactly as before.
+
+```c
+fa_cdg_presentation p;
+fa_cdg_presentation_init(&p);
+p.scale = 1;                          /* full colour at a whole multiple */
+p.safety_zone = FA_SAFETY_AUTO;       /* the border only when the song draws in it */
+p.smoothness = 2;
+p.edge_blend = 1;
+fa_cdg_surface_set_presentation(cdg, &p);
+fa_surface_set_presentation_size(cdg, 1920, 1080);   /* the window's size, in physical pixels */
+
+fa_surface_layout lay = { sizeof(lay) };
+fa_surface_get_layout(cdg, &lay);     /* lay.width x lay.height, 4 bytes per pixel */
+/* ... fa_surface_update_into as above; reallocate when fr.layout_revision changes */
+```
+
+| `fa_cdg_presentation` field | Meaning |
+|---|---|
+| `scale` | 0: the surface's own pixel format, size and flags, with the crop and padding below. 1: presentation scaling (below) |
+| `safety_zone` | `FA_SAFETY_SHOW` (default): all 300x216. `FA_SAFETY_REMOVE`: the 288x192 picture area. `FA_SAFETY_AUTO`: REMOVE, unless the song draws in the border area (tiles or scrolls; a border preset's solid colour does not count), then SHOW. `FA_SAFETY_SUPER`: only the box around everything the song ever draws other than the background, on the 6x12 tile grid. Replaces `FA_CDG_NO_BORDER` |
+| `auto_ignore_seconds` | AUTO: drawing in the border before this time does not count (title cards) |
+| `super_centered` | SUPER: the same crop on both sides, so the picture stays centred |
+| `padding` | CD+G pixels of transparent space on each side, 0..32. It scales with the picture, so the buffer is exactly the size you lay out |
+| `smoothness` | 0..10, scale on only: see below |
+| `edge_blend` | 0/1, scale on only: anti-aliases the stair steps of edges (below) |
+| `flags` | `FA_CDG_TRANSPARENT_BORDER`: the border area is transparent too; `border_index` still reports its colour so you can draw it your way |
+
+AUTO and SUPER are worked out once per song, by the same walk over the packs that builds the seek checkpoints (a few milliseconds when the first surface is created), so the crop is fixed for the whole song and the picture never jumps. A disc's packs arrive while it plays, so there they use SHOW, and the layout says so (`safety_zone_resolved` 0). A surface created before graphics are loaded also reports SHOW unresolved, and gets its zone (and a new `layout_revision`) once they are.
+
+**Scale off.** The buffer is the configured picture with the crop and the padding around it: transparent pixels (alpha 0, or `FA_CDG_INDEX_TRANSPARENT`, index 16, in INDEXED8). The transparent border is index 16 too in INDEXED8.
+
+**Scale on.** The cropped picture is drawn at the whole-number multiple N nearest the presentation size, rounded up: at 1920x1080, SHOW is 5x (1500x1080) and REMOVE is 6x (1728x1152, which you shrink slightly). Your renderer does the final fit; whole multiples keep pixels even at smoothness 0 and give the smoothing an exact grid. Without a presentation size N is 1. The buffer is premultiplied 32-bit colour, RGBA for an RGBA32 surface and BGRA otherwise, from the outside in: padding, a transparent margin of one CD+G pixel (room for smoothing at the edge, and for your own scaling), then the picture. The background colour is drawn transparent, so you fill behind it: `background` in the frame is the colour to fill with (the song's, or `background_color` and `background_opacity` when those flags are set, which then only change what is reported), and every blend is computed against transparent, so there are no dark or coloured halos over whatever you draw underneath. The config's output size, `FA_CDG_SMOOTH` and `FA_CDG_PREMULTIPLIED` do not apply; the transparency flags and `FA_CDG_HIDE_UNTIL_PRESET` do. `bitmap_x`, `bitmap_y` in the layout say where the buffer goes inside the presentation area, centred (negative when it is a little larger).
+
+| Smoothness | Look |
+|---|---|
+| 0 | Sharp pixels: each CD+G pixel an N x N block |
+| 1 | Sharp, with the output pixel either side of each pixel boundary blended |
+| 2, 3 | A blend band a quarter, then half a CD+G pixel wide |
+| 4 | Plain bilinear |
+| 5-10 | Planned (traced outlines, then curves); in this version they draw as 4 |
+
+**Edge blend** is morphological anti-aliasing on the CD+G grid. An edge is where two neighbouring pixels have different colours. Along each straight run of an edge, where one colour steps over the edge at an end (an L, Z or U shape), the pixels between the edge and a line through the step take the other colour by the area they cover. Straight edges and flat areas are left alone, nothing is blurred, and no colour appears that is not one of the two meeting there. It can be combined with any smoothness.
+
+**Scrolls are moves, not redraws.** The surface keeps the picture it drew (its master) and moves it when the screen scrolls, drawing only the band that came in and what touches it. Smooth-scroll offsets draw nothing: they move the window copied out of the master. A colour-table change draws the master again.
+
+Measured on one core of the Linux CI-class sandbox, Release build, a screen of six lines of lyrics; "full" is a seek or a new layout, "typical" one update while lyrics are coloured in (four tiles) into buffers in rotation:
+
+| | 1080p full | 1080p typical | 2160p full | 2160p typical |
+|---|---|---|---|---|
+| Scale off | 0.3 ms | 0.01 ms | same | same |
+| Smoothness 0 | 1.7 ms | 0.02 ms | 7.9 ms | 0.09 ms |
+| Smoothness 2 | 3.3 ms | 0.05 ms | 11 ms | 0.15 ms |
+| Smoothness 4 | 3.4 ms | 0.05 ms | 13 ms | 0.18 ms |
+| Smoothness 4 + edge blend | 4.5 ms | 0.16 ms | 17 ms | 0.55 ms |
+
+`fa_test_cdg` prints this table (`test_presentation_costs`), so it can be measured on any machine.
+
+In .NET, `CdgSurface.Presentation` takes a `CdgPresentation` record (null = none):
+
+```csharp
+cdg.Presentation = new CdgPresentation { Scale = true, SafetyZone = SafetyZone.Auto, Smoothness = 2, EdgeBlend = true };
+cdg.PresentationSize = new PixelSize(1920, 1080);
+var layout = cdg.GetLayout();   // layout.Width x layout.Height, 4 bytes per pixel
+```
 
 ### Change events (push model)
 
@@ -313,7 +381,8 @@ Every instruction of the CD+G "TV graphics" mode is implemented: memory preset (
 
 - Read or copy `pixels` before the next update of the same surface; it is redrawn in place.
 - With `fa_surface_update_into`, pass the revision the buffer really holds. A buffer you cleared or drew into yourself needs `dst_revision` 0, or the pixels outside the dirty rectangles stay wrong.
-- Upload in the surface's pixel format. A BGRA surface into an RGBA texture swaps red and blue.
+- Upload in the surface's pixel format. A BGRA surface into an RGBA texture swaps red and blue. With presentation scaling on the buffer is premultiplied colour even for an INDEXED8 surface.
+- With presentation options, INDEXED8 buffers can hold index 16 (`FA_CDG_INDEX_TRANSPARENT`) in the padding and a transparent border: give your palette lookup a 17th, transparent entry.
 - Leave `FA_CDG_TRANSPARENT` off unless something is drawn behind the lyrics: on its own, the background turns black or invisible depending on the renderer.
 
 ## Not provided yet

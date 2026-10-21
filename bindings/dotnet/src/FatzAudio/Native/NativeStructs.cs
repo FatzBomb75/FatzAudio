@@ -313,6 +313,20 @@ internal unsafe struct FaSurfaceFrame
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal struct FaCdgPresentation
+{
+    public uint StructSize;
+    public int Scale;
+    public int SafetyZone;
+    public float AutoIgnoreSeconds;
+    public int SuperCentered;
+    public uint Padding;
+    public int Smoothness;
+    public int EdgeBlend;
+    public uint Flags;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal struct FaCdgInfo
 {
     public int Source;

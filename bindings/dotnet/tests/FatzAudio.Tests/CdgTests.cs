@@ -340,4 +340,55 @@ public class CdgTests
         surface.Dispose();
         Assert.Throws<ObjectDisposedException>(() => surface.GetLayout());
     }
+
+    [Fact]
+    public void Presentation_ScaledCropPaddingAndTransparentBackground()
+    {
+        using var engine = CreateHeadless();
+        using var song = engine.OpenMemory(TestAudio.SineWav(), DecodeOnly);
+        var tile = new byte[16];
+        tile[0] = 1; tile[1] = 2; tile[2] = 4; tile[3] = 4;      // colours 1 / 2, row 4, column 4
+        for (int i = 4; i < 16; i++) tile[i] = 0x01;              // the last pixel of each row green
+        song.LoadCdg([.. SimpleCdg(), .. Pack(6, tile)]);
+        using var cdg = song.CreateCdgSurface();
+        Assert.Null(cdg.Presentation);
+
+        cdg.Presentation = new CdgPresentation { Scale = true, SafetyZone = SafetyZone.Remove, Padding = 1 };
+        cdg.PresentationSize = new PixelSize(1920, 1080);
+        var layout = cdg.GetLayout();
+        Assert.Equal(6f, layout.Scale);
+        Assert.Equal(((288 + 4) * 6, (192 + 4) * 6), (layout.Width, layout.Height));
+        Assert.Equal((6, 6), (layout.Margin, layout.Padding));
+        Assert.Equal(new PixelRect(12, 12, 288 * 6, 192 * 6), layout.Content);
+        Assert.Equal(SafetyZone.Remove, layout.SafetyZone);
+        Assert.True(layout.LayoutRevision > 1);
+
+        int stride = layout.Width * 4;
+        var buffer = new byte[stride * layout.Height];
+        var update = cdg.UpdateInto(buffer, stride, layout.Width, layout.Height, 0, AfterPacks(4));
+        Assert.True(update.IsFullDraw);
+        Assert.Equal(new CdgColor(255, 0, 0, 255), update.Background);   // red, drawn transparent
+        // Screen pixel (29, 48) is green: B, G, R, A at its block.
+        int x = layout.Content.X + (29 - 6) * 6 + 3, y = layout.Content.Y + (48 - 12) * 6 + 3;
+        Assert.Equal(new byte[] { 0, 255, 0, 255 }, buffer.AsSpan(y * stride + x * 4, 4).ToArray());
+        Assert.Equal(new byte[] { 0, 0, 0, 0 }, buffer.AsSpan((y - 6) * stride + x * 4, 4).ToArray());
+        Assert.Equal(new byte[] { 0, 0, 0, 0 }, buffer.AsSpan(0, 4).ToArray());
+
+        // Without scaling: the surface's own format, padding as the transparent index.
+        using var indexed = song.CreateCdgSurface(new CdgSurfaceOptions { PixelFormat = CdgPixelFormat.Indexed8 });
+        indexed.Presentation = new CdgPresentation { Padding = 2, TransparentBorder = true };
+        var small = indexed.GetLayout();
+        Assert.Equal((304, 220), (small.Width, small.Height));
+        var pixels = new byte[304 * 220];
+        indexed.UpdateInto(pixels, 304, 304, 220, 0, AfterPacks(4));
+        Assert.Equal(CdgSurface.TransparentIndex, pixels[0]);
+        Assert.Equal(CdgSurface.TransparentIndex, pixels[2 * 304 + 2]);   // the border
+        Assert.Equal(1, pixels[(2 + 20) * 304 + 2 + 20]);                  // red picture area
+        Assert.Equal(2, pixels[(2 + 48) * 304 + 2 + 29]);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => cdg.Presentation = new CdgPresentation { Smoothness = 11 });
+        Assert.Throws<ArgumentOutOfRangeException>(() => cdg.Presentation = new CdgPresentation { Padding = 33 });
+        cdg.Presentation = null;
+        Assert.Equal(300, cdg.GetLayout().Width);
+    }
 }
