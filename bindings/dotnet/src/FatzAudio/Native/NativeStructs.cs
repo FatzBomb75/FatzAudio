@@ -371,6 +371,57 @@ internal struct FaSurfaceEffects
     public FaFxBevel Bevel;
 }
 
+/// <summary>fa_lyric_style.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaLyricStyle
+{
+    public uint StructSize;
+    public nint FontFamily;
+    public nint FontPath;
+    public nint FontData;
+    public nuint FontDataSize;
+    public uint FontFace;
+    public int FontExplicit;
+    public float FontSize;
+    public int FontWeight;
+    public uint TextColor, SungColor;
+    public float VerticalPosition;
+    public float BoxWidth;
+    public float LinePitch;
+    public int LinesAbove, LinesBelow;
+    public float AboveOpacity0, AboveOpacity1;   // above_opacity[2]
+    public float NextLineOpacity;
+    public float AfterNextFactor;
+    public float NearScale, FarScale;
+    public int Wipe;
+    public int WipeCapMs;
+    public float WipeShare;
+    public int InstantCutMs;
+    public int LeadMs;
+    public int ParagraphGapMs;
+    public int SentenceGapMs;
+    public int BreakLength;
+    public int ScrollMs;
+    public int PageMs;
+    public int PageHoldMs;
+    public int PagePreviewMs;
+    public int PageOverlap;
+    public float PageInScale;
+    public float PageOutScale;
+    public int EndHoldMs, EndFadeMs;
+    public int Countdown;
+    public int CountdownCount;
+    public int CountdownMs;
+    public int CountdownGapMs;
+    public uint CountdownFrom, CountdownTo;
+    public float CountdownSize;
+    public int Panel;
+    public uint PanelColor;
+    public float PanelPadding, PanelRadius;
+    public int SubtitleMode;
+    public FaSurfaceEffects Effects;
+}
+
 [StructLayout(LayoutKind.Sequential)]
 internal struct FaCdgInfo
 {

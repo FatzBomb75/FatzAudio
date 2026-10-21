@@ -249,6 +249,21 @@ internal static unsafe partial class NativeMethods
         uint dstHeight, ulong dstRevision, FaSurfaceFrame* frame);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_surface_destroy(nint surface);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_lyric_style_init(FaLyricStyle* style, int preset);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_lyric_surface_create(StreamHandle stream, FaLyricStyle* style, out nint surface);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_lyric_surface_set_style(nint surface, FaLyricStyle* style);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_lyric_surface_get_style(nint surface, FaLyricStyle* style);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_read(StreamHandle stream, void* buffer, long frames, out long framesRead);
 
     // ---- Parameters and envelopes -----------------------------------------

@@ -1455,8 +1455,8 @@ FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_ti
 
 /* ---- Surfaces -----------------------------------------------------------
  *
- * The functions every karaoke surface has (a CD+G surface now; the MIDI lyric
- * surface will be one too). The main one draws into a buffer of yours, such as a
+ * The functions every karaoke surface has (a CD+G surface and the MIDI lyric
+ * surface are both surfaces). The main one draws into a buffer of yours, such as a
  * mapped upload buffer or a texture's staging memory, instead of handing out the
  * surface's own pixels: fa_surface_update_into. With two or three buffers in
  * rotation it draws only the area that changed since the frame the buffer holds.
@@ -1903,6 +1903,147 @@ FA_API fa_result FA_CALL fa_stream_get_midi_channel_mute(fa_stream* stream, uint
  * the controls above. */
 FA_API fa_result FA_CALL fa_stream_set_midi_effects(fa_stream* stream, int32_t enabled);
 FA_API fa_result FA_CALL fa_stream_get_midi_effects(fa_stream* stream, int32_t* out_enabled);
+
+/* ---- MIDI lyric surface ---------------------------------------------------
+ *
+ * A karaoke surface (see Surfaces) that draws a MIDI or .kar song's lyrics: the
+ * active line in the middle, the lines before and after it smaller and fainter,
+ * each syllable coloured in as it is sung, lines scrolling up as the song moves on
+ * and pages fading out and in, a countdown before a line that follows a long gap.
+ * Text is drawn with FatzAudio's own font reader and rasterizer (no system text
+ * engine), premultiplied BGRA against transparent, with the surface effects.
+ *
+ *     fa_lyric_style st;
+ *     fa_lyric_style_init(&st, FA_LYRIC_CLASSIC);
+ *     st.font_family = "Segoe UI";
+ *     fa_surface* lyrics;
+ *     fa_lyric_surface_create(stream, &st, &lyrics);
+ *     fa_surface_set_presentation_size(lyrics, 1920, 1080);
+ *     ... then fa_surface_get_layout and fa_surface_update_into as for any surface.
+ *
+ * Sizes are given for a presentation area 1080 pixels high and scale with its
+ * height (fa_surface_layout.scale = height / 1080); without a presentation size the
+ * surface draws for 1920x1080. The bitmap is the lyric block, not the whole area:
+ * it keeps one size for a presentation size and style (every line slot, the
+ * countdown row and the page fade-in included), and fa_surface_layout.bitmap_x and
+ * bitmap_y place it. Everything drawn is a function of the position, so seeks and
+ * loops need nothing; lyric times follow the stream's clock, and the animations run
+ * in real time (their lengths follow FA_PARAM_TEMPO).
+ *
+ * The song's text is fa_stream_get_midi_text's lyrics: its line and paragraph marks
+ * break lines and pages, and so do the gaps: a pause of paragraph_gap_ms starts a
+ * new page, one of sentence_gap_ms after ". ! ? : ;" a new line, and a line of
+ * break_length characters breaks at the next space. A line still wider than the box
+ * is split between words when the lines are built (each row is a line of its own,
+ * with its own wipe, on the same page); a single word wider than the box is drawn
+ * smaller. */
+
+typedef enum fa_lyric_preset {
+    FA_LYRIC_CLASSIC = 0,              /* MediaControl's look: white, sung yellow, a black
+                                          outline and shadow, a cross-fading wipe */
+    FA_LYRIC_MODERN,                   /* a sweeping wipe, a soft shadow */
+    FA_LYRIC_NEON,                     /* glowing outlines, a sweeping wipe */
+    FA_LYRIC_MINIMAL,                  /* one line above and below, a light shadow, no
+                                          countdown */
+    FA_LYRIC_SUBTITLE                  /* two lines in a band at the bottom on a panel, no
+                                          countdown */
+} fa_lyric_preset;
+
+typedef enum fa_lyric_wipe {
+    FA_WIPE_CROSSFADE = 0,             /* the syllable changes colour as a whole */
+    FA_WIPE_SWEEP                      /* an edge sweeps across the syllable */
+} fa_lyric_wipe;
+
+typedef enum fa_lyric_countdown {
+    FA_COUNTDOWN_OFF = 0,
+    FA_COUNTDOWN_CLOCK,                /* an arrow a second (countdown_ms / (count + 1)) */
+    FA_COUNTDOWN_BEAT                  /* an arrow a beat, from the song's tempo */
+} fa_lyric_countdown;
+
+/* "em" below is font_size. Times are milliseconds of real time. */
+typedef struct fa_lyric_style {
+    uint32_t struct_size;              /* sizeof(fa_lyric_style) */
+    /* The font: a file (font_path, UTF-8), a file in memory (font_data, copied), or an
+     * installed family (font_family, as fa_font_find); with none of them, or when the
+     * family is not installed, the system's UI font. A song whose text the font
+     * mostly cannot show is drawn with the system's font for its script (Japanese,
+     * Korean, Chinese) unless font_explicit is 1. fa_surface_layout.font_used names
+     * the family drawn with. */
+    const char* font_family;
+    const char* font_path;
+    const void* font_data;
+    size_t font_data_size;
+    uint32_t font_face;                /* the face of a collection (.ttc); 0 */
+    int32_t font_explicit;             /* 0 */
+    float font_size;                   /* pixels at 1080: 72 (6..240) */
+    int32_t font_weight;               /* 100..900: 700. A family without a face that
+                                          heavy gets a synthetic bold */
+    uint32_t text_color, sung_color;   /* 0xAARRGGBB: white, yellow */
+    /* Placement */
+    float vertical_position;           /* the active line's centre, 0 top .. 1 bottom: 0.5 */
+    float box_width;                   /* of the area's width, for lines: 0.85 (0.2..1) */
+    float line_pitch;                  /* em between line centres: 1.55 (0.8..4) */
+    int32_t lines_above, lines_below;  /* 0..2: 2, 2 */
+    float above_opacity[2];            /* the lines 1 and 2 above: 0.5, 0.25 */
+    float next_line_opacity;           /* the line below: 0.65 */
+    float after_next_factor;           /* the one below that: next_line_opacity times
+                                          this, 0.55 */
+    float near_scale, far_scale;       /* lines 1 and 2 away: 0.8, 0.6 (0.2..1) */
+    /* The wipe */
+    fa_lyric_wipe wipe;                /* Classic and Minimal: CROSSFADE; others: SWEEP */
+    int32_t wipe_cap_ms;               /* a syllable's wipe takes wipe_share of the time to
+                                          the next one, at most this: 600 (0..2000; 0 =
+                                          instant) */
+    float wipe_share;                  /* 0.8 (0.1..1) */
+    int32_t instant_cut_ms;            /* shorter wipes are instant: 150 (0..1000) */
+    int32_t lead_ms;                   /* syllables are coloured this early: 400 (0..2000) */
+    /* Lines and pages */
+    int32_t paragraph_gap_ms;          /* 2000 (0..60000) */
+    int32_t sentence_gap_ms;           /* 900 (0..60000) */
+    int32_t break_length;              /* characters; 0 = no rule: 42 (0..1000) */
+    int32_t scroll_ms;                 /* a line scrolling up: 1500 (0..4000) */
+    int32_t page_ms;                   /* a page fading out or in: 1000 (0..4000) */
+    int32_t page_hold_ms;              /* a page stays this long after its last syllable
+                                          when there is time: 2000 (0..10000) */
+    int32_t page_preview_ms;           /* a new page is in place this early: 1000 (0..10000) */
+    int32_t page_overlap;              /* 1: the fades may overlap, so new lyrics are never
+                                          late; 0: the new page waits for the old to go */
+    float page_in_scale;               /* a new page grows in from this: 1.5 (1..2) */
+    float page_out_scale;              /* an old page shrinks to this: 0.75 (0.25..1) */
+    int32_t end_hold_ms, end_fade_ms;  /* the lyrics fade out this long after the last
+                                          syllable, over this: 5000, 1000 (0..60000) */
+    /* The countdown before a line after a long gap */
+    fa_lyric_countdown countdown;      /* CLOCK */
+    int32_t countdown_count;           /* arrows: 4 (1..8) */
+    int32_t countdown_ms;              /* CLOCK: the whole countdown, the arrows and a last
+                                          fade: 5000 (1000..20000) */
+    int32_t countdown_gap_ms;          /* after a gap this long: 6000 (0..60000) */
+    uint32_t countdown_from, countdown_to; /* an arrow's colour before and after: red, green */
+    float countdown_size;              /* em: 0.5 (0.2..1.5) */
+    /* A panel behind each line */
+    int32_t panel;                     /* 0 */
+    uint32_t panel_color;              /* 0xAARRGGBB: black at 50 % */
+    float panel_padding, panel_radius; /* em: 0.25, 0.2 (0..1) */
+    int32_t subtitle_mode;             /* 1: no countdown */
+    fa_surface_effects effects;        /* with sung colours; as fa_surface_set_effects */
+} fa_lyric_style;
+
+/* The style of a preset. Strings and font_data are NULL (the UI font). */
+FA_API void FA_CALL fa_lyric_style_init(fa_lyric_style* style, fa_lyric_preset preset);
+/* A lyric surface for a MIDI stream; NULL style = Classic. FA_ERROR_INVALID_ARG for a
+ * stream that is not MIDI or a style out of range, FA_ERROR_NOT_FOUND when no font
+ * could be opened (font_path missing, or no system font), FA_ERROR_UNSUPPORTED_FORMAT
+ * for font_data or a font_path that is not a font. A song without lyrics draws
+ * nothing. Destroy it with fa_surface_destroy; it outlives its stream, drawing
+ * nothing more once the stream is closed. */
+FA_API fa_result FA_CALL fa_lyric_surface_create(fa_stream* stream, const fa_lyric_style* style, fa_surface** out_surface);
+/* Changes the style: the lines are built again and the next frame is drawn in full
+ * (the layout changes with sizes and fonts). Errors as fa_lyric_surface_create; on an
+ * error the old style stays. fa_surface_set_effects sets style.effects alone. */
+FA_API fa_result FA_CALL fa_lyric_surface_set_style(fa_surface* surface, const fa_lyric_style* style);
+/* The style in use, up to out_style->struct_size. Its strings and font_data point into
+ * the surface, valid until the next set_style or the surface is destroyed. */
+FA_API fa_result FA_CALL fa_lyric_surface_get_style(fa_surface* surface, fa_lyric_style* out_style);
 
 /* ---- Tracker modules ------------------------------------------------------
  *

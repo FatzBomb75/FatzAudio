@@ -14,6 +14,7 @@
 #include "surface_fx.h"
 
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define FX_TILE 512
@@ -172,12 +173,12 @@ static void edt_1d(const float* f, int n, float* d, int16_t* arg, int* v, float*
     }
 }
 
-/* The distance field of the window (wn x hn at `a`, alpha bytes 4 apart) into `out`,
- * as far as `cap` pixels: inside = 0: the distance outside the shape, from the pixels
+/* The distance field of the window (wn x hn at `a`) into `out`,
+ * as far as `cap` pixels (alpha bytes `step` apart): inside = 0: the distance outside the shape, from the pixels
  * with any coverage; inside = 1: the distance inside it, from the pixels not fully
  * covered. Corrected by the nearest pixel's coverage; FX_FAR when there is none
  * within reach. `rows` (inside only): 1 for the rows wanted, NULL = all. */
-static void field(const uint8_t* a, size_t stride, int wn, int hn, int inside, int cap, const uint8_t* rows,
+static void field(const uint8_t* a, size_t stride, int step, int wn, int hn, int inside, int cap, const uint8_t* rows,
                   fx_scratch* s, float* out)
 {
     int x, y;
@@ -190,7 +191,7 @@ static void field(const uint8_t* a, size_t stride, int wn, int hn, int inside, i
         const int16_t* gu = y ? g - wn : NULL;
         const uint8_t* cvu = y ? cv - wn : NULL;
         for (x = 0; x < wn; x++) {
-            uint8_t c = ar[(size_t)x * 4];
+            uint8_t c = ar[(size_t)x * (size_t)step];
             if (inside ? c < 255 : c > 0) {
                 g[x] = 0;
                 cv[x] = c;
@@ -296,7 +297,7 @@ static void render_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_stri
     float sfx = -p->s_dx - (float)sox, sfy = -p->s_dy - (float)soy;
     int snx = sox + (sfx >= 0.5f), sny = soy + (sfy >= 0.5f);
     const uint8_t* wa = src + (size_t)wy0 * src_stride + (size_t)wx0 * 4 + 3;
-    field(wa, src_stride, wn, hn, 0, p->reach, NULL, s, s->dout);
+    field(wa, src_stride, 4, wn, hn, 0, p->reach, NULL, s, s->dout);
     if (p->bevel) {
         /* Inside: only rows next to the shape matter. */
         for (y = 0; y < hn; y++) {
@@ -310,7 +311,7 @@ static void render_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_stri
                 if (y > 0 && !s->rows[y - 1]) s->rows[y - 1] = 2;
                 if (y + 1 < hn && !s->rows[y + 1]) s->rows[y + 1] = 2;
             }
-        field(wa, src_stride, wn, hn, 1, p->reach, s->rows, s, s->din);
+        field(wa, src_stride, 4, wn, hn, 1, p->reach, s->rows, s, s->din);
     }
     for (y = y0; y < y1; y++) {
         const uint8_t* sp = src + (size_t)y * src_stride + (size_t)x0 * 4;
@@ -383,4 +384,113 @@ void fa_fx_render(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, in
         for (tx = x0; tx < x1; tx += FX_TILE)
             render_tile(p, src, src_stride, w, h, dst, dst_stride, tx, ty, tx + FX_TILE < x1 ? tx + FX_TILE : x1,
                         ty + FX_TILE < y1 ? ty + FX_TILE : y1, &s);
+}
+
+/* ---- masks: the effects' weights, coloured later ------------------------------------ */
+
+static void masks_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, int w, int h, uint8_t* dst,
+                       size_t dst_stride, int nch, int x0, int y0, int x1, int y1, fx_scratch* s)
+{
+    int wx0 = x0 - p->reach > 0 ? x0 - p->reach : 0, wy0 = y0 - p->reach > 0 ? y0 - p->reach : 0;
+    int wx1 = x1 + p->reach < w ? x1 + p->reach : w, wy1 = y1 + p->reach < h ? y1 + p->reach : h;
+    int wn = wx1 - wx0, hn = wy1 - wy0, x, y;
+    int sox = (int)floorf(-p->s_dx), soy = (int)floorf(-p->s_dy);
+    float sfx = -p->s_dx - (float)sox, sfy = -p->s_dy - (float)soy;
+    int snx = sox + (sfx >= 0.5f), sny = soy + (sfy >= 0.5f);
+    const uint8_t* wa = src + (size_t)wy0 * src_stride + (size_t)wx0;
+    field(wa, src_stride, 1, wn, hn, 0, p->reach, NULL, s, s->dout);
+    if (p->bevel) {
+        for (y = 0; y < hn; y++) {
+            const uint8_t* ar = wa + (size_t)y * src_stride;
+            int any = 0;
+            for (x = 0; x < wn && !any; x++) any = ar[x] != 0;
+            s->rows[y] = (uint8_t)any;
+        }
+        for (y = 0; y < hn; y++)
+            if (s->rows[y] == 1) {
+                if (y > 0 && !s->rows[y - 1]) s->rows[y - 1] = 2;
+                if (y + 1 < hn && !s->rows[y + 1]) s->rows[y + 1] = 2;
+            }
+        field(wa, src_stride, 1, wn, hn, 1, p->reach, s->rows, s, s->din);
+    }
+    for (y = y0; y < y1; y++) {
+        const uint8_t* sp = src + (size_t)y * src_stride + (size_t)x0;
+        uint8_t* dp = dst + (size_t)y * dst_stride + (size_t)x0 * (size_t)nch;
+        int ly = y - wy0;
+        for (x = x0; x < x1; x++, sp++, dp += nch) {
+            int lx = x - wx0;
+            size_t at = (size_t)ly * wn + lx;
+            float a = (float)*sp / 255.0f, sw = 0.0f, ow = 0.0f, bv = 0.0f;
+            dp[2] = *sp;
+            if (p->shadow) {
+                int qx = lx + snx, qy = ly + sny;
+                if (qx >= 0 && qy >= 0 && qx < wn && qy < hn && s->dout[(size_t)qy * wn + qx] < p->s_hi + 2.5f)
+                    sw = ease_out(p->s_lo, p->s_hi, sample(s->dout, wn, hn, lx + sox, ly + soy, sfx, sfy));
+            }
+            if (p->outline) ow = ease_out(p->o_lo, p->o_hi, s->dout[at]);
+            if (p->bevel && a > 0.0f) {
+                float din = s->din[at], wgt = ease_out(p->b_lo, p->b_hi, din) * p->b_strength;
+                if (wgt > 0.0f) {
+                    int xl = lx > 0 ? lx - 1 : lx, xr = lx + 1 < wn ? lx + 1 : lx;
+                    int yu = ly > 0 ? ly - 1 : ly, yd = ly + 1 < hn ? ly + 1 : ly;
+                    float gx = (s->din[(size_t)ly * wn + xr] - s->din[(size_t)ly * wn + xl]) / (float)(xr - xl > 0 ? xr - xl : 1);
+                    float gy = (s->din[(size_t)yd * wn + lx] - s->din[(size_t)yu * wn + lx]) / (float)(yd - yu > 0 ? yd - yu : 1);
+                    float len = sqrtf(gx * gx + gy * gy);
+                    if (len > 1e-3f && s->din[(size_t)ly * wn + xr] < FX_FAR && s->din[(size_t)ly * wn + xl] < FX_FAR &&
+                        s->din[(size_t)yd * wn + lx] < FX_FAR && s->din[(size_t)yu * wn + lx] < FX_FAR)
+                        bv = -(gx * p->b_lx + gy * p->b_ly) / len * wgt * a;
+                }
+            }
+            dp[0] = (uint8_t)(sw * 255.0f + 0.5f);
+            dp[1] = (uint8_t)(ow * 255.0f + 0.5f);
+            bv = 128.0f + bv * 127.0f + 0.5f;
+            dp[3] = (uint8_t)(bv < 1.0f ? 1.0f : bv > 255.0f ? 255.0f : bv);
+        }
+    }
+}
+
+void fa_fx_masks(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, int w, int h, uint8_t* dst,
+                 size_t dst_stride, int nch, int x0, int y0, int x1, int y1, void* scratch)
+{
+    fx_scratch s;
+    int tx, ty;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > w) x1 = w;
+    if (y1 > h) y1 = h;
+    if (x0 >= x1 || y0 >= y1) return;
+    scratch_split(p, scratch, &s);
+    for (ty = y0; ty < y1; ty += FX_TILE)
+        for (tx = x0; tx < x1; tx += FX_TILE)
+            masks_tile(p, src, src_stride, w, h, dst, dst_stride, nch, tx, ty, tx + FX_TILE < x1 ? tx + FX_TILE : x1,
+                       ty + FX_TILE < y1 ? ty + FX_TILE : y1, &s);
+}
+
+int fa_fx_dilate(const uint8_t* src, size_t src_stride, int w, int h, float delta, uint8_t* dst, size_t dst_stride)
+{
+    fa_fx_plan p;
+    fx_scratch s;
+    void* mem;
+    int tx, ty, x, y;
+    memset(&p, 0, sizeof(p));
+    p.reach = (int)ceilf(delta) + 2;
+    mem = malloc(fa_fx_scratch_bytes(&p));
+    if (!mem) return 0;
+    scratch_split(&p, mem, &s);
+    for (ty = 0; ty < h; ty += FX_TILE)
+        for (tx = 0; tx < w; tx += FX_TILE) {
+            int x1 = tx + FX_TILE < w ? tx + FX_TILE : w, y1 = ty + FX_TILE < h ? ty + FX_TILE : h;
+            int wx0 = tx - p.reach > 0 ? tx - p.reach : 0, wy0 = ty - p.reach > 0 ? ty - p.reach : 0;
+            int wx1 = x1 + p.reach < w ? x1 + p.reach : w, wy1 = y1 + p.reach < h ? y1 + p.reach : h;
+            int wn = wx1 - wx0, hn = wy1 - wy0;
+            field(src + (size_t)wy0 * src_stride + (size_t)wx0, src_stride, 1, wn, hn, 0, p.reach, NULL, &s, s.dout);
+            for (y = ty; y < y1; y++)
+                for (x = tx; x < x1; x++) {
+                    float d = s.dout[(size_t)(y - wy0) * wn + (x - wx0)], v = ease_out(delta - 0.5f, delta + 0.5f, d) * 255.0f;
+                    uint8_t o = src[(size_t)y * src_stride + x];
+                    dst[(size_t)y * dst_stride + x] = (float)o >= v ? o : (uint8_t)(v + 0.5f);
+                }
+        }
+    free(mem);
+    return 1;
 }

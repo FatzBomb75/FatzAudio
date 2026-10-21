@@ -101,6 +101,8 @@ Every text event of the file is listed in time order by `fa_stream_get_midi_text
 
 Lyrics come cleaned up for display. The marks karaoke files use for layout (`/` and `\` before a syllable in `.kar` files; CR and LF in lyric events) are removed from the text and given as `FA_MIDI_NEW_LINE` and `FA_MIDI_NEW_PARAGRAPH` flags on the syllable that starts the new line. A karaoke screen joins the syllables of a line as they are and breaks before the flagged ones. In a `.kar` file the words are `FA_MIDI_LYRIC` and its `@` header lines are `FA_MIDI_TEXT`; `fa_stream_get_midi_info` gives the title and artist from the `@T` lines, and the copyright.
 
+To show the lyrics on screen without drawing them yourself, use the [MIDI lyric surface](lyrics.md): it builds lines and pages from these marks and the gaps between syllables and draws them with the sung syllables coloured in.
+
 A few more clean-ups make old karaoke files display well:
 
 - In `.kar` files a `/` or `\` anywhere in a word event starts a new line or paragraph there (the event is split into two syllables), and a leading `<` (the Soft Karaoke "clear screen" mark) starts a paragraph.

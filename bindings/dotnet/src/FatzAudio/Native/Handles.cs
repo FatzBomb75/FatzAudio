@@ -43,6 +43,13 @@ internal sealed class DeviceHandle : SafeHandle
 /// the attached device so that native teardown always happens in a safe order
 /// (stream first, then device, then engine).
 /// </summary>
+/// <summary>A surface whose native object goes with its stream (<see cref="StreamHandle.TrackSurface"/>).</summary>
+internal interface IStreamSurface
+{
+    /// <summary>Called right before the native stream is closed: destroy the native surface.</summary>
+    void Orphan();
+}
+
 internal sealed class StreamHandle : SafeHandle
 {
     private EngineHandle? _engine;
@@ -96,15 +103,15 @@ internal sealed class StreamHandle : SafeHandle
         previous?.DangerousRelease();
     }
 
-    private readonly List<CdgSurface> _surfaces = new();
+    private readonly List<IStreamSurface> _surfaces = new();
 
-    /// <summary>Registers a CD+G surface: native surfaces are freed with the stream.</summary>
-    public void TrackSurface(CdgSurface surface)
+    /// <summary>Registers a surface (CD+G or lyrics): native surfaces are freed with the stream.</summary>
+    public void TrackSurface(IStreamSurface surface)
     {
         lock (_surfaces) _surfaces.Add(surface);
     }
 
-    public void UntrackSurface(CdgSurface surface)
+    public void UntrackSurface(IStreamSurface surface)
     {
         lock (_surfaces) _surfaces.Remove(surface);
     }

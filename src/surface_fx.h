@@ -36,4 +36,16 @@ size_t fa_fx_scratch_bytes(const fa_fx_plan* p);
 void fa_fx_render(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, int w, int h, uint8_t* dst,
                   size_t dst_stride, int x0, int y0, int x1, int y1, void* scratch);
 
+/* The effects' weights instead of colours, for a shape whose colours change (the
+ * lyrics' wipe): `src` is a coverage plane (1 byte a pixel); each pixel of `dst`
+ * (`nch` >= 4 bytes) gets the shadow's and the outline's weight (0..255), the
+ * coverage, and the bevel (128 + -127..127: towards the highlight above 128, the
+ * shade below), over [x0, x1) x [y0, y1). Drawn over each other in that order with
+ * their colours, they give what fa_fx_render draws. Bytes past the fourth are left. */
+void fa_fx_masks(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, int w, int h, uint8_t* dst,
+                 size_t dst_stride, int nch, int x0, int y0, int x1, int y1, void* scratch);
+/* Grows the coverage plane `src` by `delta` pixels into `dst` (a synthetic bold).
+ * 0 when out of memory. */
+int fa_fx_dilate(const uint8_t* src, size_t src_stride, int w, int h, float delta, uint8_t* dst, size_t dst_stride);
+
 #endif

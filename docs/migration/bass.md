@@ -445,6 +445,7 @@ BASS has no CD+G decoder: apps read the `.cdg` themselves, time it from `BASS_Ch
 | Tracking which render targets need a re-upload | `fa_cdg_frame.revision` / `palette_revision` | `CdgFrame.Revision` / `PaletteRevision` | ✅ |
 | Your own seek checkpoints so scrubbing doesn't replay the whole `.cdg` | Built in: checkpoints every 10 s, at load for files and as packs arrive for discs | Built in | ✅ |
 | Redrawing the whole bitmap each tick | Upload only `frame.dirty_*`, only when `frame.changed` | `frame.Changed`, `frame.Dirty` | ✅ |
+| Drawing MIDI/.kar lyrics yourself (a text renderer, a timer, colouring syllables as they are sung) | `fa_lyric_surface_create` + `fa_surface_update_into`: lines, pages, wipes, countdown, five presets and effects, drawn for you ([lyrics](../features/lyrics.md)) | `song.CreateLyricSurface(...)` | ✅ |
 | CD+G from a disc via `BASS_CD_StreamCreate(..., BASS_CD_SUBCHANNEL)`, then de-interleaving the subchannel and decoding it yourself | `fa_stream_open_disc`: the graphics are read with the audio and drawn by the same surfaces ([disc playback](../features/disc.md#cdg-karaoke-discs)) | `engine.OpenDisc(disc, n)`, then `CreateCdgSurface()` | ✅ |
 
 ### basscd (audio CDs)
@@ -850,7 +851,19 @@ Poll `fa_disc_get_status` (`disc.Status`) to notice a new disc; a stream of a re
 
 BASS: `BASS_MIDI_FontInit` and `BASS_MIDI_StreamSetFonts`, `BASS_MIDI_StreamCreateFile`, then `BASS_MIDI_StreamGetMark(BASS_MIDI_MARK_LYRIC)` for the text and `BASS_SYNC_MIDI_LYRIC` to highlight it, stripping the `/` and `\` marks yourself; `MIDI_EVENT_TRANSPOSE` for the key.
 
-FatzAudio ([MIDI](../features/midi.md)):
+FatzAudio, the easy path: a [lyric surface](../features/lyrics.md) draws the karaoke screen (lines, pages, syllables coloured as they are sung, a countdown) into a buffer of yours:
+
+```csharp
+using (var gm = SoundFont.FromFile("GeneralUser.sf2")) engine.DefaultSoundFont = gm;   // once
+using var song = engine.OpenFile("song.kar");
+using var lyrics = song.CreateLyricSurface(LyricStyle.FromPreset(LyricPreset.Classic));
+lyrics.PresentationSize = new PixelSize(1920, 1080);
+song.MidiTranspose = -2;
+song.PlayOn(output);
+// each frame: lyrics.UpdateInto(buffer, stride, layout.Width, layout.Height, revision), drawn at layout.BitmapX/BitmapY
+```
+
+The do-it-yourself path, with the text events ([MIDI](../features/midi.md)):
 
 ```csharp
 using (var gm = SoundFont.FromFile("GeneralUser.sf2")) engine.DefaultSoundFont = gm;   // once

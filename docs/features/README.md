@@ -16,6 +16,7 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | FFmpeg hand-off and A/V sync (packets, frames, presentation clock) | [ffmpeg.md](ffmpeg.md) | ✅ |
 | Web streams and HLS (HTTP/HTTPS, radio titles, reconnects, HLS) | [web-streams.md](web-streams.md) | ✅ |
 | CD+G karaoke graphics (MP3+G, ZIP, CD+G discs, surfaces for any renderer) | [cdg.md](cdg.md) | ✅ |
+| MIDI lyric surface (karaoke lyrics drawn for you: lines, pages, wipes, countdown, presets, effects) | [lyrics.md](lyrics.md) | ✅ (intro and ending pages 🗓️) |
 | Dolby Digital and Dolby Digital Plus (AC-3, E-AC-3, up to 7.1, dynamic range) | [dolby.md](dolby.md) | ✅ (passthrough 🗓️) |
 | Disc playback (audio CDs, CD+G discs and `.cue` images) | [disc.md](disc.md) | ✅ |
 | MIDI and karaoke files (SoundFont 2 and DLS, the OS's gm.dls by default, lyrics, transpose, channel mute) | [midi.md](midi.md) | ✅ (SF3, SFZ and MIDI input 🗓️) |

@@ -1,3 +1,4 @@
+using System.Runtime.InteropServices;
 using FatzAudio.Native;
 
 namespace FatzAudio;
@@ -198,7 +199,7 @@ public sealed record SurfaceEffects
 }
 
 /// <summary>
-/// What every karaoke surface can do (<see cref="CdgSurface"/>; the MIDI lyric surface will be one too): draw into a
+/// What every karaoke surface can do (<see cref="CdgSurface"/>, <see cref="LyricSurface"/>): draw into a
 /// buffer of yours, such as a mapped upload buffer, drawing only what changed since the frame that buffer holds.
 /// One thread at a time per surface.
 /// </summary>
@@ -257,4 +258,101 @@ public interface IKaraokeSurface : IDisposable
 
     /// <summary>As <see cref="UpdateInto(nint, int, int, int, ulong, TimeSpan?)"/>, into a span that holds the whole buffer.</summary>
     SurfaceUpdate UpdateInto(Span<byte> destination, int stride, int width, int height, ulong destinationRevision, TimeSpan? time = null);
+}
+
+/// <summary>Conversions every surface shares.</summary>
+internal static unsafe class SurfaceInterop
+{
+    public static uint Argb(CdgColor c) => (uint)c.A << 24 | (uint)c.R << 16 | (uint)c.G << 8 | c.B;
+
+    public static CdgColor FromArgb(uint v) => new((byte)(v >> 16), (byte)(v >> 8), (byte)v, (byte)(v >> 24));
+
+    public static float Unit(float v) =>
+        v is >= 0.0f and <= 1.0f ? v : throw new ArgumentOutOfRangeException("value", v, "Must be 0 .. 1.");
+
+    public static float Angle(float v) =>
+        float.IsFinite(v) ? v : throw new ArgumentOutOfRangeException("value", v, "Must be finite.");
+
+    /// <summary>fa_surface_effects for <paramref name="value"/> (null: the defaults, all off).</summary>
+    public static void ToNative(SurfaceEffects? value, FaSurfaceEffects* e)
+    {
+        NativeMethods.fa_surface_effects_init(e);
+        if (value is null) return;
+        if (value.Outline is { } o)
+        {
+            e->Outline.On = 1;
+            e->Outline.Color = Argb(o.Color);
+            e->Outline.SungColor = Argb(o.SungColor);
+            e->Outline.Opacity = Unit(o.Opacity);
+            e->Outline.Size = Unit(o.Size);
+            e->Outline.Fade = Unit(o.Fade);
+        }
+        if (value.Shadow is { } s)
+        {
+            e->Shadow.On = 1;
+            e->Shadow.Color = Argb(s.Color);
+            e->Shadow.SungColor = Argb(s.SungColor);
+            e->Shadow.Opacity = Unit(s.Opacity);
+            e->Shadow.Size = Unit(s.Size);
+            e->Shadow.Distance = Unit(s.Distance);
+            e->Shadow.AngleDegrees = Angle(s.AngleDegrees);
+            e->Shadow.Fade = Unit(s.Fade);
+        }
+        if (value.Bevel is { } b)
+        {
+            e->Bevel.On = 1;
+            e->Bevel.Highlight = Argb(b.Highlight);
+            e->Bevel.Shade = Argb(b.Shade);
+            e->Bevel.Strength = Unit(b.Strength);
+            e->Bevel.Size = Unit(b.Size);
+            e->Bevel.LightAngleDegrees = Angle(b.LightAngleDegrees);
+            e->Bevel.Fade = Unit(b.Fade);
+        }
+    }
+
+    /// <summary>The effects that are on; null when none is.</summary>
+    public static SurfaceEffects? FromNative(in FaSurfaceEffects e)
+    {
+        if (e.Outline.On == 0 && e.Shadow.On == 0 && e.Bevel.On == 0) return null;
+        return new SurfaceEffects
+        {
+            Outline = e.Outline.On == 0 ? null : new OutlineEffect
+            {
+                Color = FromArgb(e.Outline.Color), SungColor = FromArgb(e.Outline.SungColor), Opacity = e.Outline.Opacity,
+                Size = e.Outline.Size, Fade = e.Outline.Fade,
+            },
+            Shadow = e.Shadow.On == 0 ? null : new ShadowEffect
+            {
+                Color = FromArgb(e.Shadow.Color), SungColor = FromArgb(e.Shadow.SungColor), Opacity = e.Shadow.Opacity,
+                Size = e.Shadow.Size, Distance = e.Shadow.Distance, AngleDegrees = e.Shadow.AngleDegrees,
+                Fade = e.Shadow.Fade,
+            },
+            Bevel = e.Bevel.On == 0 ? null : new BevelEffect
+            {
+                Highlight = FromArgb(e.Bevel.Highlight), Shade = FromArgb(e.Bevel.Shade), Strength = e.Bevel.Strength,
+                Size = e.Bevel.Size, LightAngleDegrees = e.Bevel.LightAngleDegrees, Fade = e.Bevel.Fade,
+            },
+        };
+    }
+
+    public static SurfaceLayout FromNative(FaSurfaceLayout* l)
+    {
+        string font = Marshal.PtrToStringUTF8((nint)l->FontUsed) ?? "";
+        return new SurfaceLayout((int)l->Width, (int)l->Height, l->BitmapX, l->BitmapY,
+            new PixelRect((int)l->ContentX, (int)l->ContentY, (int)l->ContentWidth, (int)l->ContentHeight), l->Scale,
+            new PixelRect((int)l->CropX, (int)l->CropY, (int)l->CropWidth, (int)l->CropHeight), (SafetyZone)l->SafetyZone,
+            l->SafetyZoneResolved != 0, font, (int)l->Margin, (int)l->Padding, l->LayoutRevision);
+    }
+
+    /// <summary>The native rule: the shape kept, inside 300x216 .. 3840x2160.</summary>
+    public static PixelSize ClampPresentation(PixelSize size)
+    {
+        if (size.IsUnset) return size;
+        double w = size.Width, h = size.Height;
+        double k = Math.Min(3840 / w, 2160 / h);
+        if (k < 1) { w *= k; h *= k; }
+        k = Math.Max(300 / w, 216 / h);
+        if (k > 1) { w *= k; h *= k; }
+        return new PixelSize(Math.Clamp((int)(w + 0.5), 300, 3840), Math.Clamp((int)(h + 0.5), 216, 2160));
+    }
 }
