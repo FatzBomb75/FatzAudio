@@ -1021,12 +1021,15 @@ static void read_info(fa_font* f)
     in->descender = s16(f->hhea, 6);
     in->line_gap = s16(f->hhea, 8);
     in->weight = 400;
+    in->width = 5;
     if (u16(f->head, 44) & 1) { in->bold = 1; in->weight = 700; }
     if (u16(f->head, 44) & 2) in->italic = 1;
     if (f->os2.n >= 78) {
         uint32_t w = u16(f->os2, 4);
         fs = u16(f->os2, 62);
         if (w >= 1 && w <= 1000) in->weight = (int)(w < 10 ? w * 100 : w);
+        w = u16(f->os2, 6);
+        if (w >= 1 && w <= 9) in->width = (int)w;
         in->italic = fs & 1 ? 1 : (fs & 0x200 ? 1 : 0);
         in->bold = fs & 0x20 ? 1 : 0;
         if (fs & 0x80 || (!in->ascender && !in->descender)) {

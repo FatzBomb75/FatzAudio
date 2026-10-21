@@ -18,6 +18,7 @@ typedef struct fa_font_info {
     int ascender, descender, line_gap; /* hhea (OS/2 typo with USE_TYPO_METRICS), descender < 0 */
     int cap_height, x_height;          /* OS/2 version 2 and later, else 0 */
     int weight;                        /* 100..900, OS/2 usWeightClass (400 without) */
+    int width;                         /* 1..9, OS/2 usWidthClass: 5 normal, 3 condensed (5 without) */
     int italic, bold;                  /* OS/2 fsSelection, else head macStyle */
     int cff;                           /* outlines are CFF (cubic) */
     int monospace;

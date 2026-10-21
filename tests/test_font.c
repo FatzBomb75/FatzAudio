@@ -386,12 +386,14 @@ static void check_find(void)
         in = fa_font_get_info(f);
         CHECK(!strcmp(in->family, family) || !strcmp(in->legacy_family, family));
         CHECK(in->weight >= 600 && !in->italic);
+        CHECK_EQ(in->width, 5);                         /* not a condensed face of the family */
         CHECK(fa_font_glyph(f, 'A') != 0);
         fa_font_close(f);
         CHECK_EQ(fa_font_find(family, 400, 1, &f), FA_OK);
         in = fa_font_get_info(f);
         printf("  %s: bold and %s %s (weight %d)\n", family, in->family, in->style, in->weight);
         CHECK(in->weight < 600);
+        CHECK_EQ(in->width, 5);
 #if defined(_WIN32) || defined(__APPLE__)
         CHECK(in->italic);
 #endif

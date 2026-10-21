@@ -46,10 +46,12 @@ static int family_eq(const char* a, const char* b)
     }
 }
 
+/* Style first, then weight, with each step away from normal width (condensed,
+ * expanded) counting as 100 of weight. */
 static int face_score(const fa_font_info* in, int weight, int italic)
 {
-    int d = in->weight - weight;
-    return (d < 0 ? -d : d) + (!in->italic != !italic ? 1000 : 0);
+    int d = in->weight - weight, w = in->width - 5;
+    return (d < 0 ? -d : d) + (w < 0 ? -w : w) * 100 + (!in->italic != !italic ? 1000 : 0);
 }
 
 typedef struct best_face {
@@ -593,5 +595,16 @@ fa_result fa_font_find_for_language(const char* language, int weight, int italic
      * only covers part of it. */
     r = find_in_list(language_families(language), weight, italic, out);
     if (r == FA_OK) return r;
-    return find_generic(language, weight, italic, out);
+    r = find_generic(language, weight, italic, out);
+    /* fontconfig picks its best font even when none has the script. */
+    if (r == FA_OK && language) {
+        uint32_t sample = !strncmp(language, "ja", 2) ? 0x3042 : !strncmp(language, "ko", 2) ? 0xAC00
+                        : !strncmp(language, "zh", 2) ? 0x4E2D : 0;
+        if (sample && !fa_font_glyph(*out, sample)) {
+            fa_font_close(*out);
+            *out = NULL;
+            r = FA_ERROR_NOT_FOUND;
+        }
+    }
+    return r;
 }
