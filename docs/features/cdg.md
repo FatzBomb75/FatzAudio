@@ -206,7 +206,7 @@ for (uint32_t i = 0; i < fr.dirty_count; i++) upload_rect(b, fr.dirty[i]);   /* 
 
 `dst` must be exactly the layout's width x height (`FA_ERROR_SIZE_MISMATCH` otherwise, and nothing is drawn: get the layout again and reallocate); `dst_stride` is bytes per row and may include padding. `fa_surface_get_layout` describes the buffer: its size, where the picture sits in it (`content_*`), the part of the CD+G screen shown (`crop_*`: all 300x216, or the 288x192 picture area with `FA_CDG_NO_BORDER`, reported as `FA_SAFETY_REMOVE`), and a `layout_revision` that goes up when any of it changes. Without presentation options it never changes. A surface used only through `update_into` never allocates pixels of its own.
 
-**Render-ahead** (`fa_surface_set_render_ahead`, off by default; .NET `RenderAhead`). With presentation scaling on, the engine's worker threads render the surface's next frame while you show the current one, and `update_into` only copies the changed area of the finished frame that fits your time best into your buffer: it never waits for a worker that is rendering. The next frame is rendered for the time your next call is expected at, judged from the times of your calls, so pass the time of the frame you are about to show (or `FA_SURFACE_NOW`) and call at the display's pace. `time` in the frame is the position the copied frame shows, and `behind = 1` says it is more than 1/60 s older than the time you asked for (the workers are not keeping up, or just after a seek), newer (just after a seek back) or of graphics since replaced; keep calling and the right frame follows within a call or two. When no worker is rendering and no finished frame fits (the first frame, the first after a new layout or new presentation options, after a seek or new graphics, or one more than 1/60 s late), `update_into` draws the frame on your thread instead, so you never get an empty or wrong one for long. Calls that change the surface (options, sizes, `fa_surface_get_layout`, `fa_cdg_surface_update`) wait for a render in progress, at most one frame. It costs two more buffers of the layout's size (about 7 MB each at 1080p), freed when you turn it off. Workers decode audio first and render only when no stream needs decoding. For CD+G it is rarely worth it: even a full 2160p frame with every option is under 20 ms and a typical frame well under a millisecond (see the table below), so leave it off unless the drawing thread is busy with other work. The classic picture ignores the setting.
+**Render-ahead** (`fa_surface_set_render_ahead`, off by default; .NET `RenderAhead`). With presentation scaling on, the engine's worker threads render the surface's next frame while you show the current one, and `update_into` only copies the changed area of the finished frame that fits your time best into your buffer: it never waits for a worker that is rendering. The next frame is rendered for the time your next call is expected at, judged from the times of your calls, so pass the time of the frame you are about to show (or `FA_SURFACE_NOW`) and call at the display's pace. `time` in the frame is the position the copied frame shows, and `behind = 1` says it is more than 1/60 s older than the time you asked for (the workers are not keeping up, or just after a seek), newer (just after a seek back) or of graphics since replaced; keep calling and the right frame follows within a call or two. When no worker is rendering and no finished frame fits (the first frame, the first after a new layout or new presentation options, after a seek or new graphics, or one more than 1/60 s late), `update_into` draws the frame on your thread instead, so you never get an empty or wrong one for long. Calls that change the surface (options, sizes, `fa_surface_get_layout`, `fa_cdg_surface_update`) wait for a render in progress, at most one frame. It costs two more buffers of the layout's size (about 7 MB each at 1080p), freed when you turn it off. Workers decode audio first and render only when no stream needs decoding. Without effects it is rarely worth it for CD+G: even a full 2160p frame with every presentation option is under 20 ms and a typical frame well under a millisecond (see the table below), so leave it off unless the drawing thread is busy with other work. With effects, a full redraw takes 30-60 ms at 1080p and 100-220 ms at 2160p, so turn it on there. The classic picture ignores the setting.
 
 In .NET, `CdgSurface` implements `IKaraokeSurface`:
 
@@ -272,6 +272,24 @@ AUTO and SUPER are worked out once per song, by the same walk over the packs tha
 
 **Scrolls are moves, not redraws.** The surface keeps the picture it drew (its master) and moves it when the screen scrolls, drawing only the band that came in and what touches it. Smooth-scroll offsets draw nothing: they move the window copied out of the master. A colour-table change draws the master again.
 
+**Effects** (`fa_surface_set_effects`; .NET `Effects`) put an outline, a shadow and a bevel around everything that is not the background, with presentation scaling on (the classic picture ignores them). All three come from one exact distance field of the picture's shape at the output size, corrected to sub-pixel accuracy from the edge pixels' coverage, so the outline is a true stroke: round at corners and the same width on diagonals as on straight edges.
+
+```c
+fa_surface_effects fx;
+fa_surface_effects_init(&fx);        /* everything off, sensible values in each */
+fx.outline.on = 1;                    /* black, size 0.5 (0.75 CD+G pixel) */
+fx.shadow.on = 1;                     /* black at 60 %, 0.5 (1 CD+G pixel) down and right */
+fa_surface_set_effects(cdg, &fx);     /* NULL turns them off */
+```
+
+| Field | Meaning |
+|---|---|
+| `outline` | `color`, `opacity` (multiplies the colour's alpha), `size` 0..1 (1 = 1.5 CD+G pixels), `fade` 0..1 (the part of the width that eases out: 0 a hard edge, 1 a glow) |
+| `shadow` | The shape and its outline, `distance` 0..1 (1 = 2 CD+G pixels) away towards `angle_degrees` (counter-clockwise from the right, 315 = down right), spread by `size` 0..1 (1 = 2 CD+G pixels) with `fade` easing it out: a soft shadow without a blur |
+| `bevel` | Lit from `light_angle_degrees` (135 = top left): `highlight` on the edges facing the light and `shade` on those facing away, `size` 0..1 in from the edge (1 = 1 CD+G pixel), `strength` 0..1, `fade` |
+
+Colours are 0xAARRGGBB with straight alpha. `sung_color` is for the lyric surface; CD+G ignores it. Sizes are in CD+G pixels, so the look is the same at every presentation size. The drawing order is shadow, outline, the picture, then the bevel over it, all premultiplied against transparent like the rest of the picture. Effects see only the cropped picture and stop at its edge (at the margin), so nothing outside the crop, such as a coloured border with `FA_SAFETY_REMOVE`, casts an outline or shadow into it; while a song uses the smooth-scroll offsets they also see the strip the offsets can bring into view. Changing the effects draws the next frame again in full. With effects on, a scroll still moves the picture, and a lyric being coloured in redraws only around it (the changed tiles plus the effects' reach).
+
 Measured on one core of the Linux CI-class sandbox, Release build, a screen of six lines of lyrics; "full" is a seek or a new layout, "typical" one update while lyrics are coloured in (four tiles) into buffers in rotation:
 
 | | 1080p full | 1080p typical | 2160p full | 2160p typical |
@@ -281,8 +299,10 @@ Measured on one core of the Linux CI-class sandbox, Release build, a screen of s
 | Smoothness 2 | 3.3 ms | 0.05 ms | 11 ms | 0.15 ms |
 | Smoothness 4 | 3.4 ms | 0.05 ms | 13 ms | 0.18 ms |
 | Smoothness 4 + edge blend | 4.5 ms | 0.16 ms | 17 ms | 0.55 ms |
+| + outline 0.5, shadow 0.5 | 28 ms | 1.2 ms | 115 ms | 4.3 ms |
+| + every effect at 1.0, fades on | 55 ms | 3.3 ms | 220 ms | 14 ms |
 
-`fa_test_cdg` prints this table (`test_presentation_costs`), so it can be measured on any machine.
+`fa_test_cdg` prints this table (`test_presentation_costs`), so it can be measured on any machine. Effects cost most when the whole picture is drawn (a seek, a new layout, a colour change); a typical frame stays a few milliseconds even at 2160p. With effects at 2160p, turn on render-ahead so a full redraw happens on a worker instead of your drawing thread.
 
 In .NET, `CdgSurface.Presentation` takes a `CdgPresentation` record (null = none):
 

@@ -236,6 +236,12 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_surface_set_render_ahead(nint surface, int enabled);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_surface_effects_init(FaSurfaceEffects* effects);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_surface_set_effects(nint surface, FaSurfaceEffects* effects);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_surface_get_layout(nint surface, FaSurfaceLayout* layout);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

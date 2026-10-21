@@ -28,6 +28,11 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   `FA_CDG_INDEX_TRANSPARENT` (index 16 in INDEXED8 padding). .NET: `CdgSurface.Presentation`, `CdgPresentation`,
   `CdgSurface.TransparentIndex`. Surfaces without presentation options draw exactly as before. See
   [docs/features/cdg.md](docs/features/cdg.md#presentation-options-fa_cdg_surface_set_presentation).
+- Surface effects: `fa_surface_set_effects` draws an outline, a shadow (offset, spread and soft) and a bevel around a
+  CD+G picture with presentation scaling, from one exact distance field of the picture's shape, so outlines are round
+  and even at any width; sizes are in CD+G pixels. Also `fa_surface_get_effects` and `fa_surface_effects_init`. .NET:
+  `IKaraokeSurface.Effects`, `SurfaceEffects`, `OutlineEffect`, `ShadowEffect`, `BevelEffect`. Off by default. See
+  [docs/features/cdg.md](docs/features/cdg.md#presentation-options-fa_cdg_surface_set_presentation).
 - Render-ahead: `fa_surface_set_render_ahead` (.NET `RenderAhead`) now works. With CD+G presentation scaling the
   engine's worker threads render the next frame ahead and `fa_surface_update_into` copies the newest finished one
   without waiting; `fa_surface_frame.behind` says when that frame is late. Workers render only when no stream needs

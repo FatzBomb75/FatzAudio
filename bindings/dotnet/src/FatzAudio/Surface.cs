@@ -129,6 +129,75 @@ public readonly ref struct SurfaceUpdate
 }
 
 /// <summary>
+/// An outline around the shape: a true stroke, round and even at any width. See <see cref="SurfaceEffects"/>.
+/// </summary>
+public sealed record OutlineEffect
+{
+    /// <summary>The outline's colour (straight alpha).</summary>
+    public CdgColor Color { get; init; } = new(0, 0, 0, 255);
+    /// <summary>Lyrics: the colour once sung. CD+G ignores it.</summary>
+    public CdgColor SungColor { get; init; } = new(0, 0, 0, 255);
+    /// <summary>0..1, multiplies the colour's alpha.</summary>
+    public float Opacity { get; init; } = 1.0f;
+    /// <summary>0..1: the width, 1 = 1.5 CD+G pixels (lyrics: 0.12 em).</summary>
+    public float Size { get; init; } = 0.5f;
+    /// <summary>0..1: the part of the width that eases out, 0 a hard edge, 1 a glow.</summary>
+    public float Fade { get; init; }
+}
+
+/// <summary>A shadow of the shape and its outline. See <see cref="SurfaceEffects"/>.</summary>
+public sealed record ShadowEffect
+{
+    /// <summary>The shadow's colour (straight alpha).</summary>
+    public CdgColor Color { get; init; } = new(0, 0, 0, 255);
+    /// <summary>Lyrics: the colour once sung. CD+G ignores it.</summary>
+    public CdgColor SungColor { get; init; } = new(0, 0, 0, 255);
+    /// <summary>0..1, multiplies the colour's alpha.</summary>
+    public float Opacity { get; init; } = 0.6f;
+    /// <summary>0..1: how far it spreads beyond the shape and outline, 1 = 2 CD+G pixels (lyrics: 0.20 em).</summary>
+    public float Size { get; init; }
+    /// <summary>0..1: how far away it falls, 1 = 2 CD+G pixels (lyrics: 0.15 em).</summary>
+    public float Distance { get; init; } = 0.5f;
+    /// <summary>Where it falls, degrees counter-clockwise from the right (315 = down right).</summary>
+    public float AngleDegrees { get; init; } = 315.0f;
+    /// <summary>0..1: the part of <see cref="Size"/> that eases out (a soft shadow).</summary>
+    public float Fade { get; init; }
+}
+
+/// <summary>A bevel lit from one side. See <see cref="SurfaceEffects"/>.</summary>
+public sealed record BevelEffect
+{
+    /// <summary>On the sides facing the light.</summary>
+    public CdgColor Highlight { get; init; } = new(255, 255, 255, 128);
+    /// <summary>On the sides facing away.</summary>
+    public CdgColor Shade { get; init; } = new(0, 0, 0, 128);
+    /// <summary>0..1.</summary>
+    public float Strength { get; init; } = 0.5f;
+    /// <summary>0..1: how far in from the edge, 1 = 1 CD+G pixel (lyrics: 0.08 em).</summary>
+    public float Size { get; init; } = 0.5f;
+    /// <summary>Where the light comes from, degrees counter-clockwise from the right (135 = top left).</summary>
+    public float LightAngleDegrees { get; init; } = 135.0f;
+    /// <summary>0..1: the part of <see cref="Size"/> that eases out.</summary>
+    public float Fade { get; init; } = 0.5f;
+}
+
+/// <summary>
+/// Outline, shadow and bevel around what a surface draws, from one distance field of its shape; drawn shadow first, then
+/// the outline, the shape, and the bevel over it, premultiplied against transparent. A null effect is off. CD+G: the shape
+/// is everything but the background, and the effects apply with <see cref="CdgPresentation.Scale"/> on (the classic
+/// picture ignores them); they are cut at the edge of the picture.
+/// </summary>
+public sealed record SurfaceEffects
+{
+    /// <summary>The outline, or null.</summary>
+    public OutlineEffect? Outline { get; init; }
+    /// <summary>The shadow, or null.</summary>
+    public ShadowEffect? Shadow { get; init; }
+    /// <summary>The bevel, or null.</summary>
+    public BevelEffect? Bevel { get; init; }
+}
+
+/// <summary>
 /// What every karaoke surface can do (<see cref="CdgSurface"/>; the MIDI lyric surface will be one too): draw into a
 /// buffer of yours, such as a mapped upload buffer, drawing only what changed since the frame that buffer holds.
 /// One thread at a time per surface.
@@ -162,6 +231,11 @@ public interface IKaraokeSurface : IDisposable
     /// frame it draws one itself. Takes two more buffers of the layout's size; the classic
     /// CD+G picture ignores it.</summary>
     bool RenderAhead { get; set; }
+
+    /// <summary>Outline, shadow and bevel; null (the default) for none. The next frame is drawn again in full.</summary>
+    /// <exception cref="ArgumentOutOfRangeException">A value out of its range (sizes, opacities, strength and fades are
+    /// 0..1; angles must be finite).</exception>
+    SurfaceEffects? Effects { get; set; }
 
     /// <summary>The buffer size to draw into, and where the picture goes.</summary>
     SurfaceLayout GetLayout();

@@ -2610,21 +2610,219 @@ static void test_presentation_scaled(void)
 /* Drawing only what changed (a moved master, offsets, the reach of smoothing and edge
  * blend) gives the same buffer as drawing everything, for every option, into buffers
  * in rotation. */
+/* Effects for the tests: 1 outline and a soft shadow, 2 bevel and a hard outline, 3
+ * a glow and a hard shadow far off. */
+static fa_surface_effects fx_set(int which)
+{
+    fa_surface_effects e;
+    fa_surface_effects_init(&e);
+    if (which == 1) {
+        e.outline.on = 1;
+        e.outline.size = 0.6f;
+        e.outline.color = 0xFF102030u;
+        e.shadow.on = 1;
+        e.shadow.size = 0.7f;
+        e.shadow.fade = 0.8f;
+        e.shadow.distance = 0.6f;
+    } else if (which == 2) {
+        e.bevel.on = 1;
+        e.bevel.strength = 1.0f;
+        e.bevel.size = 1.0f;
+        e.outline.on = 1;
+        e.outline.size = 0.3f;
+    } else {
+        e.outline.on = 1;
+        e.outline.size = 1.0f;
+        e.outline.fade = 1.0f;
+        e.outline.color = 0xC0FFE000u;
+        e.shadow.on = 1;
+        e.shadow.distance = 1.0f;
+        e.shadow.angle_degrees = 200.0f;
+    }
+    return e;
+}
+
+/* A pixel of buffer `mem` (BGRA, stride w * 4) at screen pixel (sx, sy) of a SHOW
+ * surface drawn at 2x, plus (ox, oy) buffer pixels. */
+static const uint8_t* fx_px(const uint8_t* mem, const fa_surface_layout* l, int sx, int sy, int ox, int oy)
+{
+    return mem + ((size_t)(l->content_y + (uint32_t)sy * 2 + (uint32_t)oy) * l->width + l->content_x + (uint32_t)sx * 2 +
+                  (uint32_t)ox) * 4;
+}
+
+/* Outline, shadow and bevel where they belong around a red block (screen x 120..138,
+ * y 96..120, at 2x); options checked; the classic picture ignores them. */
+static void test_effects(void)
+{
+    buf c = { 0 };
+    fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface *f = NULL, *plain = NULL, *classic = NULL, *classic_plain = NULL;
+    fa_cdg_presentation p = pres(1, FA_SAFETY_SHOW);
+    fa_surface_effects e, got;
+    fa_surface_layout l;
+    uint8_t *mem, *base;
+    const uint8_t* q;
+    int r, col;
+    colors(&c, 0, k_low);
+    preset(&c, 0, 0);
+    for (r = 8; r < 10; r++)
+        for (col = 20; col < 23; col++) tile(&c, 0, 1, 1, r, col, 0x3F);
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &plain), FA_OK);
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    CHECK_EQ(fa_cdg_surface_set_presentation(plain, &p), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(f, 600, 432), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(plain, 600, 432), FA_OK);
+    base = full_draw(plain, 200, 4, &l);
+    CHECK(base);
+    CHECK_EQ(l.scale, 2.0f);
+    CHECK_EQ(fx_px(base, &l, 125, 100, 0, 0)[2], 255);   /* red inside */
+    CHECK_EQ(fx_px(base, &l, 138, 100, 0, 0)[3], 0);     /* transparent outside */
+
+    /* Validation, defaults, NULL. */
+    memset(&got, 0, sizeof(got));
+    got.struct_size = sizeof(got);
+    CHECK_EQ(fa_surface_get_effects(f, &got), FA_OK);
+    CHECK(!got.outline.on && !got.shadow.on && !got.bevel.on);
+    CHECK_EQ(got.shadow.angle_degrees, 315.0f);
+    fa_surface_effects_init(&e);
+    e.outline.size = 1.5f;
+    CHECK_EQ(fa_surface_set_effects(f, &e), FA_ERROR_INVALID_ARG);
+    fa_surface_effects_init(&e);
+    e.shadow.on = 2;
+    CHECK_EQ(fa_surface_set_effects(f, &e), FA_ERROR_INVALID_ARG);
+    fa_surface_effects_init(&e);
+    e.bevel.light_angle_degrees = NAN;
+    CHECK_EQ(fa_surface_set_effects(f, &e), FA_ERROR_INVALID_ARG);
+
+    /* Outline 1.0 = 1.5 CD+G pixels = 3 buffer pixels, hard. */
+    fa_surface_effects_init(&e);
+    e.outline.on = 1;
+    e.outline.size = 1.0f;
+    e.outline.color = 0xFF00FF00u;
+    CHECK_EQ(fa_surface_set_effects(f, &e), FA_OK);
+    CHECK_EQ(fa_surface_get_effects(f, &got), FA_OK);
+    CHECK(got.outline.on && got.outline.size == 1.0f);
+    mem = full_draw(f, 200, 4, &l);
+    CHECK(mem);
+    CHECK_EQ(fx_px(mem, &l, 125, 100, 0, 0)[2], 255);    /* the shape over it */
+    CHECK_EQ(fx_px(mem, &l, 138, 100, 0, 0)[1], 255);    /* 0.5 px out: outline */
+    CHECK_EQ(fx_px(mem, &l, 138, 100, 2, 0)[3], 255);    /* 2.5 px out */
+    CHECK_EQ(fx_px(mem, &l, 138, 100, 2, 0)[1], 255);
+    CHECK_EQ(fx_px(mem, &l, 138, 100, 4, 0)[3], 0);      /* 4.5 px out: nothing */
+    CHECK_EQ(fx_px(mem, &l, 119, 100, 1, 0)[3], 255);    /* left side too */
+    CHECK_EQ(fx_px(mem, &l, 125, 120, 0, 1)[1], 255);    /* and below */
+    CHECK(fx_px(mem, &l, 138, 120, 3, 3)[3] < 128);      /* the corner is round: 4.2 px */
+    free(mem);
+
+    /* A hard shadow 1.0 = 2 CD+G pixels = 4 buffer pixels down right, at 60 %. */
+    fa_surface_effects_init(&e);
+    e.shadow.on = 1;
+    e.shadow.distance = 1.0f;
+    CHECK_EQ(fa_surface_set_effects(f, &e), FA_OK);
+    mem = full_draw(f, 200, 4, &l);
+    CHECK(mem);
+    q = fx_px(mem, &l, 138, 120, 1, 1);
+    CHECK(q[3] >= 150 && q[3] <= 156 && q[0] == 0 && q[1] == 0 && q[2] == 0);
+    CHECK(fx_px(mem, &l, 138, 100, 2, 0)[3] > 128);     /* to the right: 2.8 px */
+    CHECK_EQ(fx_px(mem, &l, 138, 100, 3, 0)[3], 0);
+    CHECK_EQ(fx_px(mem, &l, 138, 100, 6, 0)[3], 0);      /* 6 px right: past it */
+    CHECK_EQ(fx_px(mem, &l, 119, 100, 0, 0)[3], 0);      /* never up left */
+    CHECK_EQ(fx_px(mem, &l, 125, 95, 0, 1)[3], 0);
+    CHECK(memcmp(fx_px(mem, &l, 125, 100, 0, 0), fx_px(base, &l, 125, 100, 0, 0), 4) == 0);   /* under the shape */
+    free(mem);
+
+    /* A bevel lit from the top left: lighter along the top, darker along the bottom. */
+    fa_surface_effects_init(&e);
+    e.bevel.on = 1;
+    e.bevel.strength = 1.0f;
+    e.bevel.size = 1.0f;
+    CHECK_EQ(fa_surface_set_effects(f, &e), FA_OK);
+    mem = full_draw(f, 200, 4, &l);
+    CHECK(mem);
+    q = fx_px(mem, &l, 128, 96, 0, 0);
+    CHECK(q[0] > 60 && q[1] > 60 && q[2] == 255);        /* top: white over red */
+    q = fx_px(mem, &l, 128, 119, 0, 1);
+    CHECK(q[2] < 200 && q[0] == 0 && q[1] == 0);         /* bottom: black over red */
+    CHECK(memcmp(fx_px(mem, &l, 128, 108, 0, 0), fx_px(base, &l, 128, 108, 0, 0), 4) == 0);   /* middle: as is */
+    free(mem);
+
+    /* NULL: none again. */
+    CHECK_EQ(fa_surface_set_effects(f, NULL), FA_OK);
+    mem = full_draw(f, 200, 4, &l);
+    CHECK(mem && memcmp(mem, base, (size_t)l.width * l.height * 4) == 0);
+    free(mem);
+
+    /* The classic picture ignores them. */
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &classic), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &classic_plain), FA_OK);
+    e = fx_set(1);
+    CHECK_EQ(fa_surface_set_effects(classic, &e), FA_OK);
+    mem = full_draw(classic, 200, 4, &l);
+    CHECK(mem);
+    {
+        fa_surface_layout l2;
+        uint8_t* other = full_draw(classic_plain, 200, 4, &l2);
+        CHECK(other && memcmp(mem, other, (size_t)l.width * l.height * 4) == 0);
+        free(other);
+    }
+    free(mem);
+    free(base);
+    fa_surface_destroy(classic);
+    fa_surface_destroy(classic_plain);
+    fa_surface_destroy(plain);
+    fa_surface_destroy(f);
+    fa_stream_close(s);
+    free(c.p);
+
+    /* A coloured border outside the crop casts nothing into the picture, on any side. */
+    memset(&c, 0, sizeof(c));
+    s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    colors(&c, 0, k_low);
+    preset(&c, 0, 0);
+    border(&c, 2);
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
+    p = pres(1, FA_SAFETY_REMOVE);
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(f, 576, 384), FA_OK);
+    fa_surface_effects_init(&e);
+    e.outline.on = 1;
+    e.outline.size = 1.0f;
+    e.shadow.on = 1;
+    e.shadow.distance = 1.0f;
+    CHECK_EQ(fa_surface_set_effects(f, &e), FA_OK);
+    mem = full_draw(f, 200, 4, &l);
+    CHECK(mem);
+    CHECK_EQ(fx_px(mem, &l, 0, 100, 0, 0)[3], 0);              /* left edge */
+    CHECK_EQ(fx_px(mem, &l, 287, 100, 1, 0)[3], 0);            /* right edge */
+    CHECK_EQ(fx_px(mem, &l, 100, 0, 0, 0)[3], 0);              /* top */
+    CHECK_EQ(fx_px(mem, &l, 100, 191, 0, 1)[3], 0);            /* bottom */
+    free(mem);
+    fa_surface_destroy(f);
+    fa_stream_close(s);
+    free(c.p);
+}
+
 static void test_presentation_incremental(void)
 {
-    static const struct { fa_safety_zone zone; uint32_t w, h; int smooth, blend, tb, padding, rgba; } cfgs[] = {
-        { FA_SAFETY_SHOW, 600, 432, 0, 0, 0, 0, 0 },
-        { FA_SAFETY_SHOW, 900, 648, 1, 0, 0, 0, 1 },
-        { FA_SAFETY_REMOVE, 600, 432, 2, 1, 0, 2, 0 },
-        { FA_SAFETY_SHOW, 900, 648, 4, 1, 1, 0, 0 },
-        { FA_SAFETY_SHOW, 600, 432, 0, 1, 1, 1, 0 },
-        { FA_SAFETY_SUPER, 900, 648, 3, 1, 0, 0, 0 },
-        { FA_SAFETY_SHOW, 1200, 864, 9, 1, 0, 0, 0 },
-        { FA_SAFETY_SUPER, 900, 648, 0, 0, 0, 0, 0 },
-        { FA_SAFETY_SUPER, 900, 648, 1, 0, 1, 1, 0 },
-        { FA_SAFETY_REMOVE, 1152, 768, 0, 1, 0, 0, 0 },   /* edge blend near an edge the master does not reach */
-        { FA_SAFETY_SHOW, 600, 432, 0, 0, 1, 0, 0 },      /* a transparent border carried in by a scroll */
-        { FA_SAFETY_REMOVE, 600, 432, 0, 0, 1, 0, 0 },
+    static const struct { fa_safety_zone zone; uint32_t w, h; int smooth, blend, tb, padding, rgba, fx; } cfgs[] = {
+        { FA_SAFETY_SHOW, 600, 432, 0, 0, 0, 0, 0, 0 },
+        { FA_SAFETY_SHOW, 900, 648, 1, 0, 0, 0, 1, 0 },
+        { FA_SAFETY_REMOVE, 600, 432, 2, 1, 0, 2, 0, 0 },
+        { FA_SAFETY_SHOW, 900, 648, 4, 1, 1, 0, 0, 0 },
+        { FA_SAFETY_SHOW, 600, 432, 0, 1, 1, 1, 0, 0 },
+        { FA_SAFETY_SUPER, 900, 648, 3, 1, 0, 0, 0, 0 },
+        { FA_SAFETY_SHOW, 1200, 864, 9, 1, 0, 0, 0, 0 },
+        { FA_SAFETY_SUPER, 900, 648, 0, 0, 0, 0, 0, 0 },
+        { FA_SAFETY_SUPER, 900, 648, 1, 0, 1, 1, 0, 0 },
+        { FA_SAFETY_REMOVE, 1152, 768, 0, 1, 0, 0, 0, 0 },   /* edge blend near an edge the master does not reach */
+        { FA_SAFETY_SHOW, 600, 432, 0, 0, 1, 0, 0, 0 },      /* a transparent border carried in by a scroll */
+        { FA_SAFETY_REMOVE, 600, 432, 0, 0, 1, 0, 0, 0 },
+        { FA_SAFETY_SHOW, 900, 648, 0, 0, 0, 0, 0, 1 },   /* effects: outline and a soft shadow */
+        { FA_SAFETY_REMOVE, 900, 648, 2, 1, 0, 1, 1, 2 }, /* bevel and a hard outline */
+        { FA_SAFETY_SHOW, 600, 432, 4, 0, 1, 2, 0, 3 },   /* a glow and a hard shadow far off */
     };
     buf data[4];
     unsigned ci, di;
@@ -2659,6 +2857,11 @@ static void test_presentation_incremental(void)
             CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
             CHECK_EQ(fa_surface_set_presentation_size(f, cfgs[ci].w, cfgs[ci].h), FA_OK);
             CHECK_EQ(fa_surface_set_presentation_size(ref, cfgs[ci].w, cfgs[ci].h), FA_OK);
+            if (cfgs[ci].fx) {
+                fa_surface_effects fx = fx_set(cfgs[ci].fx);
+                CHECK_EQ(fa_surface_set_effects(f, &fx), FA_OK);
+                CHECK_EQ(fa_surface_set_effects(ref, &fx), FA_OK);
+            }
             l = layout_of(f);
             stride = (int32_t)(l.width * 4 + 12);
             size = (size_t)stride * l.height;
@@ -3102,8 +3305,10 @@ static void test_render_ahead(void)
  * (four tiles), into buffers in rotation. Checks nothing but that it runs. */
 static void test_presentation_costs(void)
 {
-    static const struct { const char* name; int smooth, blend; } levels[] = {
-        { "smoothness 0", 0, 0 }, { "smoothness 2", 2, 0 }, { "smoothness 4", 4, 0 }, { "smoothness 4 + edge blend", 4, 1 },
+    static const struct { const char* name; int smooth, blend, fx; } levels[] = {
+        { "smoothness 0", 0, 0, 0 }, { "smoothness 2", 2, 0, 0 }, { "smoothness 4", 4, 0, 0 },
+        { "smoothness 4 + edge blend", 4, 1, 0 }, { "+ outline 0.5, shadow 0.5", 4, 1, 2 },
+        { "+ all effects at maximum", 4, 1, 1 },
     };
     static const uint32_t sizes[2][2] = { { 1920, 1080 }, { 3840, 2160 } };
     buf c = { 0 };
@@ -3119,8 +3324,20 @@ static void test_presentation_costs(void)
     CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
     CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
     printf("  %-28s %10s %10s %10s %10s\n", "", "1080p full", "typical", "2160p full", "typical");
-    for (li = 0; li < 4; li++) {
+    for (li = 0; li < 6; li++) {
         double full[2], typical[2];
+        fa_surface_effects fx;
+        fa_surface_effects_init(&fx);
+        if (levels[li].fx == 1) {
+            /* Everything on at its largest. */
+            fx.outline.on = fx.shadow.on = fx.bevel.on = 1;
+            fx.outline.size = fx.shadow.size = fx.shadow.distance = fx.bevel.size = fx.bevel.strength = 1.0f;
+            fx.shadow.fade = 1.0f;
+        } else if (levels[li].fx == 2) {
+            /* A look like MediaControl's today: an outline and a hard shadow. */
+            fx.outline.on = fx.shadow.on = 1;
+        }
+        CHECK_EQ(fa_surface_set_effects(f, &fx), FA_OK);
         for (si = 0; si < 2; si++) {
             fa_cdg_presentation p = pres(1, FA_SAFETY_SHOW);
             fa_surface_layout l;
@@ -3248,6 +3465,7 @@ int main(void)
     RUN(test_presentation_scaled);
     RUN(test_safety_zone_prepass);
     RUN(test_smoothness_and_edge_blend);
+    RUN(test_effects);
     RUN(test_presentation_incremental);
     RUN(test_render_ahead);
     RUN(test_presentation_costs);
