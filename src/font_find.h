@@ -1,6 +1,6 @@
 /* Finding the system's fonts, through each OS's own lists: the registry's font
- * list on Windows, CoreText on macOS and iOS, the system font matcher on Android
- * 10 and later (the system font folders before that), fontconfig on Linux when
+ * list on Windows, CoreText on macOS and iOS, the system's font list on Android
+ * 10 and later in an app (the system font folders otherwise), fontconfig on Linux when
  * the system has it (loaded at runtime), else the usual font folders. The faces
  * found are read with our own reader (font.h), so a family is matched the same
  * way everywhere. */

@@ -286,88 +286,91 @@ static const char* const* language_families(const char* lang)
     return ui;
 }
 
-/* ---- Android: the system font matcher (API 29), else the font folders ----------- */
+/* ---- Android: the system's font list (API 29), else the font folders ------------- */
 
 #elif defined(__ANDROID__)
-typedef struct AFontMatcher AFontMatcher;
+/* The list comes from ASystemFontIterator, which an app process fills from the
+ * system's font map (updatable fonts included). AFontMatcher is not used: it
+ * needs that map too and crashes without it (a command-line program), where the
+ * iterator just lists nothing and the folders are scanned instead. */
+typedef struct ASystemFontIterator ASystemFontIterator;
 typedef struct AFont AFont;
 static struct {
     int tried;
-    AFontMatcher* (*create)(void);
-    void (*destroy)(AFontMatcher*);
-    void (*set_style)(AFontMatcher*, uint16_t, int);
-    void (*set_locales)(AFontMatcher*, const char*);
-    AFont* (*match)(const AFontMatcher*, const char*, const uint16_t*, uint32_t, uint32_t*);
+    ASystemFontIterator* (*open)(void);
+    AFont* (*next)(ASystemFontIterator*);
+    void (*close_iter)(ASystemFontIterator*);
     const char* (*path)(const AFont*);
     size_t (*index)(const AFont*);
+    const char* (*locale)(const AFont*);
     void (*close)(AFont*);
-} g_afm;
-static fa_lazy_mutex g_afm_lock;
+} g_sfi;
+static fa_lazy_mutex g_sfi_lock;
 
-static int afm_load(void)
+static int sfi_load(void)
 {
-    fa_lazy_mutex_lock(&g_afm_lock);
-    if (!g_afm.tried) {
+    fa_lazy_mutex_lock(&g_sfi_lock);
+    if (!g_sfi.tried) {
         void* lib = fa_lib_open("libandroid.so", 0);
-        g_afm.tried = 1;
+        g_sfi.tried = 1;
         if (lib) {
-            g_afm.create = (AFontMatcher * (*)(void)) fa_lib_sym(lib, "AFontMatcher_create");
-            g_afm.destroy = (void (*)(AFontMatcher*))fa_lib_sym(lib, "AFontMatcher_destroy");
-            g_afm.set_style = (void (*)(AFontMatcher*, uint16_t, int))fa_lib_sym(lib, "AFontMatcher_setStyle");
-            g_afm.set_locales = (void (*)(AFontMatcher*, const char*))fa_lib_sym(lib, "AFontMatcher_setLocales");
-            g_afm.match = (AFont * (*)(const AFontMatcher*, const char*, const uint16_t*, uint32_t, uint32_t*))
-                fa_lib_sym(lib, "AFontMatcher_match");
-            g_afm.path = (const char* (*)(const AFont*))fa_lib_sym(lib, "AFont_getFontFilePath");
-            g_afm.index = (size_t(*)(const AFont*))fa_lib_sym(lib, "AFont_getCollectionIndex");
-            g_afm.close = (void (*)(AFont*))fa_lib_sym(lib, "AFont_close");
-            if (!g_afm.create || !g_afm.destroy || !g_afm.set_style || !g_afm.set_locales || !g_afm.match ||
-                !g_afm.path || !g_afm.index || !g_afm.close)
-                g_afm.create = NULL;
+            g_sfi.open = (ASystemFontIterator * (*)(void)) fa_lib_sym(lib, "ASystemFontIterator_open");
+            g_sfi.next = (AFont * (*)(ASystemFontIterator*)) fa_lib_sym(lib, "ASystemFontIterator_next");
+            g_sfi.close_iter = (void (*)(ASystemFontIterator*))fa_lib_sym(lib, "ASystemFontIterator_close");
+            g_sfi.path = (const char* (*)(const AFont*))fa_lib_sym(lib, "AFont_getFontFilePath");
+            g_sfi.index = (size_t(*)(const AFont*))fa_lib_sym(lib, "AFont_getCollectionIndex");
+            g_sfi.locale = (const char* (*)(const AFont*))fa_lib_sym(lib, "AFont_getLocale");
+            g_sfi.close = (void (*)(AFont*))fa_lib_sym(lib, "AFont_close");
+            if (!g_sfi.next || !g_sfi.close_iter || !g_sfi.path || !g_sfi.index || !g_sfi.locale || !g_sfi.close)
+                g_sfi.open = NULL;
         }
     }
-    fa_lazy_mutex_unlock(&g_afm_lock);
-    return g_afm.create != NULL;
+    fa_lazy_mutex_unlock(&g_sfi_lock);
+    return g_sfi.open != NULL;
 }
 
-/* The matcher's face for a family (or a generic name) and a language; its file
- * and face become the candidate, checked against `family` when given. */
-static void afm_match(best_face* b, const char* name, const char* locales, const char* check_family, int weight, int italic)
+/* Whether a font's locale list ("ja-Jpan", "zh-Hans,zh-Bopo") has `tag` or a
+ * subtag of it. */
+static int locale_has(const char* list, const char* tag)
 {
-    static const uint16_t latin[] = { 'a' }, kana[] = { 0x3042 }, hangul[] = { 0xAC00 }, han[] = { 0x4E2D };
-    const uint16_t* text = latin;
-    AFontMatcher* m;
+    size_t n = strlen(tag);
+    while (list && *list) {
+        if (!strncmp(list, tag, n) && (list[n] == '\0' || list[n] == '-' || list[n] == ',')) return 1;
+        list = strchr(list, ',');
+        if (list) list++;
+    }
+    return 0;
+}
+
+/* Every listed face of `family` (any family when NULL) and, with `tag`, of that
+ * locale. Returns how many fonts the system listed. */
+static int sfi_scan(best_face* b, const char* family, const char* tag, int weight, int italic)
+{
+    ASystemFontIterator* it;
     AFont* f;
-    uint32_t run = 0;
-    if (!afm_load() || !(m = g_afm.create())) return;
-    g_afm.set_style(m, (uint16_t)weight, italic);
-    if (locales) {
-        g_afm.set_locales(m, locales);
-        text = !strncmp(locales, "ja", 2) ? kana : !strncmp(locales, "ko", 2) ? hangul : !strncmp(locales, "zh", 2) ? han : latin;
-    }
-    f = g_afm.match(m, name, text, 1, &run);
-    if (f) {
-        const char* path = g_afm.path(f);
-        FILE* fp = path ? fa_fopen_utf8(path, "rb") : NULL;
-        if (fp) {
+    int listed = 0;
+    if (g_scan_only || !sfi_load() || !(it = g_sfi.open())) return 0;
+    while ((f = g_sfi.next(it)) != NULL) {
+        const char* path = g_sfi.path(f);
+        FILE* fp;
+        listed++;
+        if (path && (!tag || locale_has(g_sfi.locale(f), tag)) && (fp = fa_fopen_utf8(path, "rb")) != NULL) {
             fa_font_info in;
-            uint32_t idx = (uint32_t)g_afm.index(f);
+            uint32_t idx = (uint32_t)g_sfi.index(f);
             if (fa_font_probe(fp, NULL, idx, &in) == FA_OK &&
-                (!check_family || family_eq(check_family, in.family) || family_eq(check_family, in.legacy_family))) {
-                fclose(fp);
-                fp = NULL;
+                (!family || family_eq(family, in.family) || family_eq(family, in.legacy_family)))
                 consider(b, path, idx, &in, weight, italic);
-            }
-            if (fp) fclose(fp);
+            fclose(fp);
         }
-        g_afm.close(f);
+        g_sfi.close(f);
     }
-    g_afm.destroy(m);
+    g_sfi.close_iter(it);
+    return listed;
 }
 
 static void os_family(best_face* b, const char* family, int weight, int italic)
 {
-    if (afm_load()) afm_match(b, family, NULL, family, weight, italic);
-    if (b->score < 0) scan_folders(b, family, weight, italic);
+    if (!sfi_scan(b, family, NULL, weight, italic)) scan_folders(b, family, weight, italic);
 }
 
 static const char* const* language_families(const char* lang)
@@ -529,20 +532,21 @@ static fa_result find_in_list(const char* const* families, int weight, int itali
     return FA_ERROR_NOT_FOUND;
 }
 
-/* A fontconfig or Android matcher pick for a generic family and language. */
+/* fontconfig's pick for a generic family and language, or Android's fonts for the
+ * language. */
 static fa_result find_generic(const char* lang, int weight, int italic, fa_font** out)
 {
 #if defined(__ANDROID__)
-    best_face b;
-    b.score = -1;
-    if (!g_scan_only && afm_load()) {
-        char loc[32];
-        if (lang) {
-            snprintf(loc, sizeof(loc), "%s", !strcmp(lang, "zh-Hans") ? "zh-CN" : !strcmp(lang, "zh-Hant") ? "zh-TW" : lang);
-            afm_match(&b, "sans-serif", loc, NULL, weight, italic);
-        } else {
-            afm_match(&b, "sans-serif", NULL, NULL, weight, italic);
-        }
+    /* The system's fonts for the language (the UI font comes from the list). */
+    if (lang) {
+        best_face b;
+        char tag[16];
+        size_t n = strcspn(lang, "-_");
+        if (!strncmp(lang, "zh-Hant", 7) || !strncmp(lang, "zh-TW", 5) || !strncmp(lang, "zh-HK", 5)) snprintf(tag, sizeof(tag), "zh-Hant");
+        else if (!strncmp(lang, "zh", 2)) snprintf(tag, sizeof(tag), "zh-Hans");
+        else snprintf(tag, sizeof(tag), "%.*s", (int)(n < 8 ? n : 8), lang);  /* the language: "ja" of "ja-JP" */
+        b.score = -1;
+        sfi_scan(&b, NULL, tag, weight, italic);
         if (b.score >= 0) return open_best(&b, out);
     }
 #elif !defined(_WIN32) && !defined(__APPLE__)
