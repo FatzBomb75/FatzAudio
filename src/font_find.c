@@ -160,12 +160,14 @@ static int registry_name_has(const char* value, const char* family)
         a = p;
         /* Does this name start with the family (as family_eq compares)? */
         for (;;) {
-            while (*a == ' ' || *a == '-' || *a == '_') a++;
+            /* The family's end is checked before the name's spaces are skipped:
+             * "Arial Bold" starts with "Arial", "Arialic" does not. */
             while (*f == ' ' || *f == '-' || *f == '_') f++;
             if (!*f) {
                 if (!*a || *a == ' ' || *a == '(' || *a == '&') return 1;
                 break;
             }
+            while (*a == ' ' || *a == '-' || *a == '_') a++;
             if (!*a) break;
             {
                 unsigned char ca = (unsigned char)*a, cb = (unsigned char)*f;
