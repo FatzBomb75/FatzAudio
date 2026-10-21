@@ -21,6 +21,17 @@ static int g_failures = 0;
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); g_failures++; return; } } while (0)
 #define CHECK_EQ(a, b) do { long long va_ = (long long)(a), vb_ = (long long)(b); if (va_ != vb_) { \
     fprintf(stderr, "  FAIL %s:%d: %s == %s (%lld vs %lld)\n", __FILE__, __LINE__, #a, #b, va_, vb_); g_failures++; return; } } while (0)
+/* Sanitizer builds run some expensive checks on a sample only (CI time). */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#  define FA_TEST_SANITIZED 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#    define FA_TEST_SANITIZED 1
+#  endif
+#endif
+#ifndef FA_TEST_SANITIZED
+#  define FA_TEST_SANITIZED 0
+#endif
 #define RUN(t) do { int before_ = g_failures; printf("%s\n", #t); t(); if (g_failures == before_) printf("  ok\n"); } while (0)
 
 static fa_engine* g_engine;
@@ -2876,6 +2887,9 @@ static void test_presentation_incremental(void)
                 CHECK_EQ(fa_surface_update_into(f, t_packs((int64_t)k), mem[b], stride, l.width, l.height, rev[b], &fr), FA_OK);
                 if (fr.base_revision) partial++;
                 rev[b] = fr.revision;
+                /* With sanitizers, effects are compared every fourth step and at the end
+                 * (a stale pixel stays until something draws over it). */
+                if (FA_TEST_SANITIZED && cfgs[ci].fx && n % 4 != 0 && n + 3 < packs + 10) continue;
                 /* The reference draws its whole master again every time. */
                 CHECK_EQ(fa_cdg_surface_set_presentation(ref, &p), FA_OK);
                 want = full_draw(ref, (int64_t)k, 4, &lr);
@@ -3325,7 +3339,7 @@ static void test_presentation_costs(void)
     CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
     printf("  %-28s %10s %10s %10s %10s\n", "", "1080p full", "typical", "2160p full", "typical");
     for (li = 0; li < 6; li++) {
-        double full[2], typical[2];
+        double full[2] = { 0, 0 }, typical[2] = { 0, 0 };
         fa_surface_effects fx;
         fa_surface_effects_init(&fx);
         if (levels[li].fx == 1) {
@@ -3338,7 +3352,7 @@ static void test_presentation_costs(void)
             fx.outline.on = fx.shadow.on = 1;
         }
         CHECK_EQ(fa_surface_set_effects(f, &fx), FA_OK);
-        for (si = 0; si < 2; si++) {
+        for (si = 0; si < (FA_TEST_SANITIZED ? 1 : 2); si++) {   /* sanitizers: timings mean nothing */
             fa_cdg_presentation p = pres(1, FA_SAFETY_SHOW);
             fa_surface_layout l;
             fa_surface_frame fr;

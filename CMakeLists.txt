@@ -98,6 +98,8 @@ set(FA_SOURCES
     src/cdg_scale.c
     src/surface.c
     src/surface_fx.c
+    src/font.c
+    src/raster.c
     src/zip.c
     src/tempo.c
     src/resample.c
