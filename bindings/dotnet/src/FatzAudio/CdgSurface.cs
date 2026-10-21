@@ -255,7 +255,7 @@ public readonly unsafe ref struct CdgFrame
 /// };
 /// </code>
 /// </example>
-public sealed unsafe class CdgSurface : IKaraokeSurface
+public sealed unsafe class CdgSurface : IKaraokeSurface, IStreamSurface
 {
     private readonly AudioStream _stream;
     private readonly object _lock = new();
@@ -370,7 +370,7 @@ public sealed unsafe class CdgSurface : IKaraokeSurface
     public AudioStream Stream => _stream;
 
     /// <summary>Called by the stream's handle right before the native stream is closed.</summary>
-    internal void Orphan()
+    void IStreamSurface.Orphan()
     {
         lock (_lock)
         {
@@ -446,7 +446,7 @@ public sealed unsafe class CdgSurface : IKaraokeSurface
             {
                 if (added) h.DangerousRelease();
             }
-            _presentationSize = ClampPresentation(value);
+            _presentationSize = SurfaceInterop.ClampPresentation(value);
         }
     }
 
@@ -480,40 +480,7 @@ public sealed unsafe class CdgSurface : IKaraokeSurface
         set
         {
             FaSurfaceEffects e;
-            NativeMethods.fa_surface_effects_init(&e);
-            if (value is not null)
-            {
-                if (value.Outline is { } o)
-                {
-                    e.Outline.On = 1;
-                    e.Outline.Color = Argb(o.Color);
-                    e.Outline.SungColor = Argb(o.SungColor);
-                    e.Outline.Opacity = Unit(o.Opacity);
-                    e.Outline.Size = Unit(o.Size);
-                    e.Outline.Fade = Unit(o.Fade);
-                }
-                if (value.Shadow is { } s)
-                {
-                    e.Shadow.On = 1;
-                    e.Shadow.Color = Argb(s.Color);
-                    e.Shadow.SungColor = Argb(s.SungColor);
-                    e.Shadow.Opacity = Unit(s.Opacity);
-                    e.Shadow.Size = Unit(s.Size);
-                    e.Shadow.Distance = Unit(s.Distance);
-                    e.Shadow.AngleDegrees = Angle(s.AngleDegrees);
-                    e.Shadow.Fade = Unit(s.Fade);
-                }
-                if (value.Bevel is { } b)
-                {
-                    e.Bevel.On = 1;
-                    e.Bevel.Highlight = Argb(b.Highlight);
-                    e.Bevel.Shade = Argb(b.Shade);
-                    e.Bevel.Strength = Unit(b.Strength);
-                    e.Bevel.Size = Unit(b.Size);
-                    e.Bevel.LightAngleDegrees = Angle(b.LightAngleDegrees);
-                    e.Bevel.Fade = Unit(b.Fade);
-                }
-            }
+            SurfaceInterop.ToNative(value, &e);
             var h = Enter(out bool added);
             try
             {
@@ -530,14 +497,6 @@ public sealed unsafe class CdgSurface : IKaraokeSurface
             }
         }
     }
-
-    private static uint Argb(CdgColor c) => (uint)c.A << 24 | (uint)c.R << 16 | (uint)c.G << 8 | c.B;
-
-    private static float Unit(float v) =>
-        v is >= 0.0f and <= 1.0f ? v : throw new ArgumentOutOfRangeException("value", v, "Must be 0 .. 1.");
-
-    private static float Angle(float v) =>
-        float.IsFinite(v) ? v : throw new ArgumentOutOfRangeException("value", v, "Must be finite.");
 
     /// <inheritdoc/>
     public SurfaceLayout GetLayout()
@@ -557,11 +516,7 @@ public sealed unsafe class CdgSurface : IKaraokeSurface
         {
             if (added) h.DangerousRelease();
         }
-        string font = Marshal.PtrToStringUTF8((nint)l.FontUsed) ?? "";
-        return new SurfaceLayout((int)l.Width, (int)l.Height, l.BitmapX, l.BitmapY,
-            new PixelRect((int)l.ContentX, (int)l.ContentY, (int)l.ContentWidth, (int)l.ContentHeight), l.Scale,
-            new PixelRect((int)l.CropX, (int)l.CropY, (int)l.CropWidth, (int)l.CropHeight), (SafetyZone)l.SafetyZone,
-            l.SafetyZoneResolved != 0, font, (int)l.Margin, (int)l.Padding, l.LayoutRevision);
+        return SurfaceInterop.FromNative(&l);
     }
 
     /// <inheritdoc/>
@@ -616,18 +571,6 @@ public sealed unsafe class CdgSurface : IKaraokeSurface
             fixed (byte* p = destination)
                 return UpdateInto((nint)p, stride, width, height, destinationRevision, time);
         }
-    }
-
-    /// <summary>The native rule: the shape kept, inside 300x216 .. 3840x2160.</summary>
-    private static PixelSize ClampPresentation(PixelSize size)
-    {
-        if (size.IsUnset) return size;
-        double w = size.Width, h = size.Height;
-        double k = Math.Min(3840 / w, 2160 / h);
-        if (k < 1) { w *= k; h *= k; }
-        k = Math.Max(300 / w, 216 / h);
-        if (k > 1) { w *= k; h *= k; }
-        return new PixelSize(Math.Clamp((int)(w + 0.5), 300, 3840), Math.Clamp((int)(h + 0.5), 216, 2160));
     }
 
     /// <summary>Holds the stream for a native call, which keeps the native stream (and so this surface) alive.</summary>

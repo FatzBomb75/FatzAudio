@@ -18,6 +18,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- MIDI lyric surface: `fa_lyric_surface_create`, `fa_lyric_surface_set_style`, `fa_lyric_surface_get_style` and
+  `fa_lyric_style_init` draw a MIDI or `.kar` song's lyrics as a karaoke screen: the active line with lines around it,
+  syllables coloured as they are sung (cross-fade or sweep), scrolling lines, page fades, a countdown after long gaps,
+  an optional panel, and the surface effects, with FatzAudio's own font reader. Five presets (`FA_LYRIC_CLASSIC`,
+  `MODERN`, `NEON`, `MINIMAL`, `SUBTITLE`). Drawn with `fa_surface_update_into` like a CD+G surface. .NET: `LyricSurface`,
+  `LyricStyle`, `LyricPreset`, `LyricWipe`, `LyricCountdown`, `AudioStream.CreateLyricSurface`; `IKaraokeSurface` is now
+  implemented by `LyricSurface` too. The intro and ending pages come later. See
+  [docs/features/lyrics.md](docs/features/lyrics.md).
 - CD+G presentation options: `fa_cdg_surface_set_presentation` crops a surface to a safety zone (show, remove, auto
   from a pre-pass over the song, or a tight box around everything drawn), adds transparent padding, and with
   presentation scaling draws the picture in premultiplied full colour at the whole-number multiple nearest the

@@ -117,7 +117,7 @@ bitmap.InstallPixels(info, frame.PixelPointer, frame.Stride);   // or copy with 
 
 ## Surfaces
 
-A surface turns the graphics into pixels for one output. Each has its own pixel format, size and options, so a small preview window and a full-screen TV output can show the same stream.
+A surface turns the graphics into pixels for one output. Each has its own pixel format, size and options, so a small preview window and a full-screen TV output can show the same stream. The functions of the `fa_surface_*` family (`update_into`, layout, presentation size, effects) are shared with the [MIDI lyric surface](lyrics.md), which draws a MIDI or `.kar` song's lyrics the same way; the options below and `fa_cdg_surface_update` are CD+G only.
 
 | Option | Values |
 |---|---|

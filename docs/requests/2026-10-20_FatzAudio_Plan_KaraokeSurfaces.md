@@ -536,7 +536,7 @@ fonts through each OS (registry list, CoreText, Android's system font list (not 
 folders). Checked against FreeType on DejaVu, FreeFont, Inter (CFF), WenQuanYi (a collection) and Noto
 Sans JP (CID-keyed CFF, 18 font dicts): a mean difference under 0.06 of 255 per pixel at 100 px; and
 against HarfBuzz kerning: 8,400 pairs, none different. No public API yet: the lyric surface (step 5)
-uses it.
+uses it. Step 5a done, PR pending: the lyric surface (timeline, layout and drawing, C API, .NET, docs, tests; docs/features/lyrics.md). Step 5b is next: the intro and ending pages, render-ahead for lyrics, and the measured cost table.
 
 ## 11. Questions, answered by MediaControl (2026-10-20)
 

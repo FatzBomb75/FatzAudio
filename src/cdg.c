@@ -18,6 +18,7 @@
  * audio thread never sees any of it. */
 #include "cdg.h"
 #include "cdg_scale.h"
+#include "lyric.h"
 #include "surface_fx.h"
 #include "surface.h"
 #include <math.h>
@@ -196,6 +197,10 @@ struct fa_cdg_surface {
     struct fa_cdg_surface* ra_next; /* engine->cdg_render, under g_bind */
     int ra_queued;                /* under g_bind */
     fa_atomic32 ra_running;       /* workers that took the surface off the queue, not done */
+    /* A MIDI lyric surface (lyric.c) instead of CD+G: on the stream's surface list
+     * like the others, so closing the stream detaches it too; the CD+G state above
+     * stays unused. */
+    struct fa_lyric* lyric;
 };
 
 /* ---- data --------------------------------------------------------------------- */
@@ -1614,6 +1619,7 @@ void fa_stream_cdg_close(struct fa_stream* s)
 
 static void surface_free(fa_cdg_surface* f)
 {
+    fa_lyric_free(f->lyric);
     free_maps(f);
     free(f->pixels);
     fa_mutex_destroy(&f->pub_lock);
@@ -2294,7 +2300,7 @@ FA_API fa_result FA_CALL fa_cdg_surface_update(fa_cdg_surface* surface, fa_cdg_f
     struct fa_stream* s;
     fa_time now;
     fa_result r;
-    if (!surface || !out_frame) return FA_ERROR_INVALID_ARG;
+    if (!surface || !out_frame || surface->lyric) return FA_ERROR_INVALID_ARG;
     s = surface_hold(surface);
     if (!s) return FA_ERROR_INVALID_ARG; /* its stream was closed */
     r = fa_stream_get_clock(s, &now);
@@ -2309,7 +2315,7 @@ FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_ti
 {
     struct fa_stream* s;
     fa_result r;
-    if (!surface || !out_frame) return FA_ERROR_INVALID_ARG;
+    if (!surface || !out_frame || surface->lyric) return FA_ERROR_INVALID_ARG;
     s = surface_hold(surface);
     if (!s) return FA_ERROR_INVALID_ARG; /* its stream was closed */
     fa_mutex_lock(&surface->work_lock);
@@ -2372,6 +2378,17 @@ FA_API fa_result FA_CALL fa_surface_get_layout(fa_surface* surface, fa_surface_l
     const cdg_layout* c;
     fa_result r;
     if (!surface || !out_layout || out_layout->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+    if (surface->lyric) {
+        memset(&l, 0, sizeof(l));
+        fa_mutex_lock(&surface->work_lock);
+        r = fa_lyric_get_layout(surface->lyric, surface->present_w, surface->present_h, &l);
+        surface->layout_revision = l.layout_revision;
+        fa_mutex_unlock(&surface->work_lock);
+        if (r != FA_OK) return r;
+        l.struct_size = out_layout->struct_size < sizeof(l) ? out_layout->struct_size : (uint32_t)sizeof(l);
+        memcpy(out_layout, &l, l.struct_size);
+        return FA_OK;
+    }
     s = surface_hold(surface);
     fa_mutex_lock(&surface->work_lock);
     r = layout_refresh(surface, s);
@@ -2463,7 +2480,15 @@ FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* surface, fa_time tim
     if (!s) return FA_ERROR_INVALID_ARG; /* its stream was closed */
     memset(&fr, 0, sizeof(fr));
     if (time == FA_SURFACE_NOW) r = fa_stream_get_clock(s, &time);
-    if (r == FA_OK) {
+    if (r == FA_OK && surface->lyric) {
+        float tempo = 1.0f;
+        if (fa_stream_get_param(s, FA_PARAM_TEMPO, &tempo) != FA_OK || !(tempo > 0.0f)) tempo = 1.0f;
+        fa_mutex_lock(&surface->work_lock);
+        r = fa_lyric_update(surface->lyric, surface->present_w, surface->present_h, (double)tempo, time, (uint8_t*)dst,
+                            dst_stride, dst_width, dst_height, dst_revision, &fr);
+        surface->layout_revision = fa_lyric_layout_revision(surface->lyric);
+        fa_mutex_unlock(&surface->work_lock);
+    } else if (r == FA_OK) {
         if (fa_mutex_trylock(&surface->work_lock)) {
             r = update_held(surface, s, time, (uint8_t*)dst, dst_stride, dst_width, dst_height, dst_revision, &fr);
             fa_mutex_unlock(&surface->work_lock);
@@ -2503,7 +2528,7 @@ FA_API void FA_CALL fa_cdg_presentation_init(fa_cdg_presentation* presentation)
 FA_API fa_result FA_CALL fa_cdg_surface_set_presentation(fa_surface* surface, const fa_cdg_presentation* presentation)
 {
     fa_cdg_presentation p;
-    if (!surface) return FA_ERROR_INVALID_ARG;
+    if (!surface || surface->lyric) return FA_ERROR_INVALID_ARG;
     if (!presentation) {
         fa_mutex_lock(&surface->work_lock);
         surface->has_pres = 0;
@@ -2565,6 +2590,7 @@ FA_API fa_result FA_CALL fa_surface_set_effects(fa_surface* surface, const fa_su
         if (!fa_fx_valid(&e)) return FA_ERROR_INVALID_ARG;
     }
     fa_mutex_lock(&surface->work_lock);
+    if (surface->lyric) fa_lyric_set_effects(surface->lyric, effects ? &e : NULL);
     surface->has_fx = effects != NULL;
     if (effects) surface->fx = e;
     surface->drawn = 0;   /* drawn again in full */
@@ -2579,7 +2605,11 @@ FA_API fa_result FA_CALL fa_surface_get_effects(fa_surface* surface, fa_surface_
     uint32_t size;
     if (!surface || !out_effects || out_effects->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
     fa_mutex_lock(&surface->work_lock);
-    if (surface->has_fx) {
+    if (surface->lyric) {
+        fa_lyric_style st;
+        fa_lyric_get_style(surface->lyric, &st);
+        e = st.effects;
+    } else if (surface->has_fx) {
         e = surface->fx;
     } else {
         fa_surface_effects_init(&e);
@@ -2595,7 +2625,8 @@ FA_API fa_result FA_CALL fa_cdg_surface_get_presentation(fa_surface* surface, fa
 {
     fa_cdg_presentation p;
     uint32_t size;
-    if (!surface || !out_presentation || out_presentation->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+    if (!surface || surface->lyric || !out_presentation || out_presentation->struct_size < sizeof(uint32_t))
+        return FA_ERROR_INVALID_ARG;
     if (surface->has_pres) {
         p = surface->pres;
     } else {
@@ -2605,5 +2636,77 @@ FA_API fa_result FA_CALL fa_cdg_surface_get_presentation(fa_surface* surface, fa
     size = out_presentation->struct_size < sizeof(p) ? out_presentation->struct_size : (uint32_t)sizeof(p);
     p.struct_size = size;
     memcpy(out_presentation, &p, size);
+    return FA_OK;
+}
+
+/* ---- MIDI lyric surface ------------------------------------------------------------ */
+
+/* The app's style over Classic's (a shorter, older struct keeps Classic's tail). */
+static fa_result lyric_style_read(const fa_lyric_style* style, fa_lyric_style* out)
+{
+    fa_lyric_style_init(out, FA_LYRIC_CLASSIC);
+    if (!style) return FA_OK;
+    if (style->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+    memcpy(out, style, style->struct_size < sizeof(*out) ? style->struct_size : sizeof(*out));
+    out->struct_size = (uint32_t)sizeof(*out);
+    out->effects.struct_size = (uint32_t)sizeof(out->effects);
+    return fa_lyric_style_valid(out) ? FA_OK : FA_ERROR_INVALID_ARG;
+}
+
+FA_API fa_result FA_CALL fa_lyric_surface_create(fa_stream* stream, const fa_lyric_style* style, fa_surface** out_surface)
+{
+    fa_lyric_style st;
+    fa_midi_info mi;
+    fa_cdg_surface* f;
+    fa_result r;
+    if (out_surface) *out_surface = NULL;
+    if (!stream || !out_surface || fa_stream_get_midi_info(stream, &mi) != FA_OK) return FA_ERROR_INVALID_ARG;
+    r = lyric_style_read(style, &st);
+    if (r != FA_OK) return r;
+    f = (fa_cdg_surface*)calloc(1, sizeof(*f));
+    if (!f) return FA_ERROR_OUT_OF_MEMORY;
+    if (fa_mutex_init(&f->work_lock) != 0) { free(f); return FA_ERROR_OUT_OF_MEMORY; }
+    if (fa_mutex_init(&f->pub_lock) != 0) {
+        fa_mutex_destroy(&f->work_lock);
+        free(f);
+        return FA_ERROR_OUT_OF_MEMORY;
+    }
+    f->front = f->ready = -1;
+    f->stream = stream;
+    f->stale_from = SIZE_MAX;
+    r = fa_lyric_new(stream, &st, &f->lyric);
+    if (r != FA_OK) { surface_free(f); return r; }
+    fa_mutex_lock(&stream->cdg_lock);
+    f->next = stream->cdg_surfaces;
+    stream->cdg_surfaces = f;
+    fa_mutex_unlock(&stream->cdg_lock);
+    *out_surface = f;
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_lyric_surface_set_style(fa_surface* surface, const fa_lyric_style* style)
+{
+    fa_lyric_style st;
+    fa_result r;
+    if (!surface || !surface->lyric || !style) return FA_ERROR_INVALID_ARG;
+    r = lyric_style_read(style, &st);
+    if (r != FA_OK) return r;
+    fa_mutex_lock(&surface->work_lock);
+    r = fa_lyric_set_style(surface->lyric, &st);
+    fa_mutex_unlock(&surface->work_lock);
+    return r;
+}
+
+FA_API fa_result FA_CALL fa_lyric_surface_get_style(fa_surface* surface, fa_lyric_style* out_style)
+{
+    fa_lyric_style st;
+    uint32_t size;
+    if (!surface || !surface->lyric || !out_style || out_style->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&surface->work_lock);
+    fa_lyric_get_style(surface->lyric, &st);
+    fa_mutex_unlock(&surface->work_lock);
+    size = out_style->struct_size < sizeof(st) ? out_style->struct_size : (uint32_t)sizeof(st);
+    st.struct_size = size;
+    memcpy(out_style, &st, size);
     return FA_OK;
 }

@@ -985,6 +985,18 @@ public unsafe class AudioStream : IDisposable
     /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
     public CdgSurface CreateCdgSurface(CdgSurfaceOptions? options = null) => new CdgSurface(this, options ?? new CdgSurfaceOptions());
 
+    /// <summary>
+    /// Creates a surface that draws this MIDI or .kar stream's lyrics as a karaoke screen, in sync with the audio
+    /// (<see cref="LyricSurface"/>). A song without lyrics draws nothing.
+    /// </summary>
+    /// <param name="style">The look; null = <see cref="LyricPreset.Classic"/> with the system's UI font.</param>
+    /// <exception cref="ArgumentException">Not a MIDI stream, or a style value out of its range.</exception>
+    /// <exception cref="FatzAudioException"><see cref="ErrorCode.NotFound"/> when no font could be opened (a missing
+    /// <see cref="LyricStyle.FontPath"/>, or no system font); <see cref="ErrorCode.UnsupportedFormat"/> for a file that
+    /// is not a font.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public LyricSurface CreateLyricSurface(LyricStyle? style = null) => new LyricSurface(this, style ?? new LyricStyle());
+
     // ---- Parameters -----------------------------------------------------------
 
     private float GetParam(AudioParameter p)
