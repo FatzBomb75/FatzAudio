@@ -49,6 +49,51 @@ public sealed record CdgSurfaceOptions
     public int? BackgroundOpacity { get; init; }
 }
 
+/// <summary>
+/// How a <see cref="CdgSurface"/> presents the picture, on top of its <see cref="CdgSurfaceOptions"/>: see
+/// <see cref="CdgSurface.Presentation"/>. The defaults change nothing.
+/// </summary>
+/// <remarks>
+/// <para>
+/// With <see cref="Scale"/> off the surface keeps its pixel format, size and options, with the <see cref="SafetyZone"/>'s
+/// crop and the <see cref="Padding"/> (transparent: alpha 0, or <see cref="CdgSurface.TransparentIndex"/> in
+/// <see cref="CdgPixelFormat.Indexed8"/>).
+/// </para>
+/// <para>
+/// With it on, the picture is drawn at the whole-number multiple nearest <see cref="IKaraokeSurface.PresentationSize"/>,
+/// rounded up (1920x1080: <see cref="FatzAudio.SafetyZone.Show"/> is 5x, 1080 high; <see cref="FatzAudio.SafetyZone.Remove"/>
+/// is 6x, 1152 high), as premultiplied colour (<see cref="CdgPixelFormat.Rgba32"/> with an RGBA surface,
+/// <see cref="CdgPixelFormat.Bgra32"/> otherwise) on a transparent background; <see cref="SurfaceUpdate.Background"/> is
+/// the colour to fill behind it. From the outside in: padding, a transparent margin of one CD+G pixel, the picture.
+/// <see cref="CdgSurfaceOptions.Width"/>, <see cref="CdgSurfaceOptions.Height"/>, <see cref="CdgSurfaceOptions.Smooth"/>,
+/// <see cref="CdgSurfaceOptions.Premultiplied"/> and the background options do not apply; the transparency options and
+/// <see cref="CdgSurfaceOptions.HideUntilPreset"/> do.
+/// </para>
+/// </remarks>
+public sealed record CdgPresentation
+{
+    /// <summary>Full colour at a whole-number multiple (off: the surface's own format and size).</summary>
+    public bool Scale { get; init; }
+    /// <summary>Which part of the screen is shown (default <see cref="FatzAudio.SafetyZone.Show"/>); replaces
+    /// <see cref="CdgSurfaceOptions.HideBorder"/>.</summary>
+    public SafetyZone SafetyZone { get; init; } = SafetyZone.Show;
+    /// <summary><see cref="FatzAudio.SafetyZone.Auto"/>: drawing in the border before this time on the graphics timeline
+    /// does not count (title cards). 0 .. 24 hours.</summary>
+    public TimeSpan AutoIgnore { get; init; }
+    /// <summary><see cref="FatzAudio.SafetyZone.Super"/>: the same crop on both sides.</summary>
+    public bool SuperCentered { get; init; }
+    /// <summary>CD+G pixels of transparent space on each side, 0..32.</summary>
+    public int Padding { get; init; }
+    /// <summary>0..10, with <see cref="Scale"/> only: 0 sharp pixels, 1-4 softer (4 = bilinear). 5-10 are planned and draw
+    /// as 4 in this version.</summary>
+    public int Smoothness { get; init; }
+    /// <summary>With <see cref="Scale"/> only: anti-aliases stair steps along the edges between colours (morphological
+    /// anti-aliasing), without blurring anything else.</summary>
+    public bool EdgeBlend { get; init; }
+    /// <summary>The border is transparent too; its colour is still reported in <see cref="SurfaceUpdate.BorderIndex"/>.</summary>
+    public bool TransparentBorder { get; init; }
+}
+
 /// <summary>Where a stream's CD+G graphics come from.</summary>
 public enum CdgSource
 {
@@ -218,6 +263,7 @@ public sealed unsafe class CdgSurface : IKaraokeSurface
     private readonly byte[] _transparency = new byte[16];
     private readonly PixelRect[] _dirty = new PixelRect[8];
     private PixelSize _presentationSize;
+    private CdgPresentation? _presentation;
     private bool _renderAhead;
     private nint _native;
 
@@ -257,6 +303,67 @@ public sealed unsafe class CdgSurface : IKaraokeSurface
 
     /// <summary>The options the surface was created with.</summary>
     public CdgSurfaceOptions Options { get; }
+
+    /// <summary>In <see cref="CdgPixelFormat.Indexed8"/> pixels: transparent (padding, and the border with
+    /// <see cref="CdgPresentation.TransparentBorder"/>).</summary>
+    public const byte TransparentIndex = 16;
+
+    /// <summary>
+    /// How the picture is presented: safety zone, padding, presentation scaling, smoothness, edge blend. Null (the default)
+    /// is the picture of <see cref="Options"/>, as without presentation options. Takes effect at the next update or
+    /// <see cref="GetLayout"/>; a change of size gives a new <see cref="SurfaceLayout.LayoutRevision"/>.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// cdg.Presentation = new CdgPresentation { Scale = true, SafetyZone = SafetyZone.Auto, Smoothness = 2, EdgeBlend = true };
+    /// cdg.PresentationSize = new PixelSize(1920, 1080);
+    /// var layout = cdg.GetLayout();   // allocate layout.Width x layout.Height, 4 bytes per pixel
+    /// </code>
+    /// </example>
+    /// <exception cref="ArgumentOutOfRangeException">A value out of its range.</exception>
+    public CdgPresentation? Presentation
+    {
+        get => _presentation;
+        set
+        {
+            FaCdgPresentation p;
+            NativeMethods.fa_cdg_presentation_init(&p);
+            if (value is not null)
+            {
+                ArgumentOutOfRangeException.ThrowIfNegative(value.Padding, nameof(value));
+                ArgumentOutOfRangeException.ThrowIfGreaterThan(value.Padding, 32, nameof(value));
+                ArgumentOutOfRangeException.ThrowIfNegative(value.Smoothness, nameof(value));
+                ArgumentOutOfRangeException.ThrowIfGreaterThan(value.Smoothness, 10, nameof(value));
+                if (value.AutoIgnore < TimeSpan.Zero || value.AutoIgnore > TimeSpan.FromHours(24))
+                    throw new ArgumentOutOfRangeException(nameof(value), "AutoIgnore must be 0 .. 24 hours.");
+                if (!Enum.IsDefined(value.SafetyZone))
+                    throw new ArgumentOutOfRangeException(nameof(value), "Unknown safety zone.");
+                p.Scale = value.Scale ? 1 : 0;
+                p.SafetyZone = (int)value.SafetyZone;
+                p.AutoIgnoreSeconds = (float)value.AutoIgnore.TotalSeconds;
+                p.SuperCentered = value.SuperCentered ? 1 : 0;
+                p.Padding = (uint)value.Padding;
+                p.Smoothness = value.Smoothness;
+                p.EdgeBlend = value.EdgeBlend ? 1 : 0;
+                p.Flags = value.TransparentBorder ? 1u : 0;
+            }
+            var h = Enter(out bool added);
+            try
+            {
+                lock (_lock)
+                {
+                    ObjectDisposedException.ThrowIf(_native == 0, this);
+                    FatzAudioException.ThrowIfFailed(
+                        NativeMethods.fa_cdg_surface_set_presentation(_native, value is null ? null : &p));
+                    _presentation = value;
+                }
+            }
+            finally
+            {
+                if (added) h.DangerousRelease();
+            }
+        }
+    }
 
     /// <summary>The stream whose graphics this surface draws.</summary>
     public AudioStream Stream => _stream;
@@ -430,13 +537,18 @@ public sealed unsafe class CdgSurface : IKaraokeSurface
     public SurfaceUpdate UpdateInto(Span<byte> destination, int stride, int width, int height, ulong destinationRevision,
         TimeSpan? time = null)
     {
-        int bpp = Options.PixelFormat == CdgPixelFormat.Indexed8 ? 1 : 4;
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
-        if (stride < width * bpp || destination.Length < (long)stride * (height - 1) + (long)width * bpp)
-            throw new ArgumentException("The span is smaller than height rows of stride bytes.", nameof(destination));
-        fixed (byte* p = destination)
-            return UpdateInto((nint)p, stride, width, height, destinationRevision, time);
+        // Under the lock (taken again inside, which Monitor allows), so another thread can't switch scaling on
+        // between this check and the draw.
+        lock (_lock)
+        {
+            int bpp = Options.PixelFormat == CdgPixelFormat.Indexed8 && _presentation?.Scale != true ? 1 : 4;
+            if (stride < width * bpp || destination.Length < (long)stride * (height - 1) + (long)width * bpp)
+                throw new ArgumentException("The span is smaller than height rows of stride bytes.", nameof(destination));
+            fixed (byte* p = destination)
+                return UpdateInto((nint)p, stride, width, height, destinationRevision, time);
+        }
     }
 
     /// <summary>The native rule: the shape kept, inside 300x216 .. 3840x2160.</summary>

@@ -224,6 +224,12 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_cdg_surface_update_at(nint surface, long time, FaCdgFrame* frame);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_cdg_presentation_init(FaCdgPresentation* presentation);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_cdg_surface_set_presentation(nint surface, FaCdgPresentation* presentation);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_surface_set_presentation_size(nint surface, uint width, uint height);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

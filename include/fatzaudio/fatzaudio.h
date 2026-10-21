@@ -1485,8 +1485,11 @@ typedef struct fa_rect {
 typedef enum fa_safety_zone {
     FA_SAFETY_SHOW = 0,                /* all of it, border included */
     FA_SAFETY_REMOVE,                  /* the 288x192 picture area (FA_CDG_NO_BORDER) */
-    FA_SAFETY_AUTO,                    /* reserved for the CD+G presentation options */
-    FA_SAFETY_SUPER
+    FA_SAFETY_AUTO,                    /* REMOVE, unless the song draws in the border area
+                                          (tiles or scrolls; a border preset's solid colour
+                                          does not count): then SHOW */
+    FA_SAFETY_SUPER                    /* the box around everything the song ever draws other
+                                          than the background, on the 6x12 tile grid */
 } fa_safety_zone;
 
 typedef struct fa_surface_layout {
@@ -1496,14 +1499,19 @@ typedef struct fa_surface_layout {
                                           without a presentation size) */
     uint32_t content_x, content_y;     /* inside the buffer: the picture, without padding */
     uint32_t content_width, content_height; /* and margin */
-    float scale;                       /* CD+G: the whole-number multiple shown (1 for the
-                                          classic picture, whatever its output size) */
+    float scale;                       /* CD+G: the whole-number multiple drawn with
+                                          presentation scaling on; 1 without it, whatever the
+                                          output size */
     uint32_t crop_x, crop_y, crop_width, crop_height; /* CD+G: the part of the 300x216
                                           screen shown, in CD+G pixels */
-    fa_safety_zone safety_zone;        /* CD+G: SHOW, or REMOVE with FA_CDG_NO_BORDER */
-    int32_t safety_zone_resolved;      /* 1 (0 is reserved for zones a disc can't work out) */
+    fa_safety_zone safety_zone;        /* CD+G: the zone in use, SHOW or REMOVE for AUTO; SHOW,
+                                          REMOVE or SUPER for SUPER */
+    int32_t safety_zone_resolved;      /* 1, or 0 when AUTO or SUPER could not look at the
+                                          song (a disc, or no graphics yet) and SHOW is used */
     char font_used[128];               /* lyrics: the font family drawn with; "" for CD+G */
-    uint32_t margin, padding;          /* in buffer pixels; 0 for the classic picture */
+    uint32_t margin, padding;          /* in buffer pixels, on each side: the transparent
+                                          margin of presentation scaling (one CD+G pixel) and
+                                          fa_cdg_presentation.padding */
     uint64_t layout_revision;          /* goes up whenever any of the above changes (then
                                           reallocate, and the next draw is a full one) */
 } fa_surface_layout;
@@ -1535,23 +1543,23 @@ typedef struct fa_surface_frame {
 /* Destroys a surface of any kind (for CD+G the same as fa_cdg_surface_destroy). */
 FA_API void FA_CALL fa_surface_destroy(fa_surface* surface);
 /* The size of the area the app shows the surface in, in physical pixels, for the
- * scaled presentations (CD+G presentation options, lyrics). 0 x 0 unsets it (the
- * default). The shape is kept and the size brought into 300x216 .. 3840x2160. The
- * classic CD+G picture ignores it: it keeps its configured output size. */
+ * scaled presentations (CD+G presentation scaling, lyrics). 0 x 0 unsets it (the
+ * default). The shape is kept and the size brought into 300x216 .. 3840x2160. A CD+G
+ * picture without presentation scaling ignores it: it keeps its output size. */
 FA_API fa_result FA_CALL fa_surface_set_presentation_size(fa_surface* surface, uint32_t width, uint32_t height);
-/* Off (0) by default. With it on, surfaces that render into a bitmap of their own
- * (CD+G presentation options, lyrics) render the next frames ahead on the engine's
- * worker threads and update_into copies the newest finished one, never waiting. The
- * classic CD+G picture is drawn straight into the buffer and accepts the setting
- * without effect. */
+/* Off (0) by default. Planned: surfaces that render into a bitmap of their own (CD+G
+ * presentation scaling, lyrics) render the next frames ahead on the engine's worker
+ * threads and update_into copies the newest finished one, never waiting. In this
+ * version every surface accepts the setting and draws on the caller's thread. */
 FA_API fa_result FA_CALL fa_surface_set_render_ahead(fa_surface* surface, int32_t enabled);
 /* Fills `out_layout` up to its struct_size and sets struct_size to the bytes filled. */
 FA_API fa_result FA_CALL fa_surface_get_layout(fa_surface* surface, fa_surface_layout* out_layout);
-/* Draws the picture at `time` (FA_SURFACE_NOW = the audio heard now) into `dst`: the
- * classic CD+G picture in the surface's pixel format, options and output size, the
- * same pixels fa_cdg_surface_update gives. dst_width x dst_height must be the
- * layout's width x height (else FA_ERROR_SIZE_MISMATCH, nothing drawn); dst_stride is
- * bytes per row, at least width x bytes per pixel.
+/* Draws the picture at `time` (FA_SURFACE_NOW = the audio heard now) into `dst`, the
+ * same pixels fa_cdg_surface_update gives: the surface's pixel format, options and
+ * output size, or what its presentation options (below) make of them. dst_width x
+ * dst_height must be the layout's width x height (else FA_ERROR_SIZE_MISMATCH,
+ * nothing drawn: get the layout again); dst_stride is bytes per row, at least width x
+ * bytes per pixel.
  *
  * dst_revision is the revision dst holds (fa_surface_frame.revision of the call that
  * last drew into it; 0 = unknown). When it is one of the last FA_SURFACE_HISTORY
@@ -1561,6 +1569,72 @@ FA_API fa_result FA_CALL fa_surface_get_layout(fa_surface* surface, fa_surface_l
 FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* surface, fa_time time, void* dst, int32_t dst_stride,
                                                 uint32_t dst_width, uint32_t dst_height, uint64_t dst_revision,
                                                 fa_surface_frame* out_frame);
+
+/* ---- CD+G presentation options ------------------------------------------
+ *
+ * How a CD+G surface presents the picture, on top of its fa_cdg_surface_config. A
+ * surface without them (the default) draws exactly as before.
+ *
+ *     fa_cdg_presentation p;
+ *     fa_cdg_presentation_init(&p);
+ *     p.scale = 1;                       // full colour at a whole multiple
+ *     p.safety_zone = FA_SAFETY_AUTO;
+ *     p.smoothness = 2;
+ *     fa_cdg_surface_set_presentation(surface, &p);
+ *     fa_surface_set_presentation_size(surface, 1920, 1080);
+ *
+ * Scale off: the configured pixel format, output size and flags, with the safety
+ * zone's crop and the padding around it (transparent: alpha 0, or index
+ * FA_CDG_INDEX_TRANSPARENT in INDEXED8). Smoothness and edge blend are ignored.
+ *
+ * Scale on: the cropped picture at a whole-number multiple N, the one nearest the
+ * presentation size, rounded up (1920x1080: SHOW is 5x, 1080 high; REMOVE is 6x,
+ * 1152 high, which the app shrinks slightly). The buffer is premultiplied 32-bit
+ * colour (RGBA with an RGBA32 config, BGRA otherwise) with a transparent background
+ * (fa_surface_frame.background is the colour to fill behind it; the background flags
+ * only change that report) and, from the outside in: padding, a transparent margin of
+ * one CD+G pixel, the picture. Without a presentation size N is 1. The config's
+ * output size, FA_CDG_SMOOTH and FA_CDG_PREMULTIPLIED do not apply; the transparency
+ * flags and FA_CDG_HIDE_UNTIL_PRESET do.
+ *
+ * Changing them, the presentation size included, may change the layout (a new
+ * layout_revision, a full draw next). A scroll of the whole screen moves the
+ * surface's picture rather than drawing it again, and smooth-scroll offsets only
+ * move what is copied out of it. */
+
+#define FA_CDG_INDEX_TRANSPARENT 16    /* INDEXED8: padding, and the border with
+                                          FA_CDG_TRANSPARENT_BORDER */
+
+typedef enum fa_cdg_presentation_flags {
+    FA_CDG_TRANSPARENT_BORDER = 1 << 0 /* the border area is transparent too; its colour is
+                                          still reported in border_index */
+} fa_cdg_presentation_flags;
+
+typedef struct fa_cdg_presentation {
+    uint32_t struct_size;              /* sizeof(fa_cdg_presentation) */
+    int32_t scale;                     /* 0 = off (the configured format and size), 1 = on */
+    fa_safety_zone safety_zone;        /* default SHOW; replaces FA_CDG_NO_BORDER */
+    float auto_ignore_seconds;         /* AUTO: drawing in the border before this time on the
+                                          graphics timeline does not count (title cards) */
+    int32_t super_centered;            /* SUPER: the same crop on both sides */
+    uint32_t padding;                  /* CD+G pixels of transparent space on each side,
+                                          0..32 */
+    int32_t smoothness;                /* 0..10, scale on only. 0 sharp pixels, 1-4 softer
+                                          (4 = bilinear). 5-10 are planned and draw as 4
+                                          in this version */
+    int32_t edge_blend;                /* 0/1, scale on only: anti-aliases stair steps along
+                                          the edges between colours (MLAA) */
+    uint32_t flags;                    /* fa_cdg_presentation_flags */
+} fa_cdg_presentation;
+
+/* Defaults: scale off, SHOW, nothing else. */
+FA_API void FA_CALL fa_cdg_presentation_init(fa_cdg_presentation* presentation);
+/* NULL goes back to the classic picture of the surface's config. Takes effect at the
+ * next update or fa_surface_get_layout. */
+FA_API fa_result FA_CALL fa_cdg_surface_set_presentation(fa_surface* surface, const fa_cdg_presentation* presentation);
+/* The options in use; without any set, the classic picture's (SHOW, or REMOVE with
+ * FA_CDG_NO_BORDER). Fills up to struct_size. */
+FA_API fa_result FA_CALL fa_cdg_surface_get_presentation(fa_surface* surface, fa_cdg_presentation* out_presentation);
 
 /* ---- MIDI ---------------------------------------------------------------
  *

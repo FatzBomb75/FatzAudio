@@ -31,9 +31,13 @@ public enum SafetyZone
     Show = 0,
     /// <summary>The 288x192 picture area (<see cref="CdgSurfaceOptions.HideBorder"/>).</summary>
     Remove,
-    /// <summary>Reserved for the CD+G presentation options.</summary>
+    /// <summary><see cref="Remove"/>, unless the song draws in the border area (tiles or scrolls; a border preset's
+    /// solid colour does not count): then <see cref="Show"/>. Worked out from the whole song before the first
+    /// picture; on a disc it can't be, and <see cref="Show"/> is used (<see cref="SurfaceLayout.SafetyZoneResolved"/>
+    /// false).</summary>
     Auto,
-    /// <summary>Reserved for the CD+G presentation options.</summary>
+    /// <summary>The box around everything the song ever draws other than the background, on the 6x12 tile grid, fixed
+    /// for the whole song. Like <see cref="Auto"/>, <see cref="Show"/> on a disc.</summary>
     Super,
 }
 
@@ -44,14 +48,18 @@ public enum SafetyZone
 /// <param name="BitmapX">Left edge of the buffer inside the presentation area (0 without a presentation size).</param>
 /// <param name="BitmapY">Top edge of the buffer inside the presentation area.</param>
 /// <param name="Content">The picture inside the buffer, without padding and margin.</param>
-/// <param name="Scale">CD+G: the whole-number multiple shown (1 for the classic picture, whatever its output size).</param>
+/// <param name="Scale">CD+G: the whole-number multiple drawn with <see cref="CdgPresentation.Scale"/>; 1 without it,
+/// whatever the output size.</param>
 /// <param name="Crop">CD+G: the part of the 300x216 screen shown, in CD+G pixels.</param>
-/// <param name="SafetyZone">CD+G: <see cref="FatzAudio.SafetyZone.Show"/>, or <see cref="FatzAudio.SafetyZone.Remove"/>
-/// with <see cref="CdgSurfaceOptions.HideBorder"/>.</param>
-/// <param name="SafetyZoneResolved">True (false is reserved for zones a disc can't work out).</param>
+/// <param name="SafetyZone">CD+G: the zone in use (<see cref="FatzAudio.SafetyZone.Auto"/> becomes
+/// <see cref="FatzAudio.SafetyZone.Show"/> or <see cref="FatzAudio.SafetyZone.Remove"/>).</param>
+/// <param name="SafetyZoneResolved">False when <see cref="FatzAudio.SafetyZone.Auto"/> or
+/// <see cref="FatzAudio.SafetyZone.Super"/> could not look at the song (a disc, or no graphics yet) and
+/// <see cref="FatzAudio.SafetyZone.Show"/> is used.</param>
 /// <param name="FontUsed">Lyrics: the font family drawn with; empty for CD+G.</param>
-/// <param name="Margin">In buffer pixels; 0 for the classic picture.</param>
-/// <param name="Padding">In buffer pixels; 0 for the classic picture.</param>
+/// <param name="Margin">In buffer pixels, on each side: the transparent margin of presentation scaling (one CD+G
+/// pixel); 0 without it.</param>
+/// <param name="Padding">In buffer pixels, on each side: <see cref="CdgPresentation.Padding"/>.</param>
 /// <param name="LayoutRevision">Goes up whenever any of the above changes: then reallocate, and the next draw is a full one.</param>
 public sealed record SurfaceLayout(int Width, int Height, int BitmapX, int BitmapY, PixelRect Content, float Scale,
     PixelRect Crop, SafetyZone SafetyZone, bool SafetyZoneResolved, string FontUsed, int Margin, int Padding,
@@ -140,12 +148,13 @@ public readonly ref struct SurfaceUpdate
 public interface IKaraokeSurface : IDisposable
 {
     /// <summary>The size of the area the surface is shown in, in physical pixels, for the scaled presentations (CD+G
-    /// presentation options, lyrics); <see cref="PixelSize.Unset"/> by default. The shape is kept and the size brought
-    /// into 300x216 .. 3840x2160; the getter returns the size in use. The classic CD+G picture ignores it.</summary>
+    /// <see cref="CdgPresentation.Scale"/>, lyrics); <see cref="PixelSize.Unset"/> by default. The shape is kept and the
+    /// size brought into 300x216 .. 3840x2160; the getter returns the size in use. A CD+G picture without presentation
+    /// scaling ignores it.</summary>
     PixelSize PresentationSize { get; set; }
 
-    /// <summary>Off by default. With it on, surfaces that render into a bitmap of their own render the next frames ahead on
-    /// the engine's workers. The classic CD+G picture is drawn straight into your buffer and ignores it.</summary>
+    /// <summary>Off by default. Planned: surfaces that render into a bitmap of their own render the next frames ahead on
+    /// the engine's workers. In this version it is accepted and every surface draws on the calling thread.</summary>
     bool RenderAhead { get; set; }
 
     /// <summary>The buffer size to draw into, and where the picture goes.</summary>
