@@ -7,6 +7,7 @@
  * end gives the winding-weighted area of each pixel. */
 #include "raster.h"
 #include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -17,6 +18,7 @@ int fa_raster_begin(fa_raster* r, int w, int h)
 {
     size_t need;
     if (w <= 0 || h <= 0) { r->w = r->h = 0; return 1; }
+    if (w > 65536 || h > 65536 || (size_t)(w + 2) > SIZE_MAX / sizeof(float) / (size_t)h) return 0;
     need = (size_t)(w + 2) * (size_t)h;
     if (need > r->cap) {
         float* n = (float*)realloc(r->acc, need * sizeof(float));
@@ -62,7 +64,7 @@ static void row_edge(float* row, int w, float a, float b, float d)
 
 void fa_raster_line(fa_raster* r, float x0, float y0, float x1, float y1)
 {
-    float dir = 1.0f, dxdy, ya, yb;
+    float dir = 1.0f, ya, yb;
     int y, ystart, yend;
     if (!r->w || y0 == y1 || !isfinite(x0) || !isfinite(y0) || !isfinite(x1) || !isfinite(y1)) return;
     if (y0 > y1) {
@@ -72,7 +74,6 @@ void fa_raster_line(fa_raster* r, float x0, float y0, float x1, float y1)
         dir = -1.0f;
     }
     if (y1 <= 0.0f || y0 >= (float)r->h) return;
-    dxdy = (x1 - x0) / (y1 - y0);
     ystart = y0 < 0.0f ? 0 : (int)y0;
     yend = y1 > (float)r->h ? r->h : (int)ceilf(y1);
     for (y = ystart; y < yend; y++) {
@@ -80,16 +81,20 @@ void fa_raster_line(fa_raster* r, float x0, float y0, float x1, float y1)
         ya = (float)y > y0 ? (float)y : y0;
         yb = (float)(y + 1) < y1 ? (float)(y + 1) : y1;
         if (yb <= ya) continue;
-        xa = x0 + (ya - y0) * dxdy;
-        xb = x0 + (yb - y0) * dxdy;
+        /* Interpolated, so a near-horizontal edge cannot overflow to inf * 0. */
+        xa = x0 + (x1 - x0) * ((ya - y0) / (y1 - y0));
+        xb = x0 + (x1 - x0) * ((yb - y0) / (y1 - y0));
+        if (!isfinite(xa) || !isfinite(xb)) continue;
         row_edge(r->acc + (size_t)y * (size_t)(r->w + 2), r->w, xa, xb, dir * (yb - ya));
     }
 }
 
 static int steps_for(float dev)
 {
-    int n = (int)ceilf(sqrtf(dev / RASTER_TOLERANCE));
-    return n < 1 ? 1 : n > RASTER_MAX_STEPS ? RASTER_MAX_STEPS : n;
+    float n;
+    if (!(dev < 1e8f)) return RASTER_MAX_STEPS;   /* also NaN */
+    n = ceilf(sqrtf(dev / RASTER_TOLERANCE));
+    return n < 1.0f ? 1 : n > (float)RASTER_MAX_STEPS ? RASTER_MAX_STEPS : (int)n;
 }
 
 void fa_raster_path(fa_raster* r, const fa_path* p, float sx, float sy, float dx, float dy)

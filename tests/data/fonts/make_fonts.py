@@ -12,6 +12,8 @@ Every shape is ours and simple, so the tests can say exactly what each glyph cov
               cubics through a global subroutine, a hintmask, and a flex.
   cid.otf     The CFF font as a CID-keyed font: two font dicts, FDSelect format 3.
   pair.ttc    A collection of tt.ttf and cff.otf.
+  bomb.ttf    Composites eight deep, each of 64 copies of the one below, over an empty
+              glyph: 64^8 components if nothing stopped it.
 
 Run from this folder; the outputs are committed, so the tests need no Python.
 """
@@ -212,6 +214,44 @@ def to_cid(font):
     return font
 
 
+def build_bomb():
+    """Built with one component each, then each composite's bytes are written by hand:
+    fontTools would count the components itself while saving."""
+    import struct
+    from fontTools.ttLib.tables._g_l_y_f import Glyph, GlyphComponent
+    from fontTools.ttLib.tables._m_a_x_p import table__m_a_x_p
+    names = [".notdef", "empty"] + ["c%d" % i for i in range(8)]
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder(names)
+    fb.setupCharacterMap({0x41: "c7"})
+    glyphs = {".notdef": TTGlyphPen(None).glyph(), "empty": TTGlyphPen(None).glyph()}
+    prev = "empty"
+    for i in range(8):
+        g = Glyph()
+        g.numberOfContours = -1
+        c = GlyphComponent()
+        c.glyphName, c.x, c.y, c.flags = prev, 0, 0, 0x2
+        g.components = [c]
+        glyphs["c%d" % i] = g
+        prev = "c%d" % i
+    fb.setupGlyf(glyphs)
+    fb.setupHorizontalMetrics({n: (500, 0) for n in names})
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({"familyName": "FA Bomb", "styleName": "Regular"})
+    fb.setupOS2()
+    fb.setupPost()
+    glyf = fb.font["glyf"]
+    for i in range(8):
+        below = names.index("empty" if i == 0 else "c%d" % (i - 1))
+        raw = struct.pack(">hhhhh", -1, 0, 0, 0, 0)
+        for k in range(64):
+            raw += struct.pack(">HHbb", 0x2 | (0x20 if k < 63 else 0), below, 0, 0)
+        glyf.glyphs["c%d" % i] = Glyph(raw)
+    fb.font.recalcBBoxes = False
+    table__m_a_x_p.recalc = lambda self, font: None
+    return fb.font
+
+
 def main():
     tt = build_tt(False)
     tt.save("tt.ttf")
@@ -222,6 +262,7 @@ def main():
     col = TTCollection()
     col.fonts = [TTFont("tt.ttf"), TTFont("cff.otf")]
     col.save("pair.ttc")
+    build_bomb().save("bomb.ttf")
 
 
 if __name__ == "__main__":

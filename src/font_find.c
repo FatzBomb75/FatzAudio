@@ -194,15 +194,20 @@ static void registry_fonts(best_face* b, HKEY root, const char* family, int weig
         LONG r = RegEnumValueW(key, i, name, &nlen, NULL, &type, (BYTE*)data, &dlen);
         if (r == ERROR_NO_MORE_ITEMS) break;
         if (r != ERROR_SUCCESS || type != REG_SZ) continue;
-        data[MAX_PATH - 1] = 0;
+        /* A registry string need not end in a terminator. */
+        data[dlen / sizeof(wchar_t) < MAX_PATH ? dlen / sizeof(wchar_t) : MAX_PATH - 1] = 0;
         if (!WideCharToMultiByte(CP_UTF8, 0, name, -1, uname, sizeof(uname), NULL, NULL)) continue;
         if (family && !registry_name_has(uname, family)) continue;
         if (wcschr(data, L'\\')) {
             if (!WideCharToMultiByte(CP_UTF8, 0, data, -1, upath, sizeof(upath), NULL, NULL)) continue;
         } else {
+            static const wchar_t fonts[] = L"\\Fonts\\";
             wchar_t full[MAX_PATH * 2];
-            _snwprintf(full, MAX_PATH * 2, L"%ls\\Fonts\\%ls", windir, data);
-            full[MAX_PATH * 2 - 1] = 0;
+            size_t a = wcslen(windir), f = sizeof(fonts) / sizeof(wchar_t) - 1, d = wcslen(data);
+            if (a + f + d >= MAX_PATH * 2) continue;
+            memcpy(full, windir, a * sizeof(wchar_t));
+            memcpy(full + a, fonts, f * sizeof(wchar_t));
+            memcpy(full + a + f, data, (d + 1) * sizeof(wchar_t));
             if (!WideCharToMultiByte(CP_UTF8, 0, full, -1, upath, sizeof(upath), NULL, NULL)) continue;
         }
         if (font_ext(upath)) probe_file(b, upath, family, weight, italic);

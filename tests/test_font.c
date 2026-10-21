@@ -281,6 +281,20 @@ static void test_collection(void)
     free(b.p);
 }
 
+/* Composites eight deep, 64 to a level, over an empty glyph: refused at once
+ * instead of drawing 64^8 nothing. */
+static void test_composite_bomb(void)
+{
+    fa_font* f = open_font("bomb.ttf", 0);
+    fa_path p = { 0 };
+    CHECK(f);
+    CHECK_EQ(fa_font_outline(f, fa_font_glyph(f, 'A'), &p), FA_ERROR_UNSUPPORTED_FORMAT);
+    CHECK_EQ(p.count, 0);
+    CHECK_EQ(fa_font_outline(f, 2, &p), FA_OK);    /* one level: 64 empty components */
+    fa_path_free(&p);
+    fa_font_close(f);
+}
+
 static uint32_t g_rand = 12345;
 static uint32_t rnd(void)
 {
@@ -318,17 +332,17 @@ static void exercise(const uint8_t* data, size_t size)
 
 static void test_damage(void)
 {
-    static const char* names[] = { "tt.ttf", "tt_gpos.ttf", "cff.otf", "cid.otf", "pair.ttc" };
+    static const char* names[] = { "tt.ttf", "tt_gpos.ttf", "cff.otf", "cid.otf", "pair.ttc", "bomb.ttf" };
     int rounds = FA_TEST_SANITIZED ? 300 : 3000;
     unsigned i;
-    for (i = 0; i < 5; i++) {
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         blob b = load(names[i]);
         uint8_t* copy;
         int k;
         CHECK(b.n);
         copy = (uint8_t*)malloc(b.n);
         CHECK(copy);
-        for (k = 0; k < rounds; k++) {
+        for (k = 0; k < (strcmp(names[i], "bomb.ttf") ? rounds : rounds / 10); k++) {   /* bomb: slow by design */
             size_t len = b.n, j;
             int hits = 1 + (int)(rnd() % 8);
             memcpy(copy, b.p, b.n);
@@ -469,6 +483,7 @@ int main(void)
     RUN(test_kerning);
     RUN(test_outlines);
     RUN(test_collection);
+    RUN(test_composite_bomb);
     RUN(test_damage);
     RUN(test_find);
     RUN(test_font_dir);

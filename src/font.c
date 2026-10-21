@@ -19,6 +19,9 @@
 #define FONT_MAX_POINTS 65536          /* points in one simple glyph */
 #define FONT_MAX_COMMANDS 400000       /* path commands of one glyph, composites included */
 #define FONT_MAX_DEPTH 8               /* composite nesting */
+#define FONT_MAX_COMPONENTS 4096       /* components drawn for one glyph, nested ones included */
+#define FONT_MAX_COORD 1e7f            /* larger coordinates (font units) mean a damaged glyph */
+#define KERN_MAX_SUBTABLES 1024        /* subtables looked at for one pair */
 #define CFF_MAX_STACK 48
 #define CFF_MAX_SUBR_DEPTH 10
 #define CFF_MAX_OPS 200000             /* operators per glyph, subroutines included */
@@ -91,7 +94,7 @@ uint32_t fa_font_face_count(const uint8_t* data, size_t size)
     uint32_t v = u32(f, 0);
     if (v == tag("ttcf")) {
         uint32_t n = u32(f, 8);
-        return has(f, 12, (size_t)n * 4) ? n : 0;
+        return n && n <= (size - 12) / 4 ? n : 0;
     }
     return is_sfnt(v) && size >= 12 ? 1 : 0;
 }
@@ -345,13 +348,15 @@ static int pair_pos(view st, uint32_t left, uint32_t right, int32_t* out)
 static int32_t gpos_kerning(const fa_font* f, uint32_t left, uint32_t right)
 {
     int32_t total = 0;
-    uint32_t i, j;
+    uint32_t i, j, visits = 0;
     for (i = 0; i < f->kern_lookup_count; i++) {
         view lk = from(f->gpos_lookups, u16(f->gpos_lookups, 2 + (size_t)f->kern_lookups[i] * 2));
         uint32_t type = u16(lk, 0), count = u16(lk, 4);
+        if (type != 2 && type != 9) continue;    /* only pair adjustment kerns */
         for (j = 0; j < count; j++) {
             view st = from(lk, u16(lk, 6 + (size_t)j * 2));
             int32_t v = 0;
+            if (++visits > KERN_MAX_SUBTABLES) return total;
             if (type == 9) {
                 if (u16(st, 2) != 2) continue;
                 st = from(st, u32(st, 4));
@@ -371,7 +376,10 @@ static int32_t kern_table(const fa_font* f, uint32_t left, uint32_t right)
     if (u16(k, 0) != 0) return 0;     /* Apple's version 1 table is not read */
     for (i = 0; i < n && has(k, at, 6); i++) {
         uint32_t len = u16(k, at + 2), cov = u16(k, at + 4);
-        view st = sub(k, at, len < 6 ? 6 : len);
+        view st;
+        /* A format 0 subtable over 64 KB has its 16-bit length wrapped: size it by its pairs. */
+        if ((cov >> 8) == 0 && len < 14 + u16(k, at + 6) * 6u) len = 14 + u16(k, at + 6) * 6u;
+        st = sub(k, at, len < 6 ? 6 : len);
         /* format 0, horizontal, neither minimum nor cross-stream */
         if ((cov >> 8) == 0 && (cov & 7) == 1) {
             uint32_t pairs = u16(st, 6), lo = 0, hi = pairs;
@@ -455,7 +463,9 @@ static void grow_box(fa_path* p, float x, float y)
 static int emit(fa_path* p, const xform* t, int op, float x1, float y1, float x2, float y2, float x, float y)
 {
     fa_path_cmd* c;
-    if (!isfinite(x) || !isfinite(y) || !isfinite(x1) || !isfinite(y1) || !isfinite(x2) || !isfinite(y2)) return 0;
+    if (!(fabsf(x) < FONT_MAX_COORD && fabsf(y) < FONT_MAX_COORD && fabsf(x1) < FONT_MAX_COORD &&
+          fabsf(y1) < FONT_MAX_COORD && fabsf(x2) < FONT_MAX_COORD && fabsf(y2) < FONT_MAX_COORD))
+        return 0;                     /* also NaN */
     if (p->count >= FONT_MAX_COMMANDS) return 0;
     if (p->count == p->cap) {
         size_t cap = p->cap ? p->cap * 2 : 64;
@@ -577,7 +587,7 @@ static fa_result glyf_simple(view gd, int contours, fa_path* p, const xform* t)
     return ok ? FA_OK : FA_ERROR_UNSUPPORTED_FORMAT;
 }
 
-static fa_result glyf_outline(const fa_font* f, uint32_t g, fa_path* p, const xform* t, int depth)
+static fa_result glyf_outline(const fa_font* f, uint32_t g, fa_path* p, const xform* t, int depth, int* budget)
 {
     view gd = glyf_data(f, g);
     int contours;
@@ -593,7 +603,7 @@ static fa_result glyf_outline(const fa_font* f, uint32_t g, fa_path* p, const xf
         float a1, a2, sa = 1, sb = 0, sc = 0, sd = 1;
         xform ct;
         fa_result r;
-        if (!has(gd, at, 4)) return FA_ERROR_UNSUPPORTED_FORMAT;
+        if (!has(gd, at, 4) || --*budget < 0) return FA_ERROR_UNSUPPORTED_FORMAT;
         flags = u16(gd, at);
         child = u16(gd, at + 2);
         at += 4;
@@ -618,7 +628,7 @@ static fa_result glyf_outline(const fa_font* f, uint32_t g, fa_path* p, const xf
         ct.c = t->a * sc + t->c * sd;
         ct.d = t->b * sc + t->d * sd;
         apply(t, a1, a2, &ct.dx, &ct.dy);
-        r = glyf_outline(f, child, p, &ct, depth + 1);
+        r = glyf_outline(f, child, p, &ct, depth + 1, budget);
         if (r != FA_OK) return r;
     } while (flags & 0x20);
     return FA_OK;
@@ -889,6 +899,7 @@ static void t2_run(t2* s, view cs, int depth)
             view body;
             if (n < 1) { s->failed = 1; return; }
             s->sp--;
+            if (!(fabsf(a[n - 1]) < 65536.0f)) { s->failed = 1; return; }
             if (b == 10) {
                 idx = (int32_t)a[n - 1] + (int32_t)subr_bias(s->lsubr_count);
                 body = idx >= 0 ? index_get(s->lsubrs, 0, (uint32_t)idx) : k_none;
@@ -909,6 +920,8 @@ static void t2_run(t2* s, view cs, int depth)
             uint32_t e = u8(cs, at++);
             float sx = s->x, sy = s->y;
             switch (e) {
+            case 0:                                /* dotsection: a hint, nothing to draw */
+                break;
             case 35:                               /* flex */
                 if (n < 13) { s->failed = 1; return; }
                 t2_curve(s, a[0], a[1], a[2], a[3], a[4], a[5]);
@@ -986,7 +999,12 @@ fa_result fa_font_outline(const fa_font* f, uint32_t g, fa_path* p)
     if (!f || !p) return FA_ERROR_INVALID_ARG;
     fa_path_clear(p);
     if (g >= f->info.glyph_count) return FA_ERROR_INVALID_ARG;
-    r = f->info.cff ? cff_outline(f, g, p, &k_identity) : glyf_outline(f, g, p, &k_identity, 0);
+    if (f->info.cff) {
+        r = cff_outline(f, g, p, &k_identity);
+    } else {
+        int budget = FONT_MAX_COMPONENTS;
+        r = glyf_outline(f, g, p, &k_identity, 0, &budget);
+    }
     if (r != FA_OK) fa_path_clear(p);
     return r;
 }
