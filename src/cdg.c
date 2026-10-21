@@ -111,6 +111,22 @@ typedef struct cdg_layout {
     uint32_t pad;                 /* the padding alone, in buffer pixels */
 } cdg_layout;
 
+/* Render-ahead: a finished frame in a buffer of the layout's size. */
+typedef struct cdg_slot {
+    uint8_t* px;                  /* stride: the surface's */
+    uint64_t revision;            /* the picture it holds, 0 = none */
+    uint32_t gen;                 /* stream->cdg_gen it was decoded from */
+    int stale;                    /* drawn from disc packs since rewritten */
+    size_t target;                /* packs applied */
+    fa_time time;                 /* graphics time */
+    int64_t render_ns;
+    uint8_t pal[16][4];
+    int32_t bg, border;
+    uint8_t background[4];
+    uint8_t transparency[16];
+    uint64_t palette_revision;
+} cdg_slot;
+
 struct fa_cdg_surface {
     struct fa_stream* stream;
     struct fa_cdg_surface* next;  /* stream->cdg_surfaces, under cdg_lock */
@@ -158,6 +174,18 @@ struct fa_cdg_surface {
     uint8_t master_pm[CDG_SCALE_COLORS][4]; /* the colours it was drawn with */
     uint8_t eidx[FA_CDG_HEIGHT][FA_CDG_WIDTH]; /* the screen as drawn: 16 = transparent border */
     uint16_t* rows;               /* the scaler's scratch rows (cdg_scale_rect) */
+    /* Render-ahead with presentation scaling: an engine worker renders the next frame
+     * into one slot while update_into copies from the one shown. work_lock guards all
+     * of the surface but what pub_lock does; every surface call and a worker's job hold
+     * it. pub_lock: which slot is which, ra_time, the history and revision. */
+    fa_mutex work_lock, pub_lock;
+    cdg_slot slot[2];
+    int front, ready;             /* the slot shown, the one finished next; -1 = none */
+    fa_time ra_time;              /* the stream time the worker renders for */
+    fa_time ra_last;              /* update_into's last time */
+    struct fa_cdg_surface* ra_next; /* engine->cdg_render, under g_bind */
+    int ra_queued;                /* under g_bind */
+    fa_atomic32 ra_running;       /* workers that took the surface off the queue, not done */
 };
 
 /* ---- data --------------------------------------------------------------------- */
@@ -1081,8 +1109,10 @@ static void advance(fa_cdg_surface* f, uint8_t pal[16][4])
     f->shown_hoff = st->hoff;
     f->shown_voff = st->voff;
     if (area.n) {
+        fa_mutex_lock(&f->pub_lock);   /* update_into reads them while a worker renders */
         f->revision++;
         fa_history_push(&f->history, f->revision, &area);
+        fa_mutex_unlock(&f->pub_lock);
     }
     bg = st->preset ? st->bg : -1;
     border = st->border;
@@ -1260,8 +1290,27 @@ static void layout_want(const fa_cdg_surface* f, const fa_cdg_data* d, cdg_layou
     l->buf_h = l->pic_h + 2 * l->pic_y;
 }
 
+/* Render-ahead: forgets the slots' pictures (keeping the buffers), so the next
+ * update_into draws a frame itself. Caller holds work_lock. */
+static void ra_forget(fa_cdg_surface* f)
+{
+    fa_mutex_lock(&f->pub_lock);
+    f->front = f->ready = -1;
+    f->slot[0].revision = f->slot[1].revision = 0;
+    fa_mutex_unlock(&f->pub_lock);
+}
+
+static void ra_free(fa_cdg_surface* f)
+{
+    ra_forget(f);
+    free(f->slot[0].px);
+    free(f->slot[1].px);
+    f->slot[0].px = f->slot[1].px = NULL;
+}
+
 static void free_maps(fa_cdg_surface* f)
 {
+    ra_free(f);
     free(f->xmap);
     free(f->ymap);
     free(f->xlerp);
@@ -1422,6 +1471,42 @@ static struct fa_stream* surface_hold(fa_cdg_surface* f)
 
 static void stream_release(struct fa_stream* s) { fa_fetch_add32(&s->cdg_users, -1); }
 
+/* Render-ahead's queue, engine->cdg_render, is guarded by g_bind too: a queued
+ * surface has a stream (closing it takes the surface off), and a running job holds
+ * that stream, so the engine is there for as long as either is. Caller holds g_bind. */
+static void ra_unqueue(fa_engine* e, fa_cdg_surface* f)
+{
+    fa_cdg_surface** pp;
+    if (!f->ra_queued) return;
+    for (pp = &e->cdg_render; *pp; pp = &(*pp)->ra_next)
+        if (*pp == f) { *pp = f->ra_next; break; }
+    f->ra_queued = 0;
+    fa_fetch_add32(&e->cdg_render_count, -1);
+}
+
+/* Asks a worker to render ahead for the surface (its stream `s` held by the caller). */
+static void ra_request(fa_cdg_surface* f, struct fa_stream* s)
+{
+    fa_engine* e = s->engine;
+    fa_cdg_surface** pp;
+    int add;
+    fa_lazy_mutex_lock(&g_bind);
+    add = !f->ra_queued && f->stream;
+    if (add) {
+        for (pp = &e->cdg_render; *pp; pp = &(*pp)->ra_next) {}
+        *pp = f;
+        f->ra_next = NULL;
+        f->ra_queued = 1;
+        fa_fetch_add32(&e->cdg_render_count, 1);
+    }
+    fa_lazy_mutex_unlock(&g_bind);
+    if (add) {
+        fa_mutex_lock(&e->list_lock);
+        fa_cond_signal(&e->work_cond);
+        fa_mutex_unlock(&e->list_lock);
+    }
+}
+
 void fa_stream_cdg_detach(struct fa_stream* s)
 {
     fa_cdg_surface* f;
@@ -1429,7 +1514,10 @@ void fa_stream_cdg_detach(struct fa_stream* s)
     fa_mutex_lock(&s->cdg_lock);
     /* Surfaces belong to the app: they outlive the stream until destroyed, and
      * only refuse to update from now on. */
-    for (f = s->cdg_surfaces; f; f = f->next) f->stream = NULL;
+    for (f = s->cdg_surfaces; f; f = f->next) {
+        ra_unqueue(s->engine, f);
+        f->stream = NULL;
+    }
     s->cdg_surfaces = NULL;
     fa_mutex_unlock(&s->cdg_lock);
     fa_lazy_mutex_unlock(&g_bind);
@@ -1453,6 +1541,8 @@ static void surface_free(fa_cdg_surface* f)
 {
     free_maps(f);
     free(f->pixels);
+    fa_mutex_destroy(&f->pub_lock);
+    fa_mutex_destroy(&f->work_lock);
     free(f);
 }
 
@@ -1546,6 +1636,13 @@ FA_API fa_result FA_CALL fa_cdg_surface_create(fa_stream* stream, const fa_cdg_s
         return FA_ERROR_INVALID_ARG;
     f = (fa_cdg_surface*)calloc(1, sizeof(*f));
     if (!f) return FA_ERROR_OUT_OF_MEMORY;
+    if (fa_mutex_init(&f->work_lock) != 0) { free(f); return FA_ERROR_OUT_OF_MEMORY; }
+    if (fa_mutex_init(&f->pub_lock) != 0) {
+        fa_mutex_destroy(&f->work_lock);
+        free(f);
+        return FA_ERROR_OUT_OF_MEMORY;
+    }
+    f->front = f->ready = -1;
     f->stream = stream;
     f->format = c.pixel_format;
     f->flags = c.flags;
@@ -1575,6 +1672,10 @@ FA_API void FA_CALL fa_cdg_surface_destroy(fa_cdg_surface* surface)
     struct fa_stream* s;
     fa_cdg_surface** link;
     if (!surface) return;
+    fa_lazy_mutex_lock(&g_bind);
+    if (surface->stream) ra_unqueue(surface->stream->engine, surface);
+    fa_lazy_mutex_unlock(&g_bind);
+    while (fa_load32(&surface->ra_running)) fa_sleep_ms(1);   /* a worker's job finishes */
     s = surface_hold(surface);
     if (s) {
         fa_mutex_lock(&s->cdg_lock);
@@ -1669,6 +1770,7 @@ static fa_time graphics_time(struct fa_stream* s, fa_time time)
 static fa_time sync_state(fa_cdg_surface* f, struct fa_stream* s, fa_time time, cdg_layout* want)
 {
     size_t target;
+    int i;
     fa_mutex_lock(&s->cdg_lock);
     time = graphics_time(s, time);
     if (f->gen != s->cdg_gen) {
@@ -1681,6 +1783,10 @@ static fa_time sync_state(fa_cdg_surface* f, struct fa_stream* s, fa_time time, 
         /* Packs from stale_from changed: back to the checkpoint before them (the
          * stream's own were redone), and on from there to the target below. */
         if (f->st.next > f->stale_from) rewind_before(f, s->cdg, f->stale_from);
+        fa_mutex_lock(&f->pub_lock);   /* render-ahead's frames drawn from them, too */
+        for (i = 0; i < 2; i++)
+            if (f->slot[i].target > f->stale_from) f->slot[i].stale = 1;
+        fa_mutex_unlock(&f->pub_lock);
         f->stale_from = SIZE_MAX;
     }
     target = s->cdg ? packs_at(time, s->cdg->count) : 0;
@@ -1700,6 +1806,263 @@ static fa_result surface_update(fa_cdg_surface* f, struct fa_stream* s, fa_time 
     if (r == FA_OK) r = render(f, out);
     out->time = time;
     return r;
+}
+
+/* ---- render-ahead ------------------------------------------------------------------ */
+
+/* Without a frame for this long before, update_into asks for the next frame this far
+ * ahead (a 60 Hz display); a longer gap than RA_LEAD_MAX is a seek, not a pace. */
+#define RA_LEAD_DEFAULT ((fa_time)16666667)
+#define RA_LEAD_MAX ((fa_time)100000000)
+/* Packs between two frames looked at to tell whether a frame is still exact. */
+#define RA_LOOK_PACKS 600
+/* A frame this many packs older than wanted (1/60 s) is still on time. */
+#define RA_ON_TIME_PACKS 5
+
+static int ra_on(const fa_cdg_surface* f) { return f->render_ahead && f->lay.scaled; }
+
+/* 1 when packs [a, b) may change the picture (anything but tiles, scrolls, presets
+ * and colours does not). Caller holds cdg_lock. */
+static int packs_visible(const fa_cdg_data* d, size_t a, size_t b)
+{
+    if (b - a > RA_LOOK_PACKS) return 1;
+    for (; a < b; a++) {
+        const uint8_t* p = d->packs + a * FA_CDG_PACK_BYTES;
+        int op = p[1] & 0x3F;
+        if ((p[0] & 0x3F) != CDG_MODE_GRAPHICS) continue;
+        if (op == CDG_TILE_NORMAL || op == CDG_TILE_XOR || op == CDG_SCROLL_PRESET || op == CDG_SCROLL_COPY ||
+            op == CDG_MEMORY_PRESET || op == CDG_BORDER_PRESET || op == CDG_TRANSPARENT || op == CDG_COLORS_LOW ||
+            op == CDG_COLORS_HIGH)
+            return 1;
+    }
+    return 0;
+}
+
+#define FIT_NONE 0                /* no slot, or a picture of other graphics */
+#define FIT_AHEAD 1               /* of a later position */
+#define FIT_BEHIND 2              /* of an earlier position */
+#define FIT_CLOSE 3               /* of an earlier position, on time (RA_ON_TIME_PACKS) */
+#define FIT_EXACT 4               /* the picture of `target` packs */
+
+/* How slot k's picture fits the picture of `target` packs. Caller holds cdg_lock and
+ * pub_lock. */
+static int slot_fit(const fa_cdg_surface* f, const struct fa_stream* s, int k, size_t target)
+{
+    const cdg_slot* sl;
+    const fa_cdg_data* d = s->cdg;
+    if (k < 0) return FIT_NONE;
+    sl = &f->slot[k];
+    if (!sl->revision || sl->stale || sl->gen != s->cdg_gen || f->stale_from != SIZE_MAX) return FIT_NONE;
+    if (sl->target == target) return FIT_EXACT;
+    if (!d) return FIT_NONE;
+    if (sl->target < target) {
+        if (!packs_visible(d, sl->target, target)) return FIT_EXACT;
+        return target - sl->target <= RA_ON_TIME_PACKS ? FIT_CLOSE : FIT_BEHIND;
+    }
+    return packs_visible(d, target, sl->target) ? FIT_AHEAD : FIT_EXACT;
+}
+
+/* Renders the decoder's state into slot k. Caller holds work_lock, and k is neither
+ * the slot shown nor the one finished next. */
+static void ra_render(fa_cdg_surface* f, int k, fa_time gtime, int64_t start)
+{
+    cdg_slot* sl = &f->slot[k];
+    uint8_t pal[16][4];
+    fa_rects drawn;
+    advance(f, pal);
+    draw(f, (const uint8_t(*)[4])pal, sl->px, f->stride, sl->revision, &drawn);
+    sl->revision = f->revision;
+    sl->gen = f->gen;
+    sl->stale = 0;
+    sl->target = f->st.next;
+    sl->time = gtime;
+    memcpy(sl->pal, pal, sizeof(pal));
+    frame_state(f, (const uint8_t(*)[4])pal, &sl->bg, &sl->border, sl->background, sl->transparency);
+    sl->palette_revision = f->palette_revision;
+    sl->render_ns = fa_monotonic_ns() - start;
+}
+
+/* A worker's job: the frame for ra_time into the free slot, finished next. A new
+ * layout waits for the app's next update_into. */
+static void ra_job(fa_cdg_surface* f, struct fa_stream* s)
+{
+    cdg_layout want;
+    fa_time t = 0, gtime;
+    int64_t start;
+    int k = -1;
+    fa_mutex_lock(&f->work_lock);
+    if (ra_on(f) && f->slot[0].px) {
+        fa_mutex_lock(&f->pub_lock);
+        if (f->front >= 0 && f->ready < 0) k = 1 - f->front;
+        t = f->ra_time;
+        fa_mutex_unlock(&f->pub_lock);
+    }
+    if (k >= 0) {
+        start = fa_monotonic_ns();
+        gtime = sync_state(f, s, t, &want);
+        if (memcmp(&want, &f->lay, sizeof(want)) == 0) {
+            ra_render(f, k, gtime, start);
+            fa_mutex_lock(&f->pub_lock);
+            f->ready = k;
+            fa_mutex_unlock(&f->pub_lock);
+        }
+    }
+    fa_mutex_unlock(&f->work_lock);
+}
+
+int fa_cdg_render_one(fa_engine* e)
+{
+    fa_cdg_surface* f;
+    struct fa_stream* s = NULL;
+    fa_lazy_mutex_lock(&g_bind);
+    f = e->cdg_render;
+    if (f) {
+        ra_unqueue(e, f);
+        s = f->stream;            /* queued surfaces have one */
+        fa_fetch_add32(&s->cdg_users, 1);
+        fa_fetch_add32(&f->ra_running, 1);   /* a count: the app may queue it again meanwhile */
+    }
+    fa_lazy_mutex_unlock(&g_bind);
+    if (!f) return 0;
+    ra_job(f, s);
+    fa_fetch_add32(&f->ra_running, -1);  /* at 0 fa_cdg_surface_destroy may free it */
+    stream_release(s);
+    return 1;
+}
+
+static void to_rect(const int r[4], fa_rect* out)
+{
+    out->x = r[0];
+    out->y = r[1];
+    out->width = (uint32_t)(r[2] - r[0]);
+    out->height = (uint32_t)(r[3] - r[1]);
+}
+
+#define RA_NEED_LOCK 1            /* ra_show: a frame must be drawn here, and work_lock is not held */
+
+/* update_into with render-ahead: picks the finished frame that fits `time` best,
+ * copies what changed since dst_revision from it, and asks a worker for the next one.
+ * When there is no frame yet (the first, or after a change of layout or options) or
+ * the best is late by more than 1/60 s, ahead of `time` or of other graphics, the
+ * frame for `time` is drawn here instead, which needs work_lock (`held`); without it
+ * (a worker is rendering) a frame that exists is shown, flagged behind. The layout in
+ * use is read: a worker never changes it. */
+static int ra_show(fa_cdg_surface* f, struct fa_stream* s, fa_time time, uint8_t* dst, int32_t dst_stride,
+                   uint64_t dst_revision, int held, fa_surface_frame* fr, fa_result* result)
+{
+    const cdg_slot* sl;
+    fa_rects drawn;
+    fa_time lead, ahead_time;
+    size_t target = 0, ahead = 0;
+    int i, fit = FIT_NONE, need, partial, b[4], drew = 0;
+    uint32_t bpp = 4;
+    *result = FA_OK;
+    if (held && !f->slot[0].px) {
+        size_t size = (size_t)f->lay.buf_h * (size_t)f->stride;
+        f->slot[0].px = (uint8_t*)malloc(size);
+        f->slot[1].px = (uint8_t*)malloc(size);
+        if (!f->slot[0].px || !f->slot[1].px) {
+            ra_free(f);
+            *result = FA_ERROR_OUT_OF_MEMORY;
+            return 0;
+        }
+    }
+    /* The pace of the calls: paused or back, the frame of `time` itself. */
+    if (time <= f->ra_last) lead = 0;
+    else if ((uint64_t)time - (uint64_t)f->ra_last > (uint64_t)RA_LEAD_MAX) lead = RA_LEAD_DEFAULT;
+    else lead = time - f->ra_last;
+    /* Half a pack short of the next call's time: a frame a hair ahead of it would
+     * wait a whole call longer to be shown. */
+    if (lead > 1000000000 / FA_CDG_PACKS_PER_SECOND / 2) lead -= 1000000000 / FA_CDG_PACKS_PER_SECOND / 2;
+    ahead_time = time > INT64_MAX - lead ? INT64_MAX : time + lead;
+    for (;;) {
+        int ff, fr_fit, k;
+        fa_mutex_lock(&s->cdg_lock);
+        if (s->cdg) {
+            target = packs_at(graphics_time(s, time), s->cdg->count);
+            ahead = packs_at(graphics_time(s, ahead_time), s->cdg->count);
+        }
+        fa_mutex_lock(&f->pub_lock);
+        /* The ready frame replaces the one shown when it fits `time` better. */
+        ff = slot_fit(f, s, f->front, target);
+        fr_fit = slot_fit(f, s, f->ready, target);
+        if (fr_fit != FIT_NONE &&
+            (fr_fit > ff || (fr_fit == ff && (fr_fit == FIT_EXACT ||
+                                                (fr_fit != FIT_AHEAD && f->slot[f->ready].target > f->slot[f->front].target) ||
+                                                (fr_fit == FIT_AHEAD && f->slot[f->ready].target < f->slot[f->front].target))))) {
+            f->front = f->ready;
+            f->ready = -1;
+            ff = fr_fit;
+        } else if (f->ready >= 0 && !(fr_fit == FIT_AHEAD && f->slot[f->ready].target <= ahead)) {
+            f->ready = -1;        /* of no use: the worker renders another */
+        }
+        fit = ff;
+        if ((f->front >= 0 && ff >= FIT_CLOSE) || drew) break;
+        if (!held) {
+            if (f->front >= 0) break;   /* shown late rather than waiting for the worker */
+            fa_mutex_unlock(&f->pub_lock);
+            fa_mutex_unlock(&s->cdg_lock);
+            return RA_NEED_LOCK;
+        }
+        /* Draw the frame for `time` here (no worker is rendering: the lock is held). */
+        f->ready = -1;
+        k = f->front < 0 ? 0 : 1 - f->front;
+        fa_mutex_unlock(&f->pub_lock);
+        fa_mutex_unlock(&s->cdg_lock);
+        {
+            int64_t start = fa_monotonic_ns();
+            cdg_layout want;
+            fa_time gtime = sync_state(f, s, time, &want);
+            if (memcmp(&want, &f->lay, sizeof(want)) != 0) {
+                *result = FA_ERROR_SIZE_MISMATCH;   /* the layout changed just now: get it again */
+                return 0;
+            }
+            ra_render(f, k, gtime, start);
+            fa_mutex_lock(&f->pub_lock);
+            f->front = k;
+            fa_mutex_unlock(&f->pub_lock);
+        }
+        drew = 1;
+    }
+    /* What to copy, and the frame's description, while the slots cannot change; the
+     * copy itself needs no lock: only this thread changes `front`, and a worker draws
+     * only into the other slot. */
+    sl = &f->slot[f->front];
+    partial = fa_history_since(&f->history, sl->revision, dst_revision, &drawn);
+    fr->revision = sl->revision;
+    fr->time = sl->time;
+    fr->render_ns = sl->render_ns;
+    fr->behind = fit < FIT_CLOSE;
+    fr->background_index = sl->bg;
+    fr->border_index = sl->border;
+    memcpy(fr->background, sl->background, sizeof(fr->background));
+    memcpy(fr->palette, sl->pal, sizeof(fr->palette));
+    memcpy(fr->transparency, sl->transparency, sizeof(fr->transparency));
+    fr->palette_revision = sl->palette_revision;
+    /* The next frame is wanted unless one is shown or on its way for `ahead`. */
+    need = f->ready < 0 && slot_fit(f, s, f->front, ahead) != FIT_EXACT;
+    f->ra_time = ahead_time;
+    fa_mutex_unlock(&f->pub_lock);
+    fa_mutex_unlock(&s->cdg_lock);
+    f->ra_last = time;
+    if (need) ra_request(f, s);
+    if (!partial) {
+        fa_rects_clear(&drawn);
+        fa_rects_add(&drawn, 0, 0, (int)f->lay.buf_w, (int)f->lay.buf_h);
+    }
+    for (i = 0; i < drawn.n; i++) {
+        const int* r = drawn.r[i];
+        int y;
+        for (y = r[1]; y < r[3]; y++)
+            memcpy(dst + (size_t)y * (size_t)dst_stride + (size_t)r[0] * bpp,
+                   sl->px + (size_t)y * (size_t)f->stride + (size_t)r[0] * bpp, (size_t)(r[2] - r[0]) * bpp);
+    }
+    fr->base_revision = partial ? dst_revision : 0;
+    fr->dirty_count = (uint32_t)drawn.n;
+    for (i = 0; i < drawn.n; i++) to_rect(drawn.r[i], &fr->dirty[i]);
+    fa_rects_bounds(&drawn, b);
+    to_rect(b, &fr->dirty_bounds);
+    return 0;
 }
 
 /* ---- change events ---------------------------------------------------------------- */
@@ -1860,7 +2223,9 @@ FA_API fa_result FA_CALL fa_cdg_surface_update(fa_cdg_surface* surface, fa_cdg_f
     s = surface_hold(surface);
     if (!s) return FA_ERROR_INVALID_ARG; /* its stream was closed */
     r = fa_stream_get_clock(s, &now);
+    fa_mutex_lock(&surface->work_lock);
     if (r == FA_OK) r = surface_update(surface, s, now, out_frame);
+    fa_mutex_unlock(&surface->work_lock);
     stream_release(s);
     return r;
 }
@@ -1872,7 +2237,9 @@ FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_ti
     if (!surface || !out_frame) return FA_ERROR_INVALID_ARG;
     s = surface_hold(surface);
     if (!s) return FA_ERROR_INVALID_ARG; /* its stream was closed */
+    fa_mutex_lock(&surface->work_lock);
     r = surface_update(surface, s, time, out_frame);
+    fa_mutex_unlock(&surface->work_lock);
     stream_release(s);
     return r;
 }
@@ -1888,22 +2255,27 @@ FA_API fa_result FA_CALL fa_surface_set_presentation_size(fa_surface* surface, u
     r = fa_presentation_size_clamp(&width, &height);
     if (r != FA_OK) return r;
     /* Used by presentation scaling, at the next update or layout. */
+    fa_mutex_lock(&surface->work_lock);
     surface->present_w = width;
     surface->present_h = height;
+    fa_mutex_unlock(&surface->work_lock);
     return FA_OK;
 }
 
 FA_API fa_result FA_CALL fa_surface_set_render_ahead(fa_surface* surface, int32_t enabled)
 {
     if (!surface || (enabled != 0 && enabled != 1)) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&surface->work_lock);
+    if (!enabled) ra_free(surface);
     surface->render_ahead = enabled;
+    fa_mutex_unlock(&surface->work_lock);
     return FA_OK;
 }
 
-/* The layout the surface's settings call for now, in place. */
-static fa_result layout_refresh(fa_cdg_surface* f)
+/* The layout the surface's settings call for now, in place; `s` is its stream, held,
+ * or NULL when it was closed. Caller holds work_lock. */
+static fa_result layout_refresh(fa_cdg_surface* f, struct fa_stream* s)
 {
-    struct fa_stream* s = surface_hold(f);
     cdg_layout want;
     if (!s) {
         /* Its stream was closed: the layout in use, or the one without graphics. */
@@ -1915,18 +2287,24 @@ static fa_result layout_refresh(fa_cdg_surface* f)
     if (f->gen != s->cdg_gen) index_build(s->cdg);   /* graphics loaded since: their pre-pass */
     layout_want(f, s->cdg, &want);
     fa_mutex_unlock(&s->cdg_lock);
-    stream_release(s);
     return layout_apply(f, &want);
 }
 
 FA_API fa_result FA_CALL fa_surface_get_layout(fa_surface* surface, fa_surface_layout* out_layout)
 {
+    struct fa_stream* s;
     fa_surface_layout l;
     const cdg_layout* c;
     fa_result r;
     if (!surface || !out_layout || out_layout->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
-    r = layout_refresh(surface);
-    if (r != FA_OK) return r;
+    s = surface_hold(surface);
+    fa_mutex_lock(&surface->work_lock);
+    r = layout_refresh(surface, s);
+    if (s) stream_release(s);
+    if (r != FA_OK) {
+        fa_mutex_unlock(&surface->work_lock);
+        return r;
+    }
     c = &surface->lay;
     memset(&l, 0, sizeof(l));
     l.struct_size = out_layout->struct_size < sizeof(l) ? out_layout->struct_size : (uint32_t)sizeof(l);
@@ -1950,16 +2328,51 @@ FA_API fa_result FA_CALL fa_surface_get_layout(fa_surface* surface, fa_surface_l
     l.margin = c->scaled ? c->n : 0;
     l.padding = c->pad;
     l.layout_revision = surface->layout_revision;
+    fa_mutex_unlock(&surface->work_lock);
     memcpy(out_layout, &l, l.struct_size);
     return FA_OK;
 }
 
-static void to_rect(const int r[4], fa_rect* out)
+/* update_into with work_lock held. */
+static fa_result update_held(fa_cdg_surface* f, struct fa_stream* s, fa_time time, uint8_t* dst, int32_t dst_stride,
+                             uint32_t dst_width, uint32_t dst_height, uint64_t dst_revision, fa_surface_frame* fr)
 {
-    out->x = r[0];
-    out->y = r[1];
-    out->width = (uint32_t)(r[2] - r[0]);
-    out->height = (uint32_t)(r[3] - r[1]);
+    cdg_layout want;
+    uint8_t pal[16][4];
+    fa_rects drawn;
+    int64_t drawing;
+    int b[4], i, partial;
+    fa_result r;
+    if (f->render_ahead) {
+        r = layout_refresh(f, s);
+        if (r != FA_OK) return r;
+        if (f->lay.scaled) {
+            if (dst_width != f->lay.buf_w || dst_height != f->lay.buf_h) return FA_ERROR_SIZE_MISMATCH;
+            if (dst_stride < f->stride) return FA_ERROR_INVALID_ARG;
+            ra_show(f, s, time, dst, dst_stride, dst_revision, 1, fr, &r);
+            return r;
+        }
+    }
+    time = sync_state(f, s, time, &want);
+    r = layout_apply(f, &want);
+    if (r != FA_OK) return r;
+    if (dst_width != f->lay.buf_w || dst_height != f->lay.buf_h) return FA_ERROR_SIZE_MISMATCH;
+    if (dst_stride < f->stride) return FA_ERROR_INVALID_ARG;
+    advance(f, pal);
+    drawing = fa_monotonic_ns();
+    partial = draw(f, (const uint8_t(*)[4])pal, dst, dst_stride, dst_revision, &drawn);
+    fr->revision = f->revision;
+    fr->base_revision = partial ? dst_revision : 0;
+    fr->dirty_count = (uint32_t)drawn.n;
+    for (i = 0; i < drawn.n; i++) to_rect(drawn.r[i], &fr->dirty[i]);
+    fa_rects_bounds(&drawn, b);
+    to_rect(b, &fr->dirty_bounds);
+    fr->time = time;
+    fr->render_ns = fa_monotonic_ns() - drawing;
+    frame_state(f, (const uint8_t(*)[4])pal, &fr->background_index, &fr->border_index, fr->background, fr->transparency);
+    memcpy(fr->palette, pal, sizeof(pal));
+    fr->palette_revision = f->palette_revision;
+    return FA_OK;
 }
 
 FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* surface, fa_time time, void* dst, int32_t dst_stride,
@@ -1968,39 +2381,33 @@ FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* surface, fa_time tim
 {
     struct fa_stream* s;
     fa_surface_frame fr;
-    cdg_layout want;
-    uint8_t pal[16][4];
-    fa_rects drawn;
-    int64_t start = fa_monotonic_ns(), drawing;
-    int b[4], i, partial;
+    int64_t start = fa_monotonic_ns();
     fa_result r = FA_OK;
     if (!surface || !dst || !out_frame || out_frame->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
     s = surface_hold(surface);
     if (!s) return FA_ERROR_INVALID_ARG; /* its stream was closed */
-    if (time == FA_SURFACE_NOW) r = fa_stream_get_clock(s, &time);
-    if (r == FA_OK) time = sync_state(surface, s, time, &want);
-    stream_release(s);
-    if (r == FA_OK) r = layout_apply(surface, &want);
-    if (r != FA_OK) return r;
-    if (dst_width != surface->lay.buf_w || dst_height != surface->lay.buf_h) return FA_ERROR_SIZE_MISMATCH;
-    if (dst_stride < surface->stride) return FA_ERROR_INVALID_ARG;
-    advance(surface, pal);
-    drawing = fa_monotonic_ns();
-    partial = draw(surface, pal, (uint8_t*)dst, dst_stride, dst_revision, &drawn);
     memset(&fr, 0, sizeof(fr));
+    if (time == FA_SURFACE_NOW) r = fa_stream_get_clock(s, &time);
+    if (r == FA_OK) {
+        if (fa_mutex_trylock(&surface->work_lock)) {
+            r = update_held(surface, s, time, (uint8_t*)dst, dst_stride, dst_width, dst_height, dst_revision, &fr);
+            fa_mutex_unlock(&surface->work_lock);
+        } else {
+            /* A worker is rendering ahead (no one else holds the lock while the app is
+             * in this call): what it finished, in the layout in use. */
+            if (dst_width != surface->lay.buf_w || dst_height != surface->lay.buf_h) r = FA_ERROR_SIZE_MISMATCH;
+            else if (dst_stride < surface->stride) r = FA_ERROR_INVALID_ARG;
+            else if (ra_show(surface, s, time, (uint8_t*)dst, dst_stride, dst_revision, 0, &fr, &r) == RA_NEED_LOCK) {
+                fa_mutex_lock(&surface->work_lock);
+                r = update_held(surface, s, time, (uint8_t*)dst, dst_stride, dst_width, dst_height, dst_revision, &fr);
+                fa_mutex_unlock(&surface->work_lock);
+            }
+        }
+    }
+    stream_release(s);
+    if (r != FA_OK) return r;
     fr.struct_size = out_frame->struct_size < sizeof(fr) ? out_frame->struct_size : (uint32_t)sizeof(fr);
-    fr.revision = surface->revision;
-    fr.base_revision = partial ? dst_revision : 0;
     fr.layout_revision = surface->layout_revision;
-    fr.dirty_count = (uint32_t)drawn.n;
-    for (i = 0; i < drawn.n; i++) to_rect(drawn.r[i], &fr.dirty[i]);
-    fa_rects_bounds(&drawn, b);
-    to_rect(b, &fr.dirty_bounds);
-    fr.time = time;
-    fr.render_ns = fa_monotonic_ns() - drawing;
-    frame_state(surface, pal, &fr.background_index, &fr.border_index, fr.background, fr.transparency);
-    memcpy(fr.palette, pal, sizeof(pal));
-    fr.palette_revision = surface->palette_revision;
     fr.draw_ns = fa_monotonic_ns() - start;
     memcpy(out_frame, &fr, fr.struct_size);
     return FA_OK;
@@ -2023,9 +2430,12 @@ FA_API fa_result FA_CALL fa_cdg_surface_set_presentation(fa_surface* surface, co
     fa_cdg_presentation p;
     if (!surface) return FA_ERROR_INVALID_ARG;
     if (!presentation) {
+        fa_mutex_lock(&surface->work_lock);
         surface->has_pres = 0;
         surface->tb = 0;
         surface->drawn = 0;
+        ra_forget(surface);
+        fa_mutex_unlock(&surface->work_lock);
         return FA_OK;
     }
     if (presentation->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
@@ -2037,10 +2447,13 @@ FA_API fa_result FA_CALL fa_cdg_surface_set_presentation(fa_surface* surface, co
         p.smoothness > 10 || (p.edge_blend != 0 && p.edge_blend != 1) || (p.flags & ~(uint32_t)FA_CDG_TRANSPARENT_BORDER))
         return FA_ERROR_INVALID_ARG;
     p.struct_size = (uint32_t)sizeof(p);
+    fa_mutex_lock(&surface->work_lock);
     surface->pres = p;
     surface->has_pres = 1;
     surface->tb = (p.flags & FA_CDG_TRANSPARENT_BORDER) != 0;
     surface->drawn = 0;   /* drawn again in full; a new layout too when it changes */
+    ra_forget(surface);   /* and shown at once, not after a worker's frame */
+    fa_mutex_unlock(&surface->work_lock);
     return FA_OK;
 }
 

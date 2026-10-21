@@ -2876,6 +2876,227 @@ static void test_smoothness_and_edge_blend(void)
     free(c.p);
 }
 
+/* `got` (stride `stride`) against `ref` drawn in full at stream time `t`. */
+static int same_as_at(fa_surface* ref, fa_time t, const uint8_t* got, int32_t stride, uint32_t bpp)
+{
+    fa_surface_layout l = layout_of(ref);
+    fa_surface_frame fr;
+    uint8_t* want = (uint8_t*)malloc((size_t)l.width * l.height * bpp);
+    uint32_t y;
+    int same = 1;
+    memset(&fr, 0, sizeof(fr));
+    fr.struct_size = sizeof(fr);
+    if (!want || fa_surface_update_into(ref, t, want, (int32_t)(l.width * bpp), l.width, l.height, 0, &fr) != FA_OK) {
+        free(want);
+        return 0;
+    }
+    for (y = 0; y < l.height && same; y++)
+        same = memcmp(got + (size_t)y * (size_t)stride, want + (size_t)y * l.width * bpp, l.width * bpp) == 0;
+    free(want);
+    return same;
+}
+
+/* update_into at `t` until the frame is no longer behind (a worker renders it). */
+static void settle(fa_surface* f, fa_time t, uint8_t* mem, int32_t stride, const fa_surface_layout* l, uint64_t* rev,
+                   fa_surface_frame* fr)
+{
+    int i;
+    for (i = 0; i < 4000; i++) {
+        memset(fr, 0, sizeof(*fr));
+        fr->struct_size = sizeof(*fr);
+        CHECK_EQ(fa_surface_update_into(f, t, mem, stride, l->width, l->height, *rev, fr), FA_OK);
+        *rev = fr->revision;
+        if (!fr->behind) break;
+        fa_sleep_ms(1);
+    }
+}
+
+/* Render-ahead: every frame shown is the picture of the position it reports, drawn
+ * only where it changed; a frame a worker has not finished yet shows as behind and
+ * arrives later; options and the classic picture are as without it; surfaces and
+ * streams closed while a worker has work for them. */
+static void test_render_ahead(void)
+{
+    buf c = busy_cdg();
+    size_t packs = c.n / FA_CDG_PACK_BYTES, n;
+    fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface *f = NULL, *ref = NULL, *classic = NULL, *classic_ref = NULL;
+    fa_cdg_presentation p = pres(1, FA_SAFETY_SHOW);
+    fa_surface_layout l;
+    fa_surface_frame fr;
+    uint8_t* mem[2];
+    uint64_t rev[2] = { 0, 0 };
+    int32_t stride;
+    uint32_t b, behind = 0, partial = 0, i;
+    p.smoothness = 2;
+    p.edge_blend = 1;
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &ref), FA_OK);
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    CHECK_EQ(fa_cdg_surface_set_presentation(ref, &p), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(f, 900, 648), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(ref, 900, 648), FA_OK);
+    CHECK_EQ(fa_surface_set_render_ahead(f, 1), FA_OK);
+    l = layout_of(f);
+    stride = (int32_t)(l.width * 4 + 8);
+    for (b = 0; b < 2; b++) mem[b] = (uint8_t*)calloc((size_t)stride * l.height, 1);
+
+    /* Two packs a frame through the song, two buffers in turn. */
+    for (n = 0; n <= packs + 4; n += 2) {
+        b = (uint32_t)(n / 2 % 2);
+        memset(&fr, 0, sizeof(fr));
+        fr.struct_size = sizeof(fr);
+        CHECK_EQ(fa_surface_update_into(f, t_packs((int64_t)n), mem[b], stride, l.width, l.height, rev[b], &fr), FA_OK);
+        if (fr.behind) behind++;
+        if (fr.base_revision) partial++;
+        CHECK(fr.revision >= rev[b] || !fr.base_revision);
+        rev[b] = fr.revision;
+        if (!same_as_at(ref, fr.time, mem[b], stride, 4)) {
+            printf("    step %u: the frame differs from the picture at its time\n", (unsigned)n);
+            CHECK(!"render-ahead frame");
+        }
+    }
+    printf("    %u of %u frames behind, %u partial\n", behind, (unsigned)(packs / 2 + 3), partial);
+    CHECK(partial > 0);
+
+    /* Paced like a display (timing-dependent, so only reported): the worker has the
+     * next frame ready. */
+    behind = 0;
+    for (n = 0; n <= packs + 4; n += 2) {
+        b = (uint32_t)(n / 2 % 2);
+        memset(&fr, 0, sizeof(fr));
+        fr.struct_size = sizeof(fr);
+        CHECK_EQ(fa_surface_update_into(f, t_packs((int64_t)n), mem[b], stride, l.width, l.height, rev[b], &fr), FA_OK);
+        if (fr.behind) behind++;
+        rev[b] = fr.revision;
+        CHECK(same_as_at(ref, fr.time, mem[b], stride, 4));
+        fa_sleep_ms(7);
+    }
+    printf("    paced: %u of %u frames behind\n", behind, (unsigned)(packs / 2 + 3));
+
+    /* Paused somewhere, and after seeks back and forward: the frame arrives. */
+    {
+        static const size_t at[] = { 30, 5, 70, 69, 0 };
+        for (i = 0; i < 5; i++) {
+            size_t k = at[i] < packs ? at[i] : packs;
+            settle(f, t_packs((int64_t)k), mem[0], stride, &l, &rev[0], &fr);
+            CHECK(!fr.behind);
+            CHECK(same_as_at(ref, t_packs((int64_t)k), mem[0], stride, 4));
+        }
+    }
+
+    /* The surface's own pixels with render-ahead on: as always. */
+    {
+        fa_cdg_frame cf, rf;
+        CHECK_EQ(fa_cdg_surface_update_at(f, t_packs(50), &cf), FA_OK);
+        CHECK_EQ(fa_cdg_surface_update_at(ref, t_packs(50), &rf), FA_OK);
+        CHECK_EQ(cf.width, rf.width);
+        CHECK_EQ(cf.height, rf.height);
+        CHECK(memcmp(cf.pixels, rf.pixels, (size_t)cf.stride * cf.height) == 0);
+    }
+
+    /* Other graphics loaded: the old song's frame is not kept. */
+    {
+        buf other = moves_cdg();
+        CHECK_EQ(fa_stream_load_cdg_memory(s, other.p, other.n), FA_OK);
+        settle(f, t_packs(20), mem[0], stride, &l, &rev[0], &fr);
+        CHECK(!fr.behind);
+        CHECK(same_as_at(ref, t_packs(20), mem[0], stride, 4));
+        CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+        settle(f, t_packs(20), mem[0], stride, &l, &rev[0], &fr);
+        CHECK(!fr.behind);
+        CHECK(same_as_at(ref, t_packs(20), mem[0], stride, 4));
+        free(other.p);
+    }
+
+    /* New options are shown at once, not after a worker's frame. */
+    p.smoothness = 0;
+    p.edge_blend = 0;
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    CHECK_EQ(fa_cdg_surface_set_presentation(ref, &p), FA_OK);
+    memset(&fr, 0, sizeof(fr));
+    fr.struct_size = sizeof(fr);
+    CHECK_EQ(fa_surface_update_into(f, t_packs(40), mem[0], stride, l.width, l.height, rev[0], &fr), FA_OK);
+    CHECK(!fr.behind);
+    rev[0] = fr.revision;
+    CHECK(same_as_at(ref, t_packs(40), mem[0], stride, 4));
+
+    /* Off again: drawn on the caller's thread, never behind. */
+    CHECK_EQ(fa_surface_set_render_ahead(f, 0), FA_OK);
+    for (n = 41; n < 60 && n <= packs; n++) {
+        memset(&fr, 0, sizeof(fr));
+        fr.struct_size = sizeof(fr);
+        CHECK_EQ(fa_surface_update_into(f, t_packs((int64_t)n), mem[0], stride, l.width, l.height, rev[0], &fr), FA_OK);
+        CHECK(!fr.behind);
+        rev[0] = fr.revision;
+        CHECK(same_as_at(ref, t_packs((int64_t)n), mem[0], stride, 4));
+    }
+
+    /* The classic picture ignores the setting. */
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &classic), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &classic_ref), FA_OK);
+    CHECK_EQ(fa_surface_set_render_ahead(classic, 1), FA_OK);
+    {
+        fa_surface_layout lc = layout_of(classic);
+        int32_t cs = (int32_t)(lc.width * 4);
+        uint8_t* cm = (uint8_t*)calloc((size_t)cs * lc.height, 1);
+        uint64_t cr = 0;
+        for (n = 0; n <= packs; n += 3) {
+            memset(&fr, 0, sizeof(fr));
+            fr.struct_size = sizeof(fr);
+            CHECK_EQ(fa_surface_update_into(classic, t_packs((int64_t)n), cm, cs, lc.width, lc.height, cr, &fr), FA_OK);
+            CHECK(!fr.behind);
+            cr = fr.revision;
+            CHECK(same_as_at(classic_ref, t_packs((int64_t)n), cm, cs, 4));
+        }
+        free(cm);
+    }
+    fa_surface_destroy(classic);
+    fa_surface_destroy(classic_ref);
+    for (b = 0; b < 2; b++) free(mem[b]);
+    fa_surface_destroy(ref);
+    fa_surface_destroy(f);
+    fa_stream_close(s);
+
+    /* Destroyed, or their stream closed, with work queued or running. */
+    for (i = 0; i < 40; i++) {
+        fa_stream* s2 = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+        fa_cdg_surface* g = NULL;
+        fa_cdg_presentation q = pres(1, FA_SAFETY_SHOW);
+        fa_surface_layout lg;
+        uint8_t* m;
+        uint64_t r = 0;
+        q.smoothness = 4;
+        q.edge_blend = 1;
+        CHECK_EQ(fa_stream_load_cdg_memory(s2, c.p, c.n), FA_OK);
+        CHECK_EQ(fa_cdg_surface_create(s2, NULL, &g), FA_OK);
+        CHECK_EQ(fa_cdg_surface_set_presentation(g, &q), FA_OK);
+        CHECK_EQ(fa_surface_set_presentation_size(g, 1920, 1080), FA_OK);
+        CHECK_EQ(fa_surface_set_render_ahead(g, 1), FA_OK);
+        lg = layout_of(g);
+        m = (uint8_t*)malloc((size_t)lg.width * lg.height * 4);
+        for (n = 0; n < 6; n++) {
+            memset(&fr, 0, sizeof(fr));
+            fr.struct_size = sizeof(fr);
+            CHECK_EQ(fa_surface_update_into(g, t_packs((int64_t)(n * 20)), m, (int32_t)(lg.width * 4), lg.width, lg.height, r, &fr), FA_OK);
+            r = fr.revision;
+        }
+        if (i % 2) {
+            fa_surface_destroy(g);
+            fa_stream_close(s2);
+        } else {
+            fa_stream_close(s2);
+            memset(&fr, 0, sizeof(fr));
+            fr.struct_size = sizeof(fr);
+            CHECK_EQ(fa_surface_update_into(g, 0, m, (int32_t)(lg.width * 4), lg.width, lg.height, r, &fr), FA_ERROR_INVALID_ARG);
+            fa_surface_destroy(g);
+        }
+        free(m);
+    }
+    free(c.p);
+}
+
 /* Prints what presentation scaling costs, for the table in docs/features/cdg.md: a
  * full redraw of a screen of lyrics, and a typical update while they are coloured in
  * (four tiles), into buffers in rotation. Checks nothing but that it runs. */
@@ -3028,6 +3249,7 @@ int main(void)
     RUN(test_safety_zone_prepass);
     RUN(test_smoothness_and_edge_blend);
     RUN(test_presentation_incremental);
+    RUN(test_render_ahead);
     RUN(test_presentation_costs);
     fa_engine_destroy(g_engine);
     remove("cdg_pair.zip");

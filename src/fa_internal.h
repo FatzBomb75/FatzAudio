@@ -704,6 +704,8 @@ struct fa_engine {
     struct fa_device* devices;
     struct fa_stream* graveyard; /* closed streams, freed by the event thread */
     struct fa_stream* cdg_watched; /* streams with CD+G change events (cdg.c), via cdg_watch_link */
+    struct fa_cdg_surface* cdg_render; /* surfaces waiting for a worker to render ahead (cdg.c) */
+    fa_atomic32 cdg_render_count; /* how many: read by idle workers without a lock */
     fa_qevent* pending;          /* events posted by API/worker threads */
     uint32_t pending_count, pending_cap;
 
@@ -1111,7 +1113,7 @@ struct fa_stream {
 
     /* CD+G graphics (cdg.c): the packs, the surfaces drawing them, and a generation
      * count that tells surfaces the graphics were replaced. Never touched by the
-     * audio thread or the workers. */
+     * audio thread; workers only through a surface's render-ahead job (cdg.c). */
     fa_mutex cdg_lock;
     struct fa_cdg_data* cdg;     /* NULL = no graphics */
     struct fa_cdg_surface* cdg_surfaces;

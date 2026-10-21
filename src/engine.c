@@ -1,4 +1,5 @@
 #include "fa_internal.h"
+#include "cdg.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -74,7 +75,8 @@ void fa_engine_track_stream(fa_engine* e, struct fa_stream* s, int add)
  * streams at all: adding one wakes it), and the others sleep until it, or an API
  * call with work for them (a push, a seek, a new stream), wakes them. A worker that
  * finds more streams wanting decoding than the one it takes wakes one more, which
- * does the same, so busy moments still get every worker. */
+ * does the same, so busy moments still get every worker. Workers with no decoding to
+ * do render ahead for drawing surfaces that asked for it (cdg.c). */
 static void worker_main(void* arg)
 {
     fa_engine* e = (fa_engine*)arg;
@@ -109,6 +111,13 @@ static void worker_main(void* arg)
             fa_mutex_lock(&e->list_lock);
             /* A seek waiting for an API call to finish: try again shortly. */
             if (busy) fa_cond_wait_ms(&e->work_cond, &e->list_lock, 1);
+            continue;
+        }
+        /* No stream wants decoding: a surface rendering ahead may (cdg.c). */
+        if (fa_load32(&e->cdg_render_count)) {
+            fa_mutex_unlock(&e->list_lock);
+            fa_cdg_render_one(e);
+            fa_mutex_lock(&e->list_lock);
             continue;
         }
         e->workers_idle++;

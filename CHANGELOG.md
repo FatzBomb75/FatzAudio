@@ -28,6 +28,10 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   `FA_CDG_INDEX_TRANSPARENT` (index 16 in INDEXED8 padding). .NET: `CdgSurface.Presentation`, `CdgPresentation`,
   `CdgSurface.TransparentIndex`. Surfaces without presentation options draw exactly as before. See
   [docs/features/cdg.md](docs/features/cdg.md#presentation-options-fa_cdg_surface_set_presentation).
+- Render-ahead: `fa_surface_set_render_ahead` (.NET `RenderAhead`) now works. With CD+G presentation scaling the
+  engine's worker threads render the next frame ahead and `fa_surface_update_into` copies the newest finished one
+  without waiting; `fa_surface_frame.behind` says when that frame is late. Workers render only when no stream needs
+  decoding.
 - Surfaces: `fa_surface_update_into` draws a CD+G surface into a buffer of yours, only the area that changed since the
   frame that buffer holds (any of the last 8 revisions), with up to 8 dirty rectangles and timings, the same pixels
   `fa_cdg_surface_update` gives. Also `fa_surface_get_layout`, `fa_surface_set_presentation_size`,

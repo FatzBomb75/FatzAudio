@@ -110,7 +110,9 @@ public readonly ref struct SurfaceUpdate
     public TimeSpan DrawTime { get; }
     /// <summary>Of that, drawing pixels (with render-ahead: the time the frame took on the worker).</summary>
     public TimeSpan RenderTime { get; }
-    /// <summary>Render-ahead: true when this is an older finished frame.</summary>
+    /// <summary>Render-ahead: true when the frame shown is more than 1/60 s older than the time asked for, of a later
+    /// position (after a seek back) or of graphics since replaced; <see cref="Time"/> is the position it shows. A newer
+    /// frame follows. Always false without render-ahead.</summary>
     public bool Behind { get; }
     /// <summary>CD+G: as <see cref="CdgFrame.BackgroundIndex"/>.</summary>
     public int BackgroundIndex { get; }
@@ -153,8 +155,12 @@ public interface IKaraokeSurface : IDisposable
     /// scaling ignores it.</summary>
     PixelSize PresentationSize { get; set; }
 
-    /// <summary>Off by default. Planned: surfaces that render into a bitmap of their own render the next frames ahead on
-    /// the engine's workers. In this version it is accepted and every surface draws on the calling thread.</summary>
+    /// <summary>Off by default. On, a surface that renders into a bitmap of its own (CD+G with
+    /// <see cref="CdgPresentation.Scale"/>; lyrics) has the engine's workers render its next frame ahead, and
+    /// <see cref="UpdateInto(nint, int, int, int, ulong, TimeSpan?)"/> copies the finished one that fits best without
+    /// waiting for a worker (<see cref="SurfaceUpdate.Behind"/> says when it is late); with no worker busy and no fitting
+    /// frame it draws one itself. Takes two more buffers of the layout's size; the classic
+    /// CD+G picture ignores it.</summary>
     bool RenderAhead { get; set; }
 
     /// <summary>The buffer size to draw into, and where the picture goes.</summary>
