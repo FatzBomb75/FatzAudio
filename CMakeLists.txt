@@ -98,6 +98,9 @@ set(FA_SOURCES
     src/cdg_scale.c
     src/surface.c
     src/surface_fx.c
+    src/font.c
+    src/raster.c
+    src/font_find.c
     src/zip.c
     src/tempo.c
     src/resample.c
@@ -201,11 +204,13 @@ set_target_properties(fatzaudio PROPERTIES
 find_package(Threads REQUIRED)
 target_link_libraries(fatzaudio PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 if(WIN32)
-    # Also the system libraries of codec_mf.c: mfuuid (GUIDs, static) and ole32.
-    set(FA_NET_LIBS ws2_32 winhttp mfuuid ole32)
+    # Also the system libraries of codec_mf.c: mfuuid (GUIDs, static) and ole32;
+    # advapi32: the registry's font list (font_find.c).
+    set(FA_NET_LIBS ws2_32 winhttp mfuuid ole32 advapi32)
 elseif(APPLE)
     # AudioToolbox: codec_at.c (and miniaudio on iOS).
-    set(FA_NET_LIBS "-framework Foundation" "-framework CFNetwork" "-framework AudioToolbox")
+    # CoreText: font_find.c.
+    set(FA_NET_LIBS "-framework Foundation" "-framework CFNetwork" "-framework AudioToolbox" "-framework CoreText")
     if(IOS)
         # miniaudio links Core Audio directly on iOS (no runtime loading there).
         list(APPEND FA_NET_LIBS "-framework CoreFoundation" "-framework CoreAudio" "-framework AVFoundation")

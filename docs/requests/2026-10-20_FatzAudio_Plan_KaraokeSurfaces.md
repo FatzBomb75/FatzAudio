@@ -529,7 +529,14 @@ than the time asked for. Step 3: the effects (section 4) on CD+G, as specified, 
 incrementally around changed tiles and moved with scrolls, and their cost added to the measured table
 (a full redraw with outline and shadow is about 28 ms at 1080p and 115 ms at 2160p, so render-ahead is
 recommended with effects at 2160p). Not in step 3: section 3.3 (the 2x internal pass at N 1-3 and the bevel
-limited to half a stroke's width), moved to step 6, which needs the same 2x path for contours.
+limited to half a stroke's width), moved to step 6, which needs the same 2x path for contours. Step 4: the font reader
+(TrueType and CFF outlines, CID-keyed CFF, collections, cmap 4/6/12, kern and GPOS pair kerning) and
+the exact-area rasterizer, about 40 KB of code, with test fonts of our own, damage tests, and finding
+fonts through each OS (registry list, CoreText, Android's system font list (not its font matcher, which crashes outside an app process), fontconfig, else the font
+folders). Checked against FreeType on DejaVu, FreeFont, Inter (CFF), WenQuanYi (a collection) and Noto
+Sans JP (CID-keyed CFF, 18 font dicts): a mean difference under 0.06 of 255 per pixel at 100 px; and
+against HarfBuzz kerning: 8,400 pairs, none different. No public API yet: the lyric surface (step 5)
+uses it.
 
 ## 11. Questions, answered by MediaControl (2026-10-20)
 
