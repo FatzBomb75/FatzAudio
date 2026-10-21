@@ -327,6 +327,51 @@ internal struct FaCdgPresentation
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal struct FaFxOutline
+{
+    public int On;
+    public uint Color;
+    public uint SungColor;
+    public float Opacity;
+    public float Size;
+    public float Fade;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaFxShadow
+{
+    public int On;
+    public uint Color;
+    public uint SungColor;
+    public float Opacity;
+    public float Size;
+    public float Distance;
+    public float AngleDegrees;
+    public float Fade;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaFxBevel
+{
+    public int On;
+    public uint Highlight;
+    public uint Shade;
+    public float Strength;
+    public float Size;
+    public float LightAngleDegrees;
+    public float Fade;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaSurfaceEffects
+{
+    public uint StructSize;
+    public FaFxShadow Shadow;
+    public FaFxOutline Outline;
+    public FaFxBevel Bevel;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal struct FaCdgInfo
 {
     public int Source;

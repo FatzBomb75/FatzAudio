@@ -18,6 +18,7 @@
  * audio thread never sees any of it. */
 #include "cdg.h"
 #include "cdg_scale.h"
+#include "surface_fx.h"
 #include "surface.h"
 #include <math.h>
 #include <stdint.h>
@@ -174,6 +175,15 @@ struct fa_cdg_surface {
     uint8_t master_pm[CDG_SCALE_COLORS][4]; /* the colours it was drawn with */
     uint8_t eidx[FA_CDG_HEIGHT][FA_CDG_WIDTH]; /* the screen as drawn: 16 = transparent border */
     uint16_t* rows;               /* the scaler's scratch rows (cdg_scale_rect) */
+    /* Effects (fa_surface_set_effects), with presentation scaling: drawn from the
+     * master into fxm, which update_into then copies from. */
+    int has_fx;
+    fa_surface_effects fx;
+    int fx_on;                    /* fxm holds the master with the effects */
+    int fx_wide;                  /* ... computed over the whole master (smooth-scroll offsets) */
+    uint8_t* fxm;
+    void* fx_scratch;
+    size_t fx_scratch_size;
     /* Render-ahead with presentation scaling: an engine worker renders the next frame
      * into one slot while update_into copies from the one shown. work_lock guards all
      * of the surface but what pub_lock does; every surface call and a worker's job hold
@@ -908,12 +918,19 @@ static void master_shift(fa_cdg_surface* f, int dx, int dy, fa_rects* m)
     int mx1 = f->mx0 + f->mw, my1 = f->my0 + f->mh;
     size_t len = (size_t)(w - (dxp < 0 ? -dxp : dxp)) * 4, to = (size_t)(dxp > 0 ? dxp : 0) * 4;
     size_t from = (size_t)(dxp < 0 ? -dxp : 0) * 4;
-    if (dyp > 0) {
-        for (y = h - 1; y >= dyp; y--)
-            memmove(f->master + (size_t)y * f->master_stride + to, f->master + (size_t)(y - dyp) * f->master_stride + from, len);
-    } else {
-        for (y = 0; y < h + dyp; y++)
-            memmove(f->master + (size_t)y * f->master_stride + to, f->master + (size_t)(y - dyp) * f->master_stride + from, len);
+    uint8_t* buf[2];
+    int k;
+    buf[0] = f->master;
+    buf[1] = f->fx_on ? f->fxm : NULL;   /* the effects move with the picture */
+    for (k = 0; k < 2 && buf[k]; k++) {
+        uint8_t* b = buf[k];
+        if (dyp > 0) {
+            for (y = h - 1; y >= dyp; y--)
+                memmove(b + (size_t)y * f->master_stride + to, b + (size_t)(y - dyp) * f->master_stride + from, len);
+        } else {
+            for (y = 0; y < h + dyp; y++)
+                memmove(b + (size_t)y * f->master_stride + to, b + (size_t)(y - dyp) * f->master_stride + from, len);
+        }
     }
     if (dx > 0) master_mark(f, m, f->mx0, f->my0, f->mx0 + dx, my1);
     if (dx < 0) master_mark(f, m, mx1 + dx, f->my0, mx1, my1);
@@ -950,6 +967,29 @@ static void view_to_buffer(const fa_cdg_surface* f, fa_rects* area, int x0, int 
                  (int)f->lay.pic_x + (x1 - cx) * n, (int)f->lay.pic_y + (y1 - cy) * n);
 }
 
+/* The effects to draw with presentation scaling, into `plan`, with their buffers
+ * ready; 0 when there are none (or no memory for them: drawn without). */
+static int fx_ready(fa_cdg_surface* f, fa_fx_plan* plan)
+{
+    float n = (float)f->sc.n;
+    size_t need;
+    if (!f->has_fx ||
+        !fa_fx_plan_make(plan, &f->fx, 1.5f * n, 2.0f * n, 2.0f * n, n, out_format(f) == FA_CDG_PIXELS_RGBA32))
+        return 0;
+    if (!f->fxm) {
+        f->fxm = (uint8_t*)malloc(f->master_stride * (size_t)f->mh * f->sc.n);
+        if (!f->fxm) return 0;
+    }
+    need = fa_fx_scratch_bytes(plan);
+    if (need > f->fx_scratch_size) {
+        free(f->fx_scratch);
+        f->fx_scratch = malloc(need);
+        f->fx_scratch_size = f->fx_scratch ? need : 0;
+        if (!f->fx_scratch) return 0;
+    }
+    return 1;
+}
+
 /* advance() with presentation scaling: the master is brought up to the decoder state
  * (moved for scrolls, the changed areas and what they reach drawn again) and `area`
  * gets the buffer pixels that changed. */
@@ -957,12 +997,17 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
 {
     cdg_state* st = &f->st;
     uint8_t pm[CDG_SCALE_COLORS][4];
-    fa_rects m;
+    fa_rects m, e;
+    fa_fx_plan plan;
     int tb = f->tb && !st->hoff && !st->voff, i, y;
-    int moved = st->shift_x || st->shift_y, full, view_full;
+    int moved = st->shift_x || st->shift_y, full, view_full, fx = fx_ready(f, &plan);
+    /* The effects see the crop, or with smooth-scroll offsets everything they can show. */
+    int wide = st->hoff || st->voff;
     scaled_palette(f, pal, pm);
     full = !f->drawn || memcmp(pm, f->master_pm, sizeof(pm)) != 0 || abs(st->shift_x) >= f->mw ||
-           abs(st->shift_y) >= f->mh;
+           abs(st->shift_y) >= f->mh || fx != f->fx_on || (fx && wide != f->fx_wide);
+    f->fx_on = fx;
+    f->fx_wide = wide;
     fa_rects_clear(&m);
     if (full) {
         fa_rects_add(&m, f->mx0, f->my0, f->mx0 + f->mw, f->my0 + f->mh);
@@ -991,6 +1036,30 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
     }
     f->master_tb = tb;
     memcpy(f->master_pm, pm, sizeof(pm));
+    if (fx) {
+        /* The effects of what changed, as far as they reach; after a move also along
+         * the edges, where what reached in from outside the master has gone. */
+        int n = (int)f->sc.n, rc = (plan.reach + n - 1) / n + 1;
+        int mx1 = f->mx0 + (wide ? f->mw : (int)f->win_w), my1 = f->my0 + (wide ? f->mh : (int)f->win_h);
+        fa_rects_clear(&e);
+        for (i = 0; i < m.n; i++) master_add(f, &e, m.r[i][0] - rc, m.r[i][1] - rc, m.r[i][2] + rc, m.r[i][3] + rc);
+        if (moved && !full) {
+            int bx = rc + abs(st->shift_x), by = rc + abs(st->shift_y);
+            if (st->shift_x) {
+                master_add(f, &e, f->mx0, f->my0, f->mx0 + bx, my1);
+                master_add(f, &e, mx1 - bx, f->my0, mx1, my1);
+            }
+            if (st->shift_y) {
+                master_add(f, &e, f->mx0, f->my0, mx1, f->my0 + by);
+                master_add(f, &e, f->mx0, my1 - by, mx1, my1);
+            }
+        }
+        for (i = 0; i < e.n; i++)
+            fa_fx_render(&plan, f->master, f->master_stride, (mx1 - f->mx0) * n, (my1 - f->my0) * n, f->fxm, f->master_stride,
+                         (e.r[i][0] - f->mx0) * n, (e.r[i][1] - f->my0) * n, (e.r[i][2] - f->mx0) * n,
+                         (e.r[i][3] - f->my0) * n, f->fx_scratch);
+        m = e;                    /* what changed in what is shown */
+    }
     /* A move or new offsets change where everything is shown. */
     view_full = full || moved || st->hoff != f->shown_hoff || st->voff != f->shown_voff;
     if (view_full) {
@@ -1040,7 +1109,7 @@ static void copy_out(const fa_cdg_surface* f, uint8_t* dst, int32_t stride, cons
             if (!shifted && zero_border) { memset(row + (size_t)sa * 4, 0, (size_t)(sb - sa) * 4); continue; }
             col = (sa - (int)l->pic_x) + ((int)f->win_x - f->mx0) * n;
             if (shifted) { sy += f->st.voff; col += f->st.hoff * n; }
-            src = f->master + (size_t)((sy - f->my0) * n + sub) * f->master_stride + (size_t)col * 4;
+            src = (f->fx_on ? f->fxm : f->master) + (size_t)((sy - f->my0) * n + sub) * f->master_stride + (size_t)col * 4;
             memcpy(row + (size_t)sa * 4, src, (size_t)(sb - sa) * 4);
         }
     }
@@ -1317,6 +1386,12 @@ static void free_maps(fa_cdg_surface* f)
     free(f->ylerp);
     free(f->master);
     free(f->rows);
+    free(f->fxm);
+    free(f->fx_scratch);
+    f->fxm = NULL;
+    f->fx_scratch = NULL;
+    f->fx_scratch_size = 0;
+    f->fx_on = 0;
     f->xmap = f->ymap = NULL;
     f->xlerp = f->ylerp = NULL;
     f->master = NULL;
@@ -2454,6 +2529,65 @@ FA_API fa_result FA_CALL fa_cdg_surface_set_presentation(fa_surface* surface, co
     surface->drawn = 0;   /* drawn again in full; a new layout too when it changes */
     ra_forget(surface);   /* and shown at once, not after a worker's frame */
     fa_mutex_unlock(&surface->work_lock);
+    return FA_OK;
+}
+
+FA_API void FA_CALL fa_surface_effects_init(fa_surface_effects* effects)
+{
+    if (!effects) return;
+    memset(effects, 0, sizeof(*effects));
+    effects->struct_size = (uint32_t)sizeof(*effects);
+    effects->outline.color = effects->outline.sung_color = 0xFF000000u;
+    effects->outline.opacity = 1.0f;
+    effects->outline.size = 0.5f;
+    effects->shadow.color = effects->shadow.sung_color = 0xFF000000u;
+    effects->shadow.opacity = 0.6f;
+    effects->shadow.distance = 0.5f;
+    effects->shadow.angle_degrees = 315.0f;
+    effects->bevel.highlight = 0x80FFFFFFu;
+    effects->bevel.shade = 0x80000000u;
+    effects->bevel.strength = 0.5f;
+    effects->bevel.size = 0.5f;
+    effects->bevel.light_angle_degrees = 135.0f;
+    effects->bevel.fade = 0.5f;
+}
+
+FA_API fa_result FA_CALL fa_surface_set_effects(fa_surface* surface, const fa_surface_effects* effects)
+{
+    fa_surface_effects e;
+    if (!surface) return FA_ERROR_INVALID_ARG;
+    memset(&e, 0, sizeof(e));
+    if (effects) {
+        if (effects->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+        fa_surface_effects_init(&e);
+        memcpy(&e, effects, effects->struct_size < sizeof(e) ? effects->struct_size : sizeof(e));
+        e.struct_size = (uint32_t)sizeof(e);
+        if (!fa_fx_valid(&e)) return FA_ERROR_INVALID_ARG;
+    }
+    fa_mutex_lock(&surface->work_lock);
+    surface->has_fx = effects != NULL;
+    if (effects) surface->fx = e;
+    surface->drawn = 0;   /* drawn again in full */
+    ra_forget(surface);
+    fa_mutex_unlock(&surface->work_lock);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_surface_get_effects(fa_surface* surface, fa_surface_effects* out_effects)
+{
+    fa_surface_effects e;
+    uint32_t size;
+    if (!surface || !out_effects || out_effects->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&surface->work_lock);
+    if (surface->has_fx) {
+        e = surface->fx;
+    } else {
+        fa_surface_effects_init(&e);
+    }
+    fa_mutex_unlock(&surface->work_lock);
+    size = out_effects->struct_size < sizeof(e) ? out_effects->struct_size : (uint32_t)sizeof(e);
+    e.struct_size = size;
+    memcpy(out_effects, &e, size);
     return FA_OK;
 }
 

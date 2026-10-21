@@ -97,6 +97,7 @@ set(FA_SOURCES
     src/cdg.c
     src/cdg_scale.c
     src/surface.c
+    src/surface_fx.c
     src/zip.c
     src/tempo.c
     src/resample.c

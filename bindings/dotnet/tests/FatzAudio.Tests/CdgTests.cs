@@ -391,4 +391,48 @@ public class CdgTests
         cdg.Presentation = null;
         Assert.Equal(300, cdg.GetLayout().Width);
     }
+
+    [Fact]
+    public void Effects_OutlineAroundTheShapeAndValidation()
+    {
+        using var engine = CreateHeadless();
+        using var song = engine.OpenMemory(TestAudio.SineWav(), DecodeOnly);
+        var tile = new byte[16];
+        tile[0] = 1; tile[1] = 2; tile[2] = 4; tile[3] = 4;
+        for (int i = 4; i < 16; i++) tile[i] = 0x01;              // a green line at screen x = 29, y 48..59
+        song.LoadCdg([.. SimpleCdg(), .. Pack(6, tile)]);
+        using var cdg = song.CreateCdgSurface();
+        Assert.Null(cdg.Effects);
+        cdg.Presentation = new CdgPresentation { Scale = true, SafetyZone = SafetyZone.Remove };
+        cdg.PresentationSize = new PixelSize(1920, 1080);
+        var layout = cdg.GetLayout();
+        int stride = layout.Width * 4;
+        var buffer = new byte[stride * layout.Height];
+        int x = layout.Content.X + (30 - 6) * 6 + 1, y = layout.Content.Y + (52 - 12) * 6 + 3;   // just right of the line
+
+        cdg.UpdateInto(buffer, stride, layout.Width, layout.Height, 0, AfterPacks(4));
+        Assert.Equal(new byte[] { 0, 0, 0, 0 }, buffer.AsSpan(y * stride + x * 4, 4).ToArray());
+
+        var effects = new SurfaceEffects { Outline = new OutlineEffect { Color = new CdgColor(0, 0, 255, 255), Size = 1 } };
+        cdg.Effects = effects;
+        Assert.Same(effects, cdg.Effects);
+        var update = cdg.UpdateInto(buffer, stride, layout.Width, layout.Height, 0, AfterPacks(4));
+        Assert.True(update.IsFullDraw);
+        Assert.Equal(new byte[] { 255, 0, 0, 255 }, buffer.AsSpan(y * stride + x * 4, 4).ToArray());   // blue, B G R A
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => cdg.Effects = new SurfaceEffects { Outline = new OutlineEffect { Size = 1.5f } });
+        Assert.Throws<ArgumentOutOfRangeException>(() => cdg.Effects = new SurfaceEffects { Shadow = new ShadowEffect { Opacity = float.NaN } });
+        Assert.Throws<ArgumentOutOfRangeException>(() => cdg.Effects = new SurfaceEffects { Bevel = new BevelEffect { LightAngleDegrees = float.PositiveInfinity } });
+        Assert.Same(effects, cdg.Effects);
+        cdg.Effects = new SurfaceEffects
+        {
+            Shadow = new ShadowEffect { Size = 1, Fade = 1 },
+            Outline = new OutlineEffect(),
+            Bevel = new BevelEffect(),
+        };
+        cdg.Effects = null;
+        Assert.Null(cdg.Effects);
+        cdg.UpdateInto(buffer, stride, layout.Width, layout.Height, 0, AfterPacks(4));
+        Assert.Equal(new byte[] { 0, 0, 0, 0 }, buffer.AsSpan(y * stride + x * 4, 4).ToArray());
+    }
 }

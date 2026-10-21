@@ -522,9 +522,14 @@ pre-pass, padding, presentation scaling with the margin, the master bitmap with 
 offsets as copies, smoothness 0-4, edge blend, the transparent border) and the first measured table
 (docs/features/cdg.md). 2b: render-ahead on the engine's workers: two output-sized slots, a worker renders
 the frame for the time the next call is expected at, `update_into` copies from the newest finished frame not
-ahead of its time and never waits (only the first frame after a layout or option change is drawn on the
-caller's thread); `behind` allows 1/60 s, since frames rendered for a predicted time are usually a pack or
-two older than the time asked for.
+ahead of its time and never waits (when no worker is busy and no finished frame fits, such as the first frame
+after a layout or option change, a seek, or a frame more than 1/60 s late, it draws one on the caller's
+thread); `behind` allows 1/60 s, since frames rendered for a predicted time are usually a pack or two older
+than the time asked for. Step 3: the effects (section 4) on CD+G, as specified, with the effects redrawn
+incrementally around changed tiles and moved with scrolls, and their cost added to the measured table
+(a full redraw with outline and shadow is about 28 ms at 1080p and 115 ms at 2160p, so render-ahead is
+recommended with effects at 2160p). Not in step 3: section 3.3 (the 2x internal pass at N 1-3 and the bevel
+limited to half a stroke's width), moved to step 6, which needs the same 2x path for contours.
 
 ## 11. Questions, answered by MediaControl (2026-10-20)
 

@@ -1583,6 +1583,69 @@ FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* surface, fa_time tim
                                                 uint32_t dst_width, uint32_t dst_height, uint64_t dst_revision,
                                                 fa_surface_frame* out_frame);
 
+/* ---- Surface effects -----------------------------------------------------
+ *
+ * Outline, shadow and bevel around what a surface draws, from one distance field of
+ * its shape: a true stroke (round, even, any width), a soft or hard shadow of the
+ * shape and its outline, and a bevel lit from one side. Drawn shadow first, then the
+ * outline, the shape, and the bevel over it, all premultiplied against transparent.
+ *
+ * CD+G: the shape is every pixel that is not the background (or transparent), and the
+ * effects apply with presentation scaling on (fa_cdg_presentation.scale); the classic
+ * picture ignores them. Effects reaching past the edge of the picture are cut there.
+ * Sizes and distances run 0..1, 1 the maximum, in units of the surface:
+ *
+ *                outline size   shadow size   shadow distance   bevel size
+ *     CD+G       1.5 px         2 px          2 px              1 px     (CD+G pixels)
+ *     lyrics     0.12 em        0.20 em       0.15 em           0.08 em
+ *
+ * Colours are 0xAARRGGBB (straight alpha) and `opacity` multiplies their alpha.
+ * `fade` 0..1 is the part of the size that eases out to nothing: 0 a hard edge, 1 a
+ * glow. Angles are in degrees, counter-clockwise from the right (315 = down right).
+ * `sung_color` is for lyrics; CD+G ignores it. */
+
+typedef struct fa_fx_outline {
+    int32_t on;
+    uint32_t color, sung_color;
+    float opacity, size, fade;
+} fa_fx_outline;
+
+typedef struct fa_fx_shadow {
+    int32_t on;
+    uint32_t color, sung_color;
+    float opacity;
+    float size;                        /* how far it spreads beyond the shape and outline */
+    float distance, angle_degrees;     /* where it falls */
+    float fade;
+} fa_fx_shadow;
+
+typedef struct fa_fx_bevel {
+    int32_t on;
+    uint32_t highlight, shade;         /* the sides facing the light, and away from it */
+    float strength;                    /* 0..1 */
+    float size;                        /* how far in from the edge */
+    float light_angle_degrees;         /* where the light comes from */
+    float fade;
+} fa_fx_bevel;
+
+typedef struct fa_surface_effects {
+    uint32_t struct_size;              /* sizeof(fa_surface_effects) */
+    fa_fx_shadow shadow;
+    fa_fx_outline outline;
+    fa_fx_bevel bevel;
+} fa_surface_effects;
+
+/* All off, with these values ready for when they are turned on: outline black, size
+ * 0.5; shadow black at 60 %, distance 0.5 at 315 degrees, size 0; bevel white and
+ * black at 50 %, strength 0.5, size 0.5, light from 135 degrees, fade 0.5. */
+FA_API void FA_CALL fa_surface_effects_init(fa_surface_effects* effects);
+/* Sets the effects (NULL = none, the default). FA_ERROR_INVALID_ARG for values out
+ * of range (on not 0/1, opacity, size, distance, strength or fade outside 0..1, an
+ * angle that is not finite). The next frame is drawn again in full. */
+FA_API fa_result FA_CALL fa_surface_set_effects(fa_surface* surface, const fa_surface_effects* effects);
+/* The effects in use (all off when none were set), up to out_effects->struct_size. */
+FA_API fa_result FA_CALL fa_surface_get_effects(fa_surface* surface, fa_surface_effects* out_effects);
+
 /* ---- CD+G presentation options ------------------------------------------
  *
  * How a CD+G surface presents the picture, on top of its fa_cdg_surface_config. A
