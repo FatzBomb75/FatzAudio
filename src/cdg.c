@@ -17,6 +17,7 @@
  * millisecond. Updates run on the caller's thread under the stream's cdg_lock; the
  * audio thread never sees any of it. */
 #include "cdg.h"
+#include "surface.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,7 +66,7 @@ typedef struct cdg_state {
     int8_t repeat;                /* repeat count of the last memory preset */
     size_t preset_at;             /* pack index of the last memory preset */
     size_t next;                  /* packs applied so far */
-    int dx0, dy0, dx1, dy1;       /* screen area changed since the last render; empty if dx0 >= dx1 */
+    fa_rects dirty;               /* screen area changed since the last render */
 } cdg_state;
 
 /* A saved cdg_state: colour indices are 4 bits, so two share a byte (the left one in
@@ -99,10 +100,16 @@ struct fa_cdg_surface {
     uint32_t flags;
     uint32_t width, height;       /* output */
     uint32_t win_x, win_y, win_w, win_h; /* the part of the screen shown */
-    uint8_t* pixels;
-    int32_t stride;
+    uint8_t* pixels;              /* fa_cdg_surface_update's picture; made by its first call */
+    int32_t stride;               /* of a row of pixels, and the least update_into takes */
+    uint64_t pixels_revision;     /* the revision `pixels` holds (0 = none) */
+    uint8_t pixels_palette[16][4]; /* the palette of fa_cdg_surface_update's last frame */
+    int pixels_drawn;
+    fa_surface_history history;   /* the output area each recent revision changed */
+    uint32_t present_w, present_h; /* fa_surface_set_presentation_size */
+    int render_ahead;
     uint32_t gen;                 /* stream->cdg_gen the state belongs to */
-    int drawn;                    /* the pixels hold a whole picture */
+    int drawn;                    /* a revision exists: the state was turned into pixels once */
     uint8_t shown_palette[16][4]; /* as of the last render */
     uint8_t shown_transparency[16];
     int shown_bg, shown_border;
@@ -231,14 +238,7 @@ fa_cdg_data* fa_cdg_find_sibling(const char* audio_path)
 
 /* ---- the pack decoder ------------------------------------------------------------ */
 
-static void mark(cdg_state* st, int x0, int y0, int x1, int y1)
-{
-    if (st->dx0 >= st->dx1) { st->dx0 = x0; st->dy0 = y0; st->dx1 = x1; st->dy1 = y1; return; }
-    if (x0 < st->dx0) st->dx0 = x0;
-    if (y0 < st->dy0) st->dy0 = y0;
-    if (x1 > st->dx1) st->dx1 = x1;
-    if (y1 > st->dy1) st->dy1 = y1;
-}
+static void mark(cdg_state* st, int x0, int y0, int x1, int y1) { fa_rects_add(&st->dirty, x0, y0, x1, y1); }
 
 static void mark_all(cdg_state* st) { mark(st, 0, 0, FA_CDG_WIDTH, FA_CDG_HEIGHT); }
 
@@ -436,7 +436,7 @@ static void checkpoint_load(const cdg_checkpoint* c, cdg_state* st)
     st->repeat = c->repeat;
     st->preset_at = c->preset_at;
     st->next = c->next;
-    st->dx0 = st->dy0 = st->dx1 = st->dy1 = 0;
+    fa_rects_clear(&st->dirty);
 }
 
 static void index_free(struct fa_cdg_index* ix)
@@ -475,7 +475,7 @@ static void index_advance(struct fa_cdg_index* ix, const fa_cdg_data* d, size_t 
         apply_pack(st, d->packs + st->next * FA_CDG_PACK_BYTES);
         st->next++;
         if (st->next % ix->step == 0 && st->next / ix->step == ix->count + 1 && ix->count < ix->cap) {
-            st->dx0 = st->dy0 = st->dx1 = st->dy1 = 0;
+            fa_rects_clear(&st->dirty);
             checkpoint_save(&ix->at[ix->count++], st);
         }
     }
@@ -595,7 +595,8 @@ static uint32_t lerp_map(uint32_t o, uint32_t n, uint32_t w)
     return p << 8 | t;
 }
 
-static void render_rect(fa_cdg_surface* f, const uint8_t pal[16][4], uint32_t ox0, uint32_t oy0, uint32_t ox1, uint32_t oy1)
+static void render_rect(const fa_cdg_surface* f, const uint8_t pal[16][4], uint8_t* dst, int32_t stride,
+                        uint32_t ox0, uint32_t oy0, uint32_t ox1, uint32_t oy1)
 {
     uint32_t pm[16][4];   /* premultiplied palette */
     uint32_t ox, oy, i, cy0 = UINT32_MAX, cy1 = UINT32_MAX;
@@ -609,7 +610,7 @@ static void render_rect(fa_cdg_surface* f, const uint8_t pal[16][4], uint32_t ox
         pm[i][2] = (pal[i][2] * pm[i][3] + 127) / 255;
     }
     for (oy = oy0; oy < oy1; oy++) {
-        uint8_t* row = f->pixels + (size_t)oy * (size_t)f->stride;
+        uint8_t* row = dst + (size_t)oy * (size_t)stride;
         if (f->format == FA_CDG_PIXELS_INDEXED8) {
             for (ox = ox0; ox < ox1; ox++) row[ox] = window_index(f, f->xmap[ox], f->ymap[oy]);
         } else if (!(f->flags & FA_CDG_SMOOTH) || (f->width == f->win_w && f->height == f->win_h)) {
@@ -664,51 +665,112 @@ static void render_rect(fa_cdg_surface* f, const uint8_t pal[16][4], uint32_t ox
     }
 }
 
-/* Draws what changed since the last render; fills the frame's dirty rectangle. */
-static void render(fa_cdg_surface* f, fa_cdg_frame* out)
+/* Brings the surface's picture up to the decoder state: works out the output pixels
+ * that changed since the last call (all of them when the colours of a colour format,
+ * the smooth-scroll offsets or nothing yet was drawn), and when any did, takes the
+ * next revision and records the area in the history. `pal` gets the colours to draw
+ * with. Draws nothing: draw() does, into whichever buffer. */
+static void advance(fa_cdg_surface* f, uint8_t pal[16][4])
 {
     cdg_state* st = &f->st;
-    uint8_t pal[16][4];
-    uint32_t ox0 = 0, oy0 = 0, ox1 = 0, oy1 = 0;
-    int palette_changed, full;
+    fa_rects area;
+    int palette_changed, full, i, bg, border;
     palette_rgba(f, pal);
-    palette_changed = !f->drawn || memcmp(pal, f->shown_palette, sizeof(pal)) != 0;
+    palette_changed = !f->drawn || memcmp(pal, f->shown_palette, 16 * 4) != 0;
     /* Indexed pixels do not depend on the palette; colour pixels do. Smooth-scroll
-     * offsets move the whole picture area. */
+     * offsets move the whole picture area; so does a scroll while they are set
+     * (rare: redraw all rather than map the shift). */
     full = !f->drawn || st->hoff != f->shown_hoff || st->voff != f->shown_voff ||
-           (palette_changed && f->format != FA_CDG_PIXELS_INDEXED8);
-    if (!full && st->dx0 < st->dx1) {
-        int64_t x0, y0, x1, y1;
-        if (st->hoff || st->voff) {
-            full = 1; /* rare (only while a scroll runs): redraw all rather than map the shift */
-        } else {
-            int pad = (f->flags & FA_CDG_SMOOTH) && f->format != FA_CDG_PIXELS_INDEXED8 ? 1 : 0;
-            x0 = (int64_t)st->dx0 - f->win_x - pad;
-            y0 = (int64_t)st->dy0 - f->win_y - pad;
-            x1 = (int64_t)st->dx1 - f->win_x + pad;
-            y1 = (int64_t)st->dy1 - f->win_y + pad;
+           (palette_changed && f->format != FA_CDG_PIXELS_INDEXED8) || (st->dirty.n && (st->hoff || st->voff));
+    fa_rects_clear(&area);
+    if (full) {
+        fa_rects_add(&area, 0, 0, (int)f->width, (int)f->height);
+    } else {
+        int pad = (f->flags & FA_CDG_SMOOTH) && f->format != FA_CDG_PIXELS_INDEXED8 ? 1 : 0;
+        for (i = 0; i < st->dirty.n; i++) {
+            const int* d = st->dirty.r[i];
+            int64_t x0 = (int64_t)d[0] - f->win_x - pad, y0 = (int64_t)d[1] - f->win_y - pad;
+            int64_t x1 = (int64_t)d[2] - f->win_x + pad, y1 = (int64_t)d[3] - f->win_y + pad;
+            uint32_t ox0, oy0, ox1, oy1;
             if (x0 < 0) x0 = 0;
             if (y0 < 0) y0 = 0;
             if (x1 > (int64_t)f->win_w) x1 = f->win_w;
             if (y1 > (int64_t)f->win_h) y1 = f->win_h;
-            if (x0 < x1 && y0 < y1) {
-                /* Output pixels whose source lies in the window rectangle (a superset). */
-                ox0 = (uint32_t)(x0 * f->width / f->win_w);
-                oy0 = (uint32_t)(y0 * f->height / f->win_h);
-                ox1 = (uint32_t)((x1 * f->width + f->win_w - 1) / f->win_w);
-                oy1 = (uint32_t)((y1 * f->height + f->win_h - 1) / f->win_h);
-                if (ox1 > f->width) ox1 = f->width;
-                if (oy1 > f->height) oy1 = f->height;
-            }
+            if (x0 >= x1 || y0 >= y1) continue;
+            /* Output pixels whose source lies in the window rectangle (a superset). */
+            ox0 = (uint32_t)(x0 * f->width / f->win_w);
+            oy0 = (uint32_t)(y0 * f->height / f->win_h);
+            ox1 = (uint32_t)((x1 * f->width + f->win_w - 1) / f->win_w);
+            oy1 = (uint32_t)((y1 * f->height + f->win_h - 1) / f->win_h);
+            if (ox1 > f->width) ox1 = f->width;
+            if (oy1 > f->height) oy1 = f->height;
+            fa_rects_add(&area, (int)ox0, (int)oy0, (int)ox1, (int)oy1);
         }
     }
-    if (full) { ox0 = oy0 = 0; ox1 = f->width; oy1 = f->height; }
-    if (ox0 < ox1 && oy0 < oy1) render_rect(f, pal, ox0, oy0, ox1, oy1);
+    fa_rects_clear(&st->dirty);
     f->drawn = 1;
     f->shown_hoff = st->hoff;
     f->shown_voff = st->voff;
-    memcpy(f->shown_palette, pal, sizeof(pal));
-    st->dx0 = st->dy0 = st->dx1 = st->dy1 = 0;
+    if (area.n) {
+        f->revision++;
+        fa_history_push(&f->history, f->revision, &area);
+    }
+    bg = st->preset ? st->bg : -1;
+    border = st->border;
+    if (palette_changed || bg != f->shown_bg || border != f->shown_border ||
+        memcmp(st->transparency, f->shown_transparency, sizeof(st->transparency)) != 0)
+        f->palette_revision++;
+    memcpy(f->shown_palette, pal, 16 * 4);
+    f->shown_bg = bg;
+    f->shown_border = border;
+    memcpy(f->shown_transparency, st->transparency, sizeof(st->transparency));
+}
+
+/* Draws into `dst`, which holds the picture of revision `since` (0 = unknown): the
+ * area changed since then, or everything. `drawn` gets what was drawn; returns 0
+ * for a full draw. */
+static int draw(const fa_cdg_surface* f, const uint8_t pal[16][4], uint8_t* dst, int32_t stride, uint64_t since,
+                fa_rects* drawn)
+{
+    int i, partial = fa_history_since(&f->history, f->revision, since, drawn);
+    if (!partial) {
+        fa_rects_clear(drawn);
+        fa_rects_add(drawn, 0, 0, (int)f->width, (int)f->height);
+    }
+    for (i = 0; i < drawn->n; i++)
+        render_rect(f, pal, dst, stride, (uint32_t)drawn->r[i][0], (uint32_t)drawn->r[i][1],
+                    (uint32_t)drawn->r[i][2], (uint32_t)drawn->r[i][3]);
+    return partial;
+}
+
+/* The decoder's state for a frame. */
+static void frame_state(const fa_cdg_surface* f, const uint8_t pal[16][4], int32_t* bg, int32_t* border,
+                        uint8_t background[4], uint8_t transparency[16])
+{
+    *bg = f->st.preset ? f->st.bg : -1;
+    *border = f->st.border;
+    memcpy(transparency, f->st.transparency, 16);
+    if (f->st.preset) memcpy(background, pal[f->st.bg], 4);
+    else memset(background, 0, 4);
+}
+
+/* fa_cdg_surface_update: the surface's own pixels, up to date. */
+static fa_result render(fa_cdg_surface* f, fa_cdg_frame* out)
+{
+    uint8_t pal[16][4];
+    fa_rects drawn;
+    int b[4], palette_changed;
+    if (!f->pixels) {
+        f->pixels = (uint8_t*)calloc((size_t)f->height, (size_t)f->stride);
+        if (!f->pixels) return FA_ERROR_OUT_OF_MEMORY;
+    }
+    advance(f, pal);
+    draw(f, pal, f->pixels, f->stride, f->pixels_revision, &drawn);
+    f->pixels_revision = f->revision;
+    palette_changed = !f->pixels_drawn || memcmp(pal, f->pixels_palette, sizeof(pal)) != 0;
+    f->pixels_drawn = 1;
+    memcpy(f->pixels_palette, pal, sizeof(pal));
+    fa_rects_bounds(&drawn, b);
 
     out->pixels = f->pixels;
     out->width = f->width;
@@ -716,28 +778,16 @@ static void render(fa_cdg_surface* f, fa_cdg_frame* out)
     out->stride = f->stride;
     out->pixel_format = f->format;
     out->palette_changed = palette_changed;
-    out->changed = (ox0 < ox1 && oy0 < oy1) || palette_changed;
-    if (ox0 < ox1 && oy0 < oy1) {
-        out->dirty_x = ox0; out->dirty_y = oy0; out->dirty_width = ox1 - ox0; out->dirty_height = oy1 - oy0;
-    } else {
-        out->dirty_x = out->dirty_y = out->dirty_width = out->dirty_height = 0;
-    }
+    out->changed = drawn.n > 0 || palette_changed;
+    out->dirty_x = (uint32_t)b[0];
+    out->dirty_y = (uint32_t)b[1];
+    out->dirty_width = (uint32_t)(b[2] - b[0]);
+    out->dirty_height = (uint32_t)(b[3] - b[1]);
     memcpy(out->palette, pal, sizeof(pal));
-
-    out->background_index = st->preset ? st->bg : -1;
-    out->border_index = st->border;
-    memcpy(out->transparency, st->transparency, sizeof(out->transparency));
-    if (st->preset) memcpy(out->background, pal[st->bg], 4);
-    else memset(out->background, 0, 4);
-    if (out->dirty_width) f->revision++;
-    if (palette_changed || out->background_index != f->shown_bg || out->border_index != f->shown_border ||
-        memcmp(st->transparency, f->shown_transparency, sizeof(st->transparency)) != 0)
-        f->palette_revision++;
-    f->shown_bg = out->background_index;
-    f->shown_border = out->border_index;
-    memcpy(f->shown_transparency, st->transparency, sizeof(st->transparency));
+    frame_state(f, pal, &out->background_index, &out->border_index, out->background, out->transparency);
     out->revision = f->revision;
     out->palette_revision = f->palette_revision;
+    return FA_OK;
 }
 
 /* ---- the public API ------------------------------------------------------------------ */
@@ -974,10 +1024,9 @@ FA_API fa_result FA_CALL fa_cdg_surface_create(fa_stream* stream, const fa_cdg_s
     f->height = c.height ? c.height : f->win_h;
     bpp = f->format == FA_CDG_PIXELS_INDEXED8 ? 1 : 4;
     f->stride = (int32_t)(f->width * bpp);
-    f->pixels = (uint8_t*)calloc((size_t)f->height, (size_t)f->stride);
     f->xmap = (uint16_t*)malloc(f->width * sizeof(uint16_t));
     f->ymap = (uint16_t*)malloc(f->height * sizeof(uint16_t));
-    if (!f->pixels || !f->xmap || !f->ymap) { surface_free(f); return FA_ERROR_OUT_OF_MEMORY; }
+    if (!f->xmap || !f->ymap) { surface_free(f); return FA_ERROR_OUT_OF_MEMORY; }
     for (i = 0; i < f->width; i++) f->xmap[i] = (uint16_t)((uint64_t)i * f->win_w / f->width);
     for (i = 0; i < f->height; i++) f->ymap[i] = (uint16_t)((uint64_t)i * f->win_h / f->height);
     if (f->flags & FA_CDG_SMOOTH) {
@@ -1032,7 +1081,8 @@ static size_t packs_at(fa_time time, size_t count)
 static void restore(fa_cdg_surface* f, const cdg_checkpoint* from)
 {
     cdg_state* st = &f->st;
-    int x0 = st->dx0, y0 = st->dy0, x1 = st->dx1, y1 = st->dy1, y;
+    fa_rects keep = st->dirty;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0, y;
     uint8_t b[FA_CDG_WIDTH];
     if (!from) memset(b, 0, sizeof(b));
     for (y = 0; y < FA_CDG_HEIGHT; y++) {
@@ -1049,7 +1099,7 @@ static void restore(fa_cdg_surface* f, const cdg_checkpoint* from)
         if (y + 1 > y1) y1 = y + 1;
     }
     if (from) checkpoint_load(from, st); else state_reset(st);
-    st->dx0 = st->dy0 = st->dx1 = st->dy1 = 0;
+    st->dirty = keep;
     if (x0 < x1) mark(st, x0, y0, x1, y1);
 }
 
@@ -1087,8 +1137,9 @@ static fa_time graphics_time(struct fa_stream* s, fa_time time)
     return time - offset;
 }
 
-/* `s` is the surface's stream, held by the caller. */
-static fa_result surface_update(fa_cdg_surface* f, struct fa_stream* s, fa_time time, fa_cdg_frame* out)
+/* Brings the surface's decoder to `time` on the stream's timeline; returns the
+ * graphics time. `s` is the surface's stream, held by the caller. */
+static fa_time sync_state(fa_cdg_surface* f, struct fa_stream* s, fa_time time)
 {
     size_t target;
     fa_mutex_lock(&s->cdg_lock);
@@ -1108,10 +1159,17 @@ static fa_result surface_update(fa_cdg_surface* f, struct fa_stream* s, fa_time 
     target = s->cdg ? packs_at(time, s->cdg->count) : 0;
     decode_to(f, s->cdg, target);
     fa_mutex_unlock(&s->cdg_lock);
+    return time;
+}
+
+static fa_result surface_update(fa_cdg_surface* f, struct fa_stream* s, fa_time time, fa_cdg_frame* out)
+{
+    fa_result r;
+    time = sync_state(f, s, time);
     /* Drawing uses only this surface's state: other surfaces and loads need not wait. */
-    render(f, out);
+    r = render(f, out);
     out->time = time;
-    return FA_OK;
+    return r;
 }
 
 /* ---- change events ---------------------------------------------------------------- */
@@ -1287,4 +1345,99 @@ FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_ti
     r = surface_update(surface, s, time, out_frame);
     stream_release(s);
     return r;
+}
+
+/* ---- fa_surface ----------------------------------------------------------------- */
+
+FA_API void FA_CALL fa_surface_destroy(fa_surface* surface) { fa_cdg_surface_destroy(surface); }
+
+FA_API fa_result FA_CALL fa_surface_set_presentation_size(fa_surface* surface, uint32_t width, uint32_t height)
+{
+    fa_result r;
+    if (!surface) return FA_ERROR_INVALID_ARG;
+    r = fa_presentation_size_clamp(&width, &height);
+    if (r != FA_OK) return r;
+    /* The classic picture keeps its output size; the presentation options use it. */
+    surface->present_w = width;
+    surface->present_h = height;
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_surface_set_render_ahead(fa_surface* surface, int32_t enabled)
+{
+    if (!surface || (enabled != 0 && enabled != 1)) return FA_ERROR_INVALID_ARG;
+    surface->render_ahead = enabled;
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_surface_get_layout(fa_surface* surface, fa_surface_layout* out_layout)
+{
+    fa_surface_layout l;
+    if (!surface || !out_layout || out_layout->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+    memset(&l, 0, sizeof(l));
+    l.struct_size = out_layout->struct_size < sizeof(l) ? out_layout->struct_size : (uint32_t)sizeof(l);
+    l.width = surface->width;
+    l.height = surface->height;
+    l.content_width = surface->width;
+    l.content_height = surface->height;
+    l.scale = 1.0f;
+    l.crop_x = surface->win_x;
+    l.crop_y = surface->win_y;
+    l.crop_width = surface->win_w;
+    l.crop_height = surface->win_h;
+    l.safety_zone = (surface->flags & FA_CDG_NO_BORDER) ? FA_SAFETY_REMOVE : FA_SAFETY_SHOW;
+    l.safety_zone_resolved = 1;
+    l.layout_revision = 1;
+    memcpy(out_layout, &l, l.struct_size);
+    return FA_OK;
+}
+
+static void to_rect(const int r[4], fa_rect* out)
+{
+    out->x = r[0];
+    out->y = r[1];
+    out->width = (uint32_t)(r[2] - r[0]);
+    out->height = (uint32_t)(r[3] - r[1]);
+}
+
+FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* surface, fa_time time, void* dst, int32_t dst_stride,
+                                                uint32_t dst_width, uint32_t dst_height, uint64_t dst_revision,
+                                                fa_surface_frame* out_frame)
+{
+    struct fa_stream* s;
+    fa_surface_frame fr;
+    uint8_t pal[16][4];
+    fa_rects drawn;
+    int64_t start = fa_monotonic_ns(), drawing;
+    int b[4], i, partial;
+    fa_result r = FA_OK;
+    if (!surface || !dst || !out_frame || out_frame->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+    if (dst_width != surface->width || dst_height != surface->height) return FA_ERROR_SIZE_MISMATCH;
+    if (dst_stride < surface->stride) return FA_ERROR_INVALID_ARG;
+    s = surface_hold(surface);
+    if (!s) return FA_ERROR_INVALID_ARG; /* its stream was closed */
+    if (time == FA_SURFACE_NOW) r = fa_stream_get_clock(s, &time);
+    if (r == FA_OK) time = sync_state(surface, s, time);
+    stream_release(s);
+    if (r != FA_OK) return r;
+    advance(surface, pal);
+    drawing = fa_monotonic_ns();
+    partial = draw(surface, pal, (uint8_t*)dst, dst_stride, dst_revision, &drawn);
+    memset(&fr, 0, sizeof(fr));
+    fr.struct_size = out_frame->struct_size < sizeof(fr) ? out_frame->struct_size : (uint32_t)sizeof(fr);
+    fr.revision = surface->revision;
+    fr.base_revision = partial ? dst_revision : 0;
+    fr.layout_revision = 1;
+    fr.dirty_count = (uint32_t)drawn.n;
+    for (i = 0; i < drawn.n; i++) to_rect(drawn.r[i], &fr.dirty[i]);
+    fa_rects_bounds(&drawn, b);
+    to_rect(b, &fr.dirty_bounds);
+    fr.time = time;
+    fr.render_ns = fa_monotonic_ns() - drawing;
+    frame_state(surface, pal, &fr.background_index, &fr.border_index, fr.background, fr.transparency);
+    memcpy(fr.palette, pal, sizeof(pal));
+    fr.palette_revision = surface->palette_revision;
+    fr.draw_ns = fa_monotonic_ns() - start;
+    memcpy(out_frame, &fr, fr.struct_size);
+    return FA_OK;
 }

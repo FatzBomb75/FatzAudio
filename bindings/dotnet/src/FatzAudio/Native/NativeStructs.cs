@@ -275,6 +275,44 @@ internal unsafe struct FaCdgFrame
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaSurfaceLayout
+{
+    public uint StructSize;
+    public uint Width, Height;
+    public int BitmapX, BitmapY;
+    public uint ContentX, ContentY, ContentWidth, ContentHeight;
+    public float Scale;
+    public uint CropX, CropY, CropWidth, CropHeight;
+    public int SafetyZone;
+    public int SafetyZoneResolved;
+    public fixed byte FontUsed[128];
+    public uint Margin, Padding;
+    public ulong LayoutRevision;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaSurfaceFrame
+{
+    public uint StructSize;
+    public ulong Revision;
+    public ulong BaseRevision;
+    public ulong LayoutRevision;
+    public uint DirtyCount;
+    public fixed int Dirty[32];          // fa_rect[8]: x, y, width, height
+    public int BoundsX, BoundsY, BoundsWidth, BoundsHeight;
+    public long Time;
+    public long DrawNs;
+    public long RenderNs;
+    public int Behind;
+    public int BackgroundIndex;
+    public int BorderIndex;
+    public fixed byte Background[4];
+    public fixed byte Palette[64];
+    public fixed byte Transparency[16];
+    public ulong PaletteRevision;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal struct FaCdgInfo
 {
     public int Source;

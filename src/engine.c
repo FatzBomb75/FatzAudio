@@ -28,6 +28,7 @@ FA_API const char* FA_CALL fa_result_string(fa_result result)
     case FA_ERROR_NO_SOUNDFONT: return "no soundfont for MIDI";
     case FA_ERROR_PROTECTED_CONTENT: return "protected content";
     case FA_ERROR_TOO_LARGE: return "too large to unpack in memory";
+    case FA_ERROR_SIZE_MISMATCH: return "the buffer is not the size the surface draws";
     default: return "unknown result";
     }
 }
