@@ -5,7 +5,9 @@
  * dirty rectangles), timing and the audio clock, MP3+G style pairs, ZIP archives
  * and the DEFLATE decoder behind them. Every input is generated here. */
 #include "cdg.h"
+#include "surface.h"
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1997,6 +1999,281 @@ typedef struct race_arg {
     fa_result last;              /* checked on the main thread */
 } race_arg;
 
+/* A song with something of every kind: tiles far apart (several dirty rectangles),
+ * XOR tiles, colour and transparency changes, a border, scrolls and smooth-scroll
+ * offsets, and a second screen clear. */
+static buf busy_cdg(void)
+{
+    static const uint8_t other[8][3] = { { 0, 0, 0 }, { 15, 8, 0 }, { 0, 15, 8 }, { 8, 0, 15 },
+                                         { 15, 15, 0 }, { 4, 4, 4 }, { 0, 9, 9 }, { 9, 0, 9 } };
+    buf c = { 0 };
+    int i;
+    colors(&c, 0, k_low);
+    colors(&c, 1, other);
+    preset(&c, 1, 0);
+    border(&c, 2);
+    for (i = 0; i < 40; i++) tile(&c, i % 5 == 4, i % 16, (i * 7) % 16, (i * 5) % 18, (i * 13) % 50, (uint8_t)(0x15 + i));
+    tile(&c, 0, 3, 4, 0, 0, 0x2A);
+    tile(&c, 0, 4, 3, 17, 49, 0x15);
+    colors(&c, 0, other);
+    transparent(&c, 3, 40);
+    for (i = 0; i < 10; i++) tile(&c, 1, 5, 6, 3 + i, 10 + 3 * i, 0x3F);
+    scroll(&c, 1, 0, 2, 0, 0, 0);
+    scroll(&c, 0, 4, 0, 0, 1, 0);
+    scroll(&c, 0, 0, 0, 3, 0, 5);
+    for (i = 0; i < 6; i++) tile(&c, 0, 7, 8, 8, 20 + i, 0x0F);
+    scroll(&c, 0, 0, 0, 0, 0, 0);
+    colors(&c, 0, k_low);
+    preset(&c, 9, 0);
+    for (i = 0; i < 12; i++) tile(&c, 0, i, 15 - i, 2 + i, 40 - i * 3, 0x33);
+    return c;
+}
+
+/* update_into gives exactly fa_cdg_surface_update's pixels in every configuration,
+ * drawing only what changed into buffers used in rotation (and everything into a
+ * buffer whose frame is too old). Buffers start as garbage, rows have padding. */
+static void test_update_into_matches(void)
+{
+    static const struct { fa_cdg_pixel_format format; uint32_t w, h, flags; } cfgs[] = {
+        { FA_CDG_PIXELS_BGRA32, 0, 0, 0 },
+        { FA_CDG_PIXELS_RGBA32, 600, 432, FA_CDG_TRANSPARENT },
+        { FA_CDG_PIXELS_INDEXED8, 0, 0, 0 },
+        { FA_CDG_PIXELS_INDEXED8, 450, 324, FA_CDG_NO_BORDER },
+        { FA_CDG_PIXELS_BGRA32, 450, 324, FA_CDG_SMOOTH | FA_CDG_TRANSPARENT | FA_CDG_PREMULTIPLIED },
+        { FA_CDG_PIXELS_BGRA32, 576, 384, FA_CDG_SMOOTH | FA_CDG_NO_BORDER | FA_CDG_TRANSPARENT_BACKGROUND_ONLY },
+    };
+    buf c = busy_cdg();
+    size_t packs = c.n / FA_CDG_PACK_BYTES, k, n;
+    unsigned ci;
+    for (ci = 0; ci < sizeof(cfgs) / sizeof(cfgs[0]); ci++) {
+        fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+        fa_cdg_surface *ref = NULL, *into = NULL;
+        fa_cdg_surface_config cfg;
+        fa_surface_layout lay;
+        fa_cdg_frame fr;
+        fa_surface_frame sf;
+        uint8_t* mem[3];
+        uint64_t rev[3] = { 0, 0, 0 };
+        uint32_t bpp, row, y, partial = 0, nbuf;
+        int32_t stride;
+        fa_cdg_surface_config_init(&cfg);
+        cfg.pixel_format = cfgs[ci].format;
+        cfg.width = cfgs[ci].w;
+        cfg.height = cfgs[ci].h;
+        cfg.flags = cfgs[ci].flags;
+        CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+        CHECK_EQ(fa_cdg_surface_create(s, &cfg, &ref), FA_OK);
+        CHECK_EQ(fa_cdg_surface_create(s, &cfg, &into), FA_OK);
+        memset(&lay, 0, sizeof(lay));
+        lay.struct_size = sizeof(lay);
+        CHECK_EQ(fa_surface_get_layout(into, &lay), FA_OK);
+        bpp = cfg.pixel_format == FA_CDG_PIXELS_INDEXED8 ? 1 : 4;
+        row = lay.width * bpp;
+        stride = (int32_t)row + 16;
+        for (nbuf = 0; nbuf < 3; nbuf++) {
+            mem[nbuf] = (uint8_t*)malloc((size_t)stride * lay.height);
+            memset(mem[nbuf], 0xCD, (size_t)stride * lay.height);
+        }
+        /* Every pack forward, then jumps back and forward. */
+        for (n = 0; n < packs + 12; n++) {
+            uint32_t b = (uint32_t)(n % 3), i;
+            k = n < packs ? n + 1 : (n * 37) % (packs + 1);
+            CHECK_EQ(fa_cdg_surface_update_at(ref, t_packs((int64_t)k), &fr), FA_OK);
+            memset(&sf, 0, sizeof(sf));
+            sf.struct_size = sizeof(sf);
+            CHECK_EQ(fa_surface_update_into(into, t_packs((int64_t)k), mem[b], stride, lay.width, lay.height, rev[b], &sf), FA_OK);
+            CHECK(sf.dirty_count <= FA_SURFACE_MAX_DIRTY);
+            for (i = 0; i < sf.dirty_count; i++)
+                CHECK(sf.dirty[i].x >= 0 && sf.dirty[i].y >= 0 && sf.dirty[i].x + sf.dirty[i].width <= lay.width &&
+                      sf.dirty[i].y + sf.dirty[i].height <= lay.height);
+            if (sf.base_revision) {
+                CHECK_EQ(sf.base_revision, rev[b]);
+                partial++;
+            }
+            rev[b] = sf.revision;
+            CHECK_EQ(sf.revision, fr.revision);
+            CHECK_EQ(sf.palette_revision, fr.palette_revision);
+            CHECK(memcmp(sf.palette, fr.palette, sizeof(sf.palette)) == 0);
+            CHECK_EQ(sf.background_index, fr.background_index);
+            CHECK_EQ(sf.time, fr.time);
+            for (y = 0; y < lay.height; y++)
+                if (memcmp(mem[b] + (size_t)y * (size_t)stride, (const uint8_t*)fr.pixels + (size_t)y * (size_t)fr.stride, row) != 0) {
+                    CHECK(!"update_into differs from update");
+                    printf("    config %u, step %u, pack %u, row %u\n", ci, (unsigned)n, (unsigned)k, y);
+                    break;
+                }
+            for (y = 0; y < lay.height; y++)   /* the padding is never written */
+                CHECK_EQ(mem[b][(size_t)y * (size_t)stride + row], 0xCD);
+        }
+        CHECK(partial > packs / 2);    /* most draws were partial */
+        for (nbuf = 0; nbuf < 3; nbuf++) free(mem[nbuf]);
+        fa_cdg_surface_destroy(ref);
+        fa_surface_destroy(into);
+        fa_stream_close(s);
+    }
+    free(c.p);
+}
+
+/* The layout report, revisions handed back, size checks, settings, older structs. */
+static void test_update_into_api(void)
+{
+    buf c = basic_cdg();
+    fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface *a = NULL, *b = NULL;
+    fa_cdg_surface_config cfg;
+    fa_surface_layout lay;
+    fa_surface_frame fr;
+    uint8_t* mem = (uint8_t*)malloc(576 * 384 * 4);
+    uint64_t r1;
+    int k;
+    tile(&c, 0, 5, 6, 4, 4, 0x01);
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &a), FA_OK);
+    fa_cdg_surface_config_init(&cfg);
+    cfg.width = 576;
+    cfg.height = 384;
+    cfg.flags = FA_CDG_NO_BORDER;
+    CHECK_EQ(fa_cdg_surface_create(s, &cfg, &b), FA_OK);
+
+    memset(&lay, 0, sizeof(lay));
+    lay.struct_size = sizeof(lay);
+    CHECK_EQ(fa_surface_get_layout(a, &lay), FA_OK);
+    CHECK_EQ(lay.width, 300); CHECK_EQ(lay.height, 216);
+    CHECK_EQ(lay.crop_x, 0); CHECK_EQ(lay.crop_width, 300); CHECK_EQ(lay.crop_height, 216);
+    CHECK_EQ(lay.content_width, 300);
+    CHECK_EQ(lay.safety_zone, FA_SAFETY_SHOW);
+    CHECK_EQ(lay.safety_zone_resolved, 1);
+    CHECK(lay.scale == 1.0f);
+    CHECK_EQ(lay.layout_revision, 1);
+    CHECK_EQ(lay.font_used[0], 0);
+    CHECK_EQ(fa_surface_get_layout(b, &lay), FA_OK);
+    CHECK_EQ(lay.width, 576); CHECK_EQ(lay.height, 384);
+    CHECK_EQ(lay.crop_x, 6); CHECK_EQ(lay.crop_y, 12); CHECK_EQ(lay.crop_width, 288); CHECK_EQ(lay.crop_height, 192);
+    CHECK_EQ(lay.safety_zone, FA_SAFETY_REMOVE);
+    /* An older, shorter struct is filled up to its size. */
+    memset(&lay, 0x55, sizeof(lay));
+    lay.struct_size = (uint32_t)offsetof(fa_surface_layout, bitmap_x);
+    CHECK_EQ(fa_surface_get_layout(b, &lay), FA_OK);
+    CHECK_EQ(lay.height, 384);
+    CHECK_EQ(lay.bitmap_x, 0x55555555);
+    lay.struct_size = 0;
+    CHECK_EQ(fa_surface_get_layout(b, &lay), FA_ERROR_INVALID_ARG);
+
+    /* The buffer must be the layout's size; the stride at least a row. */
+    memset(&fr, 0, sizeof(fr));
+    fr.struct_size = sizeof(fr);
+    CHECK_EQ(fa_surface_update_into(a, t_packs(4), mem, 300 * 4, 301, 216, 0, &fr), FA_ERROR_SIZE_MISMATCH);
+    CHECK_EQ(fa_surface_update_into(a, t_packs(4), mem, 299 * 4, 300, 216, 0, &fr), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_surface_update_into(a, t_packs(4), NULL, 300 * 4, 300, 216, 0, &fr), FA_ERROR_INVALID_ARG);
+
+    /* Unknown revision: a full draw. The same revision again: nothing drawn. */
+    CHECK_EQ(fa_surface_update_into(a, t_packs(4), mem, 300 * 4, 300, 216, 0, &fr), FA_OK);
+    CHECK_EQ(fr.base_revision, 0);
+    CHECK_EQ(fr.dirty_count, 1);
+    CHECK_EQ(fr.dirty[0].width, 300); CHECK_EQ(fr.dirty[0].height, 216);
+    CHECK_EQ(fr.dirty_bounds.width, 300);
+    CHECK_EQ(fr.layout_revision, 1);
+    CHECK(fr.draw_ns >= fr.render_ns && fr.render_ns >= 0);
+    CHECK_EQ(fr.behind, 0);
+    r1 = fr.revision;
+    CHECK_EQ(fa_surface_update_into(a, t_packs(4), mem, 300 * 4, 300, 216, r1, &fr), FA_OK);
+    CHECK_EQ(fr.dirty_count, 0);
+    CHECK_EQ(fr.base_revision, r1);
+    CHECK_EQ(fr.revision, r1);
+    /* One tile later: only that tile. */
+    CHECK_EQ(fa_surface_update_into(a, t_packs(5), mem, 300 * 4, 300, 216, r1, &fr), FA_OK);
+    CHECK_EQ(fr.base_revision, r1);
+    CHECK_EQ(fr.dirty_count, 1);
+    CHECK_EQ(fr.dirty[0].x, 24); CHECK_EQ(fr.dirty[0].y, 48);
+    CHECK_EQ(fr.dirty[0].width, 6); CHECK_EQ(fr.dirty[0].height, 12);
+    /* More than FA_SURFACE_HISTORY revisions back: a full draw. */
+    for (k = 0; k < FA_SURFACE_HISTORY + 1; k++)
+        CHECK_EQ(fa_surface_update_into(a, t_packs(k % 2 ? 4 : 5), mem, 300 * 4, 300, 216, 0, &fr), FA_OK);
+    CHECK_EQ(fa_surface_update_into(a, t_packs(4), mem, 300 * 4, 300, 216, r1 + 1, &fr), FA_OK);
+    CHECK_EQ(fr.base_revision, 0);
+    CHECK_EQ(fr.dirty[0].width, 300);
+    /* A revision from the future: full. */
+    CHECK_EQ(fa_surface_update_into(a, t_packs(4), mem, 300 * 4, 300, 216, fr.revision + 5, &fr), FA_OK);
+    CHECK_EQ(fr.base_revision, 0);
+
+    /* Settings. */
+    CHECK_EQ(fa_surface_set_presentation_size(a, 1920, 1080), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(a, 0, 0), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(a, 0, 1080), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_surface_set_presentation_size(a, 7680, 4320), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(NULL, 1920, 1080), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_surface_set_render_ahead(a, 1), FA_OK);
+    CHECK_EQ(fa_surface_set_render_ahead(a, 2), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_surface_get_layout(a, &lay), FA_ERROR_INVALID_ARG);   /* struct_size still 0 */
+    lay.struct_size = sizeof(lay);
+    CHECK_EQ(fa_surface_get_layout(a, &lay), FA_OK);
+    CHECK_EQ(lay.width, 300);   /* the classic picture keeps its size */
+
+    /* FA_SURFACE_NOW follows the clock (0 before playing: no pack). */
+    CHECK_EQ(fa_surface_update_into(a, FA_SURFACE_NOW, mem, 300 * 4, 300, 216, 0, &fr), FA_OK);
+    CHECK_EQ(fr.background_index, -1);
+
+    /* Once the stream is closed, updates refuse; destroy still works. */
+    fa_stream_close(s);
+    CHECK_EQ(fa_surface_update_into(b, t_packs(4), mem, 576 * 4, 576, 384, 0, &fr), FA_ERROR_INVALID_ARG);
+    fa_surface_destroy(a);
+    fa_surface_destroy(b);
+    fa_surface_destroy(NULL);
+    free(mem);
+    free(c.p);
+}
+
+/* The presentation size keeps its shape inside 300x216 .. 3840x2160. */
+static void test_presentation_clamp(void)
+{
+    uint32_t w, h;
+    w = 1920; h = 1080; CHECK_EQ(fa_presentation_size_clamp(&w, &h), FA_OK); CHECK_EQ(w, 1920); CHECK_EQ(h, 1080);
+    w = 7680; h = 4320; fa_presentation_size_clamp(&w, &h); CHECK_EQ(w, 3840); CHECK_EQ(h, 2160);
+    w = 320; h = 180; fa_presentation_size_clamp(&w, &h); CHECK_EQ(w, 384); CHECK_EQ(h, 216);
+    w = 5120; h = 1440; fa_presentation_size_clamp(&w, &h); CHECK_EQ(w, 3840); CHECK_EQ(h, 1080);
+    w = 100; h = 5000; fa_presentation_size_clamp(&w, &h); CHECK_EQ(h, 2160); CHECK_EQ(w, 300);
+    w = 0; h = 0; CHECK_EQ(fa_presentation_size_clamp(&w, &h), FA_OK); CHECK_EQ(w, 0);
+    w = 0; h = 1; CHECK_EQ(fa_presentation_size_clamp(&w, &h), FA_ERROR_INVALID_ARG);
+}
+
+/* The changed-area sets: merging, the limit, the history. */
+static void test_rect_sets(void)
+{
+    fa_rects r;
+    fa_surface_history h;
+    int b[4], i;
+    fa_rects_clear(&r);
+    fa_rects_add(&r, 0, 0, 6, 12);
+    fa_rects_add(&r, 6, 0, 12, 12);       /* completes a rectangle: merged */
+    CHECK_EQ(r.n, 1); CHECK_EQ(r.r[0][2], 12);
+    fa_rects_add(&r, 100, 100, 106, 112); /* far: separate */
+    CHECK_EQ(r.n, 2);
+    fa_rects_add(&r, 3, 6, 103, 106);     /* overlaps both: one */
+    CHECK_EQ(r.n, 1);
+    fa_rects_bounds(&r, b);
+    CHECK_EQ(b[0], 0); CHECK_EQ(b[3], 112);
+    fa_rects_clear(&r);
+    for (i = 0; i < 20; i++) fa_rects_add(&r, i * 20, i * 20, i * 20 + 6, i * 20 + 12);
+    CHECK_EQ(r.n, FA_SURFACE_MAX_DIRTY);
+    fa_rects_bounds(&r, b);
+    CHECK_EQ(b[0], 0); CHECK_EQ(b[2], 386); CHECK_EQ(b[3], 392);
+    fa_rects_add(&r, 5, 5, 5, 10);        /* empty: ignored */
+    CHECK_EQ(r.n, FA_SURFACE_MAX_DIRTY);
+
+    memset(&h, 0, sizeof(h));
+    for (i = 1; i <= 10; i++) {
+        fa_rects_clear(&r);
+        fa_rects_add(&r, i * 10, 0, i * 10 + 5, 5);
+        fa_history_push(&h, (uint64_t)i, &r);
+    }
+    CHECK_EQ(fa_history_since(&h, 10, 10, &r), 1); CHECK_EQ(r.n, 0);
+    CHECK_EQ(fa_history_since(&h, 10, 8, &r), 1); CHECK_EQ(r.n, 2);
+    CHECK_EQ(fa_history_since(&h, 10, 2, &r), 1); CHECK_EQ(r.n, 8);
+    CHECK_EQ(fa_history_since(&h, 10, 1, &r), 0);
+    CHECK_EQ(fa_history_since(&h, 10, 0, &r), 0);
+    CHECK_EQ(fa_history_since(&h, 10, 11, &r), 0);
+}
+
 static void race_updater(void* p)
 {
     race_arg* a = (race_arg*)p;
@@ -2071,6 +2348,10 @@ int main(void)
     RUN(test_timing_rule);
     RUN(test_change_events);
     RUN(test_close_while_updating);
+    RUN(test_update_into_matches);
+    RUN(test_update_into_api);
+    RUN(test_presentation_clamp);
+    RUN(test_rect_sets);
     fa_engine_destroy(g_engine);
     remove("cdg_pair.zip");
     remove("cdg_sibling.wav");

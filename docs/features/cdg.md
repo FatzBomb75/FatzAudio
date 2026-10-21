@@ -148,7 +148,7 @@ None of these change what a surface draws without them. Apps built against the o
 | `border_index` | Colour of the last border preset; -1 before one |
 | `transparency[16]` | The values of the last transparent-colour pack, 0 opaque .. 63 invisible, whatever the surface's flags |
 | `background[4]` | R, G, B, A the background is drawn with, options applied: fill the area around a scaled picture with it. All 0 while `background_index` is -1 |
-| `revision` | Goes up by one whenever an update changes a pixel (1 after the first update). Never goes down, also not on seeks |
+| `revision` | Goes up whenever an update changes a pixel (1 after the first update; by more than one when `fa_surface_update_into` drew changes in between). Never goes down, also not on seeks |
 | `palette_revision` | Goes up whenever `palette`, `background_index`, `border_index` or `transparency` change |
 
 ### Your own compositor (INDEXED8)
@@ -174,6 +174,52 @@ for (each render target t) {
 ```
 
 The revisions let one surface feed several render targets (a main window and a projector window, each with its own textures): each target compares them with what it last uploaded. `changed` and the dirty rectangle are relative to the previous update and suit a single target.
+
+### Drawing into your own buffers (`fa_surface_update_into`)
+
+`fa_cdg_surface_update` draws into the surface's own pixels, and you copy them. `fa_surface_update_into` draws straight into a buffer of yours instead: a mapped upload buffer, a texture's staging memory, a `WriteableBitmap`'s back buffer. The pixels are exactly those `fa_cdg_surface_update` gives (same format, size and options). `fa_surface` is the same type as `fa_cdg_surface`, so the `fa_surface_*` functions take a CD+G surface as it is.
+
+With two or three buffers in rotation, each buffer comes back holding an older frame. Pass the revision it holds as `dst_revision`, and the surface draws only the pixels that changed since that frame. It remembers what changed in its last 8 revisions (`FA_SURFACE_HISTORY`); a buffer older than that, or `dst_revision` 0, gets a full draw. The rest of the buffer is not touched, so it must still hold the frame you said it holds.
+
+```c
+fa_surface_layout lay = { sizeof(lay) };
+fa_surface_get_layout(cdg, &lay);                       /* 300 x 216 here */
+uint8_t* mem[3];                                          /* lay.height rows of `stride` bytes each */
+uint64_t rev[3] = { 0, 0, 0 };
+
+/* Each frame, with the next buffer b: */
+fa_surface_frame fr = { sizeof(fr) };
+fa_surface_update_into(cdg, FA_SURFACE_NOW, mem[b], stride, lay.width, lay.height, rev[b], &fr);
+rev[b] = fr.revision;
+for (uint32_t i = 0; i < fr.dirty_count; i++) upload_rect(b, fr.dirty[i]);   /* 0 rects: up to date */
+```
+
+| `fa_surface_frame` field | Meaning |
+|---|---|
+| `revision` | The frame now in the buffer: keep it with the buffer |
+| `base_revision` | The dirty rectangles are the change from this one (your `dst_revision`); 0 after a full draw |
+| `dirty[0 .. dirty_count - 1]`, `dirty_bounds` | The pixels drawn, up to 8 separate rectangles (tiles far apart stay separate) and the box around them |
+| `time` | The position on the graphics timeline shown |
+| `draw_ns`, `render_ns` | How long the call took, and how much of that was drawing pixels |
+| `background_index`, `border_index`, `background`, `palette`, `transparency`, `palette_revision` | As in `fa_cdg_frame`: the palette for colouring INDEXED8 output on the GPU |
+
+`dst` must be exactly the layout's width x height (`FA_ERROR_SIZE_MISMATCH` otherwise, and nothing is drawn); `dst_stride` is bytes per row and may include padding. `fa_surface_get_layout` describes the picture: its size, the part of the CD+G screen shown (`crop_*`: all 300x216, or the 288x192 picture area with `FA_CDG_NO_BORDER`, reported as `FA_SAFETY_REMOVE`), and a `layout_revision` that goes up when any of it changes (for the classic picture it never does). `fa_surface_set_presentation_size` and `fa_surface_set_render_ahead` are accepted and kept for the CD+G presentation options to come; the classic picture keeps its configured size and draws on the caller's thread. A surface used only through `update_into` never allocates pixels of its own.
+
+In .NET, `CdgSurface` implements `IKaraokeSurface`:
+
+```csharp
+IKaraokeSurface surface = song.CreateCdgSurface(new CdgSurfaceOptions { Premultiplied = true });
+var layout = surface.GetLayout();
+int stride = layout.Width * 4;
+var buffers = new[] { new byte[stride * layout.Height], new byte[stride * layout.Height] };
+var revisions = new ulong[2];
+// each frame, buffer b:
+var update = surface.UpdateInto(buffers[b], stride, layout.Width, layout.Height, revisions[b]);
+revisions[b] = update.Revision;
+foreach (var r in update.Dirty) Upload(buffers[b], r);   // PixelRect
+```
+
+`UpdateInto` also takes a pointer (`nint`) for mapped memory; a buffer of the wrong size throws `FatzAudioException` with `ErrorCode.SizeMismatch`.
 
 ### Change events (push model)
 
@@ -266,6 +312,7 @@ Every instruction of the CD+G "TV graphics" mode is implemented: memory preset (
 ## Pitfalls
 
 - Read or copy `pixels` before the next update of the same surface; it is redrawn in place.
+- With `fa_surface_update_into`, pass the revision the buffer really holds. A buffer you cleared or drew into yourself needs `dst_revision` 0, or the pixels outside the dirty rectangles stay wrong.
 - Upload in the surface's pixel format. A BGRA surface into an RGBA texture swaps red and blue.
 - Leave `FA_CDG_TRANSPARENT` off unless something is drawn behind the lyrics: on its own, the background turns black or invisible depending on the renderer.
 

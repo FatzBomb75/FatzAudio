@@ -79,9 +79,11 @@ enum {
                                         or fa_open_options.soundfont */
     FA_ERROR_PROTECTED_CONTENT = -16, /* DRM-protected or encrypted content (WMA DRM,
                                         FairPlay, encrypted MP4/MKV, SAMPLE-AES HLS) */
-    FA_ERROR_TOO_LARGE = -17         /* a compressed ZIP entry is bigger than
+    FA_ERROR_TOO_LARGE = -17,        /* a compressed ZIP entry is bigger than
                                         fa_engine_config.zip_memory_limit_mb and no
                                         temp_directory is set: extract it first */
+    FA_ERROR_SIZE_MISMATCH = -18     /* fa_surface_update_into: the buffer is not the
+                                        size fa_surface_get_layout reports */
 };
 
 typedef struct fa_engine fa_engine;   /* one per process is typical */
@@ -1269,7 +1271,10 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
  * tile blocks, scroll preset and copy with smooth-scroll offsets, transparent colour,
  * and both colour-table loads. CD+EG (extended graphics) packs are ignored. */
 
+/* A CD+G surface is an fa_surface (see Surfaces below): the fa_cdg_surface_*
+ * functions and the fa_surface_* ones both take it. */
 typedef struct fa_cdg_surface fa_cdg_surface;
+typedef fa_cdg_surface fa_surface;
 
 /* Byte order in memory. BGRA32 matches Direct3D/DXGI B8G8R8A8, WPF Bgra32/Pbgra32,
  * SkiaSharp Bgra8888 and GDI DIBs; RGBA32 matches OpenGL/Vulkan/Metal RGBA8 and
@@ -1355,9 +1360,11 @@ typedef struct fa_cdg_frame {
                                           FA_CDG_BACKGROUND_COLOR): to fill the area around
                                           a scaled picture. All 0 while background_index
                                           is -1 */
-    uint64_t revision;                 /* goes up by one whenever an update changes a pixel
-                                          (1 after the first update): compare it with the one
-                                          a render target last uploaded */
+    uint64_t revision;                 /* goes up whenever an update changes a pixel (1 after
+                                          the first update; by more than one when
+                                          fa_surface_update_into drew changes in between):
+                                          compare it with the one a render target last
+                                          uploaded */
     uint64_t palette_revision;         /* goes up whenever palette, background_index,
                                           border_index or transparency change */
 } fa_cdg_frame;
@@ -1430,7 +1437,8 @@ FA_API fa_result FA_CALL fa_stream_set_cdg_events(fa_stream* stream, int32_t ena
 FA_API fa_result FA_CALL fa_cdg_surface_create(fa_stream* stream, const fa_cdg_surface_config* config, fa_cdg_surface** out_surface);
 FA_API void FA_CALL fa_cdg_surface_destroy(fa_cdg_surface* surface);
 /* Draws the picture for the audio heard right now (fa_stream_get_clock). Cheap when
- * nothing changed: call it every frame and upload only when out_frame->changed. */
+ * nothing changed: call it every frame and upload only when out_frame->changed. The
+ * first call allocates the surface's pixels (FA_ERROR_OUT_OF_MEMORY if it can't). */
 FA_API fa_result FA_CALL fa_cdg_surface_update(fa_cdg_surface* surface, fa_cdg_frame* out_frame);
 /* Same, at a position you choose on the stream's timeline: for your own clock,
  * previews, or rendering to a video file.
@@ -1444,6 +1452,115 @@ FA_API fa_result FA_CALL fa_cdg_surface_update(fa_cdg_surface* surface, fa_cdg_f
  * checkpoint, even the first time and in parts never played (on a disc: in the parts
  * read so far). */
 FA_API fa_result FA_CALL fa_cdg_surface_update_at(fa_cdg_surface* surface, fa_time time, fa_cdg_frame* out_frame);
+
+/* ---- Surfaces -----------------------------------------------------------
+ *
+ * The functions every karaoke surface has (a CD+G surface now; the MIDI lyric
+ * surface will be one too). The main one draws into a buffer of yours, such as a
+ * mapped upload buffer or a texture's staging memory, instead of handing out the
+ * surface's own pixels: fa_surface_update_into. With two or three buffers in
+ * rotation it draws only the area that changed since the frame the buffer holds.
+ *
+ *     fa_surface_layout lay = { sizeof(lay) };
+ *     fa_surface_get_layout(surface, &lay);           // the buffer size it wants
+ *     ... every frame, with buffer b that last held frame rev[b] (0 = never):
+ *     fa_surface_frame fr = { sizeof(fr) };
+ *     fa_surface_update_into(surface, FA_SURFACE_NOW, mem[b], stride, lay.width,
+ *                            lay.height, rev[b], &fr);
+ *     rev[b] = fr.revision;   // upload fr.dirty[0 .. dirty_count - 1] of buffer b
+ *
+ * Threads, lifetime and timing are those of fa_cdg_surface_update: one thread at a
+ * time per surface, the caller's thread, never waiting for decoding or the device. */
+
+#define FA_SURFACE_NOW INT64_MIN       /* as `time`: the stream's clock (fa_stream_get_clock) */
+#define FA_SURFACE_HISTORY 8           /* how many recent revisions update_into can draw from */
+#define FA_SURFACE_MAX_DIRTY 8
+
+typedef struct fa_rect {
+    int32_t x, y;
+    uint32_t width, height;
+} fa_rect;
+
+/* Which part of the 300x216 CD+G screen is shown. */
+typedef enum fa_safety_zone {
+    FA_SAFETY_SHOW = 0,                /* all of it, border included */
+    FA_SAFETY_REMOVE,                  /* the 288x192 picture area (FA_CDG_NO_BORDER) */
+    FA_SAFETY_AUTO,                    /* reserved for the CD+G presentation options */
+    FA_SAFETY_SUPER
+} fa_safety_zone;
+
+typedef struct fa_surface_layout {
+    uint32_t struct_size;              /* sizeof(fa_surface_layout) */
+    uint32_t width, height;            /* the buffer update_into draws into, in pixels */
+    int32_t bitmap_x, bitmap_y;        /* its top-left inside the presentation area (0, 0
+                                          without a presentation size) */
+    uint32_t content_x, content_y;     /* inside the buffer: the picture, without padding */
+    uint32_t content_width, content_height; /* and margin */
+    float scale;                       /* CD+G: the whole-number multiple shown (1 for the
+                                          classic picture, whatever its output size) */
+    uint32_t crop_x, crop_y, crop_width, crop_height; /* CD+G: the part of the 300x216
+                                          screen shown, in CD+G pixels */
+    fa_safety_zone safety_zone;        /* CD+G: SHOW, or REMOVE with FA_CDG_NO_BORDER */
+    int32_t safety_zone_resolved;      /* 1 (0 is reserved for zones a disc can't work out) */
+    char font_used[128];               /* lyrics: the font family drawn with; "" for CD+G */
+    uint32_t margin, padding;          /* in buffer pixels; 0 for the classic picture */
+    uint64_t layout_revision;          /* goes up whenever any of the above changes (then
+                                          reallocate, and the next draw is a full one) */
+} fa_surface_layout;
+
+typedef struct fa_surface_frame {
+    uint32_t struct_size;              /* sizeof(fa_surface_frame) */
+    uint64_t revision;                 /* of the picture now in the buffer: pass it back as
+                                          dst_revision the next time this buffer is used */
+    uint64_t base_revision;            /* the dirty rectangles are the change from this one
+                                          (= dst_revision); 0 = a full draw */
+    uint64_t layout_revision;
+    uint32_t dirty_count;              /* 0 = nothing was drawn: the buffer was up to date */
+    fa_rect dirty[FA_SURFACE_MAX_DIRTY]; /* the pixels drawn, in buffer pixels: upload these */
+    fa_rect dirty_bounds;              /* the box around them */
+    fa_time time;                      /* position on the graphics timeline shown (as
+                                          fa_cdg_frame.time) */
+    int64_t draw_ns;                   /* how long this call took */
+    int64_t render_ns;                 /* of that, drawing pixels (with render-ahead: the
+                                          time the frame took on the worker) */
+    int32_t behind;                    /* render-ahead: 1 = an older finished frame */
+    /* CD+G, as in fa_cdg_frame (for colouring INDEXED8 output on the GPU): */
+    int32_t background_index, border_index;
+    uint8_t background[4];
+    uint8_t palette[16][4];            /* R, G, B, A, straight alpha */
+    uint8_t transparency[16];          /* 0 opaque .. 63 invisible */
+    uint64_t palette_revision;
+} fa_surface_frame;
+
+/* Destroys a surface of any kind (for CD+G the same as fa_cdg_surface_destroy). */
+FA_API void FA_CALL fa_surface_destroy(fa_surface* surface);
+/* The size of the area the app shows the surface in, in physical pixels, for the
+ * scaled presentations (CD+G presentation options, lyrics). 0 x 0 unsets it (the
+ * default). The shape is kept and the size brought into 300x216 .. 3840x2160. The
+ * classic CD+G picture ignores it: it keeps its configured output size. */
+FA_API fa_result FA_CALL fa_surface_set_presentation_size(fa_surface* surface, uint32_t width, uint32_t height);
+/* Off (0) by default. With it on, surfaces that render into a bitmap of their own
+ * (CD+G presentation options, lyrics) render the next frames ahead on the engine's
+ * worker threads and update_into copies the newest finished one, never waiting. The
+ * classic CD+G picture is drawn straight into the buffer and accepts the setting
+ * without effect. */
+FA_API fa_result FA_CALL fa_surface_set_render_ahead(fa_surface* surface, int32_t enabled);
+/* Fills `out_layout` up to its struct_size and sets struct_size to the bytes filled. */
+FA_API fa_result FA_CALL fa_surface_get_layout(fa_surface* surface, fa_surface_layout* out_layout);
+/* Draws the picture at `time` (FA_SURFACE_NOW = the audio heard now) into `dst`: the
+ * classic CD+G picture in the surface's pixel format, options and output size, the
+ * same pixels fa_cdg_surface_update gives. dst_width x dst_height must be the
+ * layout's width x height (else FA_ERROR_SIZE_MISMATCH, nothing drawn); dst_stride is
+ * bytes per row, at least width x bytes per pixel.
+ *
+ * dst_revision is the revision dst holds (fa_surface_frame.revision of the call that
+ * last drew into it; 0 = unknown). When it is one of the last FA_SURFACE_HISTORY
+ * revisions, only the pixels that changed since then are drawn; otherwise all of
+ * them. The rest of dst is not touched, so it must still hold that frame. out_frame
+ * is filled up to its struct_size, which is set to the bytes filled. */
+FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* surface, fa_time time, void* dst, int32_t dst_stride,
+                                                uint32_t dst_width, uint32_t dst_height, uint64_t dst_revision,
+                                                fa_surface_frame* out_frame);
 
 /* ---- MIDI ---------------------------------------------------------------
  *

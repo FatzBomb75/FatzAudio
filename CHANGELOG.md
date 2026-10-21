@@ -18,6 +18,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- Surfaces: `fa_surface_update_into` draws a CD+G surface into a buffer of yours, only the area that changed since the
+  frame that buffer holds (any of the last 8 revisions), with up to 8 dirty rectangles and timings, the same pixels
+  `fa_cdg_surface_update` gives. Also `fa_surface_get_layout`, `fa_surface_set_presentation_size`,
+  `fa_surface_set_render_ahead` (kept for the presentation options), `fa_surface_destroy` and
+  `FA_ERROR_SIZE_MISMATCH`. `fa_surface` is a typedef of `fa_cdg_surface` (existing code is unchanged). `fa_cdg_frame.revision` can now
+  go up by more than one between two `fa_cdg_surface_update` calls when `update_into` drew in between. .NET:
+  `IKaraokeSurface` (implemented by `CdgSurface`), `SurfaceLayout`, `SurfaceUpdate`, `PixelRect`, `PixelSize`,
+  `ErrorCode.SizeMismatch`. See [docs/features/cdg.md](docs/features/cdg.md#drawing-into-your-own-buffers-fa_surface_update_into).
 - MIDI song credits: `fa_stream_get_midi_credits` (.NET `AudioStream.MidiCredits`) gives title, artist, writer,
   lyricist, year, copyright, key, tempo, time signature and other header lines, gathered from `.kar` `@T`/`@I` lines
   and labelled text events. See [docs/features/midi.md](docs/features/midi.md#song-credits).
@@ -52,6 +60,9 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
 ### Changed
+- CD+G: a surface allocates its own pixels on the first `fa_cdg_surface_update` instead of at create, so out of
+  memory is reported there (`FA_ERROR_OUT_OF_MEMORY`), and its dirty rectangle is the box around the changed tiles' own areas, never larger than
+  before. The pixels drawn are unchanged.
 - MIDI note velocity now follows the SoundFont 2 default curve, 40·log10(velocity/127) dB (velocity 64 is 11.9 dB
   down, was 6 dB), which is what FluidSynth and DLS synths play. Songs keep their loudest notes and gain dynamics.
 - MIDI: a program change to a program the soundfont lacks (in the bank and in bank 0) plays program 0 instead of

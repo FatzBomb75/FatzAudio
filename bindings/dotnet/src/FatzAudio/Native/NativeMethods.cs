@@ -224,6 +224,19 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_cdg_surface_update_at(nint surface, long time, FaCdgFrame* frame);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_surface_set_presentation_size(nint surface, uint width, uint height);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_surface_set_render_ahead(nint surface, int enabled);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_surface_get_layout(nint surface, FaSurfaceLayout* layout);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_surface_update_into(nint surface, long time, void* dst, int dstStride, uint dstWidth,
+        uint dstHeight, ulong dstRevision, FaSurfaceFrame* frame);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_read(StreamHandle stream, void* buffer, long frames, out long framesRead);
 
     // ---- Parameters and envelopes -----------------------------------------

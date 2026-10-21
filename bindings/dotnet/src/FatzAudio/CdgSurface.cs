@@ -170,7 +170,8 @@ public readonly unsafe ref struct CdgFrame
     /// <summary>The colour the background is drawn with (after <see cref="CdgSurfaceOptions.BackgroundColor"/>), to fill
     /// the area around a scaled picture. All zero while <see cref="BackgroundIndex"/> is -1.</summary>
     public CdgColor Background { get; }
-    /// <summary>Goes up by one whenever an update changes a pixel. Each render target compares it with the revision it
+    /// <summary>Goes up whenever an update changes a pixel (by more than one when <see cref="CdgSurface.UpdateInto(nint, int, int, int, ulong, TimeSpan?)"/>
+    /// drew changes in between). Each render target compares it with the revision it
     /// last uploaded, so one surface can feed several targets.</summary>
     public ulong Revision { get; }
     /// <summary>Goes up whenever <see cref="Palette"/>, <see cref="BackgroundIndex"/>, <see cref="BorderIndex"/> or
@@ -209,12 +210,15 @@ public readonly unsafe ref struct CdgFrame
 /// };
 /// </code>
 /// </example>
-public sealed unsafe class CdgSurface : IDisposable
+public sealed unsafe class CdgSurface : IKaraokeSurface
 {
     private readonly AudioStream _stream;
     private readonly object _lock = new();
     private readonly CdgColor[] _palette = new CdgColor[16];
     private readonly byte[] _transparency = new byte[16];
+    private readonly PixelRect[] _dirty = new PixelRect[8];
+    private PixelSize _presentationSize;
+    private bool _renderAhead;
     private nint _native;
 
     internal CdgSurface(AudioStream stream, CdgSurfaceOptions options)
@@ -308,6 +312,152 @@ public sealed unsafe class CdgSurface : IDisposable
         {
             if (added) handle.DangerousRelease();
         }
+    }
+
+    /// <inheritdoc/>
+    public PixelSize PresentationSize
+    {
+        get => _presentationSize;
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value.Width, nameof(value));
+            ArgumentOutOfRangeException.ThrowIfNegative(value.Height, nameof(value));
+            if ((value.Width == 0) != (value.Height == 0))
+                throw new ArgumentException("Width and height must both be 0 (unset) or both positive.", nameof(value));
+            var h = Enter(out bool added);
+            try
+            {
+                lock (_lock)
+                {
+                    ObjectDisposedException.ThrowIf(_native == 0, this);
+                    FatzAudioException.ThrowIfFailed(
+                        NativeMethods.fa_surface_set_presentation_size(_native, (uint)value.Width, (uint)value.Height));
+                }
+            }
+            finally
+            {
+                if (added) h.DangerousRelease();
+            }
+            _presentationSize = ClampPresentation(value);
+        }
+    }
+
+    /// <inheritdoc/>
+    public bool RenderAhead
+    {
+        get => _renderAhead;
+        set
+        {
+            var h = Enter(out bool added);
+            try
+            {
+                lock (_lock)
+                {
+                    ObjectDisposedException.ThrowIf(_native == 0, this);
+                    FatzAudioException.ThrowIfFailed(NativeMethods.fa_surface_set_render_ahead(_native, value ? 1 : 0));
+                }
+            }
+            finally
+            {
+                if (added) h.DangerousRelease();
+            }
+            _renderAhead = value;
+        }
+    }
+
+    /// <inheritdoc/>
+    public SurfaceLayout GetLayout()
+    {
+        FaSurfaceLayout l = default;
+        l.StructSize = (uint)sizeof(FaSurfaceLayout);
+        var h = Enter(out bool added);
+        try
+        {
+            lock (_lock)
+            {
+                ObjectDisposedException.ThrowIf(_native == 0, this);
+                FatzAudioException.ThrowIfFailed(NativeMethods.fa_surface_get_layout(_native, &l));
+            }
+        }
+        finally
+        {
+            if (added) h.DangerousRelease();
+        }
+        string font = Marshal.PtrToStringUTF8((nint)l.FontUsed) ?? "";
+        return new SurfaceLayout((int)l.Width, (int)l.Height, l.BitmapX, l.BitmapY,
+            new PixelRect((int)l.ContentX, (int)l.ContentY, (int)l.ContentWidth, (int)l.ContentHeight), l.Scale,
+            new PixelRect((int)l.CropX, (int)l.CropY, (int)l.CropWidth, (int)l.CropHeight), (SafetyZone)l.SafetyZone,
+            l.SafetyZoneResolved != 0, font, (int)l.Margin, (int)l.Padding, l.LayoutRevision);
+    }
+
+    /// <inheritdoc/>
+    public SurfaceUpdate UpdateInto(nint destination, int stride, int width, int height, ulong destinationRevision,
+        TimeSpan? time = null)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(width);
+        ArgumentOutOfRangeException.ThrowIfNegative(height);
+        if (destination == 0) throw new ArgumentNullException(nameof(destination));
+        FaSurfaceFrame f = default;
+        f.StructSize = (uint)sizeof(FaSurfaceFrame);
+        long t = time is { } at ? TimeConvert.ToNanoseconds(at) : long.MinValue;
+        var h = Enter(out bool added);
+        try
+        {
+            lock (_lock)
+            {
+                ObjectDisposedException.ThrowIf(_native == 0, this);
+                FatzAudioException.ThrowIfFailed(NativeMethods.fa_surface_update_into(_native, t, (void*)destination, stride,
+                    (uint)width, (uint)height, destinationRevision, &f));
+            }
+        }
+        finally
+        {
+            if (added) h.DangerousRelease();
+        }
+        int count = (int)Math.Min(f.DirtyCount, 8u);
+        for (int i = 0; i < count; i++)
+            _dirty[i] = new PixelRect(f.Dirty[i * 4], f.Dirty[i * 4 + 1], f.Dirty[i * 4 + 2], f.Dirty[i * 4 + 3]);
+        for (int i = 0; i < 16; i++)
+        {
+            _palette[i] = new CdgColor(f.Palette[i * 4], f.Palette[i * 4 + 1], f.Palette[i * 4 + 2], f.Palette[i * 4 + 3]);
+            _transparency[i] = f.Transparency[i];
+        }
+        var background = new CdgColor(f.Background[0], f.Background[1], f.Background[2], f.Background[3]);
+        return new SurfaceUpdate(f, _dirty.AsSpan(0, count), _palette, _transparency, background);
+    }
+
+    /// <inheritdoc/>
+    public SurfaceUpdate UpdateInto(Span<byte> destination, int stride, int width, int height, ulong destinationRevision,
+        TimeSpan? time = null)
+    {
+        int bpp = Options.PixelFormat == CdgPixelFormat.Indexed8 ? 1 : 4;
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height);
+        if (stride < width * bpp || destination.Length < (long)stride * (height - 1) + (long)width * bpp)
+            throw new ArgumentException("The span is smaller than height rows of stride bytes.", nameof(destination));
+        fixed (byte* p = destination)
+            return UpdateInto((nint)p, stride, width, height, destinationRevision, time);
+    }
+
+    /// <summary>The native rule: the shape kept, inside 300x216 .. 3840x2160.</summary>
+    private static PixelSize ClampPresentation(PixelSize size)
+    {
+        if (size.IsUnset) return size;
+        double w = size.Width, h = size.Height;
+        double k = Math.Min(3840 / w, 2160 / h);
+        if (k < 1) { w *= k; h *= k; }
+        k = Math.Max(300 / w, 216 / h);
+        if (k > 1) { w *= k; h *= k; }
+        return new PixelSize(Math.Clamp((int)(w + 0.5), 300, 3840), Math.Clamp((int)(h + 0.5), 216, 2160));
+    }
+
+    /// <summary>Holds the stream for a native call, which keeps the native stream (and so this surface) alive.</summary>
+    private StreamHandle Enter(out bool added)
+    {
+        var handle = _stream.Handle;
+        added = false;
+        handle.DangerousAddRef(ref added);
+        return handle;
     }
 
     /// <summary>Frees the surface. Safe to call more than once, and after the stream was disposed.</summary>

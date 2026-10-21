@@ -282,4 +282,62 @@ public class CdgTests
         song.RemoveCdg();
         Assert.False(song.HasCdg);
     }
+
+    [Fact]
+    public void UpdateInto_MatchesUpdateAndDrawsOnlyChanges()
+    {
+        using var engine = CreateHeadless();
+        using var song = engine.OpenMemory(TestAudio.SineWav(), DecodeOnly);
+        var tile = new byte[16];
+        tile[0] = 1; tile[1] = 2; tile[2] = 4; tile[3] = 4;      // colours 1 / 2, row 4, column 4
+        for (int i = 4; i < 16; i++) tile[i] = 0x01;
+        song.LoadCdg([.. SimpleCdg(), .. Pack(6, tile)]);
+        using var reference = song.CreateCdgSurface();
+        IKaraokeSurface surface = song.CreateCdgSurface();
+
+        var layout = surface.GetLayout();
+        Assert.Equal((300, 216), (layout.Width, layout.Height));
+        Assert.Equal(new PixelRect(0, 0, 300, 216), layout.Crop);
+        Assert.Equal(SafetyZone.Show, layout.SafetyZone);
+        Assert.Equal(1f, layout.Scale);
+        Assert.Equal("", layout.FontUsed);
+        Assert.Equal(1UL, layout.LayoutRevision);
+
+        int stride = 300 * 4 + 8;
+        var buffer = new byte[stride * 216];
+        var first = surface.UpdateInto(buffer, stride, 300, 216, 0, AfterPacks(2));
+        Assert.True(first.IsFullDraw);
+        Assert.Equal(new PixelRect(0, 0, 300, 216), first.Dirty[0]);
+        ulong revision = first.Revision;
+        Assert.Equal(new CdgColor(255, 0, 0, 255), first.Palette[1]);
+
+        var again = surface.UpdateInto(buffer, stride, 300, 216, revision, AfterPacks(2));
+        Assert.Equal(0, again.Dirty.Length);
+        Assert.Equal(revision, again.BaseRevision);
+
+        var next = surface.UpdateInto(buffer, stride, 300, 216, revision, AfterPacks(3));
+        Assert.False(next.IsFullDraw);
+        Assert.Equal(new PixelRect(24, 48, 6, 12), next.Dirty[0]);
+        Assert.True(next.DrawTime >= next.RenderTime);
+
+        var frame = reference.UpdateAt(AfterPacks(3));
+        for (int y = 0; y < 216; y++)
+            Assert.True(frame.Pixels.Slice(y * frame.Stride, 1200).SequenceEqual(buffer.AsSpan(y * stride, 1200)));
+
+        var error = Assert.Throws<FatzAudioException>(() => surface.UpdateInto(buffer, stride, 299, 216, 0));
+        Assert.Equal(ErrorCode.SizeMismatch, error.ErrorCode);
+        Assert.Throws<ArgumentException>(() => surface.UpdateInto(new byte[100], stride, 300, 216, 0));
+
+        surface.PresentationSize = new PixelSize(1920, 1080);
+        Assert.Equal(new PixelSize(1920, 1080), surface.PresentationSize);
+        Assert.Throws<ArgumentException>(() => surface.PresentationSize = new PixelSize(0, 1080));
+        surface.PresentationSize = new PixelSize(7680, 4320);
+        Assert.Equal(new PixelSize(3840, 2160), surface.PresentationSize);
+        surface.RenderAhead = true;
+        Assert.True(surface.RenderAhead);
+        Assert.Equal(300, surface.GetLayout().Width);    // the classic picture keeps its size
+
+        surface.Dispose();
+        Assert.Throws<ObjectDisposedException>(() => surface.GetLayout());
+    }
 }

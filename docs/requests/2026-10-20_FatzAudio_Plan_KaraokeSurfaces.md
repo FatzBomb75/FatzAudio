@@ -515,6 +515,12 @@ You test each step in your player and send screenshots, as section 5 of your req
 
 ---
 
+**Progress:** step 0 done (PRs 80 and 81). Step 1 done for the classic CD+G picture: `fa_surface`,
+`update_into` with the 8-revision history and up to 8 dirty rectangles, timings, the layout report, and
+the presentation size and render-ahead settings. Render-ahead itself, and the master bitmap it renders
+into, come with step 2, the first surface that has a master bitmap (the classic picture draws straight
+into the caller's buffer, as section 2.3 says).
+
 ## 11. Questions, answered by MediaControl (2026-10-20)
 
 Their answers are in [2026-10-20_MediaControl_Answers_Plan.md](2026-10-20_MediaControl_Answers_Plan.md)

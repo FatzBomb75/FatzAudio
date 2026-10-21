@@ -45,6 +45,9 @@ public enum ErrorCode
     /// <see cref="AudioEngineOptions.TempDirectory"/> is set: extract the archive first, or set one.
     /// </summary>
     TooLarge = -17,
+    /// <summary>The buffer passed to <see cref="IKaraokeSurface.UpdateInto(nint, int, int, int, ulong, TimeSpan?)"/> is
+    /// not the size <see cref="IKaraokeSurface.GetLayout"/> reports.</summary>
+    SizeMismatch = -18,
 }
 
 /// <summary>
