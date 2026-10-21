@@ -1531,7 +1531,12 @@ typedef struct fa_surface_frame {
     int64_t draw_ns;                   /* how long this call took */
     int64_t render_ns;                 /* of that, drawing pixels (with render-ahead: the
                                           time the frame took on the worker) */
-    int32_t behind;                    /* render-ahead: 1 = an older finished frame */
+    int32_t behind;                    /* render-ahead: 1 = the frame shown is more than
+                                          1/60 s older than `time` (the workers are not
+                                          keeping up), of a later position (after a seek
+                                          back) or of graphics since replaced; a newer
+                                          one follows. `time` above is the position it
+                                          shows. Always 0 without render-ahead */
     /* CD+G, as in fa_cdg_frame (for colouring INDEXED8 output on the GPU): */
     int32_t background_index, border_index;
     uint8_t background[4];
@@ -1547,10 +1552,18 @@ FA_API void FA_CALL fa_surface_destroy(fa_surface* surface);
  * default). The shape is kept and the size brought into 300x216 .. 3840x2160. A CD+G
  * picture without presentation scaling ignores it: it keeps its output size. */
 FA_API fa_result FA_CALL fa_surface_set_presentation_size(fa_surface* surface, uint32_t width, uint32_t height);
-/* Off (0) by default. Planned: surfaces that render into a bitmap of their own (CD+G
- * presentation scaling, lyrics) render the next frames ahead on the engine's worker
- * threads and update_into copies the newest finished one, never waiting. In this
- * version every surface accepts the setting and draws on the caller's thread. */
+/* Off (0) by default. On, a surface that renders into a bitmap of its own (CD+G with
+ * presentation scaling; lyrics) has the engine's worker threads render its next frame
+ * ahead, paced by the times update_into is called with, and update_into copies the
+ * finished frame that fits `time` best. It does not wait for a worker that is
+ * rendering: it shows the frame it has, and fa_surface_frame.behind says when that one
+ * is late. When no worker is rendering and there is no fitting frame (the first, the
+ * first after a change of layout or options, after a seek or new graphics, or more
+ * than 1/60 s late) it draws the frame on the caller's thread. Calls that change the
+ * surface (options, sizes, the layout, fa_cdg_surface_update) wait for a running
+ * render, at most one frame. It takes two more buffers of the layout's size. The
+ * classic CD+G picture ignores it: it is drawn on the caller's thread either way. Off
+ * frees the buffers. */
 FA_API fa_result FA_CALL fa_surface_set_render_ahead(fa_surface* surface, int32_t enabled);
 /* Fills `out_layout` up to its struct_size and sets struct_size to the bytes filled. */
 FA_API fa_result FA_CALL fa_surface_get_layout(fa_surface* surface, fa_surface_layout* out_layout);

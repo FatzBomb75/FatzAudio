@@ -520,7 +520,11 @@ You test each step in your player and send screenshots, as section 5 of your req
 render-ahead settings. Step 2 in two parts. 2a: the CD+G presentation options (safety zones with the
 pre-pass, padding, presentation scaling with the margin, the master bitmap with scrolls as moves and
 offsets as copies, smoothness 0-4, edge blend, the transparent border) and the first measured table
-(docs/features/cdg.md). 2b: render-ahead on the engine's workers.
+(docs/features/cdg.md). 2b: render-ahead on the engine's workers: two output-sized slots, a worker renders
+the frame for the time the next call is expected at, `update_into` copies from the newest finished frame not
+ahead of its time and never waits (only the first frame after a layout or option change is drawn on the
+caller's thread); `behind` allows 1/60 s, since frames rendered for a predicted time are usually a pack or
+two older than the time asked for.
 
 ## 11. Questions, answered by MediaControl (2026-10-20)
 

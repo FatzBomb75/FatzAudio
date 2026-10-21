@@ -83,6 +83,9 @@ void fa_stream_cdg_close(struct fa_stream* s);
  * stream takes api_lock): raises FA_EVENT_CDG_CHANGED for a stream whose shown
  * packs changed since the last call. */
 void fa_stream_cdg_watch(struct fa_stream* s);
+/* An idle worker: renders ahead for the first surface waiting for it. Returns 0 when
+ * none was. */
+int fa_cdg_render_one(fa_engine* e);
 int fa_stream_cdg_present(struct fa_stream* s);
 /* Looks for "<path without extension>.cdg" next to an audio file. */
 fa_cdg_data* fa_cdg_find_sibling(const char* audio_path);
