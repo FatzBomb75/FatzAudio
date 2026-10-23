@@ -48,8 +48,12 @@ public enum ErrorCode
     /// <summary>The buffer passed to <see cref="IKaraokeSurface.UpdateInto(nint, int, int, int, ulong, TimeSpan?)"/> is
     /// not the size <see cref="IKaraokeSurface.GetLayout"/> reports.</summary>
     SizeMismatch = -18,
-    /// <summary>The output device has no channels for the headphone cue (<see cref="CueOutput.Channels34"/> on a stereo device).</summary>
+    /// <summary>The device does not have that channel: the headphone cue's (<see cref="CueOutput.Channels34"/> on a
+    /// stereo device) or a mic's (<see cref="MicOptions.Channel"/>).</summary>
     NotEnoughChannels = -19,
+    /// <summary>The app has no microphone permission (<see cref="DjMixer.AddMic"/>): ask for it first (Android
+    /// manifest and prompt, macOS and iOS usage strings).</summary>
+    PermissionDenied = -20,
 }
 
 /// <summary>

@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using FatzAudio.Native;
 
@@ -51,7 +52,7 @@ public enum LatencyMode
     /// sample rate; it needs a driver that offers small periods), about 5 ms elsewhere.
     /// </summary>
     Low = 1,
-    /// <summary>Windows exclusive mode for live mic monitoring: planned with the mic input (<see cref="ErrorCode.NotImplemented"/> for now).</summary>
+    /// <summary>Windows exclusive mode for live mic monitoring: planned with the mic setup check (<see cref="ErrorCode.NotImplemented"/> for now).</summary>
     Exclusive = 2,
 }
 
@@ -119,6 +120,15 @@ public sealed class DjMixerOptions
     public LatencyMode Latency { get; init; } = LatencyMode.Low;
 }
 
+/// <summary>What a <see cref="DjMixer"/>'s outputs and inputs add up to. Times the system does not report are estimated from the device's buffer sizes.</summary>
+/// <param name="Master">The master output (the system's buffer).</param>
+/// <param name="Cue">The headphones: the master's for <see cref="CueOutput.Channels34"/> and <see cref="CueOutput.Split"/>.</param>
+/// <param name="CueAlignment">Delay added to line up a second-device cue (planned: zero).</param>
+/// <param name="MicInput">Per mic slot: the input buffer plus the drift-corrected bridge; null = no mic in the slot.</param>
+/// <param name="MicMonitor">Per mic slot: mic to speaker, the input plus the master; null = no mic in the slot.</param>
+public sealed record MixerLatency(TimeSpan Master, TimeSpan Cue, TimeSpan CueAlignment,
+    IReadOnlyList<TimeSpan?> MicInput, IReadOnlyList<TimeSpan?> MicMonitor);
+
 /// <summary>A deck loop between two source frames.</summary>
 /// <param name="In">The loop's first frame.</param>
 /// <param name="Out">The frame it turns back at.</param>
@@ -151,8 +161,9 @@ public sealed class DjMixer : IDisposable
 {
     private readonly nint _mixer;
     private readonly DjDeck[] _decks;
+    private readonly List<Mic> _mics = new();
 
-    internal DjMixer(AudioEngine engine, nint mixer, OutputDevice output)
+    internal unsafe DjMixer(AudioEngine engine, nint mixer, OutputDevice output)
     {
         Engine = engine;
         _mixer = mixer;
@@ -164,6 +175,9 @@ public sealed class DjMixer : IDisposable
             _decks[i] = new DjDeck(this, i, d);
         }
         Crossfader = new DjCrossfader(this);
+        // The state lives until the device closes (fa_mixer_destroy waits for running callbacks).
+        var gc = output.Handle.Pin(new EventState(this));
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_set_event_callback(mixer, &OnNativeEvent, (void*)GCHandle.ToIntPtr(gc)));
     }
 
     /// <summary>The engine the mixer belongs to.</summary>
@@ -212,6 +226,133 @@ public sealed class DjMixer : IDisposable
             using var lease = Lease();
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_get_output_channels(_mixer, out _, out int cue));
             return cue < 0 ? null : cue;
+        }
+    }
+
+    /// <summary>The mics, in the order added (at most 2).</summary>
+    public IReadOnlyList<Mic> Mics
+    {
+        get
+        {
+            lock (_mics) return _mics.ToArray();
+        }
+    }
+
+    /// <summary>
+    /// Adds a karaoke mic. It fades in once its input runs. Two mics can share a 2-input interface (channels 0 and 1).
+    /// The app asks for the microphone permission first (Android manifest and prompt, macOS and iOS usage strings).
+    /// </summary>
+    /// <param name="options">The input and channel; null = the default input, all channels summed.</param>
+    /// <exception cref="ArgumentException"><see cref="MicOptions.Device"/> is not an input device.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><see cref="MicOptions.Channel"/> is negative.</exception>
+    /// <exception cref="FatzAudioException"><see cref="ErrorCode.Busy"/> for a third mic;
+    /// <see cref="ErrorCode.NotEnoughChannels"/> when the device has no such channel;
+    /// <see cref="ErrorCode.PermissionDenied"/> without the microphone permission.</exception>
+    public unsafe Mic AddMic(MicOptions? options = null)
+    {
+        options ??= new MicOptions();
+        if (options.Device is { Kind: not DeviceKind.Capture })
+            throw new ArgumentException("Not an input device.", nameof(options));
+        if (options.Channel < 0) throw new ArgumentOutOfRangeException(nameof(options), "Channel must be 0 or more.");
+        FaMicConfig c;
+        NativeMethods.fa_mic_config_init(&c);
+        c.Channel = options.Channel ?? -1;
+        c.Monitor = options.Monitor ? 1 : 0;
+        c.Flags = (options.DucksMusic ? 1u : 0u) | (options.KeepOsProcessing ? 2u : 0u);
+        byte* id = options.Device?.Id is { } devId ? (byte*)Marshal.StringToCoTaskMemUTF8(devId) : null;
+        var handle = new MicHandle();
+        using var lease = Lease();
+        nint native;
+        try
+        {
+            c.DeviceId = id;
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_add_mic(_mixer, &c, out native));
+        }
+        finally
+        {
+            if (id != null) Marshal.FreeCoTaskMem((nint)id);
+        }
+        handle.Initialize(native, Output.Handle);
+        Mic mic;
+        try
+        {
+            mic = new Mic(this, handle);
+        }
+        catch
+        {
+            handle.Dispose();
+            throw;
+        }
+        lock (_mics) _mics.Add(mic);
+        return mic;
+    }
+
+    internal void Forget(Mic mic)
+    {
+        lock (_mics) _mics.Remove(mic);
+    }
+
+    /// <summary>What the mixer's outputs and mic inputs add up to now.</summary>
+    public unsafe MixerLatency Latency
+    {
+        get
+        {
+            FaMixerLatency l = default;
+            l.StructSize = (uint)sizeof(FaMixerLatency);
+            using (Lease()) FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_get_latency(_mixer, &l));
+            var input = new TimeSpan?[2];
+            var monitor = new TimeSpan?[2];
+            for (int i = 0; i < 2; i++)
+            {
+                input[i] = l.MicInput[i] < 0 ? null : TimeConvert.FromNanoseconds(l.MicInput[i]);
+                monitor[i] = l.MicMonitor[i] < 0 ? null : TimeConvert.FromNanoseconds(l.MicMonitor[i]);
+            }
+            return new MixerLatency(TimeConvert.FromNanoseconds(l.Master), TimeConvert.FromNanoseconds(l.Cue),
+                TimeConvert.FromNanoseconds(l.CueAlignment), input, monitor);
+        }
+    }
+
+    /// <summary>
+    /// A mic's input device went away (unplugged, or taken by another app). The mic goes silent and the mix carries
+    /// on; dispose it and add a new one when the device is back. Raised on the engine's event thread.
+    /// </summary>
+    public event EventHandler<MicEventArgs>? InputLost;
+
+    private sealed class EventState
+    {
+        public EventState(DjMixer m) => Mixer = new WeakReference<DjMixer>(m);
+        public WeakReference<DjMixer> Mixer { get; }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static unsafe void OnNativeEvent(FaMixerEvent* ev, void* user)
+    {
+        try
+        {
+            if (ev == null || user == null) return;
+            if (GCHandle.FromIntPtr((nint)user).Target is EventState st && st.Mixer.TryGetTarget(out var mixer))
+                mixer.Raise(ev->Type, ev->Mic);
+        }
+        catch
+        {
+            // never throw across the native boundary
+        }
+    }
+
+    private void Raise(int type, nint native)
+    {
+        const int inputLost = 16;
+        if (type != inputLost) return;
+        Mic? mic;
+        lock (_mics) mic = _mics.Find(m => m.NativeHandle == native);
+        if (mic is null) return;
+        try
+        {
+            InputLost?.Invoke(this, new MicEventArgs(mic));
+        }
+        catch
+        {
+            // a handler's exception must not stop the event thread
         }
     }
 
@@ -269,10 +410,11 @@ public sealed class DjMixer : IDisposable
         public void Dispose() => _h.DangerousRelease();
     }
 
-    /// <summary>Unloads the decks (their streams stay open and are detached) and closes the device.</summary>
+    /// <summary>Removes the mics, unloads the decks (their streams stay open and are detached) and closes the device.</summary>
     public void Dispose()
     {
         if (Output.IsDisposed) return;
+        foreach (var m in Mics) m.Dispose();
         foreach (var d in _decks)
         {
             try { d.Unload(force: true); }

@@ -72,6 +72,18 @@ if(UNIX)
 endif()
 add_test(NAME mixer COMMAND fa_test_mixer)
 
+add_executable(fa_test_mic test_mic.c ${FA_SOURCES})
+target_include_directories(fa_test_mic PRIVATE
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
+target_compile_definitions(fa_test_mic PRIVATE FA_STATIC)
+target_compile_options(fa_test_mic PRIVATE ${FA_WARNINGS})
+target_link_libraries(fa_test_mic PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
+if(UNIX)
+    target_link_libraries(fa_test_mic PRIVATE m)
+endif()
+add_test(NAME mic COMMAND fa_test_mic)
+
 add_executable(fa_test_loudness test_loudness.c ${FA_SOURCES})
 target_include_directories(fa_test_loudness PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
@@ -322,7 +334,7 @@ add_test(NAME flac COMMAND fa_test_flac)
 foreach(t fa_test_internal fa_test_loudness fa_test_crossfade fa_test_handoff fa_test_demux
           fa_test_dolby fa_test_aac fa_test_net fa_test_cdg fa_test_disc fa_test_tempo fa_test_ogg
           fa_test_encode fa_test_midi fa_test_tracker fa_test_flac fa_test_asf fa_test_tags fa_test_font
-          fa_test_lyric fa_test_mixer)
+          fa_test_lyric fa_test_mixer fa_test_mic)
     target_link_libraries(${t} PRIVATE fa_opus fa_vorbis fa_openmpt)
     # The same static C runtime as those libraries: libopenmpt is C++, and MSVC
     # refuses to link C++ objects built for different runtimes.

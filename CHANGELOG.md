@@ -26,6 +26,13 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   `fa_deck_cue` give a CDJ-style cue. Opens in the low-latency shared mode by default (`FA_LATENCY_LOW`). New error
   `FA_ERROR_NOT_ENOUGH_CHANNELS`. .NET: `AudioEngine.CreateDjMixer`, `DjMixer`, `DjDeck`, `DjCrossfader`, `DeckEq`.
   See [docs/features/dj-mixer.md](docs/features/dj-mixer.md).
+- DJ mixer mics: `fa_mixer_add_mic` adds up to two karaoke mics, one channel (or all channels) of a capture device
+  each, brought into the master through a drift-corrected bridge, with an 80 Hz low cut, gain, a gate, EQ (new preset
+  `FA_EQ_PRESET_LIVE_VOCAL`), mute, pan, monitor on or off and a meter (`fa_mic_get_levels`). `fa_mixer_get_latency`
+  reports the master, cue and voice-to-speaker latencies; `FA_EVENT_INPUT_LOST` on the new
+  `fa_mixer_set_event_callback` reports an input that went away. Android captures unprocessed. New error
+  `FA_ERROR_PERMISSION_DENIED`. .NET: `DjMixer.AddMic`, `Mic`, `MicOptions`, `DjMixer.Latency`, `DjMixer.InputLost`,
+  `EqualizerPreset.LiveVocal`. See [docs/features/dj-mixer.md](docs/features/dj-mixer.md#microphones).
 - Track analysis: `fa_analyze_path` and `fa_analyze_stream` measure a beat grid (tempo, first beat, confidence), the
   musical key (name and Camelot code), a waveform overview (peak and low/mid/high levels every 10 ms) and the loudness in
   one decode, about 170x real time on one core, cached by content in `cache_directory`. MIDI files and tracker modules get

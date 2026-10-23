@@ -120,4 +120,81 @@ public class DjMixerTests
         Assert.Null(mixer.Decks[0].Stream);
         Assert.Null(mixer.Decks[0].Loop);
     }
+
+    [Fact]
+    public void Mics_AddRoundTripAndRemove()
+    {
+        using var engine = CreateHeadless();
+        using var mixer = engine.CreateDjMixer();
+        Assert.Empty(mixer.Mics);
+        Assert.Null(mixer.Latency.MicInput[0]);
+        using var mic = mixer.AddMic(new MicOptions { Channel = 0 });
+        using var second = mixer.AddMic(new MicOptions { Channel = 1, Monitor = false });
+        Assert.Equal(new[] { mic, second }, mixer.Mics);
+        Assert.Equal(0, mic.Index);
+        Assert.Equal(1, second.Index);
+        var ex = Assert.Throws<FatzAudioException>(() => mixer.AddMic());
+        Assert.Equal(ErrorCode.Busy, ex.ErrorCode);
+
+        Assert.Equal(-50f, mic.GateDb);
+        Assert.True(mic.LowCut);
+        Assert.True(mic.Monitor);
+        Assert.False(second.Monitor);
+        mic.GainDb = 100f;
+        mic.Pan = -0.5f;
+        mic.Muted = true;
+        mic.GateDb = -200f;
+        mic.LowCut = false;
+        Assert.Equal(40f, mic.GainDb);
+        Assert.Equal(-0.5f, mic.Pan);
+        Assert.True(mic.Muted);
+        Assert.Equal(-100f, mic.GateDb);
+        Assert.False(mic.LowCut);
+
+        Assert.Empty(mic.GetEqualizer());
+        mic.SetEqualizer(EqualizerPreset.LiveVocal);
+        Assert.Equal(Equalizer.GetPreset(EqualizerPreset.LiveVocal), mic.GetEqualizer());
+        Assert.Equal("Live vocal", Equalizer.GetPresetName(EqualizerPreset.LiveVocal));
+        var levels = mic.GetLevels();
+        Assert.Equal(0f, levels.Peak);
+
+        var latency = mixer.Latency;
+        Assert.True(latency.Master > TimeSpan.Zero);
+        Assert.Equal(latency.Master, latency.Cue);
+        Assert.True(mic.InputLatency > TimeSpan.Zero);
+        Assert.Equal(latency.MicInput[0]!.Value + latency.Master, latency.MicMonitor[0]);
+
+        mic.Dispose();
+        Assert.Equal(new[] { second }, mixer.Mics);
+        Assert.Throws<ObjectDisposedException>(() => mic.GainDb);
+        Assert.Null(mixer.Latency.MicInput[0]);
+        using var again = mixer.AddMic();
+        Assert.Equal(0, again.Index);
+    }
+
+    [Fact]
+    public void Mics_ConfigErrors()
+    {
+        using var engine = CreateHeadless();
+        using var mixer = engine.CreateDjMixer();
+        var ex = Assert.Throws<FatzAudioException>(() => mixer.AddMic(new MicOptions { Channel = 31 }));
+        Assert.Equal(ErrorCode.NotEnoughChannels, ex.ErrorCode);
+        Assert.Throws<ArgumentOutOfRangeException>(() => mixer.AddMic(new MicOptions { Channel = -1 }));
+        var output = new AudioDeviceInfo("x", "x", DeviceKind.Playback, false, 48000, 2);
+        Assert.Throws<ArgumentException>(() => mixer.AddMic(new MicOptions { Device = output }));
+        Assert.Empty(mixer.Mics);
+    }
+
+    [Fact]
+    public void Mics_GoWithTheMixer()
+    {
+        using var engine = CreateHeadless();
+        var mixer = engine.CreateDjMixer();
+        var mic = mixer.AddMic();
+        mixer.InputLost += (_, e) => e.Mic.Dispose();
+        mixer.Dispose();
+        Assert.True(mixer.Output.IsDisposed);
+        Assert.Throws<ObjectDisposedException>(() => mic.GainDb);
+        mic.Dispose();                   // twice is fine
+    }
 }

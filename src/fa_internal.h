@@ -884,6 +884,7 @@ struct fa_device {
     fa_atomic_ptr mixer;
     uint32_t open_channels;
     int open_low_latency;
+    fa_atomic32 mixer_events;    /* the mixer has events for the event thread (fa_mixer_service) */
 };
 
 /* Event thread: reopens devices that went away on the system default. */
@@ -932,6 +933,11 @@ typedef struct fa_stream_eq {
 } fa_stream_eq;
 
 void fa_eq_shared_init(fa_eq_shared* sh);
+/* API side, caller serializes writers: FA_ERROR_INVALID_ARG for an unknown type, a NaN
+ * or too many bands; set clamps as fa_stream_set_eq; get returns the band count. */
+fa_result fa_eq_check_bands(const fa_eq_band* bands, uint32_t count);
+void fa_eq_shared_set(fa_eq_shared* sh, const fa_eq_band* bands, uint32_t count);
+uint32_t fa_eq_shared_get(fa_eq_shared* sh, fa_eq_band* out_bands, uint32_t capacity);
 void fa_eq_reset(fa_eq_state* st);
 /* Start of a mix: takes new bands; `restart` clears the filter memory (the audio
  * does not continue the last mix). Returns 0 when the EQ is flat (skip it). */
@@ -1256,6 +1262,10 @@ void fa_device_render_at(fa_device* device, float* out, uint32_t frames, int64_t
 void fa_device_render_output(fa_device* device, float* out, uint32_t channels, uint32_t frames, int64_t now_ns);
 /* fa_device_open with options: `channels` 0 = the device's own count (else stereo),
  * `low_latency` = the smallest shared-mode period the system gives. */
+/* A device id string (fa_device_info.id) as the backend's id; *out_has = 0 for NULL or
+ * "" (the default device). */
+fa_result fa_device_parse_id(fa_engine* engine, fa_device_type type, const char* device_id, ma_device_id* out_id,
+                             int* out_has);
 fa_result fa_device_open_with(fa_engine* engine, const char* device_id, uint32_t channels, int low_latency,
                               fa_device** out_device);
 
@@ -1271,6 +1281,10 @@ void fa_mixer_render(struct fa_mixer* m, fa_device* dev, float* out, uint32_t ch
 void fa_mixer_bus_left(fa_bus* bus, struct fa_stream* s);
 /* fa_device_close on a mixer's device closes the mixer (which closes the device). */
 void fa_mixer_destroy_from_device(struct fa_mixer* m);
+/* Event thread, under the device's life_lock: the device's mixer, kept alive until
+ * fa_mixer_service (called without the lock) is done with it; NULL when none. */
+struct fa_mixer* fa_mixer_hold(fa_device* dev);
+void fa_mixer_service(struct fa_mixer* m);
 
 /* Deck loops (stream.c): a loop between source frames `in` and `out` over the
  * CUE_IN..CUE_OUT one; out <= in turns it off. Joins the decode-ahead audio without
