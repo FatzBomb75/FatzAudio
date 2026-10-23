@@ -18,6 +18,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- DJ mixer: `fa_mixer_create` opens two decks on one output with channel faders, trim, a three-band isolator EQ with kills
+  (Linkwitz-Riley crossovers at 250 Hz and 2.5 kHz), a crossfader with constant-power and linear curves, master gain,
+  the limiter always on, and per-deck meters (`fa_deck_get_levels`). Headphone cue on two more outputs of the same
+  device (`FA_CUE_CHANNELS`) or a Y-cable split (`FA_CUE_SPLIT`), with cue mix and gain. `fa_deck_set_loop` makes
+  seamless deck loops that follow tempo and pitch, including "loop out" while playing; `fa_deck_set_cue_point` and
+  `fa_deck_cue` give a CDJ-style cue. Opens in the low-latency shared mode by default (`FA_LATENCY_LOW`). New error
+  `FA_ERROR_NOT_ENOUGH_CHANNELS`. .NET: `AudioEngine.CreateDjMixer`, `DjMixer`, `DjDeck`, `DjCrossfader`, `DeckEq`.
+  See [docs/features/dj-mixer.md](docs/features/dj-mixer.md).
 - Track analysis: `fa_analyze_path` and `fa_analyze_stream` measure a beat grid (tempo, first beat, confidence), the
   musical key (name and Camelot code), a waveform overview (peak and low/mid/high levels every 10 ms) and the loudness in
   one decode, about 170x real time on one core, cached by content in `cache_directory`. MIDI files and tracker modules get

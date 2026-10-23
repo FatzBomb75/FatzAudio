@@ -5,7 +5,7 @@ FatzAudio measures what is being heard, for VU meters and visualizers: peak and 
 | Call | Measures |
 |---|---|
 | `fa_stream_get_levels`, `fa_stream_get_spectrum` | The stream's own audio, after its equalizer and DSP but before its volume, pan, fades and normalization (as BASS measures a channel). A stream turned down still shows its full level, and a meter doesn't drop during a fade-out. |
-| `fa_device_get_levels`, `fa_device_get_spectrum` | The device's whole output after the limiter: every stream, bus and volume, as it reaches the speakers. |
+| `fa_device_get_levels`, `fa_device_get_spectrum` | The device's whole output after the limiter: every stream and bus with their volumes. The device's own volume (`fa_device_set_volume`) is applied after the meter, so it doesn't show. |
 
 Both read the audio being heard now: the window ends at the device's latency behind the mix, so meters line up with the sound. They give zeros while the stream is not playing (stopped, paused, buffering, detached) or the device is stopped.
 

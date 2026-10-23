@@ -11,6 +11,8 @@ A **bus** is a group of streams on one device, with its own volume and pan: a DJ
 
 Bus gains multiply with each member's own gains (volume, fades, normalization). A bus has no buffer of its own, so it adds no latency and no CPU beyond one multiply per sample.
 
+For a full two-deck DJ setup (crossfader curves, isolator EQ with kills, headphone cue, deck loops), use the [DJ mixer](dj-mixer.md), which builds its decks on buses of its own.
+
 ## C
 
 ```c

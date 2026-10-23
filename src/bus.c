@@ -59,6 +59,7 @@ FA_API void FA_CALL fa_bus_destroy(fa_bus* bus)
         for (i = 0; i < voices->count; i++) fa_cas_ptr(&voices->items[i]->bus, bus, NULL);
     while (publish_buses(dev, NULL, bus) != FA_OK) fa_sleep_ms(1); /* must not fail: retry on OOM */
     fa_mutex_unlock(&dev->lock);
+    free(bus->buf);
     free(bus);
 }
 
@@ -67,7 +68,10 @@ void fa_buses_free_all(fa_device* dev)
     fa_bus_list* list = (fa_bus_list*)fa_exchange_ptr(&dev->buses, NULL);
     uint32_t i;
     if (!list) return;
-    for (i = 0; i < list->count; i++) free(list->items[i]);
+    for (i = 0; i < list->count; i++) {
+        free(list->items[i]->buf);
+        free(list->items[i]);
+    }
     free(list);
 }
 

@@ -54,6 +54,7 @@ set(FA_SOURCES
     src/eq.c
     src/lane.c
     src/bus.c
+    src/mixer.c
     src/event.c
     src/loudness.c
     src/tags.c

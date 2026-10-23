@@ -48,6 +48,8 @@ public enum ErrorCode
     /// <summary>The buffer passed to <see cref="IKaraokeSurface.UpdateInto(nint, int, int, int, ulong, TimeSpan?)"/> is
     /// not the size <see cref="IKaraokeSurface.GetLayout"/> reports.</summary>
     SizeMismatch = -18,
+    /// <summary>The output device has no channels for the headphone cue (<see cref="CueOutput.Channels34"/> on a stereo device).</summary>
+    NotEnoughChannels = -19,
 }
 
 /// <summary>

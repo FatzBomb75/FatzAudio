@@ -691,3 +691,16 @@ internal unsafe struct FaKeyInfo
     public fixed byte Name[8];
     public fixed byte Camelot[4];
 }
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaMixerConfig
+{
+    public uint StructSize;
+    public uint DeckCount;
+    public byte* DeviceId;
+    public int CueMode;
+    public byte* CueDeviceId;
+    public uint CueChannel;
+    public int Latency;
+    public uint Flags;
+}

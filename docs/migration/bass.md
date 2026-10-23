@@ -170,6 +170,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_FXSetParameters to switch a whole EQ preset | `fa_eq_get_preset` + `fa_stream_set_eq` (13 presets) | ✅ |
 | BASS_FXSetBypass on the EQ | `fa_stream_set_eq_enabled(s, 0)`: glides to flat, keeps the bands | ✅ |
 | BASS_FXReset (clear the EQ's filter memory after a seek) | Not needed: cleared by itself on a seek, a flush and a restart | ➖ |
+| Three BASS_FX_BFX_PEAKEQ (or BQF filters) per deck as a DJ EQ with kills | The DJ mixer's isolator: `FA_DECK_EQ_LOW_DB` / `_MID_DB` / `_HIGH_DB` down to `FA_DECK_EQ_KILL_DB`, flat when all at 0 ([DJ mixer](../features/dj-mixer.md)) | ✅ |
 | Other BASS_FX / bass_fx effects (compressor, reverb, echo, chorus, flanger, distortion, phaser, auto-wah, ...) | Not built in: a player rarely needs them, and `fa_stream_add_dsp` takes your own | ➖ (by design) |
 
 ### Loudness and normalization
@@ -299,7 +300,11 @@ The legacy app doesn't ship bassmix.dll, but mixer-style code built on `BASS_Cha
 | BASS_Mixer_ChannelSetPosition / GetPosition | `fa_stream_seek` / `fa_stream_get_position` | `Position` | ✅ |
 | BASS_ATTRIB_VOL on the mixer stream | `fa_bus_set_param` / `fa_bus_ramp_param` | `bus.Volume`, `bus.Ramp` | ✅ |
 | BASS_MIXER_CHAN_NORAMPIN | Not needed: starts are exact and fades are explicit | — | ➖ (by design) |
-| BASS_Split_* (one source to several outputs) | Not provided yet | | 🗓️ |
+| BASS_Split_* (one source to several outputs) | Not provided for general use. For DJ headphones: the [DJ mixer](../features/dj-mixer.md) cue on outputs 3-4 of the same device (`FA_CUE_CHANNELS`) or a Y-cable split (`FA_CUE_SPLIT`); a second device (`FA_CUE_DEVICE`) is planned | `CueOutput.Channels34`, `CueOutput.Split` | ✅ same device, 🗓️ second device and general split |
+| A BASSmix mixer with one source channel per deck, volumes from a crossfader slider | `fa_mixer_create` + `fa_deck_load`; crossfader, curves, channel faders, trim and master gain built in ([DJ mixer](../features/dj-mixer.md)) | `engine.CreateDjMixer()`, `deck.Load(stream)`, `mixer.Crossfader` | ✅ |
+| BASS_ChannelGetLevel(Ex) on a deck's mixer source (channel meter) | `fa_deck_get_levels` (after trim, EQ and fader) | `deck.GetLevels()` | ✅ |
+| A loop with BASS_SYNC_POS (MIXTIME) + BASS_ChannelSetPosition, or BASS_ChannelSetPosition in a loop sync | `fa_deck_set_loop(deck, in, out)`: seamless, follows tempo, "loop out" while playing, `FA_EVENT_LOOPED` | `deck.Loop = new DeckLoop(in, out)` | ✅ |
+| Your own cue point: pause + BASS_ChannelSetPosition | `fa_deck_set_cue_point` + `fa_deck_cue` | `deck.CuePoint`, `deck.ReturnToCuePoint()` | ✅ |
 
 ### bass_aac (AAC)
 
@@ -769,7 +774,9 @@ Per-track points from your database (where the intro starts, where the outro fad
 
 BASS: two channels and two `BASS_ChannelSetAttribute(h, BASS_ATTRIB_VOL, ...)` calls from the slider, or a BASSmix mixer per deck.
 
-FatzAudio: one bus per deck, and the slider sets or ramps the bus volumes ([buses](../features/buses.md)). In .NET: `deckA.Volume = MathF.Cos(x * MathF.PI / 2); deckB.Volume = MathF.Sin(x * MathF.PI / 2);`.
+FatzAudio: the [DJ mixer](../features/dj-mixer.md) has the decks, the crossfader (constant power or linear), channel faders, an isolator EQ and a headphone cue built in. In .NET: `using var mixer = engine.CreateDjMixer(); mixer.Decks[0].Load(songA); mixer.Decks[1].Load(songB); mixer.Crossfader.Position = x;`.
+
+For a simple two-player fader without the rest, one bus per deck works too: the slider sets or ramps the bus volumes ([buses](../features/buses.md)), `deckA.Volume = MathF.Cos(x * MathF.PI / 2); deckB.Volume = MathF.Sin(x * MathF.PI / 2);`.
 
 ### Audio of a video played with FFmpeg
 

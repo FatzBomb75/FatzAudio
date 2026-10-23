@@ -30,6 +30,7 @@ FA_API const char* FA_CALL fa_result_string(fa_result result)
     case FA_ERROR_PROTECTED_CONTENT: return "protected content";
     case FA_ERROR_TOO_LARGE: return "too large to unpack in memory";
     case FA_ERROR_SIZE_MISMATCH: return "the buffer is not the size the surface draws";
+    case FA_ERROR_NOT_ENOUGH_CHANNELS: return "the output device has no channels for the cue";
     default: return "unknown result";
     }
 }

@@ -330,6 +330,28 @@ public unsafe class AudioStream : IDisposable
         _bus = bus;
     }
 
+    internal bool IsDisposed => _handle.IsClosed;
+
+    internal nint NativeHandle => _handle.DangerousGetHandle();
+
+    // A DJ deck attached the stream to the mixer's device (fa_deck_load): mirror it here.
+    internal void JoinedDeck(OutputDevice device)
+    {
+        var h = Handle;
+        if (!ReferenceEquals(_device, device)) h.AttachDevice(device.Handle);
+        _device = device;
+        _bus = null;
+    }
+
+    // The deck let it go (unloaded: detached natively).
+    internal void LeftDeck()
+    {
+        if (_handle.IsClosed) return;
+        _handle.DetachDevice();
+        _device = null;
+        _bus = null;
+    }
+
     // The native side attached `other` to this stream's device (crossfade, queue): mirror it here.
     private void AdoptDevice(AudioStream other)
     {
