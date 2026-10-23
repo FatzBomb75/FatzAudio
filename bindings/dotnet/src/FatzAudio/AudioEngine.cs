@@ -177,6 +177,63 @@ public sealed class AudioEngine : IDisposable
         return new OutputDevice(this, dh, device);
     }
 
+    /// <summary>
+    /// Creates a DJ mixer: decks on one output device with trim, isolator EQ, faders, meters, a crossfader, a master
+    /// gain, a limiter that is always on, and a headphone cue. It opens and starts its own output device
+    /// (<see cref="DjMixer.Output"/>).
+    /// </summary>
+    /// <param name="options">The decks, the output and the cue; null uses the defaults (2 decks, the default device, no cue).</param>
+    /// <returns>The mixer; dispose it when done.</returns>
+    /// <exception cref="ArgumentException"><see cref="DjMixerOptions.Output"/> is not a playback device.</exception>
+    /// <exception cref="FatzAudioException"><see cref="ErrorCode.NotEnoughChannels"/> when the cue asks for channels the device
+    /// does not have; <see cref="ErrorCode.NotImplemented"/> for more than 2 decks or <see cref="LatencyMode.Exclusive"/>;
+    /// <see cref="ErrorCode.Device"/> when the device cannot be opened.</exception>
+    /// <example>
+    /// <code>
+    /// using var mixer = engine.CreateDjMixer(new DjMixerOptions { Cue = CueOutput.Split });
+    /// mixer.Decks[0].Load(engine.OpenFile("song1.mp3"));
+    /// mixer.Decks[0].Stream!.Play();
+    /// </code>
+    /// </example>
+    public unsafe DjMixer CreateDjMixer(DjMixerOptions? options = null)
+    {
+        options ??= new DjMixerOptions();
+        if (options.Output is { Kind: not DeviceKind.Playback })
+            throw new ArgumentException("Not a playback device.", nameof(options));
+        var h = Handle;
+        FaMixerConfig c;
+        NativeMethods.fa_mixer_config_init(&c);
+        c.DeckCount = (uint)Math.Max(0, options.Decks);
+        c.CueMode = options.Cue.Mode;
+        c.CueChannel = (uint)options.Cue.FirstChannel;
+        c.Latency = (int)options.Latency;
+        byte* id = options.Output?.Id is { } devId ? (byte*)Marshal.StringToCoTaskMemUTF8(devId) : null;
+        nint native;
+        try
+        {
+            c.DeviceId = id;
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_create(h, &c, out native));
+        }
+        finally
+        {
+            if (id != null) Marshal.FreeCoTaskMem((nint)id);
+        }
+        // The mixer lives as long as its device: closing the device destroys it.
+        NativeMethods.fa_mixer_get_device(native, out nint device);
+        var dh = new DeviceHandle();
+        dh.Initialize(device, h);
+        var output = new OutputDevice(this, dh, options.Output);
+        try
+        {
+            return new DjMixer(this, native, output);
+        }
+        catch
+        {
+            output.Dispose();
+            throw;
+        }
+    }
+
     /// <summary>Opens an audio file; the format is detected from its content.</summary>
     /// <param name="path">Path of the file.</param>
     /// <param name="options">Optional open options.</param>

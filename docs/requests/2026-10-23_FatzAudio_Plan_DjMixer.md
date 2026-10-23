@@ -50,7 +50,7 @@ when both grids are good, plain crossfade otherwise, the three events, skip); CD
 |---|---|---|
 | 0 | **Mic latency spike** on Keith's PC: capture and monitoring only, NORMAL vs LOW (exclusive measured for reference only) | If LOW cannot get mic to speaker near 20 ms on Keith's interface, MediaControl is told before any mic PR, because the app would then default to monitoring off |
 | 1 | Mixer core: 2 decks, gain/trim, isolator EQ, crossfader (2 curves), master gain, limiter, meters, channels 3-4 and split cue, frame loops, CD cue point | Opus high, 6-9 h |
-| 2 | Mics: capture through the drift-corrected bridge, gate, EQ, reverb, echo, ducking, latency report, recording (master + vocals), and the built-in setup check (below) | Opus high, 9-13 h; the karaoke-critical part |
+| 2 | Mics: capture through the drift-corrected bridge, gate, EQ, reverb, echo, ducking, latency report, recording (master + vocals), the built-in setup check (below), and WASAPI exclusive as the opt-in live-monitoring mode (Keith, 2026-10-23) | Opus high, 11-16 h; the karaoke-critical part |
 | 3 | Second-device cue on the bridge from step 2, with requirement 1 | Opus high, 3-5 h |
 | 4 | Analysis: constant grid, key, waveform, cache, MIDI/tracker grids, set/get grid | Opus high, 6-9 h; second thread, from step 1 on |
 | 5 | Sync with lock, `play_synced`, beat loops, auto-mix | Opus high, 6-9 h |
@@ -175,7 +175,7 @@ typedef enum fa_latency_mode {
     FA_LATENCY_NORMAL = 0,   /* the engine's usual period */
     FA_LATENCY_LOW,          /* smallest shared-mode period the OS gives (WASAPI IAudioClient3, CoreAudio
                                 small buffers, AAudio low latency, PulseAudio/PipeWire latency hint) */
-    FA_LATENCY_EXCLUSIVE     /* (future, value reserved) Windows WASAPI exclusive, Linux ALSA hw */
+    FA_LATENCY_EXCLUSIVE     /* Windows WASAPI exclusive (opt-in live monitoring, mic step); Linux ALSA hw is future */
 } fa_latency_mode;
 
 typedef struct fa_mixer_config {
@@ -905,7 +905,6 @@ From MediaControl's reply. The API keeps struct sizes, enum values and flags ope
 - Bar detection and bar sync; beat jump; quantized seeks.
 - Auto-mix bass swap and the restore-tempo glide.
 - Crossfader curves full-middle and cut; manual cue trim (`FA_MIX_CUE_TRIM_MS`).
-- WASAPI exclusive mode (measured in the spike for reference only).
 - Echo synced to the beat.
 - Separate recording stems (music only, each mic dry).
 - CD+G scroll shift in the frame (`scroll_dx`/`scroll_dy`), until MediaControl's profiling asks.

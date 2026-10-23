@@ -107,9 +107,10 @@ void fa_device_render(fa_device* dev, float* out, uint32_t frames)
     fa_device_render_at(dev, out, frames, fa_monotonic_ns());
 }
 
-void fa_device_render_at(fa_device* dev, float* out, uint32_t frames, int64_t now_ns)
+static void render_block(fa_device* dev, float* out, uint32_t frames, int64_t now_ns)
 {
     fa_voice_list* list;
+    struct fa_mixer* mixer = (struct fa_mixer*)fa_load_ptr(&dev->mixer);
     uint32_t i;
     publish_callback_time(dev, fa_load64(&dev->clock), now_ns);
     dev->cb_prev_frames = frames;
@@ -128,8 +129,13 @@ void fa_device_render_at(fa_device* dev, float* out, uint32_t frames, int64_t no
             changed = 0;
             for (i = 0; i < list->count; i++) changed |= fa_stream_check_queue(list->items[i], dev, frames);
         }
-        for (i = 0; i < list->count; i++) fa_stream_mix(list->items[i], dev, out, frames);
+        for (i = 0; i < list->count; i++) {
+            /* A mixer deck's streams go to the deck's buffer, the rest to the master. */
+            fa_bus* bus = mixer ? (fa_bus*)fa_load_ptr(&list->items[i]->bus) : NULL;
+            fa_stream_mix(list->items[i], dev, bus && bus->buf ? bus->buf : out, frames);
+        }
     }
+    if (mixer) fa_mixer_process(mixer, dev, out, frames);
     {
         /* The output moved (fa_devices_service, or the system rerouted it): every
          * stream on it hears about it, as its audio is mixed. */
@@ -141,8 +147,8 @@ void fa_device_render_at(fa_device* dev, float* out, uint32_t frames, int64_t no
     }
     if (!dev->xf_busy) fa_mutex_unlock(&dev->xf_lock);   /* commands taken */
     fa_buses_end(dev, frames);
-    fa_limiter_process(&dev->limiter, out, frames,
-                       powf(10.0f, fa_load_float(&dev->engine->limiter_ceiling) / 20.0f), limiter_on(dev->engine));
+    fa_limiter_process(&dev->limiter, out, frames, powf(10.0f, fa_load_float(&dev->engine->limiter_ceiling) / 20.0f),
+                       mixer || limiter_on(dev->engine));   /* a DJ mixer's master is always limited */
     {
         /* Device mute, after the limiter: glides sample by sample, costs nothing unmuted. */
         float level = dev->mute_level, target = (float)fa_load32(&dev->muted);
@@ -169,12 +175,30 @@ void fa_device_render_at(fa_device* dev, float* out, uint32_t frames, int64_t no
     fa_fetch_add64(&dev->clock, frames);
 }
 
+void fa_device_render_at(fa_device* dev, float* out, uint32_t frames, int64_t now_ns)
+{
+    uint32_t done, n;
+    if (!fa_load_ptr(&dev->mixer) || frames <= FA_MIXER_BLOCK) { render_block(dev, out, frames, now_ns); return; }
+    /* A mixer's buffers hold FA_MIXER_BLOCK frames: longer calls run in blocks. */
+    for (done = 0; done < frames; done += n) {
+        n = frames - done < FA_MIXER_BLOCK ? frames - done : FA_MIXER_BLOCK;
+        render_block(dev, out + (size_t)done * FA_DEVICE_CHANNELS, n, now_ns + (int64_t)((double)done * 1e9 / dev->rate));
+    }
+}
+
+void fa_device_render_output(fa_device* dev, float* out, uint32_t channels, uint32_t frames, int64_t now_ns)
+{
+    struct fa_mixer* m = (struct fa_mixer*)fa_load_ptr(&dev->mixer);
+    if (m) fa_mixer_render(m, dev, out, channels, frames, now_ns);
+    else fa_device_render_at(dev, out, frames, now_ns);
+}
+
 static void data_callback(ma_device* d, void* output, const void* input, ma_uint32 frames)
 {
     fa_device* dev = (fa_device*)d->pUserData;
     (void)input;
     fa_fetch_add64(&dev->epoch, 1);
-    fa_device_render(dev, (float*)output, frames);
+    fa_device_render_output(dev, (float*)output, d->playback.channels, frames, fa_monotonic_ns());
     fa_fetch_add64(&dev->epoch, 1);
 }
 
@@ -214,7 +238,7 @@ static ma_device_config device_config(fa_device* d, const ma_device_id* pid, uin
     ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
     cfg.playback.pDeviceID = pid;
     cfg.playback.format = ma_format_f32;
-    cfg.playback.channels = FA_DEVICE_CHANNELS;
+    cfg.playback.channels = d->open_channels;   /* 0 = the device's own (a mixer's cue on channels 3-4) */
     cfg.sampleRate = rate; /* 0 = native */
     cfg.periodSizeInMilliseconds = engine->config.period_ms;
     cfg.dataCallback = data_callback;
@@ -226,6 +250,18 @@ static ma_device_config device_config(fa_device* d, const ma_device_id* pid, uin
      * is enough with the callback only mixing decoded audio, and one period (10 ms)
      * less latency than miniaudio's default of three. A larger period_ms buys margin. */
     if (engine->context.backend == ma_backend_wasapi) cfg.periods = 2;
+    if (d->open_low_latency) {
+        /* The smallest period the system gives. On Windows that is the IAudioClient3
+         * low-latency shared mode, which needs the device's own rate and format: the
+         * first open asks for it (fa_device_open_with), a reopen keeps the mix rate the
+         * streams' chains were built for. */
+        if (cfg.periodSizeInMilliseconds == 0 || cfg.periodSizeInMilliseconds > 5) cfg.periodSizeInMilliseconds = 5;
+        if (engine->context.backend == ma_backend_wasapi) {
+            cfg.periodSizeInMilliseconds = 0;
+            cfg.periodSizeInFrames = 16;
+            cfg.wasapi.noAutoConvertSRC = MA_TRUE;
+        }
+    }
     return cfg;
 }
 
@@ -346,6 +382,12 @@ void fa_device_remove_voice(fa_device* dev, fa_stream* s)
 
 FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id, fa_device** out_device)
 {
+    return fa_device_open_with(engine, device_id, FA_DEVICE_CHANNELS, 0, out_device);
+}
+
+fa_result fa_device_open_with(fa_engine* engine, const char* device_id, uint32_t channels, int low_latency,
+                              fa_device** out_device)
+{
     fa_device* d;
     ma_device_config cfg;
     ma_device_id id;
@@ -386,8 +428,11 @@ FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id
         fa_mutex_destroy(&d->xf_lock); fa_mutex_destroy(&d->lock); free(d); return FA_ERROR_GENERIC;
     }
     d->volume = 1.0f;
+    d->open_channels = channels;
+    d->open_low_latency = low_latency;
 
-    cfg = device_config(d, pid, engine->config.mix_sample_rate);
+    cfg = device_config(d, pid, low_latency && engine->context.backend == ma_backend_wasapi
+                                    ? 0 : engine->config.mix_sample_rate);
     if (ma_device_init(&engine->context, &cfg, &d->device) != MA_SUCCESS) {
         fa_mutex_destroy(&d->life_lock);
         fa_mutex_destroy(&d->xf_lock);
@@ -419,7 +464,10 @@ FA_API void FA_CALL fa_device_close(fa_device* device)
 {
     fa_device** pp;
     fa_voice_list* list;
+    struct fa_mixer* mixer;
     if (!device) return;
+    mixer = (struct fa_mixer*)fa_load_ptr(&device->mixer);
+    if (mixer) { fa_mixer_destroy_from_device(mixer); return; }   /* it closes the device */
     fa_encode_device_closing(device);
     fa_mutex_lock(&device->life_lock);     /* waits for a reopen in progress; none starts after */
     fa_store32(&device->closing, 1);

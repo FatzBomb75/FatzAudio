@@ -82,8 +82,10 @@ enum {
     FA_ERROR_TOO_LARGE = -17,        /* a compressed ZIP entry is bigger than
                                         fa_engine_config.zip_memory_limit_mb and no
                                         temp_directory is set: extract it first */
-    FA_ERROR_SIZE_MISMATCH = -18     /* fa_surface_update_into: the buffer is not the
+    FA_ERROR_SIZE_MISMATCH = -18,    /* fa_surface_update_into: the buffer is not the
                                         size fa_surface_get_layout reports */
+    FA_ERROR_NOT_ENOUGH_CHANNELS = -19 /* FA_CUE_CHANNELS: the output device has no channels
+                                        for the cue (fewer than cue_channel + 2) */
 };
 
 typedef struct fa_engine fa_engine;   /* one per process is typical */
@@ -1107,8 +1109,8 @@ FA_API fa_result FA_CALL fa_stream_get_fade_curve(fa_stream* stream, fa_fade fad
  * `from` must be attached; `to` is attached to `from`'s device and bus if it is
  * not attached yet (another device: FA_ERROR_INVALID_ARG). The fades are crossfade
  * gains of their own, separate from FA_PARAM_VOLUME, so a user's volume setting is
- * kept. The start is one device period ahead (about 10 ms), so both streams are
- * guaranteed to begin on the same frame. */
+ * kept. Both start with the device's next callback, so they are guaranteed to
+ * begin on the same frame. */
 FA_API fa_result FA_CALL fa_crossfade(fa_stream* from, fa_stream* to, fa_time duration, const fa_ramp* ramp);
 
 /* Queues `next` to start automatically, sample-accurately, when `stream` reaches
@@ -1163,6 +1165,150 @@ FA_API fa_result FA_CALL fa_bus_ramp_param(fa_bus* bus, fa_param param, float ta
  * stream re-buffers from where it is). An attached forward-only source cannot
  * re-buffer: FA_ERROR_NOT_SEEKABLE (set the matrix before attaching it). */
 FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* weights, uint32_t in_channels, uint32_t out_channels);
+
+/* ---- DJ mixer ----------------------------------------------------------- */
+
+/* A DJ mixer: two decks on one output device, each with a channel fader, a trim,
+ * an isolator EQ with kills and a meter, a crossfader between them, a master gain
+ * and a limiter that is always on, plus a headphone cue.
+ *
+ *   deck: your stream (decoded, tempo/pitch, its own EQ, volume, fades)
+ *     -> trim -> isolator EQ (low / mid / high) -+-> cue send (FA_DECK_CUE, pre-fader)
+ *                                                '-> fader -> meter -> crossfader side
+ *   decks -> master gain -> limiter -> master output (channels 1-2)
+ *   cue = (1 - CUE_MIX) x cue sends + CUE_MIX x master, x CUE_GAIN -> headphones
+ *
+ * Decks hold ordinary streams: play, pause, seek, tempo, pitch, markers, CD+G and
+ * lyrics work on them as on any stream, and every deck shares the master device's
+ * clock, so fa_stream_play_at on two decks starts them on the same frame.
+ * The mixer opens and owns its output device (fa_mixer_get_device): use it for the
+ * clock, levels, spectrum and recording of the master. Closing that device (or the
+ * engine) destroys the mixer. */
+typedef struct fa_mixer fa_mixer;
+typedef struct fa_deck fa_deck;
+
+typedef enum fa_cue_mode {
+    FA_CUE_NONE = 0,
+    FA_CUE_CHANNELS,   /* channels 3-4 of the master device (DJ controllers and many USB
+                          interfaces have 4 outputs): the same clock, no drift, no delay */
+    FA_CUE_DEVICE,     /* a second output device: planned (FA_ERROR_NOT_IMPLEMENTED for now) */
+    FA_CUE_SPLIT       /* one stereo output and a Y-cable: the master in mono on the left,
+                          the cue in mono on the right */
+} fa_cue_mode;
+
+typedef enum fa_latency_mode {
+    FA_LATENCY_NORMAL = 0, /* the engine's period (fa_engine_config.period_ms) */
+    FA_LATENCY_LOW,        /* the smallest shared-mode period the system gives: WASAPI's
+                              low-latency mode on Windows (device rate, needs a driver that
+                              offers small periods), about 5 ms elsewhere */
+    FA_LATENCY_EXCLUSIVE   /* Windows exclusive mode, for live mic monitoring: planned with the
+                              mic input (FA_ERROR_NOT_IMPLEMENTED for now) */
+} fa_latency_mode;
+
+typedef struct fa_mixer_config {
+    uint32_t        struct_size;   /* set by fa_mixer_config_init */
+    uint32_t        deck_count;    /* 2 (default); more decks are planned */
+    const char*     device_id;     /* the master output (fa_device_info.id), NULL = the default
+                                      device (and follows it when it changes) */
+    fa_cue_mode     cue_mode;      /* default FA_CUE_NONE */
+    const char*     cue_device_id; /* FA_CUE_DEVICE (planned) */
+    uint32_t        cue_channel;   /* FA_CUE_CHANNELS: the first of the two cue channels,
+                                      counted from 0; 0 = 2 (channels 3 and 4) */
+    fa_latency_mode latency;       /* default FA_LATENCY_LOW */
+    uint32_t        flags;         /* none yet: 0 */
+} fa_mixer_config;
+
+FA_API void      FA_CALL fa_mixer_config_init(fa_mixer_config* config);
+/* Opens the output device and starts it. FA_ERROR_NOT_ENOUGH_CHANNELS when
+ * FA_CUE_CHANNELS asks for channels the device does not have. */
+FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_config* config, fa_mixer** out_mixer);
+/* Unloads the decks (their streams stay open, detached) and closes the device. */
+FA_API void      FA_CALL fa_mixer_destroy(fa_mixer* mixer);
+FA_API fa_result FA_CALL fa_mixer_get_device(fa_mixer* mixer, fa_device** out_device);
+FA_API fa_result FA_CALL fa_mixer_get_deck(fa_mixer* mixer, uint32_t index, fa_deck** out_deck);
+/* The device's output channels, and the first cue channel (-1 = no cue channels). */
+FA_API fa_result FA_CALL fa_mixer_get_output_channels(fa_mixer* mixer, uint32_t* out_channels, int32_t* out_cue_channel);
+
+typedef enum fa_mix_param {
+    FA_MIX_CROSSFADER = 0, /* 0 = side A only, 0.5 = the middle (default), 1 = side B only */
+    FA_MIX_MASTER_GAIN,    /* linear, 0..4, default 1; before the limiter */
+    FA_MIX_CUE_MIX,        /* 0 = cue only (default) .. 1 = master only */
+    FA_MIX_CUE_GAIN        /* linear, 0..4, default 1 */
+} fa_mix_param;
+
+/* Sets glide over 5 ms; ramps take the curve in `ramp` and start at `device_time` on
+ * the device clock (0 = at once), as fa_stream_ramp_param does. Out-of-range values
+ * are clamped. Mixer and deck ramps raise no events. */
+FA_API fa_result FA_CALL fa_mixer_set_param(fa_mixer* mixer, fa_mix_param param, float value);
+FA_API fa_result FA_CALL fa_mixer_get_param(fa_mixer* mixer, fa_mix_param param, float* out_value);
+FA_API fa_result FA_CALL fa_mixer_ramp_param(fa_mixer* mixer, fa_mix_param param, float target,
+                                             fa_time duration, fa_time device_time, const fa_ramp* ramp);
+
+typedef enum fa_xfader_curve {
+    FA_XFADER_CONSTANT_POWER = 0, /* default: steady loudness over the travel, each side
+                                     -3 dB in the middle */
+    FA_XFADER_LINEAR              /* each side -6 dB in the middle: a slight dip */
+} fa_xfader_curve;
+FA_API fa_result FA_CALL fa_mixer_set_crossfader_curve(fa_mixer* mixer, fa_xfader_curve curve);
+FA_API fa_result FA_CALL fa_mixer_get_crossfader_curve(fa_mixer* mixer, fa_xfader_curve* out_curve);
+
+/* ---- Decks ---- */
+
+#define FA_DECK_LOAD_FORCE  (1u << 0)  /* replace a stream that is playing and heard */
+#define FA_DECK_EQ_KILL_DB  (-60.0f)   /* an EQ band at this setting is silent */
+
+/* Puts your stream on the deck: it is attached to the mixer's device through the
+ * deck (from another device or deck too, keeping its position). The deck does not
+ * own it: close it after unloading. NULL unloads (the stream is detached and its
+ * deck loop cleared). FA_ERROR_BUSY while the current stream plays and the deck is
+ * heard (fader up and the crossfader not closed on its side), unless
+ * FA_DECK_LOAD_FORCE. Loading also shortens the stream's decode-ahead to 60 ms
+ * (fa_tempo_options.latency_ms) when it is not playing, so tempo and pitch moves
+ * are heard quickly; the cue point goes back to the stream's CUE_IN. A deck holds
+ * one stream: fa_crossfade and fa_stream_set_next from a deck's stream to a stream
+ * that is not attached yet are FA_ERROR_INVALID_ARG (load it on a deck instead).
+ * Close a deck's stream only from the thread that drives the deck, or unload it
+ * first. */
+FA_API fa_result FA_CALL fa_deck_load(fa_deck* deck, fa_stream* stream, uint32_t flags);
+FA_API fa_result FA_CALL fa_deck_get_stream(fa_deck* deck, fa_stream** out_stream);  /* NULL = empty */
+
+typedef enum fa_deck_param {
+    FA_DECK_GAIN = 0,      /* the channel fader, linear 0..1, default 1 */
+    FA_DECK_TRIM_DB,       /* -12..+12, default 0, on top of loudness normalization */
+    FA_DECK_EQ_LOW_DB,     /* isolator bands, FA_DECK_EQ_KILL_DB (silent)..+6, default 0 */
+    FA_DECK_EQ_MID_DB,
+    FA_DECK_EQ_HIGH_DB,
+    FA_DECK_XFADER_SIDE,   /* 0 = thru (not on the crossfader), 1 = side A, 2 = side B;
+                              default deck 1 on A, deck 2 on B. Not rampable. */
+    FA_DECK_CUE            /* 1 = sent to the headphones, 0 = not (default). Not rampable. */
+} fa_deck_param;
+FA_API fa_result FA_CALL fa_deck_set_param(fa_deck* deck, fa_deck_param param, float value);
+FA_API fa_result FA_CALL fa_deck_get_param(fa_deck* deck, fa_deck_param param, float* out_value);
+FA_API fa_result FA_CALL fa_deck_ramp_param(fa_deck* deck, fa_deck_param param, float target,
+                                            fa_time duration, fa_time device_time, const fa_ramp* ramp);
+
+/* The cue point (CDJ style): fa_deck_cue pauses the deck and goes back to it.
+ * Default: the stream's CUE_IN marker, else 0. FA_FRAMES_UNSET restores the default. */
+FA_API fa_result FA_CALL fa_deck_set_cue_point(fa_deck* deck, fa_frames source_frame);
+FA_API fa_result FA_CALL fa_deck_get_cue_point(fa_deck* deck, fa_frames* out_source_frame);
+FA_API fa_result FA_CALL fa_deck_cue(fa_deck* deck);
+
+/* A seamless loop between two source frames, at any time, also while playing. It is
+ * made where the deck is decoded, so it follows tempo and pitch, raises
+ * FA_EVENT_LOOPED at each turn, and the position and clock report the loop as
+ * heard. Setting an out point the deck has just passed (up to 0.5 s ago, as a
+ * "loop out" button does) loops back at once, keeping the loop's phase; one further
+ * behind jumps to the in point. out <= in turns the loop off (playback carries on
+ * from where it is); a seek past the out point also leaves the loop. The deck loop
+ * replaces the CUE_IN..CUE_OUT loop of fa_stream_set_loop while it is on. Only
+ * seekable streams loop (FA_ERROR_NOT_SEEKABLE). */
+FA_API fa_result FA_CALL fa_deck_set_loop(fa_deck* deck, fa_frames loop_in, fa_frames loop_out);
+FA_API fa_result FA_CALL fa_deck_get_loop(fa_deck* deck, fa_frames* out_loop_in, fa_frames* out_loop_out);  /* 0, 0 = none */
+
+/* The deck's channel meter: after trim, EQ and fader, before the crossfader, as
+ * heard now (like fa_stream_get_levels). Zeros while the deck is silent. */
+FA_API fa_result FA_CALL fa_deck_get_levels(fa_deck* deck, fa_time window, float* out_peak, float* out_rms,
+                                            uint32_t channels);
 
 /* ---- Normalization ---------------------------------------------------- */
 

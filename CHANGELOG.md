@@ -18,6 +18,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- DJ mixer: `fa_mixer_create` opens two decks on one output with channel faders, trim, a three-band isolator EQ with kills
+  (Linkwitz-Riley crossovers at 250 Hz and 2.5 kHz), a crossfader with constant-power and linear curves, master gain,
+  the limiter always on, and per-deck meters (`fa_deck_get_levels`). Headphone cue on two more outputs of the same
+  device (`FA_CUE_CHANNELS`) or a Y-cable split (`FA_CUE_SPLIT`), with cue mix and gain. `fa_deck_set_loop` makes
+  seamless deck loops that follow tempo and pitch, including "loop out" while playing; `fa_deck_set_cue_point` and
+  `fa_deck_cue` give a CDJ-style cue. Opens in the low-latency shared mode by default (`FA_LATENCY_LOW`). New error
+  `FA_ERROR_NOT_ENOUGH_CHANNELS`. .NET: `AudioEngine.CreateDjMixer`, `DjMixer`, `DjDeck`, `DjCrossfader`, `DeckEq`.
+  See [docs/features/dj-mixer.md](docs/features/dj-mixer.md).
 - CD+G smoothness 5-10: each colour region's outline is traced along the pixel edges, smoothed by local rules (diagonal
   steps at 5, shallow slopes at 6, rounded corners at 7-8, curves after the published potrace method at 9-10) and drawn
   with exact-area anti-aliasing, the colours meeting along shared outlines so no seams appear. Only the area around a

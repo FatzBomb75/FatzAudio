@@ -631,3 +631,16 @@ internal unsafe struct FaMidiInfo
     public uint LyricCount;
     public int Karaoke;
 }
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaMixerConfig
+{
+    public uint StructSize;
+    public uint DeckCount;
+    public byte* DeviceId;
+    public int CueMode;
+    public byte* CueDeviceId;
+    public uint CueChannel;
+    public int Latency;
+    public uint Flags;
+}

@@ -463,6 +463,9 @@ double fa_tmap_pos(fa_tmap* m, int64_t at, double base_src, double base_slope, d
 /* Ring frames from `at` until the source position reaches `target` (0 if it has). */
 int64_t fa_tmap_frames_to(fa_tmap* m, int64_t at, double target, double base_src, double base_slope);
 void fa_tmap_release(fa_tmap* m, int64_t at);   /* audio thread */
+/* Drops the segments starting at or after `at` (ring frames not played yet). The
+ * caller keeps the audio thread out. */
+void fa_tmap_truncate(fa_tmap* m, int64_t at);
 
 /* ---- Loudness (loudness.c) ------------------------------------------------ */
 
@@ -513,6 +516,9 @@ void fa_tap_fit(fa_atomic_ptr* slot, fa_device* device);
 /* `n` frames played from device frame `at`; skipped frames are silence. */
 void fa_tap_write(fa_tap* t, int64_t at, const float* frames, int64_t n);
 void fa_tap_free(fa_tap* t);
+/* Levels of a tap written before the limiter (a mixer deck's), as fa_stream_get_levels
+ * reads them. The caller serializes readers of `slot` (fa_tap_fit). */
+fa_result fa_tap_levels(fa_atomic_ptr* slot, fa_device* device, fa_time window, float* out_peak, float* out_rms, uint32_t channels);
 
 /* K-weighted energy meter: one mean-square energy per 100 ms sub-block. */
 typedef struct fa_meter {
@@ -799,6 +805,11 @@ struct fa_device {
     fa_atomic32 period_frames;   /* its period (frames per callback, about), the same */
     int64_t retry_at;            /* event thread: when to try reopening again */
     struct fa_device* next;      /* engine->devices */
+    /* Mixer devices (mixer.c): the mixer that owns the device, read by the audio thread;
+     * and how the device is opened (channels 0 = the device's own count). */
+    fa_atomic_ptr mixer;
+    uint32_t open_channels;
+    int open_low_latency;
 };
 
 /* Event thread: reopens devices that went away on the system default. */
@@ -956,6 +967,10 @@ int fa_lane_advance(fa_param_voice* v, int64_t clock, int64_t frames);
 struct fa_bus {
     fa_device* device;
     fa_lane lanes[FA_MIX_PARAMS];  /* VOLUME, PAN on the device clock */
+    /* A mixer deck's bus (mixer.c): its streams mix into this stereo buffer of
+     * FA_MIXER_BLOCK frames instead of the device sum; NULL for ordinary buses. */
+    float* buf;
+    struct fa_deck* deck;        /* the deck it belongs to, NULL for ordinary buses */
 };
 
 struct fa_stream {
@@ -977,6 +992,11 @@ struct fa_stream {
     fa_shape_atomic fade_shape[2];         /* FA_FADE_IN, FA_FADE_OUT */
     fa_atomic32 loop;            /* 1 = loops (FA_OPEN_LOOP, fa_stream_set_loop); changed
                                     under decode_lock, or while the mixer skips the stream */
+    /* A loop between two source frames (fa_deck_set_loop), over the CUE_IN..CUE_OUT one:
+     * region[region_idx] = { in, out }, out 0 = none. Written under api_lock + decode_lock
+     * into the other slot, then region_idx flips, so readers never see half a change. */
+    fa_frames region[2][2];
+    fa_atomic32 region_idx;
     fa_atomic32 muted;           /* fa_stream_set_mute */
     float mute_level;            /* audio thread: 0 = audible .. 1 = silent, glides to `muted` */
     int64_t mute_next;           /* audio thread: device frame right after the last one mixed
@@ -1151,6 +1171,32 @@ struct fa_stream {
 void fa_device_render(fa_device* device, float* out, uint32_t frames);
 /* The same with an explicit callback start time (white-box tests). */
 void fa_device_render_at(fa_device* device, float* out, uint32_t frames, int64_t now_ns);
+/* What the audio callback runs: render_at, or for a mixer device its master in blocks
+ * plus the cue, laid out on the device's `channels`. */
+void fa_device_render_output(fa_device* device, float* out, uint32_t channels, uint32_t frames, int64_t now_ns);
+/* fa_device_open with options: `channels` 0 = the device's own count (else stereo),
+ * `low_latency` = the smallest shared-mode period the system gives. */
+fa_result fa_device_open_with(fa_engine* engine, const char* device_id, uint32_t channels, int low_latency,
+                              fa_device** out_device);
+
+/* ---- DJ mixer (mixer.c) -------------------------------------------------- */
+#define FA_MIXER_BLOCK 2048      /* frames per mixer pass; longer callbacks run in blocks */
+struct fa_mixer;
+/* Audio thread, inside render_at after the voices: the decks' buffers into `out`. */
+void fa_mixer_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t frames);
+/* Audio thread: the device callback of a mixer device, in blocks: render_at, then the
+ * master and the cue onto the device's `channels`. */
+void fa_mixer_render(struct fa_mixer* m, fa_device* dev, float* out, uint32_t channels, uint32_t frames, int64_t now_ns);
+/* A stream left a deck's bus (moved elsewhere, detached or closed): the deck is empty. */
+void fa_mixer_bus_left(fa_bus* bus, struct fa_stream* s);
+/* fa_device_close on a mixer's device closes the mixer (which closes the device). */
+void fa_mixer_destroy_from_device(struct fa_mixer* m);
+
+/* Deck loops (stream.c): a loop between source frames `in` and `out` over the
+ * CUE_IN..CUE_OUT one; out <= in turns it off. Joins the decode-ahead audio without
+ * a gap (see the comment there). */
+fa_result fa_stream_set_loop_region(struct fa_stream* s, fa_frames in, fa_frames out);
+void fa_stream_get_loop_region(struct fa_stream* s, fa_frames* out_in, fa_frames* out_out);
 /* Device frame at the speaker at monotonic time `now_ns` (latency included). */
 double fa_device_speaker_frame(fa_device* device, int64_t now_ns);
 void fa_device_wait_quiescent(fa_device* device);
