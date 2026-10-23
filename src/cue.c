@@ -412,6 +412,8 @@ void fa_mixer_test_cue_take_over(fa_mixer* m, uint32_t rate, uint32_t period, fa
     fa_bridge_reserve(&q->br, rate);
     fa_store32(&q->br.reset, 1);
     fa_store64(&q->br.held_ns, 0);
+    fa_store32(&q->br.underruns, 0);   /* what the real devices did before is not the test's */
+    fa_store32(&q->br.overruns, 0);
     fa_store32(&q->lost, 0);
     q->lost_reported = 0;
     fa_store32(&q->running, 1);
