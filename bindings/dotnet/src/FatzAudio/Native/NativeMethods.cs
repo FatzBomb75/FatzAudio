@@ -596,6 +596,12 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_encoder_attach_stream(EncoderHandle encoder, StreamHandle stream);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_encoder_attach_mixer(EncoderHandle encoder, nint mixer, int tap);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mixer_start_recording(nint mixer, nint* encoders, uint count, long deviceTime, uint flags);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_encoder_encode_stream(EncoderHandle encoder, StreamHandle stream);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
@@ -716,4 +722,22 @@ internal static unsafe partial class NativeMethods
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_mic_get_levels(MicHandle mic, long window, out float peak, out float rms);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_mic_effects_init(FaMicEffects* effects);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mixer_set_mic_effects(nint mixer, FaMicEffects* effects);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mixer_get_mic_effects(nint mixer, FaMicEffects* effects);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_ducking_init(FaDucking* ducking);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mixer_set_ducking(nint mixer, FaDucking* ducking);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mixer_get_ducking(nint mixer, FaDucking* ducking);
 }

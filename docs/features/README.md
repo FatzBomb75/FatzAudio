@@ -13,7 +13,7 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Track analysis (beat grid and BPM, musical key, waveform overview; exact grids from MIDI and tracker files; cache) | [analysis.md](analysis.md) | ✅ (tempo maps and bar detection from audio 🗓️) |
 | Crossfades, markers, queues and gapless, scheduled starts | [crossfade.md](crossfade.md) | ✅ |
 | Buses (decks, groups) and the channel matrix | [buses.md](buses.md) | ✅ |
-| DJ mixer (two decks, isolator EQ with kills, crossfader curves, headphone cue on outputs 3-4 or a Y-cable, seamless deck loops, cue points, meters, two karaoke mics with gate, EQ and latency report) | [dj-mixer.md](dj-mixer.md) | ✅ (mic effects, ducking, sync, more decks, second-device cue 🗓️) |
+| DJ mixer (two decks, isolator EQ with kills, crossfader curves, headphone cue on outputs 3-4 or a Y-cable, seamless deck loops, cue points, meters, two karaoke mics with gate, EQ, reverb, echo, host ducking, latency report and aligned stem recording) | [dj-mixer.md](dj-mixer.md) | ✅ (setup check, sync, more decks, second-device cue 🗓️) |
 | Tempo, pitch and rate (time-stretch, key change, varispeed, formants) | [tempo-pitch.md](tempo-pitch.md) | ✅ |
 | FFmpeg hand-off and A/V sync (packets, frames, presentation clock) | [ffmpeg.md](ffmpeg.md) | ✅ |
 | Web streams and HLS (HTTP/HTTPS, radio titles, reconnects, HLS) | [web-streams.md](web-streams.md) | ✅ |

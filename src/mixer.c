@@ -231,8 +231,10 @@ void fa_mixer_render(struct fa_mixer* m, fa_device* dev, float* out, uint32_t ch
     uint32_t done, n;
     for (done = 0; done < frames; done += n) {
         float mute0 = dev->mute_level;   /* audio thread only, as render_block uses it */
+        int64_t clock = fa_load64(&dev->clock);
         n = frames - done < FA_MIXER_BLOCK ? frames - done : FA_MIXER_BLOCK;
         fa_device_render_at(dev, m->master, n, now_ns + (int64_t)((double)done * 1e9 / dev->rate));
+        if (fa_load_ptr(&m->encoders)) fa_encode_mixer_push(m, FA_MIXER_TAP_MASTER, m->master, n, clock);
         lay_out(m, m->master, out + (size_t)done * channels, channels, n, mute0, dev->mute_level, dev->rate);
     }
 }
@@ -254,6 +256,7 @@ static void free_mixer(struct fa_mixer* m)
     uint32_t i;
     for (i = 0; i < m->deck_count; i++) fa_tap_free((fa_tap*)fa_load_ptr(&m->decks[i].tap));
     fa_mixer_mics_free_removed(m);
+    fa_mic_bus_free((fa_mic_bus*)fa_load_ptr(&m->bus));
     fa_mutex_destroy(&m->cb_lock);
     fa_mutex_destroy(&m->lock);
     free(m);
@@ -338,6 +341,7 @@ FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_confi
     fa_lane_init(&m->lanes[ML_MASTER], 1.0f);
     fa_lane_init(&m->lanes[ML_CUE_MIX], 0.0f);
     fa_lane_init(&m->lanes[ML_CUE_GAIN], 1.0f);
+    fa_mixer_fx_defaults(m);
     m->lp1 = fa_mixer_design(0, ISO_LOW_HZ, dev->rate);
     m->hp1 = fa_mixer_design(1, ISO_LOW_HZ, dev->rate);
     m->lp2 = fa_mixer_design(0, ISO_HIGH_HZ, dev->rate);
@@ -393,6 +397,7 @@ FA_API void FA_CALL fa_mixer_destroy(fa_mixer* mixer)
     }
     fa_mutex_unlock(&mixer->lock);
     dev = mixer->device;
+    fa_encode_mixer_closing(mixer);   /* recordings of its taps end here */
     /* Stop it first: a callback without the mixer would lay stereo out on all the
      * device's channels (a 4-channel cue device), a burst of noise until the close. */
     fa_device_stop(dev);

@@ -39,6 +39,7 @@ typedef struct sim {
     double owed;                 /* input frames due but not fed yet */
     float* out;                  /* everything rendered, stereo */
     uint32_t frames, cap;
+    fa_stream* music;            /* on deck A, when a test plays music */
 } sim;
 
 static int sim_open(sim* s)
@@ -60,6 +61,7 @@ static int sim_mic(sim* s, int32_t channel, uint32_t in_rate, double in_true, ui
     fa_mic_config_init(&mc);
     mc.channel = channel;
     if (fa_mixer_add_mic(s->m, &mc, &mic) != FA_OK) return 0;
+    fa_mic_set_param(mic, FA_MIC_REVERB_SEND, 0.0f);   /* dry: the strip alone (the effects have their own tests) */
     if (!s->mic) {
         s->mic = mic;
         s->in_rate = in_rate;
@@ -75,7 +77,41 @@ static int sim_mic(sim* s, int32_t channel, uint32_t in_rate, double in_true, ui
 static void sim_close(sim* s)
 {
     fa_mixer_destroy(s->m);
+    if (s->music) fa_stream_close(s->music);
     free(s->out);
+}
+
+/* A 16-bit mono WAV of a sine at amplitude 0.25. */
+static uint8_t* sine_wav(uint32_t rate, uint32_t frames, double hz, size_t* size)
+{
+    size_t data = (size_t)frames * 2, n = 44 + data;
+    uint8_t* b = (uint8_t*)malloc(n);
+    uint32_t i, v;
+    memcpy(b, "RIFF", 4); v = (uint32_t)(n - 8); memcpy(b + 4, &v, 4); memcpy(b + 8, "WAVEfmt ", 8);
+    v = 16; memcpy(b + 16, &v, 4);
+    b[20] = 1; b[21] = 0; b[22] = 1; b[23] = 0;
+    memcpy(b + 24, &rate, 4); v = rate * 2; memcpy(b + 28, &v, 4);
+    b[32] = 2; b[33] = 0; b[34] = 16; b[35] = 0;
+    memcpy(b + 36, "data", 4); v = (uint32_t)data; memcpy(b + 40, &v, 4);
+    for (i = 0; i < frames; i++) {
+        int16_t sv = (int16_t)lrint(8192.0 * sin(2.0 * k_pi * hz * i / rate));
+        memcpy(b + 44 + (size_t)i * 2, &sv, 2);
+    }
+    *size = n;
+    return b;
+}
+
+/* Music on deck A: a sine of `hz`, `seconds` long, playing (crossfader in the middle:
+ * heard at -3 dB). */
+static int sim_music(sim* s, double hz, double seconds)
+{
+    size_t n;
+    fa_deck* a;
+    uint8_t* wav = sine_wav(s->dev->rate, (uint32_t)(seconds * s->dev->rate), hz, &n);
+    int ok = fa_stream_open_memory(g_engine, wav, n, NULL, &s->music) == FA_OK;
+    free(wav);
+    fa_mixer_get_deck(s->m, 0, &a);
+    return ok && fa_deck_load(a, s->music, 0) == FA_OK && fa_stream_play(s->music) == FA_OK;
 }
 
 /* Runs `seconds` of master time: input periods as they fall due, master blocks of OUT_BLOCK. */
@@ -88,6 +124,11 @@ static void sim_run(sim* s, double seconds)
         s->out = (float*)realloc(s->out, (size_t)s->cap * 2 * sizeof(float));
     }
     for (done = 0; done < total; done += OUT_BLOCK) {
+        int w;
+        for (w = 0; s->music && w < 2000; w++) {   /* the deck's worker has the block decoded */
+            if (fa_ring_readable(&s->music->ring) >= OUT_BLOCK || fa_load32(&s->music->eof)) break;
+            fa_sleep_ms(1);
+        }
         s->owed += (double)OUT_BLOCK * s->in_true / (double)s->dev->rate;
         while (s->owed >= (double)s->in_period) {
             uint32_t i, c;
@@ -240,7 +281,7 @@ static void test_gain_mute_pan_monitor(void)
     CHECK_EQ(fa_mic_get_levels(mic, 100000000, &peak, &rms), FA_OK);
     CHECK_NEAR(peak, 0.25, 0.01);                /* but metered */
     CHECK_NEAR(rms, k_sine_rms, 0.01);
-    /* Clamping, switches and the planned sends. */
+    /* Clamping, switches and the sends. */
     CHECK_EQ(fa_mic_set_param(mic, FA_MIC_GAIN_DB, 99.0f), FA_OK);
     CHECK_EQ(fa_mic_get_param(mic, FA_MIC_GAIN_DB, &v), FA_OK);
     CHECK_NEAR(v, 40.0, 1e-6);
@@ -250,8 +291,12 @@ static void test_gain_mute_pan_monitor(void)
     CHECK_EQ(fa_mic_set_param(mic, FA_MIC_LOW_CUT, 0.7f), FA_OK);
     CHECK_EQ(fa_mic_get_param(mic, FA_MIC_LOW_CUT, &v), FA_OK);
     CHECK_NEAR(v, 1.0, 1e-6);
-    CHECK_EQ(fa_mic_set_param(mic, FA_MIC_REVERB_SEND, 0.3f), FA_ERROR_NOT_IMPLEMENTED);
-    CHECK_EQ(fa_mic_set_param(mic, FA_MIC_ECHO_SEND, 0.3f), FA_ERROR_NOT_IMPLEMENTED);
+    CHECK_EQ(fa_mic_set_param(mic, FA_MIC_REVERB_SEND, 3.0f), FA_OK);
+    CHECK_EQ(fa_mic_get_param(mic, FA_MIC_REVERB_SEND, &v), FA_OK);
+    CHECK_NEAR(v, 1.0, 1e-6);
+    CHECK_EQ(fa_mic_set_param(mic, FA_MIC_ECHO_SEND, -1.0f), FA_OK);
+    CHECK_EQ(fa_mic_get_param(mic, FA_MIC_ECHO_SEND, &v), FA_OK);
+    CHECK_NEAR(v, 0.0, 1e-6);
     CHECK_EQ(fa_mic_set_param(mic, (fa_mic_param)99, 0.0f), FA_ERROR_INVALID_ARG);
     sim_close(&s);
 }
@@ -322,6 +367,7 @@ static void test_two_mics_one_input(void)
         return;
     }
     CHECK_EQ(fa_mixer_add_mic(s.m, &mc, &b), FA_OK);
+    fa_mic_set_param(b, FA_MIC_REVERB_SEND, 0.0f);
     CHECK(b->cap == a->cap);
     CHECK(b->lane != a->lane);
     CHECK_EQ(fa_mic_get_index(b, &idx), FA_OK);
@@ -474,6 +520,323 @@ static void test_config_errors(void)
     sim_close(&s);
 }
 
+/* ---- the mic bus: effects, ducking, recording ---------------------------------- */
+
+static double rms_at(const sim* s, uint32_t c, uint32_t from, uint32_t n)
+{
+    double sq = 0.0;
+    uint32_t i;
+    for (i = from; i < from + n && i < s->frames; i++) sq += (double)s->out[i * 2 + c] * s->out[i * 2 + c];
+    return sqrt(sq / n);
+}
+
+/* The first frame from `from` on where channel 0 goes above `level`. */
+static uint32_t onset(const sim* s, uint32_t from, float level)
+{
+    uint32_t i;
+    for (i = from; i < s->frames; i++)
+        if (fabsf(s->out[i * 2]) > level) return i;
+    return s->frames;
+}
+
+static void test_effects_settings(void)
+{
+    sim s;
+    fa_mic_effects e;
+    fa_ducking d;
+    fa_mic_config mc;
+    fa_mic* mic;
+    float v = -1.0f;
+    CHECK(sim_open(&s));
+    fa_mic_config_init(&mc);
+    CHECK_EQ(fa_mixer_add_mic(s.m, &mc, &mic), FA_OK);
+    CHECK_EQ(fa_mic_get_param(mic, FA_MIC_REVERB_SEND, &v), FA_OK);
+    CHECK_NEAR(v, 0.2, 1e-6);                         /* karaoke: a little reverb from the start */
+    CHECK_EQ(fa_mic_get_param(mic, FA_MIC_ECHO_SEND, &v), FA_OK);
+    CHECK_NEAR(v, 0.0, 1e-6);
+    fa_mic_effects_init(&e);
+    CHECK_EQ(fa_mixer_get_mic_effects(s.m, &e), FA_OK);
+    CHECK_NEAR(e.reverb_size, 0.5, 1e-6);
+    CHECK_NEAR(e.echo_time_ms, 250.0, 1e-6);
+    CHECK_NEAR(e.echo_feedback, 0.35, 1e-6);
+    e.reverb_size = 3.0f;
+    e.echo_time_ms = 5.0f;
+    e.echo_feedback = 2.0f;
+    e.echo_tone = -1.0f;
+    CHECK_EQ(fa_mixer_set_mic_effects(s.m, &e), FA_OK);
+    CHECK_EQ(fa_mixer_get_mic_effects(s.m, &e), FA_OK);
+    CHECK_NEAR(e.reverb_size, 1.0, 1e-6);
+    CHECK_NEAR(e.echo_time_ms, 20.0, 1e-6);
+    CHECK_NEAR(e.echo_feedback, 0.9, 1e-6);
+    CHECK_NEAR(e.echo_tone, 0.0, 1e-6);
+    e.echo_tone = NAN;
+    CHECK_EQ(fa_mixer_set_mic_effects(s.m, &e), FA_ERROR_INVALID_ARG);
+    e.struct_size = 4;
+    CHECK_EQ(fa_mixer_set_mic_effects(s.m, &e), FA_ERROR_INVALID_ARG);
+    fa_ducking_init(&d);
+    CHECK_EQ(fa_mixer_get_ducking(s.m, &d), FA_OK);
+    CHECK_NEAR(d.depth_db, -12.0, 1e-6);              /* on from the start */
+    CHECK_EQ(d.hold, 300000000);
+    d.depth_db = -100.0f;
+    d.attack = 0;
+    CHECK_EQ(fa_mixer_set_ducking(s.m, &d), FA_OK);
+    CHECK_EQ(fa_mixer_get_ducking(s.m, &d), FA_OK);
+    CHECK_NEAR(d.depth_db, -40.0, 1e-6);
+    CHECK_EQ(d.attack, 1000000);
+    CHECK_EQ(fa_mixer_set_ducking(s.m, NULL), FA_OK);
+    CHECK_EQ(fa_mixer_get_ducking(s.m, &d), FA_OK);
+    CHECK_NEAR(d.depth_db, 0.0, 1e-6);
+    sim_close(&s);
+}
+
+/* The reverb: a tail after the voice stops, longer for a bigger room; none without a send. */
+static double reverb_tail(float size, float send)
+{
+    sim s;
+    fa_mic* mic;
+    fa_mic_effects e;
+    uint32_t stop;
+    double tail;
+    if (!sim_open(&s)) return -1.0;
+    if (!sim_mic(&s, -1, s.dev->rate, s.dev->rate, 1, &mic)) { sim_close(&s); return -1.0; }
+    fa_mic_effects_init(&e);
+    e.reverb_size = size;
+    fa_mixer_set_mic_effects(s.m, &e);
+    fa_mic_set_param(mic, FA_MIC_REVERB_SEND, send);
+    s.hz[0] = 700.0;
+    s.amp[0] = 0.25;
+    sim_run(&s, 1.0);
+    s.amp[0] = 0.0;
+    stop = s.frames;
+    sim_run(&s, 2.0);
+    /* 0.5 .. 1 s after the voice stopped: only the tail is left (the gate closed long ago). */
+    tail = rms_at(&s, 0, stop + s.dev->rate / 2, s.dev->rate / 2);
+    sim_close(&s);
+    return tail;
+}
+
+static void test_reverb(void)
+{
+    double none = reverb_tail(0.5f, 0.0f), room = reverb_tail(0.0f, 1.0f), hall = reverb_tail(1.0f, 1.0f);
+    CHECK(none >= 0.0 && none < 1e-7);
+    CHECK(room > 0.0 && hall > 0.0);
+    CHECK(hall > room * 10.0);          /* a hall rings on long after a small room */
+    CHECK(hall < k_sine_rms);           /* and stays below the voice */
+}
+
+/* The echo: repeats at the set time, each `feedback` of the one before. */
+static void test_echo(void)
+{
+    sim s;
+    fa_mic* mic;
+    fa_mic_effects e;
+    uint32_t t0, d, burst;
+    double first, r1, r2;
+    CHECK(sim_open(&s));
+    CHECK(sim_mic(&s, -1, s.dev->rate, s.dev->rate, 1, &mic));
+    fa_mic_effects_init(&e);
+    e.echo_time_ms = 100.0f;
+    e.echo_feedback = 0.5f;
+    e.echo_tone = 1.0f;
+    CHECK_EQ(fa_mixer_set_mic_effects(s.m, &e), FA_OK);
+    CHECK_EQ(fa_mic_set_param(mic, FA_MIC_ECHO_SEND, 1.0f), FA_OK);
+    CHECK_EQ(fa_mic_set_param(mic, FA_MIC_GATE_DB, -100.0f), FA_OK);
+    s.hz[0] = 1000.0;
+    sim_run(&s, 0.5);                   /* the input runs, silent */
+    s.amp[0] = 0.25;
+    sim_run(&s, 0.03);
+    s.amp[0] = 0.0;
+    sim_run(&s, 1.0);
+    t0 = onset(&s, 0, 0.05f);
+    CHECK(t0 < s.frames);
+    d = s.dev->rate / 10;
+    burst = s.dev->rate / 100;          /* the middle 10 ms of each */
+    first = rms_at(&s, 0, t0 + burst / 2, burst);
+    r1 = rms_at(&s, 0, t0 + d + burst / 2, burst);
+    r2 = rms_at(&s, 0, t0 + 2 * d + burst / 2, burst);
+    CHECK_NEAR(first / k_sine_rms, 1.0, 0.05);
+    CHECK_NEAR(r1 / first, 1.0, 0.05);  /* the first repeat is the send */
+    CHECK_NEAR(r2 / r1, 0.5, 0.05);     /* then the feedback */
+    CHECK(rms_at(&s, 0, t0 + d / 2, burst) < 0.01 * first);   /* quiet between repeats */
+    sim_close(&s);
+}
+
+/* A host's voice ducks the music; a singer's does not; NULL turns it off. */
+static void test_ducking(void)
+{
+    sim s;
+    fa_mic* host;
+    fa_mic* singer;
+    fa_mic_config mc;
+    double music, ducked;
+    CHECK(sim_open(&s));
+    CHECK(sim_music(&s, 200.0, 12.0));
+    CHECK(sim_mic(&s, 0, s.dev->rate, s.dev->rate, 2, &host));
+    fa_mic_config_init(&mc);
+    mc.channel = 1;
+    CHECK_EQ(fa_mixer_add_mic(s.m, &mc, &singer), FA_OK);
+    fa_mic_set_param(singer, FA_MIC_REVERB_SEND, 0.0f);
+    fa_mic_remove(host);                /* again, now as a host */
+    mc.channel = 0;
+    mc.flags = FA_MIC_DUCKS_MUSIC;
+    CHECK_EQ(fa_mixer_add_mic(s.m, &mc, &host), FA_OK);
+    s.mic = singer;                     /* drives the shared input */
+    /* Neither heard, so the output is the music alone. */
+    CHECK_EQ(fa_mic_set_param(host, FA_MIC_MONITOR, 0.0f), FA_OK);
+    CHECK_EQ(fa_mic_set_param(singer, FA_MIC_MONITOR, 0.0f), FA_OK);
+    s.hz[0] = 1000.0;
+    s.hz[1] = 1500.0;
+    sim_run(&s, 1.0);
+    music = last_rms(&s, 0, 0.5);
+    CHECK_NEAR(music / (k_sine_rms * 0.70710678), 1.0, 0.02);
+    s.amp[0] = 0.25;                    /* the host speaks */
+    sim_run(&s, 1.0);
+    ducked = last_rms(&s, 0, 0.5);
+    CHECK_NEAR(20.0 * log10(ducked / music), -12.0, 0.3);
+    s.amp[0] = 0.0;
+    sim_run(&s, 0.2);                   /* held */
+    CHECK_NEAR(20.0 * log10(last_rms(&s, 0, 0.1) / music), -12.0, 0.3);
+    sim_run(&s, 1.2);                   /* released */
+    CHECK_NEAR(last_rms(&s, 0, 0.3) / music, 1.0, 0.02);
+    s.amp[1] = 0.25;                    /* a singer never ducks */
+    sim_run(&s, 1.0);
+    CHECK_NEAR(last_rms(&s, 0, 0.5) / music, 1.0, 0.02);
+    s.amp[1] = 0.0;
+    CHECK_EQ(fa_mic_set_param(host, FA_MIC_MUTE, 1.0f), FA_OK);
+    s.amp[0] = 0.25;                    /* a muted host does not either */
+    sim_run(&s, 1.0);
+    CHECK_NEAR(last_rms(&s, 0, 0.5) / music, 1.0, 0.02);
+    CHECK_EQ(fa_mic_set_param(host, FA_MIC_MUTE, 0.0f), FA_OK);
+    CHECK_EQ(fa_mixer_set_ducking(s.m, NULL), FA_OK);
+    sim_run(&s, 1.0);                   /* off */
+    CHECK_NEAR(last_rms(&s, 0, 0.5) / music, 1.0, 0.02);
+    sim_close(&s);
+}
+
+/* Recording: a WAV in memory, forward only. */
+typedef struct membuf { uint8_t* data; size_t size, cap; } membuf;
+
+static fa_result FA_CALL mem_write(void* user, const void* data, size_t size)
+{
+    membuf* b = (membuf*)user;
+    if (b->size + size > b->cap) {
+        b->cap = (b->size + size) * 2;
+        b->data = (uint8_t*)realloc(b->data, b->cap);
+    }
+    memcpy(b->data + b->size, data, size);
+    b->size += size;
+    return FA_OK;
+}
+
+static fa_encoder* mem_encoder(membuf* b)
+{
+    fa_encoder_options o;
+    fa_encoder_output out = { mem_write, NULL, NULL };
+    fa_encoder* e = NULL;
+    memset(b, 0, sizeof(*b));
+    fa_encoder_options_init(&o);
+    o.bits_per_sample = 32;             /* float: the samples exactly */
+    if (fa_encoder_create_output(&out, b, &o, &e) != FA_OK) return NULL;
+    return e;
+}
+
+/* The float frames of a recorded WAV, copied out (the data chunk need not be aligned). */
+static float* wav_frames(const membuf* b, uint32_t* frames)
+{
+    size_t i;
+    for (i = 12; i + 8 <= b->size; i++)
+        if (memcmp(b->data + i, "data", 4) == 0) {
+            float* f;
+            *frames = (uint32_t)((b->size - i - 8) / 8);
+            f = (float*)malloc((size_t)*frames * 8 + 8);
+            if (f) memcpy(f, b->data + i + 8, (size_t)*frames * 8);
+            return f;
+        }
+    *frames = 0;
+    return NULL;
+}
+
+static void recording(uint32_t flags)
+{
+    sim s;
+    fa_mic* mic;
+    membuf mb, vb;
+    fa_encoder* enc[2];
+    float* mf;
+    float* vf;
+    uint32_t mn = 0, vn = 0, i, bad = 0, from;
+    int64_t shift;
+    float other;
+    fa_mixer_latency lat;
+    CHECK(sim_open(&s));
+    CHECK(sim_mic(&s, -1, s.dev->rate, s.dev->rate, 1, &mic));
+    s.hz[0] = 440.0;
+    s.amp[0] = 0.25;
+    sim_run(&s, 0.5);
+    enc[0] = mem_encoder(&mb);
+    enc[1] = mem_encoder(&vb);
+    CHECK(enc[0] && enc[1]);
+    CHECK_EQ(fa_encoder_attach_mixer(enc[0], s.m, FA_MIXER_TAP_MASTER), FA_OK);
+    CHECK_EQ(fa_encoder_attach_mixer(enc[1], s.m, FA_MIXER_TAP_VOCALS), FA_OK);
+    sim_run(&s, 0.1);                   /* attached, not started: nothing yet */
+    CHECK_EQ(fa_mixer_start_recording(s.m, enc, 2, 0, flags), FA_OK);
+    CHECK_EQ(fa_mixer_start_recording(s.m, enc, 1, 0, flags), FA_ERROR_BUSY);
+    from = s.frames + FA_MIXER_BLOCK;   /* the earliest start: one block ahead */
+    sim_run(&s, 1.0);
+    lat.struct_size = sizeof(lat);
+    CHECK_EQ(fa_mixer_get_latency(s.m, &lat), FA_OK);
+    /* Both start with what the mixer made on the start frame (the master's limiter
+     * look-ahead allowed for); aligned, the vocals then start later by the round trip
+     * the singer hears: the look-ahead, the master's OS latency and the mic's input. */
+    shift = flags & FA_MIXER_REC_RAW_TIMING ? 0 : fa_mixer_vocal_shift(s.m);
+    CHECK(flags & FA_MIXER_REC_RAW_TIMING ||
+          llabs(shift - (int64_t)((double)(lat.mic_input[0] + fa_load64(&s.dev->latency_ns)) * 1e-9 * s.dev->rate) -
+                s.dev->limiter.delay) <= 1);
+    CHECK_EQ(fa_encoder_close(enc[0]), FA_OK);
+    CHECK_EQ(fa_encoder_close(enc[1]), FA_OK);
+    mf = wav_frames(&mb, &mn);
+    vf = wav_frames(&vb, &vn);
+    CHECK(mf && vf);
+    CHECK_EQ(mn, s.frames - from - s.dev->limiter.delay);   /* exactly from the start frame */
+    CHECK_EQ((int64_t)vn, (int64_t)(s.frames - from) - shift);
+    /* Only the voice plays, at unity through the master: the vocals file is the master
+     * file, `shift` frames on. */
+    for (i = 0; i < vn && i + shift < mn; i++) {
+        other = mf[(i + shift) * 2];
+        if (fabsf(vf[i * 2] - other) > 1e-6f) bad++;
+    }
+    free(mf);
+    free(vf);
+    CHECK_EQ(bad, 0);
+    free(mb.data);
+    free(vb.data);
+    sim_close(&s);
+}
+
+static void test_recording_aligned(void) { recording(0); }
+static void test_recording_raw(void) { recording(FA_MIXER_REC_RAW_TIMING); }
+
+static void test_recording_errors(void)
+{
+    sim s, t;
+    membuf b;
+    fa_encoder* e;
+    CHECK(sim_open(&s));
+    CHECK(sim_open(&t));
+    e = mem_encoder(&b);
+    CHECK(e != NULL);
+    CHECK_EQ(fa_encoder_attach_mixer(e, s.m, (fa_mixer_tap)7), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_mixer_start_recording(s.m, &e, 1, 0, 0), FA_ERROR_INVALID_ARG);   /* not attached */
+    CHECK_EQ(fa_encoder_attach_mixer(e, s.m, FA_MIXER_TAP_MASTER), FA_OK);
+    CHECK_EQ(fa_encoder_attach_mixer(e, s.m, FA_MIXER_TAP_MASTER), FA_ERROR_BUSY);
+    CHECK_EQ(fa_mixer_start_recording(t.m, &e, 1, 0, 0), FA_ERROR_INVALID_ARG);   /* another mixer */
+    CHECK_EQ(fa_mixer_start_recording(s.m, &e, 1, 0, 1u << 5), FA_ERROR_INVALID_ARG);
+    sim_close(&s);                      /* the mixer goes first: the encoder loses its source */
+    CHECK_EQ(fa_encoder_close(e), FA_OK);
+    free(b.data);
+    sim_close(&t);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -494,6 +857,13 @@ int main(void)
     RUN(test_input_lost);
     RUN(test_destroy_in_callback);
     RUN(test_config_errors);
+    RUN(test_effects_settings);
+    RUN(test_reverb);
+    RUN(test_echo);
+    RUN(test_ducking);
+    RUN(test_recording_aligned);
+    RUN(test_recording_raw);
+    RUN(test_recording_errors);
 
     fa_engine_destroy(g_engine);
     if (g_failures) { fprintf(stderr, "%d failure(s)\n", g_failures); return 1; }

@@ -1,5 +1,6 @@
 /* Mixer mics: capture devices bridged into the master callback, and each mic's
- * channel strip (low cut, gain, gate, EQ, meter, mute, pan).
+ * channel strip (low cut, gain, gate, EQ, meter, mute, pan, sends) into the mic bus
+ * (mic_fx.c).
  *
  * An input device runs on its own clock. Its callback copies the channels the mics
  * read into a ring (capture_write); the master callback takes them out through the
@@ -187,7 +188,12 @@ static void capture_pull(fa_capture* c, fa_device* dev, uint32_t frames)
 
 static float db_to_lin(float db) { return powf(10.0f, db / 20.0f); }
 
-static void mic_process(struct fa_mixer* m, struct fa_mic* mic, fa_device* dev, int64_t clock, float* out, uint32_t frames)
+/* Per sub-block edge (start, end): the gains after the strip. */
+typedef struct strip_out {
+    float audible[2], monitor[2], left[2], right[2], reverb[2], echo[2];
+} strip_out;
+
+static void mic_process(struct fa_mic* mic, fa_mic_bus* b, fa_device* dev, int64_t clock, uint32_t frames)
 {
     fa_capture* c = mic->cap;
     uint32_t rate = dev->rate, off, i;
@@ -199,17 +205,17 @@ static void mic_process(struct fa_mixer* m, struct fa_mic* mic, fa_device* dev, 
     float rel = 1.0f / ((float)GATE_RELEASE_MS * 0.001f * (float)rate);
     float fade_step = 1.0f / ((float)MIC_FADE_MS * 0.001f * (float)rate);
     int64_t hold_frames = (int64_t)(GATE_HOLD_MS * 0.001 * (double)rate);
-    float gl[FA_MIXER_BLOCK / MIXER_SUB + 1][2], gr[FA_MIXER_BLOCK / MIXER_SUB + 1][2];
+    strip_out so[FA_MIXER_BLOCK / MIXER_SUB + 1];
+    int host = (mic->flags & FA_MIC_DUCKS_MUSIC) != 0;
     fa_tap* tap;
     uint32_t k;
-    (void)m;
     take_lanes(mic->lanes, MIC_LANES, rate);
     /* Low cut, gain and gate into buf (the mono voice on both channels, for the EQ and
-     * the meter); the output gains (mute, monitor, pan) kept per sub-block. */
+     * the meter); the output gains (mute, monitor, pan, sends) kept per sub-block. */
     for (off = 0, k = 0; off < frames; off += MIXER_SUB, k++) {
         uint32_t n = frames - off < MIXER_SUB ? frames - off : MIXER_SUB;
         float v0[MIC_LANES], v1[MIC_LANES], g0, g1, inv = 1.0f / (float)n;
-        float o0, o1;
+        int e;
         lane_span(mic->lanes, MIC_LANES, clock, clock + off, n, v0, v1);
         g0 = db_to_lin(v0[MIC_GAIN]);
         g1 = db_to_lin(v1[MIC_GAIN]);
@@ -244,12 +250,15 @@ static void mic_process(struct fa_mixer* m, struct fa_mic* mic, fa_device* dev, 
             mic->buf[(size_t)(off + i) * 2] = x;
             mic->buf[(size_t)(off + i) * 2 + 1] = x;
         }
-        o0 = (1.0f - v0[MIC_MUTE]) * v0[MIC_MONITOR];
-        o1 = (1.0f - v1[MIC_MUTE]) * v1[MIC_MONITOR];
-        gl[k][0] = o0 * (v0[MIC_PAN] > 0.0f ? 1.0f - v0[MIC_PAN] : 1.0f);
-        gr[k][0] = o0 * (v0[MIC_PAN] < 0.0f ? 1.0f + v0[MIC_PAN] : 1.0f);
-        gl[k][1] = o1 * (v1[MIC_PAN] > 0.0f ? 1.0f - v1[MIC_PAN] : 1.0f);
-        gr[k][1] = o1 * (v1[MIC_PAN] < 0.0f ? 1.0f + v1[MIC_PAN] : 1.0f);
+        for (e = 0; e < 2; e++) {
+            const float* v = e ? v1 : v0;
+            so[k].audible[e] = 1.0f - v[MIC_MUTE];
+            so[k].monitor[e] = v[MIC_MONITOR];
+            so[k].left[e] = v[MIC_PAN] > 0.0f ? 1.0f - v[MIC_PAN] : 1.0f;
+            so[k].right[e] = v[MIC_PAN] < 0.0f ? 1.0f + v[MIC_PAN] : 1.0f;
+            so[k].reverb[e] = v[MIC_REVERB];
+            so[k].echo[e] = v[MIC_ECHO];
+        }
     }
     if (fabsf(mic->hp_z[0]) < 1e-20f) mic->hp_z[0] = 0.0f;
     if (fabsf(mic->hp_z[1]) < 1e-20f) mic->hp_z[1] = 0.0f;
@@ -257,15 +266,29 @@ static void mic_process(struct fa_mixer* m, struct fa_mic* mic, fa_device* dev, 
     if (fa_eq_begin(&mic->eq_st, &mic->eq, rate, 0)) fa_eq_process(&mic->eq_st, mic->buf, frames);
     tap = (fa_tap*)fa_load_ptr(&mic->tap);
     if (tap) fa_tap_write(tap, clock, mic->buf, frames);
+    /* Into the bus: heard (vox and the sends) or not (dry, for the vocals tap), and the
+     * host's level for the ducker. */
+    if (host) b->hosts++;
     for (off = 0, k = 0; off < frames; off += MIXER_SUB, k++) {
+        const strip_out* q = &so[k];
         uint32_t n = frames - off < MIXER_SUB ? frames - off : MIXER_SUB;
         float inv = 1.0f / (float)n;
-        if (gl[k][0] == 0.0f && gl[k][1] == 0.0f && gr[k][0] == 0.0f && gr[k][1] == 0.0f) continue;
+        if (q->audible[0] == 0.0f && q->audible[1] == 0.0f) continue;
         for (i = 0; i < n; i++) {
-            float f = (float)i * inv, y = mic->buf[(size_t)(off + i) * 2];
-            float* o = out + (size_t)(off + i) * 2;
-            o[0] += y * (gl[k][0] + (gl[k][1] - gl[k][0]) * f);
-            o[1] += y * (gr[k][0] + (gr[k][1] - gr[k][0]) * f);
+            float f = (float)i * inv;
+            size_t at = off + i;
+            float y = mic->buf[at * 2] * (q->audible[0] + (q->audible[1] - q->audible[0]) * f);
+            float mo = q->monitor[0] + (q->monitor[1] - q->monitor[0]) * f, heard = y * mo, quiet = y - heard;
+            float l = q->left[0] + (q->left[1] - q->left[0]) * f, r = q->right[0] + (q->right[1] - q->right[0]) * f;
+            float rs = q->reverb[0] + (q->reverb[1] - q->reverb[0]) * f, es = q->echo[0] + (q->echo[1] - q->echo[0]) * f;
+            b->vox[at * 2] += heard * l;
+            b->vox[at * 2 + 1] += heard * r;
+            b->dry[at * 2] += quiet * l;
+            b->dry[at * 2 + 1] += quiet * r;
+            b->rsend[at * 2] += heard * rs * 0.5f;   /* the reverb takes left + right */
+            b->rsend[at * 2 + 1] += heard * rs * 0.5f;
+            b->esend[at] += heard * es;
+            if (host && fabsf(y) > b->duck[at]) b->duck[at] = fabsf(y);
         }
     }
     end_lanes(mic->lanes, MIC_LANES, clock, frames);
@@ -274,7 +297,21 @@ static void mic_process(struct fa_mixer* m, struct fa_mic* mic, fa_device* dev, 
 void fa_mixer_mics_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t frames)
 {
     int64_t clock = fa_load64(&dev->clock);
+    fa_mic_bus* b = (fa_mic_bus*)fa_load_ptr(&m->bus);
     uint32_t i;
+    size_t stereo = (size_t)frames * FA_DEVICE_CHANNELS * sizeof(float);
+    if (!b) {
+        /* No mic yet: the vocals tap records silence, so a mic added later lines up. */
+        static const float silence[FA_MIXER_BLOCK * FA_DEVICE_CHANNELS];
+        if (fa_load_ptr(&m->encoders)) fa_encode_mixer_push(m, FA_MIXER_TAP_VOCALS, silence, frames, clock);
+        return;
+    }
+    memset(b->vox, 0, stereo);
+    memset(b->dry, 0, stereo);
+    memset(b->rsend, 0, stereo);
+    memset(b->esend, 0, (size_t)frames * sizeof(float));
+    memset(b->duck, 0, (size_t)frames * sizeof(float));
+    b->hosts = 0;
     for (i = 0; i < FA_MIC_MAX; i++) {
         struct fa_mic* mic = (struct fa_mic*)fa_load_ptr(&m->mics[i]);
         if (!mic) continue;
@@ -282,8 +319,9 @@ void fa_mixer_mics_process(struct fa_mixer* m, fa_device* dev, float* out, uint3
             capture_pull(mic->cap, dev, frames);
             mic->cap->pulled = m->block + 1;
         }
-        mic_process(m, mic, dev, clock, out, frames);
+        mic_process(mic, b, dev, clock, frames);
     }
+    fa_mic_bus_process(m, b, clock, out, frames);
 }
 
 /* ---- inputs (API threads, mixer lock) ------------------------------------------- */
@@ -434,6 +472,11 @@ FA_API fa_result FA_CALL fa_mixer_add_mic(fa_mixer* mixer, const fa_mic_config* 
         fa_mutex_unlock(&mixer->lock);
         return FA_ERROR_BUSY;
     }
+    r = fa_mic_bus_make(mixer);
+    if (r != FA_OK) {
+        fa_mutex_unlock(&mixer->lock);
+        return r;
+    }
     cap = capture_find(mixer, c.device_id);
     if (!cap) {
         r = capture_open(mixer, c.device_id, c.flags, &cap);
@@ -458,6 +501,8 @@ FA_API fa_result FA_CALL fa_mixer_add_mic(fa_mixer* mixer, const fa_mic_config* 
     fa_lane_init(&mic->lanes[MIC_PAN], 0.0f);
     fa_lane_init(&mic->lanes[MIC_MONITOR], c.monitor ? 1.0f : 0.0f);
     fa_lane_init(&mic->lanes[MIC_LOW_CUT], 1.0f);
+    fa_lane_init(&mic->lanes[MIC_REVERB], 0.2f);
+    fa_lane_init(&mic->lanes[MIC_ECHO], 0.0f);
     fa_store_float(&mic->gate_db, -50.0f);
     fa_eq_shared_init(&mic->eq);
     fa_eq_reset(&mic->eq_st);
@@ -554,6 +599,8 @@ static int lane_of(fa_mic_param p)
     case FA_MIC_PAN: return MIC_PAN;
     case FA_MIC_MONITOR: return MIC_MONITOR;
     case FA_MIC_LOW_CUT: return MIC_LOW_CUT;
+    case FA_MIC_REVERB_SEND: return MIC_REVERB;
+    case FA_MIC_ECHO_SEND: return MIC_ECHO;
     default: return -1;
     }
 }
@@ -562,7 +609,6 @@ FA_API fa_result FA_CALL fa_mic_set_param(fa_mic* mic, fa_mic_param param, float
 {
     int lane;
     if (!mic || value != value) return FA_ERROR_INVALID_ARG;
-    if (param == FA_MIC_REVERB_SEND || param == FA_MIC_ECHO_SEND) return FA_ERROR_NOT_IMPLEMENTED;
     if (param == FA_MIC_GATE_DB) {
         fa_store_float(&mic->gate_db, clampf(value, -100.0f, 0.0f));
         return FA_OK;
@@ -572,6 +618,8 @@ FA_API fa_result FA_CALL fa_mic_set_param(fa_mic* mic, fa_mic_param param, float
     switch (param) {
     case FA_MIC_GAIN_DB: value = clampf(value, -20.0f, 40.0f); break;
     case FA_MIC_PAN: value = clampf(value, -1.0f, 1.0f); break;
+    case FA_MIC_REVERB_SEND:
+    case FA_MIC_ECHO_SEND: value = clampf(value, 0.0f, 1.0f); break;
     default: value = value >= 0.5f ? 1.0f : 0.0f; break;   /* switches */
     }
     fa_mutex_lock(&mic->mixer->lock);
@@ -584,7 +632,6 @@ FA_API fa_result FA_CALL fa_mic_get_param(fa_mic* mic, fa_mic_param param, float
 {
     int lane;
     if (!mic || !out_value) return FA_ERROR_INVALID_ARG;
-    if (param == FA_MIC_REVERB_SEND || param == FA_MIC_ECHO_SEND) return FA_ERROR_NOT_IMPLEMENTED;
     if (param == FA_MIC_GATE_DB) {
         *out_value = fa_load_float(&mic->gate_db);
         return FA_OK;
@@ -633,8 +680,10 @@ FA_API fa_result FA_CALL fa_mixer_get_latency(fa_mixer* mixer, fa_mixer_latency*
     size = out_latency->struct_size < sizeof(l) ? out_latency->struct_size : (uint32_t)sizeof(l);
     memset(&l, 0, sizeof(l));
     l.struct_size = size;
-    l.master = fa_load64(&mixer->device->latency_ns);
-    l.cue = l.master;
+    /* The OS's buffer and the limiter's look-ahead (always on for a mixer). */
+    l.master = fa_load64(&mixer->device->latency_ns) +
+               (fa_time)((double)mixer->device->limiter.delay * 1e9 / (double)mixer->device->rate);
+    l.cue = fa_load64(&mixer->device->latency_ns);   /* the cue is not limited: no look-ahead */
     fa_mutex_lock(&mixer->lock);
     for (i = 0; i < FA_MIC_MAX; i++) {
         struct fa_mic* mic = (struct fa_mic*)fa_load_ptr(&mixer->mics[i]);

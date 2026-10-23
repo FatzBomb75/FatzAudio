@@ -13,6 +13,7 @@ Each encoder takes its audio from one source:
 | Source | C | .NET | What is recorded |
 |---|---|---|---|
 | A device's output | `fa_encoder_attach_device` | `encoder.Record(output)` | Everything the device plays (its master mix after the limiter), in stereo at the device rate, including silence while nothing plays |
+| A DJ mixer's master or vocals | `fa_encoder_attach_mixer` + `fa_mixer_start_recording` | `encoder.Record(mixer, tap)` + `mixer.StartRecording(...)` | Stems that start on one frame, the vocals lined up as the singer heard the music ([DJ mixer recording](dj-mixer.md#recording)) |
 | One playing stream | `fa_encoder_attach_stream` | `encoder.Record(stream)` | The stream as heard: volume, pan, fades, crossfades, normalization and its bus applied. Only what it plays: nothing before it starts or after it ends, and nothing while it is paused or stalled |
 | A stream that is not playing | `fa_encoder_encode_stream` | `encoder.Encode(stream)` | The stream from its position to its end, as fast as it decodes, at its own rate and channels (file conversion). Tempo, pitch and rate apply, as for `fa_stream_read` |
 | Your own samples | `fa_encoder_write` | `encoder.Write(span, rate, channels)` | Interleaved float frames from any thread. It blocks while the queue is full, so nothing is lost |

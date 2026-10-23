@@ -93,7 +93,8 @@ public sealed record EncoderStatus(EncoderState State, ErrorCode Error, bool IsP
 /// <summary>
 /// Writes audio to a WAV, FLAC or MP3 file (or any writable <see cref="Stream"/>) on its own thread. Give it one
 /// source: <see cref="Record(OutputDevice)"/> (everything a device plays), <see cref="Record(AudioStream)"/> (one
-/// playing stream as heard), <see cref="Encode"/> (a decode-only stream as fast as it decodes: file conversion), or
+/// playing stream as heard), <see cref="Record(DjMixer, MixerTap)"/> (a DJ mixer's master or vocals, as lined-up
+/// stems), <see cref="Encode"/> (a decode-only stream as fast as it decodes: file conversion), or
 /// <see cref="Write"/> (your own samples). Several encoders may record the same device or stream.
 /// </summary>
 /// <remarks>
@@ -238,6 +239,20 @@ public sealed unsafe class AudioEncoder : IDisposable
     {
         ArgumentNullException.ThrowIfNull(stream);
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_encoder_attach_stream(Handle, stream.Handle));
+    }
+
+    /// <summary>
+    /// Records a tap of a DJ mixer, in stereo at the mixer's rate. Nothing is recorded until
+    /// <see cref="DjMixer.StartRecording"/> starts it together with the mixer's other recordings, so they line up.
+    /// </summary>
+    /// <param name="mixer">The mixer.</param>
+    /// <param name="tap">The master, or the vocals (both mics with their effects).</param>
+    /// <exception cref="FatzAudioException">The encoder already has a source (<see cref="ErrorCode.Busy"/>).</exception>
+    public void Record(DjMixer mixer, MixerTap tap)
+    {
+        ArgumentNullException.ThrowIfNull(mixer);
+        using var lease = mixer.Lease();
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_encoder_attach_mixer(Handle, mixer.Native, (int)tap));
     }
 
     /// <summary>

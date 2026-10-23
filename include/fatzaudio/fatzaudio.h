@@ -2640,6 +2640,30 @@ FA_API fa_result FA_CALL fa_encoder_create_output(const fa_encoder_output* outpu
  * attached; while it plays on a device of another rate, nothing is recorded). */
 FA_API fa_result FA_CALL fa_encoder_attach_device(fa_encoder* encoder, fa_device* device);
 FA_API fa_result FA_CALL fa_encoder_attach_stream(fa_encoder* encoder, fa_stream* stream);
+
+/* Recording a DJ mixer: stems that line up. An encoder attached to a mixer tap records
+ * nothing until fa_mixer_start_recording starts it, together with the others, on one
+ * device frame, so the files line up in any editor (stereo at the mixer's rate).
+ *   FA_MIXER_TAP_MASTER  what the speakers play, after the limiter (as
+ *                        fa_encoder_attach_device on the mixer's device)
+ *   FA_MIXER_TAP_VOCALS  both mics with their reverb and echo, before the master gain;
+ *                        a mic with monitor off is recorded dry
+ * The vocals start later by the mics' input latency plus the master's output latency
+ * (fa_mixer_latency.mic_monitor, the larger of the two mics): the voice in the file
+ * then lines up with the music as the singer heard it. FA_MIXER_REC_RAW_TIMING starts
+ * them on the same frame instead (the voice as it reached the mixer). */
+typedef enum fa_mixer_tap {
+    FA_MIXER_TAP_MASTER = 0,
+    FA_MIXER_TAP_VOCALS
+} fa_mixer_tap;
+#define FA_MIXER_REC_RAW_TIMING (1u << 0)
+FA_API fa_result FA_CALL fa_encoder_attach_mixer(fa_encoder* encoder, fa_mixer* mixer, fa_mixer_tap tap);
+/* Starts `encoders` (all attached to this mixer, none started yet: FA_ERROR_INVALID_ARG,
+ * FA_ERROR_BUSY) at `device_time` on the mixer device's clock (fa_device_get_time); 0,
+ * or a time less than one mixer block (2048 frames, about 43 ms at 48 kHz)
+ * ahead, starts that one block ahead. */
+FA_API fa_result FA_CALL fa_mixer_start_recording(fa_mixer* mixer, fa_encoder* const* encoders, uint32_t count,
+                                                  fa_time device_time, uint32_t flags);
 /* Reads the stream from its current position to its end on the encoder's thread,
  * at its own rate and channels, as fast as it decodes and encodes; tempo, pitch and
  * rate apply as in fa_stream_read. The stream must not be attached (FA_ERROR_BUSY);
@@ -2776,7 +2800,8 @@ FA_API const char* FA_CALL fa_eq_preset_name(fa_eq_preset preset);
  * limiter:
  *
  *   input device -> bridge (drift-corrected) -> low cut -> gain -> gate -> EQ -> meter
- *     -> mute -> pan -> master (when monitored)
+ *     -> mute -> pan -> master (when monitored), and sends into a shared reverb and echo
+ *   host mics (FA_MIC_DUCKS_MUSIC) duck the music; the vocals can be recorded
  *
  * A mic reads one channel of a capture device (or all its channels summed). Two mics
  * on one 2-input interface share the device. The input runs on its own clock, so it
@@ -2792,8 +2817,8 @@ FA_API const char* FA_CALL fa_eq_preset_name(fa_eq_preset preset);
 typedef struct fa_mic fa_mic;
 
 #define FA_MIC_MAX           2
-#define FA_MIC_DUCKS_MUSIC   (1u << 0)  /* a host mic: its voice will duck the music (planned with
-                                           fa_mixer_set_ducking); leave it off for singers */
+#define FA_MIC_DUCKS_MUSIC   (1u << 0)  /* a host mic: its voice ducks the music (fa_mixer_set_ducking);
+                                           leave it off for singers */
 #define FA_MIC_OS_PROCESSING (1u << 1)  /* keep the OS's voice processing (calls, not singing); two
                                            mics on one device share its input, so the first mic's
                                            choice holds for both */
@@ -2826,8 +2851,8 @@ typedef enum fa_mic_param {
     FA_MIC_GATE_DB,      /* the gate's threshold, -100 (off) .. 0, default -50: opens at the
                             threshold, closes 6 dB below it after 100 ms, so breaths and room
                             noise stay out between phrases */
-    FA_MIC_REVERB_SEND,  /* planned with the mic effects (FA_ERROR_NOT_IMPLEMENTED for now) */
-    FA_MIC_ECHO_SEND,    /* planned with the mic effects (FA_ERROR_NOT_IMPLEMENTED for now) */
+    FA_MIC_REVERB_SEND,  /* 0..1, default 0.2: into the shared reverb (fa_mixer_set_mic_effects) */
+    FA_MIC_ECHO_SEND,    /* 0..1, default 0: into the shared echo */
     FA_MIC_MONITOR,      /* 1 = heard through the master, 0 = not (from fa_mic_config.monitor) */
     FA_MIC_LOW_CUT       /* 1 = an 80 Hz high-pass against handling noise and rumble (default),
                             0 = off */
@@ -2846,13 +2871,50 @@ FA_API fa_result FA_CALL fa_mic_get_levels(fa_mic* mic, fa_time window, float* o
  * are estimated from the device's buffer sizes. */
 typedef struct fa_mixer_latency {
     uint32_t struct_size;              /* sizeof(fa_mixer_latency): filled up to it */
-    fa_time  master;                   /* the master output (the OS's buffer) */
-    fa_time  cue;                      /* the headphones: the master's for CHANNELS and SPLIT */
+    fa_time  master;                   /* the master output (the OS's buffer and the limiter's look-ahead) */
+    fa_time  cue;                      /* the headphones (the OS's buffer: the cue is not limited) */
     fa_time  cue_alignment;            /* delay added to line up a second-device cue (planned: 0) */
     fa_time  mic_input[FA_MIC_MAX];    /* input buffer plus the bridge; -1 = no mic in the slot */
     fa_time  mic_monitor[FA_MIC_MAX];  /* mic to speaker: mic_input plus master; -1 = no mic */
 } fa_mixer_latency;
 FA_API fa_result FA_CALL fa_mixer_get_latency(fa_mixer* mixer, fa_mixer_latency* out_latency);
+
+/* One shared reverb and one echo for both mics, like the effects unit of a karaoke
+ * mixer. Each mic sends to them (FA_MIC_REVERB_SEND, FA_MIC_ECHO_SEND) and their returns
+ * join the mics in the master, in the middle. They take what is heard: a mic with
+ * monitor off sends nothing (and is recorded dry). */
+typedef struct fa_mic_effects {
+    uint32_t struct_size;    /* set by fa_mic_effects_init */
+    float reverb_size;       /* 0 (small room) .. 1 (hall), default 0.5 */
+    float reverb_damping;    /* 0 (bright) .. 1 (dark), default 0.5 */
+    float echo_time_ms;      /* 20..1000, default 250; a change glides, bending the repeats'
+                                pitch for a moment as a tape echo does */
+    float echo_feedback;     /* 0..0.9, default 0.35: how much of each repeat comes back */
+    float echo_tone;         /* 0 (dark) .. 1 (bright), default 0.6: a low-pass in the
+                                feedback, 1 kHz .. 16 kHz, so later repeats get duller */
+} fa_mic_effects;
+FA_API void      FA_CALL fa_mic_effects_init(fa_mic_effects* effects);
+/* Out-of-range values are clamped. */
+FA_API fa_result FA_CALL fa_mixer_set_mic_effects(fa_mixer* mixer, const fa_mic_effects* effects);
+FA_API fa_result FA_CALL fa_mixer_get_mic_effects(fa_mixer* mixer, fa_mic_effects* out_effects);
+
+/* Ducking: while a mic flagged FA_MIC_DUCKS_MUSIC (a host) speaks above the threshold,
+ * the music (the decks after the crossfader, and other streams on the mixer's device)
+ * goes down by depth_db; it comes back after hold and release. Singers are not
+ * flagged, so the music never dips under a singer. A muted host does not duck; a host
+ * with monitor off still does. On with these defaults from the start; NULL turns it
+ * off (depth 0). */
+typedef struct fa_ducking {
+    uint32_t struct_size;    /* set by fa_ducking_init */
+    float    depth_db;       /* -40..0, default -12; 0 = off */
+    fa_time  attack;         /* 1 ms..1 s, default 50 ms: how fast the music goes down */
+    fa_time  hold;           /* 0..5 s, default 300 ms: how long it stays down after the voice */
+    fa_time  release;        /* 10 ms..5 s, default 600 ms: how fast it comes back */
+    float    threshold_db;   /* -60..0, default -40: the voice level that ducks */
+} fa_ducking;
+FA_API void      FA_CALL fa_ducking_init(fa_ducking* ducking);
+FA_API fa_result FA_CALL fa_mixer_set_ducking(fa_mixer* mixer, const fa_ducking* ducking);
+FA_API fa_result FA_CALL fa_mixer_get_ducking(fa_mixer* mixer, fa_ducking* out_ducking);
 
 /* Mixer events. They run on the engine's event thread, like stream events, and may call
  * any FatzAudio function. fa_mixer_set_event_callback, fa_mic_remove and
