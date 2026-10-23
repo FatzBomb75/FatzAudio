@@ -52,7 +52,12 @@ public enum LatencyMode
     /// sample rate; it needs a driver that offers small periods), about 5 ms elsewhere.
     /// </summary>
     Low = 1,
-    /// <summary>Windows exclusive mode for live mic monitoring: planned with the mic setup check (<see cref="ErrorCode.NotImplemented"/> for now).</summary>
+    /// <summary>
+    /// Windows WASAPI exclusive, for live mic monitoring: 3 ms periods for the output and the mic inputs. Other apps
+    /// can't use those devices meanwhile, and the Windows volume no longer applies (the mixer's gains and
+    /// <see cref="OutputDevice.Volume"/> still do). <see cref="ErrorCode.NotImplemented"/> on other systems;
+    /// <see cref="ErrorCode.Device"/> when another app holds the device.
+    /// </summary>
     Exclusive = 2,
 }
 
@@ -290,6 +295,80 @@ public sealed class DjMixer : IDisposable
     internal void Forget(Mic mic)
     {
         lock (_mics) _mics.Remove(mic);
+    }
+
+    /// <summary>
+    /// The latency mode the output and the mic inputs run in. Setting it closes and opens the devices again (a moment
+    /// of silence); playback carries on where it was. A mic input that won't open in the new mode raises
+    /// <see cref="InputLost"/>.
+    /// </summary>
+    /// <exception cref="FatzAudioException">The mode can't be had (<see cref="LatencyMode.Exclusive"/>): the mixer
+    /// stays in its mode; <see cref="ErrorCode.Busy"/> while <see cref="MeasureLatencyAsync"/> runs.</exception>
+    public LatencyMode LatencyMode
+    {
+        get
+        {
+            using var lease = Lease();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_get_latency_mode(_mixer, out int mode));
+            return (LatencyMode)mode;
+        }
+        set
+        {
+            using var lease = Lease();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_set_latency_mode(_mixer, (int)value));
+        }
+    }
+
+    /// <summary>
+    /// The setup check, for the app's setup screen: plays short test sounds through the speakers, listens on
+    /// <paramref name="mic"/>, and says how long the mic takes to reach the speakers, how much mic gain the room takes
+    /// before it feeds back, and whether to monitor the mics. Put the mic where the singer will stand. It takes 3-6 s
+    /// per mode measured, with the music and the mics silenced while the test sounds play. Afterwards the mixer uses
+    /// the measured time for that mic and mode (<see cref="Mic.MonitorLatency"/>, the vocals' recording alignment).
+    /// Keep the mic until the task completes.
+    /// </summary>
+    /// <exception cref="ArgumentException"><paramref name="mic"/> is another mixer's.</exception>
+    /// <exception cref="FatzAudioException"><see cref="ErrorCode.Busy"/> while another check runs;
+    /// <see cref="ErrorCode.Device"/> when only the mixer's own mode is measured and its output isn't running, or when
+    /// the mixer can't go back to its own mode after <see cref="LatencyCheckOptions.AllModes"/> (it stays in the last
+    /// mode measured).</exception>
+    /// <example>
+    /// <code>
+    /// var check = await mixer.MeasureLatencyAsync(mic, new LatencyCheckOptions { AllModes = true });
+    /// if (check.Advice == CheckAdvice.Monitor)
+    /// {
+    ///     mixer.LatencyMode = check.AdvisedMode;
+    ///     mic.Monitor = true;
+    /// }
+    /// </code>
+    /// </example>
+    public Task<LatencyCheck> MeasureLatencyAsync(Mic mic, LatencyCheckOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(mic);
+        if (mic.Mixer != this) throw new ArgumentException("The mic is another mixer's.", nameof(mic));
+        options ??= new LatencyCheckOptions();
+        return Task.Run(() => MeasureLatency(mic, options));
+    }
+
+    private unsafe LatencyCheck MeasureLatency(Mic mic, LatencyCheckOptions options)
+    {
+        FaLatencyCheckConfig c;
+        FaLatencyCheck r = default;
+        NativeMethods.fa_latency_check_config_init(&c);
+        c.Flags = options.AllModes ? 1u : 0u;
+        c.MaxLevelDb = options.MaxLevelDb;
+        c.MaxMonitor = TimeConvert.ToNanoseconds(options.MaxMonitor);
+        r.StructSize = (uint)sizeof(FaLatencyCheck);
+        using (Lease()) FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_measure_latency(_mixer, mic.Handle, &c, &r));
+        var modes = new LatencyCheckMode[Math.Min(r.Count, 3)];
+        for (int i = 0; i < modes.Length; i++)
+        {
+            var m = i == 0 ? r.Mode0 : i == 1 ? r.Mode1 : r.Mode2;
+            modes[i] = new LatencyCheckMode((LatencyMode)m.Mode, m.Result == 0 ? null : (ErrorCode)m.Result,
+                TimeConvert.FromNanoseconds(m.MicToSpeaker), TimeConvert.FromNanoseconds(m.Spread),
+                TimeConvert.FromNanoseconds(m.Reported), m.MaxGainDb, m.LevelDb);
+        }
+        return new LatencyCheck(modes, (CheckAdvice)r.Advice, (LatencyMode)r.AdvisedMode);
     }
 
     /// <summary>What the mixer's outputs and mic inputs add up to now.</summary>

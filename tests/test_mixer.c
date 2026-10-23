@@ -186,9 +186,11 @@ static void test_loop_out_inside_ring(void)
 static void test_loop_out_just_passed(void)
 {
     fa_stream* s = playing_saw(200000);
-    int idx[20000], n = 0, j, margin = (int)(g_rate * 15 / 1000), want;
+    int idx[20000], n = 0, j, margin = (int)(g_rate * 15 / 1000), want, i;
     CHECK(s);
     render_saw(s, 3000, idx, &n);
+    /* The join is a margin ahead of the mix only once the deck has decoded that far. */
+    for (i = 0; i < 2000 && fa_ring_readable(&s->ring) < (uint32_t)margin + 512; i++) fa_sleep_ms(1);
     CHECK_EQ(fa_stream_set_loop_region(s, 500, 2800), FA_OK);
     render_saw(s, 6000, idx, &n);
     j = first_jump(idx, n, 0);
@@ -203,10 +205,11 @@ static void test_loop_out_just_passed(void)
 static void test_loop_far_behind_goes_to_in(void)
 {
     fa_stream* s = playing_saw(200000);
-    int* idx = (int*)malloc(sizeof(int) * 80000), n = 0, j, margin = (int)(g_rate * 15 / 1000);
+    int* idx = (int*)malloc(sizeof(int) * 80000), n = 0, j, margin = (int)(g_rate * 15 / 1000), i;
     fa_frames pos = 0;
     CHECK(s && idx);
     render_saw(s, 60000, idx, &n);
+    for (i = 0; i < 2000 && fa_ring_readable(&s->ring) < (uint32_t)margin + 512; i++) fa_sleep_ms(1);
     CHECK_EQ(fa_stream_set_loop_region(s, 500, 2500), FA_OK);
     render_saw(s, 4000, idx, &n);
     j = first_jump(idx, n, 0);

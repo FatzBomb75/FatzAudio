@@ -757,3 +757,36 @@ internal unsafe struct FaMixerEvent
     public nint Mic;
     public long Value;
 }
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaLatencyCheckConfig
+{
+    public uint StructSize;
+    public uint Flags;
+    public float MaxLevelDb;
+    public long MaxMonitor;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaLatencyCheckMode
+{
+    public int Mode;
+    public int Result;
+    public long MicToSpeaker;
+    public long Spread;
+    public long Reported;
+    public float MaxGainDb;
+    public float LevelDb;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaLatencyCheck
+{
+    public uint StructSize;
+    public uint Count;
+    public FaLatencyCheckMode Mode0;
+    public FaLatencyCheckMode Mode1;
+    public FaLatencyCheckMode Mode2;
+    public int Advice;
+    public int AdvisedMode;
+}

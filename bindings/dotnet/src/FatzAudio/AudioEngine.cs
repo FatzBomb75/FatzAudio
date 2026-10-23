@@ -186,7 +186,7 @@ public sealed class AudioEngine : IDisposable
     /// <returns>The mixer; dispose it when done.</returns>
     /// <exception cref="ArgumentException"><see cref="DjMixerOptions.Output"/> is not a playback device.</exception>
     /// <exception cref="FatzAudioException"><see cref="ErrorCode.NotEnoughChannels"/> when the cue asks for channels the device
-    /// does not have; <see cref="ErrorCode.NotImplemented"/> for more than 2 decks or <see cref="LatencyMode.Exclusive"/>;
+    /// does not have; <see cref="ErrorCode.NotImplemented"/> for more than 2 decks, or <see cref="LatencyMode.Exclusive"/> off Windows;
     /// <see cref="ErrorCode.Device"/> when the device cannot be opened.</exception>
     /// <example>
     /// <code>

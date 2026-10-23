@@ -115,8 +115,10 @@ static void ring_skip(fa_capture* c, uint32_t n)
     fa_store32(&c->rpos, (int32_t)((uint32_t)fa_load32(&c->rpos) + n));
 }
 
-/* `frames` frames at the master rate into c->out, both lanes. */
-static void capture_pull(fa_capture* c, fa_device* dev, uint32_t frames)
+/* `frames` frames at the master rate into c->out, both lanes. `hold`: a setup check is
+ * timing the input, so the ratio stays at the nominal one (a drift correction would bend
+ * the delay it measures; the drift of two crystals over its 3 s is a fraction of a ms). */
+static void capture_pull(fa_capture* c, fa_device* dev, uint32_t frames, int hold)
 {
     uint32_t w, r, avail, mask = c->ring_frames - 1;
     double fill, err, adj, ratio;
@@ -144,7 +146,7 @@ static void capture_pull(fa_capture* c, fa_device* dev, uint32_t frames)
     }
     c->avg += (fill - c->avg) * fmin(1.0, (double)frames / (double)dev->rate);
     err = c->avg - c->target;
-    if (err > (double)c->rate * BRIDGE_JUMP_MS / 1000.0) {
+    if (!hold && err > (double)c->rate * BRIDGE_JUMP_MS / 1000.0) {
         /* Far over (the master callback stalled): back to the target now, not over seconds.
          * The average lags the fill, which may already be under the target. */
         uint32_t drop = fill > c->target ? (uint32_t)(fill - c->target) : 0;
@@ -156,7 +158,7 @@ static void capture_pull(fa_capture* c, fa_device* dev, uint32_t frames)
         c->avg = fill;
         err = fill - c->target;
     }
-    adj = err / ((double)c->rate * BRIDGE_SETTLE_S);
+    adj = hold ? 0.0 : err / ((double)c->rate * BRIDGE_SETTLE_S);
     if (adj > BRIDGE_MAX_ADJUST) adj = BRIDGE_MAX_ADJUST;
     if (adj < -BRIDGE_MAX_ADJUST) adj = -BRIDGE_MAX_ADJUST;
     ratio = c->nominal * (1.0 + adj);
@@ -316,9 +318,10 @@ void fa_mixer_mics_process(struct fa_mixer* m, fa_device* dev, float* out, uint3
         struct fa_mic* mic = (struct fa_mic*)fa_load_ptr(&m->mics[i]);
         if (!mic) continue;
         if (mic->cap->pulled != m->block + 1) {   /* two mics on one input pull it once */
-            capture_pull(mic->cap, dev, frames);
+            capture_pull(mic->cap, dev, frames, m->check_now != NULL);
             mic->cap->pulled = m->block + 1;
         }
+        if (m->check_now && m->check_now->mic == mic) fa_mic_check_record(m->check_now, mic->cap->out, mic->lane, frames, clock);
         mic_process(mic, b, dev, clock, frames);
     }
     fa_mic_bus_process(m, b, clock, out, frames);
@@ -338,63 +341,58 @@ static void capture_free(fa_capture* c)
     free(c);
 }
 
-static fa_result capture_open(struct fa_mixer* m, const char* id, uint32_t mic_flags, fa_capture** out)
+/* Opens c's input device in `mode` and sizes the ring and the resampler for its rate. No
+ * master callback reads `c` meanwhile (it isn't published yet, or the master is closed). */
+static fa_result capture_start(fa_capture* c, fa_latency_mode mode)
 {
+    struct fa_mixer* m = c->mixer;
     fa_engine* e = m->engine;
     ma_device_config cfg;
     ma_device_id did;
     ma_result mr;
-    fa_capture* c;
     fa_result r;
-    int has_id, i;
+    int has_id;
     uint32_t frames;
     int64_t prealloc;
-    size_t len = id ? strlen(id) : 0;
-    *out = NULL;
-    r = fa_device_parse_id(e, FA_DEVICE_CAPTURE, id, &did, &has_id);
+    r = fa_device_parse_id(e, FA_DEVICE_CAPTURE, c->id, &did, &has_id);
     if (r != FA_OK) return r;
-    c = (fa_capture*)calloc(1, sizeof(*c));
-    if (!c) return FA_ERROR_OUT_OF_MEMORY;
-    c->mixer = m;
-    c->id = (char*)malloc(len + 1);
-    if (!c->id || fa_varispeed_init(&c->vs, CAPTURE_LANES) != FA_OK) {
-        free(c->id);
-        free(c);
-        return FA_ERROR_OUT_OF_MEMORY;
-    }
-    memcpy(c->id, id ? id : "", len + 1);
-    for (i = 0; i < CAPTURE_LANES; i++) fa_store32(&c->lane_src[i], CAPTURE_LANE_FREE);
     cfg = ma_device_config_init(ma_device_type_capture);
     cfg.capture.pDeviceID = has_id ? &did : NULL;
     cfg.capture.format = ma_format_f32;
     cfg.capture.channels = 0;            /* the device's own */
     cfg.sampleRate = 0;                  /* and its own rate: the bridge converts, not the OS */
-    cfg.periodSizeInMilliseconds = m->device->open_low_latency ? 5 : e->config.period_ms;
+    cfg.periodSizeInMilliseconds = mode == FA_LATENCY_LOW ? 5 : e->config.period_ms;
+    if (mode == FA_LATENCY_EXCLUSIVE) {  /* as the master (device.c) */
+        cfg.capture.shareMode = ma_share_mode_exclusive;
+        cfg.periodSizeInMilliseconds = 3;
+    }
     cfg.dataCallback = capture_callback;
     cfg.notificationCallback = capture_notification;
     cfg.pUserData = c;
     cfg.wasapi.usage = ma_wasapi_usage_pro_audio;
-    if (!(mic_flags & FA_MIC_OS_PROCESSING)) {
+    if (!c->os_processing) {
         cfg.aaudio.inputPreset = ma_aaudio_input_preset_unprocessed;
         cfg.opensl.recordingPreset = ma_opensl_recording_preset_voice_unprocessed;
+        cfg.wasapi.rawCapture = MA_TRUE;   /* miniaudio patch (PATCHES.md) */
     }
     mr = ma_device_init(&e->context, &cfg, &c->device);
-    if (mr != MA_SUCCESS) {
-        fa_varispeed_free(&c->vs);
-        free(c->id);
-        free(c);
-        return mr == MA_ACCESS_DENIED ? FA_ERROR_PERMISSION_DENIED : FA_ERROR_DEVICE;
-    }
+    if (mr != MA_SUCCESS) return mr == MA_ACCESS_DENIED ? FA_ERROR_PERMISSION_DENIED : FA_ERROR_DEVICE;
     c->device_ok = 1;
     c->channels = c->device.capture.channels;
     c->rate = c->device.sampleRate;
-    if (c->device.capture.internalSampleRate)
-        fa_store64(&c->input_ns, (int64_t)((double)c->device.capture.internalPeriodSizeInFrames *
-                                           (double)c->device.capture.internalPeriods * 1e9 /
-                                           (double)c->device.capture.internalSampleRate));
+    fa_store64(&c->input_ns, c->device.capture.internalSampleRate == 0 ? 0 :
+               (int64_t)((double)c->device.capture.internalPeriodSizeInFrames *
+                         (double)c->device.capture.internalPeriods * 1e9 /
+                         (double)c->device.capture.internalSampleRate));
     for (frames = 1024; frames < (uint32_t)((double)c->rate * RING_SECONDS); frames *= 2) {}
-    c->ring_frames = frames;
-    c->ring = (float*)calloc((size_t)frames * CAPTURE_LANES, sizeof(float));
+    if (frames != c->ring_frames) {
+        free(c->ring);
+        c->ring_frames = frames;
+        c->ring = (float*)calloc((size_t)frames * CAPTURE_LANES, sizeof(float));
+    }
+    fa_store32(&c->wpos, 0);
+    fa_store32(&c->rpos, 0);
+    c->out_rate = 0;                     /* the next pull sets the bridge up anew */
     /* Reserve the resampler's buffer now: the master callback never allocates. */
     fa_varispeed_set_keep(&c->vs, 64);
     {
@@ -404,13 +402,66 @@ static fa_result capture_open(struct fa_mixer* m, const char* id, uint32_t mic_f
         prealloc = (int64_t)ceil((double)FA_MIXER_BLOCK * most) + 2 * fa_varispeed_width(most) + 64 + 16;
         if (prealloc < VS_PREALLOC) prealloc = VS_PREALLOC;
     }
-    if (!c->ring || fa_varispeed_write(&c->vs, NULL, prealloc) != FA_OK) {
-        capture_free(c);
+    if (!c->ring || fa_varispeed_write(&c->vs, NULL, prealloc) != FA_OK) return FA_ERROR_OUT_OF_MEMORY;
+    fa_varispeed_reset(&c->vs);
+    return FA_OK;
+}
+
+static fa_result capture_open(struct fa_mixer* m, const char* id, uint32_t mic_flags, fa_capture** out)
+{
+    fa_capture* c;
+    fa_result r;
+    int i;
+    size_t len = id ? strlen(id) : 0;
+    *out = NULL;
+    c = (fa_capture*)calloc(1, sizeof(*c));
+    if (!c) return FA_ERROR_OUT_OF_MEMORY;
+    c->mixer = m;
+    c->os_processing = (mic_flags & FA_MIC_OS_PROCESSING) != 0;
+    c->id = (char*)malloc(len + 1);
+    if (!c->id || fa_varispeed_init(&c->vs, CAPTURE_LANES) != FA_OK) {
+        free(c->id);
+        free(c);
         return FA_ERROR_OUT_OF_MEMORY;
     }
-    fa_varispeed_reset(&c->vs);
+    memcpy(c->id, id ? id : "", len + 1);
+    for (i = 0; i < CAPTURE_LANES; i++) fa_store32(&c->lane_src[i], CAPTURE_LANE_FREE);
+    r = capture_start(c, m->device->open_mode);
+    if (r != FA_OK) {
+        capture_free(c);
+        return r;
+    }
     *out = c;
     return FA_OK;
+}
+
+/* fa_device_reopen_mode, while the master is closed (mixer lock held): every input opens
+ * again in `mode`. One that can't is lost (FA_EVENT_INPUT_LOST), as if unplugged, unless
+ * the master falls back to the old mode and it opens again there (the event thread can't
+ * report it meanwhile: it waits for the mixer lock). */
+void fa_mixer_captures_reopen(struct fa_mixer* m, fa_latency_mode mode)
+{
+    fa_capture* c;
+    for (c = m->captures; c; c = c->next) {
+        if ((fa_load32(&c->lost) && !c->mode_lost) || c->test_owned) continue;
+        fa_store32(&c->stopping, 1);
+        if (c->device_ok) {
+            ma_device_uninit(&c->device);   /* waits for its callback */
+            c->device_ok = 0;
+        }
+        if (capture_start(c, mode) != FA_OK || ma_device_start(&c->device) != MA_SUCCESS) {
+            if (c->device_ok) ma_device_uninit(&c->device);
+            c->device_ok = 0;
+            c->mode_lost = 1;
+            flag_lost(c);
+            continue;
+        }
+        if (c->mode_lost) {
+            c->mode_lost = 0;
+            fa_store32(&c->lost, 0);
+        }
+        fa_store32(&c->stopping, 0);
+    }
 }
 
 static fa_capture* capture_find(struct fa_mixer* m, const char* id)
@@ -693,7 +744,9 @@ FA_API fa_result FA_CALL fa_mixer_get_latency(fa_mixer* mixer, fa_mixer_latency*
             continue;
         }
         l.mic_input[i] = fa_load64(&mic->cap->input_ns) + fa_load64(&mic->cap->bridge_ns);
-        l.mic_monitor[i] = l.mic_input[i] + l.master;
+        /* The setup check's measurement in this mode, when there is one. */
+        l.mic_monitor[i] = fa_load64(&mic->measured[mixer->device->open_mode]);
+        if (l.mic_monitor[i] <= 0) l.mic_monitor[i] = l.mic_input[i] + l.master;
     }
     fa_mutex_unlock(&mixer->lock);
     memcpy(out_latency, &l, size);
@@ -756,6 +809,7 @@ void fa_mic_test_take_over(fa_mic* mic, uint32_t rate, uint32_t channels)
     fa_capture* c = mic->cap;
     fa_store32(&c->stopping, 1);
     if (c->device_ok) ma_device_stop(&c->device);
+    c->test_owned = 1;   /* a latency mode switch leaves it alone */
     c->rate = rate;
     c->channels = channels;
     fa_store32(&c->wpos, 0);

@@ -147,6 +147,7 @@ void fa_mixer_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t f
     uint32_t i, off, k;
     int p;
     mix_edges me;
+    m->check_now = (struct fa_mic_check*)fa_load_ptr(&m->check);   /* the same for the mics and the render */
     take_lanes(m->lanes, MIX_LANES, dev->rate);
     for (i = 0; i < m->deck_count; i++) take_lanes(m->decks[i].lanes, DECK_LANES, dev->rate);
     for (off = 0, k = 0;; off += MIXER_SUB, k++) {
@@ -235,6 +236,10 @@ void fa_mixer_render(struct fa_mixer* m, fa_device* dev, float* out, uint32_t ch
         n = frames - done < FA_MIXER_BLOCK ? frames - done : FA_MIXER_BLOCK;
         fa_device_render_at(dev, m->master, n, now_ns + (int64_t)((double)done * 1e9 / dev->rate));
         if (fa_load_ptr(&m->encoders)) fa_encode_mixer_push(m, FA_MIXER_TAP_MASTER, m->master, n, clock);
+        if (m->check_now) {   /* the setup check: its test sound instead of the music */
+            fa_mic_check_render(m->check_now, m->master, n, clock);
+            m->check_now = NULL;
+        }
         lay_out(m, m->master, out + (size_t)done * channels, channels, n, mute0, dev->mute_level, dev->rate);
     }
 }
@@ -304,7 +309,7 @@ FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_confi
     if (c.deck_count == 0) c.deck_count = 2;
     if (c.deck_count > 2) return FA_ERROR_NOT_IMPLEMENTED;   /* 4 decks are planned */
     if (c.deck_count < 2) return FA_ERROR_INVALID_ARG;
-    if (c.cue_mode == FA_CUE_DEVICE || c.latency == FA_LATENCY_EXCLUSIVE) return FA_ERROR_NOT_IMPLEMENTED;
+    if (c.cue_mode == FA_CUE_DEVICE) return FA_ERROR_NOT_IMPLEMENTED;
     if ((uint32_t)c.cue_mode > FA_CUE_SPLIT || (uint32_t)c.latency > FA_LATENCY_EXCLUSIVE || c.flags != 0)
         return FA_ERROR_INVALID_ARG;
     if (c.cue_channel == 0) c.cue_channel = 2;
@@ -313,7 +318,7 @@ FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_confi
      * as many as asked, with just enough). */
     channels = FA_DEVICE_CHANNELS;
     if (c.cue_mode == FA_CUE_CHANNELS) channels = (engine->config.flags & FA_ENGINE_NULL_OUTPUT) ? c.cue_channel + 2 : 0;
-    r = fa_device_open_with(engine, c.device_id, channels, c.latency == FA_LATENCY_LOW, &dev);
+    r = fa_device_open_with(engine, c.device_id, channels, c.latency, &dev);
     if (r != FA_OK) return r;
     if (c.cue_mode == FA_CUE_CHANNELS && dev->device.playback.channels < c.cue_channel + 2) {
         fa_device_close(dev);
@@ -449,6 +454,38 @@ FA_API fa_result FA_CALL fa_mixer_get_output_channels(fa_mixer* mixer, uint32_t*
         else if (mixer->cue_mode == FA_CUE_SPLIT && ch >= 2) *out_cue_channel = 1;
         else *out_cue_channel = -1;
     }
+    return FA_OK;
+}
+
+static void reopen_inputs(void* user, fa_latency_mode mode) { fa_mixer_captures_reopen((struct fa_mixer*)user, mode); }
+
+fa_result fa_mixer_switch_latency_mode(struct fa_mixer* mixer, fa_latency_mode mode)
+{
+    fa_result r = FA_OK;
+    fa_mutex_lock(&mixer->lock);
+    if (mode != mixer->device->open_mode) {
+        fa_capture* c;
+        r = fa_device_reopen_mode(mixer->device, mode, reopen_inputs, mixer);
+        for (c = mixer->captures; c; c = c->next) c->mode_lost = 0;   /* lost for good now */
+    }
+    fa_mutex_unlock(&mixer->lock);
+    return r;
+}
+
+FA_API fa_result FA_CALL fa_mixer_set_latency_mode(fa_mixer* mixer, fa_latency_mode mode)
+{
+    if (!mixer || (uint32_t)mode > FA_LATENCY_EXCLUSIVE) return FA_ERROR_INVALID_ARG;
+    /* A setup check switches modes itself and times the devices: not under its feet. */
+    if (fa_load32(&mixer->checking)) return FA_ERROR_BUSY;
+    return fa_mixer_switch_latency_mode(mixer, mode);
+}
+
+FA_API fa_result FA_CALL fa_mixer_get_latency_mode(fa_mixer* mixer, fa_latency_mode* out_mode)
+{
+    if (!mixer || !out_mode) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&mixer->lock);
+    *out_mode = mixer->device->open_mode;
+    fa_mutex_unlock(&mixer->lock);
     return FA_OK;
 }
 

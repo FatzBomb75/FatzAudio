@@ -57,6 +57,7 @@ set(FA_SOURCES
     src/mixer.c
     src/mic.c
     src/mic_fx.c
+    src/mic_check.c
     src/event.c
     src/loudness.c
     src/tags.c

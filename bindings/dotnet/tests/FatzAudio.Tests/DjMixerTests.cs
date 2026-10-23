@@ -186,6 +186,41 @@ public class DjMixerTests
     }
 
     [Fact]
+    public void LatencyMode_SwitchesAndKeepsTheMics()
+    {
+        using var engine = CreateHeadless();
+        using var mixer = engine.CreateDjMixer(new DjMixerOptions { Latency = LatencyMode.Normal });
+        using var mic = mixer.AddMic();
+        Assert.Equal(LatencyMode.Normal, mixer.LatencyMode);
+        mixer.LatencyMode = LatencyMode.Low;
+        Assert.Equal(LatencyMode.Low, mixer.LatencyMode);
+        Assert.True(mixer.Output.IsStarted);
+        Assert.Equal(new[] { mic }, mixer.Mics);
+        var ex = Assert.Throws<FatzAudioException>(() => mixer.LatencyMode = LatencyMode.Exclusive);
+        Assert.Equal(ErrorCode.NotImplemented, ex.ErrorCode);   // the null output isn't WASAPI
+        Assert.Equal(LatencyMode.Low, mixer.LatencyMode);
+    }
+
+    [Fact]
+    public async Task MeasureLatency_SilentMicIsNotHeard()
+    {
+        using var engine = CreateHeadless();
+        using var mixer = engine.CreateDjMixer(new DjMixerOptions { Latency = LatencyMode.Normal });
+        using var other = engine.CreateDjMixer();
+        using var mic = mixer.AddMic();
+        using var stranger = other.AddMic();
+        await Assert.ThrowsAsync<ArgumentNullException>(() => mixer.MeasureLatencyAsync(null!));
+        await Assert.ThrowsAsync<ArgumentException>(() => mixer.MeasureLatencyAsync(stranger));
+
+        var check = await mixer.MeasureLatencyAsync(mic, new LatencyCheckOptions { MaxLevelDb = -30f });
+        Assert.Equal(CheckAdvice.NotHeard, check.Advice);
+        var mode = Assert.Single(check.Modes);
+        Assert.Equal(LatencyMode.Normal, mode.Mode);
+        Assert.Equal(ErrorCode.NotFound, mode.Error);
+        Assert.True(mode.Reported > TimeSpan.Zero);
+    }
+
+    [Fact]
     public void Mics_GoWithTheMixer()
     {
         using var engine = CreateHeadless();

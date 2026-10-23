@@ -204,6 +204,8 @@ public sealed class Mic : IDisposable
 
     internal nint NativeHandle => _handle.IsClosed ? 0 : _handle.DangerousGetHandle();
 
+    internal MicHandle Handle => _handle;
+
     internal bool IsDisposed => _handle.IsClosed;
 
     private float Get(int p)
