@@ -59,6 +59,9 @@ static double now_s(void) { return g_fake_time >= 0 ? g_fake_time : real_now_s()
 #define MAX_REC_S 12
 #define MAX_BLOCKS 20000
 #define MAX_BURSTS 64
+/* Monitor test: broadband loop gain through speaker, room and mic. Kept well below 1: a room has
+ * resonances several dB above its average, and at 0.5 Keith's PC howled. */
+#define LOOP_GAIN 0.12f
 
 typedef struct {
     ma_uint64 start;    /* index of the block's first frame in the recording */
@@ -259,6 +262,7 @@ typedef struct {
     double ring_fill_ms;
     float loop_match;           /* correlation of the first repeat with the first arrival */
     int arrival_found;          /* monitor test: the injected chirp was heard */
+    int feedback;               /* monitor test: the loop howled */
     float probe_match;          /* best correlation found for the first repeat, even if too low */
     double probe_lag_ms;
     ma_uint32 underruns;
@@ -343,6 +347,13 @@ static void analyze(spike* s, int pass, result* res)
         float a0;
         ma_uint32 np = find_peaks(s, cor, n, 0.5f, s->chirp_len * 2, rate / 2, &p0, &a0, 1), i;
         res->arrival_found = np > 0;
+        {
+            /* a loop that howls fills the last second with a steady loud tone */
+            ma_uint64 a = s->rec_len > rate ? s->rec_len - rate : 0, j;
+            double e = 0;
+            for (j = a; j < s->rec_len; j++) e += (double)s->rec[j] * s->rec[j];
+            res->feedback = s->rec_len > a && sqrt(e / (double)(s->rec_len - a)) > 0.05;
+        }
         if (np) {
             ma_uint32 w = rate / 25;
             ma_uint64 min_lag = (ma_uint64)res->cap_period + res->play_period, max_lag = rate * 2 / 5, at = p0;
@@ -471,7 +482,7 @@ static void run_mode(ma_context* ctx, const char* mode, ma_device_id* cap_id, ma
         s->rec = (float*)malloc(sizeof(float) * (size_t)s->rec_cap);
         if (pass == 1) {
             s->monitor_gain = gain_override > 0 ? gain_override
-                              : res->amp > 1e-4f ? (0.5f / res->amp > 30.0f ? 30.0f : 0.5f / res->amp) : 0.0f;
+                              : res->amp > 1e-4f ? (LOOP_GAIN / res->amp > 30.0f ? 30.0f : LOOP_GAIN / res->amp) : 0.0f;
             res->gain = s->monitor_gain;
             if (s->monitor_gain <= 0) {
                 ma_device_uninit(&play);
@@ -538,7 +549,7 @@ static int selftest(void)
         s->rec_cap = (ma_uint64)rate * MAX_REC_S;
         s->rec = (float*)malloc(sizeof(float) * (size_t)s->rec_cap);
         if (pass) {
-            s->monitor_gain = 0.5f / res.amp;
+            s->monitor_gain = LOOP_GAIN / res.amp;
             ma_pcm_rb_init(ma_format_f32, 1, rate, NULL, NULL, &s->ring);
             s->prefill = period;
             s->inject_at = rate;
@@ -655,8 +666,8 @@ int main(int argc, char** argv)
                     printf("  monitor loop (mic -> speaker + air): median %.1f ms, min %.1f, max %.1f (%d repeats, match %.2f), gain %.1f, ring %.1f ms, underruns %u\n",
                            r->loop_median, r->loop_min, r->loop_max, r->loop_n, r->loop_match, r->gain, r->ring_fill_ms, r->underruns);
                 else if (r->rt_n)
-                    printf("  monitor loop: no repeats found (gain %.1f, chirp heard: %s, best match %.2f at %.1f ms, ring %.1f ms, underruns %u)\n",
-                           r->gain, r->arrival_found ? "yes" : "no", r->probe_match, r->probe_lag_ms, r->ring_fill_ms, r->underruns);
+                    printf("  monitor loop: no repeats found (gain %.1f, feedback: %s, chirp heard: %s, best match %.2f at %.1f ms, ring %.1f ms, underruns %u)\n",
+                           r->gain, r->feedback ? "YES" : "no", r->arrival_found ? "yes" : "no", r->probe_match, r->probe_lag_ms, r->ring_fill_ms, r->underruns);
                 if (r->error[0]) printf("  %s\n", r->error);
             }
         }
@@ -676,10 +687,10 @@ int main(int argc, char** argv)
                     "\"playback_period\": %u, \"playback_periods\": %u, \"iaudioclient3\": %d, "
                     "\"round_trip_ms\": {\"n\": %d, \"median\": %.2f, \"min\": %.2f, \"max\": %.2f}, \"level\": %.4f, "
                     "\"monitor_loop_ms\": {\"n\": %d, \"median\": %.2f, \"min\": %.2f, \"max\": %.2f}, "
-                    "\"loop_match\": %.2f, \"gain\": %.2f, \"ring_fill_ms\": %.2f, \"underruns\": %u}%s\n",
+                    "\"loop_match\": %.2f, \"feedback\": %d, \"gain\": %.2f, \"ring_fill_ms\": %.2f, \"underruns\": %u}%s\n",
                     r->name, r->error, r->rate, r->cap_period, r->cap_periods, r->play_period, r->play_periods,
                     r->low_latency_shared, r->rt_n, r->rt_median, r->rt_min, r->rt_max, r->amp, r->loop_n,
-                    r->loop_median, r->loop_min, r->loop_max, r->loop_match, r->gain, r->ring_fill_ms, r->underruns,
+                    r->loop_median, r->loop_min, r->loop_max, r->loop_match, r->feedback, r->gain, r->ring_fill_ms, r->underruns,
                     j + 1 < nres ? "," : "");
         }
         fprintf(f, "  ]\n}\n");
