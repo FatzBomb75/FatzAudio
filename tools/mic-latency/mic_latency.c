@@ -257,6 +257,7 @@ typedef struct {
     int loop_n;
     double loop_median, loop_min, loop_max;
     double ring_fill_ms;
+    float loop_match;           /* correlation of the first repeat with the first arrival */
     ma_uint32 underruns;
     float gain;
 } result;
@@ -315,17 +316,49 @@ static void analyze(spike* s, int pass, result* res)
             res->amp = amps / res->rt_n;
         }
     } else {
-        /* the chirp, then its repeats through the monitor */
-        ma_uint64 pos[16];
-        float amp[16];
-        double d[16];
-        ma_uint32 np = find_peaks(s, cor, n, 0.35f, s->chirp_len * 2, rate / 2, pos, amp, 16), i;
-        for (i = 1; i < np; i++) d[res->loop_n++] = (double)(pos[i] - pos[i - 1]) * 1000.0 / rate;
-        if (res->loop_n) {
-            qsort(d, (size_t)res->loop_n, sizeof(double), cmp_d);
-            res->loop_median = d[res->loop_n / 2];
-            res->loop_min = d[0];
-            res->loop_max = d[res->loop_n - 1];
+        /* The chirp's first arrival, then its repeats through the monitor. Each pass through the
+         * speaker, the room and the mic colours it again, so the repeats are found by correlating
+         * with what was recorded the first time (40 ms from the arrival, room echoes included)
+         * rather than with the clean chirp. A repeat cannot come sooner than one capture plus one
+         * playback period. */
+        ma_uint64 p0;
+        float a0;
+        ma_uint32 np = find_peaks(s, cor, n, 0.5f, s->chirp_len * 2, rate / 2, &p0, &a0, 1), i;
+        if (np) {
+            ma_uint32 w = rate / 25;
+            ma_uint64 min_lag = (ma_uint64)res->cap_period + res->play_period, max_lag = rate * 2 / 5, at = p0;
+            double d[8];
+            if (min_lag < rate / 200) min_lag = rate / 200;
+            for (i = 0; i < 4 && at + max_lag + w < s->rec_len; i++) {
+                const float* t = s->rec + at;
+                double et = 0, best = 0;
+                ma_uint64 lag, best_lag = 0;
+                ma_uint32 k;
+                for (k = 0; k < w; k++) et += (double)t[k] * t[k];
+                for (lag = min_lag; lag <= max_lag; lag++) {
+                    const float* x = t + lag;
+                    double acc = 0, ex = 0, c;
+                    for (k = 0; k < w; k++) {
+                        acc += (double)t[k] * x[k];
+                        ex += (double)x[k] * x[k];
+                    }
+                    c = ex > 1e-12 && et > 1e-12 ? acc / sqrt(et * ex) : 0;
+                    if (c > best) {
+                        best = c;
+                        best_lag = lag;
+                    }
+                }
+                if (best < 0.3) break;
+                d[res->loop_n++] = (double)best_lag * 1000.0 / rate;
+                if (i == 0) res->loop_match = (float)best;
+                at += best_lag;
+            }
+            if (res->loop_n) {
+                qsort(d, (size_t)res->loop_n, sizeof(double), cmp_d);
+                res->loop_median = d[res->loop_n / 2];
+                res->loop_min = d[0];
+                res->loop_max = d[res->loop_n - 1];
+            }
         }
         res->ring_fill_ms = s->fill_n ? s->fill_sum / s->fill_n * 1000.0 / rate : 0;
         res->underruns = s->underruns;
@@ -448,7 +481,7 @@ static void run_mode(ma_context* ctx, const char* mode, ma_device_id* cap_id, ma
 }
 
 /* Runs both tests on simulated devices: 480-frame periods at 48 kHz, the speaker heard by the mic
- * `delay` frames later at 0.3x with a little noise, no device latency. Expected: round trip =
+ * `delay` frames later at 0.3x with two room echoes and a little noise, no device latency. Expected: round trip =
  * delay, monitor loop = delay + the time audio waits in the ring (here one period: a capture block
  * only arrives at its end). */
 static int selftest(void)
@@ -458,6 +491,7 @@ static int selftest(void)
     result res;
     memset(&res, 0, sizeof(res));
     res.name = "selftest";
+    res.cap_period = res.play_period = period;
     for (pass = 0; pass < 2; pass++) {
         spike* s = (spike*)calloc(1, sizeof(spike));
         ma_device play, cap;
@@ -481,12 +515,17 @@ static int selftest(void)
             s->prefill = period;
             s->inject_at = rate;
         }
-        line_len = total + delay + period;
+        line_len = total + delay + period + 1000;
         line = (float*)calloc((size_t)line_len, sizeof(float));
         for (j = 0; (ma_uint64)(j + 1) * period <= total; j++) {
             g_fake_time = (double)j * period / rate;
             on_playback(&play, out, NULL, period);
-            for (i = 0; i < period; i++) line[(size_t)j * period + i + delay] += 0.3f * out[i * 2];
+            for (i = 0; i < period; i++) {
+                size_t at = (size_t)j * period + i + delay;
+                line[at] += 0.3f * out[i * 2];
+                line[at + 150] -= 0.12f * out[i * 2];   /* room echoes: 3 ms and 15 ms */
+                line[at + 720] += 0.06f * out[i * 2];
+            }
             for (i = 0; i < period; i++) {
                 seed = seed * 1103515245u + 12345u;
                 f = (ma_uint64)j * period + i;
@@ -584,8 +623,8 @@ int main(int argc, char** argv)
                     printf("  round trip (out + in + air): median %.1f ms, min %.1f, max %.1f (%d chirps), level %.3f\n",
                            r->rt_median, r->rt_min, r->rt_max, r->rt_n, r->amp);
                 if (r->loop_n)
-                    printf("  monitor loop (mic -> speaker + air): median %.1f ms, min %.1f, max %.1f (%d repeats), gain %.1f, ring %.1f ms, underruns %u\n",
-                           r->loop_median, r->loop_min, r->loop_max, r->loop_n, r->gain, r->ring_fill_ms, r->underruns);
+                    printf("  monitor loop (mic -> speaker + air): median %.1f ms, min %.1f, max %.1f (%d repeats, match %.2f), gain %.1f, ring %.1f ms, underruns %u\n",
+                           r->loop_median, r->loop_min, r->loop_max, r->loop_n, r->loop_match, r->gain, r->ring_fill_ms, r->underruns);
                 else if (r->rt_n)
                     printf("  monitor loop: no repeats found (gain %.1f); try --gain with a higher value\n", r->gain);
                 if (r->error[0]) printf("  %s\n", r->error);
@@ -607,10 +646,10 @@ int main(int argc, char** argv)
                     "\"playback_period\": %u, \"playback_periods\": %u, \"iaudioclient3\": %d, "
                     "\"round_trip_ms\": {\"n\": %d, \"median\": %.2f, \"min\": %.2f, \"max\": %.2f}, \"level\": %.4f, "
                     "\"monitor_loop_ms\": {\"n\": %d, \"median\": %.2f, \"min\": %.2f, \"max\": %.2f}, "
-                    "\"gain\": %.2f, \"ring_fill_ms\": %.2f, \"underruns\": %u}%s\n",
+                    "\"loop_match\": %.2f, \"gain\": %.2f, \"ring_fill_ms\": %.2f, \"underruns\": %u}%s\n",
                     r->name, r->error, r->rate, r->cap_period, r->cap_periods, r->play_period, r->play_periods,
                     r->low_latency_shared, r->rt_n, r->rt_median, r->rt_min, r->rt_max, r->amp, r->loop_n,
-                    r->loop_median, r->loop_min, r->loop_max, r->gain, r->ring_fill_ms, r->underruns,
+                    r->loop_median, r->loop_min, r->loop_max, r->loop_match, r->gain, r->ring_fill_ms, r->underruns,
                     j + 1 < nres ? "," : "");
         }
         fprintf(f, "  ]\n}\n");
