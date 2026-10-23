@@ -293,18 +293,40 @@ These are the rules of [CD+G surfaces](cdg.md#threading):
 
 ## Cost
 
-Measured at 1080p on one core of a desktop x64, Release build:
+Measured in a Release build on one core of a desktop x64 CPU, with a song that has intro bands, three pages and an ending card, the Classic preset (outline and shadow), 2063 frames at 16 ms steps over 33 s, called at about 60 Hz. The times are what `fa_surface_update_into` takes on your thread.
 
-| Frame | Time |
-|---|---|
-| A still frame (nothing moves; a syllable being wiped, a countdown arrow) | about 0.3 ms |
-| A frame while lines scroll or a page fades | about 3-5 ms |
-| The first frame of a page | more, while its lines are drawn |
-| Building an intro or ending page the first time it shows (once per layout) | about 15-20 ms for the bands, about 20 ms for a card |
-| A frame while the bands fade | about 3.5 ms |
-| A frame while a card fades | about 2 ms |
+| Frame | 1080p | 1080p, render-ahead | 2160p | 2160p, render-ahead |
+|---|---|---|---|---|
+| Still frame or a wipe only | about 0.2 ms | about 0.2 ms | about 0.2 ms | about 0.2 ms |
+| Frame with movement (a scroll, a page fade, an intro or ending fade), average | 3.2 ms | | 11 ms | |
+| All frames, average | 0.9 ms | 0.15 ms | 4.2 ms | 0.4 ms |
+| Frames over 8 ms | 3 of 2063 | 1 | 521 of 2063 | 3 |
+| Worst frame (the first of a page or intro, while its layers are built) | 22 ms | the first frame | about 110 ms | the first frame |
+| Frames shown late (`behind = 1`) | none | 2 of 2063 | none | about 5%, while pages are built |
 
-Lines are laid out once; a frame colours and places them, so only what changed is redrawn. A lyric surface accepts `fa_surface_set_render_ahead` (`RenderAhead`) and keeps the setting, but for now the frames are drawn on the caller's thread. Drawing on the engine's workers comes in the next step (5c of the [karaoke surfaces plan](../requests/2026-10-20_FatzAudio_Plan_KaraokeSurfaces.md)); it will also take the first-show cost of the pages off the caller's thread. A cost table for 1080p and 2160p will be measured then.
+The columns without render-ahead are the time on your thread with the setting off; with it on, the frames over 8 ms on your thread were the very first frame and the start. At 1080p, 114 of the 2063 frames took over 4 ms without render-ahead.
+
+Turning the effects off changes little: at 2160p the average goes from 4.2 ms to 3.7 ms. Lines are laid out once; a frame colours and places them, so only what changed is redrawn.
+
+### Render-ahead
+
+`fa_surface_set_render_ahead` (.NET `RenderAhead`) works for lyric surfaces as it does for [CD+G surfaces](cdg.md#drawing-into-your-own-buffers-fa_surface_update_into). It is off by default, and off behaves exactly as before: every frame is drawn on the thread that calls `fa_surface_update_into`.
+
+With it on, the surface keeps two frame-sized slots, and the engine's worker threads render the next frame ahead, for the time your next call is expected at, judged from the times you pass in. `fa_surface_update_into` then copies the finished frame that fits the time you asked for (a frame of that time, up to 1/60 s older, or a hair newer), and never waits for a worker. When the worker falls behind, you get the latest finished frame with `fa_surface_frame.behind = 1`, a dropped frame, instead of a frame drawn on your thread. Your thread draws only for the first frame, after a layout change, after a seek (a frame ahead of the time you asked for, or more than 100 ms behind it), and when no worker frame exists. It costs two more buffers of the layout's size, freed when you turn it off.
+
+Turn it on at 2160p or on slow machines, where a moving frame costs more than a few milliseconds and the page builds cost tens of milliseconds. At 1080p on a current desktop the average frame is under 1 ms and you can leave it off. Call at the display's pace and pass the time of the frame you are about to show (or `FA_SURFACE_NOW`) so the worker can predict the next one.
+
+```c
+fa_surface_set_render_ahead(surface, 1);
+/* in your render loop, at the display's pace */
+fa_surface_frame fr = { sizeof(fr) };
+fa_surface_update_into(surface, FA_SURFACE_NOW, mem, stride, lay.width, lay.height, rev, &fr);
+if (fr.behind) { /* the picture is a little late: a dropped frame; keep calling */ }
+```
+
+```csharp
+surface.RenderAhead = true;   // check SurfaceUpdate.Behind on each frame
+```
 
 ## Pitfalls
 

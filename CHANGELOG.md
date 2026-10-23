@@ -26,6 +26,11 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   `LyricStyle`, `LyricPreset`, `LyricWipe`, `LyricCountdown`, `AudioStream.CreateLyricSurface`; `IKaraokeSurface` is now
   implemented by `LyricSurface` too. See
   [docs/features/lyrics.md](docs/features/lyrics.md).
+- Lyric surface render-ahead: `fa_surface_set_render_ahead` (.NET `RenderAhead`) now works for lyric surfaces too
+  (before, the setting was accepted but frames were drawn on the caller's thread). The engine's worker threads render
+  the next frame ahead, and `fa_surface_update_into` copies the finished frame that fits; a frame the workers could not
+  finish in time is shown late with `fa_surface_frame.behind = 1`. Off by default; off behaves as before. The cost
+  table for 1080p and 2160p is in [docs/features/lyrics.md](docs/features/lyrics.md#cost).
 - Lyric surface intro and ending pages: the song's credits (`fa_stream_get_midi_credits`) on smoked glass, on by
   default and off with `subtitle_mode`. The intro fades in at 1 s: bands at the top and bottom (title, artist, year;
   length, key, tempo, timing, copyright) when the lyrics start before 8 s, else a centred card that is gone 3 s before

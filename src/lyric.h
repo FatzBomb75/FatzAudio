@@ -6,6 +6,7 @@
 #define FA_LYRIC_H
 
 #include "fatzaudio/fatzaudio.h"
+#include "surface.h"
 
 typedef struct fa_lyric fa_lyric;
 
@@ -26,5 +27,9 @@ fa_result fa_lyric_get_layout(fa_lyric* lyric, uint32_t area_w, uint32_t area_h,
 fa_result fa_lyric_update(fa_lyric* lyric, uint32_t area_w, uint32_t area_h, double tempo, fa_time time, uint8_t* dst,
                           int32_t dst_stride, uint32_t dst_w, uint32_t dst_h, uint64_t dst_revision, fa_surface_frame* fr);
 uint64_t fa_lyric_layout_revision(const fa_lyric* lyric);
+/* Render-ahead: 1 when the lines are laid out for this area and tempo (a frame drawn
+ * now needs no new layout), and the areas the recent revisions changed. */
+int fa_lyric_ready_for(const fa_lyric* lyric, uint32_t area_w, uint32_t area_h);
+const fa_surface_history* fa_lyric_history(const fa_lyric* lyric);
 
 #endif
