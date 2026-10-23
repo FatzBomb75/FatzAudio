@@ -2,28 +2,33 @@
  *
  * 1. Onset strength: log-magnitude spectral flux, a 1024-point FFT every 256
  *    samples at 44.1/48 kHz (scaled with the rate, so the envelope runs at about
- *    170-190 frames a second), with the bins below 200 Hz weighted up, where kicks
- *    are. Two frames go through one complex FFT (one as the real part, one as the
- *    imaginary part).
- * 2. The envelope minus its local mean (half a second), rectified, scaled to unit
- *    standard deviation.
- * 3. Tempo: the envelope's autocorrelation at 1, 2, 3 and 4 beat periods, weighted
- *    1, 1/2, 1/3, 1/4 (a comb), weighted by a log-normal preference around 120 BPM, searched in the
- *    preferred range in 0.05 BPM steps. A BPM tag picks between half, the same
- *    and double tempo.
- * 4. Beats: dynamic-programming beat tracking (Ellis 2007), each beat refined to
- *    a fraction of a frame on its onset peak.
- * 5. The constant grid: a robust straight-line fit of beat time over beat number
+ *    170-190 frames a second). Two envelopes are kept, one over all bins up to
+ *    11 kHz and one below 200 Hz (where kicks are); each is scaled to unit
+ *    standard deviation and the two are summed. Two frames go through one complex
+ *    FFT (one as the real part, one as the imaginary part).
+ * 2. The envelope minus its local mean (half a second), rectified.
+ * 3. Tempo candidates: the envelope's autocorrelation at 1, 2, 3 and 4 beat
+ *    periods, weighted 1, 1/2, 1/3, 1/4 (a comb), times a log-normal preference
+ *    around 120 BPM, searched in the preferred range in 0.05 BPM steps. The three
+ *    best peaks (at least half the best, more than 3% apart) are each tracked and
+ *    the one whose grid lands on the strongest onsets wins.
+ * 4. Half or double: when both a tempo and its double are in range, the faster is
+ *    tracked, and the slower kept when every other beat is clearly weaker (below
+ *    0.6 of the others). A BPM tag within 4% picks between half, the same and
+ *    double.
+ * 5. Beats: dynamic-programming beat tracking (Ellis 2007), each beat refined to
+ *    a fraction of a frame on its onset peak; weak beats at the ends are dropped.
+ * 6. The constant grid: a robust straight-line fit of beat time over beat number
  *    (outliers dropped and fitted again), which gives the tempo far more finely
- *    than the envelope's frames. The confidence is the share of beats on the grid
- *    times how much the grid's onsets stand out.
+ *    than the envelope's frames. The confidence is the share of beats on the grid,
+ *    squared, times how much the grid's onsets stand out.
  *
- * Frames of the envelope are placed where an attack lands (calibrated: the flux
- * of an attack peaks about a quarter window after the attack enters it). */
+ * Frames of the envelope are placed where an attack lands (calibrated on
+ * synthetic kicks and General MIDI renders: the flux of an attack peaks about
+ * 0.42 of a window after the attack enters it). */
 #include "fa_internal.h"
 #include <math.h>
 #include <stdlib.h>
-#include <stdio.h>
 #include <string.h>
 
 #define ONSET_LOW_HZ 200.0
@@ -34,7 +39,7 @@
 #define DP_TIGHTNESS 100.0
 #define MIN_BEATS 8
 #define ONSET_HALF_RATIO 0.6     /* every other beat this much weaker: half tempo */
-#define ONSET_DELAY 0.18         /* attack to flux peak, in windows (calibrated) */
+#define ONSET_DELAY 0.42         /* attack to flux peak, in windows (calibrated) */
 
 struct fa_onset {
     uint32_t rate;
@@ -251,13 +256,13 @@ static double tempo_score(const double* a, int64_t maxlag, double fr, double bpm
 
 #define TEMPO_CANDIDATES 3
 
-/* The best tempos in [lo, hi] (the highest peaks of the score, at least half the
- * best, apart by more than 3%), best first; returns how many. */
+/* The best tempos in [lo, hi]: the highest peaks of the score, at least half the
+ * best, more than 3% apart, best first; returns how many. */
 static int find_tempos(const float* e, int64_t n, double fr, double lo, double hi, double* out)
 {
     int64_t maxlag = (int64_t)ceil(4.0 * fr * 60.0 / lo) + 2, steps, i;
     double *a, *sc, ps[TEMPO_CANDIDATES];
-    int found = 0, c, d;
+    int found = 0, c;
     if (maxlag >= n) maxlag = n - 1;
     if (maxlag < 4) return 0;
     steps = (int64_t)floor((hi - lo) / 0.05 + 1e-9) + 1;
@@ -265,30 +270,20 @@ static int find_tempos(const float* e, int64_t n, double fr, double lo, double h
     sc = (double*)malloc((size_t)steps * sizeof(double));
     if (!a || !sc) { free(a); free(sc); return 0; }
     for (i = 0; i < steps; i++) sc[i] = tempo_score(a, maxlag, fr, lo + 0.05 * (double)i);
-    for (i = 0; i < steps; i++) {
-        double bpm = lo + 0.05 * (double)i, v = sc[i];
-        int near = 0;
-        if ((i > 0 && sc[i - 1] >= v) || (i + 1 < steps && sc[i + 1] > v) || v <= 0.0) continue;   /* not a peak */
-        for (c = 0; c < found; c++)
-            if (fabs(out[c] - bpm) < 0.03 * bpm) {
-                near = 1;
-                if (v > ps[c]) { out[c] = bpm; ps[c] = v; }
-            }
-        if (near) continue;
-        for (c = 0; c < found && ps[c] >= v; c++) {}
-        if (c >= TEMPO_CANDIDATES) continue;
-        if (found < TEMPO_CANDIDATES) found++;
-        for (d = found - 1; d > c; d--) { out[d] = out[d - 1]; ps[d] = ps[d - 1]; }
-        out[c] = bpm;
-        ps[c] = v;
-    }
-    /* Re-sort after merges, and keep those within half of the best. */
-    for (c = 1; c < found; c++)
-        for (d = c; d > 0 && ps[d] > ps[d - 1]; d--) {
-            double t = ps[d]; ps[d] = ps[d - 1]; ps[d - 1] = t;
-            t = out[d]; out[d] = out[d - 1]; out[d - 1] = t;
+    /* Highest peak first, each time leaving out those near a chosen one. */
+    while (found < TEMPO_CANDIDATES) {
+        int64_t best = -1;
+        for (i = 0; i < steps; i++) {
+            double bpm = lo + 0.05 * (double)i;
+            int near = 0;
+            if (sc[i] <= 0.0 || (i > 0 && sc[i - 1] >= sc[i]) || (i + 1 < steps && sc[i + 1] > sc[i])) continue;
+            for (c = 0; c < found && !near; c++) near = fabs(out[c] - bpm) < 0.03 * bpm;
+            if (!near && (best < 0 || sc[i] > sc[best])) best = i;
         }
-    while (found > 1 && ps[found - 1] < 0.5 * ps[0]) found--;
+        if (best < 0 || (found > 0 && sc[best] < 0.5 * ps[0])) break;
+        out[found] = lo + 0.05 * (double)best;
+        ps[found++] = sc[best];
+    }
     free(a);
     free(sc);
     return found;
@@ -300,20 +295,26 @@ static int64_t track_beats(const float* e, int64_t n, double period, double** ou
 {
     double* score = (double*)malloc((size_t)n * sizeof(double));
     int64_t* back = (int64_t*)malloc((size_t)n * sizeof(int64_t));
-    double* beats = NULL;
-    int64_t t, nb = 0, end, i;
+    double *beats = NULL, *pen;
+    int64_t t, nb = 0, end, i, d;
     int64_t wlo = (int64_t)floor(period / 2.0), whi = (int64_t)ceil(period * 2.0);
     double best;
     *out = NULL;
-    if (!score || !back) { free(score); free(back); return 0; }
+    if (wlo < 1) wlo = 1;
+    pen = (double*)malloc((size_t)(whi + 1) * sizeof(double));
+    if (!score || !back || !pen) { free(score); free(back); free(pen); return 0; }
+    /* The penalty for a beat d frames after the last, by d. */
+    for (d = wlo; d <= whi; d++) {
+        double l = log((double)d / period);
+        pen[d] = DP_TIGHTNESS * l * l;
+    }
     for (t = 0; t < n; t++) {
         int64_t tau, from = t - whi, to = t - wlo;
         double bs = -1e300;
         int64_t bt = -1;
         if (from < 0) from = 0;
         for (tau = from; tau <= to; tau++) {
-            double l = log((double)(t - tau) / period);
-            double s = score[tau] - DP_TIGHTNESS * l * l;
+            double s = score[tau] - pen[t - tau];
             if (s > bs) { bs = s; bt = tau; }
         }
         if (bt >= 0) { score[t] = e[t] + bs; back[t] = bt; }
@@ -334,6 +335,7 @@ static int64_t track_beats(const float* e, int64_t n, double period, double** ou
     }
     free(score);
     free(back);
+    free(pen);
     *out = beats;
     return nb;
 }
@@ -498,6 +500,7 @@ int fa_onset_grid(fa_onset* o, double min_bpm, double max_bpm, double tag_bpm, f
     /* Among the strongest tempos, the one whose tracked grid lands on the strongest
      * onsets (a tempo 3:2 off the true one lands on every other beat and between). */
     nc = find_tempos(o->env, n, fr, min_bpm, max_bpm, cands);
+
     if (nc == 0) return 0;
     bpm = cands[0];
     if (nc > 1) {
@@ -507,7 +510,6 @@ int fa_onset_grid(fa_onset* o, double min_bpm, double max_bpm, double tag_bpm, f
             grid_try t;
             if (try_tempo(o->env, n, fr, cands[c], &t)) {
                 double v = grid_strength(o->env, n, &t);
-                if (getenv("FA_BEAT_DEBUG")) fprintf(stderr, "candidate %.2f: %.3f\n", cands[c], v);
                 if (v > best_c) { best_c = v; bpm = cands[c]; }
             }
             try_free(&t);
@@ -537,7 +539,6 @@ int fa_onset_grid(fa_onset* o, double min_bpm, double max_bpm, double tag_bpm, f
             if (fabs(slow - tag_bpm) < 0.04 * tag_bpm) use_slow = 1;
             else if (fabs(bpm - tag_bpm) < 0.04 * tag_bpm) use_slow = 0;
         }
-        if (getenv("FA_BEAT_DEBUG")) fprintf(stderr, "octave %.2f/%.2f: even %.3f odd %.3f -> %s\n", slow, bpm, even, odd, use_slow ? "slow" : "fast");
         if (use_slow) {
             grid_try h;
             if (try_tempo(o->env, n, fr, slow, &h)) { try_free(&g); g = h; }
@@ -563,6 +564,8 @@ int fa_onset_grid(fa_onset* o, double min_bpm, double max_bpm, double tag_bpm, f
      * an attack's flux peaks about ONSET_DELAY windows after it enters. */
     frame0 = (double)o->first_frame_end - 1.0 - ONSET_DELAY * o->n;
     first_beat = (fa_frames)llround(frame0 + (g.f.a + g.idx[g.first] * g.f.p) * o->hop);
+    /* A beat a few ms before the start is the song's first (the estimate's own scatter). */
+    if (first_beat < 0 && first_beat > -(fa_frames)(o->rate / 200)) first_beat = 0;
     while (first_beat < 0) first_beat += (fa_frames)llround(g.f.p * o->hop);
 
     out->segs = (fa_tempo_segment*)malloc(sizeof(fa_tempo_segment));

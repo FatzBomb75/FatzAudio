@@ -301,6 +301,8 @@ void fa_grid_data_free(fa_grid_data* g);
  * and the CONSTANT flag from the segments. */
 void fa_grid_data_finish(fa_grid_data* g, fa_frames length);
 fa_result fa_grid_data_copy(fa_grid_data* dst, const fa_grid_data* src);
+/* The checks of fa_stream_set_beat_grid (segments may be NULL with count 0). */
+int fa_grid_valid(const fa_beat_grid* g, const fa_tempo_segment* segs, uint32_t count);
 /* Copies a grid out the way the public getters do. */
 fa_result fa_grid_data_get(const fa_grid_data* g, fa_beat_grid* out_grid, fa_tempo_segment* out_segments,
                            uint32_t capacity, uint32_t* out_count);

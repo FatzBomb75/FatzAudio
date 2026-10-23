@@ -420,7 +420,11 @@ bass_fx needs a decode stream wrapped in a separate tempo stream; FatzAudio puts
 | Keeping the buffer short so tempo changes respond quickly | `fa_tempo_options.latency_ms` (default 150) | `TempoOptions.Latency` | ✅ |
 | Converting positions back with BASS_FX_TempoGetRateRatio | Not needed: positions, markers, the clock and CD+G stay in song time | — | ➖ (by design) |
 | BASS_FX_ReverseCreate / BASS_ATTRIB_REVERSE_DIR | Reverse playback | | 🗓️ |
-| BASS_FX_BPM_* / BASS_FX_BPM_Beat* | BPM and beat detection | | 🗓️ |
+| BASS_FX_BPM_DecodeGet | `fa_analyze_path` with `FA_ANALYZE_BEATS`, then `fa_analysis_get_beat_grid` ([track analysis](../features/analysis.md)) | `AudioEngine.Analyze` / `AnalyzeAsync`, `TrackAnalysis.Beats` | ✅ |
+| BASS_FX_BPM_BeatDecodeGet | Beat times from the grid: `fa_beat_grid.first_beat` plus `bpm`, or the tempo segments for songs that change tempo | `BeatGrid.BeatToFrame` | ✅ |
+| BASS_FX_BPM_CallbackSet / BPM of a live stream | Analyse the file instead: `fa_analyze_stream`. A web or push stream cannot be read twice (`FA_ERROR_NOT_SEEKABLE`) | `AudioStream.Analyze` | ✅ (file and memory streams; ➖ live streams) |
+| BASS_FX_BPM_Translate | Not needed: `bpm` is a double, so double or halve it yourself (to correct a grid, set a new one with `fa_stream_set_beat_grid`) | `BeatGrid.Constant`, `AudioStream.BeatGrid` | ➖ (by design) |
+| BASS_FX_BPM_Free | `fa_analysis_free` | Nothing to dispose: `TrackAnalysis` is a plain object | ✅ |
 
 ### CD+G karaoke graphics
 
@@ -544,7 +548,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | basswma.dll | Built-in ASF demuxer (`.wma`, `.asf`, `.wmv` audio; files, memory, your own reader, HTTP), decoded by Media Foundation on Windows (unsupported elsewhere); ReplayGain attributes for normalization, tags and covers ([WMA](../features/streams.md#wma)) | ✅ playback; ➖ encoding (record to MP3, FLAC or WAV with `fa_encoder_*` instead), MMS, broadcasting and DRM |
 | bassenc.dll, bassenc_mp3.dll, bassenc_flac.dll (if added later) | Built in: `fa_encoder_*` writes WAV and FLAC itself and MP3 through the app's LAME ([recording and encoding](../features/recording-encoding.md)) | ✅ WAV/FLAC/MP3, 🗓️ Opus/AAC/casting |
 | bassmidi.dll | Built-in SoundFont 2 synthesizer for `.mid`, `.kar` and `.rmi`: SF2 or DLS banks, engine-wide or per-stream, the OS's `gm.dls` when the app sets none, SF3 banks, reverb and chorus, lyrics and text events, transpose and channel mute ([MIDI](../features/midi.md)) | ✅ (SFZ and MIDI input 🗓️) |
-| bass_fx.dll | Tempo/pitch/rate params on every stream ([tempo and pitch](../features/tempo-pitch.md)); reverse and BPM planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | ✅ tempo/pitch/rate and level control, 🗓️ reverse and BPM |
+| bass_fx.dll | Tempo/pitch/rate params on every stream ([tempo and pitch](../features/tempo-pitch.md)); BPM and beat detection in [track analysis](../features/analysis.md); reverse planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | ✅ tempo/pitch/rate, BPM and beats, and level control; 🗓️ reverse |
 | basscd.dll | Built-in disc source: drives on Windows, macOS and Linux, `.cue` images, CD-Text, freedb and MusicBrainz ids, CD+G graphics ([disc playback](../features/disc.md)); analog playback not provided | ✅ disc and CD+G discs |
 | Your own CD+G decoder and renderer (MP3+G, ZIP) | Built in: `fa_cdg_surface_*` draws the graphics in sync with the audio ([CD+G](../features/cdg.md)) | ✅ |
 

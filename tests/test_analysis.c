@@ -549,6 +549,19 @@ static void test_midi_exact_grid(void)
     CHECK_EQ(g.beats_per_bar, 4);
     CHECK_NEAR(g.bpm, 100.0, 1e-9);
     fa_analysis_free(a);
+
+    /* SMPTE timing (25 fps, 40 ticks a frame) has no tempo: no exact grid, the
+     * render is listened to instead. */
+    m2.d[12] = 0xE7;
+    m2.d[13] = 40;
+    a = analyze(&m2, FA_ANALYZE_BEATS);
+    CHECK(a != NULL);
+    if (a && get_grid(a, &g)) CHECK(!(g.flags & FA_GRID_EXACT));
+    fa_analysis_free(a);
+    st = open_mem(&m2, g_font);
+    CHECK(st != NULL);
+    CHECK(fa_stream_get_beat_grid(st, &g, NULL, 0, &count) == FA_ERROR_NOT_FOUND);
+    fa_stream_close(st);
     free(m2.d);
     free(s.e);
 }
@@ -607,7 +620,6 @@ static void test_tracker_exact_grid(void)
     fa_stream* st;
     CHECK(a && get_grid(a, &g));
     CHECK(g.flags & FA_GRID_EXACT);
-    { uint32_t q; fa_tempo_segment sg[16]; fa_analysis_get_tempo_map(a, sg, 16, &q); for (q = 0; q < g.segment_count && q < 16; q++) printf("  seg %lld %.4f %.4f\n", (long long)sg[q].start, sg[q].bpm, sg[q].beat); }
     CHECK_EQ(g.segment_count, 2);
     CHECK(fa_analysis_get_tempo_map(a, seg, 4, &count) == FA_OK);
     CHECK_EQ(seg[0].start, 0);
@@ -726,8 +738,8 @@ static int same_results(const fa_analysis* a, const fa_analysis* b)
     uint32_t na = 0, nb = 0;
     memset(pa, 0, sizeof(pa));
     memset(pb, 0, sizeof(pb));
-    if (get_grid(a, &ga) != get_grid(b, &gb) || get_key(a, &ka) != get_key(b, &kb)) { printf("  have %d %d %d %d\n", get_grid(a, &ga), get_grid(b, &gb), get_key(a, &ka), get_key(b, &kb)); return 0; }
-    if (memcmp(&ga, &gb, sizeof(ga)) != 0) { printf("  grid %.9f %lld %u %u %u %.9f %u %u / %.9f %lld %u %u %u %.9f %u %u\n", ga.bpm, (long long)ga.first_beat, ga.sample_rate, ga.beats_per_bar, ga.bar_offset, ga.confidence, ga.flags, ga.segment_count, gb.bpm, (long long)gb.first_beat, gb.sample_rate, gb.beats_per_bar, gb.bar_offset, gb.confidence, gb.flags, gb.segment_count); return 0; }
+    if (get_grid(a, &ga) != get_grid(b, &gb) || get_key(a, &ka) != get_key(b, &kb)) return 0;
+    if (memcmp(&ga, &gb, sizeof(ga)) != 0) return 0;
     if (strcmp(ka.name, kb.name) != 0 || ka.confidence != kb.confidence) return 0;
     fa_analysis_get_waveform(a, pa, 64, &na);
     fa_analysis_get_waveform(b, pb, 64, &nb);
@@ -806,7 +818,6 @@ static void test_cache(void)
         uint32_t c1 = 0, c2 = 0;
         fa_analysis* fresh = analyze_cached(e, &w, FA_ANALYZE_WAVEFORM, 0, FA_ANALYZE_NO_CACHE);
         CHECK(get_grid(a, &ga) && get_grid(b, &gb));
-        if (memcmp(&ga, &gb, sizeof(ga)) != 0) printf("  grid %.9f %lld %.9f %u / %.9f %lld %.9f %u\n", ga.bpm, (long long)ga.first_beat, ga.confidence, ga.flags, gb.bpm, (long long)gb.first_beat, gb.confidence, gb.flags);
         CHECK(memcmp(&ga, &gb, sizeof(ga)) == 0);
         CHECK(fresh && !(info_flags(fresh) & FA_ANALYSIS_FROM_CACHE));
         fa_analysis_get_waveform(fresh, p1, 8, &c1);
@@ -867,6 +878,7 @@ static void test_stream_grid(void)
     CHECK(fa_stream_get_beat_grid(s, &out, got, 2, &count) == FA_OK);
     CHECK_EQ(count, 3);
     CHECK_EQ(out.segment_count, 3);
+    CHECK_EQ(out.flags, FA_GRID_EDITED);
     CHECK_EQ(got[1].start, 50000);
     CHECK(fa_stream_get_beat_grid(s, NULL, NULL, 0, &count) == FA_OK);
     CHECK_EQ(count, 3);
@@ -874,7 +886,7 @@ static void test_stream_grid(void)
     seg[1].start = 1000;
     CHECK(fa_stream_set_beat_grid(s, &g, seg, 3) == FA_ERROR_INVALID_ARG);
     seg[1].start = 50000;
-    g.bpm = 0.5;
+    g.bpm = 0.05;
     CHECK(fa_stream_set_beat_grid(s, &g, NULL, 0) == FA_ERROR_INVALID_ARG);
     g.bpm = 128.0;
     g.flags = 1u << 20;
@@ -890,6 +902,10 @@ static void test_stream_grid(void)
     CHECK_EQ(count, 3);
     CHECK(fa_stream_set_beat_grid(s, NULL, NULL, 0) == FA_OK);
     CHECK(fa_stream_get_beat_grid(s, &out, NULL, 0, &count) == FA_ERROR_NOT_FOUND);
+    /* Exact grids of modules can be fast (speed 1, tempo 255); they can be set back. */
+    g.bpm = 1531.25;
+    CHECK(fa_stream_set_beat_grid(s, &g, NULL, 0) == FA_OK);
+    g.bpm = 128.0;
     fa_stream_close(s);
     free(w.d);
 
@@ -902,6 +918,7 @@ static void test_stream_grid(void)
     CHECK(fa_stream_set_beat_grid(s, &g, NULL, 0) == FA_OK);
     CHECK(fa_stream_get_beat_grid(s, &out, NULL, 0, &count) == FA_OK);
     CHECK_NEAR(out.bpm, 128.0, 0.0);
+    CHECK_EQ(out.flags, FA_GRID_CONSTANT | FA_GRID_EDITED);
     CHECK(fa_stream_set_beat_grid(s, NULL, NULL, 0) == FA_OK);
     CHECK(fa_stream_get_beat_grid(s, &out, NULL, 0, &count) == FA_OK);
     CHECK_NEAR(out.bpm, 100.0, 1e-9);
@@ -955,8 +972,9 @@ typedef struct report_song { double bpm; int tonic, minor, style; } report_song;
 
 /* General MIDI drums: kick, snare, closed hat. Styles: 0 four on the floor, 1 rock
  * backbeat with eighth hats, 2 half-time feel, 3 humanized (+-12 ms) with the
- * tempo drifting by 1% over the song. */
-static buf report_midi(const report_song* r, double* out_drift)
+ * tempo drifting by 1% over the song. *out_mean = the song's mean tempo (beats over
+ * time). */
+static buf report_midi(const report_song* r, double* out_mean)
 {
     song s = { 0 };
     int bars = 48, bar, b, i, h;
@@ -966,7 +984,6 @@ static buf report_midi(const report_song* r, double* out_drift)
     double tvals[64];
     int nt = 0;
     buf m;
-    *out_drift = 0.0;
     add_ev(&s, 0, 2, 0xC0, 0, 0);             /* piano */
     add_ev(&s, 0, 2, 0xC1, 33, 0);            /* fingered bass */
     add_ev(&s, 0, 2, 0xC2, 48, 0);            /* strings */
@@ -993,7 +1010,15 @@ static buf report_midi(const report_song* r, double* out_drift)
             nt++;
         }
     }
-    if (nt) *out_drift = tvals[nt - 1] - r->bpm;
+    {
+        double secs = 0.0, cur = r->bpm;
+        int k2 = 0;
+        for (bar = 0; bar < bars; bar++) {
+            if (k2 < nt && tticks[k2] == (uint32_t)bar * 1920) cur = tvals[k2++];
+            secs += 4.0 * 60.0 / cur;
+        }
+        *out_mean = bars * 4 / (secs / 60.0);
+    }
     m = write_song(&s, r->bpm, tticks, tvals, nt, 0, 0);
     free(s.e);
     return m;
@@ -1021,7 +1046,7 @@ static void run_report(const char* sf2)
     static const char* const styles[4] = { "four on the floor", "rock", "half-time", "humanized, drifting" };
     fa_soundfont* font = NULL;
     report_song songs[REPORT_SONGS];
-    int i, exact = 0, rel = 0, fifth = 0, par = 0, other = 0, tempo_ok[4] = { 0 }, count[4] = { 0 };
+    int i, exact = 0, rel = 0, fifth = 0, par = 0, other = 0, tempo_ok[4] = { 0 }, count[4] = { 0 }, octave[4] = { 0 };
     double secs_total = 0.0, wall_total = 0.0, worst_bpm[4] = { 0 }, worst_ms[4] = { 0 }, conf_sum[4] = { 0 };
     if (fa_soundfont_open_path(sf2, &font) != FA_OK) { fprintf(stderr, "cannot open %s\n", sf2); g_failures++; return; }
     for (i = 0; i < REPORT_SONGS; i++) {
@@ -1030,12 +1055,11 @@ static void run_report(const char* sf2)
         songs[i].minor = (i / 12) % 2;
         songs[i].style = i % 4;
     }
-    printf("| # | Style | True BPM | Found | Error (BPM) | Beat error (ms) | Confidence | Key | Found | |\n");
+    printf("| # | Style | BPM (file) | Found | Error (BPM) | Beat error (ms) | Confidence | Key | Found | |\n");
     printf("|---|---|---|---|---|---|---|---|---|---|\n");
     for (i = 0; i < REPORT_SONGS; i++) {
-        double drift, secs, ms, t0, t1;
-        buf m = report_midi(&songs[i], &drift);
-        buf w = render(&m, font, &secs);
+        double truth, secs, ms, t0, t1, err;
+        buf m, w;
         fa_stream* s;
         fa_analysis* a = NULL;
         fa_analysis_options o;
@@ -1043,6 +1067,9 @@ static void run_report(const char* sf2)
         fa_key_info k, want;
         const char* rel_s;
         int st = songs[i].style;
+        if (getenv("FA_REPORT_ONLY") && atoi(getenv("FA_REPORT_ONLY")) != i + 1) continue;
+        m = report_midi(&songs[i], &truth);
+        w = render(&m, font, &secs);
         fa_analysis_options_init(&o);
         o.kinds = FA_ANALYZE_BEATS | FA_ANALYZE_KEY | FA_ANALYZE_WAVEFORM;
         o.flags = FA_ANALYZE_NO_CACHE;
@@ -1055,12 +1082,20 @@ static void run_report(const char* sf2)
         wall_total += t1 - t0;
         want.struct_size = sizeof(want);
         fa_key_make(songs[i].tonic, songs[i].minor, &want);
-        if (!a || !get_grid(a, &g)) { printf("| %d | %s | %.1f | none | | | | %s | | |\n", i + 1, styles[st], songs[i].bpm, want.name); fa_analysis_free(a); free(m.d); free(w.d); continue; }
-        ms = beat_error_ms(&g, songs[i].bpm, 0.0, st == 3 ? 4.0 : secs - 4.0);
+        if (!a || !get_grid(a, &g)) {
+            printf("| %d | %s | %.2f | none | | | | %s | | |\n", i + 1, styles[st], truth, want.name);
+            fa_analysis_free(a); free(m.d); free(w.d);
+            continue;
+        }
         count[st]++;
         conf_sum[st] += g.confidence;
-        if (fabs(g.bpm - songs[i].bpm) <= 0.05) tempo_ok[st]++;
-        if (fabs(g.bpm - songs[i].bpm) > worst_bpm[st]) worst_bpm[st] = fabs(g.bpm - songs[i].bpm);
+        /* Half or double tempo is counted apart, its error measured at that tempo. */
+        if (fabs(g.bpm - truth / 2.0) < 0.01 * truth) { octave[st]++; truth /= 2.0; }
+        else if (fabs(g.bpm - truth * 2.0) < 0.02 * truth) { octave[st]++; truth *= 2.0; }
+        err = g.bpm - truth;
+        ms = beat_error_ms(&g, truth, 0.0, st == 3 ? 4.0 : secs - 4.0);
+        if (fabs(err) <= 0.05) tempo_ok[st]++;
+        if (fabs(err) > worst_bpm[st]) worst_bpm[st] = fabs(err);
         if (ms > worst_ms[st]) worst_ms[st] = ms;
         if (get_key(a, &k)) rel_s = key_relation(&k, songs[i].tonic, songs[i].minor);
         else { rel_s = "none"; strcpy(k.name, "-"); }
@@ -1069,16 +1104,16 @@ static void run_report(const char* sf2)
         else if (!strcmp(rel_s, "fifth")) fifth++;
         else if (!strcmp(rel_s, "parallel")) par++;
         else other++;
-        printf("| %d | %s | %.1f | %.2f | %.3f | %.1f | %.2f | %s | %s | %s |\n", i + 1, styles[st], songs[i].bpm, g.bpm,
-               g.bpm - songs[i].bpm, ms, g.confidence, want.name, k.name, rel_s);
+        printf("| %d | %s | %.2f | %.2f | %.3f | %.1f | %.2f | %s | %s | %s |\n", i + 1, styles[st], truth, g.bpm, err, ms,
+               g.confidence, want.name, k.name, rel_s);
         fa_analysis_free(a);
         free(m.d);
         free(w.d);
     }
-    printf("\n| Style | Songs | Tempo within 0.05 BPM | Worst tempo error | Worst beat error (ms) | Mean confidence |\n|---|---|---|---|---|---|\n");
+    printf("\n| Style | Songs | Tempo within 0.05 BPM | Of those, half or double | Worst tempo error | Worst beat error (ms) | Mean confidence |\n|---|---|---|---|---|---|---|\n");
     for (i = 0; i < 4; i++)
-        printf("| %s | %d | %d | %.3f | %.1f | %.2f |\n", styles[i], count[i], tempo_ok[i], worst_bpm[i], worst_ms[i],
-               count[i] ? conf_sum[i] / count[i] : 0.0);
+        printf("| %s | %d | %d | %d | %.3f | %.1f | %.2f |\n", styles[i], count[i], tempo_ok[i], octave[i], worst_bpm[i],
+               worst_ms[i], count[i] ? conf_sum[i] / count[i] : 0.0);
     printf("\nKeys: %d exact, %d relative, %d a fifth away, %d parallel, %d other (of %d)\n", exact, rel, fifth, par, other,
            REPORT_SONGS);
     printf("Speed: %.0f s of audio in %.2f s (%.0fx real time, one core, beats + key + waveform)\n", secs_total, wall_total,

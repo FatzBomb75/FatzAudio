@@ -8,7 +8,8 @@
  * measured so far: a request for more measures the union and rewrites it, so
  * asking for kinds one at a time does not thrash. The file is binary,
  * little-endian, after a text magic line that changes whenever a measurement
- * does (then older files are simply measured again). */
+ * does (then older files are simply measured again), and ends with a checksum;
+ * a file that fails it or holds values a result cannot have is measured again. */
 #include "fa_internal.h"
 #include <math.h>
 #include <stddef.h>
@@ -21,6 +22,7 @@
 #define FA_ANALYSIS_MAX_CACHE ((size_t)64 << 20)
 #define FA_ANALYZE_ALL (FA_ANALYZE_LOUDNESS | FA_ANALYZE_BEATS | FA_ANALYZE_KEY | FA_ANALYZE_WAVEFORM)
 #define FA_PI 3.14159265358979323846
+#define FA_FNV_BASIS 0xcbf29ce484222325ULL
 
 struct fa_analysis {
     uint32_t kinds;              /* measured (fa_analysis_kind) */
@@ -295,6 +297,7 @@ static void encode(const fa_analysis* a, bytes* b)
         put_f64(b, a->loudness.range_lu);
         put_f64(b, a->loudness.true_peak_dbtp);
     }
+    if (!b->failed) put_u64(b, fa_fnv1a(FA_FNV_BASIS, b->d, b->n));
 }
 
 static int decode(fa_analysis* a, const uint8_t* d, size_t n)
@@ -302,8 +305,10 @@ static int decode(fa_analysis* a, const uint8_t* d, size_t n)
     reader r;
     uint32_t i, count;
     size_t m = strlen(FA_ANALYSIS_MAGIC);
-    if (n < m || memcmp(d, FA_ANALYSIS_MAGIC, m) != 0) return 0;
-    r.d = d; r.n = n; r.at = m; r.bad = 0;
+    if (n < m + 8 || memcmp(d, FA_ANALYSIS_MAGIC, m) != 0) return 0;
+    r.d = d; r.n = n; r.at = n - 8; r.bad = 0;
+    if (get_u64(&r) != fa_fnv1a(FA_FNV_BASIS, d, n - 8)) return 0;
+    r.n = n - 8; r.at = m;
     a->kinds = get_u32(&r);
     a->rate = get_u32(&r);
     a->length = (fa_frames)get_u64(&r);
@@ -330,13 +335,14 @@ static int decode(fa_analysis* a, const uint8_t* d, size_t n)
             a->grid.segs[i].bpm = get_f64(&r);
             a->grid.segs[i].beat = get_f64(&r);
         }
+        if (g->sample_rate != a->rate || !fa_grid_valid(g, a->grid.segs, count)) return 0;
     }
     a->have_key = get_u32(&r) != 0;
     if (a->have_key) {
         int32_t tonic = (int32_t)get_u32(&r), minor = (int32_t)get_u32(&r);
         float conf = get_f32(&r);
         a->key.struct_size = sizeof(a->key);
-        if (r.bad || fa_key_make(tonic, minor, &a->key) != FA_OK) return 0;
+        if (r.bad || fa_key_make(tonic, minor, &a->key) != FA_OK || !(conf >= 0.0f && conf <= 1.0f)) return 0;
         a->key.confidence = conf;
     }
     count = get_u32(&r);
@@ -360,7 +366,10 @@ static int decode(fa_analysis* a, const uint8_t* d, size_t n)
         a->loudness.is_final = 1;
         a->loudness.source = FA_LOUDNESS_CACHE;
     }
-    return !r.bad && r.at == r.n && (a->kinds & ~(uint32_t)FA_ANALYZE_ALL) == 0;
+    return !r.bad && r.at == r.n && a->rate > 0 && (a->kinds & ~(uint32_t)FA_ANALYZE_ALL) == 0 &&
+           (!a->have_grid || (a->kinds & FA_ANALYZE_BEATS)) && (!a->have_key || (a->kinds & FA_ANALYZE_KEY)) &&
+           (a->have_loudness == ((a->kinds & FA_ANALYZE_LOUDNESS) != 0)) &&
+           (a->nwave == 0 || (a->kinds & FA_ANALYZE_WAVEFORM));
 }
 
 static void free_parts(fa_analysis* a)
@@ -409,7 +418,8 @@ static void cache_write(const char* dir, const char* path, const fa_analysis* a)
     FILE* f;
     memset(&b, 0, sizeof(b));
     encode(a, &b);
-    if (b.failed) { free(b.d); return; }
+    /* Past the read limit (a waveform of about a day) it could not be read back. */
+    if (b.failed || b.n > FA_ANALYSIS_MAX_CACHE) { free(b.d); return; }
     fa_mkdir_utf8(dir);
     snprintf(tmp, sizeof(tmp), "%s.%llx.tmp", path, (unsigned long long)fa_thread_current_id());
     f = fa_fopen_utf8(tmp, "wb");
@@ -473,13 +483,14 @@ static fa_result measure(const job* j, uint32_t kinds, fa_analysis* a)
     memset(&wave, 0, sizeof(wave));
     if (rate == 0 || ch == 0) r = FA_ERROR_UNSUPPORTED_FORMAT;
     if (r == FA_OK && (kinds & FA_ANALYZE_BEATS)) {
-        if (midi) {
-            r = fa_midi_exact_grid(midi, &a->grid);
+        if (midi) r = fa_midi_exact_grid(midi, &a->grid);
+        if (midi && r != FA_ERROR_NOT_FOUND) {
             a->have_grid = r == FA_OK;
         } else if (tracker) {
             r = fa_tracker_grid_start(tracker);
-        } else if (!(onset = fa_onset_new(rate))) {
-            r = FA_ERROR_OUT_OF_MEMORY;
+        } else {
+            /* Audio, or a MIDI file with SMPTE timing (no tempo): listen to it. */
+            r = (onset = fa_onset_new(rate)) != NULL ? FA_OK : FA_ERROR_OUT_OF_MEMORY;
         }
     }
     if (r == FA_OK && (kinds & FA_ANALYZE_KEY) && !(chroma = fa_chroma_new(rate))) r = FA_ERROR_OUT_OF_MEMORY;
@@ -578,6 +589,16 @@ static fa_result run(const job* j, fa_analysis** out)
         r = open_source(j, &src);
         if (r != FA_OK) { free(a); return r; }
         if (fa_scan_cache_key(&src, &j->env, &key)) {
+            const uint8_t* head;
+            size_t n = fa_source_peek(&src, &head);
+            /* A module renders at the engine's rate, and its frames are in it (MIDI
+             * keys have the rate already). */
+            if (fa_probe_tracker(head, n, 0) > 2) {
+                uint8_t rb[4];
+                int i;
+                for (i = 0; i < 4; i++) rb[i] = (uint8_t)(j->env.midi_rate >> (i * 8));
+                key = fa_fnv1a(key, rb, sizeof(rb));
+            }
             use_cache = 1;
             key_size = src.length;
         }

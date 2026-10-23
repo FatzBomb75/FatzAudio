@@ -464,6 +464,51 @@ public sealed class AudioEngine : IDisposable
         return Loudness.From(l);
     }
 
+    /// <summary>
+    /// Analyses a file without playing it: one decode of the audio gives any mix of the beat grid, the key, a waveform
+    /// overview and the loudness. MIDI files and tracker modules get their exact beat grid from the file (MIDI files are
+    /// rendered with <see cref="DefaultSoundFont"/>, else the OS's instruments, as playback does). Results are cached when
+    /// <see cref="AudioEngineOptions.CacheDirectory"/> is set, so a song is analysed once. Blocks until done (about a second
+    /// for a 4-minute song on one core): call it from a worker thread, or use <see cref="AnalyzeAsync"/>, and run several
+    /// at once for a library.
+    /// </summary>
+    /// <param name="path">Path of the audio file.</param>
+    /// <param name="kinds">What to find out; defaults to the beat grid and the key.</param>
+    /// <param name="options">Tempo range and cache use; null uses the defaults.</param>
+    /// <returns>The result, a plain object with nothing to dispose.</returns>
+    /// <exception cref="FatzAudioException">The file is missing (<see cref="ErrorCode.NotFound"/>), no decoder reads it (<see cref="ErrorCode.UnsupportedFormat"/>), or the options are invalid (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <exception cref="ObjectDisposedException">The engine was disposed.</exception>
+    /// <example>
+    /// <code>
+    /// var t = engine.Analyze("song.mp3");
+    /// Console.WriteLine($"{t.Beats?.Bpm:0.0} BPM, key {t.Key?.Name} ({t.Key?.Camelot})");
+    /// </code>
+    /// </example>
+    public TrackAnalysis Analyze(string path, AnalysisKinds kinds = AnalysisKinds.Beats | AnalysisKinds.Key, AnalysisOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        return TrackAnalysis.Run(Handle, path, kinds, options);
+    }
+
+    /// <summary>
+    /// <see cref="Analyze"/> on a thread-pool thread. Disposing the engine while it runs is safe: the analysis keeps the
+    /// native engine alive until it is done.
+    /// </summary>
+    /// <param name="path">Path of the audio file.</param>
+    /// <param name="kinds">What to find out; defaults to the beat grid and the key.</param>
+    /// <param name="options">Tempo range and cache use; null uses the defaults.</param>
+    /// <param name="cancellationToken">Stops the wait (the native analysis, which cannot be interrupted, runs to its end).</param>
+    /// <returns>A task with the result.</returns>
+    /// <exception cref="FatzAudioException">As for <see cref="Analyze"/>, thrown through the task.</exception>
+    /// <exception cref="OperationCanceledException">The token was cancelled.</exception>
+    /// <exception cref="ObjectDisposedException">The engine was disposed.</exception>
+    public Task<TrackAnalysis> AnalyzeAsync(string path, AnalysisKinds kinds = AnalysisKinds.Beats | AnalysisKinds.Key,
+        AnalysisOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        return TrackAnalysis.RunAsync(Handle, h => TrackAnalysis.Run(h, path, kinds, options), cancellationToken);
+    }
+
     private SoundFont? _defaultSoundFont;
 
     /// <summary>

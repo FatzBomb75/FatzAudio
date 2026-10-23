@@ -1256,11 +1256,13 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
  * Results are cached in fa_engine_config.cache_directory, keyed by the file's
  * content like loudness scans, so a song is analysed once.
  *
- * Accuracy, measured (docs/features/analysis.md has the report): steady,
- * quantized music gets its tempo within 0.05 BPM and beats within a few ms; live
- * drumming gets a lower confidence. The key is right about three times in four on
- * pop, and most misses are the relative major/minor or a fifth away. Show both, and
- * let users correct the grid (fa_stream_set_beat_grid). Bars (which beat starts a
+ * Accuracy, measured on General MIDI renders (docs/features/analysis.md has the
+ * report): steady music gets its tempo within 0.05 BPM and beats within about
+ * 2 ms; played-in tempo that drifts gets the right mean tempo but a low confidence,
+ * as a constant grid cannot follow it. Half-time songs may read at half tempo. Real
+ * recordings do worse than renders, the key most of all (misses are mostly the
+ * relative major/minor or a fifth away). Show the confidence, and let users correct
+ * the grid (fa_stream_set_beat_grid). Bars (which beat starts a
  * bar) are known only for exact grids; other grids say beat 0 starts a bar. */
 typedef enum fa_analysis_kind {
     FA_ANALYZE_LOUDNESS = 1 << 0,
@@ -1278,8 +1280,8 @@ typedef struct fa_analysis_options {
     uint32_t kinds;          /* fa_analysis_kind bits; default BEATS | KEY */
     float min_bpm;           /* preferred tempo range: a tempo outside it is doubled or
                                 halved into it (default 70) ... */
-    float max_bpm;           /* ... 180; max_bpm must be at least 1.9 x min_bpm. MIDI
-                                and tracker grids are never folded */
+    float max_bpm;           /* ... 180; min_bpm >= 30, max_bpm <= 400 and at least
+                                1.9 x min_bpm. MIDI and tracker grids are never folded */
     uint32_t flags;          /* fa_analysis_flags */
 } fa_analysis_options;
 
@@ -1287,7 +1289,7 @@ FA_API void FA_CALL fa_analysis_options_init(fa_analysis_options* options);
 
 typedef struct fa_analysis fa_analysis;
 
-/* Analyses a file and blocks until done (about a second for a 4-minute song on one
+/* Analyses a file and blocks until done (about 1.5 s for a 4-minute song on one
  * core; call it from a worker thread, and run several at once for a library).
  * MIDI files use the engine's soundfont, else the OS's instruments, as playback
  * does. options NULL = defaults. FA_ERROR_UNSUPPORTED_FORMAT for files no decoder
@@ -1319,8 +1321,9 @@ typedef enum fa_grid_flags {
     FA_GRID_CONSTANT = 1 << 0,  /* one tempo for the whole song (segment_count 1) */
     FA_GRID_EXACT    = 1 << 1,  /* from the file (MIDI tempo events, tracker rows), not measured */
     FA_GRID_EDITED   = 1 << 2,  /* set by the app, e.g. after the user corrected it */
-    FA_GRID_BARS     = 1 << 3   /* beats_per_bar and bar_offset are known (exact grids
-                                   with one time signature); else they are 4 and 0 */
+    FA_GRID_BARS     = 1 << 3   /* beats_per_bar and bar_offset are known (MIDI files
+                                   with one time signature from the start); else they
+                                   are 4 and 0 */
 } fa_grid_flags;
 
 typedef struct fa_beat_grid {
@@ -1361,8 +1364,9 @@ typedef struct fa_key_info {
     char camelot[4];         /* "8B" (C major) .. "12A" */
 } fa_key_info;
 
-/* FA_ERROR_NOT_FOUND when the kind was not asked for, or when the audio has no
- * steady beat (silence, a few seconds of speech) or no key (silence, drums only). */
+/* Each getter returns FA_ERROR_NOT_FOUND when its kind was not asked for; the grid
+ * and key also when the audio has no steady beat (silence, a few seconds of speech)
+ * or no key (silence, drums only). */
 FA_API fa_result FA_CALL fa_analysis_get_beat_grid(const fa_analysis* analysis, fa_beat_grid* out_grid);
 /* Copies up to `capacity` segments (NULL with capacity 0 to count them). */
 FA_API fa_result FA_CALL fa_analysis_get_tempo_map(const fa_analysis* analysis, fa_tempo_segment* out_segments,
@@ -1383,15 +1387,17 @@ FA_API fa_result FA_CALL fa_key_transpose(const fa_key_info* key, int32_t semito
 FA_API fa_result FA_CALL fa_key_make(int32_t tonic, int32_t minor, fa_key_info* out_key);
 
 /* A stream's beat grid, for decks (sync, beat loops, aligned auto-mix): one from an
- * analysis, one the user corrected, or the app's own. grid NULL removes it. With
+ * analysis, one the user corrected, or the app's own. grid NULL removes it (a MIDI or
+ * tracker stream then gets its file's grid again). With
  * count 0 the grid is constant (one segment at first_beat, beat 0); otherwise
- * `segments` (count of them, starts rising, bpm 1..1000) are the tempo map and
+ * `segments` (count of them, starts rising, bpm 0.1..100000) are the tempo map and
  * grid->segment_count is ignored. Frames are the grid's sample_rate. The flags
- * are kept as given. */
+ * are kept as given, except FA_GRID_CONSTANT, which is set when there is one
+ * segment and cleared otherwise. */
 FA_API fa_result FA_CALL fa_stream_set_beat_grid(fa_stream* stream, const fa_beat_grid* grid,
                                                  const fa_tempo_segment* segments, uint32_t count);
 /* The grid set last, else, for MIDI files and tracker modules, the exact one from
- * the file (for a module, the first call renders it once without sound, about 0.1 s
+ * the file (for a module, the first call renders it once without sound, about 0.25 s
  * for a 4-minute song), else FA_ERROR_NOT_FOUND. Segments as for
  * fa_analysis_get_tempo_map; out_segments may be NULL with capacity 0. */
 FA_API fa_result FA_CALL fa_stream_get_beat_grid(fa_stream* stream, fa_beat_grid* out_grid,

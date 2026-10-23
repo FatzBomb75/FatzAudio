@@ -465,6 +465,7 @@ typedef struct midi_sysex {
 enum { MODE_GM, MODE_GM2, MODE_GS, MODE_XG };
 
 struct fa_midi {
+    int smpte;                  /* SMPTE time division: no tempo, so no beat grid */
     fa_soundfont* font;         /* a reference */
     tsf* synth;
     uint32_t rate;
@@ -1192,6 +1193,7 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
     double rate = (double)m->rate;
 
     m->info.format = smf[9];
+    m->smpte = (smf[12] & 0x80) != 0;
     m->info.tracks = ((uint32_t)smf[10] << 8) | smf[11];
     text_per_track = (uint32_t*)calloc(m->info.tracks ? m->info.tracks : 1, 2 * sizeof(uint32_t));
     if (!text_per_track) return FA_ERROR_OUT_OF_MEMORY;
@@ -1545,6 +1547,7 @@ fa_result fa_midi_exact_grid(const struct fa_midi* m, fa_grid_data* out)
     double us = 500000.0, beat = 0.0;     /* 120 bpm until the first tempo event */
     fa_frames at = 0;
     memset(out, 0, sizeof(*out));
+    if (m->smpte) return FA_ERROR_NOT_FOUND;
     out->segs = (fa_tempo_segment*)malloc(((size_t)m->nmarks + 1) * sizeof(fa_tempo_segment));
     if (!out->segs) return FA_ERROR_OUT_OF_MEMORY;
     out->segs[n].start = 0;

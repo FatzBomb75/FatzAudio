@@ -8,6 +8,24 @@
 
 #define FA_GRID_FLAGS_ALL (FA_GRID_CONSTANT | FA_GRID_EXACT | FA_GRID_EDITED | FA_GRID_BARS)
 #define FA_GRID_SIZE_V1 (offsetof(fa_beat_grid, segment_count) + sizeof(uint32_t))
+#define FA_GRID_MIN_BPM 0.1        /* MIDI tempos reach 3.6 BPM, tracker ones go lower ... */
+#define FA_GRID_MAX_BPM 100000.0   /* ... and far higher (speed 1, tempo 255) */
+
+static int bpm_ok(double bpm) { return bpm >= FA_GRID_MIN_BPM && bpm <= FA_GRID_MAX_BPM; }
+
+int fa_grid_valid(const fa_beat_grid* g, const fa_tempo_segment* segs, uint32_t count)
+{
+    uint32_t i;
+    if (!bpm_ok(g->bpm) || g->sample_rate == 0 || g->sample_rate > 1000000 || g->beats_per_bar == 0 ||
+        g->beats_per_bar > 64 || g->bar_offset >= g->beats_per_bar || (g->flags & ~(uint32_t)FA_GRID_FLAGS_ALL) ||
+        !(g->confidence >= 0.0f && g->confidence <= 1.0f))
+        return 0;
+    for (i = 0; i < count; i++) {
+        if (!bpm_ok(segs[i].bpm) || !isfinite(segs[i].beat)) return 0;
+        if (i && (segs[i].start <= segs[i - 1].start || segs[i].beat < segs[i - 1].beat)) return 0;
+    }
+    return 1;
+}
 
 void fa_grid_data_free(fa_grid_data* g)
 {
@@ -69,7 +87,7 @@ static fa_result file_grid(struct fa_stream* s, fa_grid_data* out)
     if (r != FA_OK) return r;
     memset(&env, 0, sizeof(env));
     env.midi_rate = s->decoder.format.sample_rate;
-    r = fa_decoder_open(&dec, &src, NULL, NULL, s->audio_track, &env);
+    r = fa_decoder_open(&dec, &src, s->path && s->path_length > 0 ? s->path_name : s->path, NULL, s->audio_track, &env);
     if (r == FA_OK) {
         r = fa_tracker_of(&dec) ? fa_tracker_grid_render(&dec, out) : FA_ERROR_NOT_FOUND;
         fa_decoder_close(&dec);
@@ -82,7 +100,6 @@ FA_API fa_result FA_CALL fa_stream_set_beat_grid(fa_stream* stream, const fa_bea
                                                  const fa_tempo_segment* segments, uint32_t count)
 {
     fa_grid_data g;
-    uint32_t i;
     if (!stream) return FA_ERROR_INVALID_ARG;
     if (!grid) {
         fa_mutex_lock(&stream->grid_lock);
@@ -91,20 +108,14 @@ FA_API fa_result FA_CALL fa_stream_set_beat_grid(fa_stream* stream, const fa_bea
         fa_mutex_unlock(&stream->grid_lock);
         return FA_OK;
     }
-    if (grid->struct_size < FA_GRID_SIZE_V1 || (count && !segments) || !(grid->bpm >= 1.0 && grid->bpm <= 1000.0) ||
-        grid->sample_rate == 0 || grid->sample_rate > 1000000 || grid->beats_per_bar == 0 || grid->beats_per_bar > 64 ||
-        grid->bar_offset >= grid->beats_per_bar || (grid->flags & ~(uint32_t)FA_GRID_FLAGS_ALL) ||
-        !(grid->confidence >= 0.0f && grid->confidence <= 1.0f))
+    if (grid->struct_size < FA_GRID_SIZE_V1 || (count && !segments) || !fa_grid_valid(grid, segments, count))
         return FA_ERROR_INVALID_ARG;
-    for (i = 0; i < count; i++) {
-        if (!(segments[i].bpm >= 1.0 && segments[i].bpm <= 1000.0) || !isfinite(segments[i].beat)) return FA_ERROR_INVALID_ARG;
-        if (i && (segments[i].start <= segments[i - 1].start || segments[i].beat < segments[i - 1].beat))
-            return FA_ERROR_INVALID_ARG;
-    }
     memset(&g, 0, sizeof(g));
     memcpy(&g.grid, grid, FA_GRID_SIZE_V1);
     g.grid.struct_size = sizeof(fa_beat_grid);
     g.grid.segment_count = count ? count : 1;
+    if (g.grid.segment_count == 1) g.grid.flags |= FA_GRID_CONSTANT;
+    else g.grid.flags &= ~(uint32_t)FA_GRID_CONSTANT;
     g.segs = (fa_tempo_segment*)malloc((size_t)g.grid.segment_count * sizeof(fa_tempo_segment));
     if (!g.segs) return FA_ERROR_OUT_OF_MEMORY;
     if (count) {
