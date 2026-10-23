@@ -20,7 +20,7 @@ public sealed class MicOptions
     /// </summary>
     public bool Monitor { get; init; } = true;
 
-    /// <summary>A host mic: its voice will duck the music (planned with the mic ducking). Leave it off for singers.</summary>
+    /// <summary>A host mic: its voice ducks the music (<see cref="DjMixer.Ducking"/>). Leave it off for singers.</summary>
     public bool DucksMusic { get; init; }
 
     /// <summary>
@@ -29,6 +29,62 @@ public sealed class MicOptions
     /// decides for both.
     /// </summary>
     public bool KeepOsProcessing { get; init; }
+}
+
+/// <summary>
+/// The shared reverb and echo of a <see cref="DjMixer"/>'s mics, like the effects unit of a karaoke mixer. Each mic
+/// sends to them (<see cref="Mic.ReverbSend"/>, <see cref="Mic.EchoSend"/>); a mic with monitor off sends nothing.
+/// Out-of-range values are clamped.
+/// </summary>
+public sealed record MicEffects
+{
+    /// <summary>0 (small room) .. 1 (hall), default 0.5.</summary>
+    public float ReverbSize { get; init; } = 0.5f;
+
+    /// <summary>0 (bright) .. 1 (dark), default 0.5.</summary>
+    public float ReverbDamping { get; init; } = 0.5f;
+
+    /// <summary>The echo's time, 20 ms .. 1 s, default 250 ms; a change glides, bending the repeats for a moment.</summary>
+    public TimeSpan EchoTime { get; init; } = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>How much of each repeat comes back, 0..0.9, default 0.35.</summary>
+    public float EchoFeedback { get; init; } = 0.35f;
+
+    /// <summary>0 (dark) .. 1 (bright), default 0.6: a low-pass in the feedback, so later repeats get duller.</summary>
+    public float EchoTone { get; init; } = 0.6f;
+}
+
+/// <summary>
+/// How a host's voice ducks the music (<see cref="DjMixer.Ducking"/>): while a mic with
+/// <see cref="MicOptions.DucksMusic"/> speaks above the threshold, the decks go down by the depth, and come back after
+/// the hold and the release. The music is the decks and any other stream on the mixer's device. Out-of-range values are
+/// clamped.
+/// </summary>
+public sealed record Ducking
+{
+    /// <summary>How far the music goes down, -40..0 dB, default -12.</summary>
+    public float DepthDb { get; init; } = -12f;
+
+    /// <summary>How fast it goes down, 1 ms .. 1 s, default 50 ms.</summary>
+    public TimeSpan Attack { get; init; } = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>How long it stays down after the voice, up to 5 s, default 300 ms.</summary>
+    public TimeSpan Hold { get; init; } = TimeSpan.FromMilliseconds(300);
+
+    /// <summary>How fast it comes back, 10 ms .. 5 s, default 600 ms.</summary>
+    public TimeSpan Release { get; init; } = TimeSpan.FromMilliseconds(600);
+
+    /// <summary>The voice level that ducks, -60..0 dB, default -40.</summary>
+    public float ThresholdDb { get; init; } = -40f;
+}
+
+/// <summary>What a <see cref="DjMixer"/> recording takes (<see cref="AudioEncoder.Record(DjMixer, MixerTap)"/>).</summary>
+public enum MixerTap
+{
+    /// <summary>What the speakers play, after the limiter.</summary>
+    Master = 0,
+    /// <summary>Both mics with their reverb and echo, before the master gain; a mic with monitor off is recorded dry.</summary>
+    Vocals = 1,
 }
 
 /// <summary>A mic's meter reading.</summary>
@@ -55,7 +111,8 @@ public sealed class MicEventArgs : EventArgs
 /// </remarks>
 public sealed class Mic : IDisposable
 {
-    private const int ParamGainDb = 0, ParamMute = 1, ParamPan = 2, ParamGateDb = 3, ParamMonitor = 6, ParamLowCut = 7;
+    private const int ParamGainDb = 0, ParamMute = 1, ParamPan = 2, ParamGateDb = 3, ParamReverb = 4, ParamEcho = 5,
+        ParamMonitor = 6, ParamLowCut = 7;
     private readonly DjMixer _mixer;
     private readonly MicHandle _handle;
 
@@ -93,6 +150,12 @@ public sealed class Mic : IDisposable
 
     /// <summary>An 80 Hz high-pass against handling noise and rumble; on by default.</summary>
     public bool LowCut { get => Get(ParamLowCut) != 0f; set => Set(ParamLowCut, value ? 1f : 0f); }
+
+    /// <summary>The send into the shared reverb (<see cref="DjMixer.MicEffects"/>), 0..1, default 0.2; glides over 5 ms.</summary>
+    public float ReverbSend { get => Get(ParamReverb); set => Set(ParamReverb, value); }
+
+    /// <summary>The send into the shared echo, 0..1, default 0; glides over 5 ms.</summary>
+    public float EchoSend { get => Get(ParamEcho); set => Set(ParamEcho, value); }
 
     /// <summary>
     /// Sets the mic's EQ: the same bands and limits as <see cref="AudioStream.SetEqualizer(IReadOnlyList{EqualizerBand})"/>.

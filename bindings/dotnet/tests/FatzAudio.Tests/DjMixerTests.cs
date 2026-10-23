@@ -160,7 +160,7 @@ public class DjMixerTests
 
         var latency = mixer.Latency;
         Assert.True(latency.Master > TimeSpan.Zero);
-        Assert.Equal(latency.Master, latency.Cue);
+        Assert.True(latency.Cue <= latency.Master);   // the master adds the limiter's look-ahead
         Assert.True(mic.InputLatency > TimeSpan.Zero);
         Assert.Equal(latency.MicInput[0]!.Value + latency.Master, latency.MicMonitor[0]);
 
@@ -196,5 +196,58 @@ public class DjMixerTests
         Assert.True(mixer.Output.IsDisposed);
         Assert.Throws<ObjectDisposedException>(() => mic.GainDb);
         mic.Dispose();                   // twice is fine
+    }
+
+    [Fact]
+    public void MicEffectsAndDucking_RoundTripAndClamp()
+    {
+        using var engine = CreateHeadless();
+        using var mixer = engine.CreateDjMixer();
+        using var mic = mixer.AddMic();
+        Assert.Equal(0.2f, mic.ReverbSend);
+        Assert.Equal(0f, mic.EchoSend);
+        mic.ReverbSend = 2f;
+        mic.EchoSend = 0.5f;
+        Assert.Equal(1f, mic.ReverbSend);
+        Assert.Equal(0.5f, mic.EchoSend);
+        Assert.Equal(new MicEffects(), mixer.MicEffects);
+        mixer.MicEffects = new MicEffects { ReverbSize = 0.8f, EchoTime = TimeSpan.FromSeconds(5), EchoFeedback = 0.5f };
+        var fx = mixer.MicEffects;
+        Assert.Equal(0.8f, fx.ReverbSize);
+        Assert.Equal(TimeSpan.FromSeconds(1), fx.EchoTime);
+        Assert.Equal(0.5f, fx.EchoFeedback);
+        Assert.Equal(new Ducking(), mixer.Ducking);
+        mixer.Ducking = new Ducking { DepthDb = -6f, Release = TimeSpan.FromSeconds(1) };
+        Assert.Equal(-6f, mixer.Ducking!.DepthDb);
+        Assert.Equal(TimeSpan.FromSeconds(1), mixer.Ducking.Release);
+        mixer.Ducking = null;
+        Assert.Null(mixer.Ducking);
+    }
+
+    [Fact]
+    public void Recording_MasterAndVocalsStartTogether()
+    {
+        using var engine = CreateHeadless();
+        using var mixer = engine.CreateDjMixer(new DjMixerOptions { Latency = LatencyMode.Normal });
+        using var mic = mixer.AddMic();
+        var masterFile = new MemoryStream();
+        var vocalsFile = new MemoryStream();
+        using var master = AudioEncoder.Create(masterFile, leaveOpen: true);
+        using var vocals = AudioEncoder.Create(vocalsFile, leaveOpen: true);
+        master.Record(mixer, MixerTap.Master);
+        vocals.Record(mixer, MixerTap.Vocals);
+        Thread.Sleep(100);
+        Assert.Equal(0, master.Status.Frames);   // waits for StartRecording
+        mixer.StartRecording([master, vocals]);
+        var ex = Assert.Throws<FatzAudioException>(() => mixer.StartRecording([master]));
+        Assert.Equal(ErrorCode.Busy, ex.ErrorCode);
+        Thread.Sleep(400);
+        master.Close();
+        vocals.Close();
+        Assert.True(masterFile.Length > 44);
+        Assert.True(vocalsFile.Length > 44);
+        using var other = AudioEncoder.Create(new MemoryStream());
+        ex = Assert.Throws<FatzAudioException>(() => mixer.StartRecording([other]));
+        Assert.Equal(ErrorCode.InvalidArgument, ex.ErrorCode);
     }
 }

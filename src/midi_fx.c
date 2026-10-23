@@ -10,6 +10,10 @@
  * Chorus: two modulated delay taps per channel (10-16 ms, sine LFOs at 0.4 Hz in
  * quadrature between the channels), averaged, no feedback.
  *
+ * The reverb's room (comb feedback), damping, input gain and wet level default to
+ * the MIDI tuning below; the DJ mixer's mic reverb sets its own (fa_midi_fx_set_reverb)
+ * and runs the reverb alone (fa_midi_fx_reverb).
+ *
  * Both are deterministic: the output depends only on the input since the last
  * reset, and the chorus LFO only on the song frame, so reading in any block size
  * gives the same samples. When the input has been silent long enough for the
@@ -43,6 +47,7 @@ typedef struct fx_line { float* buf; int len, pos; float lp; } fx_line;
 
 struct fa_midi_fx {
     uint32_t rate;
+    float room, damp, in_gain, wet;     /* the reverb's tuning */
     fx_line comb[2][FX_COMBS];
     fx_line allpass[2][FX_ALLPASSES];
     int reverb_idle;
@@ -71,6 +76,10 @@ fa_midi_fx* fa_midi_fx_new(uint32_t rate)
     int ch, i;
     if (!fx) return NULL;
     fx->rate = rate;
+    fx->room = FX_ROOM;
+    fx->damp = FX_DAMP;
+    fx->in_gain = FX_INPUT_GAIN;
+    fx->wet = FX_REVERB_WET;
     for (ch = 0; ch < 2; ch++) {
         for (i = 0; i < FX_COMBS; i++) total += (size_t)(fx->comb[ch][i].len = scaled(comb_tuning[i] + ch * FX_SPREAD, rate));
         for (i = 0; i < FX_ALLPASSES; i++) total += (size_t)(fx->allpass[ch][i].len = scaled(allpass_tuning[i] + ch * FX_SPREAD, rate));
@@ -148,14 +157,14 @@ static void reverb_process(fa_midi_fx* fx, const float* in, float* out, int fram
     fx->reverb_idle = 0;
     fx->reverb_quiet = quiet_in ? fx->reverb_quiet + frames : 0;
     for (f = 0; f < frames; f++) {
-        float x = (in[f * 2] + in[f * 2 + 1]) * FX_INPUT_GAIN;
+        float x = (in[f * 2] + in[f * 2 + 1]) * fx->in_gain;
         for (ch = 0; ch < 2; ch++) {
             float y = 0.0f;
             for (i = 0; i < FX_COMBS; i++) {
                 fx_line* c = &fx->comb[ch][i];
                 float d = c->buf[c->pos];
-                c->lp = d * (1.0f - FX_DAMP) + c->lp * FX_DAMP;
-                c->buf[c->pos] = x + c->lp * FX_ROOM;
+                c->lp = d * (1.0f - fx->damp) + c->lp * fx->damp;
+                c->buf[c->pos] = x + c->lp * fx->room;
                 if (++c->pos == c->len) c->pos = 0;
                 y += d;
             }
@@ -166,7 +175,7 @@ static void reverb_process(fa_midi_fx* fx, const float* in, float* out, int fram
                 if (++a->pos == a->len) a->pos = 0;
                 y = d - y;
             }
-            y *= FX_REVERB_WET;
+            y *= fx->wet;
             out[f * 2 + ch] += y;
             if (fabsf(y) > peak) peak = fabsf(y);
         }
@@ -246,6 +255,19 @@ static void chorus_process(fa_midi_fx* fx, const float* in, float* out, int fram
     fx->lfo_s = s;
     fx->lfo_c = c;
     fx->lfo_next = song_frame + frames;
+}
+
+void fa_midi_fx_set_reverb(fa_midi_fx* fx, float room, float damp, float in_gain, float wet)
+{
+    fx->room = room;
+    fx->damp = damp;
+    fx->in_gain = in_gain;
+    fx->wet = wet;
+}
+
+void fa_midi_fx_reverb(fa_midi_fx* fx, const float* in, float* out, int frames)
+{
+    if (fx && frames > 0) reverb_process(fx, in, out, frames);
 }
 
 void fa_midi_fx_process(fa_midi_fx* fx, const float* reverb_in, const float* chorus_in, float* out, int frames, fa_frames song_frame)

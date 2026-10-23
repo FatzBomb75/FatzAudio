@@ -260,6 +260,11 @@ fa_midi_fx* fa_midi_fx_new(uint32_t rate);
 void fa_midi_fx_free(fa_midi_fx* fx);
 void fa_midi_fx_reset(fa_midi_fx* fx);
 void fa_midi_fx_process(fa_midi_fx* fx, const float* reverb_in, const float* chorus_in, float* out, int frames, fa_frames song_frame);
+/* The reverb alone, with its own tuning (the DJ mixer's mic reverb): room is the comb
+ * feedback (0.7..0.98), damp the lowpass in it (0..0.4), then the input and wet gains.
+ * Call set_reverb on the thread that processes; it takes effect at once. */
+void fa_midi_fx_set_reverb(fa_midi_fx* fx, float room, float damp, float in_gain, float wet);
+void fa_midi_fx_reverb(fa_midi_fx* fx, const float* in, float* out, int frames);
 struct fa_soundfont* fa_soundfont_retain(struct fa_soundfont* f);
 void fa_soundfont_release(struct fa_soundfont* f);
 /* A fingerprint of the soundfont's content, for the loudness cache. */

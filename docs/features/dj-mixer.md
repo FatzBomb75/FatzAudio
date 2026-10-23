@@ -128,7 +128,11 @@ Up to two karaoke mics (`FA_MIC_MAX`), mixed into the master before the master g
 
 ```
  input device -> bridge (drift-corrected) -> low cut -> gain -> gate -> EQ -> meter
-   -> mute -> pan -> master (when monitored)
+   -> mute -> pan -+-> master (when monitored)
+                   +-> reverb send -> shared reverb -+-> master
+                   '-> echo send ---> shared echo ---'
+ host mics -> ducker -> gain on the music (the decks)
+ mics with their effects -> vocals recording tap
 ```
 
 ```c
@@ -171,7 +175,8 @@ TimeSpan delay = mic.MonitorLatency;            // voice to speaker
 | Low cut | `FA_MIC_LOW_CUT` | `LowCut` | an 80 Hz high-pass, on / off | on |
 | Monitor | `FA_MIC_MONITOR`, `fa_mic_config.monitor` | `Monitor`, `MicOptions.Monitor` | heard through the master, or metered only (a mic that goes through a hardware mixer) | heard |
 | EQ | `fa_mic_set_eq` | `SetEqualizer` | the stream EQ's bands and presets ([equalizer](equalizer.md)); `FA_EQ_PRESET_LIVE_VOCAL` is made for mics | off |
-| Reverb, echo | `FA_MIC_REVERB_SEND`, `FA_MIC_ECHO_SEND` | — | planned next (`FA_ERROR_NOT_IMPLEMENTED`) | |
+| Reverb send | `FA_MIC_REVERB_SEND` | `ReverbSend` | 0..1 into the shared reverb | 0.2 |
+| Echo send | `FA_MIC_ECHO_SEND` | `EchoSend` | 0..1 into the shared echo | 0 |
 
 - **Inputs.** A mic reads one channel of a capture device (`channel`, from 0) or all of them summed (−1, the default). Two mics on one 2-input interface share the device: it is opened once. A channel the device does not have is `FA_ERROR_NOT_ENOUGH_CHANNELS`; a third mic is `FA_ERROR_BUSY`.
 - **Clocks.** The input runs on its own clock and often at its own rate (a USB mic at 44.1 kHz into a 48 kHz master). It reaches the master through a small buffer that a resampler keeps at a steady fill, adjusting the speed by at most 0.2% (not audible), so drift never builds up into a delay or a click. If the input stalls, the buffer grows by 2 ms (up to 50 ms) and starts again.
@@ -181,7 +186,83 @@ TimeSpan delay = mic.MonitorLatency;            // voice to speaker
 - **Unprocessed capture.** Mics ask for the input without the system's voice processing (automatic gain, noise suppression, echo cancelling: made for calls, they spoil singing and add latency). For now that is Android's UNPROCESSED input preset; Windows' raw mode is planned with the setup check, and macOS, iOS and Linux give the input as the system delivers it. `FA_MIC_OS_PROCESSING` (`KeepOsProcessing`) keeps the processing; two mics on one device share its input, so the first mic added decides for both.
 - **Permission.** The app asks for the microphone permission before adding a mic: Android needs `RECORD_AUDIO` in the manifest and the runtime prompt; macOS and iOS need `NSMicrophoneUsageDescription` (and a sandboxed macOS app the audio-input entitlement). Where the system refuses at open, adding a mic is `FA_ERROR_PERMISSION_DENIED` (`ErrorCode.PermissionDenied`); some systems deliver silence instead.
 - **Input lost.** An input that goes away (unplugged, taken by another app) goes silent, the mix carries on, and the mixer raises `FA_EVENT_INPUT_LOST` once per mic on `fa_mixer_set_event_callback` (`InputLost`), on the engine's event thread. Remove the mic there or later and add it again when the device is back. `fa_mic_remove` works inside the callback, also for the event's own mic.
-- **Host mics.** `FA_MIC_DUCKS_MUSIC` (`DucksMusic`) marks a host's mic, for the planned ducking; leave it off for singers.
+- **Host mics.** `FA_MIC_DUCKS_MUSIC` (`DucksMusic`) marks a host's mic: its voice ducks the music (below). Leave it off for singers.
+
+### Reverb and echo
+
+Both mics share one reverb and one echo, like the effects unit of a karaoke mixer; each mic sets how much it sends (`FA_MIC_REVERB_SEND`, `FA_MIC_ECHO_SEND`). Their returns join the mics in the master, in the middle. They take what is heard: a mic with monitor off sends nothing.
+
+```c
+fa_mic_effects fx;
+fa_mic_effects_init(&fx);              /* the defaults below */
+fx.reverb_size = 0.7f;
+fx.echo_time_ms = 180;
+fa_mixer_set_mic_effects(mixer, &fx);
+fa_mic_set_param(mic, FA_MIC_ECHO_SEND, 0.3f);
+```
+
+```csharp
+mixer.MicEffects = new MicEffects { ReverbSize = 0.7f, EchoTime = TimeSpan.FromMilliseconds(180) };
+mic.EchoSend = 0.3f;
+```
+
+| Setting | C (`fa_mic_effects`) | .NET (`MicEffects`) | Range | Default |
+|---|---|---|---|---|
+| Reverb size | `reverb_size` | `ReverbSize` | 0 (small room) .. 1 (hall) | 0.5 |
+| Reverb damping | `reverb_damping` | `ReverbDamping` | 0 (bright) .. 1 (dark) | 0.5 |
+| Echo time | `echo_time_ms` | `EchoTime` | 20 ms .. 1 s | 250 ms |
+| Echo feedback | `echo_feedback` | `EchoFeedback` | 0 .. 0.9, how much of each repeat comes back | 0.35 |
+| Echo tone | `echo_tone` | `EchoTone` | 0 (dark) .. 1 (bright): a low-pass in the feedback from 1 to 16 kHz, so later repeats get duller | 0.6 |
+
+The reverb is the one the MIDI synthesizer uses (eight combs and four allpasses per side, after the published Freeverb design), with Freeverb's size and damping ranges. An echo time change glides over about 50 ms, bending the repeats for a moment as a tape echo does, so it never clicks. Out-of-range values are clamped. The tails ring out after a mic is removed.
+
+### Ducking
+
+While a host mic speaks above the threshold, the music (the decks after the crossfader, and any other stream on the mixer's device) goes down by the depth; it comes back after the hold and the release. It is on with these defaults from the start, so marking a mic `FA_MIC_DUCKS_MUSIC` is enough; `fa_mixer_set_ducking(mixer, NULL)` (`Ducking = null`) turns it off.
+
+| Setting | C (`fa_ducking`) | .NET (`Ducking`) | Range | Default |
+|---|---|---|---|---|
+| Depth | `depth_db` | `DepthDb` | −40..0 dB (0 = off) | −12 dB |
+| Attack | `attack` | `Attack` | 1 ms .. 1 s | 50 ms |
+| Hold | `hold` | `Hold` | 0 .. 5 s | 300 ms |
+| Release | `release` | `Release` | 10 ms .. 5 s | 600 ms |
+| Threshold | `threshold_db` | `ThresholdDb` | −60..0 dB, the voice level that ducks | −40 dB |
+
+The music is everything the decks and other streams on the mixer's device play; the mics and their effects are not ducked. The ducker follows the host's voice after the gate, so room noise below the gate never ducks. A muted host does not duck; a host with monitor off (heard through a hardware mixer) still does. Singers are never marked, so the music never dips under a singer.
+
+### Recording
+
+A mixer has two recording taps. Encoders attached to them record nothing until `fa_mixer_start_recording` starts them together on one device frame, so the files line up in any editor:
+
+| Tap | C | .NET | What it records |
+|---|---|---|---|
+| Master | `FA_MIXER_TAP_MASTER` | `MixerTap.Master` | what the speakers play, after the limiter |
+| Vocals | `FA_MIXER_TAP_VOCALS` | `MixerTap.Vocals` | both mics with their reverb and echo, before the master gain; a mic with monitor off is recorded dry |
+
+```c
+fa_encoder *master, *vocals;
+fa_encoder_create_path("night.flac", &flac_options, &master);
+fa_encoder_create_path("vocals.wav", NULL, &vocals);
+fa_encoder_attach_mixer(master, mixer, FA_MIXER_TAP_MASTER);
+fa_encoder_attach_mixer(vocals, mixer, FA_MIXER_TAP_VOCALS);
+fa_encoder* both[] = { master, vocals };
+fa_mixer_start_recording(mixer, both, 2, 0, 0);   /* 0 = with the next audio block */
+/* ... the show ... */
+fa_encoder_close(master);
+fa_encoder_close(vocals);
+```
+
+```csharp
+using var master = AudioEncoder.Create("night.flac", new EncoderOptions { Format = EncodeFormat.Flac });
+using var vocals = AudioEncoder.Create("vocals.wav");
+master.Record(mixer, MixerTap.Master);
+vocals.Record(mixer, MixerTap.Vocals);
+mixer.StartRecording([master, vocals]);
+```
+
+- **Lined up as the singer heard it.** A singer sings along with music that reached the speakers a little late, and the voice reaches the mixer a little late again. So the vocals file starts later than the master file by that round trip (the mic's input latency plus the master's output latency, the larger of two mics): put both files at 0 in an editor and the voice sits on the beat it was sung to. `FA_MIXER_REC_RAW_TIMING` (`rawTiming: true`) starts both with what the mixer made on the same frame instead (the voice as it reached the mixer). The round trip is the reported latency; the setup check will measure it.
+- `device_time` (`startAt`) starts on a frame of the mixer device's clock (`fa_device_get_time`, `Output.Time`). 0, or a time less than one mixer block (2048 frames, about 43 ms at 48 kHz) ahead, starts one block ahead, so a block already in the audio thread never splits the stems.
+- Formats, options and closing are those of every encoder ([recording and encoding](recording-encoding.md)). Destroying the mixer ends the recordings' input; close the encoders to complete the files.
 
 ### Latency
 
@@ -189,8 +270,8 @@ TimeSpan delay = mic.MonitorLatency;            // voice to speaker
 
 | Field | What it is |
 |---|---|
-| `master` | the master output's buffer |
-| `cue` | the headphones; the same as `master` for the channel and Y-cable cues |
+| `master` | the master output's buffer plus the limiter's look-ahead (about 2 ms) |
+| `cue` | the headphones: the output's buffer (the cue is not limited, so it has no look-ahead) |
 | `cue_alignment` | delay added to line up a second-device cue (planned; 0) |
 | `mic_input[i]` | the input device's buffer plus the bridge's fill; −1 when slot `i` has no mic |
 | `mic_monitor[i]` | voice to speaker: `mic_input[i]` plus `master`; −1 when no mic |
@@ -199,4 +280,4 @@ Times the system does not report are estimated from the buffer sizes. Below abou
 
 ## Planned
 
-Reverb and echo for the mics, host-mic ducking, recording the master and the vocals, a measured setup check and exclusive mode, more than two decks, a second-device cue, beat sync and beat loops (BPM analysis), and auto-mix are the next steps of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).
+A measured setup check and exclusive mode, more than two decks, a second-device cue, beat sync and beat loops (BPM analysis), and auto-mix are the next steps of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).

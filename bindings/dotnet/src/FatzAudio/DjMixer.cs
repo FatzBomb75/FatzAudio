@@ -121,8 +121,8 @@ public sealed class DjMixerOptions
 }
 
 /// <summary>What a <see cref="DjMixer"/>'s outputs and inputs add up to. Times the system does not report are estimated from the device's buffer sizes.</summary>
-/// <param name="Master">The master output (the system's buffer).</param>
-/// <param name="Cue">The headphones: the master's for <see cref="CueOutput.Channels34"/> and <see cref="CueOutput.Split"/>.</param>
+/// <param name="Master">The master output: the system's buffer plus the limiter's look-ahead (about 2 ms).</param>
+/// <param name="Cue">The headphones: the output's buffer (the cue is not limited, so it has no look-ahead).</param>
 /// <param name="CueAlignment">Delay added to line up a second-device cue (planned: zero).</param>
 /// <param name="MicInput">Per mic slot: the input buffer plus the drift-corrected bridge; null = no mic in the slot.</param>
 /// <param name="MicMonitor">Per mic slot: mic to speaker, the input plus the master; null = no mic in the slot.</param>
@@ -309,6 +309,126 @@ public sealed class DjMixer : IDisposable
             }
             return new MixerLatency(TimeConvert.FromNanoseconds(l.Master), TimeConvert.FromNanoseconds(l.Cue),
                 TimeConvert.FromNanoseconds(l.CueAlignment), input, monitor);
+        }
+    }
+
+    /// <summary>The mics' shared reverb and echo; set a new record to change them.</summary>
+    public unsafe MicEffects MicEffects
+    {
+        get
+        {
+            FaMicEffects e;
+            NativeMethods.fa_mic_effects_init(&e);
+            using (Lease()) FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_get_mic_effects(_mixer, &e));
+            return new MicEffects
+            {
+                ReverbSize = e.ReverbSize,
+                ReverbDamping = e.ReverbDamping,
+                EchoTime = TimeSpan.FromMilliseconds(e.EchoTimeMs),
+                EchoFeedback = e.EchoFeedback,
+                EchoTone = e.EchoTone,
+            };
+        }
+        set
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            FaMicEffects e;
+            NativeMethods.fa_mic_effects_init(&e);
+            e.ReverbSize = value.ReverbSize;
+            e.ReverbDamping = value.ReverbDamping;
+            e.EchoTimeMs = (float)value.EchoTime.TotalMilliseconds;
+            e.EchoFeedback = value.EchoFeedback;
+            e.EchoTone = value.EchoTone;
+            using (Lease()) FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_set_mic_effects(_mixer, &e));
+        }
+    }
+
+    /// <summary>
+    /// How a host mic (<see cref="MicOptions.DucksMusic"/>) ducks the music; on with the <see cref="FatzAudio.Ducking"/>
+    /// defaults from the start. Null turns it off (and reads back as null when off). Singers never duck the music.
+    /// </summary>
+    public unsafe Ducking? Ducking
+    {
+        get
+        {
+            FaDucking d;
+            NativeMethods.fa_ducking_init(&d);
+            using (Lease()) FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_get_ducking(_mixer, &d));
+            if (d.DepthDb == 0f) return null;
+            return new Ducking
+            {
+                DepthDb = d.DepthDb,
+                Attack = TimeConvert.FromNanoseconds(d.Attack),
+                Hold = TimeConvert.FromNanoseconds(d.Hold),
+                Release = TimeConvert.FromNanoseconds(d.Release),
+                ThresholdDb = d.ThresholdDb,
+            };
+        }
+        set
+        {
+            using var lease = Lease();
+            if (value is null)
+            {
+                FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_set_ducking(_mixer, null));
+                return;
+            }
+            FaDucking d;
+            NativeMethods.fa_ducking_init(&d);
+            d.DepthDb = value.DepthDb;
+            d.Attack = TimeConvert.ToNanoseconds(value.Attack);
+            d.Hold = TimeConvert.ToNanoseconds(value.Hold);
+            d.Release = TimeConvert.ToNanoseconds(value.Release);
+            d.ThresholdDb = value.ThresholdDb;
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_set_ducking(_mixer, &d));
+        }
+    }
+
+    /// <summary>
+    /// Starts encoders attached to this mixer's taps (<see cref="AudioEncoder.Record(DjMixer, MixerTap)"/>) together,
+    /// on one device frame, so the files line up in any editor. The vocals start later by the mics' input latency and
+    /// the master's output latency, so the voice lines up with the music as the singer heard it.
+    /// </summary>
+    /// <param name="encoders">Encoders attached to this mixer and not started yet.</param>
+    /// <param name="startAt">When to start on the <see cref="OutputDevice.Time"/> clock of <see cref="Output"/>; null, or a time less than one mixer block (2048 frames) ahead, starts one block ahead.</param>
+    /// <param name="rawTiming">Start the vocals on the same frame instead (the voice as it reached the mixer).</param>
+    /// <exception cref="FatzAudioException"><see cref="ErrorCode.InvalidArgument"/> for an encoder not on this mixer;
+    /// <see cref="ErrorCode.Busy"/> for one already started.</exception>
+    /// <example>
+    /// <code>
+    /// using var master = AudioEncoder.Create("night.flac", new EncoderOptions { Format = EncodeFormat.Flac });
+    /// using var vocals = AudioEncoder.Create("vocals.wav");
+    /// master.Record(mixer, MixerTap.Master);
+    /// vocals.Record(mixer, MixerTap.Vocals);
+    /// mixer.StartRecording([master, vocals]);
+    /// </code>
+    /// </example>
+    public unsafe void StartRecording(IReadOnlyList<AudioEncoder> encoders, TimeSpan? startAt = null, bool rawTiming = false)
+    {
+        ArgumentNullException.ThrowIfNull(encoders);
+        if (startAt < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(startAt));
+        var handles = new EncoderHandle[encoders.Count];
+        var native = new nint[encoders.Count];
+        int added = 0;
+        try
+        {
+            for (; added < handles.Length; added++)
+            {
+                var h = (encoders[added] ?? throw new ArgumentNullException(nameof(encoders))).Handle;
+                bool ok = false;
+                h.DangerousAddRef(ref ok);
+                handles[added] = h;
+                native[added] = h.DangerousGetHandle();
+            }
+            using var lease = Lease();
+            fixed (nint* p = native)
+            {
+                FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_start_recording(_mixer, p, (uint)native.Length,
+                    startAt is { } t ? TimeConvert.ToNanoseconds(t) : 0, rawTiming ? 1u : 0u));
+            }
+        }
+        finally
+        {
+            for (int i = 0; i < added; i++) handles[i].DangerousRelease();
         }
     }
 

@@ -243,6 +243,9 @@ MOD, S3M, XM, IT, MPTM and many more play through the statically linked libopenm
 | BASS_RecordGetDeviceInfo | `fa_device_count/get_info(FA_DEVICE_CAPTURE)` | ✅ (listing) |
 | BASS_RecordInit + BASS_RecordStart, the record channel played live through a mixer (a karaoke mic) | `fa_mixer_add_mic` on the [DJ mixer](../features/dj-mixer.md#microphones): one channel or all channels of a capture device, drift-corrected into the master, with low cut, gain, gate, EQ, mute and pan built in; `fa_mic_remove` frees it. In .NET: `mixer.AddMic(new MicOptions { Device = input, Channel = 0 })` | ✅ |
 | BASS_ChannelGetLevel(Ex) on a record channel (a mic meter) | `fa_mic_get_levels` (after gain, gate and EQ) | ✅ |
+| BASS_FX_BFX_FREEVERB / BASS_FX_BFX_ECHO4 on a record channel (karaoke mic effects) | One shared reverb and echo for the mics: `fa_mixer_set_mic_effects` (size, damping, echo time, feedback, tone) and the sends `FA_MIC_REVERB_SEND` / `FA_MIC_ECHO_SEND`. In .NET: `mixer.MicEffects`, `mic.ReverbSend`, `mic.EchoSend` | ✅ |
+| Ducking the music under a host mic by hand (`BASS_ChannelSlideAttribute` on the music's volume when the mic level rises) | `FA_MIC_DUCKS_MUSIC` on the host's mic; depth, attack, hold, release and threshold in `fa_mixer_set_ducking` (on by default). In .NET: `MicOptions.DucksMusic`, `mixer.Ducking` | ✅ |
+| BASS_Encode_Start on the mixer plus one on the record channel, started together (a karaoke night as stems) | `fa_encoder_attach_mixer(enc, mixer, FA_MIXER_TAP_MASTER / FA_MIXER_TAP_VOCALS)` + `fa_mixer_start_recording`: one start frame, the vocals lined up as the singer heard the music. In .NET: `encoder.Record(mixer, MixerTap.Vocals)`, `mixer.StartRecording([...])` | ✅ |
 | BASS_RecordInit / Free / SetDevice / GetDevice / GetInfo / Start for other uses | Capture devices as stream sources | 🗓️ |
 | BASS_RecordGetInput / SetInput / GetInputName | Not provided (old WinMM mixer lines) | ➖ |
 

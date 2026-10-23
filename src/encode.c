@@ -15,6 +15,7 @@
 #  define _POSIX_C_SOURCE 200809L    /* fseeko under strict C11 */
 #endif
 #include "encode.h"
+#include "mixer.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,7 +27,7 @@
 #define ENC_IDLE_WAIT_MS 5           /* the audio thread cannot wake the encoder: it polls */
 #define ENC_APP_WAIT_MS 1000         /* fa_encoder_write signals; this is only a safety net */
 
-enum { SRC_NONE = 0, SRC_DEVICE, SRC_STREAM, SRC_READ, SRC_APP, SRC_DEAD };
+enum { SRC_NONE = 0, SRC_DEVICE, SRC_STREAM, SRC_READ, SRC_APP, SRC_DEAD, SRC_MIXER };
 
 struct fa_encoder {
     const fa_enc_backend* be;
@@ -44,6 +45,9 @@ struct fa_encoder {
     int source;                  /* SRC_*: set once, under tap_lock */
     fa_device* device;           /* under tap_lock; NULL once the device closed */
     fa_stream* stream;           /* under tap_lock (SRC_READ: and read_lock) */
+    struct fa_mixer* dj;         /* SRC_MIXER: under tap_lock; NULL once the mixer went */
+    int dj_tap;                  /* fa_mixer_tap */
+    fa_atomic64 dj_start;        /* the device frame it records from; DJ_WAITING until started */
     fa_mutex read_lock;          /* SRC_READ: held while the thread reads `stream` */
     fa_mutex write_lock;         /* SRC_APP: fixes the input format once */
     uint32_t in_rate, in_channels;
@@ -70,6 +74,8 @@ struct fa_encoder {
 };
 
 static fa_lazy_mutex tap_lock;
+
+#define DJ_WAITING INT64_MAX
 
 /* ---- sink ---------------------------------------------------------------------- */
 
@@ -649,6 +655,62 @@ FA_API fa_result FA_CALL fa_encoder_attach_stream(fa_encoder* encoder, fa_stream
     return r;
 }
 
+FA_API fa_result FA_CALL fa_encoder_attach_mixer(fa_encoder* encoder, fa_mixer* mixer, fa_mixer_tap tap)
+{
+    fa_result r;
+    if (!encoder || !mixer || (tap != FA_MIXER_TAP_MASTER && tap != FA_MIXER_TAP_VOCALS)) return FA_ERROR_INVALID_ARG;
+    fa_lazy_mutex_lock(&tap_lock);
+    if (encoder->source != SRC_NONE) { fa_lazy_mutex_unlock(&tap_lock); return FA_ERROR_BUSY; }
+    fa_store64(&encoder->dj_start, DJ_WAITING);
+    encoder->dj_tap = (int)tap;
+    r = start(encoder, SRC_MIXER, mixer->device->rate, FA_DEVICE_CHANNELS);
+    if (r == FA_OK) {
+        encoder->dj = mixer;
+        r = publish(&mixer->encoders, encoder, NULL, 0, mixer->device);
+        if (r != FA_OK) { encoder->dj = NULL; fail_start(encoder, r); }
+    }
+    fa_lazy_mutex_unlock(&tap_lock);
+    return r;
+}
+
+FA_API fa_result FA_CALL fa_mixer_start_recording(fa_mixer* mixer, fa_encoder* const* encoders, uint32_t count,
+                                                  fa_time device_time, uint32_t flags)
+{
+    fa_device* dev;
+    int64_t now, at, shift, look;
+    uint32_t i;
+    fa_result r = FA_OK;
+    if (!mixer || (count > 0 && !encoders) || (flags & ~FA_MIXER_REC_RAW_TIMING) || device_time < 0)
+        return FA_ERROR_INVALID_ARG;
+    dev = mixer->device;
+    /* The master tap is after the limiter's look-ahead, the vocals tap before it: the
+     * master starts that much later, so both files begin with what the mixer made on
+     * frame `at`. Aligned, the vocals then start later by the whole round trip from
+     * the mixer to the singer and back: the look-ahead, the master's OS buffer and
+     * the mic's input (fa_mixer_latency.mic_monitor), since the singer hears the music
+     * made on frame `at` only once it has left the limiter. */
+    look = dev->limiter.delay;
+    shift = flags & FA_MIXER_REC_RAW_TIMING ? 0 : fa_mixer_vocal_shift(mixer);
+    fa_lazy_mutex_lock(&tap_lock);
+    for (i = 0; i < count && r == FA_OK; i++) {
+        fa_encoder* e = encoders[i];
+        if (!e || e->source != SRC_MIXER || e->dj != mixer) r = FA_ERROR_INVALID_ARG;
+        else if (fa_load64(&e->dj_start) != DJ_WAITING) r = FA_ERROR_BUSY;
+    }
+    if (r == FA_OK) {
+        /* A block may be in the audio thread now, past the vocals tap but not yet at the
+         * master's (the clock moves on at its end, by at most FA_MIXER_BLOCK): the
+         * earliest start is one whole block ahead, so both taps see it. */
+        now = fa_load64(&dev->clock) + FA_MIXER_BLOCK;
+        at = device_time > 0 ? (int64_t)((double)device_time * (double)dev->rate / 1e9 + 0.5) : now;
+        if (at < now) at = now;
+        for (i = 0; i < count; i++)
+            fa_store64(&encoders[i]->dj_start, at + (encoders[i]->dj_tap == FA_MIXER_TAP_VOCALS ? shift : look));
+    }
+    fa_lazy_mutex_unlock(&tap_lock);
+    return r;
+}
+
 FA_API fa_result FA_CALL fa_encoder_encode_stream(fa_encoder* encoder, fa_stream* stream)
 {
     fa_result r;
@@ -743,6 +805,20 @@ void fa_encode_push(fa_encoder* e, const float* frames, int64_t count, uint32_t 
     if (room < count) fa_fetch_add64(&e->dropped, count - room);
 }
 
+void fa_encode_mixer_push(struct fa_mixer* m, int tap, const float* frames, int64_t count, int64_t clock)
+{
+    fa_enc_list* encs = (fa_enc_list*)fa_load_ptr(&m->encoders);
+    uint32_t i;
+    if (!encs) return;
+    for (i = 0; i < encs->count; i++) {
+        fa_encoder* e = encs->items[i];
+        int64_t from = fa_load64(&e->dj_start), off;
+        if (e->dj_tap != tap || from >= clock + count) continue;
+        off = from > clock ? from - clock : 0;
+        fa_encode_push(e, frames + off * FA_DEVICE_CHANNELS, count - off, m->device->rate);
+    }
+}
+
 void fa_encode_drop(fa_encoder* e, int64_t count)
 {
     if (count > 0 && !fa_load32(&e->paused)) fa_fetch_add64(&e->dropped, count);
@@ -759,6 +835,20 @@ void fa_encode_device_closing(fa_device* d)
     fa_device_wait_quiescent(d);
     if (list) {
         for (i = 0; i < list->count; i++) list->items[i]->device = NULL;
+        free(list);
+    }
+    fa_lazy_mutex_unlock(&tap_lock);
+}
+
+void fa_encode_mixer_closing(struct fa_mixer* m)
+{
+    fa_enc_list* list;
+    uint32_t i;
+    fa_lazy_mutex_lock(&tap_lock);
+    list = (fa_enc_list*)fa_exchange_ptr(&m->encoders, NULL);
+    fa_device_wait_quiescent(m->device);
+    if (list) {
+        for (i = 0; i < list->count; i++) list->items[i]->dj = NULL;
         free(list);
     }
     fa_lazy_mutex_unlock(&tap_lock);
@@ -794,6 +884,9 @@ static void detach_source(fa_encoder* e)
     if (e->source == SRC_DEVICE && e->device) {
         while (publish(&e->device->encoders, NULL, e, 0, e->device) != FA_OK) fa_sleep_ms(1);
         e->device = NULL;
+    } else if (e->source == SRC_MIXER && e->dj) {
+        while (publish(&e->dj->encoders, NULL, e, 0, e->dj->device) != FA_OK) fa_sleep_ms(1);
+        e->dj = NULL;
     } else if (e->source == SRC_STREAM && e->stream) {
         fa_stream* s = e->stream;
         fa_mutex_lock(&s->api_lock);

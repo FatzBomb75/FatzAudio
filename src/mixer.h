@@ -19,6 +19,7 @@ static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v
 
 enum { DL_GAIN = 0, DL_TRIM, DL_LOW, DL_MID, DL_HIGH, DL_CUE, DECK_LANES };
 enum { ML_XF = 0, ML_MASTER, ML_CUE_MIX, ML_CUE_GAIN, MIX_LANES };
+enum { MFX_REVERB_SIZE = 0, MFX_REVERB_DAMPING, MFX_ECHO_MS, MFX_ECHO_FEEDBACK, MFX_ECHO_TONE, MFX_COUNT };
 
 typedef struct biquad {
     float b0, b1, b2, a1, a2;
@@ -70,6 +71,11 @@ struct fa_mixer {
     struct fa_mic* removed[FA_MIC_MAX];               /* fa_mixer_destroy's mics, freed with the mixer
                                                          (a running callback may still hold one) */
     struct fa_capture* captures;                      /* the open inputs (lock) */
+    fa_atomic_ptr bus;                                /* struct fa_mic_bus*, made with the first mic (lock) */
+    fa_atomic32 fx[MFX_COUNT];                        /* fa_mic_effects, float bits */
+    fa_atomic32 duck_depth, duck_threshold;           /* fa_ducking, float bits */
+    fa_atomic64 duck_attack, duck_hold, duck_release; /* ns */
+    fa_atomic_ptr encoders;                           /* fa_enc_list* on the taps (encode.c) */
     uint64_t block;                                   /* audio thread: fa_mixer_process calls */
     /* Events (fa_mixer_set_event_callback), run by the event thread (fa_mixer_service). */
     fa_mutex cb_lock;
@@ -147,7 +153,30 @@ typedef struct fa_capture {
     float out[FA_MIXER_BLOCK * CAPTURE_LANES];
 } fa_capture;
 
-enum { MIC_GAIN = 0, MIC_MUTE, MIC_PAN, MIC_MONITOR, MIC_LOW_CUT, MIC_LANES };
+enum { MIC_GAIN = 0, MIC_MUTE, MIC_PAN, MIC_MONITOR, MIC_LOW_CUT, MIC_REVERB, MIC_ECHO, MIC_LANES };
+
+/* What the mics share (mic_fx.c): the bus they add into, the effects and the ducker.
+ * Made with the mixer's first mic, at the device's rate, and kept until the mixer goes,
+ * so the effects' tails ring out after a mic is removed. Audio thread only. */
+#define ECHO_MAX_MS 1000.0
+typedef struct fa_mic_bus {
+    float vox[FA_MIXER_BLOCK * FA_DEVICE_CHANNELS];    /* into the master: heard mics and the returns */
+    float dry[FA_MIXER_BLOCK * FA_DEVICE_CHANNELS];    /* mics with monitor off (the vocals tap only) */
+    float rsend[FA_MIXER_BLOCK * FA_DEVICE_CHANNELS];  /* into the reverb */
+    float esend[FA_MIXER_BLOCK];                       /* into the echo */
+    float duck[FA_MIXER_BLOCK];                        /* the hosts' voice, then the ducker's dB */
+    uint32_t rate;
+    int hosts;                   /* host mics this block */
+    fa_midi_fx* reverb;
+    float* echo;                 /* the echo's delay line */
+    uint32_t echo_len, echo_pos;
+    double echo_delay;           /* frames, gliding to the set time */
+    float echo_fb, echo_lp;      /* the feedback (gliding) and its tone filter's state */
+    int echo_idle;
+    int64_t echo_quiet;          /* frames since its input was non-zero or its output audible */
+    float duck_env, duck_db;     /* the hosts' level follower; the music's gain now */
+    int64_t duck_hold;
+} fa_mic_bus;
 
 struct fa_mic {
     float buf[FA_MIXER_BLOCK * FA_DEVICE_CHANNELS];   /* first: aligned as the EQ's vector loads want */
@@ -181,6 +210,20 @@ void fa_mixer_release(struct fa_mixer* m);
 void fa_mixer_mics_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t frames);   /* audio thread */
 void fa_mixer_mics_free(struct fa_mixer* m);       /* fa_mixer_destroy: removes every mic */
 void fa_mixer_mics_free_removed(struct fa_mixer* m);   /* free_mixer: frees what fa_mixer_mics_free removed */
+/* mic_fx.c */
+fa_result fa_mic_bus_make(struct fa_mixer* m);     /* lock: the bus, once */
+void fa_mic_bus_free(fa_mic_bus* b);
+void fa_mixer_fx_defaults(struct fa_mixer* m);     /* create: effects and ducking defaults */
+/* Audio thread, after the mics added into the bus: the effects, the ducking of `out`
+ * (the music so far), then the mics into `out` and the vocals tap. */
+void fa_mic_bus_process(struct fa_mixer* m, fa_mic_bus* b, int64_t clock, float* out, uint32_t frames);
+/* Frames the vocals tap starts later by (fa_mixer_start_recording). */
+int64_t fa_mixer_vocal_shift(struct fa_mixer* m);
+/* encode.c: audio thread, `frames` of a tap starting at device frame `clock`. */
+void fa_encode_mixer_push(struct fa_mixer* m, int tap, const float* frames, int64_t count, int64_t clock);
+/* encode.c: fa_mixer_destroy: the encoders on its taps lose their source. */
+void fa_encode_mixer_closing(struct fa_mixer* m);
+
 /* RBJ cookbook sections at Q 1/sqrt(2): 0 low-pass, 1 high-pass, 2 allpass. */
 biquad fa_mixer_design(int type, double hz, double rate);
 

@@ -727,6 +727,28 @@ internal unsafe struct FaMixerLatency
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal struct FaMicEffects
+{
+    public uint StructSize;
+    public float ReverbSize;
+    public float ReverbDamping;
+    public float EchoTimeMs;
+    public float EchoFeedback;
+    public float EchoTone;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaDucking
+{
+    public uint StructSize;
+    public float DepthDb;
+    public long Attack;
+    public long Hold;
+    public long Release;
+    public float ThresholdDb;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal unsafe struct FaMixerEvent
 {
     public int Type;
