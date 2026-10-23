@@ -9,70 +9,18 @@
  * device's channels. Parameters are lanes on the device clock, as buses use: sets
  * glide over 5 ms, ramps start on their device frame. Nothing here locks or
  * allocates on the audio thread. */
-#include "fa_internal.h"
+#include "mixer.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define MIXER_MAX_DECKS 2
-#define MIXER_DEZIPPER_NS 5000000
-#define MIXER_SUB 16             /* gains are exact every 16 frames, linear in between */
-#define ISO_LOW_HZ 250.0
-#define ISO_HIGH_HZ 2500.0
-#define ISO_SECTIONS 9
-#define DECK_TEMPO_LATENCY_MS 60
-
-static const double k_pi = 3.14159265358979323846;
-
-enum { DL_GAIN = 0, DL_TRIM, DL_LOW, DL_MID, DL_HIGH, DL_CUE, DECK_LANES };
-enum { ML_XF = 0, ML_MASTER, ML_CUE_MIX, ML_CUE_GAIN, MIX_LANES };
-
-typedef struct biquad {
-    float b0, b1, b2, a1, a2;
-} biquad;
-
-struct fa_deck {
-    struct fa_mixer* mixer;
-    uint32_t index;
-    fa_bus* bus;                 /* its streams mix into bus->buf */
-    fa_atomic_ptr stream;        /* fa_stream*; written under the mixer lock, or cleared when it leaves */
-    fa_frames cue_point;         /* mixer lock; FA_FRAMES_UNSET = the stream's CUE_IN */
-    fa_lane lanes[DECK_LANES];
-    fa_atomic32 side;            /* FA_DECK_XFADER_SIDE */
-    fa_atomic_ptr tap;           /* fa_tap*, the channel meter (post fader) */
-    /* audio thread */
-    float side_w[3];             /* thru, A, B: glide between sides over 5 ms */
-    float z[ISO_SECTIONS][2][2]; /* isolator filter memory, per section and channel */
-};
-
-struct fa_mixer {
-    fa_engine* engine;
-    fa_device* device;
-    fa_mutex lock;               /* API calls */
-    uint32_t deck_count;
-    struct fa_deck decks[MIXER_MAX_DECKS];
-    fa_lane lanes[MIX_LANES];
-    fa_atomic32 curve;           /* fa_xfader_curve */
-    fa_cue_mode cue_mode;
-    uint32_t cue_channel;
-    /* The isolator: LR4 low/high at 250 Hz (2 + 2 sections), LR4 low/high at 2.5 kHz on
-     * the upper band (2 + 2), and an allpass at 2.5 kHz on the low band so the three
-     * sum flat. */
-    biquad lp1, hp1, lp2, hp2, ap2;
-    /* audio thread */
-    float master[FA_MIXER_BLOCK * FA_DEVICE_CHANNELS];
-    float cue[FA_MIXER_BLOCK * FA_DEVICE_CHANNELS];   /* the cue sends, scaled by (1 - mix) x gain */
-    float cue_master[FA_MIXER_BLOCK];                 /* mix x gain: the master's share of the cue */
-};
-
-static float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
 
 /* ---- the isolator ------------------------------------------------------------- */
 
 /* RBJ cookbook sections, Q = 1/sqrt(2): two Butterworth sections are one LR4 filter,
  * and LR4 low + high is exactly the allpass at the same frequency (all bilinear with
  * the same prewarp), so low (allpassed at 2.5 kHz) + mid + high is flat. */
-static biquad design(int type, double hz, double rate)
+biquad fa_mixer_design(int type, double hz, double rate)
 {
     double w = 2.0 * k_pi * hz / rate, c = cos(w), alpha = sin(w) / (2.0 * 0.70710678118654752);
     double a0 = 1.0 + alpha, b0, b1, b2;
@@ -88,22 +36,15 @@ static biquad design(int type, double hz, double rate)
     return q;
 }
 
-static inline float run(const biquad* q, float* z, float x)
-{
-    float y = q->b0 * x + z[0];
-    z[0] = q->b1 * x - q->a1 * y + z[1];
-    z[1] = q->b2 * x - q->a2 * y;
-    return y;
-}
 
 /* One sample of one channel: the three bands, weighted. */
 static inline float isolate(const struct fa_mixer* m, float (*z)[2][2], int c, float x, float gl, float gm, float gh)
 {
-    float lo = run(&m->lp1, z[1][c], run(&m->lp1, z[0][c], x));
-    float up = run(&m->hp1, z[3][c], run(&m->hp1, z[2][c], x));
-    float mid = run(&m->lp2, z[5][c], run(&m->lp2, z[4][c], up));
-    float hi = run(&m->hp2, z[7][c], run(&m->hp2, z[6][c], up));
-    lo = run(&m->ap2, z[8][c], lo);
+    float lo = fa_biquad_run(&m->lp1, z[1][c], fa_biquad_run(&m->lp1, z[0][c], x));
+    float up = fa_biquad_run(&m->hp1, z[3][c], fa_biquad_run(&m->hp1, z[2][c], x));
+    float mid = fa_biquad_run(&m->lp2, z[5][c], fa_biquad_run(&m->lp2, z[4][c], up));
+    float hi = fa_biquad_run(&m->hp2, z[7][c], fa_biquad_run(&m->hp2, z[6][c], up));
+    lo = fa_biquad_run(&m->ap2, z[8][c], lo);
     return gl * lo + gm * mid + gh * hi;
 }
 
@@ -128,30 +69,6 @@ static void xfader_gains(int curve, float x, float* ga, float* gb)
 
 /* ---- audio thread ------------------------------------------------------------- */
 
-static void take_lanes(fa_lane* lanes, int n, uint32_t rate)
-{
-    int i;
-    for (i = 0; i < n; i++) fa_lane_take(&lanes[i], 1, rate, NULL);
-}
-
-static void end_lanes(fa_lane* lanes, int n, int64_t clock, int64_t frames)
-{
-    int i;
-    for (i = 0; i < n; i++) {
-        fa_lane_advance(&lanes[i].v, clock, frames);
-        fa_store_float(&lanes[i].current, lanes[i].v.value);
-    }
-}
-
-/* Values of `lanes` at the start and the end of [at, at + n). */
-static void lane_span(const fa_lane* lanes, int n, int64_t clock, int64_t at, int64_t len, float* v0, float* v1)
-{
-    int i;
-    for (i = 0; i < n; i++) {
-        v0[i] = fa_lane_value_at_frame(&lanes[i].v, clock, at, 1);
-        v1[i] = fa_lane_value_at_frame(&lanes[i].v, clock, at + len, 0);
-    }
-}
 
 static float side_glide(float w, float target, int64_t n, uint32_t rate)
 {
@@ -242,6 +159,8 @@ void fa_mixer_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t f
     }
     if (m->cue_mode != FA_CUE_NONE) memset(m->cue, 0, (size_t)frames * FA_DEVICE_CHANNELS * sizeof(float));
     for (i = 0; i < m->deck_count; i++) deck_process(m, &m->decks[i], &me, clock, dev->rate, out, frames);
+    fa_mixer_mics_process(m, dev, out, frames);   /* the mics join the music before the master gain */
+    m->block++;
     /* Master gain on the sum; the cue's blend factors for fa_mixer_render. */
     for (off = 0, k = 0; off < frames; off += MIXER_SUB, k++) {
         uint32_t n = frames - off < MIXER_SUB ? frames - off : MIXER_SUB, j;
@@ -334,8 +253,35 @@ static void free_mixer(struct fa_mixer* m)
 {
     uint32_t i;
     for (i = 0; i < m->deck_count; i++) fa_tap_free((fa_tap*)fa_load_ptr(&m->decks[i].tap));
+    fa_mixer_mics_free_removed(m);
+    fa_mutex_destroy(&m->cb_lock);
     fa_mutex_destroy(&m->lock);
     free(m);
+}
+
+/* Whether this thread is the engine's event thread (a mixer callback may be running on it). */
+static int on_event_thread(struct fa_mixer* m)
+{
+    return (uintptr_t)fa_load64(&m->engine->event_thread_id) == fa_thread_current_id();
+}
+
+void fa_mixer_wait_callbacks(struct fa_mixer* m)
+{
+    if (on_event_thread(m)) return;
+    while (fa_load32(&m->busy)) fa_sleep_ms(1);
+}
+
+struct fa_mixer* fa_mixer_hold(fa_device* dev)
+{
+    struct fa_mixer* m = (struct fa_mixer*)fa_load_ptr(&dev->mixer);
+    if (m) fa_fetch_add32(&m->busy, 1);   /* fa_mixer_destroy waits for it after the close */
+    return m;
+}
+
+void fa_mixer_release(struct fa_mixer* m)
+{
+    fa_fetch_add32(&m->busy, -1);
+    if (fa_load32(&m->doomed)) free_mixer(m);   /* destroyed by its own callback */
 }
 
 FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_config* config, fa_mixer** out_mixer)
@@ -376,6 +322,12 @@ FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_confi
         fa_device_close(dev);
         return m ? FA_ERROR_GENERIC : FA_ERROR_OUT_OF_MEMORY;
     }
+    if (fa_mutex_init(&m->cb_lock) != 0) {
+        fa_mutex_destroy(&m->lock);
+        free(m);
+        fa_device_close(dev);
+        return FA_ERROR_GENERIC;
+    }
     m->engine = engine;
     m->device = dev;
     m->deck_count = c.deck_count;
@@ -386,11 +338,11 @@ FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_confi
     fa_lane_init(&m->lanes[ML_MASTER], 1.0f);
     fa_lane_init(&m->lanes[ML_CUE_MIX], 0.0f);
     fa_lane_init(&m->lanes[ML_CUE_GAIN], 1.0f);
-    m->lp1 = design(0, ISO_LOW_HZ, dev->rate);
-    m->hp1 = design(1, ISO_LOW_HZ, dev->rate);
-    m->lp2 = design(0, ISO_HIGH_HZ, dev->rate);
-    m->hp2 = design(1, ISO_HIGH_HZ, dev->rate);
-    m->ap2 = design(2, ISO_HIGH_HZ, dev->rate);
+    m->lp1 = fa_mixer_design(0, ISO_LOW_HZ, dev->rate);
+    m->hp1 = fa_mixer_design(1, ISO_LOW_HZ, dev->rate);
+    m->lp2 = fa_mixer_design(0, ISO_HIGH_HZ, dev->rate);
+    m->hp2 = fa_mixer_design(1, ISO_HIGH_HZ, dev->rate);
+    m->ap2 = fa_mixer_design(2, ISO_HIGH_HZ, dev->rate);
     for (i = 0; i < m->deck_count; i++) {
         struct fa_deck* d = &m->decks[i];
         int side = i % 2 ? 2 : 1;
@@ -446,7 +398,16 @@ FA_API void FA_CALL fa_mixer_destroy(fa_mixer* mixer)
     fa_device_stop(dev);
     fa_exchange_ptr(&dev->mixer, NULL);
     fa_device_wait_quiescent(dev);   /* no callback is in the mixer any more */
+    fa_mixer_mics_free(mixer);       /* closes the inputs */
     fa_device_close(dev);
+    /* After the close the event thread cannot pick the mixer up again; wait out a
+     * service that has it, unless that is us (destroyed from its own callback): then
+     * the service frees it when the callback returns. */
+    if (on_event_thread(mixer) && fa_load32(&mixer->busy)) {
+        fa_store32(&mixer->doomed, 1);
+        return;
+    }
+    fa_mixer_wait_callbacks(mixer);
     free_mixer(mixer);
 }
 

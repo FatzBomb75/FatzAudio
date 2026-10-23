@@ -84,8 +84,12 @@ enum {
                                         temp_directory is set: extract it first */
     FA_ERROR_SIZE_MISMATCH = -18,    /* fa_surface_update_into: the buffer is not the
                                         size fa_surface_get_layout reports */
-    FA_ERROR_NOT_ENOUGH_CHANNELS = -19 /* FA_CUE_CHANNELS: the output device has no channels
-                                        for the cue (fewer than cue_channel + 2) */
+    FA_ERROR_NOT_ENOUGH_CHANNELS = -19, /* FA_CUE_CHANNELS: the output device has no channels
+                                        for the cue (fewer than cue_channel + 2); a mic's
+                                        channel that its input device does not have */
+    FA_ERROR_PERMISSION_DENIED = -20 /* the OS refused the microphone: the app has no
+                                        permission (Android RECORD_AUDIO, the macOS and iOS
+                                        microphone prompt, Windows privacy settings) */
 };
 
 typedef struct fa_engine fa_engine;   /* one per process is typical */
@@ -2351,7 +2355,8 @@ typedef enum fa_event_type {
     FA_EVENT_LOOPED,          /* a looping stream jumped back to its loop start */
     FA_EVENT_CDG_CHANGED,     /* the CD+G picture heard now changed (fa_stream_set_cdg_events) */
     FA_EVENT_SEEK_FAILED,     /* fa_stream_seek_async could not reach `frame` (value = the fa_result) */
-    FA_EVENT_TRACKER_ROW      /* a tracker module row is heard (FA_TRACKER_ROW_EVENTS) */
+    FA_EVENT_TRACKER_ROW,     /* a tracker module row is heard (FA_TRACKER_ROW_EVENTS) */
+    FA_EVENT_INPUT_LOST       /* a mixer mic's input device went away (fa_mixer_set_event_callback) */
 } fa_event_type;
 
 typedef struct fa_event {
@@ -2593,6 +2598,7 @@ typedef enum fa_eq_preset {
     FA_EQ_PRESET_BASS_BOOST,
     FA_EQ_PRESET_TREBLE_BOOST,
     FA_EQ_PRESET_LOUDNESS,     /* lows and highs up, for quiet listening */
+    FA_EQ_PRESET_LIVE_VOCAL,   /* a live singing mic: less boom and mud, more presence and air */
     FA_EQ_PRESET_COUNT
 } fa_eq_preset;
 
@@ -2602,6 +2608,107 @@ typedef enum fa_eq_preset {
 FA_API fa_result FA_CALL fa_eq_get_preset(fa_eq_preset preset, fa_eq_band* out_bands, uint32_t* out_count);
 /* English display name ("Rock"), NULL for an unknown preset. */
 FA_API const char* FA_CALL fa_eq_preset_name(fa_eq_preset preset);
+
+/* ---- DJ mixer: microphones ------------------------------------------ */
+
+/* Up to two karaoke mics, mixed into the master before the master gain and the
+ * limiter:
+ *
+ *   input device -> bridge (drift-corrected) -> low cut -> gain -> gate -> EQ -> meter
+ *     -> mute -> pan -> master (when monitored)
+ *
+ * A mic reads one channel of a capture device (or all its channels summed). Two mics
+ * on one 2-input interface share the device. The input runs on its own clock, so it
+ * reaches the master through a small buffer that a resampler keeps at a steady fill,
+ * whatever the two clocks' drift or rates; fa_mixer_get_latency reports what that
+ * and the devices add. Mics ask the OS for unprocessed capture (no automatic gain,
+ * noise suppression or echo cancelling, which spoil singing and add latency) where
+ * the OS offers it: Android's UNPROCESSED input preset; elsewhere the input as the OS
+ * gives it. The app asks for the microphone permission (Android manifest and prompt,
+ * macOS and iOS usage strings); without it adding a mic is FA_ERROR_PERMISSION_DENIED
+ * (on systems that refuse at open; some deliver silence instead). An input that goes
+ * away goes silent and raises FA_EVENT_INPUT_LOST; the mix carries on. */
+typedef struct fa_mic fa_mic;
+
+#define FA_MIC_MAX           2
+#define FA_MIC_DUCKS_MUSIC   (1u << 0)  /* a host mic: its voice will duck the music (planned with
+                                           fa_mixer_set_ducking); leave it off for singers */
+#define FA_MIC_OS_PROCESSING (1u << 1)  /* keep the OS's voice processing (calls, not singing); two
+                                           mics on one device share its input, so the first mic's
+                                           choice holds for both */
+
+typedef struct fa_mic_config {
+    uint32_t    struct_size;  /* set by fa_mic_config_init */
+    const char* device_id;    /* the input (fa_device_info.id of an FA_DEVICE_CAPTURE device),
+                                 NULL = the default input */
+    int32_t     channel;      /* the input channel, from 0; -1 = all channels summed (default) */
+    int32_t     monitor;      /* 1 = heard through the master (default); 0 = metered (and, with
+                                 the recording step, recorded) only: for a hardware mixer */
+    uint32_t    flags;        /* FA_MIC_* */
+} fa_mic_config;
+
+FA_API void      FA_CALL fa_mic_config_init(fa_mic_config* config);
+/* At most FA_MIC_MAX mics per mixer (FA_ERROR_BUSY for a third). The mic fades in once
+ * its input runs. FA_ERROR_NOT_ENOUGH_CHANNELS when `channel` is not on the device. */
+FA_API fa_result FA_CALL fa_mixer_add_mic(fa_mixer* mixer, const fa_mic_config* config, fa_mic** out_mic);
+/* Removes the mic, and closes its input device when no other mic uses it; also from the
+ * mixer's event callback, the event's own mic included. fa_mixer_destroy removes the
+ * mixer's mics. */
+FA_API void      FA_CALL fa_mic_remove(fa_mic* mic);
+/* The mic's slot, 0 or 1 (fa_mixer_latency.mic_*, fa_mixer_event.index). */
+FA_API fa_result FA_CALL fa_mic_get_index(fa_mic* mic, uint32_t* out_index);
+
+typedef enum fa_mic_param {
+    FA_MIC_GAIN_DB = 0,  /* -20..+40, default 0 */
+    FA_MIC_MUTE,         /* 1 = muted, 0 = not (default); glides over 5 ms */
+    FA_MIC_PAN,          /* -1 (left) .. 1 (right), default 0; balance, as stream pan */
+    FA_MIC_GATE_DB,      /* the gate's threshold, -100 (off) .. 0, default -50: opens at the
+                            threshold, closes 6 dB below it after 100 ms, so breaths and room
+                            noise stay out between phrases */
+    FA_MIC_REVERB_SEND,  /* planned with the mic effects (FA_ERROR_NOT_IMPLEMENTED for now) */
+    FA_MIC_ECHO_SEND,    /* planned with the mic effects (FA_ERROR_NOT_IMPLEMENTED for now) */
+    FA_MIC_MONITOR,      /* 1 = heard through the master, 0 = not (from fa_mic_config.monitor) */
+    FA_MIC_LOW_CUT       /* 1 = an 80 Hz high-pass against handling noise and rumble (default),
+                            0 = off */
+} fa_mic_param;
+/* Sets glide over 5 ms. Out-of-range values are clamped. */
+FA_API fa_result FA_CALL fa_mic_set_param(fa_mic* mic, fa_mic_param param, float value);
+FA_API fa_result FA_CALL fa_mic_get_param(fa_mic* mic, fa_mic_param param, float* out_value);
+/* The mic's EQ: the same bands, limits and presets as a stream's (fa_stream_set_eq,
+ * fa_eq_get_preset; FA_EQ_PRESET_LIVE_VOCAL is made for mics). Off by default. */
+FA_API fa_result FA_CALL fa_mic_set_eq(fa_mic* mic, const fa_eq_band* bands, uint32_t count);
+FA_API fa_result FA_CALL fa_mic_get_eq(fa_mic* mic, fa_eq_band* out_bands, uint32_t capacity, uint32_t* out_count);
+/* The mic's meter: after gain, gate and EQ, before mute and pan, as heard now. */
+FA_API fa_result FA_CALL fa_mic_get_levels(fa_mic* mic, fa_time window, float* out_peak, float* out_rms);
+
+/* What the mixer's outputs and inputs add up to, in ns. Times the OS does not report
+ * are estimated from the device's buffer sizes. */
+typedef struct fa_mixer_latency {
+    uint32_t struct_size;              /* sizeof(fa_mixer_latency): filled up to it */
+    fa_time  master;                   /* the master output (the OS's buffer) */
+    fa_time  cue;                      /* the headphones: the master's for CHANNELS and SPLIT */
+    fa_time  cue_alignment;            /* delay added to line up a second-device cue (planned: 0) */
+    fa_time  mic_input[FA_MIC_MAX];    /* input buffer plus the bridge; -1 = no mic in the slot */
+    fa_time  mic_monitor[FA_MIC_MAX];  /* mic to speaker: mic_input plus master; -1 = no mic */
+} fa_mixer_latency;
+FA_API fa_result FA_CALL fa_mixer_get_latency(fa_mixer* mixer, fa_mixer_latency* out_latency);
+
+/* Mixer events. They run on the engine's event thread, like stream events, and may call
+ * any FatzAudio function. fa_mixer_set_event_callback, fa_mic_remove and
+ * fa_mixer_destroy return once no callback for the mixer is running (unless called
+ * from inside one), so `user` can then be freed.
+ *
+ * type                 index       mic                        value
+ * FA_EVENT_INPUT_LOST  the slot    the mic (valid in the call) 0 */
+typedef struct fa_mixer_event {
+    fa_event_type type;
+    fa_mixer* mixer;
+    uint32_t index;
+    fa_mic* mic;
+    int64_t value;
+} fa_mixer_event;
+typedef void (FA_CALL *fa_mixer_event_callback)(const fa_mixer_event* event, void* user);
+FA_API fa_result FA_CALL fa_mixer_set_event_callback(fa_mixer* mixer, fa_mixer_event_callback callback, void* user);
 
 /* ---- User DSP --------------------------------------------------------- */
 

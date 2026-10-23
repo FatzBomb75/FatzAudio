@@ -644,3 +644,34 @@ internal unsafe struct FaMixerConfig
     public int Latency;
     public uint Flags;
 }
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaMicConfig
+{
+    public uint StructSize;
+    public byte* DeviceId;
+    public int Channel;
+    public int Monitor;
+    public uint Flags;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaMixerLatency
+{
+    public uint StructSize;
+    public long Master;
+    public long Cue;
+    public long CueAlignment;
+    public fixed long MicInput[2];
+    public fixed long MicMonitor[2];
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaMixerEvent
+{
+    public int Type;
+    public nint Mixer;
+    public uint Index;
+    public nint Mic;
+    public long Value;
+}

@@ -19,6 +19,7 @@ internal sealed class EngineHandle : SafeHandle
 internal sealed class DeviceHandle : SafeHandle
 {
     private EngineHandle? _engine;
+    private readonly List<GCHandle> _pins = new();
 
     public DeviceHandle() : base(0, true) { }
     public override bool IsInvalid => handle == 0;
@@ -29,11 +30,50 @@ internal sealed class DeviceHandle : SafeHandle
         SetHandle(native);
     }
 
+    /// <summary>Keeps a callback state object alive until the native device is closed.</summary>
+    public GCHandle Pin(object state)
+    {
+        var h = GCHandle.Alloc(state);
+        lock (_pins) _pins.Add(h);
+        return h;
+    }
+
     protected override bool ReleaseHandle()
     {
         NativeMethods.fa_device_close(handle);
+        lock (_pins)
+        {
+            foreach (var h in _pins) h.Free();
+            _pins.Clear();
+        }
         _engine?.DangerousRelease();
         _engine = null;
+        return true;
+    }
+}
+
+/// <summary>
+/// Owns an <c>fa_mic*</c> of a DJ mixer and keeps the mixer's device open, so the mic is always removed before the
+/// mixer goes (<c>fa_mixer_destroy</c> would free it).
+/// </summary>
+internal sealed class MicHandle : SafeHandle
+{
+    private DeviceHandle? _device;
+
+    public MicHandle() : base(0, true) { }
+    public override bool IsInvalid => handle == 0;
+
+    public void Initialize(nint native, DeviceHandle device)
+    {
+        _device = HandleRef.AddRef(device);
+        SetHandle(native);
+    }
+
+    protected override bool ReleaseHandle()
+    {
+        NativeMethods.fa_mic_remove(handle);
+        _device?.DangerousRelease();
+        _device = null;
         return true;
     }
 }

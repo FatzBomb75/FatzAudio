@@ -639,4 +639,38 @@ internal static unsafe partial class NativeMethods
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_deck_get_levels(nint deck, long window, float* peak, float* rms, uint channels);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mixer_get_latency(nint mixer, FaMixerLatency* latency);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mixer_set_event_callback(nint mixer, delegate* unmanaged[Cdecl]<FaMixerEvent*, void*, void> callback, void* user);
+
+    // ---- DJ mixer: microphones ---------------------------------------------
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_mic_config_init(FaMicConfig* config);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mixer_add_mic(nint mixer, FaMicConfig* config, out nint mic);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_mic_remove(nint mic);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mic_get_index(MicHandle mic, out uint index);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mic_set_param(MicHandle mic, int param, float value);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mic_get_param(MicHandle mic, int param, out float value);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mic_set_eq(MicHandle mic, FaEqBand* bands, uint count);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mic_get_eq(MicHandle mic, FaEqBand* bands, uint capacity, out uint count);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mic_get_levels(MicHandle mic, long window, out float peak, out float rms);
 }

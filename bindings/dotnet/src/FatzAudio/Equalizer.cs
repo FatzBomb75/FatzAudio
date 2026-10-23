@@ -53,6 +53,8 @@ public enum EqualizerPreset
     TrebleBoost,
     /// <summary>Lows and highs up, for quiet listening.</summary>
     Loudness,
+    /// <summary>A live singing mic: less boom and mud, more presence and air.</summary>
+    LiveVocal,
 }
 
 /// <summary>Equalizer presets.</summary>

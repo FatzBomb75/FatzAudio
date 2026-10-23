@@ -1,6 +1,6 @@
 # Equalizer, presets and user DSP
 
-Every stream has a parametric equalizer: up to 16 bands, each a peak (bell), a low shelf or a high shelf. Ten peaks on the octave frequencies make the usual 10-band graphic EQ, and 13 built-in presets fill those ten bands for you. For anything else, `fa_stream_add_dsp` runs your own processing on the stream's audio.
+Every stream has a parametric equalizer: up to 16 bands, each a peak (bell), a low shelf or a high shelf. Ten peaks on the octave frequencies make the usual 10-band graphic EQ, and 14 built-in presets fill those ten bands for you. For anything else, `fa_stream_add_dsp` runs your own processing on the stream's audio.
 
 ## What it does
 
@@ -69,6 +69,7 @@ All presets are ten peak bands at 31, 62, 125, 250, 500 Hz and 1, 2, 4, 8, 16 kH
 | Bass boost | 7 | 6 | 4 | 2 | 0 | 0 | 0 | 0 | 0 | 0 |
 | Treble boost | 0 | 0 | 0 | 0 | 0 | 1 | 2 | 4 | 5 | 6 |
 | Loudness | 5 | 4 | 2 | 0 | -1 | -1 | 0 | 2 | 4 | 5 |
+| Live vocal (for mics, see [DJ mixer](dj-mixer.md#microphones)) | -4 | -3 | -1 | -2 | -1 | 0 | 2 | 3 | 2 | 1 |
 
 The app owns user presets: store the bands it read with `fa_stream_get_eq` and set them again.
 

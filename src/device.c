@@ -304,6 +304,8 @@ static int needs_service(fa_device* d, int64_t now)
     return fa_load32(&d->lost) && now >= d->retry_at && now >= fa_load64(&d->lost_at) + FA_REROUTE_GRACE_NS;
 }
 
+static int wants_service(fa_device* d, int64_t now) { return needs_service(d, now) || fa_load32(&d->mixer_events); }
+
 /* Event thread (it looks every few milliseconds). */
 void fa_devices_service(fa_engine* e)
 {
@@ -312,11 +314,13 @@ void fa_devices_service(fa_engine* e)
         fa_device* d;
         fa_device* pick = NULL;
         fa_mutex_lock(&e->list_lock);
+        struct fa_mixer* mixer = NULL;
         for (d = e->devices; d; d = d->next)
             /* Only tried: fa_device_close holds it while it takes the device away. */
-            if (needs_service(d, now) && fa_mutex_trylock(&d->life_lock)) { pick = d; break; }
+            if (wants_service(d, now) && fa_mutex_trylock(&d->life_lock)) { pick = d; break; }
         fa_mutex_unlock(&e->list_lock);
         if (!pick) return;
+        if (fa_exchange32(&pick->mixer_events, 0)) mixer = fa_mixer_hold(pick);
         if (fa_exchange32(&pick->rerouted, 0) && pick->device_ok) store_latency(pick);
         if (needs_service(pick, now)) {
             if (pick->device_ok && ma_device_is_started(&pick->device)) fa_store32(&pick->lost, 0); /* rerouted meanwhile */
@@ -324,6 +328,9 @@ void fa_devices_service(fa_engine* e)
             if (fa_load32(&pick->lost) && pick->retry_at <= now) pick->retry_at = now + 1000000000;
         }
         fa_mutex_unlock(&pick->life_lock);
+        /* The mixer's events run without the device's lock: its callbacks may close it.
+         * `pick` is not touched after this. */
+        if (mixer) fa_mixer_service(mixer);
     }
 }
 
@@ -385,6 +392,34 @@ FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id
     return fa_device_open_with(engine, device_id, FA_DEVICE_CHANNELS, 0, out_device);
 }
 
+fa_result fa_device_parse_id(fa_engine* engine, fa_device_type type, const char* device_id, ma_device_id* out_id,
+                             int* out_has)
+{
+    *out_has = 0;
+    if (!device_id || !device_id[0]) return FA_OK;
+    if (device_id[0] == '#') {
+        ma_device_info* infos; ma_uint32 n; unsigned idx = (unsigned)atoi(device_id + 1);
+        ma_mutex_lock(&engine->lock);
+        if (list_devices(engine, type, &infos, &n) != MA_SUCCESS || idx >= n) {
+            ma_mutex_unlock(&engine->lock);
+            return FA_ERROR_NOT_FOUND;
+        }
+        *out_id = infos[idx].id;
+        ma_mutex_unlock(&engine->lock);
+    } else {
+        size_t len = strlen(device_id), i;
+        if ((len & 1) || len / 2 > sizeof(ma_device_id)) return FA_ERROR_INVALID_ARG;
+        memset(out_id, 0, sizeof(*out_id));
+        for (i = 0; i < len / 2; i++) {
+            int hi = hexval(device_id[i * 2]), lo = hexval(device_id[i * 2 + 1]);
+            if (hi < 0 || lo < 0) return FA_ERROR_INVALID_ARG;
+            ((unsigned char*)out_id)[i] = (unsigned char)((hi << 4) | lo);
+        }
+    }
+    *out_has = 1;
+    return FA_OK;
+}
+
 fa_result fa_device_open_with(fa_engine* engine, const char* device_id, uint32_t channels, int low_latency,
                               fa_device** out_device)
 {
@@ -392,32 +427,15 @@ fa_result fa_device_open_with(fa_engine* engine, const char* device_id, uint32_t
     ma_device_config cfg;
     ma_device_id id;
     ma_device_id* pid = NULL;
+    fa_result pr;
+    int has_id;
 
     if (!engine || !out_device) return FA_ERROR_INVALID_ARG;
     *out_device = NULL;
 
-    if (device_id && device_id[0]) {
-        if (device_id[0] == '#') {
-            ma_device_info* infos; ma_uint32 n; unsigned idx = (unsigned)atoi(device_id + 1);
-            ma_mutex_lock(&engine->lock);
-            if (list_devices(engine, FA_DEVICE_PLAYBACK, &infos, &n) != MA_SUCCESS || idx >= n) {
-                ma_mutex_unlock(&engine->lock);
-                return FA_ERROR_NOT_FOUND;
-            }
-            id = infos[idx].id;
-            ma_mutex_unlock(&engine->lock);
-        } else {
-            size_t len = strlen(device_id), i;
-            if ((len & 1) || len / 2 > sizeof(ma_device_id)) return FA_ERROR_INVALID_ARG;
-            memset(&id, 0, sizeof(id));
-            for (i = 0; i < len / 2; i++) {
-                int hi = hexval(device_id[i * 2]), lo = hexval(device_id[i * 2 + 1]);
-                if (hi < 0 || lo < 0) return FA_ERROR_INVALID_ARG;
-                ((unsigned char*)&id)[i] = (unsigned char)((hi << 4) | lo);
-            }
-        }
-        pid = &id;
-    }
+    pr = fa_device_parse_id(engine, FA_DEVICE_PLAYBACK, device_id, &id, &has_id);
+    if (pr != FA_OK) return pr;
+    if (has_id) pid = &id;
 
     d = (fa_device*)calloc(1, sizeof(*d));
     if (!d) return FA_ERROR_OUT_OF_MEMORY;

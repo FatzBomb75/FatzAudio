@@ -11,7 +11,7 @@ public class EqualizerTests
     [Fact]
     public void Presets_HaveTenOctaveBandsAndNames()
     {
-        Assert.Equal(13, Equalizer.Presets.Count);
+        Assert.Equal(14, Equalizer.Presets.Count);
         foreach (var p in Equalizer.Presets)
         {
             var bands = Equalizer.GetPreset(p);

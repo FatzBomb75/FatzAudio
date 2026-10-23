@@ -167,7 +167,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 |---|---|---|
 | BASS_ChannelSetFX(BASS_FX_DX8_PARAMEQ) per band, or bass_fx `BASS_FX_BFX_PEAKEQ` with `lBand` per band + BASS_FXSetParameters | `fa_stream_set_eq` with up to 16 peak or shelf bands; `fa_stream_set_eq_gain` for one slider. No FX handles: one equalizer per stream, before volume and normalization, gliding without clicks, free when flat ([equalizer](../features/equalizer.md)) | ✅ |
 | `BASS_BFX_PEAKEQ.fCenter` / `fBandwidth` (octaves) / `fQ` / `fGain` | `fa_eq_band.frequency_hz` / `q` (one octave = 1.41) / `gain_db` | ✅ |
-| BASS_FXSetParameters to switch a whole EQ preset | `fa_eq_get_preset` + `fa_stream_set_eq` (13 presets) | ✅ |
+| BASS_FXSetParameters to switch a whole EQ preset | `fa_eq_get_preset` + `fa_stream_set_eq` (14 presets) | ✅ |
 | BASS_FXSetBypass on the EQ | `fa_stream_set_eq_enabled(s, 0)`: glides to flat, keeps the bands | ✅ |
 | BASS_FXReset (clear the EQ's filter memory after a seek) | Not needed: cleared by itself on a seek, a flush and a restart | ➖ |
 | Three BASS_FX_BFX_PEAKEQ (or BQF filters) per deck as a DJ EQ with kills | The DJ mixer's isolator: `FA_DECK_EQ_LOW_DB` / `_MID_DB` / `_HIGH_DB` down to `FA_DECK_EQ_KILL_DB`, flat when all at 0 ([DJ mixer](../features/dj-mixer.md)) | ✅ |
@@ -241,7 +241,9 @@ MOD, S3M, XM, IT, MPTM and many more play through the statically linked libopenm
 | BASS | FatzAudio | Status |
 |---|---|---|
 | BASS_RecordGetDeviceInfo | `fa_device_count/get_info(FA_DEVICE_CAPTURE)` | ✅ (listing) |
-| BASS_RecordInit / Free / SetDevice / GetDevice / GetInfo / Start | Capture devices as stream sources | 🗓️ |
+| BASS_RecordInit + BASS_RecordStart, the record channel played live through a mixer (a karaoke mic) | `fa_mixer_add_mic` on the [DJ mixer](../features/dj-mixer.md#microphones): one channel or all channels of a capture device, drift-corrected into the master, with low cut, gain, gate, EQ, mute and pan built in; `fa_mic_remove` frees it. In .NET: `mixer.AddMic(new MicOptions { Device = input, Channel = 0 })` | ✅ |
+| BASS_ChannelGetLevel(Ex) on a record channel (a mic meter) | `fa_mic_get_levels` (after gain, gate and EQ) | ✅ |
+| BASS_RecordInit / Free / SetDevice / GetDevice / GetInfo / Start for other uses | Capture devices as stream sources | 🗓️ |
 | BASS_RecordGetInput / SetInput / GetInputName | Not provided (old WinMM mixer lines) | ➖ |
 
 ### Encoding and recording (BASSenc, BASSenc_MP3, BASSenc_FLAC)

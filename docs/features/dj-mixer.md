@@ -110,7 +110,7 @@ The cue send is taken before the channel fader, so a deck with its fader down ca
 - The device mute (`fa_device_set_mute`, `Output.Muted`) silences the headphones too.
 - The cue point (`fa_deck_set_cue_point`, `CuePoint`) defaults to the stream's CUE_IN marker, else 0. `fa_deck_cue` (`ReturnToCuePoint`) pauses the deck and goes back to it.
 - The meter (`fa_deck_get_levels`) shows the deck after trim, EQ and fader, before the crossfader, as heard now.
-- `latency` defaults to `FA_LATENCY_LOW`: on Windows the WASAPI low-latency shared mode at the device's own rate (needs a driver that offers small periods, most do), about 5 ms periods elsewhere. `FA_LATENCY_NORMAL` uses the engine's period. `FA_LATENCY_EXCLUSIVE` comes with the mic input.
+- `latency` defaults to `FA_LATENCY_LOW`: on Windows the WASAPI low-latency shared mode at the device's own rate (needs a driver that offers small periods, most do), about 5 ms periods elsewhere. `FA_LATENCY_NORMAL` uses the engine's period. `FA_LATENCY_EXCLUSIVE` comes with the mic setup check.
 - Closing the mixer's device, or the engine, destroys the mixer. In .NET, `DjMixer` keeps its `OutputDevice`, so dispose the mixer, not its `Output`.
 
 ## Deck loops
@@ -122,6 +122,81 @@ The cue send is taken before the channel fader, so a deck with its fader down ca
 - While on, the deck loop replaces the CUE_IN..CUE_OUT loop of `fa_stream_set_loop`. Unloading the deck clears it.
 - Only seekable streams loop (`FA_ERROR_NOT_SEEKABLE`): files, memory and discs, not web radio.
 
+## Microphones
+
+Up to two karaoke mics (`FA_MIC_MAX`), mixed into the master before the master gain and the limiter, so the limiter catches a shout:
+
+```
+ input device -> bridge (drift-corrected) -> low cut -> gain -> gate -> EQ -> meter
+   -> mute -> pan -> master (when monitored)
+```
+
+```c
+fa_mic_config mc;
+fa_mic_config_init(&mc);            /* the default input, all its channels summed, heard */
+mc.device_id = info.id;             /* an FA_DEVICE_CAPTURE device from fa_device_get_info */
+mc.channel = 0;                     /* input 1 of a 2-input interface; a second mic takes 1 */
+
+fa_mic* mic;
+fa_result r = fa_mixer_add_mic(mixer, &mc, &mic);   /* FA_ERROR_PERMISSION_DENIED: ask for it first */
+fa_mic_set_param(mic, FA_MIC_GAIN_DB, 6);
+fa_eq_band eq[10]; uint32_t n;
+fa_eq_get_preset(FA_EQ_PRESET_LIVE_VOCAL, eq, &n);
+fa_mic_set_eq(mic, eq, n);
+
+float peak, rms;
+fa_mic_get_levels(mic, 50000000, &peak, &rms);       /* the singer's meter */
+
+fa_mixer_latency lat = { sizeof lat };
+fa_mixer_get_latency(mixer, &lat);  /* lat.mic_monitor[0]: voice to speaker, in ns */
+fa_mic_remove(mic);
+```
+
+```csharp
+var input = engine.InputDevices.First(d => d.Name.Contains("Scarlett"));
+using var mic = mixer.AddMic(new MicOptions { Device = input, Channel = 0 });
+mic.GainDb = 6;
+mic.SetEqualizer(EqualizerPreset.LiveVocal);
+mixer.InputLost += (_, e) => e.Mic.Dispose();   // unplugged: add it again when it is back
+MicLevels level = mic.GetLevels();
+TimeSpan delay = mic.MonitorLatency;            // voice to speaker
+```
+
+| Setting | C | .NET | Range | Default |
+|---|---|---|---|---|
+| Gain | `FA_MIC_GAIN_DB` | `GainDb` | −20..+40 dB | 0 |
+| Mute | `FA_MIC_MUTE` | `Muted` | off / on, glides over 5 ms | off |
+| Pan | `FA_MIC_PAN` | `Pan` | −1 (left) .. 1 (right), balance | 0 |
+| Gate | `FA_MIC_GATE_DB` | `GateDb` | −100 (off) .. 0 dB | −50 |
+| Low cut | `FA_MIC_LOW_CUT` | `LowCut` | an 80 Hz high-pass, on / off | on |
+| Monitor | `FA_MIC_MONITOR`, `fa_mic_config.monitor` | `Monitor`, `MicOptions.Monitor` | heard through the master, or metered only (a mic that goes through a hardware mixer) | heard |
+| EQ | `fa_mic_set_eq` | `SetEqualizer` | the stream EQ's bands and presets ([equalizer](equalizer.md)); `FA_EQ_PRESET_LIVE_VOCAL` is made for mics | off |
+| Reverb, echo | `FA_MIC_REVERB_SEND`, `FA_MIC_ECHO_SEND` | — | planned next (`FA_ERROR_NOT_IMPLEMENTED`) | |
+
+- **Inputs.** A mic reads one channel of a capture device (`channel`, from 0) or all of them summed (−1, the default). Two mics on one 2-input interface share the device: it is opened once. A channel the device does not have is `FA_ERROR_NOT_ENOUGH_CHANNELS`; a third mic is `FA_ERROR_BUSY`.
+- **Clocks.** The input runs on its own clock and often at its own rate (a USB mic at 44.1 kHz into a 48 kHz master). It reaches the master through a small buffer that a resampler keeps at a steady fill, adjusting the speed by at most 0.2% (not audible), so drift never builds up into a delay or a click. If the input stalls, the buffer grows by 2 ms (up to 50 ms) and starts again.
+- **The gate** opens at the threshold within 1 ms, stays open while the voice is at most 6 dB below it, and closes over 150 ms after 100 ms below that, so breaths and room noise stay out between phrases without chopping words.
+- **The meter** (`fa_mic_get_levels`, `GetLevels`) reads the mic after gain, gate and EQ, before mute and pan, so a muted singer still sees their level. The first call starts measuring and reads silence.
+- **Fade-in.** A new mic is silent for 50 ms, then fades in over 10 ms, so adding one never pops.
+- **Unprocessed capture.** Mics ask for the input without the system's voice processing (automatic gain, noise suppression, echo cancelling: made for calls, they spoil singing and add latency). For now that is Android's UNPROCESSED input preset; Windows' raw mode is planned with the setup check, and macOS, iOS and Linux give the input as the system delivers it. `FA_MIC_OS_PROCESSING` (`KeepOsProcessing`) keeps the processing; two mics on one device share its input, so the first mic added decides for both.
+- **Permission.** The app asks for the microphone permission before adding a mic: Android needs `RECORD_AUDIO` in the manifest and the runtime prompt; macOS and iOS need `NSMicrophoneUsageDescription` (and a sandboxed macOS app the audio-input entitlement). Where the system refuses at open, adding a mic is `FA_ERROR_PERMISSION_DENIED` (`ErrorCode.PermissionDenied`); some systems deliver silence instead.
+- **Input lost.** An input that goes away (unplugged, taken by another app) goes silent, the mix carries on, and the mixer raises `FA_EVENT_INPUT_LOST` once per mic on `fa_mixer_set_event_callback` (`InputLost`), on the engine's event thread. Remove the mic there or later and add it again when the device is back. `fa_mic_remove` works inside the callback, also for the event's own mic.
+- **Host mics.** `FA_MIC_DUCKS_MUSIC` (`DucksMusic`) marks a host's mic, for the planned ducking; leave it off for singers.
+
+### Latency
+
+`fa_mixer_get_latency` (`Latency`, `Mic.InputLatency`, `Mic.MonitorLatency`) reports, in ns:
+
+| Field | What it is |
+|---|---|
+| `master` | the master output's buffer |
+| `cue` | the headphones; the same as `master` for the channel and Y-cable cues |
+| `cue_alignment` | delay added to line up a second-device cue (planned; 0) |
+| `mic_input[i]` | the input device's buffer plus the bridge's fill; −1 when slot `i` has no mic |
+| `mic_monitor[i]` | voice to speaker: `mic_input[i]` plus `master`; −1 when no mic |
+
+Times the system does not report are estimated from the buffer sizes. Below about 20 ms voice to speaker a singer does not notice; at 30 ms and more it sounds like a slap-back. With the low-latency default the bridge holds about one input period, one master period and a millisecond. A measured check of the real total, speaker to mic, comes with the setup check.
+
 ## Planned
 
-More than two decks, a second-device cue, exclusive mode with the mic input, beat sync and beat loops (BPM analysis), and auto-mix are the next steps of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).
+Reverb and echo for the mics, host-mic ducking, recording the master and the vocals, a measured setup check and exclusive mode, more than two decks, a second-device cue, beat sync and beat loops (BPM analysis), and auto-mix are the next steps of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).
