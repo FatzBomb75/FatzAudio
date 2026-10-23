@@ -127,6 +127,10 @@ typedef struct cdg_slot {
     uint8_t background[4];
     uint8_t transparency[16];
     uint64_t palette_revision;
+    /* A lyric surface's frame: its layout and tempo, and the history as of it. */
+    uint64_t layout_rev;
+    float tempo;
+    fa_surface_history hist;
 } cdg_slot;
 
 struct fa_cdg_surface {
@@ -150,6 +154,8 @@ struct fa_cdg_surface {
     fa_surface_history history;   /* the output area each recent revision changed */
     uint32_t present_w, present_h; /* fa_surface_set_presentation_size */
     int render_ahead;
+    uint32_t ra_w, ra_h;          /* lyric render-ahead: the slots' size and layout */
+    uint64_t ra_layout;
     uint32_t gen;                 /* stream->cdg_gen the state belongs to */
     int drawn;                    /* a revision exists: the state was turned into pixels once */
     uint8_t shown_palette[16][4]; /* as of the last render */
@@ -1965,12 +1971,18 @@ static void ra_render(fa_cdg_surface* f, int k, fa_time gtime, int64_t start)
 
 /* A worker's job: the frame for ra_time into the free slot, finished next. A new
  * layout waits for the app's next update_into. */
+static void lyric_ra_job(fa_cdg_surface* f, struct fa_stream* s);
+
 static void ra_job(fa_cdg_surface* f, struct fa_stream* s)
 {
     cdg_layout want;
     fa_time t = 0, gtime;
     int64_t start;
     int k = -1;
+    if (f->lyric) {
+        lyric_ra_job(f, s);
+        return;
+    }
     fa_mutex_lock(&f->work_lock);
     if (ra_on(f) && f->slot[0].px) {
         fa_mutex_lock(&f->pub_lock);
@@ -2337,6 +2349,8 @@ FA_API fa_result FA_CALL fa_surface_set_presentation_size(fa_surface* surface, u
     if (r != FA_OK) return r;
     /* Used by presentation scaling, at the next update or layout. */
     fa_mutex_lock(&surface->work_lock);
+    /* A lyric surface's slots are of the old area: the next update_into draws. */
+    if (surface->lyric && (surface->present_w != width || surface->present_h != height)) ra_forget(surface);
     surface->present_w = width;
     surface->present_h = height;
     fa_mutex_unlock(&surface->work_lock);
@@ -2382,6 +2396,7 @@ FA_API fa_result FA_CALL fa_surface_get_layout(fa_surface* surface, fa_surface_l
         memset(&l, 0, sizeof(l));
         fa_mutex_lock(&surface->work_lock);
         r = fa_lyric_get_layout(surface->lyric, surface->present_w, surface->present_h, &l);
+        if (r == FA_OK && l.layout_revision != surface->ra_layout) ra_forget(surface);
         surface->layout_revision = l.layout_revision;
         fa_mutex_unlock(&surface->work_lock);
         if (r != FA_OK) return r;
@@ -2422,6 +2437,189 @@ FA_API fa_result FA_CALL fa_surface_get_layout(fa_surface* surface, fa_surface_l
     l.layout_revision = surface->layout_revision;
     fa_mutex_unlock(&surface->work_lock);
     memcpy(out_layout, &l, l.struct_size);
+    return FA_OK;
+}
+
+/* ---- render-ahead for a lyric surface ----
+ *
+ * The same two slots: a slot is a buffer of the lyric bitmap that fa_lyric_update
+ * brings to a time from the revision it holds, with a copy of the history as of that
+ * revision so update_into can copy from it to the app's buffer without the lyric's
+ * lock. A frame fits a time when it is of that time or up to 1/60 s before it (or a
+ * hair after); lyrics move continuously, so there is no "same picture" test as for
+ * CD+G packs. A later frame is shown, flagged behind, while the worker catches up;
+ * only with none of the layout, one ahead of `time` or one a seek away is the frame
+ * drawn on the caller's thread. */
+
+#define LY_RA_CLOSE ((fa_time)16666667)
+
+static float stream_tempo(struct fa_stream* s)
+{
+    float tempo = 1.0f;
+    if (fa_stream_get_param(s, FA_PARAM_TEMPO, &tempo) != FA_OK || !(tempo > 0.0f)) tempo = 1.0f;
+    return tempo;
+}
+
+/* Slot k's fit for `time`; caller holds pub_lock. */
+static int lyric_fit(const fa_cdg_surface* f, int k, fa_time time, float tempo)
+{
+    const cdg_slot* sl;
+    if (k < 0) return FIT_NONE;
+    sl = &f->slot[k];
+    if (!sl->revision || sl->layout_rev != f->ra_layout || sl->tempo != tempo) return FIT_NONE;
+    if (time == sl->time) return FIT_EXACT;
+    if (time > sl->time) return (uint64_t)time - (uint64_t)sl->time <= (uint64_t)LY_RA_CLOSE ? FIT_CLOSE : FIT_BEHIND;
+    return (uint64_t)sl->time - (uint64_t)time <= (uint64_t)(LY_RA_CLOSE / 2) ? FIT_CLOSE : FIT_AHEAD;
+}
+
+/* Draws the frame for `time` into slot k. Caller holds work_lock; k is neither the
+ * slot shown nor the one finished next. */
+static fa_result lyric_ra_render(fa_cdg_surface* f, int k, fa_time time, float tempo)
+{
+    cdg_slot* sl = &f->slot[k];
+    fa_surface_frame fr;
+    int64_t start = fa_monotonic_ns();
+    fa_result r;
+    memset(&fr, 0, sizeof(fr));
+    r = fa_lyric_update(f->lyric, f->present_w, f->present_h, (double)tempo, time, sl->px, (int32_t)f->ra_w * 4, f->ra_w,
+                        f->ra_h, sl->revision, &fr);
+    if (r != FA_OK) return r;
+    sl->revision = fr.revision;
+    sl->time = time;
+    sl->tempo = tempo;
+    sl->layout_rev = fa_lyric_layout_revision(f->lyric);
+    sl->hist = *fa_lyric_history(f->lyric);
+    sl->render_ns = fa_monotonic_ns() - start;
+    return FA_OK;
+}
+
+/* A worker's job: the frame for ra_time into the free slot. A new layout (a new
+ * presentation size or style) waits for the app's next update_into. */
+static void lyric_ra_job(fa_cdg_surface* f, struct fa_stream* s)
+{
+    fa_time t = 0;
+    float tempo = stream_tempo(s);
+    int k = -1;
+    fa_mutex_lock(&f->work_lock);
+    if (f->render_ahead && f->slot[0].px && fa_lyric_ready_for(f->lyric, f->present_w, f->present_h) &&
+        fa_lyric_layout_revision(f->lyric) == f->ra_layout) {
+        fa_mutex_lock(&f->pub_lock);
+        if (f->front >= 0 && f->ready < 0) k = 1 - f->front;
+        t = f->ra_time;
+        fa_mutex_unlock(&f->pub_lock);
+    }
+    if (k >= 0 && lyric_ra_render(f, k, t, tempo) == FA_OK) {
+        fa_mutex_lock(&f->pub_lock);
+        f->ready = k;
+        fa_mutex_unlock(&f->pub_lock);
+    }
+    fa_mutex_unlock(&f->work_lock);
+}
+
+/* update_into for a lyric surface with render-ahead (as ra_show for CD+G). `held`:
+ * work_lock is held, so the layout is current and a frame can be drawn here. */
+static fa_result lyric_ra_update(fa_cdg_surface* f, struct fa_stream* s, fa_time time, uint8_t* dst, int32_t dst_stride,
+                                 uint32_t dst_w, uint32_t dst_h, uint64_t dst_revision, int held, fa_surface_frame* fr)
+{
+    const cdg_slot* sl;
+    fa_rects copy;
+    fa_time lead, ahead_time;
+    float tempo = stream_tempo(s);
+    int i, fit, need, partial, b[4];
+    if (held) {
+        fa_surface_layout lay;
+        fa_result r;
+        memset(&lay, 0, sizeof(lay));
+        r = fa_lyric_get_layout(f->lyric, f->present_w, f->present_h, &lay);
+        if (r != FA_OK) return r;
+        f->layout_revision = lay.layout_revision;
+        if (lay.layout_revision != f->ra_layout || !f->slot[0].px) {
+            size_t size = (size_t)lay.width * (size_t)lay.height * 4;
+            ra_free(f);
+            f->ra_layout = lay.layout_revision;
+            f->ra_w = lay.width;
+            f->ra_h = lay.height;
+            f->slot[0].px = (uint8_t*)malloc(size);
+            f->slot[1].px = (uint8_t*)malloc(size);
+            if (!f->slot[0].px || !f->slot[1].px) {
+                ra_free(f);
+                return FA_ERROR_OUT_OF_MEMORY;
+            }
+        }
+    }
+    /* Without the lock the layout may have changed since: the caller takes the lock
+     * and comes back. */
+    if (!f->slot[0].px || dst_w != f->ra_w || dst_h != f->ra_h) return held ? FA_ERROR_SIZE_MISMATCH : FA_ERROR_BUSY;
+    if (dst_stride < (int32_t)f->ra_w * 4) return FA_ERROR_INVALID_ARG;
+    /* The pace of the calls, as for CD+G. */
+    if (time <= f->ra_last) lead = 0;
+    else if ((uint64_t)time - (uint64_t)f->ra_last > (uint64_t)RA_LEAD_MAX) lead = RA_LEAD_DEFAULT;
+    else lead = time - f->ra_last;
+    ahead_time = time > INT64_MAX - lead ? INT64_MAX : time + lead;
+    fa_mutex_lock(&f->pub_lock);
+    for (;;) {
+        int ff = lyric_fit(f, f->front, time, tempo), rf = lyric_fit(f, f->ready, time, tempo), k;
+        if (rf != FIT_NONE && (rf > ff || (rf == ff && (rf == FIT_AHEAD ? f->slot[f->ready].time < f->slot[f->front].time
+                                                     : f->slot[f->ready].time > f->slot[f->front].time)))) {
+            f->front = f->ready;
+            f->ready = -1;
+            ff = rf;
+        } else if (f->ready >= 0 && !(rf == FIT_AHEAD && f->slot[f->ready].time <= ahead_time)) {
+            f->ready = -1;        /* of no use: the worker renders another */
+        }
+        fit = ff;
+        /* On time; or late by less than a seek while a worker brings the next: lyrics
+         * drop a frame rather than draw it here (the worker would fall behind again). */
+        if (f->front >= 0 &&
+            (ff >= FIT_CLOSE || (ff == FIT_BEHIND && (uint64_t)time - (uint64_t)f->slot[f->front].time <= (uint64_t)RA_LEAD_MAX)))
+            break;
+        if (!held) {
+            if (f->front >= 0 && ff != FIT_NONE) break;   /* shown late rather than waiting */
+            fa_mutex_unlock(&f->pub_lock);
+            return FA_ERROR_BUSY;                          /* the caller takes the lock and comes back */
+        }
+        /* Draw the frame for `time` here: no worker is rendering (the lock is held). */
+        f->ready = -1;
+        k = f->front < 0 ? 0 : 1 - f->front;
+        fa_mutex_unlock(&f->pub_lock);
+        {
+            fa_result r = lyric_ra_render(f, k, time, tempo);
+            if (r != FA_OK) return r;
+        }
+        fa_mutex_lock(&f->pub_lock);
+        f->front = k;
+        fit = FIT_EXACT;
+        break;
+    }
+    sl = &f->slot[f->front];
+    partial = fa_history_since(&sl->hist, sl->revision, dst_revision, &copy);
+    fr->revision = sl->revision;
+    fr->base_revision = partial ? dst_revision : 0;
+    fr->time = sl->time;
+    fr->render_ns = sl->render_ns;
+    fr->behind = fit < FIT_CLOSE;
+    fr->background_index = fr->border_index = -1;
+    need = f->ready < 0 && sl->time != ahead_time;
+    f->ra_time = ahead_time;
+    fa_mutex_unlock(&f->pub_lock);
+    f->ra_last = time;
+    if (need) ra_request(f, s);
+    if (!partial) {
+        fa_rects_clear(&copy);
+        fa_rects_add(&copy, 0, 0, (int)f->ra_w, (int)f->ra_h);
+    }
+    /* Only this thread changes `front`, and a worker draws only into the other slot. */
+    for (i = 0; i < copy.n; i++) {
+        const int* r = copy.r[i];
+        int y;
+        for (y = r[1]; y < r[3]; y++)
+            memcpy(dst + (size_t)y * (size_t)dst_stride + (size_t)r[0] * 4, sl->px + ((size_t)y * f->ra_w + (size_t)r[0]) * 4,
+                   (size_t)(r[2] - r[0]) * 4);
+    }
+    fr->dirty_count = (uint32_t)copy.n;
+    for (i = 0; i < copy.n; i++) to_rect(copy.r[i], &fr->dirty[i]);
+    fa_rects_bounds(&copy, b);
+    to_rect(b, &fr->dirty_bounds);
     return FA_OK;
 }
 
@@ -2480,9 +2678,21 @@ FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* surface, fa_time tim
     if (!s) return FA_ERROR_INVALID_ARG; /* its stream was closed */
     memset(&fr, 0, sizeof(fr));
     if (time == FA_SURFACE_NOW) r = fa_stream_get_clock(s, &time);
-    if (r == FA_OK && surface->lyric) {
-        float tempo = 1.0f;
-        if (fa_stream_get_param(s, FA_PARAM_TEMPO, &tempo) != FA_OK || !(tempo > 0.0f)) tempo = 1.0f;
+    if (r == FA_OK && surface->lyric && surface->render_ahead) {
+        if (fa_mutex_trylock(&surface->work_lock)) {
+            r = lyric_ra_update(surface, s, time, (uint8_t*)dst, dst_stride, dst_width, dst_height, dst_revision, 1, &fr);
+            fa_mutex_unlock(&surface->work_lock);
+        } else {
+            /* A worker is rendering ahead: what it finished; else wait for it. */
+            r = lyric_ra_update(surface, s, time, (uint8_t*)dst, dst_stride, dst_width, dst_height, dst_revision, 0, &fr);
+            if (r == FA_ERROR_BUSY) {
+                fa_mutex_lock(&surface->work_lock);
+                r = lyric_ra_update(surface, s, time, (uint8_t*)dst, dst_stride, dst_width, dst_height, dst_revision, 1, &fr);
+                fa_mutex_unlock(&surface->work_lock);
+            }
+        }
+    } else if (r == FA_OK && surface->lyric) {
+        float tempo = stream_tempo(s);
         fa_mutex_lock(&surface->work_lock);
         r = fa_lyric_update(surface->lyric, surface->present_w, surface->present_h, (double)tempo, time, (uint8_t*)dst,
                             dst_stride, dst_width, dst_height, dst_revision, &fr);
@@ -2693,6 +2903,7 @@ FA_API fa_result FA_CALL fa_lyric_surface_set_style(fa_surface* surface, const f
     if (r != FA_OK) return r;
     fa_mutex_lock(&surface->work_lock);
     r = fa_lyric_set_style(surface->lyric, &st);
+    if (r == FA_OK) ra_forget(surface);   /* the slots show the old style */
     fa_mutex_unlock(&surface->work_lock);
     return r;
 }

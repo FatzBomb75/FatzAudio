@@ -1190,6 +1190,87 @@ static void test_intro_stateless(void)
     free(song.d);
 }
 
+/* Render-ahead: every frame shown is the picture at the time it says, from slots a
+ * worker filled or drawn here, through two buffers in turn; paced like a display the
+ * worker has the frames ready. */
+static int same_at(fa_surface* ref, target* rt, fa_time time, const target* got)
+{
+    fa_surface_frame fr;
+    uint32_t y;
+    if (draw_at(ref, rt, time, &fr) != FA_OK) return 0;
+    for (y = 0; y < got->lay.height; y++)
+        if (memcmp(rt->px + (size_t)y * (size_t)rt->stride, got->px + (size_t)y * (size_t)got->stride, (size_t)got->lay.width * 4))
+            return 0;
+    return 1;
+}
+
+static void test_render_ahead(void)
+{
+    buf song = make_titled("@TBOA", "@TVOB", 0, 40);
+    fa_stream* s = open_buf(&song);
+    fa_lyric_style st;
+    fa_surface *f = NULL, *ref = NULL;
+    fa_surface_frame fr;
+    target t[2], rt;
+    int k, b, behind = 0, partial = 0, frames = 0;
+    CHECK(s != NULL);
+    style(&st, FA_LYRIC_CLASSIC);
+    CHECK_EQ(fa_lyric_surface_create(s, &st, &f), FA_OK);
+    CHECK_EQ(fa_lyric_surface_create(s, &st, &ref), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(f, 1280, 720), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(ref, 1280, 720), FA_OK);
+    CHECK_EQ(fa_surface_set_render_ahead(f, 1), FA_OK);
+    CHECK(target_make(f, &t[0]));
+    CHECK(target_make(f, &t[1]));
+    CHECK(target_make(ref, &rt));
+    for (k = 0; k < 2; k++) t[k].stride += 8;
+    for (k = 0; k < 2; k++) {
+        free(t[k].px);
+        t[k].px = (uint8_t*)calloc((size_t)t[k].stride * t[k].lay.height, 1);
+        CHECK(t[k].px != NULL);
+    }
+    for (k = 0; k <= 12000; k += 17) {
+        b = (k / 17) % 2;
+        CHECK_EQ(draw_at(f, &t[b], (fa_time)k * MS, &fr), FA_OK);
+        frames++;
+        if (fr.behind) behind++;
+        if (fr.base_revision) partial++;
+        /* On time: of this time, up to 1/60 s before it or a hair after; late frames say so. */
+        CHECK(fr.time <= (fa_time)k * MS + 8333334);
+        CHECK(fr.behind || fr.time >= (fa_time)k * MS - 16666667);
+        if (!same_at(ref, &rt, fr.time, &t[b])) {
+            fprintf(stderr, "  differs at %d ms (frame of %lld ns)\n", k, (long long)fr.time);
+            CHECK(0);
+        }
+        if (k > 6000) fa_sleep_ms(5);
+    }
+    printf("    %d of %d frames behind, %d partial\n", behind, frames, partial);
+    CHECK(partial > 0);
+    /* Paused: the frame of that time. A seek back: drawn here. */
+    CHECK_EQ(draw_at(f, &t[0], 4000 * MS, &fr), FA_OK);
+    CHECK_EQ(draw_at(f, &t[0], 4000 * MS, &fr), FA_OK);
+    CHECK_EQ(fr.time, 4000 * MS);
+    CHECK(same_at(ref, &rt, fr.time, &t[0]));
+    /* A new presentation size: the old buffer no longer fits; a new one does. */
+    CHECK_EQ(fa_surface_set_presentation_size(f, 1920, 1080), FA_OK);
+    CHECK_EQ(draw_at(f, &t[0], 4100 * MS, &fr), FA_ERROR_SIZE_MISMATCH);
+    free(t[0].px);
+    CHECK(target_make(f, &t[0]));
+    CHECK_EQ(draw_at(f, &t[0], 4100 * MS, &fr), FA_OK);
+    CHECK_EQ(fr.layout_revision, t[0].lay.layout_revision);
+    /* Off again: drawn on this thread as before. */
+    CHECK_EQ(fa_surface_set_render_ahead(f, 0), FA_OK);
+    CHECK_EQ(draw_at(f, &t[0], 4200 * MS, &fr), FA_OK);
+    CHECK_EQ(fr.time, 4200 * MS);
+    fa_surface_destroy(f);
+    fa_surface_destroy(ref);
+    free(t[0].px);
+    free(t[1].px);
+    free(rt.px);
+    fa_stream_close(s);
+    free(song.d);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -1225,6 +1306,7 @@ int main(void)
     RUN(test_intro_card);
     RUN(test_intro_when);
     RUN(test_intro_stateless);
+    RUN(test_render_ahead);
     free(g_song.d);
     fa_soundfont_close(g_font);
     fa_engine_destroy(g_engine);

@@ -1559,7 +1559,10 @@ FA_API fa_result FA_CALL fa_surface_set_presentation_size(fa_surface* surface, u
  * rendering: it shows the frame it has, and fa_surface_frame.behind says when that one
  * is late. When no worker is rendering and there is no fitting frame (the first, the
  * first after a change of layout or options, after a seek or new graphics, or more
- * than 1/60 s late) it draws the frame on the caller's thread. Calls that change the
+ * than 1/60 s late) it draws the frame on the caller's thread. A lyric surface draws
+ * a late frame there only when it is more than 100 ms late: below that it shows the
+ * late frame (behind = 1) and drops it, since drawing here would leave the worker
+ * behind again. Calls that change the
  * surface (options, sizes, the layout, fa_cdg_surface_update) wait for a running
  * render, at most one frame. It takes two more buffers of the layout's size. The
  * classic CD+G picture ignores it: it is drawn on the caller's thread either way. Off

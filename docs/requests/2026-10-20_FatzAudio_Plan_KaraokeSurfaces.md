@@ -456,6 +456,8 @@ of the master plus the exposed band, about 1 ms at 1080p and 3-5 ms at 2160p wit
 | Scroll or page-fade frame (all lines resampled) | 3 ms | 3 ms | 12 ms | 12 ms |
 | Intro or ending page (once) | 3 ms | 8 ms | 12 ms | 30 ms |
 
+The numbers measured with the finished lyric surface, with and without render-ahead, are in [docs/features/lyrics.md](../features/lyrics.md#cost).
+
 So: CD+G is cheap enough on the caller's thread except full repaints with effects at 2160p, which
 render-ahead or a split across workers takes care of. Lyrics at 2160p want render-ahead during the
 1-1.5 s scroll and page animations. The GPU path is not needed on these numbers; we would revisit it
@@ -536,7 +538,7 @@ fonts through each OS (registry list, CoreText, Android's system font list (not 
 folders). Checked against FreeType on DejaVu, FreeFont, Inter (CFF), WenQuanYi (a collection) and Noto
 Sans JP (CID-keyed CFF, 18 font dicts): a mean difference under 0.06 of 255 per pixel at 100 px; and
 against HarfBuzz kerning: 8,400 pairs, none different. No public API yet: the lyric surface (step 5)
-uses it. Step 5a done, merged as PR 87: the lyric surface (timeline, layout and drawing, C API, .NET, docs, tests; docs/features/lyrics.md). Step 5b done, this PR: the intro and ending pages. Step 5c is next: render-ahead for lyrics (which also takes the pages' first-show cost off the caller's thread) and the measured cost table.
+uses it. Step 5a done, merged as PR 87: the lyric surface (timeline, layout and drawing, C API, .NET, docs, tests; docs/features/lyrics.md). Step 5b done, merged as PR 88: the intro and ending pages. Step 5c done, this PR: render-ahead for lyrics (which also takes the pages' first-show cost off the caller's thread) and the measured cost table. Step 6 is next.
 
 ## 11. Questions, answered by MediaControl (2026-10-20)
 

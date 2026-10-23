@@ -2107,6 +2107,17 @@ void fa_lyric_set_effects(fa_lyric* l, const fa_surface_effects* e)
 
 uint64_t fa_lyric_layout_revision(const fa_lyric* l) { return l->layout_revision; }
 
+int fa_lyric_ready_for(const fa_lyric* l, uint32_t aw, uint32_t ah)
+{
+    if (!aw || !ah) {
+        aw = LY_DESIGN_W;
+        ah = LY_DESIGN_H;
+    }
+    return l->laid && l->built && l->area_w == aw && l->area_h == ah;
+}
+
+const fa_surface_history* fa_lyric_history(const fa_lyric* l) { return &l->hist; }
+
 fa_result fa_lyric_get_layout(fa_lyric* l, uint32_t aw, uint32_t ah, fa_surface_layout* o)
 {
     fa_result r = layout(l, aw, ah, l->tempo);
