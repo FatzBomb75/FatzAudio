@@ -76,7 +76,7 @@ add_executable(fa_test_mic test_mic.c ${FA_SOURCES})
 target_include_directories(fa_test_mic PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
-target_compile_definitions(fa_test_mic PRIVATE FA_STATIC)
+target_compile_definitions(fa_test_mic PRIVATE FA_STATIC FA_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
 target_compile_options(fa_test_mic PRIVATE ${FA_WARNINGS})
 target_link_libraries(fa_test_mic PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
 if(UNIX)

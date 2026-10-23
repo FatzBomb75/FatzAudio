@@ -1195,7 +1195,8 @@ typedef enum fa_cue_mode {
     FA_CUE_NONE = 0,
     FA_CUE_CHANNELS,   /* channels 3-4 of the master device (DJ controllers and many USB
                           interfaces have 4 outputs): the same clock, no drift, no delay */
-    FA_CUE_DEVICE,     /* a second output device: planned (FA_ERROR_NOT_IMPLEMENTED for now) */
+    FA_CUE_DEVICE,     /* a second output device (cue_device_id), such as USB headphones: its
+                          own clock, bridged and lined up with the master (below) */
     FA_CUE_SPLIT       /* one stereo output and a Y-cable: the master in mono on the left,
                           the cue in mono on the right */
 } fa_cue_mode;
@@ -1219,22 +1220,51 @@ typedef struct fa_mixer_config {
     const char*     device_id;     /* the master output (fa_device_info.id), NULL = the default
                                       device (and follows it when it changes) */
     fa_cue_mode     cue_mode;      /* default FA_CUE_NONE */
-    const char*     cue_device_id; /* FA_CUE_DEVICE (planned) */
+    const char*     cue_device_id; /* FA_CUE_DEVICE: the headphones (fa_device_info.id of a
+                                      playback device), NULL = the default output */
     uint32_t        cue_channel;   /* FA_CUE_CHANNELS: the first of the two cue channels,
                                       counted from 0; 0 = 2 (channels 3 and 4) */
     fa_latency_mode latency;       /* default FA_LATENCY_LOW */
-    uint32_t        flags;         /* none yet: 0 */
+    uint32_t        flags;         /* FA_MIXER_* */
 } fa_mixer_config;
 
+#define FA_MIXER_CUE_LOWEST_LATENCY (1u << 0)  /* FA_CUE_DEVICE: don't line the two outputs up
+                                                   (neither is delayed) */
+
+/* The headphones on a second device (FA_CUE_DEVICE). They run on their own crystal, so
+ * the cue reaches them through a small buffer that a resampler keeps at a steady fill,
+ * moving its rate by at most 0.05% (about 1 cent), whatever the drift between the two
+ * devices or their rates (a 48 kHz master and 44.1 kHz headphones). The two outputs are
+ * then lined up: the faster one is delayed by the difference of their latencies, so the
+ * master heard in the headphones (FA_MIX_CUE_MIX) lands with the speakers in the room.
+ * fa_mixer_latency says which output was delayed, and by how much.
+ * - While any mic is monitored (FA_MIC_MONITOR), the master is never delayed: when the
+ *   master is the faster output, alignment is skipped (FA_CUE_ALIGN_SKIPPED), and a delay
+ *   already on the master is taken off the moment a mic is monitored.
+ * - A delay on the master is part of what is heard: fa_stream_get_clock (so CD+G and
+ *   lyric surfaces, and video following the clock), meters, fa_device_get_latency and
+ *   fa_mixer_latency.mic_monitor include it. fa_stream_get_position, which counts frames
+ *   handed to the device, does not include any output latency.
+ * - The OS's latency figures are not exact: FA_MIX_CUE_TRIM_MS corrects them by ear.
+ * - A change of alignment (a trim, a mic turned to monitored, other headphones) makes a
+ *   short gap in the output it delays; small changes (under 5 ms) in the headphones glide.
+ * Headphones that go away go silent and raise FA_EVENT_CUE_LOST; the master plays on
+ * untouched (keeping any delay) until fa_mixer_set_cue_device opens headphones again.
+ * Windows, macOS, Linux and Android (where the system may route both outputs to one
+ * place); FA_ERROR_NOT_IMPLEMENTED on iOS (use FA_CUE_SPLIT). */
+
 FA_API void      FA_CALL fa_mixer_config_init(fa_mixer_config* config);
-/* Opens the output device and starts it. FA_ERROR_NOT_ENOUGH_CHANNELS when
- * FA_CUE_CHANNELS asks for channels the device does not have. */
+/* Opens the output device (and the headphones of FA_CUE_DEVICE) and starts it.
+ * FA_ERROR_NOT_ENOUGH_CHANNELS when FA_CUE_CHANNELS asks for channels the device does
+ * not have; the headphones' open error (FA_ERROR_DEVICE, FA_ERROR_NOT_FOUND) when they
+ * won't open. */
 FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_config* config, fa_mixer** out_mixer);
 /* Unloads the decks (their streams stay open, detached) and closes the device. */
 FA_API void      FA_CALL fa_mixer_destroy(fa_mixer* mixer);
 FA_API fa_result FA_CALL fa_mixer_get_device(fa_mixer* mixer, fa_device** out_device);
 FA_API fa_result FA_CALL fa_mixer_get_deck(fa_mixer* mixer, uint32_t index, fa_deck** out_deck);
-/* The device's output channels, and the first cue channel (-1 = no cue channels). */
+/* The device's output channels, and the first cue channel (-1 = no cue channels, as
+ * with FA_CUE_DEVICE). */
 FA_API fa_result FA_CALL fa_mixer_get_output_channels(fa_mixer* mixer, uint32_t* out_channels, int32_t* out_cue_channel);
 /* Moves the master output and the mics' inputs to another latency mode, as if the mixer
  * were made with it: the devices close and open again (a moment of silence) and playback
@@ -1243,12 +1273,24 @@ FA_API fa_result FA_CALL fa_mixer_get_output_channels(fa_mixer* mixer, uint32_t*
  * mode raises FA_EVENT_INPUT_LOST. FA_ERROR_BUSY while fa_mixer_measure_latency runs. */
 FA_API fa_result FA_CALL fa_mixer_set_latency_mode(fa_mixer* mixer, fa_latency_mode mode);
 FA_API fa_result FA_CALL fa_mixer_get_latency_mode(fa_mixer* mixer, fa_latency_mode* out_mode);
+/* FA_CUE_DEVICE: opens other headphones (fa_device_info.id, NULL = the default output), or
+ * the same again after FA_EVENT_CUE_LOST; the cue is silent meanwhile and is lined up
+ * anew. A malformed id is FA_ERROR_INVALID_ARG and changes nothing; when the device won't
+ * open the cue stays silent and the result is the open error.
+ * FA_ERROR_INVALID_ARG when the mixer was made without FA_CUE_DEVICE. The headphones
+ * follow the latency mode (fa_mixer_set_latency_mode), with FA_LATENCY_LOW's period in
+ * exclusive mode: they are reopened with the master. */
+FA_API fa_result FA_CALL fa_mixer_set_cue_device(fa_mixer* mixer, const char* device_id);
 
 typedef enum fa_mix_param {
     FA_MIX_CROSSFADER = 0, /* 0 = side A only, 0.5 = the middle (default), 1 = side B only */
     FA_MIX_MASTER_GAIN,    /* linear, 0..4, default 1; before the limiter */
     FA_MIX_CUE_MIX,        /* 0 = cue only (default) .. 1 = master only */
-    FA_MIX_CUE_GAIN        /* linear, 0..4, default 1 */
+    FA_MIX_CUE_GAIN,       /* linear, 0..4, default 1 */
+    FA_MIX_CUE_TRIM_MS     /* FA_CUE_DEVICE: -250..250, default 0, added to the master's latency
+                              when the outputs are lined up: raise it when the headphones sound
+                              early against the speakers, lower it when they sound late. Takes
+                              effect at once; not rampable */
 } fa_mix_param;
 
 /* Sets glide over 5 ms; ramps take the curve in `ramp` and start at `device_time` on
@@ -2528,7 +2570,8 @@ typedef enum fa_event_type {
     FA_EVENT_CDG_CHANGED,     /* the CD+G picture heard now changed (fa_stream_set_cdg_events) */
     FA_EVENT_SEEK_FAILED,     /* fa_stream_seek_async could not reach `frame` (value = the fa_result) */
     FA_EVENT_TRACKER_ROW,     /* a tracker module row is heard (FA_TRACKER_ROW_EVENTS) */
-    FA_EVENT_INPUT_LOST       /* a mixer mic's input device went away (fa_mixer_set_event_callback) */
+    FA_EVENT_INPUT_LOST,      /* a mixer mic's input device went away (fa_mixer_set_event_callback) */
+    FA_EVENT_CUE_LOST         /* a mixer's headphone device (FA_CUE_DEVICE) went away */
 } fa_event_type;
 
 typedef struct fa_event {
@@ -2880,15 +2923,29 @@ FA_API fa_result FA_CALL fa_mic_get_levels(fa_mic* mic, fa_time window, float* o
 
 /* What the mixer's outputs and inputs add up to, in ns. Times the OS does not report
  * are estimated from the device's buffer sizes. */
+typedef enum fa_cue_align {
+    FA_CUE_ALIGN_NONE = 0,   /* nothing delayed: no second-device cue (or no headphones open
+                                yet), or the two outputs already line up (within 1 ms) */
+    FA_CUE_ALIGN_CUE,        /* the headphones are delayed by cue_alignment */
+    FA_CUE_ALIGN_MASTER,     /* the master is delayed by cue_alignment (part of `master`) */
+    FA_CUE_ALIGN_SKIPPED,    /* the master is the faster output but a mic is monitored, so it is
+                                not delayed: the headphones are cue - master late */
+    FA_CUE_ALIGN_OFF         /* FA_MIXER_CUE_LOWEST_LATENCY */
+} fa_cue_align;
+
 typedef struct fa_mixer_latency {
     uint32_t struct_size;              /* sizeof(fa_mixer_latency): filled up to it */
-    fa_time  master;                   /* the master output (the OS's buffer and the limiter's look-ahead) */
-    fa_time  cue;                      /* the headphones (the OS's buffer: the cue is not limited) */
-    fa_time  cue_alignment;            /* delay added to line up a second-device cue (planned: 0) */
+    fa_time  master;                   /* the master output: the OS's buffer, the limiter's
+                                          look-ahead and any alignment delay */
+    fa_time  cue;                      /* the headphones: the OS's buffer (the cue is not
+                                          limited); for FA_CUE_DEVICE also the bridge and any
+                                          alignment delay */
+    fa_time  cue_alignment;            /* the delay added to line up a second-device cue */
     fa_time  mic_input[FA_MIC_MAX];    /* input buffer plus the bridge; -1 = no mic in the slot */
     fa_time  mic_monitor[FA_MIC_MAX];  /* mic to speaker: measured by fa_mixer_measure_latency in
                                           the mixer's mode when it has been, else mic_input plus
-                                          master; -1 = no mic */
+                                          master; -1 = no mic. Includes a delay on the master */
+    int32_t  cue_align;                /* fa_cue_align: which output cue_alignment delays */
 } fa_mixer_latency;
 FA_API fa_result FA_CALL fa_mixer_get_latency(fa_mixer* mixer, fa_mixer_latency* out_latency);
 
@@ -3002,7 +3059,8 @@ FA_API fa_result FA_CALL fa_mixer_get_ducking(fa_mixer* mixer, fa_ducking* out_d
  * from inside one), so `user` can then be freed.
  *
  * type                 index       mic                        value
- * FA_EVENT_INPUT_LOST  the slot    the mic (valid in the call) 0 */
+ * FA_EVENT_INPUT_LOST  the slot    the mic (valid in the call) 0
+ * FA_EVENT_CUE_LOST    0           NULL                       0 */
 typedef struct fa_mixer_event {
     fa_event_type type;
     fa_mixer* mixer;

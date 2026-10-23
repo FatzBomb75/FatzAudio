@@ -652,6 +652,7 @@ FA_API fa_result FA_CALL fa_device_get_latency(fa_device* device, fa_time* out_l
 {
     if (!device || !out_latency) return FA_ERROR_INVALID_ARG;
     *out_latency = fa_load64(&device->latency_ns);   /* the clock reads it: no lock */
+    *out_latency += fa_device_align_ns(device);       /* a mixer's delay to line up its cue */
     if (*out_latency == 0) return FA_OK;
     if (device->rate) *out_latency += (fa_time)((double)device->limiter.delay * 1e9 / (double)device->rate);
     return FA_OK;
