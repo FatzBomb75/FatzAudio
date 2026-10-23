@@ -10,7 +10,12 @@
  * count as none, and rows far from the shape cost almost nothing. Outside the shape
  * the field gives the outline and (at an offset) the shadow; inside, its gradient
  * gives the bevel. A rectangle is drawn in tiles, each over a window grown by the
- * reach, so the scratch stays small. */
+ * reach, so the scratch stays small.
+ *
+ * The bevel is kept to half the width of the stroke it is on: the stroke's half width
+ * near a pixel is the largest inside distance within twice the bevel's size of it,
+ * and the bevel there is at most half of that, so the middle of a thin stroke keeps
+ * its colour (a one-pixel stroke gets none). */
 #include "surface_fx.h"
 
 #include <math.h>
@@ -83,7 +88,9 @@ int fa_fx_plan_make(fa_fx_plan* p, const fa_surface_effects* e, float outline, f
         p->b_strength = e->bevel.strength;
         color_pm(e->bevel.highlight, 1.0f, rgba, p->b_hi_pm);
         color_pm(e->bevel.shade, 1.0f, rgba, p->b_sh_pm);
-        if (p->bevel && p->b_hi + 1.0f > reach) reach = p->b_hi + 1.0f;
+        /* The half width is looked for 2 * size around a pixel, from inside distances
+         * up to 2 * size, which need the shape that far again. */
+        if (p->bevel && 4.0f * p->b_hi + 1.0f > reach) reach = 4.0f * p->b_hi + 1.0f;
     }
     p->reach = (int)ceilf(reach) + 2;
     return 1;
@@ -93,7 +100,7 @@ static int window_side(const fa_fx_plan* p) { return FX_TILE + 2 * p->reach; }
 
 size_t fa_fx_scratch_bytes(const fa_fx_plan* p)
 {
-    size_t n = (size_t)window_side(p), planes = (size_t)(p->bevel ? 2 : 1);
+    size_t n = (size_t)window_side(p), planes = (size_t)(p->bevel ? 3 : 1);
     /* g and cv, the distance planes, and the line buffers. */
     return n * n * (sizeof(int16_t) + 1) + planes * n * n * sizeof(float) +
            n * (3 * sizeof(float) + sizeof(int16_t) + sizeof(int) + 1) + 2 * sizeof(float) + 64;
@@ -104,6 +111,7 @@ typedef struct fx_scratch {
     uint8_t* cv;                  /* and that shape pixel's coverage */
     float* dout;                  /* distance outside the shape (negative inside) */
     float* din;                   /* distance inside it (bevel only) */
+    float* half;                  /* the stroke's half width near each pixel (bevel only) */
     float *f, *dd, *z;
     int16_t* arg;
     int* v;
@@ -125,6 +133,7 @@ static void scratch_split(const fa_fx_plan* p, void* mem, fx_scratch* s)
     s->cv = (uint8_t*)take(&at, n * n);
     s->dout = (float*)take(&at, n * n * sizeof(float));
     s->din = p->bevel ? (float*)take(&at, n * n * sizeof(float)) : NULL;
+    s->half = p->bevel ? (float*)take(&at, n * n * sizeof(float)) : NULL;
     s->f = (float*)take(&at, n * sizeof(float));
     s->dd = (float*)take(&at, n * sizeof(float));
     s->z = (float*)take(&at, (n + 1) * sizeof(float));
@@ -285,6 +294,60 @@ static void over(float acc[4], const float layer[4], float k)
     for (i = 0; i < 4; i++) acc[i] = layer[i] * k + acc[i] * keep;
 }
 
+/* out[i] = the largest of in[i - r .. i + r] (in steps of `step`), a sliding window
+ * kept as a falling queue of indices. */
+static void max_line(const float* in, size_t step, int n, int r, float* out, size_t ostep, int* q)
+{
+    int head = 0, tail = 0, j;
+    for (j = 0; j < n + r; j++) {
+        int i = j - r;
+        if (j < n) {
+            float v = in[(size_t)j * step];
+            while (tail > head && in[(size_t)q[tail - 1] * step] <= v) tail--;
+            q[tail++] = j;
+        }
+        if (i < 0) continue;
+        while (q[head] < i - r) head++;
+        out[(size_t)i * ostep] = in[(size_t)q[head] * step];
+    }
+}
+
+/* s->half: half the largest inside distance (up to 2 * b_hi) within 2 * b_hi of each
+ * pixel, from the rows of s->din worked out (`rows`). */
+static void half_widths(const fa_fx_plan* p, fx_scratch* s, int wn, int hn)
+{
+    float cap = 2.0f * p->b_hi;
+    int r = (int)ceilf(cap), x, y;
+    for (y = 0; y < hn; y++) {
+        float* d = s->din + (size_t)y * wn;
+        float* o = s->half + (size_t)y * wn;
+        if (!s->rows[y]) {
+            for (x = 0; x < wn; x++) o[x] = 0.0f;
+            continue;
+        }
+        for (x = 0; x < wn; x++) s->f[x] = d[x] < cap ? d[x] : cap;
+        max_line(s->f, 1, wn, r, o, 1, s->v);
+    }
+    for (x = 0; x < wn; x++) {
+        for (y = 0; y < hn; y++) s->dd[y] = s->half[(size_t)y * wn + x];
+        max_line(s->dd, 1, hn, r, s->half + x, (size_t)wn, s->v);
+    }
+    for (y = 0; y < hn; y++)
+        for (x = 0; x < wn; x++) s->half[(size_t)y * wn + x] *= 0.5f;
+}
+
+/* The bevel's weight at inside distance `din`, kept to `half`. */
+static float bevel_weight(const fa_fx_plan* p, float din, float half)
+{
+    float hi = p->b_hi, lo = p->b_lo;
+    if (half < hi) {
+        if (half <= 0.0f) return 0.0f;
+        lo *= half / hi;
+        hi = half;
+    }
+    return ease_out(lo, hi, din) * p->b_strength;
+}
+
 static void render_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, int w, int h, uint8_t* dst,
                         size_t dst_stride, int x0, int y0, int x1, int y1, fx_scratch* s)
 {
@@ -312,6 +375,7 @@ static void render_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_stri
                 if (y + 1 < hn && !s->rows[y + 1]) s->rows[y + 1] = 2;
             }
         field(wa, src_stride, 4, wn, hn, 1, p->reach, s->rows, s, s->din);
+        half_widths(p, s, wn, hn);
     }
     for (y = y0; y < y1; y++) {
         const uint8_t* sp = src + (size_t)y * src_stride + (size_t)x0 * 4;
@@ -345,7 +409,7 @@ static void render_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_stri
             for (i = 0; i < 4; i++) shape[i] = (float)sp[i] / 255.0f;
             over(acc, shape, 1.0f);
             if (p->bevel && a > 0.0f) {
-                float din = s->din[at], wgt = ease_out(p->b_lo, p->b_hi, din) * p->b_strength;
+                float din = s->din[at], wgt = bevel_weight(p, din, s->half[at]);
                 if (wgt > 0.0f) {
                     /* The field rises inward; the edge faces the other way. */
                     int xl = lx > 0 ? lx - 1 : lx, xr = lx + 1 < wn ? lx + 1 : lx;
@@ -412,6 +476,7 @@ static void masks_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_strid
                 if (y + 1 < hn && !s->rows[y + 1]) s->rows[y + 1] = 2;
             }
         field(wa, src_stride, 1, wn, hn, 1, p->reach, s->rows, s, s->din);
+        half_widths(p, s, wn, hn);
     }
     for (y = y0; y < y1; y++) {
         const uint8_t* sp = src + (size_t)y * src_stride + (size_t)x0;
@@ -429,7 +494,7 @@ static void masks_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_strid
             }
             if (p->outline) ow = ease_out(p->o_lo, p->o_hi, s->dout[at]);
             if (p->bevel && a > 0.0f) {
-                float din = s->din[at], wgt = ease_out(p->b_lo, p->b_hi, din) * p->b_strength;
+                float din = s->din[at], wgt = bevel_weight(p, din, s->half[at]);
                 if (wgt > 0.0f) {
                     int xl = lx > 0 ? lx - 1 : lx, xr = lx + 1 < wn ? lx + 1 : lx;
                     int yu = ly > 0 ? ly - 1 : ly, yd = ly + 1 < hn ? ly + 1 : ly;

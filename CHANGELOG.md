@@ -23,6 +23,8 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   with exact-area anti-aliasing, the colours meeting along shared outlines so no seams appear. Only the area around a
   change is drawn again, and scrolls still move the picture. Edge blend has no effect at these levels. See
   [docs/features/cdg.md](docs/features/cdg.md#presentation-options-fa_cdg_surface_set_presentation).
+- Surface effects at small CD+G presentation sizes (1x to 3x) are worked out at twice the size and box-filtered down,
+  so thin outlines and bevels keep their shape.
 - MIDI lyric surface: `fa_lyric_surface_create`, `fa_lyric_surface_set_style`, `fa_lyric_surface_get_style` and
   `fa_lyric_style_init` draw a MIDI or `.kar` song's lyrics as a karaoke screen: the active line with lines around it,
   syllables coloured as they are sung (cross-fade or sweep), scrolling lines, page fades, a countdown after long gaps,
@@ -109,6 +111,8 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
 ### Changed
+- The surface bevel reaches at most half as far in as a stroke's middle, so a thin stroke is never filled in by it
+  (CD+G and lyric surfaces). Wide strokes look as before.
 - CD+G: a surface allocates its own pixels on the first `fa_cdg_surface_update` instead of at create, so out of
   memory is reported there (`FA_ERROR_OUT_OF_MEMORY`), and its dirty rectangle is the box around the changed tiles' own areas, never larger than
   before. The pixels drawn are unchanged.

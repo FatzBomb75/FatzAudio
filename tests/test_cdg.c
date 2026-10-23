@@ -7,6 +7,7 @@
 #include "cdg.h"
 #include "cdg_contour.h"
 #include "surface.h"
+#include "surface_fx.h"
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -2662,6 +2663,127 @@ static const uint8_t* fx_px(const uint8_t* mem, const fa_surface_layout* l, int 
                   (uint32_t)ox) * 4;
 }
 
+/* The bevel is kept to half a stroke's width: on a bar 4 pixels wide (half width 2)
+ * a bevel 4 pixels deep stops 1 pixel in, so the bar's middle keeps its colour; on a
+ * wide bar it goes the whole 4 pixels in. */
+static void test_bevel_half_stroke(void)
+{
+    enum { BW = 96, BH = 64 };
+    uint8_t* src = (uint8_t*)calloc((size_t)BW * BH, 4);
+    uint8_t* dst = (uint8_t*)calloc((size_t)BW * BH, 4);
+    fa_surface_effects fx;
+    fa_fx_plan plan;
+    void* scratch;
+    int x, y;
+    CHECK(src && dst);
+    for (y = 8; y < 56; y++) {
+        for (x = 10; x < 14; x++) memset(src + ((size_t)y * BW + x) * 4, 255, 4);    /* thin */
+        for (x = 30; x < 80; x++) memset(src + ((size_t)y * BW + x) * 4, 255, 4);    /* wide */
+    }
+    fa_surface_effects_init(&fx);
+    fx.bevel.on = 1;
+    fx.bevel.size = 1.0f;
+    fx.bevel.strength = 1.0f;
+    fx.bevel.fade = 0.0f;
+    fx.bevel.light_angle_degrees = 0.0f;   /* from the right: left edges in shade */
+    CHECK(fa_fx_plan_make(&plan, &fx, 1.0f, 1.0f, 1.0f, 4.0f, 0));
+    scratch = malloc(fa_fx_scratch_bytes(&plan));
+    CHECK(scratch);
+    fa_fx_render(&plan, src, (size_t)BW * 4, BW, BH, dst, (size_t)BW * 4, 0, 0, BW, BH, scratch);
+    y = 32;
+    /* Thin bar: the outer pixel on each side shaded or lit, the middle two untouched. */
+    CHECK(memcmp(dst + ((size_t)y * BW + 10) * 4, src + ((size_t)y * BW + 10) * 4, 4) != 0);
+    CHECK(memcmp(dst + ((size_t)y * BW + 11) * 4, src + ((size_t)y * BW + 11) * 4, 4) == 0);
+    CHECK(memcmp(dst + ((size_t)y * BW + 12) * 4, src + ((size_t)y * BW + 12) * 4, 4) == 0);
+    /* Wide bar: the shade reaches 4 pixels in (the fourth at inside distance 3.5), and
+     * not the middle. */
+    CHECK(memcmp(dst + ((size_t)y * BW + 30) * 4, src + ((size_t)y * BW + 30) * 4, 4) != 0);
+    CHECK(memcmp(dst + ((size_t)y * BW + 33) * 4, src + ((size_t)y * BW + 33) * 4, 4) != 0);
+    CHECK(memcmp(dst + ((size_t)y * BW + 55) * 4, src + ((size_t)y * BW + 55) * 4, 4) == 0);
+    free(scratch);
+    free(src);
+    free(dst);
+}
+
+/* At 1x the effects are worked out at 2x and box-filtered down: a bar 2 CD+G pixels
+ * wide gets a bevel (at 1x itself half its width is under a pixel and there would be
+ * none), a 1-pixel bar keeps its colour, and a 0.45-pixel outline covers about half
+ * of the pixel next to the shape. */
+static void test_effects_small_sizes(void)
+{
+    buf c = { 0 };
+    fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface* f = NULL;
+    fa_cdg_presentation p = pres(1, FA_SAFETY_SHOW);
+    fa_surface_effects e;
+    fa_surface_layout l;
+    uint8_t *mem, *base;
+    int r;
+    colors(&c, 0, k_low);
+    preset(&c, 0, 0);
+    for (r = 8; r < 10; r++) {
+        tile(&c, 0, 0, 1, r, 20, 0x20);   /* x 120 */
+        tile(&c, 0, 0, 1, r, 22, 0x30);   /* x 132, 133 */
+    }
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(f, 300, 216), FA_OK);
+    base = full_draw(f, 200, 4, &l);
+    CHECK(base);
+    CHECK_EQ(l.scale, 1.0f);
+#define SMALL_PX(m, x) ((m) + ((size_t)(l.content_y + 100) * l.width + l.content_x + (x)) * 4)
+    fa_surface_effects_init(&e);
+    e.bevel.on = 1;
+    e.bevel.size = 1.0f;
+    e.bevel.strength = 1.0f;
+    CHECK_EQ(fa_surface_set_effects(f, &e), FA_OK);
+    mem = full_draw(f, 200, 4, &l);
+    CHECK(mem);
+    CHECK(memcmp(SMALL_PX(mem, 120), SMALL_PX(base, 120), 4) == 0);
+    CHECK(memcmp(SMALL_PX(mem, 132), SMALL_PX(base, 132), 4) != 0);
+    CHECK(memcmp(SMALL_PX(mem, 133), SMALL_PX(base, 133), 4) != 0);
+    free(mem);
+    fa_surface_effects_init(&e);
+    e.outline.on = 1;
+    e.outline.size = 0.3f;
+    e.outline.color = 0xFF00FF00u;
+    CHECK_EQ(fa_surface_set_effects(f, &e), FA_OK);
+    mem = full_draw(f, 200, 4, &l);
+    CHECK(mem);
+    CHECK(SMALL_PX(mem, 119)[3] > 100 && SMALL_PX(mem, 119)[3] < 150 && SMALL_PX(mem, 119)[1] == SMALL_PX(mem, 119)[3]);
+    CHECK(SMALL_PX(mem, 121)[3] > 100 && SMALL_PX(mem, 121)[3] < 150);
+    CHECK_EQ(SMALL_PX(mem, 122)[3], 0);
+#undef SMALL_PX
+    free(mem);
+    free(base);
+    /* The picture under the effects is blended as without them (smoothness 1 at 3x). */
+    p.smoothness = 1;
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(f, 900, 648), FA_OK);
+    CHECK_EQ(fa_surface_set_effects(f, NULL), FA_OK);
+    base = full_draw(f, 200, 4, &l);
+    fa_surface_effects_init(&e);
+    e.shadow.on = 1;
+    e.shadow.opacity = 0.01f;
+    CHECK_EQ(fa_surface_set_effects(f, &e), FA_OK);
+    mem = full_draw(f, 200, 4, &l);
+    CHECK(base && mem);
+    if (base && mem) {
+        size_t i, most = 0;
+        for (i = 0; i < (size_t)l.width * l.height * 4; i++) {
+            size_t d = (size_t)abs(mem[i] - base[i]);
+            if (d > most) most = d;
+        }
+        CHECK(most <= 4);
+    }
+    free(mem);
+    free(base);
+    fa_surface_destroy(f);
+    fa_stream_close(s);
+    free(c.p);
+}
+
 /* Outline, shadow and bevel where they belong around a red block (screen x 120..138,
  * y 96..120, at 2x); options checked; the classic picture ignores them. */
 static void test_effects(void)
@@ -3676,6 +3798,8 @@ int main(void)
     RUN(test_smoothness_and_edge_blend);
     RUN(test_contours);
     RUN(test_effects);
+    RUN(test_bevel_half_stroke);
+    RUN(test_effects_small_sizes);
     RUN(test_presentation_incremental);
     RUN(test_render_ahead);
     RUN(test_presentation_costs);
