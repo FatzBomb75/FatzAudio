@@ -1080,8 +1080,9 @@ static void test_check_reflection(void)
     CHECK(check_sim(&t));
     CHECK(room_check(&t, &plain, NULL, &b, &r));
     CHECK_EQ(b.modes[0].result, FA_OK);
-    /* The direct sound, not the reflection 1 ms later. */
-    CHECK_NEAR(ms(a.modes[0].mic_to_speaker), ms(b.modes[0].mic_to_speaker), 0.25);
+    /* The direct sound, not the reflection 1 ms later. Two checks can differ by a few
+     * frames (the block the check thread starts on), so the line is halfway. */
+    CHECK_NEAR(ms(a.modes[0].mic_to_speaker), ms(b.modes[0].mic_to_speaker), 0.5);
     sim_close(&s);
     sim_close(&t);
 }
