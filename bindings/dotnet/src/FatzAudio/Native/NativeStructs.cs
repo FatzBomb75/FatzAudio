@@ -724,6 +724,7 @@ internal unsafe struct FaMixerLatency
     public long CueAlignment;
     public fixed long MicInput[2];
     public fixed long MicMonitor[2];
+    public int CueAlign;
 }
 
 [StructLayout(LayoutKind.Sequential)]

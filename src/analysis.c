@@ -29,7 +29,7 @@ static uint32_t tap_frames(fa_device* dev)
     if (dev) {
         cb = (uint32_t)fa_load32(&dev->period_frames);
         if (dev->cb_prev_frames > cb) cb = dev->cb_prev_frames;   /* the callbacks seen, if bigger */
-        latency = (int64_t)((double)fa_load64(&dev->latency_ns) * rate / 1e9 + 0.5);
+        latency = (int64_t)((double)fa_load64(&dev->latency_ns) * rate / 1e9 + 0.5) + dev->align_max;
     }
     need += latency + 3 * (int64_t)cb + 1024;
     while ((int64_t)frames < need && frames < (1u << 22)) frames <<= 1;

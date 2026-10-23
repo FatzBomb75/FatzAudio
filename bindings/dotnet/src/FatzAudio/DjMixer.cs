@@ -7,13 +7,21 @@ namespace FatzAudio;
 /// <summary>Where the headphone cue of a <see cref="DjMixer"/> goes.</summary>
 public sealed class CueOutput
 {
-    private CueOutput(int mode, int firstChannel)
+    private CueOutput(int mode, int firstChannel, AudioDeviceInfo? headphones = null, bool lineUp = true)
     {
         Mode = mode;
         FirstChannel = firstChannel;
+        Headphones = headphones;
+        LineUp = lineUp;
     }
 
     internal int Mode { get; }
+
+    /// <summary>The headphones of <see cref="Device"/>; null = the system default output (or not a second device).</summary>
+    public AudioDeviceInfo? Headphones { get; }
+
+    /// <summary>Whether <see cref="Device"/> lines the two outputs up (see <see cref="DjMixer.CueTrim"/>).</summary>
+    public bool LineUp { get; }
 
     /// <summary>The first of the two cue channels, counted from 0 (<see cref="Channels"/> only).</summary>
     public int FirstChannel { get; }
@@ -31,6 +39,24 @@ public sealed class CueOutput
     /// One stereo output with a Y-cable: the master in mono on the left, the cue in mono on the right.
     /// </summary>
     public static CueOutput Split { get; } = new(3, 0);
+
+    /// <summary>
+    /// A second output device, such as USB headphones. It runs on its own clock: the cue reaches it through a small
+    /// buffer kept steady by a resampler that moves by at most 0.05% (about 1 cent), whatever the drift or the rates.
+    /// With <paramref name="lineUp"/> the faster output is delayed so the master in the headphones lands with the
+    /// speakers (<see cref="DjMixer.Latency"/> says which one), except that the master is never delayed while a mic is
+    /// monitored. A delay on the master is part of every heard position (<see cref="AudioStream.Clock"/>, CD+G and
+    /// lyric surfaces). Not on iOS (use <see cref="Split"/>).
+    /// </summary>
+    /// <param name="headphones">The headphones (a playback device); null = the system default output.</param>
+    /// <param name="lineUp">False delays neither output (the lowest latency on both).</param>
+    /// <exception cref="ArgumentException"><paramref name="headphones"/> is not a playback device.</exception>
+    public static CueOutput Device(AudioDeviceInfo? headphones = null, bool lineUp = true)
+    {
+        if (headphones is { Kind: not DeviceKind.Playback })
+            throw new ArgumentException("Not a playback device.", nameof(headphones));
+        return new CueOutput(2, 0, headphones, lineUp);
+    }
 
     /// <summary>Two other channels of the master device, for a sound card with more outputs (channels 5-6 of a 5.1 card: 4).</summary>
     /// <param name="firstChannel">The first of the two cue channels, counted from 0 (2 or more).</param>
@@ -127,12 +153,29 @@ public sealed class DjMixerOptions
 
 /// <summary>What a <see cref="DjMixer"/>'s outputs and inputs add up to. Times the system does not report are estimated from the device's buffer sizes.</summary>
 /// <param name="Master">The master output: the system's buffer plus the limiter's look-ahead (about 2 ms).</param>
-/// <param name="Cue">The headphones: the output's buffer (the cue is not limited, so it has no look-ahead).</param>
-/// <param name="CueAlignment">Delay added to line up a second-device cue (planned: zero).</param>
+/// <param name="Cue">The headphones: the output's buffer (the cue is not limited, so it has no look-ahead); on a
+/// second device also the bridge and any alignment delay.</param>
+/// <param name="CueAlignment">The delay added to line up a second-device cue (on the output <paramref name="CueAligned"/> names).</param>
 /// <param name="MicInput">Per mic slot: the input buffer plus the drift-corrected bridge; null = no mic in the slot.</param>
-/// <param name="MicMonitor">Per mic slot: mic to speaker, the input plus the master; null = no mic in the slot.</param>
+/// <param name="MicMonitor">Per mic slot: mic to speaker, the input plus the master (with any delay on it); null = no mic in the slot.</param>
+/// <param name="CueAligned">Which output <paramref name="CueAlignment"/> delays, or why neither is.</param>
 public sealed record MixerLatency(TimeSpan Master, TimeSpan Cue, TimeSpan CueAlignment,
-    IReadOnlyList<TimeSpan?> MicInput, IReadOnlyList<TimeSpan?> MicMonitor);
+    IReadOnlyList<TimeSpan?> MicInput, IReadOnlyList<TimeSpan?> MicMonitor, CueAlign CueAligned = CueAlign.None);
+
+/// <summary>How a second-device cue (<see cref="CueOutput.Device"/>) is lined up with the master.</summary>
+public enum CueAlign
+{
+    /// <summary>Nothing delayed: no second device (or not open yet), or the outputs already line up (within 1 ms).</summary>
+    None = 0,
+    /// <summary>The headphones are delayed by <see cref="MixerLatency.CueAlignment"/>.</summary>
+    Cue = 1,
+    /// <summary>The master is delayed by <see cref="MixerLatency.CueAlignment"/> (part of <see cref="MixerLatency.Master"/> and every heard position).</summary>
+    Master = 2,
+    /// <summary>The master is the faster output but a mic is monitored, so it is not delayed: the headphones are <see cref="MixerLatency.Cue"/> - <see cref="MixerLatency.Master"/> late.</summary>
+    Skipped = 3,
+    /// <summary>Lining up is off (<see cref="CueOutput.Device"/> with lineUp false).</summary>
+    Off = 4,
+}
 
 /// <summary>A deck loop between two source frames.</summary>
 /// <param name="In">The loop's first frame.</param>
@@ -208,6 +251,43 @@ public sealed class DjMixer : IDisposable
 
     /// <summary>Linear headphone gain, 0..4 (1 = unity).</summary>
     public float CueGain { get => Get(MixerParameter.CueGain); set => Set(MixerParameter.CueGain, value); }
+
+    /// <summary>
+    /// Second-device cue: a correction to the master's reported latency when the outputs are lined up, -250..250 ms.
+    /// Raise it when the headphones sound early against the speakers, lower it when they sound late. Takes effect at
+    /// once (a short gap in the output it delays).
+    /// </summary>
+    public TimeSpan CueTrim
+    {
+        get => TimeSpan.FromMilliseconds(Get(ParamCueTrimMs));
+        set => Set(ParamCueTrimMs, (float)value.TotalMilliseconds);
+    }
+
+    private const MixerParameter ParamCueTrimMs = (MixerParameter)4;   // FA_MIX_CUE_TRIM_MS: not rampable, so not public
+
+    /// <summary>
+    /// Second-device cue: opens other headphones, or the same again after <see cref="CueLost"/>. The cue is silent
+    /// meanwhile and is lined up anew.
+    /// </summary>
+    /// <param name="headphones">A playback device; null = the system default output.</param>
+    /// <exception cref="ArgumentException"><paramref name="headphones"/> is not a playback device.</exception>
+    /// <exception cref="FatzAudioException"><see cref="ErrorCode.InvalidArgument"/> when the mixer was made without
+    /// <see cref="CueOutput.Device"/>; the open error (the cue stays silent) when the device won't open.</exception>
+    public unsafe void SetCueDevice(AudioDeviceInfo? headphones)
+    {
+        if (headphones is { Kind: not DeviceKind.Playback })
+            throw new ArgumentException("Not a playback device.", nameof(headphones));
+        using var lease = Lease();
+        byte* id = headphones?.Id is { } devId ? (byte*)Marshal.StringToCoTaskMemUTF8(devId) : null;
+        try
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_set_cue_device(_mixer, id));
+        }
+        finally
+        {
+            if (id != null) Marshal.FreeCoTaskMem((nint)id);
+        }
+    }
 
     /// <summary>The output device's channel count now (it can change when the default device changes).</summary>
     public int OutputChannels
@@ -387,7 +467,7 @@ public sealed class DjMixer : IDisposable
                 monitor[i] = l.MicMonitor[i] < 0 ? null : TimeConvert.FromNanoseconds(l.MicMonitor[i]);
             }
             return new MixerLatency(TimeConvert.FromNanoseconds(l.Master), TimeConvert.FromNanoseconds(l.Cue),
-                TimeConvert.FromNanoseconds(l.CueAlignment), input, monitor);
+                TimeConvert.FromNanoseconds(l.CueAlignment), input, monitor, (CueAlign)l.CueAlign);
         }
     }
 
@@ -517,6 +597,12 @@ public sealed class DjMixer : IDisposable
     /// </summary>
     public event EventHandler<MicEventArgs>? InputLost;
 
+    /// <summary>
+    /// The headphones of a second-device cue went away. The cue goes silent and the master plays on untouched (keeping
+    /// any delay); <see cref="SetCueDevice"/> opens headphones again. Raised on the engine's event thread.
+    /// </summary>
+    public event EventHandler? CueLost;
+
     private sealed class EventState
     {
         public EventState(DjMixer m) => Mixer = new WeakReference<DjMixer>(m);
@@ -540,7 +626,19 @@ public sealed class DjMixer : IDisposable
 
     private void Raise(int type, nint native)
     {
-        const int inputLost = 16;
+        const int inputLost = 16, cueLost = 17;
+        if (type == cueLost)
+        {
+            try
+            {
+                CueLost?.Invoke(this, EventArgs.Empty);
+            }
+            catch
+            {
+                // a handler's exception must not stop the event thread
+            }
+            return;
+        }
         if (type != inputLost) return;
         Mic? mic;
         lock (_mics) mic = _mics.Find(m => m.NativeHandle == native);

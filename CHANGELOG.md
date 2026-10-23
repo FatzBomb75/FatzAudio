@@ -50,6 +50,15 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   `fa_mixer_set_event_callback` reports an input that went away. Android captures unprocessed. New error
   `FA_ERROR_PERMISSION_DENIED`. .NET: `DjMixer.AddMic`, `Mic`, `MicOptions`, `DjMixer.Latency`, `DjMixer.InputLost`,
   `EqualizerPreset.LiveVocal`. See [docs/features/dj-mixer.md](docs/features/dj-mixer.md#microphones).
+- DJ mixer second-device cue: `FA_CUE_DEVICE` with `cue_device_id` puts the headphones on another output device, its
+  drift (and a different rate) absorbed by a resampler that moves by at most 0.05%. The faster output is delayed so
+  the master in the headphones lands with the speakers, except that the master is never delayed while a mic is
+  monitored; a delay on the master is part of every heard position (`fa_stream_get_clock`, CD+G and lyric surfaces,
+  `fa_device_get_latency`). New `fa_mixer_latency.cue_align` (`fa_cue_align`), `FA_MIX_CUE_TRIM_MS`,
+  `FA_MIXER_CUE_LOWEST_LATENCY`, `fa_mixer_set_cue_device` and `FA_EVENT_CUE_LOST`. The mic bridge and the cue share
+  one implementation. .NET: `CueOutput.Device`, `DjMixer.CueTrim`, `DjMixer.SetCueDevice`, `DjMixer.CueLost`,
+  `MixerLatency.CueAligned` (a new optional record parameter), `CueAlign`. See
+  [docs/features/dj-mixer.md](docs/features/dj-mixer.md#second-device-cue).
 - Track analysis: `fa_analyze_path` and `fa_analyze_stream` measure a beat grid (tempo, first beat, confidence), the
   musical key (name and Camelot code), a waveform overview (peak and low/mid/high levels every 10 ms) and the loudness in
   one decode, about 170x real time on one core, cached by content in `cache_directory`. MIDI files and tracker modules get

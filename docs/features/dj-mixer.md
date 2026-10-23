@@ -81,9 +81,41 @@ var levels = a.GetLevels();           // the channel meter
 | None | `FA_CUE_NONE` | `CueOutput.None` | Master only |
 | Channels 3-4 | `FA_CUE_CHANNELS` | `CueOutput.Channels34`, `CueOutput.Channels(n)` | Master on outputs 1-2, cue on two more outputs of the same device (DJ controllers, 4-output USB interfaces). Same clock: no drift, no delay. `cue_channel` picks the first cue output (counted from 0, default 2). `FA_ERROR_NOT_ENOUGH_CHANNELS` when the device has too few |
 | Split | `FA_CUE_SPLIT` | `CueOutput.Split` | One stereo output and a Y-cable: master in mono on the left, cue in mono on the right |
-| Second device | `FA_CUE_DEVICE` | — | Planned (`FA_ERROR_NOT_IMPLEMENTED`) |
+| Second device | `FA_CUE_DEVICE` | `CueOutput.Device(headphones)` | The cue on another output device, such as USB headphones or the laptop's own jack, chosen by `cue_device_id` (NULL = the default output). Its own clock, bridged and lined up with the master ([below](#second-device-cue)). Not on iOS |
 
 The cue send is taken before the channel fader, so a deck with its fader down can still be heard in the headphones. `FA_MIX_CUE_MIX` blends from cue only (0, the default) to master only (1), and `FA_MIX_CUE_GAIN` sets the headphone level. The master part of the blend is taken after the limiter, as the crowd hears it.
+
+### Second-device cue
+
+```c
+fa_mixer_config c;
+fa_mixer_config_init(&c);
+c.cue_mode = FA_CUE_DEVICE;
+c.cue_device_id = headphones->id;              /* NULL = the default output */
+fa_mixer* mixer;
+fa_mixer_create(engine, &c, &mixer);
+fa_mixer_set_param(mixer, FA_MIX_CUE_TRIM_MS, 8.0f);   /* the headphones sounded early */
+fa_mixer_latency l = { sizeof l };
+fa_mixer_get_latency(mixer, &l);               /* l.cue_align, l.cue_alignment */
+```
+
+```csharp
+var headphones = engine.OutputDevices.First(d => d.Name.Contains("USB"));
+using var mixer = engine.CreateDjMixer(new DjMixerOptions { Cue = CueOutput.Device(headphones) });
+mixer.CueTrim = TimeSpan.FromMilliseconds(8);
+Console.WriteLine($"{mixer.Latency.CueAligned}: {mixer.Latency.CueAlignment.TotalMilliseconds:F1} ms");
+mixer.CueLost += (_, _) => Console.WriteLine("headphones gone; call SetCueDevice when they are back");
+```
+
+- **Drift.** The headphones run on their own crystal. The cue reaches them through a small buffer that a resampler keeps at a steady fill, moving its rate by at most 0.05% (about 1 cent, never heard), whatever the drift between the two devices or their rates (a 48 kHz master and 44.1 kHz headphones). The buffer holds one master period, one headphone period, the resampler's look-ahead and a millisecond; a gap in the headphones raises it by 2 ms (up to 50 ms), so a system with uneven callbacks settles at what it needs. The mic inputs use the same bridge.
+- **Lining up.** The two outputs have different latencies, so the master heard in the headphones (`FA_MIX_CUE_MIX`) would come early or late against the speakers. The mixer delays the faster output by the difference (at most 500 ms): `fa_mixer_latency.cue_align` (`Latency.CueAligned`) says which (`FA_CUE_ALIGN_CUE` the headphones, `FA_CUE_ALIGN_MASTER` the master) and `cue_alignment` by how much. Within 1 ms nothing is delayed (`FA_CUE_ALIGN_NONE`). `FA_MIXER_CUE_LOWEST_LATENCY` (`CueOutput.Device(lineUp: false)`) delays neither (`FA_CUE_ALIGN_OFF`), for the lowest latency on both.
+- **Monitored mics come first.** While any mic is monitored (`FA_MIC_MONITOR`), the master is never delayed: a singer must not hear their voice later. When the master is the faster output, alignment is skipped (`FA_CUE_ALIGN_SKIPPED`; the headphones are `cue` − `master` late), and a delay already on the master comes off the moment a mic is monitored. Delaying the headphones goes on as usual.
+- **Heard positions.** A delay on the master is part of what the crowd hears, so it is part of `fa_stream_get_clock` (`Clock`), and with it CD+G and lyric surfaces and video that follows the clock, deck meters, `fa_device_get_latency` and `mic_monitor`. `fa_stream_get_position`, which counts frames handed to the device, has no output latency in it.
+- **Trim.** The latencies the system reports are not exact. `FA_MIX_CUE_TRIM_MS` (`CueTrim`, −250..250 ms) is added to the master's: raise it when the headphones sound early against the speakers, lower it when late. It takes effect at once and can't be ramped.
+- **Changes.** A change of alignment (a trim, a mic turned to monitored, other headphones) makes a short gap in the output it delays (5 ms fades on the master); changes under 5 ms in the headphones glide in.
+- **Mode.** The headphones open in the mixer's latency mode (low when it is exclusive, which a second device can't share) and move with `fa_mixer_set_latency_mode`.
+- **Lost headphones.** Headphones that go away go silent and raise `FA_EVENT_CUE_LOST` (`CueLost`) once; the master plays on untouched, keeping any delay. `fa_mixer_set_cue_device` (`SetCueDevice`) opens the same or other headphones (lined up anew). It is `FA_ERROR_INVALID_ARG` on a mixer made without `FA_CUE_DEVICE`.
+- **Systems.** Windows, macOS, Linux and Android (where the system may route both outputs to one place). iOS is `FA_ERROR_NOT_IMPLEMENTED`: use `FA_CUE_SPLIT`.
 
 ## Parameters
 
@@ -93,6 +125,7 @@ The cue send is taken before the channel fader, so a deck with its fader down ca
 | `FA_MIX_MASTER_GAIN` / `MasterGain` | 0..4, linear, before the limiter | 1 |
 | `FA_MIX_CUE_MIX` / `CueMix` | 0 (cue) .. 1 (master) | 0 |
 | `FA_MIX_CUE_GAIN` / `CueGain` | 0..4, linear | 1 |
+| `FA_MIX_CUE_TRIM_MS` / `CueTrim` | −250..250 ms, [second-device cue](#second-device-cue) only, not rampable | 0 |
 | `fa_mixer_set_crossfader_curve` / `Crossfader.Curve` | constant power (each side −3 dB in the middle, steady loudness) or linear (−6 dB, a slight dip) | constant power |
 | `FA_DECK_GAIN` / `Gain` | 0..1, the channel fader | 1 |
 | `FA_DECK_TRIM_DB` / `TrimDb` | −12..+12 dB, on top of loudness normalization | 0 |
@@ -270,11 +303,12 @@ mixer.StartRecording([master, vocals]);
 
 | Field | What it is |
 |---|---|
-| `master` | the master output's buffer plus the limiter's look-ahead (about 2 ms) |
-| `cue` | the headphones: the output's buffer (the cue is not limited, so it has no look-ahead) |
-| `cue_alignment` | delay added to line up a second-device cue (planned; 0) |
+| `master` | the master output's buffer plus the limiter's look-ahead (about 2 ms) and any alignment delay on it |
+| `cue` | the headphones: the output's buffer (the cue is not limited, so it has no look-ahead); on a second device also the bridge and any alignment delay |
+| `cue_alignment` | the delay added to line up a [second-device cue](#second-device-cue) |
+| `cue_align` | which output `cue_alignment` delays: `FA_CUE_ALIGN_NONE`, `_CUE`, `_MASTER`, `_SKIPPED` (a mic is monitored) or `_OFF` |
 | `mic_input[i]` | the input device's buffer plus the bridge's fill; −1 when slot `i` has no mic |
-| `mic_monitor[i]` | voice to speaker: measured by the setup check, else `mic_input[i]` plus `master`; −1 when no mic |
+| `mic_monitor[i]` | voice to speaker: measured by the setup check, else `mic_input[i]` plus `master` (with any delay on it); −1 when no mic |
 
 Times the system does not report are estimated from the buffer sizes. Below about 20 ms voice to speaker a singer does not notice; at 30 ms and more it sounds like a slap-back. With the low-latency default the bridge holds about one input period, one master period and a millisecond. The [setup check](#setup-check) measures the real total; after it, `mic_monitor[i]` is the measured time for that mic in the mode measured (`mic_input[i]` stays the reported one).
 
@@ -316,4 +350,4 @@ foreach (var m in check.Modes)
 
 ## Planned
 
-More than two decks, a second-device cue, beat sync and beat loops (BPM analysis), and auto-mix are the next steps of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).
+More than two decks, beat sync and beat loops (BPM analysis), and auto-mix are the next steps of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).

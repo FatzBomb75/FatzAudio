@@ -55,6 +55,8 @@ set(FA_SOURCES
     src/lane.c
     src/bus.c
     src/mixer.c
+    src/bridge.c
+    src/cue.c
     src/mic.c
     src/mic_fx.c
     src/mic_check.c
