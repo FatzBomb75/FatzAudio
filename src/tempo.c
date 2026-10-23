@@ -669,6 +669,17 @@ int64_t fa_tmap_frames_to(fa_tmap* m, int64_t at, double target, double base_src
     }
 }
 
+void fa_tmap_truncate(fa_tmap* m, int64_t at)
+{
+    int64_t w, r;
+    if (!m) return;
+    w = fa_load64(&m->write);
+    r = fa_load64(&m->read);
+    while (w > r + 1 && m->at[(w - 1) % FA_TMAP_SIZE] >= at) w--;
+    if (w == r + 1 && m->at[r % FA_TMAP_SIZE] >= at) w = r;
+    fa_store64(&m->write, w);
+}
+
 void fa_tmap_release(fa_tmap* m, int64_t at)
 {
     int64_t r0, r, w;

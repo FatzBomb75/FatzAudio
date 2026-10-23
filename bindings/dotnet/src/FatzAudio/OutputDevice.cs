@@ -33,6 +33,8 @@ public sealed class OutputDevice : IDisposable
     /// <summary>The device description this output was opened with, or null when the system default device was requested.</summary>
     public AudioDeviceInfo? Info { get; }
 
+    internal bool IsDisposed => _handle.IsClosed;
+
     internal DeviceHandle Handle
     {
         get

@@ -1,0 +1,546 @@
+using System.Runtime.InteropServices;
+using FatzAudio.Native;
+
+namespace FatzAudio;
+
+/// <summary>Where the headphone cue of a <see cref="DjMixer"/> goes.</summary>
+public sealed class CueOutput
+{
+    private CueOutput(int mode, int firstChannel)
+    {
+        Mode = mode;
+        FirstChannel = firstChannel;
+    }
+
+    internal int Mode { get; }
+
+    /// <summary>The first of the two cue channels, counted from 0 (<see cref="Channels"/> only).</summary>
+    public int FirstChannel { get; }
+
+    /// <summary>No headphone cue.</summary>
+    public static CueOutput None { get; } = new(0, 0);
+
+    /// <summary>
+    /// Channels 3 and 4 of the master device (DJ controllers and many USB interfaces have 4 outputs): the same
+    /// clock as the master, so no drift and no delay.
+    /// </summary>
+    public static CueOutput Channels34 { get; } = new(1, 2);
+
+    /// <summary>
+    /// One stereo output with a Y-cable: the master in mono on the left, the cue in mono on the right.
+    /// </summary>
+    public static CueOutput Split { get; } = new(3, 0);
+
+    /// <summary>Two other channels of the master device, for a sound card with more outputs (channels 5-6 of a 5.1 card: 4).</summary>
+    /// <param name="firstChannel">The first of the two cue channels, counted from 0 (2 or more).</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="firstChannel"/> is below 2.</exception>
+    public static CueOutput Channels(int firstChannel)
+    {
+        if (firstChannel < 2 || firstChannel > 30) throw new ArgumentOutOfRangeException(nameof(firstChannel));
+        return new CueOutput(1, firstChannel);
+    }
+}
+
+/// <summary>How small the mixer's output period is.</summary>
+public enum LatencyMode
+{
+    /// <summary>The engine's period (<see cref="AudioEngineOptions"/>).</summary>
+    Normal = 0,
+    /// <summary>
+    /// The smallest shared-mode period the system gives: WASAPI's low-latency mode on Windows (at the device's own
+    /// sample rate; it needs a driver that offers small periods), about 5 ms elsewhere.
+    /// </summary>
+    Low = 1,
+    /// <summary>Windows exclusive mode for live mic monitoring: planned with the mic input (<see cref="ErrorCode.NotImplemented"/> for now).</summary>
+    Exclusive = 2,
+}
+
+/// <summary>How the crossfader shares the level between its two sides.</summary>
+public enum CrossfaderCurve
+{
+    /// <summary>Steady loudness over the travel: each side at -3 dB in the middle (the default).</summary>
+    ConstantPower = 0,
+    /// <summary>Each side at -6 dB in the middle: a slight dip.</summary>
+    Linear = 1,
+}
+
+/// <summary>Which side of the crossfader a deck is on.</summary>
+public enum CrossfaderSide
+{
+    /// <summary>Not on the crossfader: always at full level.</summary>
+    Thru = 0,
+    /// <summary>Side A (crossfader at 0).</summary>
+    A = 1,
+    /// <summary>Side B (crossfader at 1).</summary>
+    B = 2,
+}
+
+/// <summary>Mixer parameters that can be ramped with <see cref="DjMixer.Ramp"/>.</summary>
+public enum MixerParameter
+{
+    /// <summary>The crossfader: 0 = side A only, 0.5 = the middle, 1 = side B only.</summary>
+    Crossfader = 0,
+    /// <summary>Linear master gain before the limiter, 0..4.</summary>
+    MasterGain = 1,
+    /// <summary>The headphones' blend: 0 = cue only, 1 = master only.</summary>
+    CueMix = 2,
+    /// <summary>Linear headphone gain, 0..4.</summary>
+    CueGain = 3,
+}
+
+/// <summary>Deck parameters that can be ramped with <see cref="DjDeck.Ramp"/>.</summary>
+public enum DeckParameter
+{
+    /// <summary>The channel fader, linear 0..1.</summary>
+    Gain = 0,
+    /// <summary>The trim in dB, -12..12.</summary>
+    TrimDb = 1,
+    /// <summary>The low band in dB, <see cref="DeckEq.Kill"/>..6.</summary>
+    EqLowDb = 2,
+    /// <summary>The mid band in dB, <see cref="DeckEq.Kill"/>..6.</summary>
+    EqMidDb = 3,
+    /// <summary>The high band in dB, <see cref="DeckEq.Kill"/>..6.</summary>
+    EqHighDb = 4,
+}
+
+/// <summary>Options for <see cref="AudioEngine.CreateDjMixer"/>.</summary>
+public sealed class DjMixerOptions
+{
+    /// <summary>Number of decks: 2 (more are planned).</summary>
+    public int Decks { get; init; } = 2;
+
+    /// <summary>The master output; null = the system default device (followed when it changes).</summary>
+    public AudioDeviceInfo? Output { get; init; }
+
+    /// <summary>Where the headphone cue goes; defaults to <see cref="CueOutput.None"/>.</summary>
+    public CueOutput Cue { get; init; } = CueOutput.None;
+
+    /// <summary>The output period; defaults to <see cref="LatencyMode.Low"/>.</summary>
+    public LatencyMode Latency { get; init; } = LatencyMode.Low;
+}
+
+/// <summary>A deck loop between two source frames.</summary>
+/// <param name="In">The loop's first frame.</param>
+/// <param name="Out">The frame it turns back at.</param>
+public readonly record struct DeckLoop(long In, long Out);
+
+/// <summary>
+/// A DJ mixer: decks on one output device, each with a channel fader, a trim, an isolator EQ with kills and a meter,
+/// a crossfader between them, a master gain and a limiter that is always on, plus a headphone cue.
+/// </summary>
+/// <remarks>
+/// Decks hold ordinary <see cref="AudioStream"/>s: play, pause, seek, tempo, pitch, markers, CD+G and lyrics work on
+/// them as on any stream, and every deck shares the master device's clock (<see cref="Output"/>), so
+/// <see cref="AudioStream.PlayAt"/> on two decks starts them on the same frame. Disposing the mixer unloads its decks
+/// (their streams stay open) and closes the device.
+/// </remarks>
+/// <example>
+/// <code>
+/// using var mixer = engine.CreateDjMixer(new DjMixerOptions { Cue = CueOutput.Channels34 });
+/// DjDeck a = mixer.Decks[0], b = mixer.Decks[1];
+/// a.Load(engine.OpenFile(@"C:\karaoke\song1.mp3"));
+/// a.Stream!.Play();
+/// a.Eq.Low = -6;
+/// a.Eq.High = DeckEq.Kill;
+/// b.Cue = true;                                        // in the headphones
+/// mixer.Crossfader.Ramp(1f, TimeSpan.FromSeconds(8));  // to side B over 8 s
+/// var levels = a.GetLevels();
+/// </code>
+/// </example>
+public sealed class DjMixer : IDisposable
+{
+    private readonly nint _mixer;
+    private readonly DjDeck[] _decks;
+
+    internal DjMixer(AudioEngine engine, nint mixer, OutputDevice output)
+    {
+        Engine = engine;
+        _mixer = mixer;
+        Output = output;
+        _decks = new DjDeck[2];
+        for (int i = 0; i < _decks.Length; i++)
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_get_deck(mixer, (uint)i, out nint d));
+            _decks[i] = new DjDeck(this, i, d);
+        }
+        Crossfader = new DjCrossfader(this);
+    }
+
+    /// <summary>The engine the mixer belongs to.</summary>
+    public AudioEngine Engine { get; }
+
+    /// <summary>
+    /// The master output as an ordinary device: its clock (<see cref="OutputDevice.Time"/>), levels, spectrum and
+    /// recording. The mixer owns it: disposing it disposes the mixer.
+    /// </summary>
+    public OutputDevice Output { get; }
+
+    /// <summary>The decks, in order (deck 1 starts on crossfader side A, deck 2 on side B).</summary>
+    public IReadOnlyList<DjDeck> Decks => _decks;
+
+    /// <summary>The crossfader.</summary>
+    public DjCrossfader Crossfader { get; }
+
+    /// <summary>Linear master gain before the limiter, 0..4 (1 = unity); changes glide over 5 ms.</summary>
+    public float MasterGain { get => Get(MixerParameter.MasterGain); set => Set(MixerParameter.MasterGain, value); }
+
+    /// <summary>The headphones' blend: 0 = the cue only (default), 1 = the master only.</summary>
+    public float CueMix { get => Get(MixerParameter.CueMix); set => Set(MixerParameter.CueMix, value); }
+
+    /// <summary>Linear headphone gain, 0..4 (1 = unity).</summary>
+    public float CueGain { get => Get(MixerParameter.CueGain); set => Set(MixerParameter.CueGain, value); }
+
+    /// <summary>The output device's channel count now (it can change when the default device changes).</summary>
+    public int OutputChannels
+    {
+        get
+        {
+            using var _ = Lease();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_get_output_channels(_mixer, out uint ch, out _));
+            return (int)ch;
+        }
+    }
+
+    /// <summary>
+    /// The first output channel carrying the cue (counted from 0), or null when the cue has no channels now: no cue,
+    /// or a device that does not have them (the system default changed to a stereo device).
+    /// </summary>
+    public int? CueChannel
+    {
+        get
+        {
+            using var _ = Lease();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_get_output_channels(_mixer, out _, out int cue));
+            return cue < 0 ? null : cue;
+        }
+    }
+
+    /// <summary>Ramps a mixer parameter to a target and returns at once.</summary>
+    /// <param name="parameter">The parameter.</param>
+    /// <param name="target">The target value (clamped to the parameter's range).</param>
+    /// <param name="duration">The ramp's length.</param>
+    /// <param name="curve">The ramp's shape; defaults to <see cref="Curve.Linear"/>.</param>
+    /// <param name="startAt">When to start on the <see cref="OutputDevice.Time"/> clock of <see cref="Output"/>; null starts now.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="duration"/> or <paramref name="startAt"/> is negative.</exception>
+    public unsafe void Ramp(MixerParameter parameter, float target, TimeSpan duration, Curve? curve = null, TimeSpan? startAt = null)
+    {
+        if (duration < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(duration));
+        if (startAt < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(startAt));
+        var c = curve ?? Curve.Linear;
+        var ramp = c.ToNative();
+        using (Lease())
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_ramp_param(_mixer, (int)parameter, target,
+                TimeConvert.ToNanoseconds(duration), startAt is { } t ? Math.Max(1, TimeConvert.ToNanoseconds(t)) : 0, &ramp));
+        }
+        GC.KeepAlive(c);
+    }
+
+    internal float Get(MixerParameter p)
+    {
+        using var _ = Lease();
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_get_param(_mixer, (int)p, out float v));
+        return v;
+    }
+
+    internal void Set(MixerParameter p, float v)
+    {
+        using var _ = Lease();
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_set_param(_mixer, (int)p, v));
+    }
+
+    internal nint Native => _mixer;
+
+    /// <summary>Keeps the native mixer alive (it lives as long as its device) for one call.</summary>
+    internal DeviceLease Lease() => new(Output.Handle);
+
+    internal readonly struct DeviceLease : IDisposable
+    {
+        private readonly DeviceHandle _h;
+
+        public DeviceLease(DeviceHandle h)
+        {
+            bool ok = false;
+            h.DangerousAddRef(ref ok);
+            if (!ok) throw new ObjectDisposedException(nameof(DjMixer));
+            _h = h;
+        }
+
+        public void Dispose() => _h.DangerousRelease();
+    }
+
+    /// <summary>Unloads the decks (their streams stay open and are detached) and closes the device.</summary>
+    public void Dispose()
+    {
+        if (Output.IsDisposed) return;
+        foreach (var d in _decks)
+        {
+            try { d.Unload(force: true); }
+            catch (ObjectDisposedException) { }
+        }
+        Output.Dispose();
+    }
+}
+
+/// <summary>The crossfader of a <see cref="DjMixer"/>.</summary>
+public sealed class DjCrossfader
+{
+    private readonly DjMixer _mixer;
+
+    internal DjCrossfader(DjMixer mixer) => _mixer = mixer;
+
+    /// <summary>0 = side A only, 0.5 = the middle (default), 1 = side B only; changes glide over 5 ms.</summary>
+    public float Position { get => _mixer.Get(MixerParameter.Crossfader); set => _mixer.Set(MixerParameter.Crossfader, value); }
+
+    /// <summary>How the level is shared between the sides.</summary>
+    public CrossfaderCurve Curve
+    {
+        get
+        {
+            using var _ = _mixer.Lease();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_get_crossfader_curve(_mixer.Native, out int c));
+            return (CrossfaderCurve)c;
+        }
+        set
+        {
+            using var _ = _mixer.Lease();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_set_crossfader_curve(_mixer.Native, (int)value));
+        }
+    }
+
+    /// <summary>Moves the crossfader to <paramref name="target"/> over <paramref name="duration"/> and returns at once.</summary>
+    /// <param name="target">0 = side A .. 1 = side B.</param>
+    /// <param name="duration">The move's length.</param>
+    /// <param name="curve">The move's shape; defaults to <see cref="FatzAudio.Curve.Linear"/>.</param>
+    /// <param name="startAt">When to start on the device clock; null starts now.</param>
+    public void Ramp(float target, TimeSpan duration, Curve? curve = null, TimeSpan? startAt = null) =>
+        _mixer.Ramp(MixerParameter.Crossfader, target, duration, curve, startAt);
+}
+
+/// <summary>The isolator EQ of a <see cref="DjDeck"/>: three bands split at 250 Hz and 2.5 kHz, flat at 0 dB.</summary>
+public sealed class DeckEq
+{
+    private readonly DjDeck _deck;
+
+    internal DeckEq(DjDeck deck) => _deck = deck;
+
+    /// <summary>The setting that silences a band (-60 dB); lower values are taken as it.</summary>
+    public const float Kill = -60f;
+
+    /// <summary>The lows (below 250 Hz) in dB, <see cref="Kill"/>..6.</summary>
+    public float Low { get => _deck.Get(DeckParameter.EqLowDb); set => _deck.Set(DeckParameter.EqLowDb, value); }
+
+    /// <summary>The mids (250 Hz to 2.5 kHz) in dB, <see cref="Kill"/>..6.</summary>
+    public float Mid { get => _deck.Get(DeckParameter.EqMidDb); set => _deck.Set(DeckParameter.EqMidDb, value); }
+
+    /// <summary>The highs (above 2.5 kHz) in dB, <see cref="Kill"/>..6.</summary>
+    public float High { get => _deck.Get(DeckParameter.EqHighDb); set => _deck.Set(DeckParameter.EqHighDb, value); }
+}
+
+/// <summary>
+/// A deck of a <see cref="DjMixer"/>: trim, isolator EQ, cue send, channel fader, meter and crossfader side around an
+/// ordinary <see cref="AudioStream"/>. Transport stays on the stream (<see cref="AudioStream.Play"/>,
+/// <see cref="AudioStream.Pause"/>, seeking, tempo and pitch).
+/// </summary>
+public sealed class DjDeck
+{
+    private const int ParamXfaderSide = 5, ParamCue = 6;
+    private readonly DjMixer _mixer;
+    private readonly nint _deck;
+    private AudioStream? _stream;
+
+    internal DjDeck(DjMixer mixer, int index, nint deck)
+    {
+        _mixer = mixer;
+        Index = index;
+        _deck = deck;
+        Eq = new DeckEq(this);
+    }
+
+    /// <summary>The deck's index in <see cref="DjMixer.Decks"/>.</summary>
+    public int Index { get; }
+
+    /// <summary>The isolator EQ.</summary>
+    public DeckEq Eq { get; }
+
+    /// <summary>
+    /// The stream on the deck, or null when empty. A stream leaves the deck when it is disposed, detached or played
+    /// on another device or bus.
+    /// </summary>
+    public AudioStream? Stream
+    {
+        get
+        {
+            using var _ = _mixer.Lease();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_get_stream(_deck, out nint native));
+            if (_stream is not null && (native == 0 || _stream.IsDisposed || _stream.NativeHandle != native)) _stream = null;
+            return _stream;
+        }
+    }
+
+    /// <summary>
+    /// Puts <paramref name="stream"/> on the deck (from another device or deck too, keeping its position); it is not
+    /// started. The deck does not own it: dispose it after unloading. Loading also shortens the stream's decode-ahead
+    /// to 60 ms when it is not playing (so tempo and pitch moves are heard quickly), and the cue point goes back to
+    /// the stream's <see cref="StreamMarkers.CueIn"/>.
+    /// </summary>
+    /// <param name="stream">The stream; null unloads.</param>
+    /// <param name="force">Replace a stream that is playing and heard (fader up, crossfader not closed on its side).</param>
+    /// <exception cref="FatzAudioException"><see cref="ErrorCode.Busy"/> when the current stream is playing and heard and <paramref name="force"/> is false.</exception>
+    public void Load(AudioStream? stream, bool force = false)
+    {
+        var old = Stream;
+        if (ReferenceEquals(old, stream) && stream is not null) return;
+        using (_mixer.Lease())
+        {
+            var sh = stream?.Handle;
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_load(_deck, sh is null ? 0 : sh.DangerousGetHandle(), force ? 1u : 0u));
+            GC.KeepAlive(sh);
+        }
+        old?.LeftDeck();
+        stream?.JoinedDeck(_mixer.Output);
+        _stream = stream;
+    }
+
+    /// <summary>Takes the stream off the deck (it is detached, stays open, and its deck loop is cleared).</summary>
+    /// <param name="force">Unload a stream that is playing and heard.</param>
+    public void Unload(bool force = false) => Load(null, force);
+
+    /// <summary>The channel fader, linear 0..1 (default 1); changes glide over 5 ms.</summary>
+    public float Gain { get => Get(DeckParameter.Gain); set => Set(DeckParameter.Gain, value); }
+
+    /// <summary>The trim in dB, -12..12 (default 0), on top of loudness normalization.</summary>
+    public float TrimDb { get => Get(DeckParameter.TrimDb); set => Set(DeckParameter.TrimDb, value); }
+
+    /// <summary>The crossfader side; switching glides over 5 ms.</summary>
+    public CrossfaderSide Side
+    {
+        get => (CrossfaderSide)(int)GetRaw(ParamXfaderSide);
+        set => SetRaw(ParamXfaderSide, (int)value);
+    }
+
+    /// <summary>Whether the deck is sent to the headphones (before its fader).</summary>
+    public bool Cue { get => GetRaw(ParamCue) != 0f; set => SetRaw(ParamCue, value ? 1f : 0f); }
+
+    /// <summary>Ramps a deck parameter to a target and returns at once.</summary>
+    /// <param name="parameter">The parameter.</param>
+    /// <param name="target">The target value (clamped to the parameter's range).</param>
+    /// <param name="duration">The ramp's length.</param>
+    /// <param name="curve">The ramp's shape; defaults to <see cref="Curve.Linear"/>.</param>
+    /// <param name="startAt">When to start on the device clock; null starts now.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="duration"/> or <paramref name="startAt"/> is negative.</exception>
+    public unsafe void Ramp(DeckParameter parameter, float target, TimeSpan duration, Curve? curve = null, TimeSpan? startAt = null)
+    {
+        if (duration < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(duration));
+        if (startAt < TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(startAt));
+        var c = curve ?? Curve.Linear;
+        var ramp = c.ToNative();
+        using (_mixer.Lease())
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_ramp_param(_deck, (int)parameter, target,
+                TimeConvert.ToNanoseconds(duration), startAt is { } t ? Math.Max(1, TimeConvert.ToNanoseconds(t)) : 0, &ramp));
+        }
+        GC.KeepAlive(c);
+    }
+
+    /// <summary>
+    /// The cue point in source frames (CDJ style; see <see cref="ReturnToCuePoint"/>). Default: the stream's
+    /// <see cref="StreamMarkers.CueIn"/>, else 0. Setting null restores the default.
+    /// </summary>
+    public long? CuePoint
+    {
+        get
+        {
+            using var _ = _mixer.Lease();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_get_cue_point(_deck, out long f));
+            return f;
+        }
+        set
+        {
+            if (value < 0) throw new ArgumentOutOfRangeException(nameof(value));
+            using var _ = _mixer.Lease();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_set_cue_point(_deck, value ?? -1));
+        }
+    }
+
+    /// <summary>The CDJ cue button: pauses the deck and goes back to the <see cref="CuePoint"/>.</summary>
+    /// <exception cref="FatzAudioException"><see cref="ErrorCode.NotFound"/> when the deck is empty.</exception>
+    public void ReturnToCuePoint()
+    {
+        using var _ = _mixer.Lease();
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_cue(_deck));
+    }
+
+    /// <summary>
+    /// The deck loop, or null when off. Setting one works at any time, also while playing, without a gap: it follows
+    /// tempo and pitch, raises <see cref="AudioStream.Looped"/> at each turn, and <see cref="AudioStream.Position"/>
+    /// reports the loop as heard. Setting an out point the deck has just passed (up to 0.5 s ago, as a "loop out"
+    /// button does) loops back at once, keeping the loop's phase; one further behind jumps to the in point. Setting
+    /// null turns it off (playback carries on from where it is); a seek past the out point also leaves the loop.
+    /// </summary>
+    /// <exception cref="FatzAudioException"><see cref="ErrorCode.NotFound"/> when the deck is empty;
+    /// <see cref="ErrorCode.NotSeekable"/> for a stream that cannot loop.</exception>
+    public DeckLoop? Loop
+    {
+        get
+        {
+            using var _ = _mixer.Lease();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_get_loop(_deck, out long i, out long o));
+            return o > i ? new DeckLoop(i, o) : null;
+        }
+        set
+        {
+            if (value is { } v && (v.In < 0 || v.Out <= v.In)) throw new ArgumentOutOfRangeException(nameof(value), "Out must be after In.");
+            using var _ = _mixer.Lease();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_set_loop(_deck, value?.In ?? 0, value?.Out ?? 0));
+        }
+    }
+
+    /// <summary>
+    /// The deck's channel meter: peak and RMS after trim, EQ and fader, before the crossfader, as heard now. The
+    /// first call starts measuring, so it reads silence.
+    /// </summary>
+    /// <param name="window">Length of the measurement window; defaults to 50 ms, at most about 1 s.</param>
+    /// <returns>Levels for left and right.</returns>
+    public StreamLevels GetLevels(TimeSpan? window = null)
+    {
+        var peak = new float[2];
+        var rms = new float[2];
+        GetLevels(peak, rms, window);
+        return new StreamLevels(peak, rms);
+    }
+
+    /// <summary>Like <see cref="GetLevels(TimeSpan?)"/>, into your own buffers (no allocation per call).</summary>
+    /// <param name="peak">Receives the left and right peaks (at least 2 values).</param>
+    /// <param name="rms">Receives the left and right RMS values (at least 2 values).</param>
+    /// <param name="window">Length of the measurement window; defaults to 50 ms, at most about 1 s.</param>
+    /// <exception cref="ArgumentException">A span shorter than 2.</exception>
+    public unsafe void GetLevels(Span<float> peak, Span<float> rms, TimeSpan? window = null)
+    {
+        if (peak.Length < 2 || rms.Length < 2) throw new ArgumentException("Room for left and right is needed.", peak.Length < 2 ? nameof(peak) : nameof(rms));
+        using var _ = _mixer.Lease();
+        fixed (float* pp = peak)
+        fixed (float* pr = rms)
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_get_levels(
+                _deck, TimeConvert.ToNanoseconds(window ?? StreamLevels.DefaultWindow), pp, pr, 2));
+        }
+    }
+
+    internal float Get(DeckParameter p) => GetRaw((int)p);
+
+    internal void Set(DeckParameter p, float v) => SetRaw((int)p, v);
+
+    private float GetRaw(int p)
+    {
+        using var _ = _mixer.Lease();
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_get_param(_deck, p, out float v));
+        return v;
+    }
+
+    private void SetRaw(int p, float v)
+    {
+        using var _ = _mixer.Lease();
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_set_param(_deck, p, v));
+    }
+}

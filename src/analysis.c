@@ -411,3 +411,17 @@ FA_API fa_result FA_CALL fa_device_get_spectrum(fa_device* device, uint32_t size
     if (!spectrum_args(&m, size, flags, out_bins, out_bin_hz) || !device) return FA_ERROR_INVALID_ARG;
     return device_measure(device, &m);
 }
+
+fa_result fa_tap_levels(fa_atomic_ptr* slot, fa_device* device, fa_time window, float* out_peak, float* out_rms, uint32_t channels)
+{
+    measure m;
+    fa_tap* t;
+    fa_result r;
+    if (!levels_args(&m, window, out_peak, out_rms, channels) || !device) return FA_ERROR_INVALID_ARG;
+    fa_tap_fit(slot, device);
+    t = fa_tap_get(slot, device);
+    if (!t) return FA_ERROR_OUT_OF_MEMORY;
+    r = run_measure(&m, t, device, 0);
+    if (r == FA_ERROR_NOT_FOUND) { zero_measure(&m); r = FA_OK; }
+    return r;
+}
