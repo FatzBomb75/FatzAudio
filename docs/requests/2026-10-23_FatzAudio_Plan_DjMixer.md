@@ -50,10 +50,19 @@ when both grids are good, plain crossfade otherwise, the three events, skip); CD
 |---|---|---|
 | 0 | **Mic latency spike** on Keith's PC: capture and monitoring only, NORMAL vs LOW (exclusive measured for reference only) | If LOW cannot get mic to speaker near 20 ms on Keith's interface, MediaControl is told before any mic PR, because the app would then default to monitoring off |
 | 1 | Mixer core: 2 decks, gain/trim, isolator EQ, crossfader (2 curves), master gain, limiter, meters, channels 3-4 and split cue, frame loops, CD cue point | Opus high, 6-9 h |
-| 2 | Mics: capture through the drift-corrected bridge, gate, EQ, reverb, echo, ducking, latency report, recording (master + vocals) | Opus high, 8-12 h; the karaoke-critical part |
+| 2 | Mics: capture through the drift-corrected bridge, gate, EQ, reverb, echo, ducking, latency report, recording (master + vocals), and the built-in setup check (below) | Opus high, 9-13 h; the karaoke-critical part |
 | 3 | Second-device cue on the bridge from step 2, with requirement 1 | Opus high, 3-5 h |
 | 4 | Analysis: constant grid, key, waveform, cache, MIDI/tracker grids, set/get grid | Opus high, 6-9 h; second thread, from step 1 on |
 | 5 | Sync with lock, `play_synced`, beat loops, auto-mix | Opus high, 6-9 h |
+
+**Setup check (Keith, 2026-10-23):** `fa_mixer_measure_latency(mixer, mic, options, &result)` (.NET
+`DjMixer.MeasureLatencyAsync`) turns the spike tool into a library call for the app's setup screen. It
+plays a few chirps through the real speakers and listens on the real mic, then reports per available mode
+(normal, low, exclusive) the measured round trip and mic-to-speaker delay, the highest monitor gain that
+stays clear of feedback (a room resonates several dB above its average; Keith's PC howled at a broadband
+loop gain of 0.5), and a recommendation (monitor on in a given mode, or off, with the reason). The mixer
+keeps the measured delays and uses them instead of the OS's reported latency for vocal recording alignment
+and cue alignment. About 8 KB, no new dependencies.
 
 About 30-45 hours of thread time in 5 PRs plus the spike, binary growth about 70-100 KB (*estimate*).
 Every PR keeps struct sizes, enum values and flags open for the section 19 items.
