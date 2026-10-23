@@ -6,6 +6,7 @@
 #include "fa_platform.h"
 #include "tempo.h"
 #include <stdio.h>
+#include <string.h>
 
 #define FA_DEVICE_CHANNELS 2
 #define FA_PROBE_BYTES 8192
@@ -288,6 +289,58 @@ uint32_t fa_tracker_rows_in(const struct fa_tracker* t, fa_frames from, fa_frame
  * audio thread to raise FA_EVENT_MIDI_TEXT). */
 const fa_frames* fa_midi_text_frames(const struct fa_midi* m, uint32_t* out_count);
 
+/* ---- Track analysis (analyze.c, beat.c, key.c, beat_grid.c) ------------------ */
+
+/* A beat grid with its tempo map (grid.segment_count segments, malloc'ed). */
+typedef struct fa_grid_data {
+    fa_beat_grid grid;
+    fa_tempo_segment* segs;
+} fa_grid_data;
+void fa_grid_data_free(fa_grid_data* g);
+/* Fills grid.bpm (the tempo that lasts longest up to `length` frames, -1 = unknown)
+ * and the CONSTANT flag from the segments. */
+void fa_grid_data_finish(fa_grid_data* g, fa_frames length);
+fa_result fa_grid_data_copy(fa_grid_data* dst, const fa_grid_data* src);
+/* Copies a grid out the way the public getters do. */
+fa_result fa_grid_data_get(const fa_grid_data* g, fa_beat_grid* out_grid, fa_tempo_segment* out_segments,
+                           uint32_t capacity, uint32_t* out_count);
+
+/* The exact grid of a MIDI file, from its tempo and time signature events. */
+fa_result fa_midi_exact_grid(const struct fa_midi* m, fa_grid_data* out);
+/* Tracker modules: while recording (start before the first read, from frame 0),
+ * the decoder notes every row it renders with its tempo; then the exact grid. */
+fa_result fa_tracker_grid_start(struct fa_tracker* t);
+fa_result fa_tracker_grid_finish(struct fa_tracker* t, fa_frames length, fa_grid_data* out);
+/* Renders a freshly opened module through to the end, without interpolation, to
+ * find its grid. */
+fa_result fa_tracker_grid_render(fa_decoder* dec, fa_grid_data* out);
+
+/* Copies the fields `full` bytes of `src` has into `dst`, up to dst's struct_size
+ * (its first uint32_t, at least 4), and sets that to what was filled. */
+static inline void fa_copy_sized(void* dst, const void* src, uint32_t full)
+{
+    uint32_t want;
+    memcpy(&want, dst, sizeof(want));
+    if (want > full) want = full;
+    memcpy((char*)dst + sizeof(uint32_t), (const char*)src + sizeof(uint32_t), want - sizeof(uint32_t));
+    memcpy(dst, &want, sizeof(want));
+}
+
+/* Onset envelope and beat tracking (beat.c): feed mono audio, then ask for the
+ * grid (0 = no steady beat). tag_bpm <= 0 = no tag. */
+typedef struct fa_onset fa_onset;
+fa_onset* fa_onset_new(uint32_t rate);
+void fa_onset_free(fa_onset* o);
+fa_result fa_onset_process(fa_onset* o, const float* mono, int64_t frames);
+int fa_onset_grid(fa_onset* o, double min_bpm, double max_bpm, double tag_bpm, fa_grid_data* out);
+
+/* Chroma and key (key.c): feed mono audio, then ask for the key (0 = none). */
+typedef struct fa_chroma fa_chroma;
+fa_chroma* fa_chroma_new(uint32_t rate);
+void fa_chroma_free(fa_chroma* c);
+void fa_chroma_process(fa_chroma* c, const float* mono, int64_t frames);
+int fa_chroma_key(fa_chroma* c, fa_key_info* out);
+
 /* ---- Ring buffer (ring.c): single producer (worker), single consumer (audio) */
 
 typedef struct fa_ring {
@@ -514,6 +567,18 @@ void fa_tap_fit(fa_atomic_ptr* slot, fa_device* device);
 void fa_tap_write(fa_tap* t, int64_t at, const float* frames, int64_t n);
 void fa_tap_free(fa_tap* t);
 
+/* In-place radix-2 FFT of n complex values (n a power of two, 2..2^FA_FFT_MAX_LOG2),
+ * with tables made once per size and kept (analysis.c). */
+#define FA_FFT_MAX_LOG2 14
+typedef struct fa_fft_tables {
+    float* cs;                /* cos(2 pi k / n), k < n/2 */
+    float* sn;                /* sin(2 pi k / n) */
+    float* hann;              /* the Hann window, n values */
+    double hann_sum;
+} fa_fft_tables;
+const fa_fft_tables* fa_fft_tables_get(uint32_t n);   /* NULL: not a valid size, or no memory */
+void fa_fft(float* re, float* im, const fa_fft_tables* tb, uint32_t n);
+
 /* K-weighted energy meter: one mean-square energy per 100 ms sub-block. */
 typedef struct fa_meter {
     uint32_t rate, channels;
@@ -598,6 +663,13 @@ fa_scan_job* fa_scan_start_stream(struct fa_stream* s, int use_tags);
 /* Cancels if still running, waits until no scan thread uses it, frees it. */
 void fa_scan_release(fa_scan_job* job);
 void fa_scan_shutdown(fa_engine* engine);
+/* The scan cache (fa_engine_config.cache_directory): a content key of the source
+ * (MIDI files: with their soundfont and rate), 0 if none could be made; a file's
+ * path "<dir>/<key>-<size>-<track>.<ext>"; a loudness result stored as a scan would. */
+int fa_scan_cache_key(fa_source* src, const fa_decoder_env* env, uint64_t* out_key);
+void fa_scan_cache_path(const char* dir, uint64_t key, int64_t size, int32_t track, const char* ext, char* out,
+                        size_t cap);
+void fa_scan_cache_write_loudness(const char* dir, uint64_t key, int64_t size, int32_t track, const fa_loudness* l);
 /* Gain normalization gives a stream of loudness `lufs` with the engine's current settings. */
 float fa_engine_norm_gain_db(fa_engine* engine, double lufs);
 
@@ -1141,6 +1213,12 @@ struct fa_stream {
     struct fa_soundfont* soundfont;
     struct fa_midi* midi;
     struct fa_tracker* tracker;  /* tracker modules: the decoder's state (dec_tracker.c) */
+
+    /* Beat grid (beat_grid.c), under grid_lock: the app's, else the file's exact one
+     * (MIDI, trackers), looked for on the first request. */
+    fa_mutex grid_lock;
+    int grid_state;              /* 0 not looked for, 1 grid holds one, 2 the file has none */
+    fa_grid_data grid;
 
     struct fa_stream* next;      /* engine->streams or engine->graveyard */
 };

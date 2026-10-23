@@ -184,23 +184,21 @@ static void zero_levels(float* peak, float* rms, uint32_t channels)
 
 /* ---- spectrum ----------------------------------------------------------- */
 
-/* Per size: cos and sin of 2 pi k / n for k < n/2, the Hann window and its sum.
- * Made once and kept until the process ends, like the MDCT tables. */
-typedef struct fft_tables {
-    float* cs;
-    float* sn;
-    float* hann;
-    double hann_sum;
-} fft_tables;
+/* Per size: cos and sin of 2 pi k / n for k < n/2, the Hann window and its sum
+ * (fa_fft_tables). Made once and kept until the process ends, like the MDCT tables. */
+static fa_atomic_ptr g_fft_tables[FA_FFT_MAX_LOG2 + 1];
 
-static fa_atomic_ptr g_fft_tables[FA_SPECTRUM_MAX_LOG2 + 1];
-
-static const fft_tables* tables_for(uint32_t n, int log2n)
+const fa_fft_tables* fa_fft_tables_get(uint32_t n)
 {
-    fft_tables* t = (fft_tables*)fa_load_ptr(&g_fft_tables[log2n]);
+    fa_fft_tables* t;
     uint32_t i;
+    int log2n = 0;
+    if (n < 2 || (n & (n - 1))) return NULL;
+    while ((1u << log2n) < n) log2n++;
+    if (log2n > FA_FFT_MAX_LOG2) return NULL;
+    t = (fa_fft_tables*)fa_load_ptr(&g_fft_tables[log2n]);
     if (t) return t;
-    t = (fft_tables*)calloc(1, sizeof(*t) + (size_t)n * 2 * sizeof(float));
+    t = (fa_fft_tables*)calloc(1, sizeof(*t) + (size_t)n * 2 * sizeof(float));
     if (!t) return NULL;
     t->cs = (float*)(t + 1);
     t->sn = t->cs + n / 2;
@@ -215,13 +213,12 @@ static const fft_tables* tables_for(uint32_t n, int log2n)
     }
     if (!fa_cas_ptr(&g_fft_tables[log2n], NULL, t)) {
         free(t);
-        t = (fft_tables*)fa_load_ptr(&g_fft_tables[log2n]);
+        t = (fa_fft_tables*)fa_load_ptr(&g_fft_tables[log2n]);
     }
     return t;
 }
 
-/* In-place radix-2 FFT of n complex values. */
-static void fft(float* re, float* im, const fft_tables* tb, uint32_t n)
+void fa_fft(float* re, float* im, const fa_fft_tables* tb, uint32_t n)
 {
     uint32_t i, j, len;
     for (i = 1, j = 0; i < n; i++) {
@@ -246,7 +243,7 @@ static void fft(float* re, float* im, const fft_tables* tb, uint32_t n)
     }
 }
 
-static fa_result spectrum(const tap_view* v, const fft_tables* tb, uint32_t flags, float* bins)
+static fa_result spectrum(const tap_view* v, const fa_fft_tables* tb, uint32_t flags, float* bins)
 {
     uint32_t n = (uint32_t)v->n, i;
     int window = !(flags & FA_SPECTRUM_NO_WINDOW);
@@ -262,7 +259,7 @@ static fa_result spectrum(const tap_view* v, const fft_tables* tb, uint32_t flag
         re[i] = window ? x * tb->hann[i] : x;
         im[i] = 0.0f;
     }
-    fft(re, im, tb, n);
+    fa_fft(re, im, tb, n);
     /* A full-scale sine centred on a bin reads 1.0 there. */
     for (i = 0; i < n / 2; i++)
         bins[i] = (float)(sqrt((double)re[i] * re[i] + (double)im[i] * im[i]) * (i ? 2.0 : 1.0) / wsum);
@@ -308,7 +305,7 @@ static fa_result run_measure(const measure* m, fa_tap* t, fa_device* dev, int af
     tap_view v;
     if (device_live(dev) && view_open(&v, t, dev, speaker_end(dev, after_limiter), m->window, m->size)) {
         if (m->bins) {
-            const fft_tables* tb = tables_for(m->size, m->log2n);
+            const fa_fft_tables* tb = fa_fft_tables_get(m->size);
             if (!tb) return FA_ERROR_OUT_OF_MEMORY;
             if (m->bin_hz) *m->bin_hz = (float)dev->rate / m->size;
             return spectrum(&v, tb, m->flags, m->bins);
