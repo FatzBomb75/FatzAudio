@@ -26,6 +26,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   `fa_deck_cue` give a CDJ-style cue. Opens in the low-latency shared mode by default (`FA_LATENCY_LOW`). New error
   `FA_ERROR_NOT_ENOUGH_CHANNELS`. .NET: `AudioEngine.CreateDjMixer`, `DjMixer`, `DjDeck`, `DjCrossfader`, `DeckEq`.
   See [docs/features/dj-mixer.md](docs/features/dj-mixer.md).
+- DJ mixer setup check: `fa_mixer_measure_latency` plays test chirps and pink noise through the speakers, listens on
+  a mic, and measures each latency mode (`FA_CHECK_ALL_MODES`): mic-to-speaker time, its spread, the reported figure,
+  and the most mic gain that stays 6 dB clear of feedback. It advises monitoring, in which mode, or why not
+  (`fa_check_advice`); the mixer then uses the measured latency for that mic. Opt-in Windows WASAPI exclusive mode
+  (`FA_LATENCY_EXCLUSIVE`, 3 ms periods) and `fa_mixer_set_latency_mode` / `fa_mixer_get_latency_mode` to switch a
+  running mixer. Mics capture in WASAPI raw mode on Windows (no voice processing). .NET: `DjMixer.LatencyMode`,
+  `DjMixer.MeasureLatencyAsync`, `LatencyCheckOptions`, `LatencyCheck`, `CheckAdvice`. See
+  [docs/features/dj-mixer.md](docs/features/dj-mixer.md#setup-check).
 - DJ mixer mic effects, ducking and recording: one shared reverb (the MIDI reverb, now tunable) and echo for the
   mics, with per-mic sends (`FA_MIC_REVERB_SEND`, default 0.2, and `FA_MIC_ECHO_SEND`) and `fa_mixer_set_mic_effects`
   (size, damping, echo time, feedback, tone). Host mics (`FA_MIC_DUCKS_MUSIC`) duck the music, set with

@@ -888,7 +888,9 @@ struct fa_device {
      * and how the device is opened (channels 0 = the device's own count). */
     fa_atomic_ptr mixer;
     uint32_t open_channels;
-    int open_low_latency;
+    fa_latency_mode open_mode;
+    ma_device_id open_id;        /* the device asked for, when open_has_id (else the default) */
+    int open_has_id;
     fa_atomic32 mixer_events;    /* the mixer has events for the event thread (fa_mixer_service) */
 };
 
@@ -1265,14 +1267,20 @@ void fa_device_render_at(fa_device* device, float* out, uint32_t frames, int64_t
 /* What the audio callback runs: render_at, or for a mixer device its master in blocks
  * plus the cue, laid out on the device's `channels`. */
 void fa_device_render_output(fa_device* device, float* out, uint32_t channels, uint32_t frames, int64_t now_ns);
-/* fa_device_open with options: `channels` 0 = the device's own count (else stereo),
- * `low_latency` = the smallest shared-mode period the system gives. */
 /* A device id string (fa_device_info.id) as the backend's id; *out_has = 0 for NULL or
  * "" (the default device). */
 fa_result fa_device_parse_id(fa_engine* engine, fa_device_type type, const char* device_id, ma_device_id* out_id,
                              int* out_has);
-fa_result fa_device_open_with(fa_engine* engine, const char* device_id, uint32_t channels, int low_latency,
+/* fa_device_open with options: `channels` 0 = the device's own count (else stereo), and
+ * the latency mode (fa_latency_mode: LOW is the smallest shared-mode period the system
+ * gives, EXCLUSIVE is WASAPI exclusive and NOT_IMPLEMENTED on other backends). */
+fa_result fa_device_open_with(fa_engine* engine, const char* device_id, uint32_t channels, fa_latency_mode mode,
                               fa_device** out_device);
+/* Closes the backend device and opens it again in `mode` at the same mix rate, so the
+ * streams on it carry on. `between` runs while no callback can (a mixer reopens its inputs
+ * there), with the mode the device is about to open in; if that mode fails, it runs again
+ * with the old one, the device goes back to it and the result is FA_ERROR_DEVICE. */
+fa_result fa_device_reopen_mode(fa_device* d, fa_latency_mode mode, void (*between)(void*, fa_latency_mode), void* user);
 
 /* ---- DJ mixer (mixer.c) -------------------------------------------------- */
 #define FA_MIXER_BLOCK 2048      /* frames per mixer pass; longer callbacks run in blocks */

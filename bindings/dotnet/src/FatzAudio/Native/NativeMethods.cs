@@ -740,4 +740,16 @@ internal static unsafe partial class NativeMethods
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_mixer_get_ducking(nint mixer, FaDucking* ducking);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mixer_set_latency_mode(nint mixer, int mode);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mixer_get_latency_mode(nint mixer, out int mode);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_latency_check_config_init(FaLatencyCheckConfig* config);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mixer_measure_latency(nint mixer, MicHandle mic, FaLatencyCheckConfig* config, FaLatencyCheck* result);
 }

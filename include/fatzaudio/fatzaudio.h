@@ -1205,8 +1205,12 @@ typedef enum fa_latency_mode {
     FA_LATENCY_LOW,        /* the smallest shared-mode period the system gives: WASAPI's
                               low-latency mode on Windows (device rate, needs a driver that
                               offers small periods), about 5 ms elsewhere */
-    FA_LATENCY_EXCLUSIVE   /* Windows exclusive mode, for live mic monitoring: planned with the
-                              mic input (FA_ERROR_NOT_IMPLEMENTED for now) */
+    FA_LATENCY_EXCLUSIVE   /* Windows WASAPI exclusive, for live mic monitoring: 3 ms periods
+                              for the output and the mic inputs. Other apps can't use those
+                              devices meanwhile, and the Windows volume no longer applies
+                              (the mixer's gains and fa_device_set_volume still do).
+                              FA_ERROR_NOT_IMPLEMENTED on other systems; FA_ERROR_DEVICE when
+                              the device can't be had (another app holds it) */
 } fa_latency_mode;
 
 typedef struct fa_mixer_config {
@@ -1232,6 +1236,13 @@ FA_API fa_result FA_CALL fa_mixer_get_device(fa_mixer* mixer, fa_device** out_de
 FA_API fa_result FA_CALL fa_mixer_get_deck(fa_mixer* mixer, uint32_t index, fa_deck** out_deck);
 /* The device's output channels, and the first cue channel (-1 = no cue channels). */
 FA_API fa_result FA_CALL fa_mixer_get_output_channels(fa_mixer* mixer, uint32_t* out_channels, int32_t* out_cue_channel);
+/* Moves the master output and the mics' inputs to another latency mode, as if the mixer
+ * were made with it: the devices close and open again (a moment of silence) and playback
+ * carries on where it was. When the mode can't be had the mixer stays in its own and the
+ * result is that mode's error (fa_latency_mode); an input that won't open in the new
+ * mode raises FA_EVENT_INPUT_LOST. FA_ERROR_BUSY while fa_mixer_measure_latency runs. */
+FA_API fa_result FA_CALL fa_mixer_set_latency_mode(fa_mixer* mixer, fa_latency_mode mode);
+FA_API fa_result FA_CALL fa_mixer_get_latency_mode(fa_mixer* mixer, fa_latency_mode* out_mode);
 
 typedef enum fa_mix_param {
     FA_MIX_CROSSFADER = 0, /* 0 = side A only, 0.5 = the middle (default), 1 = side B only */
@@ -2809,8 +2820,8 @@ FA_API const char* FA_CALL fa_eq_preset_name(fa_eq_preset preset);
  * whatever the two clocks' drift or rates; fa_mixer_get_latency reports what that
  * and the devices add. Mics ask the OS for unprocessed capture (no automatic gain,
  * noise suppression or echo cancelling, which spoil singing and add latency) where
- * the OS offers it: Android's UNPROCESSED input preset; elsewhere the input as the OS
- * gives it. The app asks for the microphone permission (Android manifest and prompt,
+ * the OS offers it: Windows' RAW capture stream (on drivers that support it) and
+ * Android's UNPROCESSED input preset; elsewhere the input as the OS gives it. The app asks for the microphone permission (Android manifest and prompt,
  * macOS and iOS usage strings); without it adding a mic is FA_ERROR_PERMISSION_DENIED
  * (on systems that refuse at open; some deliver silence instead). An input that goes
  * away goes silent and raises FA_EVENT_INPUT_LOST; the mix carries on. */
@@ -2875,9 +2886,78 @@ typedef struct fa_mixer_latency {
     fa_time  cue;                      /* the headphones (the OS's buffer: the cue is not limited) */
     fa_time  cue_alignment;            /* delay added to line up a second-device cue (planned: 0) */
     fa_time  mic_input[FA_MIC_MAX];    /* input buffer plus the bridge; -1 = no mic in the slot */
-    fa_time  mic_monitor[FA_MIC_MAX];  /* mic to speaker: mic_input plus master; -1 = no mic */
+    fa_time  mic_monitor[FA_MIC_MAX];  /* mic to speaker: measured by fa_mixer_measure_latency in
+                                          the mixer's mode when it has been, else mic_input plus
+                                          master; -1 = no mic */
 } fa_mixer_latency;
 FA_API fa_result FA_CALL fa_mixer_get_latency(fa_mixer* mixer, fa_mixer_latency* out_latency);
+
+/* The setup check, for the app's setup screen: plays short test sounds through the
+ * speakers, listens on `mic`, and says how long the mic takes to reach the speakers,
+ * how much mic gain the room takes before it feeds back, and whether to monitor the
+ * mics at all. Put the mic where the singer will stand. It blocks for about 3 s per
+ * mode measured (call it from a worker thread); the music and the mics are silenced
+ * while the test sounds play and come back after. The sounds start quiet (-40 dBFS)
+ * and get louder until the mic hears them, up to max_level_db. Keep the mic in the
+ * mixer until it returns.
+ *
+ * Afterwards the mixer uses the measured time for that mic and mode (mic_monitor
+ * above, and the vocals' alignment in fa_mixer_start_recording) instead of the OS's
+ * figures, until the mic is removed. */
+#define FA_CHECK_ALL_MODES (1u << 0)  /* measure each latency mode the system has, switching the
+                                         mixer to it (fa_mixer_set_latency_mode) and back after;
+                                         else only the mixer's own mode */
+typedef struct fa_latency_check_config {
+    uint32_t struct_size;    /* set by fa_latency_check_config_init */
+    uint32_t flags;          /* FA_CHECK_* */
+    float    max_level_db;   /* the loudest test sound, dBFS, -40..-6, default -12. In exclusive
+                                mode the Windows volume no longer applies, so the same level
+                                can be much louder than in shared mode */
+    fa_time  max_monitor;    /* mic to speaker that still feels live, default 25 ms */
+} fa_latency_check_config;
+
+typedef struct fa_latency_check_mode {
+    fa_latency_mode mode;
+    fa_result result;        /* FA_OK; FA_ERROR_NOT_IMPLEMENTED (not on this system),
+                                FA_ERROR_DEVICE (it would not open, or the output isn't
+                                running), FA_ERROR_NOT_FOUND (the mic didn't hear the test) */
+    fa_time  mic_to_speaker; /* measured: the input, the bridge, the limiter, the output and
+                                the air from the speaker back to the mic (3 ms per metre) */
+    fa_time  spread;         /* how far the test sounds' times differed */
+    fa_time  reported;       /* what the OS's figures add up to, for comparison */
+    float    max_gain_db;    /* the most FA_MIC_GAIN_DB that stays 6 dB clear of feedback, with
+                                the master gain as it is now and the mic's EQ flat (an EQ
+                                boost takes that much off); -20..40 */
+    float    level_db;       /* the test level the mic heard */
+} fa_latency_check_mode;
+
+typedef enum fa_check_advice {
+    FA_CHECK_MONITOR = 0,    /* monitor the mics, in advised_mode */
+    FA_CHECK_SLOW,           /* monitor off: every mode measured is over max_monitor (an
+                                audible slap-back); advised_mode is the fastest */
+    FA_CHECK_FEEDBACK,       /* monitor off: the room feeds back below 0 dB of mic gain;
+                                move the mic away from the speakers, or point it away */
+    FA_CHECK_NOT_HEARD       /* the mic didn't hear the speakers: is it on and unmuted, are
+                                the speakers up, is it a headset? */
+} fa_check_advice;
+
+typedef struct fa_latency_check {
+    uint32_t struct_size;            /* sizeof(fa_latency_check): filled up to it */
+    uint32_t count;                  /* entries in modes */
+    fa_latency_check_mode modes[3];  /* normal, low, exclusive (or only the mixer's mode) */
+    fa_check_advice advice;
+    fa_latency_mode advised_mode;    /* the cheapest mode fast enough: shared before
+                                        exclusive, which takes the devices from other apps */
+} fa_latency_check;
+
+FA_API void      FA_CALL fa_latency_check_config_init(fa_latency_check_config* config);
+/* FA_ERROR_BUSY while another check runs on the mixer. When only the mixer's own mode
+ * is measured and it fails other than by not being heard, that is the result. With
+ * FA_CHECK_ALL_MODES, when the mixer can't go back to its own mode afterwards it stays in
+ * the last mode measured and the result is that error (out_result is still filled in);
+ * otherwise FA_OK with each mode's result inside. */
+FA_API fa_result FA_CALL fa_mixer_measure_latency(fa_mixer* mixer, fa_mic* mic, const fa_latency_check_config* config,
+                                                  fa_latency_check* out_result);
 
 /* One shared reverb and one echo for both mics, like the effects unit of a karaoke
  * mixer. Each mic sends to them (FA_MIC_REVERB_SEND, FA_MIC_ECHO_SEND) and their returns

@@ -250,7 +250,13 @@ static ma_device_config device_config(fa_device* d, const ma_device_id* pid, uin
      * is enough with the callback only mixing decoded audio, and one period (10 ms)
      * less latency than miniaudio's default of three. A larger period_ms buys margin. */
     if (engine->context.backend == ma_backend_wasapi) cfg.periods = 2;
-    if (d->open_low_latency) {
+    if (d->open_mode == FA_LATENCY_EXCLUSIVE) {
+        /* WASAPI exclusive (a mixer's opt-in live monitoring): the device's own format,
+         * converted by miniaudio, and 3 ms periods, as measured in the mic latency spike. */
+        cfg.playback.shareMode = ma_share_mode_exclusive;
+        cfg.periodSizeInMilliseconds = 3;
+        cfg.periods = 0;
+    } else if (d->open_mode == FA_LATENCY_LOW) {
         /* The smallest period the system gives. On Windows that is the IAudioClient3
          * low-latency shared mode, which needs the device's own rate and format: the
          * first open asks for it (fa_device_open_with), a reopen keeps the mix rate the
@@ -271,6 +277,7 @@ static void reopen_default_locked(fa_device* d, int64_t now)
 {
     ma_device_config cfg;
     if (fa_load32(&d->closing)) return;
+    d->open_has_id = 0;                  /* it follows the default from now on */
     cfg = device_config(d, NULL, d->rate);
     fa_store32(&d->reopening, 1);
     if (d->device_ok) {
@@ -292,6 +299,54 @@ static void reopen_default_locked(fa_device* d, int64_t now)
         fa_store32(&d->lost, 1);
         d->retry_at = now + 1000000000;
     }
+}
+
+fa_result fa_device_reopen_mode(fa_device* d, fa_latency_mode mode, void (*between)(void*, fa_latency_mode), void* user)
+{
+    ma_device_config cfg;
+    fa_latency_mode old = d->open_mode;
+    fa_result r = FA_OK;
+    int ok;
+    if (mode == FA_LATENCY_EXCLUSIVE && d->engine->context.backend != ma_backend_wasapi) return FA_ERROR_NOT_IMPLEMENTED;
+    fa_mutex_lock(&d->life_lock);
+    if (fa_load32(&d->closing)) {
+        fa_mutex_unlock(&d->life_lock);
+        return FA_ERROR_INVALID_ARG;
+    }
+    fa_store32(&d->reopening, 1);
+    if (d->device_ok) {
+        ma_device_uninit(&d->device);   /* waits for its callback: none runs until the reopen */
+        d->device_ok = 0;
+    }
+    d->open_mode = mode;
+    if (between) between(user, mode);
+    cfg = device_config(d, d->open_has_id ? &d->open_id : NULL, d->rate);
+    ok = ma_device_init(&d->engine->context, &cfg, &d->device) == MA_SUCCESS;
+    if (!ok) {
+        /* Not in this mode (exclusive: another app holds the device, or its format is
+         * one miniaudio can't use): back to the old one. */
+        r = FA_ERROR_DEVICE;
+        d->open_mode = old;
+        if (between) between(user, old);
+        cfg = device_config(d, d->open_has_id ? &d->open_id : NULL, d->rate);
+        ok = ma_device_init(&d->engine->context, &cfg, &d->device) == MA_SUCCESS;
+    }
+    if (ok) {
+        d->device_ok = 1;
+        store_latency(d);
+        if (d->volume != 1.0f) ma_device_set_master_volume(&d->device, d->volume);
+    }
+    fa_store32(&d->reopening, 0);
+    if (!ok || (fa_load32(&d->want_started) && ma_device_start(&d->device) != MA_SUCCESS)) {
+        /* Gone meanwhile: the event thread reopens it on the default, as after a loss. */
+        fa_store64(&d->lost_at, fa_monotonic_ns());
+        fa_store32(&d->lost, 1);
+        fa_cond_broadcast(&d->engine->event_cond);
+    } else {
+        fa_store32(&d->lost, 0);   /* open again: a loss before the switch is over */
+    }
+    fa_mutex_unlock(&d->life_lock);
+    return r;
 }
 
 /* How long a backend gets to reroute a default device itself before it counts as lost
@@ -389,7 +444,7 @@ void fa_device_remove_voice(fa_device* dev, fa_stream* s)
 
 FA_API fa_result FA_CALL fa_device_open(fa_engine* engine, const char* device_id, fa_device** out_device)
 {
-    return fa_device_open_with(engine, device_id, FA_DEVICE_CHANNELS, 0, out_device);
+    return fa_device_open_with(engine, device_id, FA_DEVICE_CHANNELS, FA_LATENCY_NORMAL, out_device);
 }
 
 fa_result fa_device_parse_id(fa_engine* engine, fa_device_type type, const char* device_id, ma_device_id* out_id,
@@ -420,7 +475,7 @@ fa_result fa_device_parse_id(fa_engine* engine, fa_device_type type, const char*
     return FA_OK;
 }
 
-fa_result fa_device_open_with(fa_engine* engine, const char* device_id, uint32_t channels, int low_latency,
+fa_result fa_device_open_with(fa_engine* engine, const char* device_id, uint32_t channels, fa_latency_mode mode,
                               fa_device** out_device)
 {
     fa_device* d;
@@ -433,9 +488,11 @@ fa_result fa_device_open_with(fa_engine* engine, const char* device_id, uint32_t
     if (!engine || !out_device) return FA_ERROR_INVALID_ARG;
     *out_device = NULL;
 
+    memset(&id, 0, sizeof(id));
     pr = fa_device_parse_id(engine, FA_DEVICE_PLAYBACK, device_id, &id, &has_id);
     if (pr != FA_OK) return pr;
     if (has_id) pid = &id;
+    if (mode == FA_LATENCY_EXCLUSIVE && engine->context.backend != ma_backend_wasapi) return FA_ERROR_NOT_IMPLEMENTED;
 
     d = (fa_device*)calloc(1, sizeof(*d));
     if (!d) return FA_ERROR_OUT_OF_MEMORY;
@@ -447,9 +504,11 @@ fa_result fa_device_open_with(fa_engine* engine, const char* device_id, uint32_t
     }
     d->volume = 1.0f;
     d->open_channels = channels;
-    d->open_low_latency = low_latency;
+    d->open_mode = mode;
+    d->open_id = id;
+    d->open_has_id = has_id;
 
-    cfg = device_config(d, pid, low_latency && engine->context.backend == ma_backend_wasapi
+    cfg = device_config(d, pid, mode == FA_LATENCY_LOW && engine->context.backend == ma_backend_wasapi
                                     ? 0 : engine->config.mix_sample_rate);
     if (ma_device_init(&engine->context, &cfg, &d->device) != MA_SUCCESS) {
         fa_mutex_destroy(&d->life_lock);

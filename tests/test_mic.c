@@ -837,6 +837,290 @@ static void test_recording_errors(void)
     sim_close(&t);
 }
 
+/* ---- the setup check ---------------------------------------------------------------
+ * A simulated room: the mic hears the master `delay` frames later, through a gain, a
+ * resonance (a peaking filter at 1 kHz) and some noise, while fa_mixer_measure_latency
+ * runs on another thread. */
+typedef struct room {
+    int64_t delay;
+    double gain, peak_db, noise_db;
+    int64_t reflection;      /* a reflection this many frames after the direct sound (0 = none) */
+    double reflection_gain;
+} room;
+
+typedef struct check_job {
+    fa_mixer* m;
+    fa_mic* mic;
+    fa_latency_check_config cfg;
+    fa_latency_check res;
+    fa_result r;
+    fa_atomic32 done;
+} check_job;
+
+static void check_thread(void* arg)
+{
+    check_job* j = (check_job*)arg;
+    j->r = fa_mixer_measure_latency(j->m, j->mic, &j->cfg, &j->res);
+    fa_store32(&j->done, 1);
+}
+
+static int room_check(sim* s, const room* rm, const fa_latency_check_config* cfg, fa_latency_check* out, fa_result* out_r)
+{
+    check_job job;
+    fa_thread t;
+    float* hist = NULL;
+    uint32_t cap = 0, rendered = 0, fed = 0, rate = s->dev->rate, i;
+    int64_t deadline;
+    double A = pow(10.0, rm->peak_db / 40.0), w0 = 2.0 * k_pi * 1000.0 / rate, alpha = sin(w0) / 16.0;
+    double a0 = 1.0 + alpha / A, b0 = (1.0 + alpha * A) / a0, b1 = -2.0 * cos(w0) / a0, b2 = (1.0 - alpha * A) / a0;
+    double a1 = -2.0 * cos(w0) / a0, a2 = (1.0 - alpha / A) / a0, z1 = 0.0, z2 = 0.0;
+    double noise = pow(10.0, rm->noise_db / 20.0) * 1.7320508;   /* uniform: RMS = amplitude / sqrt(3) */
+    uint32_t seed = 12345u;
+    float in[4800], blk[OUT_BLOCK * 2];
+    double owed = 0.0;
+    if (rm->delay < OUT_BLOCK) return 0;   /* the input runs up to a block ahead of the render */
+    sim_run(s, 3.0);   /* the bridge fills and settles */
+    memset(&job, 0, sizeof(job));
+    job.m = s->m;
+    job.mic = s->mic;
+    job.res.struct_size = (uint32_t)sizeof(job.res);
+    if (cfg) job.cfg = *cfg; else fa_latency_check_config_init(&job.cfg);
+    if (fa_thread_create(&t, check_thread, &job) != 0) return 0;
+    /* Wall time, not blocks: on a loaded machine the check thread can fall far behind. */
+    deadline = fa_monotonic_ns() + 180 * (int64_t)1000000000;
+    while (!fa_load32(&job.done) && fa_monotonic_ns() < deadline) {
+        if (rendered + OUT_BLOCK > cap) {
+            cap = cap ? cap * 2 : rate * 8;
+            hist = (float*)realloc(hist, (size_t)cap * sizeof(float));
+        }
+        /* The input first, as sim_run: what the mic hears is `delay` behind, so it is
+         * already rendered. */
+        owed += OUT_BLOCK;
+        while (owed >= (double)s->in_period) {
+            for (i = 0; i < s->in_period; i++, fed++) {
+                double x = fed >= rm->delay ? hist[fed - rm->delay] : 0.0, y;
+                if (rm->reflection && fed >= rm->delay + rm->reflection)
+                    x += rm->reflection_gain * hist[fed - rm->delay - rm->reflection];
+                y = b0 * x + z1;
+                z1 = b1 * x - a1 * y + z2;
+                z2 = b2 * x - a2 * y;
+                seed = seed * 1664525u + 1013904223u;
+                in[i] = (float)(rm->gain * y + noise * ((double)seed / 2147483648.0 - 1.0));
+            }
+            fa_mic_test_feed(s->mic, in, s->in_period);
+            owed -= (double)s->in_period;
+        }
+        fa_fetch_add64(&s->dev->epoch, 1);
+        fa_device_render_output(s->dev, blk, 2, OUT_BLOCK, fa_monotonic_ns());
+        fa_fetch_add64(&s->dev->epoch, 1);
+        for (i = 0; i < OUT_BLOCK; i++) hist[rendered + i] = blk[i * 2];
+        rendered += OUT_BLOCK;
+        /* Between passes (settling, analysing) the check thread needs the time; during a
+         * pass the blocks go as fast as they render. */
+        if (!fa_load_ptr(&s->m->check)) fa_sleep_ms(1);
+    }
+    fa_thread_join(&t);
+    free(hist);
+    *out = job.res;
+    *out_r = job.r;
+    return 1;
+}
+
+static int check_sim(sim* s)
+{
+    if (!sim_open(s) || !sim_mic(s, 0, 48000, 48000.0, 1, NULL)) return 0;
+    return s->dev->rate == 48000;
+}
+
+static double ms(fa_time t) { return (double)t / 1e6; }
+
+static void test_check_delay_and_gain(void)
+{
+    sim s, t;
+    room rm = { 480, 0.1, 12.0, -70.0, 0, 0.0 };
+    fa_latency_check_config cfg;
+    fa_latency_check a, b;
+    fa_mixer_latency l;
+    fa_result r;
+    fa_latency_check_config_init(&cfg);
+    cfg.max_monitor = 200000000;
+    CHECK(check_sim(&s));
+    CHECK(room_check(&s, &rm, &cfg, &a, &r));
+    CHECK_EQ(r, FA_OK);
+    CHECK_EQ(a.count, 1);
+    CHECK_EQ(a.modes[0].mode, FA_LATENCY_NORMAL);
+    CHECK_EQ(a.modes[0].result, FA_OK);
+    CHECK_EQ(a.advice, FA_CHECK_MONITOR);
+    CHECK_EQ(a.advised_mode, FA_LATENCY_NORMAL);
+    CHECK(a.modes[0].level_db <= -30.0f);
+    CHECK(ms(a.modes[0].spread) <= 1.0);
+    /* 20 dB down, a 12 dB resonance and 6 dB to spare: +2 dB. */
+    CHECK_NEAR(a.modes[0].max_gain_db, 2.0, 1.5);
+    /* Kept: the latency report now gives the measured time. */
+    l.struct_size = (uint32_t)sizeof(l);
+    CHECK_EQ(fa_mixer_get_latency(s.m, &l), FA_OK);
+    CHECK_EQ(l.mic_monitor[0], a.modes[0].mic_to_speaker);
+    /* 40 ms more in the room is 40 ms more measured, to the frame. */
+    rm.delay = 480 + 1920;
+    CHECK(check_sim(&t));
+    CHECK(room_check(&t, &rm, &cfg, &b, &r));
+    CHECK_EQ(b.modes[0].result, FA_OK);
+    CHECK_NEAR(ms(b.modes[0].mic_to_speaker - a.modes[0].mic_to_speaker), 40.0, 0.25);
+    /* The rest is the bridge and the limiter's look-ahead (the simulated output has none). */
+    CHECK(ms(a.modes[0].mic_to_speaker) > 10.0 && ms(a.modes[0].mic_to_speaker) < 40.0);
+    sim_close(&s);
+    sim_close(&t);
+}
+
+static void test_check_level_ramp(void)
+{
+    sim s;
+    room rm = { 480, 0.1, 0.0, -45.0, 0, 0.0 };   /* noisy: the first probes drown */
+    fa_latency_check a;
+    fa_result r;
+    CHECK(check_sim(&s));
+    CHECK(room_check(&s, &rm, NULL, &a, &r));
+    CHECK_EQ(r, FA_OK);
+    CHECK_EQ(a.modes[0].result, FA_OK);
+    CHECK(a.modes[0].level_db >= -30.0f && a.modes[0].level_db <= -12.0f);
+    CHECK_NEAR(a.modes[0].max_gain_db, 14.0, 2.0);
+    sim_close(&s);
+}
+
+static void test_check_reflection(void)
+{
+    sim s, t;
+    room rm = { 480, 0.1, 0.0, -80.0, 48, 0.5 };   /* a hard wall right behind the mic: never "clear" */
+    room plain = { 480, 0.1, 0.0, -80.0, 0, 0.0 };
+    fa_latency_check a, b;
+    fa_result r;
+    CHECK(check_sim(&s));
+    CHECK(room_check(&s, &rm, NULL, &a, &r));
+    CHECK_EQ(r, FA_OK);
+    CHECK_EQ(a.modes[0].result, FA_OK);
+    CHECK(a.modes[0].level_db < -12.0f);   /* louder didn't help: the quieter level is kept */
+    CHECK(check_sim(&t));
+    CHECK(room_check(&t, &plain, NULL, &b, &r));
+    CHECK_EQ(b.modes[0].result, FA_OK);
+    /* The direct sound, not the reflection 1 ms later. */
+    CHECK_NEAR(ms(a.modes[0].mic_to_speaker), ms(b.modes[0].mic_to_speaker), 0.25);
+    sim_close(&s);
+    sim_close(&t);
+}
+
+static void test_check_not_heard(void)
+{
+    sim s;
+    room rm = { 480, 0.0, 0.0, -60.0, 0, 0.0 };
+    fa_latency_check a;
+    fa_result r;
+    CHECK(check_sim(&s));
+    CHECK(room_check(&s, &rm, NULL, &a, &r));
+    CHECK_EQ(r, FA_OK);
+    CHECK_EQ(a.modes[0].result, FA_ERROR_NOT_FOUND);
+    CHECK_EQ(a.advice, FA_CHECK_NOT_HEARD);
+    sim_close(&s);
+}
+
+static void test_check_advice(void)
+{
+    sim s, t;
+    room loud = { 480, 1.0, 12.0, -70.0, 0, 0.0 }, far = { 2400, 0.1, 0.0, -70.0, 0, 0.0 };
+    fa_latency_check_config cfg;
+    fa_latency_check a;
+    fa_result r;
+    fa_latency_check_config_init(&cfg);
+    cfg.max_monitor = 200000000;
+    CHECK(check_sim(&s));
+    CHECK(room_check(&s, &loud, &cfg, &a, &r));
+    CHECK_EQ(a.modes[0].result, FA_OK);
+    CHECK(a.modes[0].max_gain_db < 0.0f);
+    CHECK_EQ(a.advice, FA_CHECK_FEEDBACK);
+    CHECK(check_sim(&t));
+    CHECK(room_check(&t, &far, NULL, &a, &r));   /* over the default 25 ms */
+    CHECK_EQ(a.modes[0].result, FA_OK);
+    CHECK(ms(a.modes[0].mic_to_speaker) > 50.0);
+    CHECK_EQ(a.advice, FA_CHECK_SLOW);
+    CHECK_EQ(a.advised_mode, FA_LATENCY_NORMAL);
+    sim_close(&s);
+    sim_close(&t);
+}
+
+static void test_check_all_modes(void)
+{
+    sim s;
+    room rm = { 480, 0.1, 0.0, -70.0, 0, 0.0 };
+    fa_latency_check_config cfg;
+    fa_latency_check a;
+    fa_latency_mode mode;
+    fa_result r;
+    fa_latency_check_config_init(&cfg);
+    cfg.flags = FA_CHECK_ALL_MODES;
+    cfg.max_monitor = 200000000;
+    CHECK(check_sim(&s));
+    CHECK(room_check(&s, &rm, &cfg, &a, &r));
+    CHECK_EQ(r, FA_OK);
+    CHECK_EQ(a.count, 3);
+    CHECK_EQ(a.modes[0].mode, FA_LATENCY_NORMAL);
+    CHECK_EQ(a.modes[1].mode, FA_LATENCY_LOW);
+    CHECK_EQ(a.modes[2].mode, FA_LATENCY_EXCLUSIVE);
+    CHECK_EQ(a.modes[0].result, FA_OK);
+    CHECK_EQ(a.modes[1].result, FA_OK);
+    CHECK_EQ(a.modes[2].result, FA_ERROR_NOT_IMPLEMENTED);   /* not Windows */
+    CHECK_EQ(a.advice, FA_CHECK_MONITOR);
+    CHECK_EQ(a.advised_mode, FA_LATENCY_LOW);   /* shared and fast enough: the cheapest */
+    CHECK_EQ(fa_mixer_get_latency_mode(s.m, &mode), FA_OK);
+    CHECK_EQ(mode, FA_LATENCY_NORMAL);          /* back where it was */
+    sim_close(&s);
+}
+
+static void test_check_errors(void)
+{
+    sim s, t;
+    fa_latency_check a;
+    fa_latency_check_config cfg;
+    CHECK(check_sim(&s));
+    CHECK(check_sim(&t));
+    a.struct_size = (uint32_t)sizeof(a);
+    CHECK_EQ(fa_mixer_measure_latency(s.m, t.mic, NULL, &a), FA_ERROR_INVALID_ARG);   /* another mixer's mic */
+    CHECK_EQ(fa_mixer_measure_latency(s.m, NULL, NULL, &a), FA_ERROR_INVALID_ARG);
+    fa_latency_check_config_init(&cfg);
+    cfg.flags = 1u << 7;
+    CHECK_EQ(fa_mixer_measure_latency(s.m, s.mic, &cfg, &a), FA_ERROR_INVALID_ARG);
+    /* The output doesn't run (nobody renders it): the device error, soon. */
+    fa_latency_check_config_init(&cfg);
+    CHECK_EQ(fa_mixer_measure_latency(s.m, s.mic, &cfg, &a), FA_ERROR_DEVICE);
+    sim_close(&s);
+    sim_close(&t);
+}
+
+static void test_latency_mode(void)
+{
+    fa_mixer_config c;
+    fa_mixer* m;
+    fa_mic* mic;
+    fa_latency_mode mode;
+    fa_mixer_config_init(&c);
+    c.latency = FA_LATENCY_EXCLUSIVE;
+    CHECK_EQ(fa_mixer_create(g_engine, &c, &m), FA_ERROR_NOT_IMPLEMENTED);   /* not Windows */
+    c.latency = FA_LATENCY_NORMAL;
+    CHECK_EQ(fa_mixer_create(g_engine, &c, &m), FA_OK);
+    CHECK_EQ(fa_mixer_add_mic(m, NULL, &mic), FA_OK);
+    CHECK_EQ(fa_mixer_get_latency_mode(m, &mode), FA_OK);
+    CHECK_EQ(mode, FA_LATENCY_NORMAL);
+    CHECK_EQ(fa_mixer_set_latency_mode(m, FA_LATENCY_LOW), FA_OK);
+    CHECK_EQ(fa_mixer_get_latency_mode(m, &mode), FA_OK);
+    CHECK_EQ(mode, FA_LATENCY_LOW);
+    CHECK_EQ(fa_mixer_set_latency_mode(m, FA_LATENCY_EXCLUSIVE), FA_ERROR_NOT_IMPLEMENTED);
+    CHECK_EQ(fa_mixer_set_latency_mode(m, (fa_latency_mode)7), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_mixer_get_latency_mode(m, &mode), FA_OK);
+    CHECK_EQ(mode, FA_LATENCY_LOW);
+    CHECK_EQ(fa_load32(&mic->cap->lost), 0);    /* the input opened again */
+    CHECK(mic->cap->device_ok);
+    CHECK_EQ(fa_mixer_set_latency_mode(m, FA_LATENCY_NORMAL), FA_OK);
+    fa_mixer_destroy(m);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -864,6 +1148,14 @@ int main(void)
     RUN(test_recording_aligned);
     RUN(test_recording_raw);
     RUN(test_recording_errors);
+    RUN(test_check_delay_and_gain);
+    RUN(test_check_level_ramp);
+    RUN(test_check_reflection);
+    RUN(test_check_not_heard);
+    RUN(test_check_advice);
+    RUN(test_check_all_modes);
+    RUN(test_check_errors);
+    RUN(test_latency_mode);
 
     fa_engine_destroy(g_engine);
     if (g_failures) { fprintf(stderr, "%d failure(s)\n", g_failures); return 1; }

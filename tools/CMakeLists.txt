@@ -12,6 +12,14 @@ if(WIN32)
     endif()
 endif()
 
+# Runs the DJ mixer's setup check on a real rig (tools/mic-check/fa_mic_check.c).
+add_executable(fa_mic_check mic-check/fa_mic_check.c)
+target_link_libraries(fa_mic_check PRIVATE fatzaudio)
+target_compile_options(fa_mic_check PRIVATE ${FA_WARNINGS})
+if(MSVC)
+    target_compile_definitions(fa_mic_check PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
 # BASS comparison harness (tools/bass-compare/README.md).
 add_executable(fa_bench bass-compare/fa_bench.c)
 target_link_libraries(fa_bench PRIVATE fatzaudio)

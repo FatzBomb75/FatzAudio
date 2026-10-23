@@ -76,6 +76,9 @@ struct fa_mixer {
     fa_atomic32 duck_depth, duck_threshold;           /* fa_ducking, float bits */
     fa_atomic64 duck_attack, duck_hold, duck_release; /* ns */
     fa_atomic_ptr encoders;                           /* fa_enc_list* on the taps (encode.c) */
+    fa_atomic_ptr check;                              /* struct fa_mic_check*: a setup check pass */
+    fa_atomic32 checking;                             /* fa_mixer_measure_latency runs */
+    struct fa_mic_check* check_now;                   /* audio thread: `check` for this block */
     uint64_t block;                                   /* audio thread: fa_mixer_process calls */
     /* Events (fa_mixer_set_event_callback), run by the event thread (fa_mixer_service). */
     fa_mutex cb_lock;
@@ -129,6 +132,10 @@ typedef struct fa_capture {
     ma_device device;
     int device_ok;
     int users;                   /* mics on it (mixer lock) */
+    int os_processing;           /* FA_MIC_OS_PROCESSING of the mic that opened it */
+    int test_owned;              /* fa_mic_test_take_over: the test is its input */
+    int mode_lost;               /* lost by the latency switch in progress (mixer lock): opened
+                                    again if the switch falls back to the old mode */
     int lane_users[CAPTURE_LANES];  /* mics reading each lane (mixer lock) */
     uint32_t channels, rate;     /* the input as opened */
     fa_atomic32 lane_src[CAPTURE_LANES];  /* the channel each lane carries, or CAPTURE_LANE_* */
@@ -199,7 +206,27 @@ struct fa_mic {
     int64_t gate_hold;           /* frames the gate stays open below its close level */
     int64_t warm;                /* frames of silence before it fades in */
     float fade;                  /* the fade-in, 0..1 */
+    fa_atomic64 measured[3];     /* mic to speaker per fa_latency_mode, from the setup check; 0 = not measured */
 };
+
+/* A pass of the setup check (mic_check.c): `signal` plays after the limiter, from
+ * `fade` frames after the block it begins on (t0), while `mic`'s input is recorded into
+ * `rec`; the music fades out before and back after. */
+#define FA_CHECK_UNSET INT64_MIN
+typedef struct fa_mic_check {
+    struct fa_mic* mic;
+    const float* signal;
+    int64_t signal_len;
+    float* rec;
+    int64_t rec_len;
+    int64_t fade;
+    int64_t t0;                  /* audio thread */
+    fa_atomic32 done;            /* the music is back: the pass is over */
+} fa_mic_check;
+/* Audio thread: the mic's bridged input (lane `lane` of CAPTURE_LANES), and the master
+ * after the limiter. */
+void fa_mic_check_record(fa_mic_check* k, const float* in, int lane, uint32_t frames, int64_t clock);
+void fa_mic_check_render(fa_mic_check* k, float* master, uint32_t frames, int64_t clock);
 
 /* mixer.c: wait until no mixer callback runs (returns at once on the event thread). */
 void fa_mixer_wait_callbacks(struct fa_mixer* m);
@@ -210,6 +237,9 @@ void fa_mixer_release(struct fa_mixer* m);
 void fa_mixer_mics_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t frames);   /* audio thread */
 void fa_mixer_mics_free(struct fa_mixer* m);       /* fa_mixer_destroy: removes every mic */
 void fa_mixer_mics_free_removed(struct fa_mixer* m);   /* free_mixer: frees what fa_mixer_mics_free removed */
+void fa_mixer_captures_reopen(struct fa_mixer* m, fa_latency_mode mode);   /* fa_mixer_set_latency_mode */
+/* fa_mixer_set_latency_mode without the setup check's guard (mixer.c; mic_check.c uses it). */
+fa_result fa_mixer_switch_latency_mode(struct fa_mixer* m, fa_latency_mode mode);
 /* mic_fx.c */
 fa_result fa_mic_bus_make(struct fa_mixer* m);     /* lock: the bus, once */
 void fa_mic_bus_free(fa_mic_bus* b);

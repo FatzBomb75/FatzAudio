@@ -110,7 +110,7 @@ The cue send is taken before the channel fader, so a deck with its fader down ca
 - The device mute (`fa_device_set_mute`, `Output.Muted`) silences the headphones too.
 - The cue point (`fa_deck_set_cue_point`, `CuePoint`) defaults to the stream's CUE_IN marker, else 0. `fa_deck_cue` (`ReturnToCuePoint`) pauses the deck and goes back to it.
 - The meter (`fa_deck_get_levels`) shows the deck after trim, EQ and fader, before the crossfader, as heard now.
-- `latency` defaults to `FA_LATENCY_LOW`: on Windows the WASAPI low-latency shared mode at the device's own rate (needs a driver that offers small periods, most do), about 5 ms periods elsewhere. `FA_LATENCY_NORMAL` uses the engine's period. `FA_LATENCY_EXCLUSIVE` comes with the mic setup check.
+- `latency` defaults to `FA_LATENCY_LOW`: on Windows the WASAPI low-latency shared mode at the device's own rate (needs a driver that offers small periods, most do), about 5 ms periods elsewhere. `FA_LATENCY_NORMAL` uses the engine's period. `FA_LATENCY_EXCLUSIVE` (opt-in) is Windows WASAPI exclusive with 3 ms periods for the output and the mics: other apps can't use those devices meanwhile and the Windows volume no longer applies (the mixer's gains and `fa_device_set_volume` still do); `FA_ERROR_NOT_IMPLEMENTED` on other systems, `FA_ERROR_DEVICE` when another app holds the device. `fa_mixer_set_latency_mode` (`LatencyMode`) moves a running mixer to another mode: the devices close and open again (a moment of silence) and playback carries on. When the new mode can't be had the mixer stays in its own and returns that error; a mic input that won't open in the new mode raises `FA_EVENT_INPUT_LOST`.
 - Closing the mixer's device, or the engine, destroys the mixer. In .NET, `DjMixer` keeps its `OutputDevice`, so dispose the mixer, not its `Output`.
 
 ## Deck loops
@@ -183,7 +183,7 @@ TimeSpan delay = mic.MonitorLatency;            // voice to speaker
 - **The gate** opens at the threshold within 1 ms, stays open while the voice is at most 6 dB below it, and closes over 150 ms after 100 ms below that, so breaths and room noise stay out between phrases without chopping words.
 - **The meter** (`fa_mic_get_levels`, `GetLevels`) reads the mic after gain, gate and EQ, before mute and pan, so a muted singer still sees their level. The first call starts measuring and reads silence.
 - **Fade-in.** A new mic is silent for 50 ms, then fades in over 10 ms, so adding one never pops.
-- **Unprocessed capture.** Mics ask for the input without the system's voice processing (automatic gain, noise suppression, echo cancelling: made for calls, they spoil singing and add latency). For now that is Android's UNPROCESSED input preset; Windows' raw mode is planned with the setup check, and macOS, iOS and Linux give the input as the system delivers it. `FA_MIC_OS_PROCESSING` (`KeepOsProcessing`) keeps the processing; two mics on one device share its input, so the first mic added decides for both.
+- **Unprocessed capture.** Mics ask for the input without the system's voice processing (automatic gain, noise suppression, echo cancelling: made for calls, they spoil singing and add latency). That is WASAPI's raw mode on Windows (`AUDCLNT_STREAMOPTIONS_RAW`, where the driver offers it) and Android's UNPROCESSED input preset; macOS, iOS and Linux give the input as the system delivers it. `FA_MIC_OS_PROCESSING` (`KeepOsProcessing`) keeps the processing; two mics on one device share its input, so the first mic added decides for both.
 - **Permission.** The app asks for the microphone permission before adding a mic: Android needs `RECORD_AUDIO` in the manifest and the runtime prompt; macOS and iOS need `NSMicrophoneUsageDescription` (and a sandboxed macOS app the audio-input entitlement). Where the system refuses at open, adding a mic is `FA_ERROR_PERMISSION_DENIED` (`ErrorCode.PermissionDenied`); some systems deliver silence instead.
 - **Input lost.** An input that goes away (unplugged, taken by another app) goes silent, the mix carries on, and the mixer raises `FA_EVENT_INPUT_LOST` once per mic on `fa_mixer_set_event_callback` (`InputLost`), on the engine's event thread. Remove the mic there or later and add it again when the device is back. `fa_mic_remove` works inside the callback, also for the event's own mic.
 - **Host mics.** `FA_MIC_DUCKS_MUSIC` (`DucksMusic`) marks a host's mic: its voice ducks the music (below). Leave it off for singers.
@@ -260,7 +260,7 @@ vocals.Record(mixer, MixerTap.Vocals);
 mixer.StartRecording([master, vocals]);
 ```
 
-- **Lined up as the singer heard it.** A singer sings along with music that reached the speakers a little late, and the voice reaches the mixer a little late again. So the vocals file starts later than the master file by that round trip (the mic's input latency plus the master's output latency, the larger of two mics): put both files at 0 in an editor and the voice sits on the beat it was sung to. `FA_MIXER_REC_RAW_TIMING` (`rawTiming: true`) starts both with what the mixer made on the same frame instead (the voice as it reached the mixer). The round trip is the reported latency; the setup check will measure it.
+- **Lined up as the singer heard it.** A singer sings along with music that reached the speakers a little late, and the voice reaches the mixer a little late again. So the vocals file starts later than the master file by that round trip (the mic's input latency plus the master's output latency, the larger of two mics): put both files at 0 in an editor and the voice sits on the beat it was sung to. `FA_MIXER_REC_RAW_TIMING` (`rawTiming: true`) starts both with what the mixer made on the same frame instead (the voice as it reached the mixer). The round trip is the reported latency until the [setup check](#setup-check) has measured that mic in that mode; then it is the measured one.
 - `device_time` (`startAt`) starts on a frame of the mixer device's clock (`fa_device_get_time`, `Output.Time`). 0, or a time less than one mixer block (2048 frames, about 43 ms at 48 kHz) ahead, starts one block ahead, so a block already in the audio thread never splits the stems.
 - Formats, options and closing are those of every encoder ([recording and encoding](recording-encoding.md)). Destroying the mixer ends the recordings' input; close the encoders to complete the files.
 
@@ -274,10 +274,46 @@ mixer.StartRecording([master, vocals]);
 | `cue` | the headphones: the output's buffer (the cue is not limited, so it has no look-ahead) |
 | `cue_alignment` | delay added to line up a second-device cue (planned; 0) |
 | `mic_input[i]` | the input device's buffer plus the bridge's fill; −1 when slot `i` has no mic |
-| `mic_monitor[i]` | voice to speaker: `mic_input[i]` plus `master`; −1 when no mic |
+| `mic_monitor[i]` | voice to speaker: measured by the setup check, else `mic_input[i]` plus `master`; −1 when no mic |
 
-Times the system does not report are estimated from the buffer sizes. Below about 20 ms voice to speaker a singer does not notice; at 30 ms and more it sounds like a slap-back. With the low-latency default the bridge holds about one input period, one master period and a millisecond. A measured check of the real total, speaker to mic, comes with the setup check.
+Times the system does not report are estimated from the buffer sizes. Below about 20 ms voice to speaker a singer does not notice; at 30 ms and more it sounds like a slap-back. With the low-latency default the bridge holds about one input period, one master period and a millisecond. The [setup check](#setup-check) measures the real total; after it, `mic_monitor[i]` is the measured time for that mic in the mode measured (`mic_input[i]` stays the reported one).
+
+### Setup check
+
+`fa_mixer_measure_latency` (`MeasureLatencyAsync`) is a test mode for the app's setup screen. With the mic where the singer will stand, it plays short test sounds through the speakers, listens on the mic, and reports for each latency mode it measured how long the mic takes to reach the speakers, and how much mic gain the room takes before it feeds back. Then it advises whether to monitor the mics, and in which mode.
+
+```c
+fa_latency_check_config cc;
+fa_latency_check_config_init(&cc);        /* -12 dBFS at most, 25 ms still feels live */
+cc.flags = FA_CHECK_ALL_MODES;            /* normal, low and (Windows) exclusive */
+fa_latency_check res = { sizeof res };
+fa_result r = fa_mixer_measure_latency(mixer, mic, &cc, &res);   /* blocks 3-6 s per mode */
+if (r == FA_OK && res.advice == FA_CHECK_MONITOR) {
+    fa_mixer_set_latency_mode(mixer, res.advised_mode);
+    fa_mic_set_param(mic, FA_MIC_MONITOR, 1);
+}
+/* res.modes[i]: .result, .mic_to_speaker, .spread, .reported, .max_gain_db, .level_db */
+```
+
+```csharp
+var check = await mixer.MeasureLatencyAsync(mic, new LatencyCheckOptions { AllModes = true });
+if (check.Advice == CheckAdvice.Monitor)
+{
+    mixer.LatencyMode = check.AdvisedMode;
+    mic.Monitor = true;
+}
+foreach (var m in check.Modes)
+    Console.WriteLine($"{m.Mode}: {m.Error?.ToString() ?? $"{m.MicToSpeaker.TotalMilliseconds:F1} ms, gain up to {m.MaxGainDb:F0} dB"}");
+```
+
+- **What it plays.** The music fades out over 10 ms and the mics are silenced while the test sounds play, then everything fades back in. After a switch of mode it first waits until the input has run for half a second without a gap (at most 3 s), and a mode not heard right after a switch is tried once more. First a probe: three 5 ms chirps (1-6 kHz), 150 ms apart. It starts at −40 dBFS and gets 10 dB louder each time until the mic hears every chirp clearly (or 10 dB more no longer makes them clearer: a room's reflections set a limit, and the quieter level is kept), up to `max_level_db` (`MaxLevelDb`, −40..−6, default −12). Then at that level five chirps and 1.5 s of pink noise 10 dB below them. A mode takes 3-6 s.
+- **The time.** `mic_to_speaker` (`MicToSpeaker`) is the median of the chirps' times, mic to speaker: the input, the bridge, the limiter, the output, and the air back to the mic (3 ms per metre). `spread` is how far the chirps differed (a steady system: well under 1 ms); `reported` is what the system's figures add up to, for comparison. The mixer uses the measured time for that mic and mode from then on (`fa_mixer_get_latency`, the vocals' recording alignment), until the mic is removed. While a check runs the bridge holds its speed, so its drift correction can't bend the time.
+- **The gain.** From the pink noise, the loudest 1/24 octave of the loop speaker to mic between 100 Hz and 10 kHz (the room's worst resonance) gives `max_gain_db` (`MaxGainDb`): the most mic gain that stays 6 dB clear of feedback, with the master gain as it is now and the mic's EQ flat (an EQ boost takes that much off), −20..40.
+- **The advice.** `FA_CHECK_MONITOR` (`Monitor`): monitor in `advised_mode`, the first of low, normal and exclusive that measured within `max_monitor` (`MaxMonitor`, default 25 ms), so shared modes come before exclusive, which takes the devices from other apps. `FA_CHECK_FEEDBACK`: that mode is fast enough, but the room feeds back below 0 dB of gain: move the mic away from the speakers or point it away. `FA_CHECK_SLOW`: every mode measured is slower than `max_monitor` (an audible slap-back), `advised_mode` is the fastest; leave the mics unmonitored or use a hardware mixer. `FA_CHECK_NOT_HEARD`: the mic didn't hear the speakers (is it on and unmuted, are the speakers up, is it a headset?).
+- **Each mode.** `modes[i].result` is `FA_OK`, `FA_ERROR_NOT_IMPLEMENTED` (exclusive off Windows), `FA_ERROR_DEVICE` (it would not open, or the output isn't running) or `FA_ERROR_NOT_FOUND` (not heard). `FA_CHECK_ALL_MODES` switches the mixer to each mode with `fa_mixer_set_latency_mode`, waits half a second for it to settle, measures, and returns to the mixer's own mode (if that fails, the mixer stays in the last mode measured and the call returns the error, with the measurements filled in). Without it only the mixer's own mode is measured, and a failure other than not heard is also the call's result.
+- **Trying a rig.** `tools/mic-check/fa_mic_check` runs the check from a command line: `fa_mic_check --list`, then `fa_mic_check --mic Yeti --all` (`--out NAME` for the output, `--level DB`, `--repeat N`).
+- **Rules.** The call blocks (in .NET it runs on a thread pool thread); call it from a thread of your own, not the event callback. A second check, or `fa_mixer_set_latency_mode`, while one runs is `FA_ERROR_BUSY`; a mic of another mixer is `FA_ERROR_INVALID_ARG`. Keep the mic until it returns. Exclusive mode ignores the Windows volume, so a level that was quiet in a shared mode can be much louder there.
 
 ## Planned
 
-A measured setup check and exclusive mode, more than two decks, a second-device cue, beat sync and beat loops (BPM analysis), and auto-mix are the next steps of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).
+More than two decks, a second-device cue, beat sync and beat loops (BPM analysis), and auto-mix are the next steps of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).
