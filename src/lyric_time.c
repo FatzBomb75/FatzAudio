@@ -447,6 +447,8 @@ void ly_schedule(ly_timeline* tl, const ly_params* p, ly_beat beat, void* beat_c
     tl->duration = p->duration;
     if (!tl->n) {
         tl->end_fade0 = tl->end_fade1 = 0;
+        tl->intro_bands = 0;
+        tl->intro_end = 0;
         return;
     }
     last_end = tl->line[tl->n - 1].last;
@@ -459,6 +461,35 @@ void ly_schedule(ly_timeline* tl, const ly_params* p, ly_beat beat, void* beat_c
         tl->end_fade1 = tl->duration;
         tl->end_fade0 = max_t(last_end, tl->duration - p->end_fade);
     }
+    {
+        /* The intro: lyrics (or their countdown) soon after the start leave room only
+         * at the top and bottom, on bands until intro_band; later lyrics wait for a
+         * card in the middle to be gone intro_clear before them. */
+        fa_time show = max_t(0, tl->line[0].first - countdown_span(&tl->line[0], p));
+        tl->intro_bands = show < p->intro_band;
+        tl->intro_end = tl->intro_bands ? min_t(p->intro_band, tl->duration) : show - p->intro_clear;
+        /* No room to fade in and out: no intro, rather than a blink. */
+        if (tl->intro_end < p->intro_start + 2 * p->intro_fade) tl->intro_end = 0;
+    }
+}
+
+float ly_intro_at(const ly_timeline* tl, const ly_params* p, fa_time t)
+{
+    float in, out;
+    if (!p->intro || !tl->n || t < p->intro_start || t >= tl->intro_end) return 0.0f;
+    in = ly_smoothstep(progress(t, p->intro_start, p->intro_start + p->intro_fade, 1.0f));
+    out = 1.0f - ly_smoothstep(progress(t, tl->intro_end - p->intro_fade, tl->intro_end, 0.0f));
+    return in < out ? in : out;
+}
+
+float ly_ending_at(const ly_timeline* tl, const ly_params* p, fa_time t)
+{
+    fa_time a = tl->end_fade1, b = tl->duration;
+    float in, out;
+    if (!p->ending || !tl->n || b - a < p->ending_min || b <= a || t < a || t >= b) return 0.0f;
+    in = ly_smoothstep(progress(t, a, a + p->ending_fade, 1.0f));
+    out = 1.0f - ly_smoothstep(progress(t, b - p->ending_fade, b, 0.0f));
+    return in < out ? in : out;
 }
 
 /* ---- one position --------------------------------------------------------------- */

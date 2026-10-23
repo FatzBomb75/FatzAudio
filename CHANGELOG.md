@@ -24,8 +24,20 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   an optional panel, and the surface effects, with FatzAudio's own font reader. Five presets (`FA_LYRIC_CLASSIC`,
   `MODERN`, `NEON`, `MINIMAL`, `SUBTITLE`). Drawn with `fa_surface_update_into` like a CD+G surface. .NET: `LyricSurface`,
   `LyricStyle`, `LyricPreset`, `LyricWipe`, `LyricCountdown`, `AudioStream.CreateLyricSurface`; `IKaraokeSurface` is now
-  implemented by `LyricSurface` too. The intro and ending pages come later. See
+  implemented by `LyricSurface` too. See
   [docs/features/lyrics.md](docs/features/lyrics.md).
+- Lyric surface intro and ending pages: the song's credits (`fa_stream_get_midi_credits`) on smoked glass, on by
+  default and off with `subtitle_mode`. The intro fades in at 1 s: bands at the top and bottom (title, artist, year;
+  length, key, tempo, timing, copyright) when the lyrics start before 8 s, else a centred card that is gone 3 s before
+  the lyrics. An ending card follows the lyrics' end fade when at least 3 s of song remain. A song with no title and no
+  artist gets an intro only with `fallback_title`, and no ending. New `fa_lyric_style` fields after `effects`:
+  `intro_page`, `ending_page`, `fallback_title`, `labels`, `intro_start_ms`, `intro_fade_ms`, `intro_clear_ms`,
+  `intro_band_ms`, `ending_min_ms`, `ending_fade_ms`, `card_color`, `card_accent`, `title_color`, `info_color`,
+  `copyright_color`. .NET: the matching `LyricStyle` properties (`IntroPage`, `EndingPage`, `FallbackTitle`, `Labels`,
+  `IntroStart`, `IntroFade`, `IntroClear`, `IntroBand`, `EndingMin`, `EndingFade`, `CardColor`, `CardAccent`,
+  `TitleColor`, `InfoColor`, `CopyrightColor`). When either page can show, the surface's bitmap is the whole
+  presentation area (`bitmap_x` and `bitmap_y` are 0) instead of the lyric block. See
+  [docs/features/lyrics.md](docs/features/lyrics.md#intro-and-ending-pages).
 - CD+G presentation options: `fa_cdg_surface_set_presentation` crops a surface to a safety zone (show, remove, auto
   from a pre-pass over the song, or a tight box around everything drawn), adds transparent padding, and with
   presentation scaling draws the picture in premultiplied full colour at the whole-number multiple nearest the

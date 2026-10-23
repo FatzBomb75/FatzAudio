@@ -182,11 +182,51 @@ public sealed record LyricStyle
     public float PanelPadding { get; init; }
     /// <summary>Em, 0..1.</summary>
     public float PanelRadius { get; init; }
-    /// <summary>No countdown.</summary>
+    /// <summary>No countdown, no intro or ending page.</summary>
     public bool SubtitleMode { get; init; }
     /// <summary>Outline, shadow and bevel, with sung colours; null for none. Sizes are in em: outline 0.12, shadow 0.20,
     /// distance 0.15, bevel 0.08 em at 1.</summary>
     public SurfaceEffects? Effects { get; init; }
+
+    // ---- intro and ending pages ----
+
+    /// <summary>
+    /// The song's credits (<see cref="AudioStream.MidiCredits"/>) before the first line: on bands at the top and
+    /// bottom until <see cref="IntroBand"/> when the lyrics (or their countdown) start before it, else on a card in the
+    /// middle, gone <see cref="IntroClear"/> before them. With a page the bitmap is the whole presentation area.
+    /// </summary>
+    public bool IntroPage { get; init; }
+    /// <summary>A card with the title, artist, year and copyright after the lyrics have faded, when
+    /// <see cref="EndingMin"/> of the song is left.</summary>
+    public bool EndingPage { get; init; }
+    /// <summary>For a song that names neither a title nor an artist: the intro's title (the file's name, say). Null: no
+    /// pages for such songs.</summary>
+    public string? FallbackTitle { get; init; }
+    /// <summary>The words "Length", "Key", "Tempo", "Timing", "Written By" and "Lyricist" in another language, one per
+    /// line; null or a missing line keeps the English.</summary>
+    public string? Labels { get; init; }
+    /// <summary>The intro fades in from here (0..60 s).</summary>
+    public TimeSpan IntroStart { get; init; }
+    /// <summary>Over this, and out over the same (0..60 s).</summary>
+    public TimeSpan IntroFade { get; init; }
+    /// <summary>The intro card is gone this long before the lyrics (0..60 s).</summary>
+    public TimeSpan IntroClear { get; init; }
+    /// <summary>Lyrics starting before this get the intro on bands, shown until then (0..60 s).</summary>
+    public TimeSpan IntroBand { get; init; }
+    /// <summary>The ending card needs this much of the song left after the lyrics' fade (0..60 s).</summary>
+    public TimeSpan EndingMin { get; init; }
+    /// <summary>The ending card fades in and out over this (0..60 s).</summary>
+    public TimeSpan EndingFade { get; init; }
+    /// <summary>The pages' glass; the alpha is its opacity.</summary>
+    public CdgColor CardColor { get; init; }
+    /// <summary>The pages' borders and the artist.</summary>
+    public CdgColor CardAccent { get; init; }
+    /// <summary>The title.</summary>
+    public CdgColor TitleColor { get; init; }
+    /// <summary>The information lines.</summary>
+    public CdgColor InfoColor { get; init; }
+    /// <summary>The copyright.</summary>
+    public CdgColor CopyrightColor { get; init; }
 
     private unsafe LyricStyle(FaLyricStyle style)
     {
@@ -243,6 +283,21 @@ public sealed record LyricStyle
         PanelRadius = s->PanelRadius;
         SubtitleMode = s->SubtitleMode != 0;
         Effects = SurfaceInterop.FromNative(s->Effects);
+        IntroPage = s->IntroPage != 0;
+        EndingPage = s->EndingPage != 0;
+        FallbackTitle = s->FallbackTitle == 0 ? null : Marshal.PtrToStringUTF8(s->FallbackTitle);
+        Labels = s->Labels == 0 ? null : Marshal.PtrToStringUTF8(s->Labels);
+        IntroStart = TimeSpan.FromMilliseconds(s->IntroStartMs);
+        IntroFade = TimeSpan.FromMilliseconds(s->IntroFadeMs);
+        IntroClear = TimeSpan.FromMilliseconds(s->IntroClearMs);
+        IntroBand = TimeSpan.FromMilliseconds(s->IntroBandMs);
+        EndingMin = TimeSpan.FromMilliseconds(s->EndingMinMs);
+        EndingFade = TimeSpan.FromMilliseconds(s->EndingFadeMs);
+        CardColor = SurfaceInterop.FromArgb(s->CardColor);
+        CardAccent = SurfaceInterop.FromArgb(s->CardAccent);
+        TitleColor = SurfaceInterop.FromArgb(s->TitleColor);
+        InfoColor = SurfaceInterop.FromArgb(s->InfoColor);
+        CopyrightColor = SurfaceInterop.FromArgb(s->CopyrightColor);
     }
 
     private static int Ms(TimeSpan t, string name) =>
@@ -302,12 +357,29 @@ public sealed record LyricStyle
         s.PanelRadius = PanelRadius;
         s.SubtitleMode = SubtitleMode ? 1 : 0;
         SurfaceInterop.ToNative(Effects, &s.Effects);
+        s.IntroPage = IntroPage ? 1 : 0;
+        s.EndingPage = EndingPage ? 1 : 0;
+        s.IntroStartMs = Ms(IntroStart, nameof(IntroStart));
+        s.IntroFadeMs = Ms(IntroFade, nameof(IntroFade));
+        s.IntroClearMs = Ms(IntroClear, nameof(IntroClear));
+        s.IntroBandMs = Ms(IntroBand, nameof(IntroBand));
+        s.EndingMinMs = Ms(EndingMin, nameof(EndingMin));
+        s.EndingFadeMs = Ms(EndingFade, nameof(EndingFade));
+        s.CardColor = SurfaceInterop.Argb(CardColor);
+        s.CardAccent = SurfaceInterop.Argb(CardAccent);
+        s.TitleColor = SurfaceInterop.Argb(TitleColor);
+        s.InfoColor = SurfaceInterop.Argb(InfoColor);
+        s.CopyrightColor = SurfaceInterop.Argb(CopyrightColor);
         nint family = FontFamily is null ? 0 : Marshal.StringToCoTaskMemUTF8(FontFamily);
         nint path = FontPath is null ? 0 : Marshal.StringToCoTaskMemUTF8(FontPath);
+        nint fallback = FallbackTitle is null ? 0 : Marshal.StringToCoTaskMemUTF8(FallbackTitle);
+        nint labels = Labels is null ? 0 : Marshal.StringToCoTaskMemUTF8(Labels);
         try
         {
             s.FontFamily = family;
             s.FontPath = path;
+            s.FallbackTitle = fallback;
+            s.Labels = labels;
             if (FontData is { IsEmpty: false } data)
             {
                 fixed (byte* d = data.Span)
@@ -323,6 +395,8 @@ public sealed record LyricStyle
         {
             Marshal.FreeCoTaskMem(family);
             Marshal.FreeCoTaskMem(path);
+            Marshal.FreeCoTaskMem(fallback);
+            Marshal.FreeCoTaskMem(labels);
         }
     }
 }
@@ -335,8 +409,9 @@ public sealed record LyricStyle
 /// <see cref="UpdateInto(nint, int, int, int, ulong, TimeSpan?)"/> as any <see cref="IKaraokeSurface"/>.
 /// </summary>
 /// <remarks>
-/// The buffer is the block of lyric lines, not the whole area: <see cref="SurfaceLayout.BitmapX"/> and
-/// <see cref="SurfaceLayout.BitmapY"/> place it. Pixels are premultiplied BGRA against transparent. Every frame is a
+/// The buffer is the block of lyric lines, or the whole area when the song has an intro or ending page (see
+/// <see cref="LyricStyle.IntroPage"/>): <see cref="SurfaceLayout.BitmapX"/> and <see cref="SurfaceLayout.BitmapY"/> place
+/// it. Pixels are premultiplied BGRA against transparent. Every frame is a
 /// function of the position, so seeks, loops and tempo changes need nothing. Text is drawn by FatzAudio's own font
 /// reader; <see cref="SurfaceLayout.FontUsed"/> names the family drawn with.
 /// </remarks>

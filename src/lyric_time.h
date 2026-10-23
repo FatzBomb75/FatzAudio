@@ -59,6 +59,10 @@ typedef struct ly_params {
     float near_scale, far_scale;
     float page_in_scale, page_out_scale;
     fa_time duration;             /* the song's length; 0 = unknown */
+    /* The intro and ending pages: on, and their times (real time made stream time). */
+    int intro, ending;
+    fa_time intro_start, intro_fade, intro_clear, intro_band;
+    fa_time ending_min, ending_fade;
 } ly_params;
 
 /* Width of `len` bytes of UTF-8 text at the design size, for splitting lines wider
@@ -73,6 +77,10 @@ typedef struct ly_timeline {
     uint32_t n;
     fa_time end_fade0, end_fade1;
     fa_time duration;
+    /* The intro: on bands (the lyrics start before intro_band) or on a card, gone at
+     * intro_end. */
+    int intro_bands;
+    fa_time intro_end;
 } ly_timeline;
 
 fa_result ly_build(ly_timeline* tl, const ly_frag* frags, uint32_t count, const ly_params* p, ly_measure measure,
@@ -112,6 +120,11 @@ typedef struct ly_count {
 } ly_count;
 
 void ly_countdown_at(const ly_line* l, const ly_params* p, fa_time t, ly_count* out);
+
+/* The intro page's opacity at `t` (0 when it is off or not shown), and the ending
+ * card's: it shows after the lyrics have faded when ending_min is left of the song. */
+float ly_intro_at(const ly_timeline* tl, const ly_params* p, fa_time t);
+float ly_ending_at(const ly_timeline* tl, const ly_params* p, fa_time t);
 
 /* The easing curves of the design reference. */
 float ly_smoothstep(float t);

@@ -9,11 +9,12 @@ A lyric surface draws the lyrics of a MIDI or `.kar` song as a karaoke screen, s
 - Lines scrolling up as the song moves on, and pages fading out and in at long pauses.
 - A countdown of arrows before a line that follows a long gap.
 - The lyrics fading out after the last syllable.
+- An [intro page](#intro-and-ending-pages) with the song's title and credits before the lyrics, and an ending card after them.
 - An optional rounded panel behind each line, and the [surface effects](#effects) (outline, shadow, bevel).
 
 Text is drawn with FatzAudio's own font reader and rasterizer, not the system's text engine, so the picture is the same on every platform. Pixels are premultiplied BGRA against a transparent background: draw the surface over your video or background.
 
-Not drawn yet: the title and credits page before the song and the ending page of the [design reference](../requests/2026-10-20_MediaControl_KaraokeDesignReference.md). They come in the next step. A song without lyrics draws nothing.
+The intro and ending pages follow the design reference ([sections 4.3 and 4.4](../requests/2026-10-20_MediaControl_KaraokeDesignReference.md)). A song without lyrics draws nothing.
 
 ## Quick start
 
@@ -35,8 +36,9 @@ fa_surface_set_presentation_size(lyrics, 1920, 1080); /* the area the lyrics are
 
 fa_surface_layout lay = { sizeof(lay) };
 fa_surface_get_layout(lyrics, &lay);                 /* the buffer size it wants: lay.width x lay.height */
-/* The buffer is the block of lyric lines, not the whole area. Draw it at
- * (lay.bitmap_x, lay.bitmap_y) inside the presentation area. */
+/* The buffer is the whole presentation area when the song has an intro or ending
+ * page, else the block of lyric lines. Draw it at (lay.bitmap_x, lay.bitmap_y)
+ * inside the presentation area. */
 
 uint8_t* mem[3];                                     /* lay.height rows of `stride` bytes (BGRA) */
 uint64_t rev[3] = { 0, 0, 0 };                       /* 0 = the buffer holds nothing yet */
@@ -60,7 +62,7 @@ fa_stream_close(song);
 
 `fa_surface_update_into`, the dirty rectangles, `revision` and the buffer rotation work exactly as for CD+G: see [drawing into your own buffers](cdg.md#drawing-into-your-own-buffers-fa_surface_update_into). A buffer of another size than the layout's gets `FA_ERROR_SIZE_MISMATCH`.
 
-The block keeps one size for a presentation size and style: every line slot, the countdown row and the page fade-in are inside it, so the texture does not change size while the song plays. `bitmap_x` and `bitmap_y` give its top-left corner in the presentation area. `fa_surface_layout.scale` is the presentation height / 1080, and `font_used` names the font family that was drawn with.
+The bitmap keeps one size for a presentation size and style, so the texture does not change size while the song plays. When the song can show an intro or ending page, it is the whole presentation area (`bitmap_x` and `bitmap_y` are 0) and the layout's content rectangle is the box the lyric lines fit in. Otherwise it is the block of lyric lines: every line slot, the countdown row and the page fade-in are inside it, and `bitmap_x` and `bitmap_y` give its top-left corner in the presentation area. `fa_surface_layout.scale` is the presentation height / 1080, and `font_used` names the font family that was drawn with.
 
 ### C#
 
@@ -177,13 +179,69 @@ Shown before a line that follows a long gap.
 | `panel` (`Panel`) | 0 | 0/1 | A rounded panel behind each line |
 | `panel_color` (`PanelColor`) | black at 50 % | | `0xAARRGGBB`; the alpha is the opacity |
 | `panel_padding`, `panel_radius` (`PanelPadding`, `PanelRadius`) | 0.25, 0.2 | 0..1 | Em |
-| `subtitle_mode` (`SubtitleMode`) | 0 | 0/1 | 1: no countdown (the Subtitle preset sets it) |
+| `subtitle_mode` (`SubtitleMode`) | 0 | 0/1 | 1: no countdown and no intro or ending page (the Subtitle preset sets it) |
+
+### Intro and ending pages
+
+| Field (.NET) | Default | Range | Meaning |
+|---|---|---|---|
+| `intro_page`, `ending_page` (`IntroPage`, `EndingPage`) | 1, 1 | 0/1 | The two pages. `subtitle_mode` turns both off |
+| `fallback_title` (`FallbackTitle`) | NULL | | UTF-8. For a song with no title and no artist: the intro's title, such as the file's name. NULL: no pages for such a song |
+| `labels` (`Labels`) | NULL | | UTF-8, one per line: "Length", "Key", "Tempo", "Timing", "Written By", "Lyricist". A missing line keeps the English word |
+| `intro_start_ms`, `intro_fade_ms` (`IntroStart`, `IntroFade`) | 1000, 1000 | 0..60000 | The intro starts to fade in at this time, over this long |
+| `intro_clear_ms` (`IntroClear`) | 3000 | 0..60000 | A card is gone this long before the lyrics (or their countdown) |
+| `intro_band_ms` (`IntroBand`) | 8000 | 0..60000 | Lyrics starting before this time get bands instead of a card, shown until this time |
+| `ending_min_ms`, `ending_fade_ms` (`EndingMin`, `EndingFade`) | 3000, 750 | 0..60000 | The ending card needs this much song left after the lyrics' fade, and fades in and out over this long |
+| `card_color`, `card_accent` (`CardColor`, `CardAccent`) | `0xE00E131C`, `0xFF78DCE8` | | The smoked glass, and the border and artist |
+| `title_color`, `info_color`, `copyright_color` (`TitleColor`, `InfoColor`, `CopyrightColor`) | `0xFFFFF4DC`, `0xFFD5DCE6`, `0xFFB8A87A` | | `0xAARRGGBB` |
 
 ### Effects
 
 `fa_lyric_style.effects` (.NET `LyricStyle.Effects`) is a `fa_surface_effects`: outline, shadow and bevel, the same effects as on [CD+G surfaces](cdg.md#presentation-options-fa_cdg_surface_set_presentation), with `sung_color` values so the outline and shadow can change colour as a syllable is sung. `fa_surface_set_effects(surface, &effects)` (.NET `lyrics.Effects`) sets the effects alone and also updates the style's.
 
 For lyrics the sizes are in em, so the look is the same at every font size: at 1, the outline is 0.12 em wide, the shadow's `size` is 0.20 em, its `distance` 0.15 em and the bevel's `size` 0.08 em. Ranges and the other fields are those of `fa_surface_effects`.
+
+## Intro and ending pages
+
+The surface can also draw the song's credits (`fa_stream_get_midi_credits`, .NET `AudioStream.MidiCredits`; see [song credits](midi.md#song-credits)) on smoked glass before the first line and after the last one. Both pages are on by default; a style with `subtitle_mode` set draws neither.
+
+- **The intro** starts to fade in at 1 s, over 1 s. If the lyrics (or the countdown before the first line) start before 8 s, the intro is two bands drawn behind the lyric lines: one at the top with the title, then the artist and year, and one at the bottom with the length, the key, tempo and time signature, and the copyright. They stay until 8 s and fade out over the last second. Otherwise the intro is a card in the middle with the title, artist, the writers and lyricist line, year, length, key, tempo and time signature, the song's other `@I` notes, and the copyright in italics. It fades out so that it is gone 3 s before the lyrics or their countdown. With custom times that leave no room to fade in and out before then, there is no intro rather than a blink.
+- **The ending card** (title, artist, year, copyright) fades in over 750 ms after the lyrics' end fade, and out over the last 750 ms of the song. It is drawn only when at least 3 s of the song remain after the lyrics' fade.
+- **A song with no title and no artist** gets an intro only if `fallback_title` is set (the file's name, say). That intro has a smaller title on a narrower card, with no credits or other notes, and the song never gets an ending card.
+- **Labels.** `labels` replaces the words "Length", "Key", "Tempo", "Timing", "Written By" and "Lyricist" for another language, one per line; a missing line keeps the English.
+- **Times** are real time, like the other animation times, so they follow `FA_PARAM_TEMPO`.
+
+When either page can be shown, the surface's bitmap is the whole presentation area (`bitmap_x` and `bitmap_y` are 0) instead of the lyric block, and the layout's content rectangle is still the box the lyric lines fit in. Turn both pages off to keep the smaller block.
+
+### C
+
+```c
+fa_lyric_style style;
+fa_lyric_style_init(&style, FA_LYRIC_CLASSIC);
+style.fallback_title = "Song file name";            /* for a song without title and artist */
+style.labels = "Dauer\nTonart\nTempo\nTakt\nText von\nTextdichter";   /* German; one word per line */
+style.intro_band_ms = 6000;                         /* bands only if the lyrics start before 6 s */
+style.ending_page = 0;                              /* no ending card */
+
+fa_surface* lyrics;
+fa_lyric_surface_create(song, &style, &lyrics);
+/* fa_surface_get_layout: bitmap_x = bitmap_y = 0, the whole presentation area */
+```
+
+### C#
+
+```csharp
+var style = new LyricStyle
+{
+    FallbackTitle = Path.GetFileNameWithoutExtension(path),
+    Labels = "Dauer\nTonart\nTempo\nTakt\nText von\nTextdichter",
+    IntroBand = TimeSpan.FromSeconds(6),
+    EndingPage = false,
+};
+using var lyrics = song.CreateLyricSurface(style);   // layout.BitmapX == layout.BitmapY == 0
+```
+
+The pages match the [design reference](../requests/2026-10-20_MediaControl_KaraokeDesignReference.md) (sizes, colours and timings), with three differences: the info and copyright text use the font family's regular weight (or the lyric font when it is given by path or data), the italics are a synthetic slant, and the labels are configurable.
 
 ## How lines and pages are built
 
@@ -211,6 +269,8 @@ Lyric times follow the stream's clock (`FA_SURFACE_NOW` is `fa_stream_get_clock`
 | A new page is in place | 1 s before its first syllable |
 | Countdown | after a gap of 6 s or more: 4 arrows over 5 s (one every 1 s), then a last fade |
 | End of the song | the lyrics fade out 5 s after the last syllable, over 1 s |
+| Intro | fades in at 1 s over 1 s; bands until 8 s if the lyrics start before then, else a card gone 3 s before the lyrics |
+| Ending card | fades in over 750 ms after the lyrics' end fade, out over the last 750 ms; only with 3 s or more of song left |
 
 ## Fonts
 
@@ -240,12 +300,15 @@ Measured at 1080p on one core of a desktop x64, Release build:
 | A still frame (nothing moves; a syllable being wiped, a countdown arrow) | about 0.3 ms |
 | A frame while lines scroll or a page fades | about 3-5 ms |
 | The first frame of a page | more, while its lines are drawn |
+| Building an intro or ending page the first time it shows (once per layout) | about 15-20 ms for the bands, about 20 ms for a card |
+| A frame while the bands fade | about 3.5 ms |
+| A frame while a card fades | about 2 ms |
 
-Lines are laid out once; a frame colours and places them, so only what changed is redrawn. A lyric surface accepts `fa_surface_set_render_ahead` (`RenderAhead`) and keeps the setting, but for now the frames are drawn on the caller's thread. Drawing on the engine's workers, with the intro and ending pages, comes in the next step (5b of the [karaoke surfaces plan](../requests/2026-10-20_FatzAudio_Plan_KaraokeSurfaces.md)). A cost table for 1080p and 2160p will be measured then.
+Lines are laid out once; a frame colours and places them, so only what changed is redrawn. A lyric surface accepts `fa_surface_set_render_ahead` (`RenderAhead`) and keeps the setting, but for now the frames are drawn on the caller's thread. Drawing on the engine's workers comes in the next step (5c of the [karaoke surfaces plan](../requests/2026-10-20_FatzAudio_Plan_KaraokeSurfaces.md)); it will also take the first-show cost of the pages off the caller's thread. A cost table for 1080p and 2160p will be measured then.
 
 ## Pitfalls
 
-- The bitmap is the block of lyrics, not the whole area. Draw it at `bitmap_x`, `bitmap_y` in the presentation area; do not stretch it to the screen.
+- The bitmap is the whole presentation area when an intro or ending page can show, else only the block of lyrics. Draw it at `bitmap_x`, `bitmap_y` in the presentation area; do not stretch it to the screen.
 - Set `fa_surface_set_presentation_size` to the real size of the area, in physical pixels, before the first layout. Without it the surface draws for 1920x1080.
 - Use a `dst_revision` of 0 for a buffer you have cleared or drawn into yourself.
 - The pixels are premultiplied BGRA. Blend with "one, one minus source alpha".
