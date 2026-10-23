@@ -195,7 +195,7 @@ public sealed class DjMixer : IDisposable
     {
         get
         {
-            using var _ = Lease();
+            using var lease = Lease();
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_get_output_channels(_mixer, out uint ch, out _));
             return (int)ch;
         }
@@ -209,7 +209,7 @@ public sealed class DjMixer : IDisposable
     {
         get
         {
-            using var _ = Lease();
+            using var lease = Lease();
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_get_output_channels(_mixer, out _, out int cue));
             return cue < 0 ? null : cue;
         }

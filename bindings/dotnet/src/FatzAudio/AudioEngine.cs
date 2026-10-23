@@ -207,7 +207,7 @@ public sealed class AudioEngine : IDisposable
         c.CueMode = options.Cue.Mode;
         c.CueChannel = (uint)options.Cue.FirstChannel;
         c.Latency = (int)options.Latency;
-        byte* id = Utf8(options.Output?.Id);
+        byte* id = options.Output?.Id is { } devId ? (byte*)Marshal.StringToCoTaskMemUTF8(devId) : null;
         nint native;
         try
         {
