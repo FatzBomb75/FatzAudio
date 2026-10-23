@@ -339,6 +339,49 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_scan_loudness_path(EngineHandle engine, string path, out FaLoudness loudness);
 
+    // ---- Track analysis ----------------------------------------------------
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_analysis_options_init(FaAnalysisOptions* options);
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_analyze_path(EngineHandle engine, string path, FaAnalysisOptions* options, out nint analysis);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_analyze_stream(StreamHandle stream, FaAnalysisOptions* options, out nint analysis);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_analysis_free(nint analysis);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_analysis_get_info(nint analysis, FaAnalysisInfo* info);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_analysis_get_beat_grid(nint analysis, FaBeatGrid* grid);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_analysis_get_tempo_map(nint analysis, FaTempoSegment* segments, uint capacity, uint* count);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_analysis_get_key(nint analysis, FaKeyInfo* key);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_analysis_get_waveform(nint analysis, FaWaveformPoint* points, uint capacity, uint* count);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_analysis_get_loudness(nint analysis, out FaLoudness loudness);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_key_transpose(FaKeyInfo* key, int semitones, FaKeyInfo* result);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_key_make(int tonic, int minor, FaKeyInfo* result);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_beat_grid(StreamHandle stream, FaBeatGrid* grid, FaTempoSegment* segments, uint count);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_beat_grid(StreamHandle stream, FaBeatGrid* grid, FaTempoSegment* segments, uint capacity, uint* count);
+
     // ---- Tags --------------------------------------------------------------
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_tags_read_path(string path, uint flags, out nint tags);

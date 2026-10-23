@@ -124,13 +124,24 @@ static uint64_t midi_key(fa_source* src, const fa_decoder_env* env, uint64_t key
     return fa_fnv1a(key, extra, sizeof(extra));
 }
 
-static void cache_path(const fa_scan_job* j, char* out, size_t cap)
+void fa_scan_cache_path(const char* dir, uint64_t key, int64_t size, int32_t track, const char* ext, char* out,
+                        size_t cap)
 {
-    const char* dir = j->engine->config.cache_directory;
     size_t n = strlen(dir);
     const char* sep = (n > 0 && (dir[n - 1] == '/' || dir[n - 1] == '\\')) ? "" : "/";
-    snprintf(out, cap, "%s%s%016llx-%lld-%d.loudness", dir, sep, (unsigned long long)j->key,
-             (long long)j->key_size, (int)j->audio_track);
+    snprintf(out, cap, "%s%s%016llx-%lld-%d.%s", dir, sep, (unsigned long long)key, (long long)size, (int)track, ext);
+}
+
+int fa_scan_cache_key(fa_source* src, const fa_decoder_env* env, uint64_t* out_key)
+{
+    if (!content_key(src, out_key)) return 0;
+    *out_key = midi_key(src, env, *out_key);
+    return 1;
+}
+
+static void cache_path(const fa_scan_job* j, char* out, size_t cap)
+{
+    fa_scan_cache_path(j->engine->config.cache_directory, j->key, j->key_size, j->audio_track, "loudness", out, cap);
 }
 
 /* Values are stored as integers in thousandths so the file never depends on
@@ -177,12 +188,12 @@ static int cache_read(const fa_scan_job* j, fa_loudness* out)
     return 1;
 }
 
-static void cache_write(const fa_scan_job* j, const fa_loudness* l)
+void fa_scan_cache_write_loudness(const char* dir, uint64_t key, int64_t size, int32_t track, const fa_loudness* l)
 {
     char path[1024], tmp[1100];
     FILE* f;
-    fa_mkdir_utf8(j->engine->config.cache_directory);
-    cache_path(j, path, sizeof(path));
+    fa_mkdir_utf8(dir);
+    fa_scan_cache_path(dir, key, size, track, "loudness", path, sizeof(path));
     snprintf(tmp, sizeof(tmp), "%s.%llx.tmp", path, (unsigned long long)fa_thread_current_id());
     f = fa_fopen_utf8(tmp, "wb");
     if (!f) return;
@@ -192,6 +203,11 @@ static void cache_write(const fa_scan_job* j, const fa_loudness* l)
     write_value(f, l->true_peak_dbtp);
     fputc('\n', f);
     if (fclose(f) != 0 || fa_replace_file(tmp, path) != 0) remove(tmp);
+}
+
+static void cache_write(const fa_scan_job* j, const fa_loudness* l)
+{
+    fa_scan_cache_write_loudness(j->engine->config.cache_directory, j->key, j->key_size, j->audio_track, l);
 }
 
 /* ---- Tasks -------------------------------------------------------------------- */
@@ -235,8 +251,8 @@ static int run_prepare(fa_scan_job* j)
             return 1;
         }
     }
-    if (j->engine->config.cache_directory && j->engine->config.cache_directory[0] && content_key(&src, &j->key)) {
-        j->key = midi_key(&src, &j->env, j->key);
+    if (j->engine->config.cache_directory && j->engine->config.cache_directory[0] &&
+        fa_scan_cache_key(&src, &j->env, &j->key)) {
         j->have_key = 1;
         j->key_size = src.length;
         if (cache_read(j, &j->result)) {

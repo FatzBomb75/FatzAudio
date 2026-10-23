@@ -77,7 +77,18 @@ struct fa_tracker {
     fa_atomic64 rows_w, runs_w;
     int64_t last_value;         /* the run's last entry, -1 = none yet */
     int log_after;              /* at open: note the first row after the first read */
+
+    /* Grid recording (fa_tracker_grid_start): every new row with its tempo. */
+    struct grid_row* grid_rows;
+    size_t grid_n, grid_cap;
+    int grid_on, grid_failed;
 };
+
+typedef struct grid_row {
+    fa_frames frame;            /* noted within FA_TRACKER_STEP frames after the row starts */
+    double bpm;                 /* libopenmpt's tempo of the row, in beats */
+    int32_t rows_per_beat;
+} grid_row;
 
 /* ---- Row log ---- */
 
@@ -103,6 +114,26 @@ static void set_run_end(struct fa_tracker* t, fa_frames end)
     fa_store64(&t->runs[(fa_load64(&t->runs_w) - 1) % FA_TRACKER_RUNS].end, end);
 }
 
+#define FA_TRACKER_GRID_MAX 100000  /* segments of an exact grid, at most */
+
+static void grid_note(struct fa_tracker* t, fa_frames frame)
+{
+    grid_row* g;
+    int32_t rpb = openmpt_module_get_pattern_rows_per_beat(t->mod, openmpt_module_get_current_pattern(t->mod));
+    if (t->grid_failed) return;
+    if (t->grid_n == t->grid_cap) {
+        size_t cap = t->grid_cap ? t->grid_cap * 2 : 1024;
+        grid_row* grown = (grid_row*)realloc(t->grid_rows, cap * sizeof(grid_row));
+        if (!grown) { t->grid_failed = 1; return; }
+        t->grid_rows = grown;
+        t->grid_cap = cap;
+    }
+    g = &t->grid_rows[t->grid_n++];
+    g->frame = frame;
+    g->bpm = openmpt_module_get_current_estimated_bpm(t->mod);
+    g->rows_per_beat = rpb > 0 ? rpb : 4;
+}
+
 /* The row playing at `frame` (libopenmpt's current one), noted if it is new. */
 static void log_row(struct fa_tracker* t, fa_frames frame)
 {
@@ -126,6 +157,7 @@ static void log_row(struct fa_tracker* t, fa_frames frame)
     fa_store64(&e->tag, i);
     fa_store64(&t->rows_w, i + 1);
     t->last_value = v;
+    if (t->grid_on) grid_note(t, frame);
 }
 
 /* A run from `start`, where libopenmpt now is (after a seek): its row is known
@@ -383,6 +415,7 @@ static void tracker_free(struct fa_tracker* t)
     uint32_t i;
     if (!t) return;
     if (t->ext) openmpt_module_ext_destroy(t->ext);
+    free(t->grid_rows);
     free(t->message);
     for (k = 0; k <= FA_TRACKER_TEXT_SUBSONG; k++) {
         for (i = 0; i < t->name_count[k]; i++) free(t->names[k][i]);
@@ -760,4 +793,98 @@ FA_API fa_result FA_CALL fa_stream_get_tracker_channel_mute(fa_stream* stream, u
         return FA_ERROR_INVALID_ARG;
     *out_muted = (int32_t)(((uint64_t)fa_load64(&stream->tracker->mute) >> channel) & 1);
     return FA_OK;
+}
+
+/* ---- Exact beat grid ------------------------------------------------------------ */
+
+fa_result fa_tracker_grid_start(struct fa_tracker* t)
+{
+    if (t->pos != 0 || t->grid_on) return FA_ERROR_INVALID_ARG;
+    t->grid_on = 1;
+    return FA_OK;
+}
+
+/* Rows are only noted to within FA_TRACKER_STEP frames: a row noted at frame F
+ * started in [F - STEP, F - 1] (the song's first row at 0). Within a run of rows
+ * at one tempo every row lasts the same, exactly known from the tempo, so each
+ * noted row narrows down where the run started; a run ends where the tempo
+ * changes or the rows stop fitting (a pattern delay). Each run is a segment;
+ * beats count rows. A tempo change can land after the first tick of its row (MOD
+ * files change it on the second tick, as ProTracker did): the segment then starts
+ * at the next row, where the new tempo holds for a whole row. */
+fa_result fa_tracker_grid_finish(struct fa_tracker* t, fa_frames length, fa_grid_data* out)
+{
+    size_t i, n = 0, cap, first = 0;
+    double beat = 0.0, run_beat = 0.0, lo = 0.0, hi = 0.0, len = 0.0;
+    memset(out, 0, sizeof(*out));
+    t->grid_on = 0;
+    if (t->grid_failed) return FA_ERROR_OUT_OF_MEMORY;
+    if (t->grid_n == 0 || !(t->grid_rows[0].bpm > 0.0)) return FA_ERROR_NOT_FOUND;
+    cap = t->grid_n < FA_TRACKER_GRID_MAX ? t->grid_n : FA_TRACKER_GRID_MAX;
+    out->segs = (fa_tempo_segment*)malloc(cap * sizeof(fa_tempo_segment));
+    if (!out->segs) return FA_ERROR_OUT_OF_MEMORY;
+    for (i = 0; i <= t->grid_n; i++) {
+        const grid_row* r = i < t->grid_n ? &t->grid_rows[i] : NULL;
+        int same = 0;
+        double k = 0.0, nlo = 0.0, nhi = 0.0;
+        if (r && i > first) {
+            const grid_row* f = &t->grid_rows[first];
+            k = (double)(i - first);
+            nlo = (double)(r->frame - FA_TRACKER_STEP) - k * len;
+            nhi = (double)(r->frame - 1) - k * len;
+            if (nlo < lo) nlo = lo;
+            if (nhi > hi) nhi = hi;
+            same = r->bpm == f->bpm && r->rows_per_beat == f->rows_per_beat && nlo <= nhi + 2.0;
+        }
+        if (same) {
+            lo = nlo;
+            hi = nhi;
+        } else {
+            if (i > 0) {   /* the run that ends here */
+                if (n == cap) break;
+                out->segs[n].start = (fa_frames)llround((lo + hi) / 2.0);
+                out->segs[n].bpm = t->grid_rows[first].bpm;
+                out->segs[n].beat = run_beat;
+                n++;
+            }
+            if (!r) break;
+            first = i;
+            run_beat = beat;
+            len = r->bpm > 0.0 ? 60.0 / (r->bpm * r->rows_per_beat) * t->rate : 0.0;
+            lo = i == 0 ? 0.0 : (double)(r->frame - FA_TRACKER_STEP);
+            hi = i == 0 ? 0.0 : (double)(r->frame - 1);
+        }
+        if (r) beat += 1.0 / r->rows_per_beat;
+    }
+    /* A row without a tempo (cannot happen with libopenmpt's estimate) ends it all. */
+    while (n > 0 && !(out->segs[n - 1].bpm > 0.0)) n--;
+    if (n == 0) { fa_grid_data_free(out); return FA_ERROR_NOT_FOUND; }
+    out->grid.struct_size = sizeof(fa_beat_grid);
+    out->grid.sample_rate = t->rate;
+    out->grid.first_beat = out->segs[0].start;
+    out->grid.beats_per_bar = 4;
+    out->grid.confidence = 1.0f;
+    out->grid.flags = FA_GRID_EXACT;
+    out->grid.segment_count = (uint32_t)n;
+    fa_grid_data_finish(out, length);
+    return FA_OK;
+}
+
+fa_result fa_tracker_grid_render(fa_decoder* dec, fa_grid_data* out)
+{
+    struct fa_tracker* t = fa_tracker_of(dec);
+    float* buf;
+    fa_frames got;
+    fa_result r;
+    memset(out, 0, sizeof(*out));
+    if (!t) return FA_ERROR_INVALID_ARG;
+    r = fa_tracker_grid_start(t);
+    if (r != FA_OK) return r;
+    /* The timing does not depend on how samples are interpolated: the cheapest. */
+    fa_store32(&t->interpolation, 1);
+    buf = (float*)malloc(4096 * 2 * sizeof(float));
+    if (!buf) return FA_ERROR_OUT_OF_MEMORY;
+    while (tracker_read(dec, buf, 4096, &got) == FA_OK && got > 0) {}
+    free(buf);
+    return fa_tracker_grid_finish(t, t->length, out);
 }

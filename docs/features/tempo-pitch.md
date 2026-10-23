@@ -118,4 +118,4 @@ Both take `--tempo` (multiplier), `--pitch` (semitones) and `--rate` (multiplier
 - `fa_stream_get_param` returns the value being applied now. A value you just set reads back at once, but is heard after the latency above.
 - A forward-only stream (an HTTP download without range requests) can't re-render from the position being heard, so the first change on it is heard after the whole decode-ahead buffer.
 - Extreme settings (tempo below 0.25 or above 4, pitch beyond an octave) work but sound processed with any stretcher; keep_formants helps voices most within about ±5 semitones.
-- Reverse playback and BPM detection from bass_fx are not available yet.
+- Reverse playback from bass_fx is not available yet. BPM and beat detection is [track analysis](analysis.md).

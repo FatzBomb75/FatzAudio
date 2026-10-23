@@ -465,6 +465,7 @@ typedef struct midi_sysex {
 enum { MODE_GM, MODE_GM2, MODE_GS, MODE_XG };
 
 struct fa_midi {
+    int smpte;                  /* SMPTE time division: no tempo, so no beat grid */
     fa_soundfont* font;         /* a reference */
     tsf* synth;
     uint32_t rate;
@@ -1192,6 +1193,7 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
     double rate = (double)m->rate;
 
     m->info.format = smf[9];
+    m->smpte = (smf[12] & 0x80) != 0;
     m->info.tracks = ((uint32_t)smf[10] << 8) | smf[11];
     text_per_track = (uint32_t*)calloc(m->info.tracks ? m->info.tracks : 1, 2 * sizeof(uint32_t));
     if (!text_per_track) return FA_ERROR_OUT_OF_MEMORY;
@@ -1530,5 +1532,60 @@ FA_API fa_result FA_CALL fa_stream_get_midi_channel_mute(fa_stream* stream, uint
 {
     if (!stream || !out_muted || !stream->midi || channel > 15) return FA_ERROR_INVALID_ARG;
     *out_muted = (fa_load32(&stream->midi->mute) >> channel) & 1;
+    return FA_OK;
+}
+
+/* ---- Exact beat grid ---------------------------------------------------------- */
+
+/* Beats are quarter notes, as MIDI tempos count them; a tempo change opens a
+ * segment. Bars are known when the file keeps one time signature from the start,
+ * or has none (4/4 then, as the standard says). */
+fa_result fa_midi_exact_grid(const struct fa_midi* m, fa_grid_data* out)
+{
+    uint32_t i, n = 0, sigs = 0;
+    int32_t num = 4, den = 4, late = 0;
+    double us = 500000.0, beat = 0.0;     /* 120 bpm until the first tempo event */
+    fa_frames at = 0;
+    memset(out, 0, sizeof(*out));
+    if (m->smpte) return FA_ERROR_NOT_FOUND;
+    out->segs = (fa_tempo_segment*)malloc(((size_t)m->nmarks + 1) * sizeof(fa_tempo_segment));
+    if (!out->segs) return FA_ERROR_OUT_OF_MEMORY;
+    out->segs[n].start = 0;
+    out->segs[n].bpm = 120.0;
+    out->segs[n].beat = 0.0;
+    n++;
+    for (i = 0; i < m->nmarks; i++) {
+        const fa_midi_mark* k = &m->marks[i];
+        if (k->type == FA_MIDI_MARK_TIME_SIGNATURE) {
+            if (sigs == 0 && k->frame > 0) late = 1;
+            if (sigs == 0 || k->value != num || k->value2 != den) sigs++;
+            num = k->value;
+            den = k->value2;
+            continue;
+        }
+        if (k->type != FA_MIDI_MARK_TEMPO || k->value <= 0) continue;
+        beat += (double)(k->frame - at) / m->rate * 1e6 / us;
+        if (fabs(beat - floor(beat + 0.5)) < 1e-4) beat = floor(beat + 0.5);
+        at = k->frame;
+        us = (double)k->value;
+        if (out->segs[n - 1].start == at) n--;          /* a later event at the same time wins */
+        else if (out->segs[n - 1].bpm == 60000000.0 / us) continue;   /* the same tempo again */
+        out->segs[n].start = at;
+        out->segs[n].bpm = 60000000.0 / us;
+        out->segs[n].beat = beat;
+        n++;
+    }
+    out->grid.struct_size = sizeof(fa_beat_grid);
+    out->grid.sample_rate = m->rate;
+    out->grid.first_beat = 0;
+    out->grid.confidence = 1.0f;
+    out->grid.flags = FA_GRID_EXACT;
+    out->grid.segment_count = n;
+    out->grid.beats_per_bar = 4;
+    if (sigs <= 1 && !late && (num * 4) % den == 0 && num * 4 / den >= 1) {
+        out->grid.beats_per_bar = (uint32_t)(num * 4 / den);
+        out->grid.flags |= FA_GRID_BARS;
+    }
+    fa_grid_data_finish(out, m->length);
     return FA_OK;
 }

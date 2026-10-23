@@ -1560,6 +1560,63 @@ public unsafe class AudioStream : IDisposable
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_loudness(Handle, in l));
     }
 
+    /// <summary>
+    /// Analyses this stream's file or memory without touching playback (it reads with its own decoder): the beat grid, the
+    /// key, a waveform overview and the loudness, in one pass. MIDI files use the stream's soundfont. Results are cached when
+    /// <see cref="AudioEngineOptions.CacheDirectory"/> is set. Blocks until done: call it from a worker thread, or use
+    /// <see cref="AnalyzeAsync"/>.
+    /// </summary>
+    /// <param name="kinds">What to find out; defaults to the beat grid and the key.</param>
+    /// <param name="options">Tempo range and cache use; null uses the defaults.</param>
+    /// <returns>The result, a plain object with nothing to dispose.</returns>
+    /// <exception cref="FatzAudioException">The stream cannot be read twice (web, push and app I/O streams: <see cref="ErrorCode.NotSeekable"/>), no decoder reads it, or the options are invalid.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public TrackAnalysis Analyze(AnalysisKinds kinds = AnalysisKinds.Beats | AnalysisKinds.Key, AnalysisOptions? options = null) =>
+        TrackAnalysis.Run(Handle, kinds, options);
+
+    /// <summary>
+    /// <see cref="Analyze"/> on a thread-pool thread. Disposing the stream while it runs is safe: the analysis keeps the
+    /// native stream alive until it is done.
+    /// </summary>
+    /// <param name="kinds">What to find out; defaults to the beat grid and the key.</param>
+    /// <param name="options">Tempo range and cache use; null uses the defaults.</param>
+    /// <param name="cancellationToken">Stops the wait (the native analysis, which cannot be interrupted, runs to its end).</param>
+    /// <returns>A task with the result.</returns>
+    /// <exception cref="FatzAudioException">As for <see cref="Analyze"/>, thrown through the task.</exception>
+    /// <exception cref="OperationCanceledException">The token was cancelled.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public Task<TrackAnalysis> AnalyzeAsync(AnalysisKinds kinds = AnalysisKinds.Beats | AnalysisKinds.Key,
+        AnalysisOptions? options = null, CancellationToken cancellationToken = default) =>
+        TrackAnalysis.RunAsync(Handle, h => TrackAnalysis.Run(h, kinds, options), cancellationToken);
+
+    /// <summary>
+    /// The stream's beat grid, for decks (sync, beat loops, aligned mixes). Reading returns the grid set last, else, for MIDI
+    /// files and tracker modules, the exact one from the file (for a module the first read renders it once without sound,
+    /// about 0.25 s for a 4-minute song), else null. Setting one from an analysis (<see cref="TrackAnalysis.Beats"/>), from the
+    /// user's correction or from your library replaces it; setting null removes it (a MIDI or tracker stream then reads its
+    /// file's grid again).
+    /// </summary>
+    /// <exception cref="FatzAudioException">Setting: a tempo outside 0.1..100000, segments that do not start in rising order, a bar offset past the bar, or a confidence outside 0..1 (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    /// <example>
+    /// <code>
+    /// var t = engine.Analyze("song.mp3");
+    /// deck.Stream.BeatGrid = t.Beats;
+    /// </code>
+    /// </example>
+    public BeatGrid? BeatGrid
+    {
+        get => FatzAudio.BeatGrid.FromStream(Handle);
+        set
+        {
+            var h = Handle;
+            if (value is null)
+                FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_beat_grid(h, null, null, 0));
+            else
+                value.Apply(h);
+        }
+    }
+
     /// <summary>Requests a <see cref="PositionReached"/> event when playback reaches a position.</summary>
     /// <param name="position">The position to watch.</param>
     /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
