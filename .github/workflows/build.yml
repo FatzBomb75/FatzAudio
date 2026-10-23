@@ -17,6 +17,18 @@ on:
         type: boolean
         default: false
 
+# A newer push to the same pull request cancels the older run. Runs on main (which
+# publish the NuGet) and manual runs are never cancelled.
+concurrency:
+  group: build-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Every compile goes through ccache (each job restores and saves its own cache).
+env:
+  CMAKE_C_COMPILER_LAUNCHER: ccache
+  CMAKE_CXX_COMPILER_LAUNCHER: ccache
+  CMAKE_OBJC_COMPILER_LAUNCHER: ccache
+
 jobs:
   build:
     strategy:
@@ -27,6 +39,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: hendrikmuhs/ccache-action@v1.2.14
+        with:
+          key: build-${{ matrix.os }}
+          max-size: 500M
+      - name: Count the CPUs
+        shell: bash
+        run: echo "JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)" >> "$GITHUB_ENV"
       - name: Install Linux audio headers and FFmpeg (runtime codecs and the helper test)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libavformat-dev libavcodec-dev libmp3lame0
@@ -35,24 +54,47 @@ jobs:
       - name: Install LAME (macOS)
         if: runner.os == 'macOS'
         run: brew install lame
+      # Only the built libmp3lame.dll is cached (a vcpkg install is over a minute);
+      # bump the key to refresh it.
+      - name: Restore LAME (Windows)
+        id: lame
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/lame
+          key: lame-x64-windows-v1
       - name: Install LAME (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          "$VCPKG_INSTALLATION_ROOT/vcpkg" install mp3lame:x64-windows
-          dll=$(find "$VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin" -iname '*mp3lame*.dll' | head -1)
-          test -n "$dll"
-          mkdir -p "$RUNNER_TEMP/lame"
-          cp "$dll" "$RUNNER_TEMP/lame/libmp3lame.dll"
+          if [ "${{ steps.lame.outputs.cache-hit }}" != "true" ]; then
+            "$VCPKG_INSTALLATION_ROOT/vcpkg" install mp3lame:x64-windows
+            dll=$(find "$VCPKG_INSTALLATION_ROOT/installed/x64-windows/bin" -iname '*mp3lame*.dll' | head -1)
+            test -n "$dll"
+            mkdir -p "$RUNNER_TEMP/lame"
+            cp "$dll" "$RUNNER_TEMP/lame/libmp3lame.dll"
+          fi
+          test -f "$RUNNER_TEMP/lame/libmp3lame.dll"
           cygpath -w "$RUNNER_TEMP/lame" >> "$GITHUB_PATH"
+      # Ninja instead of the Visual Studio generator on Windows: the latter ignores
+      # the compiler launcher, so ccache would never see a compile.
+      - name: Set up the MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1.13.0
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+        run: |
+          gen=()
+          if [ "$RUNNER_OS" = "Windows" ]; then gen=(-G Ninja); fi
+          cmake -S . -B build "${gen[@]}" -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build build --config Release
+        shell: bash
+        run: cmake --build build --config Release --parallel "$JOBS"
       - name: Test
+        shell: bash
         env:
           FA_TEST_REQUIRE_LAME: '1'
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: ctest --test-dir build -C Release -j "$JOBS" --output-on-failure
       # The win-x64 and linux-x64 libraries go into the NuGet package (job "package");
       # the .NET tests below run against these staged copies.
       - name: Stage the native library for the NuGet package
@@ -61,7 +103,7 @@ jobs:
         run: |
           mkdir -p native
           if [ "$RUNNER_OS" = "Windows" ]; then
-            cp build/bin/Release/fatzaudio.dll native/
+            cp build/bin/fatzaudio.dll native/
           else
             cp -L build/bin/libfatzaudio.so native/
             strip --strip-unneeded native/libfatzaudio.so
@@ -140,17 +182,23 @@ jobs:
           --api-key ${{ secrets.GITHUB_TOKEN }}
 
   sanitizers:
-    runs-on: ubuntu-latest
+    # 22.04 like the Linux build: on ubuntu-latest (24.04) this apt install alone
+    # took 15 minutes, on 22.04 about 20 seconds.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+      - uses: hendrikmuhs/ccache-action@v1.2.14
+        with:
+          key: sanitizers
+          max-size: 500M
       - name: Install Linux audio headers and FFmpeg (runtime codecs and the helper test)
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libavformat-dev libavcodec-dev
       - name: Configure (ASan + UBSan)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined"
       - name: Build
-        run: cmake --build build
+        run: cmake --build build --parallel "$(nproc)"
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build -j "$(nproc)" --output-on-failure
 
   # Library only, every Android ABI: checks the .so needs nothing but libc, libm
   # and libdl and exports only fa_*.
@@ -158,6 +206,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: hendrikmuhs/ccache-action@v1.2.14
+        with:
+          key: android
+          max-size: 500M
       - name: Build for every Android ABI
         run: |
           for abi in arm64-v8a x86_64 armeabi-v7a x86; do
@@ -165,7 +217,7 @@ jobs:
               -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
               -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release \
               -DFA_BUILD_TESTS=OFF -DFA_BUILD_TOOLS=OFF
-            cmake --build build-android-$abi
+            cmake --build build-android-$abi --parallel "$(nproc)"
           done
       - name: Check dependencies and exports
         run: |
@@ -187,6 +239,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: hendrikmuhs/ccache-action@v1.2.14
+        with:
+          key: android-test-${{ matrix.abi }}
+          max-size: 500M
       - name: Install qemu-user
         if: matrix.abi == 'arm64-v8a'
         run: sudo apt-get update && sudo apt-get install -y qemu-user-static
@@ -196,7 +252,7 @@ jobs:
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=${{ matrix.abi }} -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release \
             -DFA_BUILD_TOOLS=OFF
-          cmake --build build-android
+          cmake --build build-android --parallel "$(nproc)"
       - name: Test in Android 14
         run: sudo tools/android-test/run.sh build-android
 
@@ -205,5 +261,9 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: hendrikmuhs/ccache-action@v1.2.14
+        with:
+          key: ios
+          max-size: 500M
       - name: Build fatzaudio.xcframework
         run: tools/build-xcframework.sh build-ios

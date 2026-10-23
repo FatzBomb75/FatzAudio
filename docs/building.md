@@ -22,7 +22,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-The library is written to `build/bin/` (`build/bin/Release/` with Visual Studio).
+The library is written to `build/bin/` (`build/bin/Release/` with Visual Studio; CI uses Ninja on Windows, so `build/bin/` there).
 On Windows use the "Visual Studio 18 2026" generator and keep any old compilers
 off `PATH`. Linux needs the ALSA headers for audio output (`libasound2-dev`).
 
