@@ -1024,11 +1024,11 @@ static buf report_midi(const report_song* r, double* out_mean)
     return m;
 }
 
+/* Processor time: the analysis runs on this one thread (and timespec_get is
+ * missing from older Android). */
 static double now_s(void)
 {
-    struct timespec ts;
-    timespec_get(&ts, TIME_UTC);
-    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
+    return (double)clock() / CLOCKS_PER_SEC;
 }
 
 static const char* key_relation(const fa_key_info* got, int tonic, int minor)
