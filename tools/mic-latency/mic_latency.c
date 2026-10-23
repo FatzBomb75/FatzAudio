@@ -16,7 +16,7 @@
  * for reference only).
  *
  * Usage: mic_latency [--list] [--capture N] [--playback N] [--modes normal,low,exclusive]
- *                    [--gain G] [--out results.json] [--selftest]
+ *                    [--gain G] [--out results.json] [--dump prefix] [--selftest]
  * Put the microphone close to a speaker (or a headphone against it), or use a loopback cable from an
  * output to an input. Medium volume is enough. */
 #define MINIAUDIO_IMPLEMENTATION
@@ -258,9 +258,27 @@ typedef struct {
     double loop_median, loop_min, loop_max;
     double ring_fill_ms;
     float loop_match;           /* correlation of the first repeat with the first arrival */
+    int arrival_found;          /* monitor test: the injected chirp was heard */
+    float probe_match;          /* best correlation found for the first repeat, even if too low */
+    double probe_lag_ms;
     ma_uint32 underruns;
     float gain;
 } result;
+
+static const char* g_dump;  /* --dump prefix: write each test's recording as a WAV */
+
+static void write_wav(const char* path, const float* x, ma_uint64 n, ma_uint32 rate)
+{
+    FILE* f = fopen(path, "wb");
+    ma_uint32 v, data = (ma_uint32)(n * 4);
+    ma_uint16 h;
+    if (!f) return;
+    fwrite("RIFF", 1, 4, f); v = 36 + data; fwrite(&v, 4, 1, f); fwrite("WAVEfmt ", 1, 8, f);
+    v = 16; fwrite(&v, 4, 1, f); h = 3; fwrite(&h, 2, 1, f); h = 1; fwrite(&h, 2, 1, f);
+    fwrite(&rate, 4, 1, f); v = rate * 4; fwrite(&v, 4, 1, f); h = 4; fwrite(&h, 2, 1, f); h = 32; fwrite(&h, 2, 1, f);
+    fwrite("data", 1, 4, f); fwrite(&data, 4, 1, f); fwrite(x, 4, (size_t)n, f);
+    fclose(f);
+}
 
 static int g_iac3_count;
 static void on_log(void* user, ma_uint32 level, const char* msg)
@@ -324,6 +342,7 @@ static void analyze(spike* s, int pass, result* res)
         ma_uint64 p0;
         float a0;
         ma_uint32 np = find_peaks(s, cor, n, 0.5f, s->chirp_len * 2, rate / 2, &p0, &a0, 1), i;
+        res->arrival_found = np > 0;
         if (np) {
             ma_uint32 w = rate / 25;
             ma_uint64 min_lag = (ma_uint64)res->cap_period + res->play_period, max_lag = rate * 2 / 5, at = p0;
@@ -347,6 +366,10 @@ static void analyze(spike* s, int pass, result* res)
                         best = c;
                         best_lag = lag;
                     }
+                }
+                if (i == 0) {
+                    res->probe_match = (float)best;
+                    res->probe_lag_ms = (double)best_lag * 1000.0 / rate;
                 }
                 if (best < 0.3) break;
                 d[res->loop_n++] = (double)best_lag * 1000.0 / rate;
@@ -470,6 +493,11 @@ static void run_mode(ma_context* ctx, const char* mode, ma_device_id* cap_id, ma
         ma_device_uninit(&cap);
 
         analyze(s, pass, res);
+        if (g_dump) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s-%s-%s.wav", g_dump, mode, pass ? "monitor" : "roundtrip");
+            write_wav(path, s->rec, s->rec_len, rate);
+        }
         if (pass == 1) ma_pcm_rb_uninit(&s->ring);
         free(s->chirp);
         free(s->rec);
@@ -575,6 +603,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--modes") && i + 1 < (ma_uint32)argc) modes = argv[++i];
         else if (!strcmp(argv[i], "--out") && i + 1 < (ma_uint32)argc) out_path = argv[++i];
         else if (!strcmp(argv[i], "--gain") && i + 1 < (ma_uint32)argc) gain = (float)atof(argv[++i]);
+        else if (!strcmp(argv[i], "--dump") && i + 1 < (ma_uint32)argc) g_dump = argv[++i];
         else {
             fprintf(stderr, "usage: %s [--list] [--capture N] [--playback N] [--modes normal,low,exclusive] [--gain G] [--out file]\n", argv[0]);
             return 2;
@@ -626,7 +655,8 @@ int main(int argc, char** argv)
                     printf("  monitor loop (mic -> speaker + air): median %.1f ms, min %.1f, max %.1f (%d repeats, match %.2f), gain %.1f, ring %.1f ms, underruns %u\n",
                            r->loop_median, r->loop_min, r->loop_max, r->loop_n, r->loop_match, r->gain, r->ring_fill_ms, r->underruns);
                 else if (r->rt_n)
-                    printf("  monitor loop: no repeats found (gain %.1f); try --gain with a higher value\n", r->gain);
+                    printf("  monitor loop: no repeats found (gain %.1f, chirp heard: %s, best match %.2f at %.1f ms, ring %.1f ms, underruns %u)\n",
+                           r->gain, r->arrival_found ? "yes" : "no", r->probe_match, r->probe_lag_ms, r->ring_fill_ms, r->underruns);
                 if (r->error[0]) printf("  %s\n", r->error);
             }
         }
