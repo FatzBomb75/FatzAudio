@@ -22,6 +22,7 @@
 #include "surface_fx.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -29,6 +30,12 @@
 #define LY_DESIGN_H 1080u
 #define LY_CACHE 24
 #define LY_MS 1000000LL
+/* The intro's top and bottom bands, its card, the ending card. */
+#define LY_PAGES 4
+enum { PG_TOP = 0, PG_BOTTOM, PG_CARD, PG_END };
+#define LY_MAX_INST (LY_MAX_SHOW + LY_PAGES)
+/* ly_inst.line of a page. */
+#define LY_PAGE_LINE 0x80000000u
 
 /* ---- the style ------------------------------------------------------------------ */
 
@@ -92,6 +99,19 @@ FA_API void FA_CALL fa_lyric_style_init(fa_lyric_style* st, fa_lyric_preset pres
     st->effects.shadow.size = 0.0f;
     st->effects.shadow.distance = 0.26f;
     st->effects.shadow.angle_degrees = 315.0f;
+    st->intro_page = 1;
+    st->ending_page = 1;
+    st->intro_start_ms = 1000;
+    st->intro_fade_ms = 1000;
+    st->intro_clear_ms = 3000;
+    st->intro_band_ms = 8000;
+    st->ending_min_ms = 3000;
+    st->ending_fade_ms = 750;
+    st->card_color = 0xE00E131Cu;
+    st->card_accent = 0xFF78DCE8u;
+    st->title_color = 0xFFFFF4DCu;
+    st->info_color = 0xFFD5DCE6u;
+    st->copyright_color = 0xFFB8A87Au;
     switch (preset) {
     case FA_LYRIC_MODERN:
         st->wipe = FA_WIPE_SWEEP;
@@ -169,7 +189,10 @@ int fa_lyric_style_valid(const fa_lyric_style* s)
            ims(s->end_fade_ms, 0, 60000) && (uint32_t)s->countdown <= FA_COUNTDOWN_BEAT &&
            ims(s->countdown_count, 1, 8) && ims(s->countdown_ms, 1000, 20000) && ims(s->countdown_gap_ms, 0, 60000) &&
            in(s->countdown_size, 0.2f, 1.5f) && ims(s->panel, 0, 1) && in(s->panel_padding, 0.0f, 1.0f) &&
-           in(s->panel_radius, 0.0f, 1.0f) && ims(s->subtitle_mode, 0, 1) && fa_fx_valid(&s->effects);
+           in(s->panel_radius, 0.0f, 1.0f) && ims(s->subtitle_mode, 0, 1) && fa_fx_valid(&s->effects) &&
+           ims(s->intro_page, 0, 1) && ims(s->ending_page, 0, 1) && ims(s->intro_start_ms, 0, 60000) &&
+           ims(s->intro_fade_ms, 0, 60000) && ims(s->intro_clear_ms, 0, 60000) && ims(s->intro_band_ms, 0, 60000) &&
+           ims(s->ending_min_ms, 0, 60000) && ims(s->ending_fade_ms, 0, 60000);
 }
 
 /* ---- the surface's state -------------------------------------------------------- */
@@ -191,9 +214,10 @@ typedef struct ly_layer {
     int pw_valid;
 } ly_layer;
 
-/* A line placed in one frame. */
+/* A line or a page placed in one frame. */
 typedef struct ly_inst {
-    uint32_t line;
+    uint32_t line;                /* LY_PAGE_LINE + page for a page */
+    int page;                     /* PG_*, or -1 for a line */
     int outgoing;
     float cx, cy, sc, op;         /* its centre in bitmap pixels */
     ly_wipe wipe;
@@ -220,16 +244,27 @@ struct fa_lyric {
     fa_midi_mark* tempos;
     uint32_t ntempos;
     fa_time duration;
-    /* The font. */
+    fa_midi_credits cr;
+    int named;                    /* the song names a title or an artist */
+    /* The font, and a regular weight of its family for the pages' smaller text (NULL:
+     * the font). */
     fa_font* font;
     float bold;                   /* synthetic bold, em */
+    fa_font* font2;
+    float bold2;
     char font_used[128];
+    char* fallback;
+    char* labels;
+    char* label_buf;
+    const char* label[6];         /* Length, Key, Tempo, Timing, Written By, Lyricist */
     /* Layout, for area_w x area_h. */
     int laid;
     uint32_t area_w, area_h;
     float em, pitch, anchor, line_h, asc;
     float tri, tri_w, arrow_gap, arrow_lift;
     int pad;
+    int pages;                    /* an intro or ending page may show: the bitmap is the area */
+    int block_w;                  /* the lyric block's width (a growing line fits it) */
     int bx, by, bw, bh;           /* the bitmap in the area */
     int content[4];
     uint64_t layout_revision;
@@ -248,11 +283,14 @@ struct fa_lyric {
     uint64_t revision;
     fa_surface_history hist;
     int full;                     /* the next frame redraws everything */
-    ly_inst prev[LY_MAX_SHOW];
+    ly_inst prev[LY_MAX_INST];
     uint32_t nprev;
     ly_layer cache[LY_CACHE];
     uint64_t stamp;
     ly_layer arrow;
+    ly_layer pg[LY_PAGES];        /* drawn when first shown; placed with (cx, cy) = (0, 0) */
+    int pg_failed[LY_PAGES];      /* could not be drawn (memory): left out until the next layout */
+    float pg_x[LY_PAGES], pg_y[LY_PAGES];
     fa_path gpath;
     fa_raster ras;
     float* tmp;
@@ -286,6 +324,10 @@ static void cache_clear(fa_lyric* l)
     int i;
     for (i = 0; i < LY_CACHE; i++) layer_clear(&l->cache[i]);
     layer_clear(&l->arrow);
+    for (i = 0; i < LY_PAGES; i++) {
+        layer_clear(&l->pg[i]);
+        l->pg_failed[i] = 0;
+    }
     l->nprev = 0;
 }
 
@@ -313,15 +355,15 @@ static uint32_t next_cp(const char* s, uint32_t len, uint32_t* i)
 /* Pen positions of a line's text, in em (font size 1): x[b] for each byte b that
  * starts a character, and x[len] the end. Glyphs into `g` (one per character, at
  * its first byte; others 0). Returns the width. */
-static float shape(const fa_lyric* l, const char* text, uint32_t len, float* x, uint32_t* g)
+static float shape_with(fa_font* font, float bold, const char* text, uint32_t len, float* x, uint32_t* g)
 {
-    const fa_font_info* in = fa_font_get_info(l->font);
-    float upem = (float)in->units_per_em, pen = 0.0f, extra = 2.0f * l->bold;
+    const fa_font_info* in = fa_font_get_info(font);
+    float upem = (float)in->units_per_em, pen = 0.0f, extra = 2.0f * bold;
     uint32_t i = 0, prev = 0;
     int have = 0;
     while (i < len) {
-        uint32_t at = i, cp = next_cp(text, len, &i), gid = fa_font_glyph(l->font, cp), b;
-        if (have) pen += (float)fa_font_kerning(l->font, prev, gid) / upem;
+        uint32_t at = i, cp = next_cp(text, len, &i), gid = fa_font_glyph(font, cp), b;
+        if (have) pen += (float)fa_font_kerning(font, prev, gid) / upem;
         if (x) {
             x[at] = pen;
             for (b = at + 1; b < i; b++) x[b] = pen;
@@ -330,12 +372,17 @@ static float shape(const fa_lyric* l, const char* text, uint32_t len, float* x, 
             g[at] = gid;
             for (b = at + 1; b < i; b++) g[b] = UINT32_MAX;
         }
-        pen += (float)fa_font_advance(l->font, gid) / upem + extra;
+        pen += (float)fa_font_advance(font, gid) / upem + extra;
         prev = gid;
         have = 1;
     }
     if (x) x[len] = pen;
     return pen;
+}
+
+static float shape(const fa_lyric* l, const char* text, uint32_t len, float* x, uint32_t* g)
+{
+    return shape_with(l->font, l->bold, text, len, x, g);
 }
 
 static float measure_design(void* ctx, const char* text, uint32_t len)
@@ -458,6 +505,12 @@ static fa_result read_song(fa_lyric* l, fa_stream* s)
         l->ntempos = k;
     }
     if (fa_stream_get_info(s, &si) == FA_OK && si.duration > 0) l->duration = si.duration;
+    l->cr.struct_size = (uint32_t)sizeof(l->cr);
+    if (fa_stream_get_midi_credits(s, &l->cr) != FA_OK) {
+        memset(&l->cr, 0, sizeof(l->cr));
+        l->cr.struct_size = (uint32_t)sizeof(l->cr);
+    }
+    l->named = l->cr.title[0] || l->cr.artist[0];
     return FA_OK;
 }
 
@@ -508,6 +561,14 @@ static void params_make(const fa_lyric* l, double tempo, ly_params* p)
     p->page_in_scale = s->page_in_scale;
     p->page_out_scale = s->page_out_scale;
     p->duration = l->duration;
+    p->intro = !s->subtitle_mode && s->intro_page && (l->named || (l->fallback && l->fallback[0]));
+    p->ending = !s->subtitle_mode && s->ending_page && l->named;
+    p->intro_start = RT(s->intro_start_ms);
+    p->intro_fade = RT(s->intro_fade_ms);
+    p->intro_clear = RT(s->intro_clear_ms);
+    p->intro_band = RT(s->intro_band_ms);
+    p->ending_min = RT(s->ending_min_ms);
+    p->ending_fade = RT(s->ending_fade_ms);
 #undef RT
 }
 
@@ -616,6 +677,20 @@ static fa_result layout(fa_lyric* l, uint32_t aw, uint32_t ah, double tempo)
     if (x1 > W) x1 = W;
     if (top < 0.0f) top = 0.0f;
     if (bottom > H) bottom = H;
+    /* The content: the lyric block less its padding. */
+    {
+        int t = (int)floorf(top), b = (int)ceilf(bottom), p = l->pad < (b - t) / 2 ? l->pad : 0;
+        l->content[1] = t + p;
+        l->content[3] = b - t - 2 * p;
+    }
+    /* Pages are drawn anywhere in the area: then the bitmap is all of it. */
+    l->block_w = (int)ceilf(x1) - (int)floorf(x0);
+    l->pages = l->tl.n && (l->prm.intro || l->prm.ending);
+    if (l->pages) {
+        x0 = top = 0.0f;
+        x1 = W;
+        bottom = H;
+    }
     l->bx = (int)floorf(x0);
     l->by = (int)floorf(top);
     l->bw = (int)ceilf(x1) - l->bx;
@@ -626,8 +701,7 @@ static fa_result layout(fa_lyric* l, uint32_t aw, uint32_t ah, double tempo)
     if (l->content[0] < 0) l->content[0] = 0;
     l->content[2] = (int)ceilf(boxw);
     if (l->content[0] + l->content[2] > l->bw) l->content[2] = l->bw - l->content[0];
-    l->content[1] = l->pad < l->bh / 2 ? l->pad : 0;
-    l->content[3] = l->bh - 2 * l->content[1];
+    l->content[1] -= l->by;
     {
         uint8_t* m = (uint8_t*)realloc(l->master, (size_t)l->bw * (size_t)l->bh * 4);
         if (!m) return FA_ERROR_OUT_OF_MEMORY;
@@ -897,7 +971,9 @@ static float seg_mix(const ly_wipe* w, uint32_t j)
     return (int)j == w->current ? w->mix : 0.0f;
 }
 
-static int same(float a, float b) { return fabsf(a - b) < 1e-4f; }
+/* Exactly: a frame left out for a tiny step would leave the next ones drawn from a
+ * place a fresh draw would not use. */
+static int same(float a, float b) { return a == b; }
 
 /* Colours columns [c0, c1) of a layer's picture from its masks: a line's colours at
  * its wipe (`line` set) or one colour (an arrow). */
@@ -1047,6 +1123,30 @@ static void draw_place(fa_lyric* l, const ly_layer* L, float cx, float cy, float
     if (dx1 < x1) x1 = dx1;
     if (dy1 < y1) y1 = dy1;
     if (x0 >= x1 || y0 >= y1 || op <= 0.0f) return;
+    if (sc == 1.0f && cx - L->cx == floorf(cx - L->cx) && cy - L->cy == floorf(cy - L->cy)) {
+        /* On whole pixels at full size (a page): the picture itself, at op. */
+        int ox = (int)(cx - L->cx), oy = (int)(cy - L->cy);
+        for (y = y0; y < y1; y++) {
+            int v = y - oy, a, b;
+            uint8_t* d;
+            const uint8_t* src;
+            if (v < 0 || v >= L->h) continue;
+            a = L->span[2 * v] + ox;
+            b = L->span[2 * v + 1] + ox;
+            if (a < x0) a = x0;
+            if (b > x1) b = x1;
+            d = l->master + ((size_t)y * (size_t)l->bw + (size_t)a) * 4;
+            src = L->px + ((size_t)v * (size_t)L->w + (size_t)(a - ox)) * 4;
+            for (x = a; x < b; x++, d += 4, src += 4) {
+                float keep = 1.0f - (float)src[3] * op / 255.0f;
+                for (k = 0; k < 4; k++) {
+                    float m = (float)src[k] * op + (float)d[k] * keep + 0.5f;
+                    d[k] = (uint8_t)(m >= 255.0f ? 255.0f : m);
+                }
+            }
+        }
+        return;
+    }
     cols = (taps*)malloc((size_t)(x1 - x0) * sizeof(taps));
     if (!cols) return;
     /* Per output column its taps; the source columns they read: [ua, ub). */
@@ -1120,6 +1220,517 @@ static void draw_place(fa_lyric* l, const ly_layer* L, float cx, float cy, float
     free(cols);
 }
 
+/* ---- the intro and ending pages ------------------------------------------------- */
+
+/* A line of a page's text: bytes [a, a + n), w pixels wide. */
+typedef struct ly_tline {
+    uint32_t a, n;
+    float w;
+} ly_tline;
+
+#define LY_TLINES 16
+
+/* A block of a page's text, centred in its width, wrapped between words and at "\n",
+ * cut to the lines that fit max_h (one at least). */
+typedef struct ly_text {
+    fa_font* font;
+    float bold, size, shadow, max_h;
+    const char* s;
+    uint32_t color;
+    int italic;
+    ly_tline ln[LY_TLINES];
+    int n;
+    float lh, asc, h;
+} ly_text;
+
+static float shape_px(const ly_text* t, uint32_t a, uint32_t n)
+{
+    return shape_with(t->font, t->bold, t->s + a, n, NULL, NULL) * t->size;
+}
+
+static void text_wrap(ly_text* t, float max_w)
+{
+    const fa_font_info* fi = fa_font_get_info(t->font);
+    uint32_t len = (uint32_t)strlen(t->s), p = 0;
+    t->n = 0;
+    t->lh = (float)(fi->ascender - fi->descender) / (float)fi->units_per_em * t->size;
+    t->asc = (float)fi->ascender / (float)fi->units_per_em * t->size;
+    if (!(t->lh > 0.0f)) {
+        t->lh = 1.2f * t->size;
+        t->asc = 0.9f * t->size;
+    }
+    while (p < len && t->n < LY_TLINES) {
+        uint32_t e = p, a = p;
+        while (e < len && t->s[e] != '\n' && t->s[e] != '\r') e++;
+        for (;;) {
+            uint32_t end = 0, q;
+            float w = 0.0f;
+            while (a < e && t->s[a] == ' ') a++;
+            if (a >= e || t->n >= LY_TLINES) break;
+            /* The most words from a that fit; a word wider than the width alone. */
+            for (q = a; q < e;) {
+                uint32_t r = q, wq;
+                float ww;
+                while (r < e && t->s[r] == ' ') r++;
+                if (r >= e) break;            /* only spaces left */
+                while (r < e && t->s[r] != ' ') r++;
+                wq = r;
+                ww = shape_px(t, a, wq - a);
+                if (end && ww > max_w) break;
+                end = wq;
+                w = ww;
+                q = r;
+            }
+            t->ln[t->n].a = a;
+            t->ln[t->n].n = end - a;
+            t->ln[t->n].w = w;
+            t->n++;
+            a = end;
+        }
+        p = e + 1;
+    }
+    while (t->n > 1 && (float)t->n * t->lh > t->max_h) t->n--;
+    t->h = (float)t->n * t->lh;
+}
+
+/* A page is drawn into floats, premultiplied B G R A 0..1, then made the layer's
+ * picture. */
+typedef struct ly_canvas {
+    float* px;
+    int w, h;
+} ly_canvas;
+
+/* A rounded rectangle's coverage at pixel centres: filled, or a `stroke` wide line
+ * along its edge; colour 0xAARRGGBB with its alpha times k. */
+static void cv_rect(ly_canvas* cv, float x0, float y0, float x1, float y1, float radius, uint32_t argb, float k, float stroke)
+{
+    float c[4], hw = (x1 - x0) / 2.0f, hh = (y1 - y0) / 2.0f, cx = (x0 + x1) / 2.0f, cy = (y0 + y1) / 2.0f;
+    float reach = stroke / 2.0f + 1.0f;
+    int x, y, xa = (int)floorf(x0 - reach), xb = (int)ceilf(x1 + reach), ya = (int)floorf(y0 - reach), yb = (int)ceilf(y1 + reach);
+    if (hw <= 0.0f || hh <= 0.0f) return;
+    if (radius > hw) radius = hw;
+    if (radius > hh) radius = hh;
+    if (radius < 0.0f) radius = 0.0f;
+    if (xa < 0) xa = 0;
+    if (ya < 0) ya = 0;
+    if (xb > cv->w) xb = cv->w;
+    if (yb > cv->h) yb = cv->h;
+    color_mix(argb, argb, 0.0f, k, c);
+    if (radius <= 0.0f && stroke <= 0.0f) {
+        /* Square corners: each pixel's exact area, row times column. */
+        for (y = ya; y < yb; y++) {
+            float ry = fminf((float)y + 1.0f, y1) - fmaxf((float)y, y0);   /* at most 1, as rx */
+            if (ry <= 0.0f) continue;
+            for (x = xa; x < xb; x++) {
+                float rx = fminf((float)x + 1.0f, x1) - fmaxf((float)x, x0);
+                if (rx > 0.0f) over(cv->px + ((size_t)y * (size_t)cv->w + (size_t)x) * 4, c, rx * ry);
+            }
+        }
+        return;
+    }
+    for (y = ya; y < yb; y++)
+        for (x = xa; x < xb; x++) {
+            float qx = fabsf((float)x + 0.5f - cx) - (hw - radius), qy = fabsf((float)y + 0.5f - cy) - (hh - radius);
+            float ox = qx > 0.0f ? qx : 0.0f, oy = qy > 0.0f ? qy : 0.0f;
+            float d = sqrtf(ox * ox + oy * oy) + (qx > qy ? (qx < 0.0f ? qx : 0.0f) : (qy < 0.0f ? qy : 0.0f)) - radius;
+            float a = stroke > 0.0f ? stroke / 2.0f + 0.5f - fabsf(d) : 0.5f - d;
+            if (a > 0.0f) over(cv->px + ((size_t)y * (size_t)cv->w + (size_t)x) * 4, c, a > 1.0f ? 1.0f : a);
+        }
+}
+
+/* One line of text with its baseline at y, from x: a shadow (when `shadow` > 0, that
+ * many pixels down and right, black at 82 %), then the text, each rasterized over the
+ * line's own box. 0 when out of memory. */
+static int cv_line(fa_lyric* l, ly_canvas* cv, const ly_text* t, uint32_t a, uint32_t n, float x, float y, float w)
+{
+    const fa_font_info* fi = fa_font_get_info(t->font);
+    float gs = t->size / (float)fi->units_per_em, grow = t->bold * t->size;
+    float* xs = (float*)malloc(((size_t)n + 1) * sizeof(float));
+    uint32_t* g = (uint32_t*)malloc(((size_t)n + 1) * sizeof(uint32_t));
+    int pass, ok = xs && g;
+    /* Ink can reach past the line's box by the bold, the slant and a glyph's overhang. */
+    int m = 2 + (int)ceilf(grow + 0.25f * t->size + (t->italic ? 0.2f * t->asc : 0.0f));
+    if (ok) shape_with(t->font, t->bold, t->s + a, n, xs, g);
+    for (pass = 0; pass < 2 && ok; pass++) {
+        float c[4], d = pass ? 0.0f : t->shadow;
+        int x0 = (int)floorf(x + d) - m, x1 = (int)ceilf(x + d + w) + m;
+        int y0 = (int)floorf(y + d - t->asc) - m, y1 = (int)ceilf(y + d - t->asc + t->lh) + m, bw, bh, i, j;
+        uint32_t k;
+        uint8_t* cov;
+        if (!pass && t->shadow <= 0.0f) continue;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > cv->w) x1 = cv->w;
+        if (y1 > cv->h) y1 = cv->h;
+        bw = x1 - x0;
+        bh = y1 - y0;
+        if (bw <= 0 || bh <= 0) continue;
+        color_mix(pass ? t->color : 0xD0000000u, pass ? t->color : 0xD0000000u, 0.0f, 1.0f, c);
+        if (!raster_shape(l, bw, bh, &cov)) {
+            ok = 0;
+            break;
+        }
+        for (k = 0; k < n; k++) {
+            size_t q;
+            if (g[k] == UINT32_MAX || t->s[a + k] == ' ') continue;
+            if (fa_font_outline(t->font, g[k], &l->gpath) != FA_OK || !l->gpath.count) continue;
+            if (t->italic)
+                for (q = 0; q < l->gpath.count; q++) {
+                    fa_path_cmd* pc = &l->gpath.cmd[q];
+                    pc->x += 0.2f * pc->y;
+                    pc->x1 += 0.2f * pc->y1;
+                    pc->x2 += 0.2f * pc->y2;
+                }
+            fa_raster_path(&l->ras, &l->gpath, gs, -gs, x + xs[k] * t->size + grow + d - (float)x0, y + d - (float)y0);
+        }
+        fa_raster_end(&l->ras, cov, (size_t)bw);
+        if (grow > 0.0f) {
+            uint8_t* b = (uint8_t*)malloc((size_t)bw * (size_t)bh);
+            if (!b || !fa_fx_dilate(cov, (size_t)bw, bw, bh, grow, b, (size_t)bw)) {
+                free(b);
+                free(cov);
+                ok = 0;
+                break;
+            }
+            free(cov);
+            cov = b;
+        }
+        for (j = 0; j < bh; j++)
+            for (i = 0; i < bw; i++) {
+                uint8_t v = cov[(size_t)j * (size_t)bw + (size_t)i];
+                if (v) over(cv->px + ((size_t)(y0 + j) * (size_t)cv->w + (size_t)(x0 + i)) * 4, c, (float)v / 255.0f);
+            }
+        free(cov);
+    }
+    free(xs);
+    free(g);
+    return ok;
+}
+
+/* A block of text from `top`, each line centred in [left, left + width). */
+static int cv_text(fa_lyric* l, ly_canvas* cv, const ly_text* t, float left, float width, float top)
+{
+    int i;
+    for (i = 0; i < t->n; i++)
+        if (!cv_line(l, cv, t, t->ln[i].a, t->ln[i].n, left + (width - t->ln[i].w) / 2.0f, top + (float)i * t->lh + t->asc,
+                     t->ln[i].w))
+            return 0;
+    return 1;
+}
+
+static void text_init(ly_text* t, fa_font* font, float bold, float size, const char* s, uint32_t color, float shadow,
+                      float max_h)
+{
+    memset(t, 0, sizeof(*t));
+    t->font = font;
+    t->bold = bold;
+    t->size = size;
+    t->s = s;
+    t->color = color;
+    t->shadow = shadow;
+    t->max_h = max_h;
+}
+
+/* Appends to a string of `cap` bytes, cutting what does not fit. */
+static void cat(char* d, size_t cap, const char* s)
+{
+    size_t n = strlen(d), m = strlen(s);
+    if (n + 1 >= cap) return;
+    if (m > cap - 1 - n) {
+        m = cap - 1 - n;
+        while (m && ((unsigned char)s[m] & 0xC0) == 0x80) m--;   /* not inside a character */
+    }
+    memcpy(d + n, s, m);
+    d[n + m] = 0;
+}
+
+#define LY_DOT "  \xE2\x80\xA2  "
+
+/* Joins non-empty parts with `sep`. */
+static void cat_part(char* d, size_t cap, const char* sep, const char* label, const char* value, int* any)
+{
+    if (!value[0]) return;
+    if (*any) cat(d, cap, sep);
+    if (label) {
+        cat(d, cap, label);
+        cat(d, cap, "  ");
+    }
+    cat(d, cap, value);
+    *any = 1;
+}
+
+static int same_ci(const char* a, const char* b)
+{
+    for (; *a && *b; a++, b++) {
+        int x = (unsigned char)*a, y = (unsigned char)*b;
+        if (x >= 'A' && x <= 'Z') x += 32;
+        if (y >= 'A' && y <= 'Z') y += 32;
+        if (x != y) return 0;
+    }
+    return *a == *b;
+}
+
+/* "Length  3:25" (or 1:02:03), "" when the length is unknown. */
+static void length_text(const fa_lyric* l, char* d, size_t cap)
+{
+    long long s;
+    char num[32];
+    d[0] = 0;
+    if (l->duration <= 0) return;
+    s = (long long)((l->duration + 500000000) / 1000000000);
+    if (s >= 3600) snprintf(num, sizeof(num), "%lld:%02lld:%02lld", s / 3600, s / 60 % 60, s % 60);
+    else snprintf(num, sizeof(num), "%lld:%02lld", s / 60, s % 60);
+    cat(d, cap, l->label[0]);
+    cat(d, cap, "  ");
+    cat(d, cap, num);
+}
+
+/* "Key  E minor  •  Tempo  120 bpm  •  Timing  4/4" */
+static void details_text(const fa_lyric* l, char* d, size_t cap)
+{
+    int any = 0;
+    d[0] = 0;
+    cat_part(d, cap, LY_DOT, l->label[1], l->cr.key, &any);
+    cat_part(d, cap, LY_DOT, l->label[2], l->cr.tempo, &any);
+    cat_part(d, cap, LY_DOT, l->label[3], l->cr.time_signature, &any);
+}
+
+static void line_add(char* d, size_t cap, const char* s)
+{
+    if (!s[0]) return;
+    if (d[0]) cat(d, cap, "\n");
+    cat(d, cap, s);
+}
+
+/* The card's information lines: the writers, the year, the length, the key, tempo
+ * and time signature, the song's other notes (the ending card: the year alone). */
+static void info_text(const fa_lyric* l, int ending, char* d, size_t cap)
+{
+    char tmp[1024];
+    const fa_midi_credits* c = &l->cr;
+    d[0] = 0;
+    if (!ending && l->named) {
+        tmp[0] = 0;
+        if (c->writer[0] && c->lyricist[0] && same_ci(c->writer, c->lyricist)) {
+            cat(tmp, sizeof(tmp), l->label[4]);
+            cat(tmp, sizeof(tmp), " / ");
+            cat(tmp, sizeof(tmp), l->label[5]);
+            cat(tmp, sizeof(tmp), ":  ");
+            cat(tmp, sizeof(tmp), c->writer);
+        } else {
+            int any = 0;
+            char lab[64];
+            if (c->writer[0]) {
+                lab[0] = 0;
+                cat(lab, sizeof(lab) - 1, l->label[4]);
+                cat(lab, sizeof(lab), ":");
+                cat_part(tmp, sizeof(tmp), LY_DOT, lab, c->writer, &any);
+            }
+            if (c->lyricist[0]) {
+                lab[0] = 0;
+                cat(lab, sizeof(lab) - 1, l->label[5]);
+                cat(lab, sizeof(lab), ":");
+                cat_part(tmp, sizeof(tmp), LY_DOT, lab, c->lyricist, &any);
+            }
+        }
+        line_add(d, cap, tmp);
+    }
+    line_add(d, cap, c->year);
+    if (ending) return;
+    length_text(l, tmp, sizeof(tmp));
+    line_add(d, cap, tmp);
+    details_text(l, tmp, sizeof(tmp));
+    line_add(d, cap, tmp);
+    if (l->named && c->other[0]) {
+        /* Its lines joined with dots. */
+        const char* p = c->other;
+        int any = 0;
+        tmp[0] = 0;
+        while (*p) {
+            char one[256];
+            size_t n = strcspn(p, "\n");
+            if (n >= sizeof(one)) {
+                n = sizeof(one) - 1;
+                while (n && ((unsigned char)p[n] & 0xC0) == 0x80) n--;
+            }
+            memcpy(one, p, n);
+            one[n] = 0;
+            cat_part(tmp, sizeof(tmp), LY_DOT, NULL, one, &any);
+            p += strcspn(p, "\n");
+            if (*p) p++;
+        }
+        line_add(d, cap, tmp);
+    }
+}
+
+/* The canvas made the layer's picture, with its rows' spans. */
+static int canvas_take(ly_layer* L, ly_canvas* cv)
+{
+    size_t i, px = (size_t)cv->w * (size_t)cv->h;
+    int x, y;
+    L->w = cv->w;
+    L->h = cv->h;
+    L->px = (uint8_t*)malloc(px * 4);
+    L->span = (int*)malloc((size_t)cv->h * 2 * sizeof(int));
+    if (!L->px || !L->span) return 0;
+    for (i = 0; i < px * 4; i++) {
+        float v = cv->px[i] * 255.0f + 0.5f;
+        L->px[i] = (uint8_t)(v >= 255.0f ? 255.0f : v <= 0.0f ? 0.0f : v);
+    }
+    for (y = 0; y < cv->h; y++) {
+        const uint8_t* r = L->px + (size_t)y * (size_t)cv->w * 4;
+        int a = cv->w, b = 0;
+        for (x = 0; x < cv->w; x++)
+            if (r[x * 4 + 3]) {
+                if (x < a) a = x;
+                b = x + 1;
+            }
+        L->span[2 * y] = a < b ? a : 0;
+        L->span[2 * y + 1] = b;
+    }
+    return 1;
+}
+
+/* Glass: a fill, a sheen over its top, a border line. */
+static void glass(const fa_lyric* l, ly_canvas* cv, float x0, float y0, float x1, float y1, float r, float k, float fill_k)
+{
+    float in = 3.0f * k;
+    cv_rect(cv, x0, y0, x1, y1, r, l->st.card_color, fill_k, 0.0f);
+    cv_rect(cv, x0 + in, y0 + in, x1 - in, y0 + in + 0.42f * (y1 - y0), r - in > 1.0f ? r - in : 1.0f, 0x1F335770u, 1.0f, 0.0f);
+}
+
+/* The intro's or the ending's card, in the middle of the area. */
+static int card_build(fa_lyric* l, ly_layer* L, int ending, float* at_x, float* at_y)
+{
+    float W = (float)l->area_w, H = (float)l->area_h, k = H / (float)LY_DESIGN_H, F = l->em;
+    int fb = !l->named, ok, m = 2;
+    fa_font* f2 = l->font2 ? l->font2 : l->font;
+    float b2 = l->font2 ? l->bold2 : 0.0f;
+    float boxw = W * (fb ? 0.5f : 0.72f), tw = boxw - 0.9f * F, pad = 0.45f * F, r = 0.22f * F, boxh, y;
+    ly_text t[4];
+    float gap[4];                 /* above each block */
+    char info[2048];
+    int i, n = 0;
+    ly_canvas cv;
+    info_text(l, ending, info, sizeof(info));
+    gap[n] = 0.0f;
+    text_init(&t[n++], l->font, l->bold, F * (fb ? 0.65f : 0.92f), fb ? l->fallback : l->cr.title, l->st.title_color, 2.2f * k,
+              0.15f * H);
+    if (l->cr.artist[0]) {
+        gap[n] = 0.13f * F;
+        text_init(&t[n++], l->font, l->bold, 0.55f * F, l->cr.artist, l->st.card_accent, 1.5f * k, 0.1f * H);
+    }
+    if (info[0]) {
+        gap[n] = 0.2f * F;
+        text_init(&t[n++], f2, b2, 0.31f * F, info, l->st.info_color, 1.0f * k, 0.24f * H);
+    }
+    if (l->cr.copyright[0]) {
+        gap[n] = 0.2f * F;
+        text_init(&t[n], f2, b2, 0.23f * F, l->cr.copyright, l->st.copyright_color, 1.0f * k, 0.08f * H);
+        t[n++].italic = 1;
+    }
+    boxh = 2.0f * pad;
+    for (i = 0; i < n; i++) {
+        text_wrap(&t[i], tw);
+        boxh += gap[i] + t[i].h;
+    }
+    cv.w = (int)ceilf(boxw + 8.0f * k) + 2 * m;
+    cv.h = (int)ceilf(boxh + 10.0f * k) + 2 * m;
+    cv.px = (float*)calloc((size_t)cv.w * (size_t)cv.h * 4, sizeof(float));
+    if (!cv.px) return 0;
+    cv_rect(&cv, (float)m + 8.0f * k, (float)m + 10.0f * k, (float)m + 8.0f * k + boxw, (float)m + 10.0f * k + boxh, r, 0xFF000000u,
+            0.42f, 0.0f);
+    glass(l, &cv, (float)m, (float)m, (float)m + boxw, (float)m + boxh, r, k, 1.0f);
+    cv_rect(&cv, (float)m, (float)m, (float)m + boxw, (float)m + boxh, r, l->st.card_accent, 0.5f, 1.5f * k);
+    y = (float)m + pad;
+    ok = 1;
+    for (i = 0; i < n && ok; i++) {
+        y += gap[i];
+        ok = cv_text(l, &cv, &t[i], (float)m + (boxw - tw) / 2.0f, tw, y);
+        y += t[i].h;
+    }
+    ok = ok && canvas_take(L, &cv);
+    free(cv.px);
+    *at_x = floorf(W / 2.0f - boxw / 2.0f + 0.5f) - (float)m - (float)l->bx;
+    *at_y = floorf(H / 2.0f - boxh / 2.0f + 0.5f) - (float)m - (float)l->by;
+    return ok;
+}
+
+/* The intro's band at the top (title, then artist and year) or the bottom (the
+ * length, key, tempo and time signature, the copyright). */
+static int band_build(fa_lyric* l, ly_layer* L, int bottom, float* at_x, float* at_y)
+{
+    float W = (float)l->area_w, H = (float)l->area_h, k = H / (float)LY_DESIGN_H, F = l->em, bh, tw = 0.88f * W, line = 1.5f * k;
+    int fb = !l->named, ok = 1;
+    fa_font* f2 = l->font2 ? l->font2 : l->font;
+    float b2 = l->font2 ? l->bold2 : 0.0f;
+    char a[1024], b[1024];
+    ly_text t;
+    ly_canvas cv;
+    bh = ceilf(H * (bottom ? 0.16f : 0.17f));
+    cv.w = (int)W;
+    cv.h = (int)bh;
+    cv.px = (float*)calloc((size_t)cv.w * (size_t)cv.h * 4, sizeof(float));
+    if (!cv.px) return 0;
+    /* The bands are a little clearer than the card: 0.78 / 0.88 of its alpha. */
+    cv_rect(&cv, 0.0f, 0.0f, W, bh, 0.0f, l->st.card_color, 0.886f, 0.0f);
+    cv_rect(&cv, 0.0f, 0.0f, W, 0.45f * bh, 0.0f, 0x291F3345u, 1.0f, 0.0f);
+    if (bottom) cv_rect(&cv, 0.0f, 0.0f, W, line, 0.0f, l->st.card_accent, 0.45f, 0.0f);
+    else cv_rect(&cv, 0.0f, bh - 1.0f - line / 2.0f, W, bh - 1.0f + line / 2.0f, 0.0f, l->st.card_accent, 0.45f, 0.0f);
+    if (!bottom) {
+        float y = 0.12f * bh;
+        int any = 0;
+        text_init(&t, l->font, l->bold, F * (fb ? 0.52f : 0.68f), fb ? l->fallback : l->cr.title, l->st.title_color, 1.8f * k,
+                  0.55f * bh);
+        text_wrap(&t, tw);
+        ok = cv_text(l, &cv, &t, (W - tw) / 2.0f, tw, y);
+        y += t.h;
+        a[0] = 0;
+        cat_part(a, sizeof(a), LY_DOT, NULL, l->cr.artist, &any);
+        cat_part(a, sizeof(a), LY_DOT, NULL, l->cr.year, &any);
+        if (ok && a[0]) {
+            text_init(&t, l->font, l->bold, 0.36f * F, a, l->st.card_accent, 1.2f * k, bh - y);
+            text_wrap(&t, tw);
+            ok = cv_text(l, &cv, &t, (W - tw) / 2.0f, tw, y);
+        }
+    } else {
+        a[0] = 0;
+        length_text(l, b, sizeof(b));
+        line_add(a, sizeof(a), b);
+        details_text(l, b, sizeof(b));
+        line_add(a, sizeof(a), b);
+        line_add(a, sizeof(a), l->cr.copyright);
+        if (a[0]) {
+            text_init(&t, f2, b2, 0.27f * F, a, l->st.info_color, 1.0f * k, 0.86f * bh);
+            text_wrap(&t, tw);
+            ok = cv_text(l, &cv, &t, (W - tw) / 2.0f, tw, 0.14f * bh);
+        }
+    }
+    ok = ok && canvas_take(L, &cv);
+    free(cv.px);
+    *at_x = -(float)l->bx;
+    *at_y = (bottom ? H - bh : 0.0f) - (float)l->by;
+    return ok;
+}
+
+static ly_layer* page_get(fa_lyric* l, int k)
+{
+    ly_layer* L = &l->pg[k];
+    int ok;
+    if (L->px) return L;
+    if (l->pg_failed[k]) return NULL;
+    layer_clear(L);
+    ok = k == PG_TOP || k == PG_BOTTOM ? band_build(l, L, k == PG_BOTTOM, &l->pg_x[k], &l->pg_y[k])
+                                       : card_build(l, L, k == PG_END, &l->pg_x[k], &l->pg_y[k]);
+    if (!ok) {
+        layer_clear(L);
+        l->pg_failed[k] = 1;
+        return NULL;
+    }
+    L->line = k;
+    return L;
+}
+
 /* ---- frames --------------------------------------------------------------------- */
 
 static void box_of(const fa_lyric* l, const ly_layer* L, float cx, float cy, float sc, int out[4])
@@ -1144,16 +1755,42 @@ static void arrow_at(const fa_lyric* l, const ly_inst* in, int i, float* x, floa
     *y = in->cy + (ay - L->cy) * in->sc;
 }
 
+/* Page k at opacity op into *in: 1, or 0 when it could not be drawn (the lyrics go
+ * on without it). */
+static int page_inst(fa_lyric* l, int k, float op, ly_inst* in)
+{
+    ly_layer* L = page_get(l, k);
+    if (!L) return 0;
+    memset(in, 0, sizeof(*in));
+    in->line = LY_PAGE_LINE + (uint32_t)k;
+    in->page = k;
+    in->layer = L;
+    in->sc = 1.0f;
+    in->op = op;
+    in->cx = l->pg_x[k];
+    in->cy = l->pg_y[k];
+    box_of(l, L, in->cx, in->cy, 1.0f, in->box);
+    return 1;
+}
+
+/* What shows at t, in drawing order: the intro's bands behind the lines, its card
+ * and the ending card over them. */
 static int frame_list(fa_lyric* l, fa_time t, ly_inst* out)
 {
     ly_show sh[LY_MAX_SHOW];
     uint32_t n = ly_frame(&l->tl, &l->prm, t, sh), i, m = 0;
+    float intro = ly_intro_at(&l->tl, &l->prm, t), ending = ly_ending_at(&l->tl, &l->prm, t);
+    if (intro > 0.0f && l->tl.intro_bands) {
+        m += (uint32_t)page_inst(l, PG_TOP, intro, &out[m]);
+        m += (uint32_t)page_inst(l, PG_BOTTOM, intro, &out[m]);
+    }
     for (i = 0; i < n; i++) {
         ly_inst* in = &out[m];
         ly_layer* L = layer_get(l, sh[i].line);
-        float maxw = (float)l->bw;
+        float maxw = (float)l->block_w;
         if (!L) return -1;
         memset(in, 0, sizeof(*in));
+        in->page = -1;
         in->line = sh[i].line;
         in->outgoing = sh[i].outgoing;
         in->layer = L;
@@ -1186,6 +1823,8 @@ static int frame_list(fa_lyric* l, fa_time t, ly_inst* out)
         }
         m++;
     }
+    if (intro > 0.0f && !l->tl.intro_bands) m += (uint32_t)page_inst(l, PG_CARD, intro, &out[m]);
+    if (ending > 0.0f) m += (uint32_t)page_inst(l, PG_END, ending, &out[m]);
     return (int)m;
 }
 
@@ -1207,6 +1846,7 @@ static void diff(const fa_lyric* l, const ly_inst* a, int na, const ly_inst* b, 
             }
             continue;
         }
+        if (o->page >= 0) continue;
         /* In place: the syllables whose colour changed, and the arrows. */
         {
             const ly_line* line = &l->tl.line[o->line];
@@ -1253,6 +1893,11 @@ static void draw_rect(fa_lyric* l, const ly_inst* list, int n, const int r[4])
     for (y = r[1]; y < r[3]; y++) memset(l->master + ((size_t)y * (size_t)l->bw + (size_t)r[0]) * 4, 0, (size_t)(r[2] - r[0]) * 4);
     for (i = 0; i < n; i++) {
         const ly_inst* in = &list[i];
+        if (in->page >= 0) {
+            if (in->box[0] < r[2] && r[0] < in->box[2] && in->box[1] < r[3] && r[1] < in->box[3])
+                draw_place(l, in->layer, in->cx, in->cy, 1.0f, in->op, r[0], r[1], r[2], r[3]);
+            continue;
+        }
         if (in->box[0] < r[2] && r[0] < in->box[2] && in->box[1] < r[3] && r[1] < in->box[3] &&
             color_line(l, in->layer, &l->tl.line[in->line], &in->wipe))
             draw_place(l, in->layer, in->cx, in->cy, in->sc, in->op, r[0], r[1], r[2], r[3]);
@@ -1286,7 +1931,7 @@ static void to_rect(const int r[4], fa_rect* out)
 /* Brings the master to `t`: the frame's revision goes up when anything changed. */
 static fa_result render(fa_lyric* l, fa_time t)
 {
-    ly_inst now[LY_MAX_SHOW];
+    ly_inst now[LY_MAX_INST];
     fa_rects dirty;
     int n = frame_list(l, t, now), i;
     if (n < 0) return FA_ERROR_OUT_OF_MEMORY;
@@ -1309,49 +1954,85 @@ static fa_result render(fa_lyric* l, fa_time t)
 
 /* ---- the surface ---------------------------------------------------------------- */
 
+/* The labels, one per line, over the English ones. */
+static void labels_split(fa_lyric* l)
+{
+    static const char* const english[6] = { "Length", "Key", "Tempo", "Timing", "Written By", "Lyricist" };
+    char* p = l->label_buf;
+    int i;
+    for (i = 0; i < 6; i++) {
+        char* e;
+        l->label[i] = english[i];
+        if (!p) continue;
+        e = strchr(p, '\n');
+        if (e) *e = 0;
+        if (*p && p[strlen(p) - 1] == '\r') p[strlen(p) - 1] = 0;
+        if (*p) l->label[i] = p;
+        p = e ? e + 1 : NULL;
+    }
+}
+
 static fa_result style_take(fa_lyric* l, const fa_lyric_style* st)
 {
     char* family = dup_str(st->font_family);
     char* path = dup_str(st->font_path);
+    char* fallback = dup_str(st->fallback_title);
+    char* labels = dup_str(st->labels);
+    char* label_buf = dup_str(st->labels);
     void* data = NULL;
-    fa_font* font = NULL;
-    float bold = 0.0f;
-    fa_result r;
-    if ((st->font_family && !family) || (st->font_path && !path)) {
-        free(family);
-        free(path);
-        return FA_ERROR_OUT_OF_MEMORY;
-    }
-    if (st->font_data) {
+    fa_font *font = NULL, *font2 = NULL;
+    float bold = 0.0f, bold2 = 0.0f;
+    fa_result r = FA_OK;
+    if ((st->font_family && !family) || (st->font_path && !path) || (st->fallback_title && !fallback) ||
+        (st->labels && (!labels || !label_buf)))
+        r = FA_ERROR_OUT_OF_MEMORY;
+    if (r == FA_OK && st->font_data) {
         data = malloc(st->font_data_size);
-        if (!data) {
-            free(family);
-            free(path);
-            return FA_ERROR_OUT_OF_MEMORY;
-        }
-        memcpy(data, st->font_data, st->font_data_size);
+        if (data) memcpy(data, st->font_data, st->font_data_size);
+        else r = FA_ERROR_OUT_OF_MEMORY;
     }
-    r = font_open(l, st, &font, &bold);
+    if (r == FA_OK) r = font_open(l, st, &font, &bold);
     if (r != FA_OK) {
         free(family);
         free(path);
+        free(fallback);
+        free(labels);
+        free(label_buf);
         free(data);
         return r;
     }
+    if (!st->font_data && !st->font_path && fa_font_get_info(font)->weight > 500) {
+        /* The pages' smaller text in the family's regular weight (none: the font). */
+        fa_lyric_style reg = *st;
+        reg.font_weight = 400;
+        if (font_open(l, &reg, &font2, &bold2) != FA_OK) font2 = NULL;
+    }
     if (l->font) fa_font_close(l->font);
+    if (l->font2) fa_font_close(l->font2);
     free(l->family);
     free(l->path);
     free(l->data);
+    free(l->fallback);
+    free(l->labels);
+    free(l->label_buf);
     l->font = font;
     l->bold = bold;
+    l->font2 = font2;
+    l->bold2 = bold2;
     l->family = family;
     l->path = path;
     l->data = data;
+    l->fallback = fallback;
+    l->labels = labels;
+    l->label_buf = label_buf;
+    labels_split(l);
     l->st = *st;
     l->st.struct_size = (uint32_t)sizeof(l->st);
     l->st.font_family = family;
     l->st.font_path = path;
     l->st.font_data = data;
+    l->st.fallback_title = fallback;
+    l->st.labels = labels;
     {
         const char* name = fa_font_get_info(font)->family;
         size_t n = strlen(name);
@@ -1373,6 +2054,7 @@ fa_result fa_lyric_new(fa_stream* stream, const fa_lyric_style* style, fa_lyric*
     if (!l) return FA_ERROR_OUT_OF_MEMORY;
     for (i = 0; i < LY_CACHE; i++) l->cache[i].line = -1;
     l->arrow.line = -1;
+    for (i = 0; i < LY_PAGES; i++) l->pg[i].line = -1;
     l->tempo = 1.0;
     r = read_song(l, stream);
     if (r == FA_OK) r = style_take(l, style);
@@ -1394,9 +2076,13 @@ void fa_lyric_free(fa_lyric* l)
     free(l->song);
     free(l->tempos);
     if (l->font) fa_font_close(l->font);
+    if (l->font2) fa_font_close(l->font2);
     free(l->family);
     free(l->path);
     free(l->data);
+    free(l->fallback);
+    free(l->labels);
+    free(l->label_buf);
     free(l->scratch);
     free(l->master);
     free(l->tmp);

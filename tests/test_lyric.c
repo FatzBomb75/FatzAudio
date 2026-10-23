@@ -8,6 +8,7 @@
 #include "fa_internal.h"
 #include "lyric_time.h"
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -882,6 +883,313 @@ static void test_no_lyrics(void)
     free(t.d);
 }
 
+/* ---- intro and ending pages -------------------------------------------------------- */
+
+static void test_intro_time(void)
+{
+    ly_params p;
+    ly_timeline tl;
+    ly_frag f[] = { { "a", 1 * SEC, 0 }, { "b", 10 * SEC, FA_MIDI_NEW_PARAGRAPH } };
+    params(&p);
+    p.intro = p.ending = 1;
+    p.intro_start = 1000 * MS;
+    p.intro_fade = 1000 * MS;
+    p.intro_clear = 3000 * MS;
+    p.intro_band = 8000 * MS;
+    p.ending_min = 3000 * MS;
+    p.ending_fade = 750 * MS;
+    /* Lyrics from 1 s: bands until 8 s. */
+    CHECK_EQ(ly_build(&tl, f, 2, &p, NULL, NULL, 0.0f, NULL, NULL), FA_OK);
+    CHECK(tl.intro_bands);
+    CHECK_EQ(tl.intro_end, 8 * SEC);
+    CHECK_NEAR(ly_intro_at(&tl, &p, 500 * MS), 0.0, 1e-6);
+    CHECK_NEAR(ly_intro_at(&tl, &p, 1500 * MS), 0.5, 1e-5);
+    CHECK_NEAR(ly_intro_at(&tl, &p, 4 * SEC), 1.0, 1e-6);
+    CHECK_NEAR(ly_intro_at(&tl, &p, 7500 * MS), 0.5, 1e-5);
+    CHECK_NEAR(ly_intro_at(&tl, &p, 8 * SEC), 0.0, 1e-6);
+    ly_free(&tl);
+    /* Lyrics from 20 s: a card, gone 3 s before them; with a countdown, 3 s before it. */
+    f[0].time = 20 * SEC;
+    f[1].time = 30 * SEC;
+    CHECK_EQ(ly_build(&tl, f, 2, &p, NULL, NULL, 0.0f, NULL, NULL), FA_OK);
+    CHECK(!tl.intro_bands);
+    CHECK_EQ(tl.intro_end, 17 * SEC);
+    CHECK_NEAR(ly_intro_at(&tl, &p, 16500 * MS), 0.5, 1e-5);
+    p.countdown = FA_COUNTDOWN_CLOCK;
+    ly_schedule(&tl, &p, NULL, NULL);
+    CHECK_EQ(tl.intro_end, 12 * SEC);
+    /* The ending card: from the end of the lyrics' fade (36 s) to the song's end. */
+    CHECK_NEAR(ly_ending_at(&tl, &p, 35900 * MS), 0.0, 1e-6);
+    CHECK_NEAR(ly_ending_at(&tl, &p, 36375 * MS), 0.5, 1e-5);
+    CHECK_NEAR(ly_ending_at(&tl, &p, 60 * SEC), 1.0, 1e-6);
+    CHECK_NEAR(ly_ending_at(&tl, &p, 99625 * MS), 0.5, 1e-5);
+    CHECK_NEAR(ly_ending_at(&tl, &p, 100 * SEC), 0.0, 1e-6);
+    /* Not with less than ending_min left; neither page when off. */
+    p.duration = 38 * SEC;
+    ly_schedule(&tl, &p, NULL, NULL);
+    CHECK_NEAR(ly_ending_at(&tl, &p, 37 * SEC), 0.0, 1e-6);
+    p.intro = 0;
+    CHECK_NEAR(ly_intro_at(&tl, &p, 5 * SEC), 0.0, 1e-6);
+    ly_free(&tl);
+    /* No room to fade in and out (a card gone by 1 s): no intro at all. */
+    p.intro = 1;
+    p.countdown = FA_COUNTDOWN_OFF;
+    p.intro_band = 0;
+    f[0].time = 4 * SEC;
+    f[1].time = 10 * SEC;
+    CHECK_EQ(ly_build(&tl, f, 2, &p, NULL, NULL, 0.0f, NULL, NULL), FA_OK);
+    CHECK(!tl.intro_bands);
+    CHECK_NEAR(ly_intro_at(&tl, &p, 1500 * MS), 0.0, 1e-6);
+    ly_free(&tl);
+}
+
+static void text_event(buf* t, uint32_t delta, const char* text)
+{
+    size_t n = strlen(text);
+    varlen(t, delta); put8(t, 0xFF); put8(t, 0x01); varlen(t, (uint32_t)n); put(t, text, n);
+}
+
+/* make_song with "@T" title lines (NULL: none), its lyrics `shift` seconds later, and
+ * its note held to `end` seconds. */
+static buf make_titled(const char* title, const char* artist, uint32_t shift, uint32_t end)
+{
+    buf f = { 0 }, t = { 0 };
+    put(&f, "MThd", 4); put32be(&f, 6); put8(&f, 0); put8(&f, 0); put8(&f, 0); put8(&f, 1); put8(&f, 480 >> 8); put8(&f, 480 & 255);
+    if (title) text_event(&t, 0, title);
+    if (artist) text_event(&t, 0, artist);
+    ev3(&t, 0, 0x90, 69, 1);
+    lyric(&t, 960 + shift * 960, "AB");
+    lyric(&t, 480, "BA ");
+    lyric(&t, 480, "VO");
+    lyric(&t, 960, "\rOB");
+    lyric(&t, 480, "AV");
+    lyric(&t, 6240, "BOA");
+    lyric(&t, 480, " VA");
+    ev3(&t, end * 960 - (shift * 960 + 10080), 0x80, 69, 0);
+    varlen(&t, 0); put8(&t, 0xFF); put8(&t, 0x2F); put8(&t, 0);
+    put(&f, "MTrk", 4); put32be(&f, (uint32_t)t.n); put(&f, t.d, t.n);
+    free(t.d);
+    return f;
+}
+
+static fa_stream* open_buf(const buf* b)
+{
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    return fa_stream_open_memory(g_engine, b->d, b->n, &o, &s) == FA_OK ? s : NULL;
+}
+
+/* The alpha of the bitmap's rows [y0, y1), summed. */
+static long alpha_rows(const target* t, uint32_t y0, uint32_t y1)
+{
+    uint32_t x, y;
+    long sum = 0;
+    for (y = y0; y < y1 && y < t->lay.height; y++)
+        for (x = 0; x < t->lay.width; x++) sum += t->px[(size_t)y * (size_t)t->stride + x * 4 + 3];
+    return sum;
+}
+
+static const uint8_t* pixel(const target* t, uint32_t x, uint32_t y) { return t->px + (size_t)y * (size_t)t->stride + x * 4; }
+
+/* Lyrics from 1 s: the intro on bands at the top and bottom, the ending card after the
+ * lyrics' fade. The bitmap is the whole area. */
+static void test_intro_bands(void)
+{
+    buf song = make_titled("@TBOA", "@TVOB", 0, 40);
+    fa_stream* s = open_buf(&song);
+    fa_lyric_style st;
+    fa_surface* f = NULL;
+    fa_surface_frame fr;
+    target t;
+    CHECK(s != NULL);
+    style(&st, FA_LYRIC_CLASSIC);
+    CHECK_EQ(fa_lyric_surface_create(s, &st, &f), FA_OK);
+    CHECK(target_make(f, &t));
+    CHECK_EQ(t.lay.width, 1920);
+    CHECK_EQ(t.lay.height, 1080);
+    CHECK_EQ(t.lay.bitmap_x, 0);
+    CHECK_EQ(t.lay.bitmap_y, 0);
+    CHECK_EQ(t.lay.content_width, (uint32_t)ceil(0.85 * 1920));
+    CHECK(t.lay.content_y > 150 && t.lay.content_y + t.lay.content_height < 930);
+    CHECK_EQ(draw_at(f, &t, 500 * MS, &fr), FA_OK);
+    CHECK_EQ(alpha_rows(&t, 0, 150), 0);
+    /* At 4 s: glass at the top and the bottom, the title on it. */
+    CHECK_EQ(draw_at(f, &t, 4 * SEC, &fr), FA_OK);
+    CHECK(pixel(&t, 10, 60)[3] > 150);
+    CHECK(pixel(&t, 10, 1070)[3] > 150);
+    CHECK_EQ(pixel(&t, 10, 400)[3], 0);
+    CHECK(count_color(&t, 255, 244, 220) > 50);
+    /* Gone by 8 s. */
+    CHECK_EQ(draw_at(f, &t, 8 * SEC, &fr), FA_OK);
+    CHECK_EQ(alpha_rows(&t, 0, 150), 0);
+    CHECK_EQ(alpha_rows(&t, 950, 1080), 0);
+    /* The ending card: in the middle from 16.5 s. */
+    CHECK_EQ(draw_at(f, &t, 16 * SEC, &fr), FA_OK);
+    CHECK_EQ(count_color(&t, 255, 244, 220), 0);
+    CHECK_EQ(draw_at(f, &t, 25 * SEC, &fr), FA_OK);
+    CHECK(pixel(&t, 960, 540)[3] > 200);
+    CHECK(count_color(&t, 255, 244, 220) > 50);
+    CHECK_EQ(alpha_rows(&t, 0, 150), 0);
+    fa_surface_destroy(f);
+    free(t.px);
+    fa_stream_close(s);
+    free(song.d);
+}
+
+/* Lyrics from 15 s after a countdown from 10 s: the intro on a card, gone by 7 s. */
+static void test_intro_card(void)
+{
+    buf song = make_titled("@TBOA", "@TVOB", 14, 60);
+    fa_stream* s = open_buf(&song);
+    fa_lyric_style st;
+    fa_surface* f = NULL;
+    fa_surface_frame fr;
+    target t;
+    CHECK(s != NULL);
+    style(&st, FA_LYRIC_CLASSIC);
+    CHECK_EQ(fa_lyric_surface_create(s, &st, &f), FA_OK);
+    CHECK(target_make(f, &t));
+    CHECK_EQ(draw_at(f, &t, 4 * SEC, &fr), FA_OK);
+    CHECK(pixel(&t, 960, 540)[3] > 200);
+    CHECK_EQ(alpha_rows(&t, 0, 150), 0);
+    CHECK(count_color(&t, 255, 244, 220) > 50);
+    CHECK_EQ(draw_at(f, &t, 7500 * MS, &fr), FA_OK);
+    CHECK_EQ(alpha_rows(&t, 0, 1080), 0);
+    fa_surface_destroy(f);
+    free(t.px);
+    fa_stream_close(s);
+    free(song.d);
+}
+
+/* When the pages show: a song naming nothing has them only with fallback_title; off,
+ * subtitle mode or an older style's size. */
+static void test_intro_when(void)
+{
+    buf song = make_titled("@TBOA", NULL, 0, 40);
+    fa_stream *s = open_buf(&song), *plain = open_song();
+    fa_lyric_style st, got;
+    fa_surface* f = NULL;
+    fa_surface_frame fr;
+    target t;
+    CHECK(s != NULL && plain != NULL);
+    /* An empty fallback title is none. */
+    style(&st, FA_LYRIC_CLASSIC);
+    st.fallback_title = "";
+    CHECK_EQ(fa_lyric_surface_create(plain, &st, &f), FA_OK);
+    CHECK(target_make(f, &t));
+    CHECK(t.lay.height < 1080);
+    fa_surface_destroy(f);
+    free(t.px);
+    /* A plain song with a fallback title: bands with it. */
+    style(&st, FA_LYRIC_CLASSIC);
+    st.fallback_title = "VOBA";
+    st.labels = "L\nK";
+    CHECK_EQ(fa_lyric_surface_create(plain, &st, &f), FA_OK);
+    CHECK(target_make(f, &t));
+    CHECK_EQ(t.lay.height, 1080);
+    CHECK_EQ(draw_at(f, &t, 4 * SEC, &fr), FA_OK);
+    CHECK(count_color(&t, 255, 244, 220) > 50);
+    memset(&got, 0, sizeof(got));
+    got.struct_size = (uint32_t)sizeof(got);
+    CHECK_EQ(fa_lyric_surface_get_style(f, &got), FA_OK);
+    CHECK(got.fallback_title != st.fallback_title && strcmp(got.fallback_title, "VOBA") == 0);
+    CHECK(strcmp(got.labels, "L\nK") == 0);
+    fa_surface_destroy(f);
+    free(t.px);
+    /* Pages off, or subtitle mode: the lyric block. */
+    style(&st, FA_LYRIC_CLASSIC);
+    st.intro_page = st.ending_page = 0;
+    CHECK_EQ(fa_lyric_surface_create(s, &st, &f), FA_OK);
+    CHECK(target_make(f, &t));
+    CHECK(t.lay.height < 1080);
+    fa_surface_destroy(f);
+    free(t.px);
+    style(&st, FA_LYRIC_SUBTITLE);
+    CHECK_EQ(fa_lyric_surface_create(s, &st, &f), FA_OK);
+    CHECK(target_make(f, &t));
+    CHECK(t.lay.height < 1080);
+    fa_surface_destroy(f);
+    free(t.px);
+    /* A style of the size before the pages: they are on. */
+    style(&st, FA_LYRIC_CLASSIC);
+    st.struct_size = (uint32_t)offsetof(fa_lyric_style, intro_page);
+    CHECK_EQ(fa_lyric_surface_create(s, &st, &f), FA_OK);
+    CHECK(target_make(f, &t));
+    CHECK_EQ(t.lay.height, 1080);
+    CHECK_EQ(fa_lyric_surface_get_style(f, &got), FA_OK);
+    CHECK_EQ(got.intro_page, 1);
+    CHECK_EQ(got.ending_fade_ms, 750);
+    fa_surface_destroy(f);
+    free(t.px);
+    /* Out of range. */
+    style(&st, FA_LYRIC_CLASSIC);
+    st.intro_page = 2;
+    CHECK_EQ(fa_lyric_surface_create(s, &st, &f), FA_ERROR_INVALID_ARG);
+    style(&st, FA_LYRIC_CLASSIC);
+    st.ending_fade_ms = -1;
+    CHECK_EQ(fa_lyric_surface_create(s, &st, &f), FA_ERROR_INVALID_ARG);
+    fa_stream_close(s);
+    fa_stream_close(plain);
+    free(song.d);
+}
+
+/* Pages drawn by changed areas equal pages drawn at once. */
+static void test_intro_stateless(void)
+{
+    static const int ms[] = { 0, 1200, 1500, 4000, 7600, 8200, 12000, 16000, 16700, 17000, 25000, 39900, 3000, 20000, 1200, 7000 };
+    buf song = make_titled("@TBOA", "@TVOB", 0, 40);
+    fa_stream* s = open_buf(&song);
+    fa_lyric_style st;
+    fa_surface *a = NULL, *b = NULL;
+    fa_surface_frame fr;
+    target ta, tb;
+    size_t i;
+    CHECK(s != NULL);
+    style(&st, FA_LYRIC_CLASSIC);
+    CHECK_EQ(fa_lyric_surface_create(s, &st, &a), FA_OK);
+    CHECK(target_make(a, &ta));
+    for (i = 0; i < sizeof(ms) / sizeof(ms[0]); i++) {
+        CHECK_EQ(draw_at(a, &ta, (fa_time)ms[i] * MS, &fr), FA_OK);
+        CHECK_EQ(fa_lyric_surface_create(s, &st, &b), FA_OK);
+        CHECK(target_make(b, &tb));
+        CHECK_EQ(draw_at(b, &tb, (fa_time)ms[i] * MS, &fr), FA_OK);
+        if (memcmp(ta.px, tb.px, (size_t)ta.stride * ta.lay.height) != 0) {
+            fprintf(stderr, "  differs at %d ms\n", ms[i]);
+            fa_surface_destroy(b);
+            free(tb.px);
+            CHECK(0);
+        }
+        fa_surface_destroy(b);
+        free(tb.px);
+    }
+    /* Small steps (each a tiny move at a scroll's ends) add up to what a fresh draw
+     * gives. */
+    {
+        int k;
+        for (k = 0; k <= 6000; k += 3) {
+            CHECK_EQ(draw_at(a, &ta, (fa_time)k * MS, &fr), FA_OK);
+            if (k % 600) continue;
+            CHECK_EQ(fa_lyric_surface_create(s, &st, &b), FA_OK);
+            CHECK(target_make(b, &tb));
+            CHECK_EQ(draw_at(b, &tb, (fa_time)k * MS, &fr), FA_OK);
+            if (memcmp(ta.px, tb.px, (size_t)ta.stride * ta.lay.height) != 0) {
+                fprintf(stderr, "  differs at %d ms after small steps\n", k);
+                fa_surface_destroy(b);
+                free(tb.px);
+                CHECK(0);
+            }
+            fa_surface_destroy(b);
+            free(tb.px);
+        }
+    }
+    fa_surface_destroy(a);
+    free(ta.px);
+    fa_stream_close(s);
+    free(song.d);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -912,6 +1220,11 @@ int main(void)
     RUN(test_sizes);
     RUN(test_styles);
     RUN(test_no_lyrics);
+    RUN(test_intro_time);
+    RUN(test_intro_bands);
+    RUN(test_intro_card);
+    RUN(test_intro_when);
+    RUN(test_intro_stateless);
     free(g_song.d);
     fa_soundfont_close(g_font);
     fa_engine_destroy(g_engine);

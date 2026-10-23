@@ -420,6 +420,21 @@ internal struct FaLyricStyle
     public float PanelPadding, PanelRadius;
     public int SubtitleMode;
     public FaSurfaceEffects Effects;
+    public int IntroPage;
+    public int EndingPage;
+    public nint FallbackTitle;
+    public nint Labels;
+    public int IntroStartMs;
+    public int IntroFadeMs;
+    public int IntroClearMs;
+    public int IntroBandMs;
+    public int EndingMinMs;
+    public int EndingFadeMs;
+    public uint CardColor;
+    public uint CardAccent;
+    public uint TitleColor;
+    public uint InfoColor;
+    public uint CopyrightColor;
 }
 
 [StructLayout(LayoutKind.Sequential)]

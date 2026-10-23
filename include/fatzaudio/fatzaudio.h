@@ -1923,12 +1923,13 @@ FA_API fa_result FA_CALL fa_stream_get_midi_effects(fa_stream* stream, int32_t* 
  *
  * Sizes are given for a presentation area 1080 pixels high and scale with its
  * height (fa_surface_layout.scale = height / 1080); without a presentation size the
- * surface draws for 1920x1080. The bitmap is the lyric block, not the whole area:
- * it keeps one size for a presentation size and style (every line slot, the
- * countdown row and the page fade-in included), and fa_surface_layout.bitmap_x and
- * bitmap_y place it. Everything drawn is a function of the position, so seeks and
- * loops need nothing; lyric times follow the stream's clock, and the animations run
- * in real time (their lengths follow FA_PARAM_TEMPO).
+ * surface draws for 1920x1080. The bitmap keeps one size for a presentation size
+ * and style, and fa_surface_layout.bitmap_x and bitmap_y place it: the whole area
+ * when the song has an intro or ending page (see intro_page), else the lyric block
+ * (every line slot, the countdown row and the page fade-in included). The layout's
+ * content rectangle is the box the lines fit in. Everything drawn is a function of
+ * the position, so seeks and loops need nothing; lyric times follow the stream's
+ * clock, and the animations run in real time (their lengths follow FA_PARAM_TEMPO).
  *
  * The song's text is fa_stream_get_midi_text's lyrics: its line and paragraph marks
  * break lines and pages, and so do the gaps: a pause of paragraph_gap_ms starts a
@@ -2024,8 +2025,29 @@ typedef struct fa_lyric_style {
     int32_t panel;                     /* 0 */
     uint32_t panel_color;              /* 0xAARRGGBB: black at 50 % */
     float panel_padding, panel_radius; /* em: 0.25, 0.2 (0..1) */
-    int32_t subtitle_mode;             /* 1: no countdown */
+    int32_t subtitle_mode;             /* 1: no countdown, no intro or ending page */
     fa_surface_effects effects;        /* with sung colours; as fa_surface_set_effects */
+    /* The intro and ending pages: the song's credits (fa_stream_get_midi_credits) on
+     * smoked glass. The intro fades in at intro_start_ms; when the lyrics (or their
+     * countdown) start before intro_band_ms it is a band at the top (title, artist and
+     * year) and one at the bottom (length, key, tempo and time signature, copyright)
+     * until intro_band_ms, else a card in the middle (also the writers and the
+     * song's other notes) gone intro_clear_ms before the lyrics; with no time to fade
+     * in and out before then, no intro. The ending card (title, artist, year,
+     * copyright) follows the lyrics' fade when ending_min_ms of the song is left. A song naming neither title nor artist gets an intro with
+     * fallback_title (the file's name, say) and no ending; with no fallback_title,
+     * neither. */
+    int32_t intro_page, ending_page;   /* 1, 1 */
+    const char* fallback_title;        /* UTF-8; NULL */
+    const char* labels;                /* UTF-8, one per line: "Length", "Key", "Tempo",
+                                          "Timing", "Written By", "Lyricist"; NULL = these */
+    int32_t intro_start_ms, intro_fade_ms; /* 1000, 1000 (0..60000) */
+    int32_t intro_clear_ms;            /* 3000 (0..60000) */
+    int32_t intro_band_ms;             /* 8000 (0..60000) */
+    int32_t ending_min_ms, ending_fade_ms; /* 3000, 750 (0..60000) */
+    uint32_t card_color;               /* the glass, 0xAARRGGBB: 0xE00E131C */
+    uint32_t card_accent;              /* the border and the artist: 0xFF78DCE8 */
+    uint32_t title_color, info_color, copyright_color; /* 0xFFFFF4DC, 0xFFD5DCE6, 0xFFB8A87A */
 } fa_lyric_style;
 
 /* The style of a preset. Strings and font_data are NULL (the UI font). */

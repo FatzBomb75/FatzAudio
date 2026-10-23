@@ -35,16 +35,21 @@ public class LyricTests
 
     /// <summary>960 ticks a second; lyrics in the test font's letters (A B O V): "ABBA VO" at 1, 1.5, 2 s and "OBAV" at
     /// 3, 3.5 s.</summary>
-    private static byte[] Song()
+    private static byte[] Song(string? title = null, double endSeconds = 4.5)
     {
         var t = new List<byte>();
+        if (title != null)
+        {
+            var b = Encoding.ASCII.GetBytes(title);
+            VarLen(t, 0); t.Add(0xFF); t.Add(0x01); VarLen(t, b.Length); t.AddRange(b);
+        }
         VarLen(t, 0); t.AddRange(new byte[] { 0x90, 69, 1 });
         Lyric(t, 960, "AB");
         Lyric(t, 480, "BA ");
         Lyric(t, 480, "VO");
         Lyric(t, 960, "\rOB");
         Lyric(t, 480, "AV");
-        VarLen(t, 960); t.AddRange(new byte[] { 0x80, 69, 0 });
+        VarLen(t, (int)(endSeconds * 960) - 3360); t.AddRange(new byte[] { 0x80, 69, 0 });
         VarLen(t, 0); t.AddRange(new byte[] { 0xFF, 0x2F, 0 });
         var f = new List<byte>();
         f.AddRange("MThd"u8.ToArray()); f.AddRange(new byte[] { 0, 0, 0, 6, 0, 0, 0, 1, 480 >> 8, 480 & 255 });
@@ -54,11 +59,11 @@ public class LyricTests
         return f.ToArray();
     }
 
-    private static (AudioEngine, SoundFont, AudioStream) Open()
+    private static (AudioEngine, SoundFont, AudioStream) Open(byte[]? song = null)
     {
         var engine = CreateHeadless();
         var font = SoundFont.FromMemory(MidiTests.SineSoundFont());
-        var s = engine.OpenMemory(Song(), new StreamOptions { DecodeOnly = true, SoundFont = font });
+        var s = engine.OpenMemory(song ?? Song(), new StreamOptions { DecodeOnly = true, SoundFont = font });
         return (engine, font, s);
     }
 
@@ -148,6 +153,42 @@ public class LyricTests
             var data = File.ReadAllBytes(FindTestFile("tests/data/fonts/tt.ttf"));
             lyrics.Style = LyricStyle.FromPreset(LyricPreset.Neon) with { FontData = data };
             Assert.Equal("FA Test", lyrics.GetLayout().FontUsed);
+        }
+    }
+
+    [Fact]
+    public void IntroPage_UsesTheWholeArea()
+    {
+        var (engine, font, s) = Open(Song("@TBOA", 30));
+        using (engine) using (font) using (s)
+        {
+            var style = TestFont(LyricPreset.Classic);
+            Assert.True(style.IntroPage);
+            Assert.True(style.EndingPage);
+            Assert.Equal(TimeSpan.FromSeconds(8), style.IntroBand);
+            Assert.Equal(TimeSpan.FromMilliseconds(750), style.EndingFade);
+            using var lyrics = s.CreateLyricSurface(style);
+            var layout = lyrics.GetLayout();
+            Assert.Equal(1920, layout.Width);
+            Assert.Equal(1080, layout.Height);
+            var buffer = new byte[layout.Width * 4 * layout.Height];
+            // The intro's top band at 0.5 s (lyrics from 1 s): glass at the top.
+            lyrics.UpdateInto(buffer, layout.Width * 4, layout.Width, layout.Height, 0, TimeSpan.FromSeconds(1.5));
+            Assert.True(buffer[(60 * layout.Width + 10) * 4 + 3] > 50);
+            lyrics.Style = lyrics.Style with { IntroPage = false, EndingPage = false };
+            Assert.True(lyrics.GetLayout().Height < 1080);
+            Assert.Throws<ArgumentOutOfRangeException>(() => lyrics.Style = lyrics.Style with { IntroFade = TimeSpan.FromMinutes(2) });
+        }
+        // A song naming nothing: pages only with a fallback title.
+        var (e2, f2, plain) = Open();
+        using (e2) using (f2) using (plain)
+        {
+            using var lyrics = plain.CreateLyricSurface(TestFont(LyricPreset.Classic));
+            Assert.True(lyrics.GetLayout().Height < 1080);
+            lyrics.Style = lyrics.Style with { FallbackTitle = "VOBA", Labels = "L\nK" };
+            Assert.Equal(1080, lyrics.GetLayout().Height);
+            Assert.Equal("VOBA", lyrics.Style.FallbackTitle);
+            Assert.Equal("L\nK", lyrics.Style.Labels);
         }
     }
 
