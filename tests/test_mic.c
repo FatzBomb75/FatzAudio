@@ -169,6 +169,18 @@ static int sim_music(sim* s, double hz, double seconds)
     return ok && fa_deck_load(a, s->music, 0) == FA_OK && fa_stream_play(s->music) == FA_OK;
 }
 
+/* Until the decks' workers have the next block decoded (or 2 s). */
+static void sim_wait_decoded(sim* s)
+{
+    int w;
+    for (w = 0; s->music && w < 2000; w++) {
+        if ((fa_ring_readable(&s->music->ring) >= OUT_BLOCK || fa_load32(&s->music->eof)) &&
+            (!s->music2 || fa_ring_readable(&s->music2->ring) >= OUT_BLOCK || fa_load32(&s->music2->eof)))
+            break;
+        fa_sleep_ms(1);
+    }
+}
+
 /* One master block of OUT_BLOCK, rendered at `now_ns`, and the input periods and the
  * headphones' periods that fell due. */
 static void sim_step(sim* s, int64_t now_ns)
@@ -179,13 +191,7 @@ static void sim_step(sim* s, int64_t now_ns)
         s->out = (float*)realloc(s->out, (size_t)s->cap * 2 * sizeof(float));
     }
     {
-        int w;
-        for (w = 0; s->music && w < 2000; w++) {   /* the decks' workers have the block decoded */
-            if ((fa_ring_readable(&s->music->ring) >= OUT_BLOCK || fa_load32(&s->music->eof)) &&
-                (!s->music2 || fa_ring_readable(&s->music2->ring) >= OUT_BLOCK || fa_load32(&s->music2->eof)))
-                break;
-            fa_sleep_ms(1);
-        }
+        sim_wait_decoded(s);
         s->owed += (double)OUT_BLOCK * s->in_true / (double)s->dev->rate;
         while (s->mic && s->owed >= (double)s->in_period) {
             uint32_t i, c;
@@ -1730,7 +1736,7 @@ static void test_cue_heard_position(void)
     fa_time da = 0, db = 0;
     double delay_ms = 0.0, worst_clock = 0.0, worst_lyric = 0.0, worst_cdg = 0.0;
     int64_t turn_a = -1, turn_b = -1;
-    uint32_t blocks = 0;
+    uint32_t blocks = 0, compared = 0;
     memset(&la, 0, sizeof(la));
     memset(&lb, 0, sizeof(lb));
     CHECK(sim_open_cue_settled(&a, 0, 48000, 48000.0, 480, 120000000));
@@ -1753,9 +1759,12 @@ static void test_cue_heard_position(void)
     a.dev->cb_prev_time = 0;
     b.dev->cb_prev_time = 0;
     for (blocks = 0; blocks < 2.5 * a.dev->rate / OUT_BLOCK; blocks++) {
-        int64_t now = fa_monotonic_ns(), t[7];
+        int64_t now, t[7];
         fa_time ca = 0, cb = 0, ya, yb;
         fa_cdg_frame fa_, fb_;
+        sim_wait_decoded(&a);   /* no waiting (a 15 ms sleep on Windows) between `now` and the reads */
+        sim_wait_decoded(&b);
+        now = fa_monotonic_ns();
         sim_step(&a, now);
         sim_step(&b, now);
         /* Each pair is asked one after the other: the clocks move on with real time
@@ -1776,14 +1785,17 @@ static void test_cue_heard_position(void)
         if (cb < 300000000 || ca <= 0) continue;   /* both heard and well under way */
         /* At the same moment the delayed mixer is exactly the delay behind. Each read
          * happened somewhere between the stamps around it, so the gap between the two
-         * reads is known to within those stamps: only an error beyond that counts. */
-        {
+         * reads is known to within those stamps: only an error beyond that counts. A
+         * clock holds at the end of what was rendered, so reads later than the undelayed
+         * mixer's latency after `now` (a busy machine) are left out. */
+        if (t[6] - now < db) {
             double dc = fabs((double)(cb - ca - (t[1] - t[0])) / 1e6 - delay_ms) - (double)(t[2] - t[0]) / 1e6;
             double dg = fabs((double)(fb_.time - fa_.time - (t[3] - t[2])) / 1e6 - delay_ms) - (double)(t[4] - t[2]) / 1e6;
             double dy = fabs((double)(yb - ya - (t[5] - t[4])) / 1e6 - delay_ms) - (double)(t[6] - t[4]) / 1e6;
             if (dc > worst_clock) worst_clock = dc;
             if (dg > worst_cdg) worst_cdg = dg;
             if (dy > worst_lyric) worst_lyric = dy;
+            compared++;
         }
         /* The picture turns white at 1 s on both, so on the delayed one that much later:
          * it is still black when the other turns. */
@@ -1797,6 +1809,7 @@ static void test_cue_heard_position(void)
     }
     /* (How many frames apart the two turns are depends on how fast this test renders
      * against real time; the clocks above compare them at the same moment.) */
+    CHECK(compared > 100);
     CHECK(worst_clock <= 0.001);   /* a microsecond: rounding */
     CHECK(worst_cdg <= 0.001);
     CHECK(worst_lyric <= 0.001);
