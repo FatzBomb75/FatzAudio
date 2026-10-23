@@ -84,11 +84,11 @@ public sealed record CdgPresentation
     public bool SuperCentered { get; init; }
     /// <summary>CD+G pixels of transparent space on each side, 0..32.</summary>
     public int Padding { get; init; }
-    /// <summary>0..10, with <see cref="Scale"/> only: 0 sharp pixels, 1-4 softer (4 = bilinear). 5-10 are planned and draw
-    /// as 4 in this version.</summary>
+    /// <summary>0..10, with <see cref="Scale"/> only: 0 sharp pixels, 1-4 softer (4 = bilinear), 5-10 traced outlines (5
+    /// diagonal steps straightened, 6 shallow slopes too, 7-8 corners rounded, 9-10 curves).</summary>
     public int Smoothness { get; init; }
     /// <summary>With <see cref="Scale"/> only: anti-aliases stair steps along the edges between colours (morphological
-    /// anti-aliasing), without blurring anything else.</summary>
+    /// anti-aliasing), without blurring anything else. No effect at smoothness 5-10.</summary>
     public bool EdgeBlend { get; init; }
     /// <summary>The border is transparent too; its colour is still reported in <see cref="SurfaceUpdate.BorderIndex"/>.</summary>
     public bool TransparentBorder { get; init; }
