@@ -5,6 +5,7 @@
  * dirty rectangles), timing and the audio clock, MP3+G style pairs, ZIP archives
  * and the DEFLATE decoder behind them. Every input is generated here. */
 #include "cdg.h"
+#include "cdg_contour.h"
 #include "surface.h"
 #include <math.h>
 #include <stddef.h>
@@ -2834,6 +2835,11 @@ static void test_presentation_incremental(void)
         { FA_SAFETY_SHOW, 900, 648, 0, 0, 0, 0, 0, 1 },   /* effects: outline and a soft shadow */
         { FA_SAFETY_REMOVE, 900, 648, 2, 1, 0, 1, 1, 2 }, /* bevel and a hard outline */
         { FA_SAFETY_SHOW, 600, 432, 4, 0, 1, 2, 0, 3 },   /* a glow and a hard shadow far off */
+        { FA_SAFETY_SHOW, 900, 648, 5, 1, 0, 0, 0, 0 },   /* contours: edge blend has nothing to add */
+        { FA_SAFETY_SUPER, 600, 432, 6, 0, 1, 1, 1, 0 },
+        { FA_SAFETY_REMOVE, 900, 648, 7, 0, 0, 2, 0, 0 },
+        { FA_SAFETY_SHOW, 1200, 864, 8, 0, 1, 0, 0, 1 },
+        { FA_SAFETY_SHOW, 900, 648, 10, 0, 0, 0, 1, 2 },
     };
     buf data[4];
     unsigned ci, di;
@@ -3032,6 +3038,184 @@ static void test_safety_zone_prepass(void)
  * colour change, more pixels the higher the level; edge blend turns a staircase into
  * partly covered pixels and leaves a straight edge alone. All in premultiplied colour
  * between the two colours that meet. */
+/* Contour mode (smoothness 5-10) on random screens: with the smoothing off the traced
+ * outlines draw exactly the nearest picture; drawing around a change gives what
+ * drawing everything gives; a picture moved by whole pixels draws the same pixels
+ * (scrolls move the master); and two colours meet without a seam. */
+static void cm_screen(uint8_t s[CDG_SCALE_H][CDG_SCALE_W], uint32_t* rs, int shapes)
+{
+    int i, x, y;
+    memset(s, 0, (size_t)CDG_SCALE_H * CDG_SCALE_W);
+    for (i = 0; i < shapes; i++) {
+        int w, h, x0, y0, c, kind;
+        *rs = *rs * 1103515245u + 12345u; w = 1 + (int)((*rs >> 16) % 8);
+        *rs = *rs * 1103515245u + 12345u; h = 1 + (int)((*rs >> 16) % 8);
+        *rs = *rs * 1103515245u + 12345u; x0 = (int)((*rs >> 16) % CDG_SCALE_W);
+        *rs = *rs * 1103515245u + 12345u; y0 = (int)((*rs >> 16) % CDG_SCALE_H);
+        *rs = *rs * 1103515245u + 12345u; c = (int)((*rs >> 16) % CDG_SCALE_COLORS);
+        *rs = *rs * 1103515245u + 12345u; kind = (int)((*rs >> 16) % 3);
+        for (y = y0; y < y0 + h && y < CDG_SCALE_H; y++)
+            for (x = x0; x < x0 + w && x < CDG_SCALE_W; x++) {
+                if (kind == 1 && (x - x0) * h / w != y - y0) continue;   /* a diagonal */
+                if (kind == 2 && (x + y) % 2) continue;                  /* a checkerboard */
+                s[y][x] = (uint8_t)c;
+            }
+    }
+}
+
+static void test_contours(void)
+{
+    static uint8_t a[CDG_SCALE_H][CDG_SCALE_W], b[CDG_SCALE_H][CDG_SCALE_W];
+    static const int levels[] = { 0, 5, 6, 7, 8, 9, 10 };
+    uint8_t pm[CDG_SCALE_COLORS][4];
+    uint32_t n = 3, rs = 7;
+    size_t stride = (size_t)CDG_SCALE_W * n * 4, size = stride * CDG_SCALE_H * n;
+    uint8_t *o1 = (uint8_t*)malloc(size), *o2 = (uint8_t*)malloc(size);
+    int32_t* acc = (int32_t*)malloc(CDG_CONTOUR_ACC_BYTES(n));
+    cdg_contours* ct = NULL;
+    unsigned li;
+    int i, it;
+    CHECK(o1 && o2 && acc);
+    for (i = 0; i < CDG_SCALE_COLORS; i++) {
+        pm[i][0] = (uint8_t)(i * 13);
+        pm[i][1] = (uint8_t)(i * 7 + 20);
+        pm[i][2] = (uint8_t)(255 - i * 9);
+        pm[i][3] = 255;
+    }
+    memset(pm[16], 0, 4);
+    memset(acc, 0x5A, CDG_CONTOUR_ACC_BYTES(n));   /* shared scratch: any contents */
+    for (li = 0; li < sizeof(levels) / sizeof(levels[0]); li++) {
+        int level = levels[li], reach = cdg_contour_reach(level);
+        for (it = 0; it < (FA_TEST_SANITIZED ? 6 : 25); it++) {
+            int x0, y0, x1, y1, dx, dy, x, y, m;
+            cm_screen(a, &rs, 400);
+            CHECK(cdg_contours_build(&ct, (const uint8_t(*)[CDG_SCALE_W])a, level, n));
+            cdg_contours_draw(ct, (const uint8_t(*)[CDG_SCALE_W])a, (const uint8_t(*)[4])pm, o1, stride, 0, 0, 0, 0,
+                              CDG_SCALE_W, CDG_SCALE_H, acc);
+            if (level == 0)
+                for (y = 0; y < CDG_SCALE_H * (int)n; y++)
+                    for (x = 0; x < CDG_SCALE_W * (int)n; x++)
+                        if (memcmp(o1 + (size_t)y * stride + (size_t)x * 4, pm[a[y / (int)n][x / (int)n]], 4) != 0) {
+                            printf("    traced edges differ from nearest at %d, %d\n", x, y);
+                            CHECK(0);
+                            goto next_level;
+                        }
+            /* A change, drawn around it, against everything drawn. */
+            memcpy(b, a, sizeof(a));
+            rs = rs * 1103515245u + 12345u; x0 = (int)((rs >> 16) % CDG_SCALE_W);
+            rs = rs * 1103515245u + 12345u; y0 = (int)((rs >> 16) % CDG_SCALE_H);
+            x1 = x0 + 6 < CDG_SCALE_W ? x0 + 6 : CDG_SCALE_W;
+            y1 = y0 + 12 < CDG_SCALE_H ? y0 + 12 : CDG_SCALE_H;
+            for (y = y0; y < y1; y++)
+                for (x = x0; x < x1; x++) {
+                    rs = rs * 1103515245u + 12345u;
+                    b[y][x] = (uint8_t)((rs >> 16) % 3);
+                }
+            CHECK(cdg_contours_build(&ct, (const uint8_t(*)[CDG_SCALE_W])b, level, n));
+            cdg_contours_draw(ct, (const uint8_t(*)[CDG_SCALE_W])b, (const uint8_t(*)[4])pm, o1, stride, 0, 0, x0 - reach,
+                              y0 - reach, x1 + reach, y1 + reach, acc);
+            cdg_contours_draw(ct, (const uint8_t(*)[CDG_SCALE_W])b, (const uint8_t(*)[4])pm, o2, stride, 0, 0, 0, 0,
+                              CDG_SCALE_W, CDG_SCALE_H, acc);
+            if (memcmp(o1, o2, size) != 0) {
+                printf("    level %d: drawing around a change differs from drawing all\n", level);
+                CHECK(0);
+                goto next_level;
+            }
+            /* Moved by whole pixels: the same pixels away from the screen's edges. */
+            rs = rs * 1103515245u + 12345u; dx = (int)((rs >> 16) % 13) - 6;
+            rs = rs * 1103515245u + 12345u; dy = (int)((rs >> 16) % 25) - 12;
+            for (y = 0; y < CDG_SCALE_H; y++)
+                for (x = 0; x < CDG_SCALE_W; x++) {
+                    int sx = x - dx, sy = y - dy;
+                    a[y][x] = sx >= 0 && sy >= 0 && sx < CDG_SCALE_W && sy < CDG_SCALE_H ? b[sy][sx] : 0;
+                }
+            CHECK(cdg_contours_build(&ct, (const uint8_t(*)[CDG_SCALE_W])a, level, n));
+            cdg_contours_draw(ct, (const uint8_t(*)[CDG_SCALE_W])a, (const uint8_t(*)[4])pm, o1, stride, 0, 0, 0, 0,
+                              CDG_SCALE_W, CDG_SCALE_H, acc);
+            m = reach + 14;
+            for (y = m * (int)n; y < (CDG_SCALE_H - m) * (int)n; y++)
+                if (memcmp(o1 + (size_t)y * stride + (size_t)m * n * 4,
+                           o2 + (size_t)(y - dy * (int)n) * stride + (size_t)(m - dx) * n * 4,
+                           (size_t)(CDG_SCALE_W - 2 * m) * n * 4) != 0) {
+                    printf("    level %d: moved by %d, %d draws differently (row %d)\n", level, dx, dy, y);
+                    CHECK(0);
+                    goto next_level;
+                }
+        }
+        {
+            /* Red against transparent only: R equals A and B, G stay 0 at every pixel
+             * (premultiplied blends of the two colours, no seam of anything else). */
+            uint8_t two[CDG_SCALE_COLORS][4];
+            int x, y;
+            memset(two, 0, sizeof(two));
+            two[1][2] = two[1][3] = 255;   /* BGRA red */
+            cm_screen(a, &rs, 300);
+            for (y = 0; y < CDG_SCALE_H; y++)
+                for (x = 0; x < CDG_SCALE_W; x++) a[y][x] = a[y][x] ? 1 : 16;
+            CHECK(cdg_contours_build(&ct, (const uint8_t(*)[CDG_SCALE_W])a, level, n));
+            cdg_contours_draw(ct, (const uint8_t(*)[CDG_SCALE_W])a, (const uint8_t(*)[4])two, o1, stride, 0, 0, 0, 0,
+                              CDG_SCALE_W, CDG_SCALE_H, acc);
+            for (i = 0; i < CDG_SCALE_W * (int)n * CDG_SCALE_H * (int)n; i++) {
+                const uint8_t* q = o1 + (size_t)i * 4;
+                if (q[0] || q[1] || q[2] != q[3]) {
+                    printf("    level %d: pixel %d is %u %u %u %u\n", level, i, q[0], q[1], q[2], q[3]);
+                    CHECK(0);
+                    break;
+                }
+            }
+        }
+    next_level:;
+    }
+    {
+        /* One pixel added next to a large ellipse: tracing order makes some of its
+         * outline run the other way, which must not change anything far from the
+         * pixel (it did, by 1, before points and curves were stored the same either
+         * way). */
+        uint32_t n8 = 8;
+        size_t stride8 = (size_t)CDG_SCALE_W * n8 * 4, size8 = stride8 * CDG_SCALE_H * n8;
+        uint8_t *e1 = (uint8_t*)malloc(size8), *e2 = (uint8_t*)malloc(size8);
+        int32_t* acc8 = (int32_t*)malloc(CDG_CONTOUR_ACC_BYTES(n8));
+        int level, x, y, tried = 0;
+        CHECK(e1 && e2 && acc8);
+        for (y = 0; y < CDG_SCALE_H; y++)
+            for (x = 0; x < CDG_SCALE_W; x++) {
+                float u = ((float)x + 0.5f - 150.3f) / 60.0f, v = ((float)y + 0.5f - 108.7f) / 45.0f;
+                a[y][x] = (uint8_t)(u * u + v * v < 1.0f);
+            }
+        for (level = 8; level <= 10; level += 2)
+            for (y = 1; y < CDG_SCALE_H - 1; y++)
+                for (x = 1; x < CDG_SCALE_W - 1; x++) {
+                    int reach = cdg_contour_reach(level);
+                    if (a[y][x] || !(a[y - 1][x] || a[y + 1][x] || a[y][x - 1] || a[y][x + 1])) continue;
+                    if (++tried % (FA_TEST_SANITIZED ? 40 : 9) != 0 && !(x == 210 && y == 101)) continue;
+                    CHECK(cdg_contours_build(&ct, (const uint8_t(*)[CDG_SCALE_W])a, level, n8));
+                    cdg_contours_draw(ct, (const uint8_t(*)[CDG_SCALE_W])a, (const uint8_t(*)[4])pm, e1, stride8, 0, 0, 0, 0,
+                                      CDG_SCALE_W, CDG_SCALE_H, acc8);
+                    memcpy(b, a, sizeof(a));
+                    b[y][x] = 2;
+                    CHECK(cdg_contours_build(&ct, (const uint8_t(*)[CDG_SCALE_W])b, level, n8));
+                    cdg_contours_draw(ct, (const uint8_t(*)[CDG_SCALE_W])b, (const uint8_t(*)[4])pm, e1, stride8, 0, 0,
+                                      x - reach, y - reach, x + 1 + reach, y + 1 + reach, acc8);
+                    cdg_contours_draw(ct, (const uint8_t(*)[CDG_SCALE_W])b, (const uint8_t(*)[4])pm, e2, stride8, 0, 0, 0, 0,
+                                      CDG_SCALE_W, CDG_SCALE_H, acc8);
+                    if (memcmp(e1, e2, size8) != 0) {
+                        printf("    level %d: a pixel at %d, %d changes the ellipse beyond the reach\n", level, x, y);
+                        CHECK(0);
+                        level = 11;
+                        y = CDG_SCALE_H;
+                        break;
+                    }
+                }
+        free(e1);
+        free(e2);
+        free(acc8);
+    }
+    cdg_contours_free(ct);
+    free(acc);
+    free(o1);
+    free(o2);
+}
+
 static void test_smoothness_and_edge_blend(void)
 {
     fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
@@ -3055,12 +3239,12 @@ static void test_smoothness_and_edge_blend(void)
     CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
     CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
     CHECK_EQ(fa_surface_set_presentation_size(f, 2400, 1728), FA_OK);   /* 8x */
-    for (level = 0; level <= 5; level++) {
+    for (level = 0; level <= 11; level++) {
         int mixed = 0;
         uint32_t x, y;
         p = pres(1, FA_SAFETY_SHOW);
-        p.smoothness = level < 5 ? level : 0;
-        p.edge_blend = level == 5;
+        p.smoothness = level < 5 ? level : level == 5 ? 0 : level - 1;   /* 5: edge blend; 6..11: smoothness 5..10 */
+        p.edge_blend = level >= 5;
         CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
         a = full_draw(f, 20, 4, &l);
         CHECK(a);
@@ -3077,7 +3261,16 @@ static void test_smoothness_and_edge_blend(void)
         CHECK_EQ(a[(((size_t)100 * 8 + 8) * l.width + (size_t)100 * 8 + 8) * 4 + 3], 0);
         if (level >= 1 && level <= 4) CHECK(mixed >= prev);   /* higher is never sharper */
         if (level == 0) CHECK_EQ(mixed, 0);
-        if (level == 5) {
+        if (level >= 6) {
+            /* Edge blend adds nothing to the outlines: the same picture without it. */
+            uint8_t* nb;
+            p.edge_blend = 0;
+            CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+            nb = full_draw(f, 20, 4, &l);
+            CHECK(nb && memcmp(a, nb, (size_t)l.width * l.height * 4) == 0);
+            free(nb);
+        }
+        if (level >= 5) {
             /* The block's straight top edge (row 144, columns well inside it) is not
              * touched; the staircase is. */
             uint32_t top = (12 * 12) * 8 + 8, mid = (21 * 6) * 8 + 8;
@@ -3322,7 +3515,9 @@ static void test_presentation_costs(void)
     static const struct { const char* name; int smooth, blend, fx; } levels[] = {
         { "smoothness 0", 0, 0, 0 }, { "smoothness 2", 2, 0, 0 }, { "smoothness 4", 4, 0, 0 },
         { "smoothness 4 + edge blend", 4, 1, 0 }, { "+ outline 0.5, shadow 0.5", 4, 1, 2 },
-        { "+ all effects at maximum", 4, 1, 1 },
+        { "+ all effects at maximum", 4, 1, 1 }, { "smoothness 5 (contours)", 5, 0, 0 },
+        { "smoothness 6", 6, 0, 0 }, { "smoothness 8", 8, 0, 0 }, { "smoothness 10 (curves)", 10, 0, 0 },
+        { "10 + outline 0.5, shadow 0.5", 10, 0, 2 },
     };
     static const uint32_t sizes[2][2] = { { 1920, 1080 }, { 3840, 2160 } };
     buf c = { 0 };
@@ -3338,7 +3533,7 @@ static void test_presentation_costs(void)
     CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
     CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
     printf("  %-28s %10s %10s %10s %10s\n", "", "1080p full", "typical", "2160p full", "typical");
-    for (li = 0; li < 6; li++) {
+    for (li = 0; li < (int)(sizeof(levels) / sizeof(levels[0])); li++) {
         double full[2] = { 0, 0 }, typical[2] = { 0, 0 };
         fa_surface_effects fx;
         fa_surface_effects_init(&fx);
@@ -3479,6 +3674,7 @@ int main(void)
     RUN(test_presentation_scaled);
     RUN(test_safety_zone_prepass);
     RUN(test_smoothness_and_edge_blend);
+    RUN(test_contours);
     RUN(test_effects);
     RUN(test_presentation_incremental);
     RUN(test_render_ahead);

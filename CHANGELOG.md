@@ -18,6 +18,11 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- CD+G smoothness 5-10: each colour region's outline is traced along the pixel edges, smoothed by local rules (diagonal
+  steps at 5, shallow slopes at 6, rounded corners at 7-8, curves after the published potrace method at 9-10) and drawn
+  with exact-area anti-aliasing, the colours meeting along shared outlines so no seams appear. Only the area around a
+  change is drawn again, and scrolls still move the picture. Edge blend has no effect at these levels. See
+  [docs/features/cdg.md](docs/features/cdg.md#presentation-options-fa_cdg_surface_set_presentation).
 - MIDI lyric surface: `fa_lyric_surface_create`, `fa_lyric_surface_set_style`, `fa_lyric_surface_get_style` and
   `fa_lyric_style_init` draw a MIDI or `.kar` song's lyrics as a karaoke screen: the active line with lines around it,
   syllables coloured as they are sung (cross-fade or sweep), scrolling lines, page fades, a countdown after long gaps,
@@ -46,8 +51,8 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - CD+G presentation options: `fa_cdg_surface_set_presentation` crops a surface to a safety zone (show, remove, auto
   from a pre-pass over the song, or a tight box around everything drawn), adds transparent padding, and with
   presentation scaling draws the picture in premultiplied full colour at the whole-number multiple nearest the
-  presentation size, on a transparent background with a one-pixel transparent margin, at smoothness 0-4 (5-10 draw
-  as 4 for now), with optional edge anti-aliasing (MLAA) and a transparent border. Scrolls move the surface's
+  presentation size, on a transparent background with a one-pixel transparent margin, at smoothness 0-10 (5-10
+  traced outlines and curves), with optional edge anti-aliasing (MLAA) and a transparent border. Scrolls move the surface's
   picture instead of redrawing it, and smooth-scroll offsets only move what is copied out. Also
   `fa_cdg_surface_get_presentation`, `fa_cdg_presentation_init`, `FA_CDG_TRANSPARENT_BORDER` and
   `FA_CDG_INDEX_TRANSPARENT` (index 16 in INDEXED8 padding). .NET: `CdgSurface.Presentation`, `CdgPresentation`,

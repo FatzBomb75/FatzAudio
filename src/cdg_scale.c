@@ -16,6 +16,7 @@
  * colour by the area they cover. The grid is exact, so no threshold is needed and
  * nothing else is touched. */
 #include "cdg_scale.h"
+#include "cdg_contour.h"
 #include <string.h>
 
 #define EDGE_SPAN 4               /* CD+G pixels a step's line reaches along its edge */
@@ -25,11 +26,16 @@ void cdg_scaler_init(cdg_scaler* sc, uint32_t n, int smoothness, int edge_blend)
     static const float band[5] = { 0.0f, 0.0f, 0.25f, 0.5f, 1.0f };
     uint32_t p;
     float width;
+    struct cdg_contours* ct = sc->ct;
+    int contour = smoothness >= 5 && smoothness <= 10 ? smoothness : 0, failed = sc->ct_failed;
     memset(sc, 0, sizeof(*sc));
+    sc->ct = ct;
+    sc->ct_failed = failed;
     if (n < 1) n = 1;
     if (n > CDG_SCALE_MAX_N) n = CDG_SCALE_MAX_N;
     if (smoothness < 0) smoothness = 0;
-    if (smoothness > 4) smoothness = 4;
+    if (smoothness > 4) smoothness = 4;   /* contour mode falls back to 4 without memory */
+    if (contour) edge_blend = 0;          /* nothing left for it to do */
     sc->n = n;
     sc->smooth = smoothness > 0;
     sc->edge_blend = edge_blend != 0;
@@ -50,6 +56,32 @@ void cdg_scaler_init(cdg_scaler* sc, uint32_t n, int smoothness, int edge_blend)
     }
     sc->reach_across = sc->smooth || sc->edge_blend ? 1 : 0;
     sc->reach_along = sc->edge_blend ? 2 * EDGE_SPAN + 2 : sc->reach_across;
+    if (contour) {
+        /* An outline bends round corners: the reach is the same every way. */
+        sc->contour = contour;
+        sc->reach_across = sc->reach_along = cdg_contour_reach(contour);
+    }
+}
+
+int cdg_scale_prepare(cdg_scaler* sc, const uint8_t screen[CDG_SCALE_H][CDG_SCALE_W])
+{
+    int was;
+    if (!sc->contour) return 0;
+    was = !sc->ct_failed;
+    sc->ct_ok = cdg_contours_build(&sc->ct, screen, sc->contour, sc->n);
+    if (!sc->ct_ok) sc->ct_failed = 1;
+    if (sc->ct_ok && !was) {
+        sc->ct_failed = 0;
+        return 1;
+    }
+    return 0;
+}
+
+void cdg_scaler_free(cdg_scaler* sc)
+{
+    cdg_contours_free(sc->ct);
+    sc->ct = NULL;
+    sc->ct_ok = 0;
 }
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -243,6 +275,10 @@ void cdg_scale_rect(const cdg_scaler* sc, const uint8_t screen[CDG_SCALE_H][CDG_
     if (sx1 > CDG_SCALE_W) sx1 = CDG_SCALE_W;
     if (sy1 > CDG_SCALE_H) sy1 = CDG_SCALE_H;
     if (sx0 >= sx1 || sy0 >= sy1) return;
+    if (sc->contour && sc->ct_ok) {
+        cdg_contours_draw(sc->ct, screen, pm, out, out_stride, ox, oy, sx0, sy0, sx1, sy1, (int32_t*)(void*)rows);
+        return;
+    }
     base_pass(sc, screen, pm, out, out_stride, ox, oy, sx0, sy0, sx1, sy1, rows);
     if (!sc->edge_blend) return;
     m.sc = sc;

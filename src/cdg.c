@@ -1041,6 +1041,10 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
                     memset(f->eidx[y] + FA_CDG_WIDTH - CDG_BORDER_X, FA_CDG_INDEX_TRANSPARENT, CDG_BORDER_X);
                 }
             }
+        if (cdg_scale_prepare(&f->sc, (const uint8_t(*)[CDG_SCALE_W])f->eidx)) {
+            fa_rects_clear(&m);
+            fa_rects_add(&m, f->mx0, f->my0, f->mx0 + f->mw, f->my0 + f->mh);
+        }
         for (i = 0; i < m.n; i++)
             cdg_scale_rect(&f->sc, (const uint8_t(*)[CDG_SCALE_W])f->eidx, (const uint8_t(*)[4])pm, f->master,
                            f->master_stride, f->mx0, f->my0, m.r[i][0], m.r[i][1], m.r[i][2], m.r[i][3], f->rows);
@@ -1397,6 +1401,7 @@ static void free_maps(fa_cdg_surface* f)
     free(f->ylerp);
     free(f->master);
     free(f->rows);
+    cdg_scaler_free(&f->sc);
     free(f->fxm);
     free(f->fx_scratch);
     f->fxm = NULL;

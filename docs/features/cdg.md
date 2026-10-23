@@ -266,9 +266,14 @@ AUTO and SUPER are worked out once per song, by the same walk over the packs tha
 | 1 | Sharp, with the output pixel either side of each pixel boundary blended |
 | 2, 3 | A blend band a quarter, then half a CD+G pixel wide |
 | 4 | Plain bilinear |
-| 5-10 | Planned (traced outlines, then curves); in this version they draw as 4 |
+| 5 | **Traced outlines.** Each colour region's outline is traced along the CD+G pixel edges and drawn with exact-area anti-aliasing at the output size. Single-pixel stair steps (a diagonal stroke) become straight 45-degree edges; every other corner stays |
+| 6 | Also shallow and steep slopes: steps of 2 to 4 pixels become the straight slope they draw |
+| 7, 8 | Also rounds corners (radius up to half a CD+G pixel at 7, one at 8), except a right-angle corner whose both sides are at least 2 (7) or 3 (8) pixels long, so block and serif letters keep their corners |
+| 9, 10 | Curves: the level-6 outline fitted with Bezier curves after Selinger's published potrace method (our own code from the paper; potrace itself is not used). A right-angle corner whose sides are at least 4 (9) or 3 (10) pixels long stays a corner, so 10 is the crisper of the two |
 
-**Edge blend** is morphological anti-aliasing on the CD+G grid. An edge is where two neighbouring pixels have different colours. Along each straight run of an edge, where one colour steps over the edge at an end (an L, Z or U shape), the pixels between the edge and a line through the step take the other colour by the area they cover. Straight edges and flat areas are left alone, nothing is blurred, and no colour appears that is not one of the two meeting there. It can be combined with any smoothness.
+At 5-10 the colours meet along shared outlines, so two colours that touch never leave a gap or a seam of background between them, and nothing outside the two colours meeting at an edge appears. Where two pixels of one colour touch only at a corner (a one-pixel diagonal line), the colour that is scarcer around that corner is joined across it, as the line was meant to be. The outlines are worked out from a few pixels around each point only, so a change still redraws only around it (up to 16 CD+G pixels away at 9-10), and a scroll still moves the picture.
+
+**Edge blend** is morphological anti-aliasing on the CD+G grid. An edge is where two neighbouring pixels have different colours. Along each straight run of an edge, where one colour steps over the edge at an end (an L, Z or U shape), the pixels between the edge and a line through the step take the other colour by the area they cover. Straight edges and flat areas are left alone, nothing is blurred, and no colour appears that is not one of the two meeting there. It can be combined with any smoothness; at 5-10 it has no effect (the outlines are smooth already), so it can stay on while the user moves a smoothness slider.
 
 **Scrolls are moves, not redraws.** The surface keeps the picture it drew (its master) and moves it when the screen scrolls, drawing only the band that came in and what touches it. Smooth-scroll offsets draw nothing: they move the window copied out of the master. A colour-table change draws the master again.
 
@@ -299,10 +304,15 @@ Measured on one core of the Linux CI-class sandbox, Release build, a screen of s
 | Smoothness 2 | 3.3 ms | 0.05 ms | 11 ms | 0.15 ms |
 | Smoothness 4 | 3.4 ms | 0.05 ms | 13 ms | 0.18 ms |
 | Smoothness 4 + edge blend | 4.5 ms | 0.16 ms | 17 ms | 0.55 ms |
+| Smoothness 5 (traced outlines) | 5.7 ms | 0.8 ms | 20 ms | 0.9 ms |
+| Smoothness 6 | 6.0 ms | 0.7 ms | 18 ms | 1.1 ms |
+| Smoothness 8 | 6.0 ms | 0.8 ms | 18 ms | 1.3 ms |
+| Smoothness 10 (curves) | 6.6 ms | 0.9 ms | 19 ms | 1.7 ms |
+| Smoothness 10 + outline 0.5, shadow 0.5 | 26 ms | 2.2 ms | 109 ms | 8.7 ms |
 | + outline 0.5, shadow 0.5 | 28 ms | 1.2 ms | 115 ms | 4.3 ms |
 | + every effect at 1.0, fades on | 55 ms | 3.3 ms | 220 ms | 14 ms |
 
-`fa_test_cdg` prints this table (`test_presentation_costs`), so it can be measured on any machine. Effects cost most when the whole picture is drawn (a seek, a new layout, a colour change); a typical frame stays a few milliseconds even at 2160p. With effects at 2160p, turn on render-ahead so a full redraw happens on a worker instead of your drawing thread.
+`fa_test_cdg` prints this table (`test_presentation_costs`), so it can be measured on any machine. At smoothness 5-10 most of a typical update is tracing the whole screen's outlines again (about 0.6 to 1 ms here), which does not grow with the output size. Effects cost most when the whole picture is drawn (a seek, a new layout, a colour change); a typical frame stays a few milliseconds even at 2160p. With effects at 2160p, turn on render-ahead so a full redraw happens on a worker instead of your drawing thread.
 
 In .NET, `CdgSurface.Presentation` takes a `CdgPresentation` record (null = none):
 

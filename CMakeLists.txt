@@ -98,6 +98,7 @@ set(FA_SOURCES
     src/lyric.c
     src/lyric_time.c
     src/cdg_scale.c
+    src/cdg_contour.c
     src/surface.c
     src/surface_fx.c
     src/font.c

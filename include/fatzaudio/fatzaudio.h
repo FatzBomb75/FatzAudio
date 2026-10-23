@@ -1699,10 +1699,12 @@ typedef struct fa_cdg_presentation {
     uint32_t padding;                  /* CD+G pixels of transparent space on each side,
                                           0..32 */
     int32_t smoothness;                /* 0..10, scale on only. 0 sharp pixels, 1-4 softer
-                                          (4 = bilinear). 5-10 are planned and draw as 4
-                                          in this version */
+                                          (4 = bilinear), 5-10 traced outlines: 5 diagonal
+                                          steps straightened, 6 shallow slopes too, 7-8
+                                          corners rounded, 9-10 curves */
     int32_t edge_blend;                /* 0/1, scale on only: anti-aliases stair steps along
-                                          the edges between colours (MLAA) */
+                                          the edges between colours (MLAA); no effect at
+                                          smoothness 5-10, which are smooth already */
     uint32_t flags;                    /* fa_cdg_presentation_flags */
 } fa_cdg_presentation;
 
