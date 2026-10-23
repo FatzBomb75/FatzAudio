@@ -79,4 +79,4 @@ library first, then point the tests at it:
 dotnet test bindings/dotnet/tests/FatzAudio.Tests -p:FatzAudioNativeDir=<repo>/build/bin/Release
 ```
 
-On Linux and macOS the CMake output folder is `build/bin` (no `Release` subfolder).
+On Linux and macOS (and Windows with the Ninja generator, as in CI) the CMake output folder is `build/bin` (no `Release` subfolder).

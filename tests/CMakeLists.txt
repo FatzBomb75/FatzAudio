@@ -311,3 +311,8 @@ foreach(t fa_test_internal fa_test_loudness fa_test_crossfade fa_test_handoff fa
         set_property(TARGET ${t} PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
 endforeach()
+
+# These tests write scratch files with fixed names into the shared working
+# directory, so ctest -j must not run two of them at once. Everything else runs
+# in parallel.
+set_tests_properties(core loudness cdg disc encode midi internal tags PROPERTIES RESOURCE_LOCK fa_scratch_files)
