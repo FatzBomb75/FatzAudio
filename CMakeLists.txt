@@ -64,6 +64,10 @@ set(FA_SOURCES
     src/normalize.c
     src/limiter.c
     src/analysis.c
+    src/analyze.c
+    src/beat.c
+    src/beat_grid.c
+    src/key.c
     src/clock.c
     src/codec.c
     src/ac3.c

@@ -23,6 +23,13 @@ if(UNIX)
 endif()
 add_test(NAME core COMMAND fa_test_core WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
+add_executable(fa_test_analysis test_analysis.c)
+target_link_libraries(fa_test_analysis PRIVATE fatzaudio)
+if(UNIX)
+    target_link_libraries(fa_test_analysis PRIVATE m)
+endif()
+add_test(NAME analysis COMMAND fa_test_analysis WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
 # White-box tests: the library sources compiled straight into the test, so it can
 # drive the mixer by hand and check exact sample values.
 list(TRANSFORM FA_SOURCES PREPEND ${PROJECT_SOURCE_DIR}/)
@@ -339,4 +346,4 @@ endforeach()
 # These tests write scratch files with fixed names into the shared working
 # directory, so ctest -j must not run two of them at once. Everything else runs
 # in parallel.
-set_tests_properties(core loudness cdg disc encode midi internal tags PROPERTIES RESOURCE_LOCK fa_scratch_files)
+set_tests_properties(core loudness cdg disc encode midi internal tags analysis PROPERTIES RESOURCE_LOCK fa_scratch_files)

@@ -74,6 +74,8 @@ void fa_stream_free_memory(struct fa_stream* s)
     free(s->ptimes);
     free(fa_load_ptr(&s->dsps));
     fa_tap_free((fa_tap*)fa_load_ptr(&s->tap));
+    fa_grid_data_free(&s->grid);
+    fa_mutex_destroy(&s->grid_lock);
     fa_mutex_destroy(&s->tempo_lock);
     fa_mutex_destroy(&s->cdg_lock);
     fa_mutex_destroy(&s->norm_lock);
@@ -146,6 +148,11 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
     if (fa_mutex_init(&s->tempo_lock) != 0) {
         fa_mutex_destroy(&s->cdg_lock); fa_mutex_destroy(&s->norm_lock); fa_mutex_destroy(&s->cb_lock);
         fa_mutex_destroy(&s->decode_lock); fa_mutex_destroy(&s->api_lock); free(s);
+        return FA_ERROR_GENERIC;
+    }
+    if (fa_mutex_init(&s->grid_lock) != 0) {
+        fa_mutex_destroy(&s->tempo_lock); fa_mutex_destroy(&s->cdg_lock); fa_mutex_destroy(&s->norm_lock);
+        fa_mutex_destroy(&s->cb_lock); fa_mutex_destroy(&s->decode_lock); fa_mutex_destroy(&s->api_lock); free(s);
         return FA_ERROR_GENERIC;
     }
     for (i = 0; i < FA_TEMPO_PARAMS; i++) fa_tparam_init(&s->tparams[i], FA_PARAM_RATE + i == FA_PARAM_PITCH ? 0.0f : 1.0f);

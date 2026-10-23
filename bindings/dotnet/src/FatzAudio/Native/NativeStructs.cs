@@ -633,6 +633,66 @@ internal unsafe struct FaMidiInfo
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal struct FaAnalysisOptions
+{
+    public uint StructSize;
+    public uint Kinds;
+    public float MinBpm;
+    public float MaxBpm;
+    public uint Flags;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaAnalysisInfo
+{
+    public uint StructSize;
+    public uint Kinds;
+    public uint Flags;
+    public uint SampleRate;
+    public long Length;
+}
+
+// The uint StructSize is followed by 4 bytes of padding before the double: Sequential layout inserts it, as the C compiler does.
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaBeatGrid
+{
+    public uint StructSize;
+    public double Bpm;
+    public long FirstBeat;
+    public uint SampleRate;
+    public uint BeatsPerBar;
+    public uint BarOffset;
+    public float Confidence;
+    public uint Flags;
+    public uint SegmentCount;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaTempoSegment
+{
+    public long Start;
+    public double Bpm;
+    public double Beat;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaWaveformPoint
+{
+    public float Peak, Low, Mid, High;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaKeyInfo
+{
+    public uint StructSize;
+    public int Tonic;
+    public int Minor;
+    public float Confidence;
+    public fixed byte Name[8];
+    public fixed byte Camelot[4];
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal unsafe struct FaMixerConfig
 {
     public uint StructSize;

@@ -33,6 +33,15 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   `fa_mixer_set_event_callback` reports an input that went away. Android captures unprocessed. New error
   `FA_ERROR_PERMISSION_DENIED`. .NET: `DjMixer.AddMic`, `Mic`, `MicOptions`, `DjMixer.Latency`, `DjMixer.InputLost`,
   `EqualizerPreset.LiveVocal`. See [docs/features/dj-mixer.md](docs/features/dj-mixer.md#microphones).
+- Track analysis: `fa_analyze_path` and `fa_analyze_stream` measure a beat grid (tempo, first beat, confidence), the
+  musical key (name and Camelot code), a waveform overview (peak and low/mid/high levels every 10 ms) and the loudness in
+  one decode, about 170x real time on one core, cached by content in `cache_directory`. MIDI files and tracker modules get
+  exact grids, with tempo changes, from the file. `fa_stream_set_beat_grid` and `fa_stream_get_beat_grid` put a grid on a
+  stream (for decks), `fa_key_transpose` and `fa_key_make` handle keys. Replaces `BASS_FX_BPM_*`. Constant grids only from
+  audio; tempo maps and bar detection are later. See [docs/features/analysis.md](docs/features/analysis.md).
+- .NET: `AudioEngine.Analyze` / `AnalyzeAsync` and `AudioStream.Analyze` / `AnalyzeAsync` return a `TrackAnalysis`
+  (`Beats`, `Key`, `Waveform`, `Loudness`); `BeatGrid` (with `BeatToFrame` / `FrameToBeat`), `MusicalKey` (with
+  `Transpose`), `AnalysisKinds`, `AnalysisOptions`; `AudioStream.BeatGrid` gets and sets a stream's grid.
 - CD+G smoothness 5-10: each colour region's outline is traced along the pixel edges, smoothed by local rules (diagonal
   steps at 5, shallow slopes at 6, rounded corners at 7-8, curves after the published potrace method at 9-10) and drawn
   with exact-area anti-aliasing, the colours meeting along shared outlines so no seams appear. Only the area around a
