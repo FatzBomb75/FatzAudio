@@ -37,6 +37,9 @@ typedef struct cdg_scaler {
 /* smoothness 0..10, edge_blend 0/1 (no effect at 5..10), n 1..CDG_SCALE_MAX_N. Keeps
  * the contour buffers of an earlier init, so `sc` must be zeroed before the first. */
 void cdg_scaler_init(cdg_scaler* sc, uint32_t n, int smoothness, int edge_blend);
+/* As cdg_scaler_init, drawing at n with the blend of size `look` (n a multiple of it),
+ * so the picture box-filtered down to `look` looks as it does drawn there. */
+void cdg_scaler_init_look(cdg_scaler* sc, uint32_t n, uint32_t look, int smoothness, int edge_blend);
 /* Before drawing rectangles of a changed `screen` (contour mode traces it). Returns 1
  * when the whole screen must be drawn: contours are back after a trace that ran out
  * of memory (drawn as smoothness 4 meanwhile). */

@@ -191,6 +191,13 @@ struct fa_cdg_surface {
     uint8_t* fxm;
     void* fx_scratch;
     size_t fx_scratch_size;
+    /* At N 1-3 the effects are worked out at 2N and box-filtered down (plan 3.3): m2
+     * is the master drawn at 2N (by sc2), f2 its effects. */
+    int x2;
+    cdg_scaler sc2;
+    uint8_t *m2, *f2;
+    size_t m2_stride;
+    uint16_t* rows2;
     /* Render-ahead with presentation scaling: an engine worker renders the next frame
      * into one slot while update_into copies from the one shown. work_lock guards all
      * of the surface but what pub_lock does; every surface call and a worker's job hold
@@ -930,10 +937,11 @@ static void master_shift(fa_cdg_surface* f, int dx, int dy, fa_rects* m)
     size_t len = (size_t)(w - (dxp < 0 ? -dxp : dxp)) * 4, to = (size_t)(dxp > 0 ? dxp : 0) * 4;
     size_t from = (size_t)(dxp < 0 ? -dxp : 0) * 4;
     uint8_t* buf[2];
-    int k;
-    buf[0] = f->master;
-    buf[1] = f->fx_on ? f->fxm : NULL;   /* the effects move with the picture */
-    for (k = 0; k < 2 && buf[k]; k++) {
+    int k, nbuf = 0;
+    /* The effects move with the picture; with the 2N pass the N master is not shown. */
+    if (!(f->fx_on && f->x2)) buf[nbuf++] = f->master;
+    if (f->fx_on) buf[nbuf++] = f->fxm;
+    for (k = 0; k < nbuf; k++) {
         uint8_t* b = buf[k];
         if (dyp > 0) {
             for (y = h - 1; y >= dyp; y--)
@@ -941,6 +949,19 @@ static void master_shift(fa_cdg_surface* f, int dx, int dy, fa_rects* m)
         } else {
             for (y = 0; y < h + dyp; y++)
                 memmove(b + (size_t)y * f->master_stride + to, b + (size_t)(y - dyp) * f->master_stride + from, len);
+        }
+    }
+    if (f->fx_on && f->x2) {
+        /* The 2N master moves too (its effects are drawn again where they changed). */
+        int d2y = 2 * dyp, h2 = 2 * h;
+        size_t len2 = 2 * len, to2 = 2 * to, from2 = 2 * from;
+        uint8_t* b = f->m2;
+        if (d2y > 0) {
+            for (y = h2 - 1; y >= d2y; y--)
+                memmove(b + (size_t)y * f->m2_stride + to2, b + (size_t)(y - d2y) * f->m2_stride + from2, len2);
+        } else {
+            for (y = 0; y < h2 + d2y; y++)
+                memmove(b + (size_t)y * f->m2_stride + to2, b + (size_t)(y - d2y) * f->m2_stride + from2, len2);
         }
     }
     if (dx > 0) master_mark(f, m, f->mx0, f->my0, f->mx0 + dx, my1);
@@ -982,8 +1003,19 @@ static void view_to_buffer(const fa_cdg_surface* f, fa_rects* area, int x0, int 
  * ready; 0 when there are none (or no memory for them: drawn without). */
 static int fx_ready(fa_cdg_surface* f, fa_fx_plan* plan)
 {
-    float n = (float)f->sc.n;
+    int x2 = f->sc.n <= 3;
+    float n = (float)(x2 ? 2 * f->sc.n : f->sc.n);
     size_t need;
+    if (!f->has_fx && f->m2) {
+        /* Effects off: the 2N buffers go (a full redraw follows when they come back). */
+        free(f->m2);
+        free(f->f2);
+        free(f->rows2);
+        cdg_scaler_free(&f->sc2);
+        f->m2 = f->f2 = NULL;
+        f->rows2 = NULL;
+        f->x2 = 0;
+    }
     if (!f->has_fx ||
         !fa_fx_plan_make(plan, &f->fx, 1.5f * n, 2.0f * n, 2.0f * n, n, out_format(f) == FA_CDG_PIXELS_RGBA32))
         return 0;
@@ -991,6 +1023,22 @@ static int fx_ready(fa_cdg_surface* f, fa_fx_plan* plan)
         f->fxm = (uint8_t*)malloc(f->master_stride * (size_t)f->mh * f->sc.n);
         if (!f->fxm) return 0;
     }
+    if (x2 && !f->m2) {
+        uint32_t n2 = 2 * f->sc.n;
+        f->m2_stride = 2 * f->master_stride;
+        f->m2 = (uint8_t*)malloc(f->m2_stride * (size_t)f->mh * n2);
+        f->f2 = (uint8_t*)malloc(f->m2_stride * (size_t)f->mh * n2);
+        f->rows2 = (uint16_t*)malloc(CDG_SCALE_ROWS_BYTES(n2));
+        if (!f->m2 || !f->f2 || !f->rows2) {
+            free(f->m2);
+            free(f->f2);
+            free(f->rows2);
+            f->m2 = f->f2 = NULL;
+            f->rows2 = NULL;
+            return 0;
+        }
+    }
+    f->x2 = x2;
     need = fa_fx_scratch_bytes(plan);
     if (need > f->fx_scratch_size) {
         free(f->fx_scratch);
@@ -1041,20 +1089,24 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
                     memset(f->eidx[y] + FA_CDG_WIDTH - CDG_BORDER_X, FA_CDG_INDEX_TRANSPARENT, CDG_BORDER_X);
                 }
             }
-        if (cdg_scale_prepare(&f->sc, (const uint8_t(*)[CDG_SCALE_W])f->eidx)) {
+        /* With the 2N pass the effects draw the picture from the 2N master, so the N
+         * one is not shown (a change of effects draws everything again). */
+        cdg_scaler* sc = fx && f->x2 ? &f->sc2 : &f->sc;
+        if (cdg_scale_prepare(sc, (const uint8_t(*)[CDG_SCALE_W])f->eidx)) {
             fa_rects_clear(&m);
             fa_rects_add(&m, f->mx0, f->my0, f->mx0 + f->mw, f->my0 + f->mh);
         }
         for (i = 0; i < m.n; i++)
-            cdg_scale_rect(&f->sc, (const uint8_t(*)[CDG_SCALE_W])f->eidx, (const uint8_t(*)[4])pm, f->master,
-                           f->master_stride, f->mx0, f->my0, m.r[i][0], m.r[i][1], m.r[i][2], m.r[i][3], f->rows);
+            cdg_scale_rect(sc, (const uint8_t(*)[CDG_SCALE_W])f->eidx, (const uint8_t(*)[4])pm,
+                           sc == &f->sc2 ? f->m2 : f->master, sc == &f->sc2 ? f->m2_stride : f->master_stride, f->mx0,
+                           f->my0, m.r[i][0], m.r[i][1], m.r[i][2], m.r[i][3], sc == &f->sc2 ? f->rows2 : f->rows);
     }
     f->master_tb = tb;
     memcpy(f->master_pm, pm, sizeof(pm));
     if (fx) {
         /* The effects of what changed, as far as they reach; after a move also along
          * the edges, where what reached in from outside the master has gone. */
-        int n = (int)f->sc.n, rc = (plan.reach + n - 1) / n + 1;
+        int n = (int)f->sc.n, pn = f->x2 ? 2 * n : n, rc = (plan.reach + pn - 1) / pn + 1;
         int mx1 = f->mx0 + (wide ? f->mw : (int)f->win_w), my1 = f->my0 + (wide ? f->mh : (int)f->win_h);
         fa_rects_clear(&e);
         for (i = 0; i < m.n; i++) master_add(f, &e, m.r[i][0] - rc, m.r[i][1] - rc, m.r[i][2] + rc, m.r[i][3] + rc);
@@ -1069,10 +1121,25 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
                 master_add(f, &e, f->mx0, my1 - by, mx1, my1);
             }
         }
-        for (i = 0; i < e.n; i++)
-            fa_fx_render(&plan, f->master, f->master_stride, (mx1 - f->mx0) * n, (my1 - f->my0) * n, f->fxm, f->master_stride,
-                         (e.r[i][0] - f->mx0) * n, (e.r[i][1] - f->my0) * n, (e.r[i][2] - f->mx0) * n,
-                         (e.r[i][3] - f->my0) * n, f->fx_scratch);
+        for (i = 0; i < e.n; i++) {
+            int x0 = (e.r[i][0] - f->mx0) * n, y0 = (e.r[i][1] - f->my0) * n;
+            int x1 = (e.r[i][2] - f->mx0) * n, y1 = (e.r[i][3] - f->my0) * n, xx, yy, k;
+            if (!f->x2) {
+                fa_fx_render(&plan, f->master, f->master_stride, (mx1 - f->mx0) * n, (my1 - f->my0) * n, f->fxm,
+                             f->master_stride, x0, y0, x1, y1, f->fx_scratch);
+                continue;
+            }
+            /* At 2N, then each output pixel the mean of its four. */
+            fa_fx_render(&plan, f->m2, f->m2_stride, (mx1 - f->mx0) * pn, (my1 - f->my0) * pn, f->f2, f->m2_stride,
+                         2 * x0, 2 * y0, 2 * x1, 2 * y1, f->fx_scratch);
+            for (yy = y0; yy < y1; yy++) {
+                const uint8_t* a = f->f2 + (size_t)(2 * yy) * f->m2_stride + (size_t)(2 * x0) * 4;
+                const uint8_t* b = a + f->m2_stride;
+                uint8_t* o = f->fxm + (size_t)yy * f->master_stride + (size_t)x0 * 4;
+                for (xx = x0; xx < x1; xx++, a += 8, b += 8, o += 4)
+                    for (k = 0; k < 4; k++) o[k] = (uint8_t)((a[k] + a[k + 4] + b[k] + b[k + 4] + 2) >> 2);
+            }
+        }
         m = e;                    /* what changed in what is shown */
     }
     /* A move or new offsets change where everything is shown. */
@@ -1404,6 +1471,13 @@ static void free_maps(fa_cdg_surface* f)
     cdg_scaler_free(&f->sc);
     free(f->fxm);
     free(f->fx_scratch);
+    free(f->m2);
+    free(f->f2);
+    free(f->rows2);
+    cdg_scaler_free(&f->sc2);
+    f->m2 = f->f2 = NULL;
+    f->rows2 = NULL;
+    f->x2 = 0;
     f->fxm = NULL;
     f->fx_scratch = NULL;
     f->fx_scratch_size = 0;
@@ -1422,7 +1496,11 @@ static fa_result layout_apply(fa_cdg_surface* f, const cdg_layout* l)
 {
     int smooth = f->has_pres ? f->pres.smoothness : 0, blend = f->has_pres ? f->pres.edge_blend : 0;
     uint32_t i;
-    if (l->scaled) cdg_scaler_init(&f->sc, l->n, smooth, blend);
+    if (l->scaled) {
+        cdg_scaler_init(&f->sc, l->n, smooth, blend);
+        /* The effects' 2N master at N 1-3, blended as at N. */
+        if (l->n <= 3) cdg_scaler_init_look(&f->sc2, 2 * l->n, l->n, smooth, blend);
+    }
     if (f->lay.buf_w && memcmp(l, &f->lay, sizeof(*l)) == 0) return FA_OK;
     free_maps(f);
     free(f->pixels);

@@ -23,6 +23,11 @@
 
 void cdg_scaler_init(cdg_scaler* sc, uint32_t n, int smoothness, int edge_blend)
 {
+    cdg_scaler_init_look(sc, n, n, smoothness, edge_blend);
+}
+
+void cdg_scaler_init_look(cdg_scaler* sc, uint32_t n, uint32_t look, int smoothness, int edge_blend)
+{
     static const float band[5] = { 0.0f, 0.0f, 0.25f, 0.5f, 1.0f };
     uint32_t p;
     float width;
@@ -33,6 +38,7 @@ void cdg_scaler_init(cdg_scaler* sc, uint32_t n, int smoothness, int edge_blend)
     sc->ct_failed = failed;
     if (n < 1) n = 1;
     if (n > CDG_SCALE_MAX_N) n = CDG_SCALE_MAX_N;
+    if (look < 1 || look > n) look = n;
     if (smoothness < 0) smoothness = 0;
     if (smoothness > 4) smoothness = 4;   /* contour mode falls back to 4 without memory */
     if (contour) edge_blend = 0;          /* nothing left for it to do */
@@ -40,7 +46,7 @@ void cdg_scaler_init(cdg_scaler* sc, uint32_t n, int smoothness, int edge_blend)
     sc->smooth = smoothness > 0;
     sc->edge_blend = edge_blend != 0;
     /* At least two output pixels wide, so the pixel either side of a boundary blends. */
-    width = band[smoothness] > 2.0f / (float)n ? band[smoothness] : 2.0f / (float)n;
+    width = band[smoothness] > 2.0f / (float)look ? band[smoothness] : 2.0f / (float)look;
     if (width > 1.0f) width = 1.0f;
     for (p = 0; p < n; p++) {
         /* Output pixel centre u inside its CD+G pixel; t = position between the
