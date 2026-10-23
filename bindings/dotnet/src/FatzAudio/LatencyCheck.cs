@@ -11,7 +11,7 @@ public sealed class LatencyCheckOptions
 
     /// <summary>
     /// The loudest test sound in dBFS, -40..-6 (default -12). The sounds start at -40 and get louder until the mic
-    /// hears them clearly. In exclusive mode the Windows volume no longer applies, so the same level can be much louder.
+    /// hears them clearly (or 10 dB more no longer helps). In exclusive mode the Windows volume no longer applies, so the same level can be much louder.
     /// </summary>
     public float MaxLevelDb { get; init; } = -12f;
 

@@ -844,6 +844,8 @@ static void test_recording_errors(void)
 typedef struct room {
     int64_t delay;
     double gain, peak_db, noise_db;
+    int64_t reflection;      /* a reflection this many frames after the direct sound (0 = none) */
+    double reflection_gain;
 } room;
 
 typedef struct check_job {
@@ -897,6 +899,8 @@ static int room_check(sim* s, const room* rm, const fa_latency_check_config* cfg
         while (owed >= (double)s->in_period) {
             for (i = 0; i < s->in_period; i++, fed++) {
                 double x = fed >= rm->delay ? hist[fed - rm->delay] : 0.0, y;
+                if (rm->reflection && fed >= rm->delay + rm->reflection)
+                    x += rm->reflection_gain * hist[fed - rm->delay - rm->reflection];
                 y = b0 * x + z1;
                 z1 = b1 * x - a1 * y + z2;
                 z2 = b2 * x - a2 * y;
@@ -933,7 +937,7 @@ static double ms(fa_time t) { return (double)t / 1e6; }
 static void test_check_delay_and_gain(void)
 {
     sim s, t;
-    room rm = { 480, 0.1, 12.0, -70.0 };
+    room rm = { 480, 0.1, 12.0, -70.0, 0, 0.0 };
     fa_latency_check_config cfg;
     fa_latency_check a, b;
     fa_mixer_latency l;
@@ -971,7 +975,7 @@ static void test_check_delay_and_gain(void)
 static void test_check_level_ramp(void)
 {
     sim s;
-    room rm = { 480, 0.1, 0.0, -45.0 };   /* noisy: the first probes drown */
+    room rm = { 480, 0.1, 0.0, -45.0, 0, 0.0 };   /* noisy: the first probes drown */
     fa_latency_check a;
     fa_result r;
     CHECK(check_sim(&s));
@@ -983,10 +987,31 @@ static void test_check_level_ramp(void)
     sim_close(&s);
 }
 
+static void test_check_reflection(void)
+{
+    sim s, t;
+    room rm = { 480, 0.1, 0.0, -80.0, 48, 0.5 };   /* a hard wall right behind the mic: never "clear" */
+    room plain = { 480, 0.1, 0.0, -80.0, 0, 0.0 };
+    fa_latency_check a, b;
+    fa_result r;
+    CHECK(check_sim(&s));
+    CHECK(room_check(&s, &rm, NULL, &a, &r));
+    CHECK_EQ(r, FA_OK);
+    CHECK_EQ(a.modes[0].result, FA_OK);
+    CHECK(a.modes[0].level_db < -12.0f);   /* louder didn't help: the quieter level is kept */
+    CHECK(check_sim(&t));
+    CHECK(room_check(&t, &plain, NULL, &b, &r));
+    CHECK_EQ(b.modes[0].result, FA_OK);
+    /* The direct sound, not the reflection 1 ms later. */
+    CHECK_NEAR(ms(a.modes[0].mic_to_speaker), ms(b.modes[0].mic_to_speaker), 0.25);
+    sim_close(&s);
+    sim_close(&t);
+}
+
 static void test_check_not_heard(void)
 {
     sim s;
-    room rm = { 480, 0.0, 0.0, -60.0 };
+    room rm = { 480, 0.0, 0.0, -60.0, 0, 0.0 };
     fa_latency_check a;
     fa_result r;
     CHECK(check_sim(&s));
@@ -1000,7 +1025,7 @@ static void test_check_not_heard(void)
 static void test_check_advice(void)
 {
     sim s, t;
-    room loud = { 480, 1.0, 12.0, -70.0 }, far = { 2400, 0.1, 0.0, -70.0 };
+    room loud = { 480, 1.0, 12.0, -70.0, 0, 0.0 }, far = { 2400, 0.1, 0.0, -70.0, 0, 0.0 };
     fa_latency_check_config cfg;
     fa_latency_check a;
     fa_result r;
@@ -1024,7 +1049,7 @@ static void test_check_advice(void)
 static void test_check_all_modes(void)
 {
     sim s;
-    room rm = { 480, 0.1, 0.0, -70.0 };
+    room rm = { 480, 0.1, 0.0, -70.0, 0, 0.0 };
     fa_latency_check_config cfg;
     fa_latency_check a;
     fa_latency_mode mode;
@@ -1125,6 +1150,7 @@ int main(void)
     RUN(test_recording_errors);
     RUN(test_check_delay_and_gain);
     RUN(test_check_level_ramp);
+    RUN(test_check_reflection);
     RUN(test_check_not_heard);
     RUN(test_check_advice);
     RUN(test_check_all_modes);

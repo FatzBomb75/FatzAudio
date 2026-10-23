@@ -38,13 +38,16 @@
 #define NOISE_CREST_DB 10.0      /* the noise's RMS below the chirps' peak */
 #define HEARD_MATCH 0.5f         /* normalized correlation that counts as heard */
 #define CLEAR_MATCH 0.9f         /* and heard clearly: the probes stop getting louder */
+#define PLATEAU_MATCH 0.05f      /* less gained by 10 dB more: the room, not the noise, limits it */
 #define AGREE_MS 2.0             /* chirps further from the median than this are echoes */
 #define LEVEL_START_DB (-40.0f)
 #define LEVEL_STEP_DB 10.0f
 #define FEEDBACK_MARGIN_DB 6.0f
 #define BAND_LOW_HZ 100.0
 #define BAND_HIGH_HZ 10000.0
-#define SETTLE_MS 500            /* after a mode switch: the inputs and the bridge fill */
+#define SETTLE_MS 500            /* after a mode switch: the input runs that long without an
+                                    underrun (at most SETTLE_MAX_MS) */
+#define SETTLE_MAX_MS 3000
 
 static const double k_two_pi = 6.283185307179586;
 
@@ -342,7 +345,7 @@ static void measure_mode(struct fa_mixer* m, struct fa_mic* mic, const fa_latenc
     pass p;
     int64_t delay = 0, spread = 0, look = (int64_t)m->device->limiter.delay;
     int heard = 0, any = 0;
-    float worst = 0.0f, heard_at = 0.0f;
+    float worst = 0.0f, heard_at = 0.0f, last_worst = -1.0f;
     out->result = FA_OK;
     /* What the OS's figures add up to (fa_mixer_get_latency before any measurement). */
     out->reported = fa_load64(&mic->cap->input_ns) + fa_load64(&mic->cap->bridge_ns) +
@@ -358,11 +361,15 @@ static void measure_mode(struct fa_mixer* m, struct fa_mic* mic, const fa_latenc
         free(rec);
         pass_free(&p);
         if (out->result != FA_OK) return;
+        /* A real room's reflections can hold the match under CLEAR_MATCH at any level:
+         * when 10 dB more didn't help, the quieter level was as clear, and it is used. */
+        if (heard && last_worst >= 0.0f && worst < last_worst + PLATEAU_MATCH) break;
         if (heard) {
             any = 1;
             heard_at = level;
         }
         if ((heard && worst >= CLEAR_MATCH) || level >= c->max_level_db) break;
+        last_worst = heard ? worst : -1.0f;
         level += LEVEL_STEP_DB;
     }
     if (!any) { out->result = FA_ERROR_NOT_FOUND; return; }
@@ -395,6 +402,24 @@ static void measure_mode(struct fa_mixer* m, struct fa_mic* mic, const fa_latenc
 static int mode_available(struct fa_mixer* m, fa_latency_mode mode)
 {
     return mode != FA_LATENCY_EXCLUSIVE || m->engine->context.backend == ma_backend_wasapi;
+}
+
+/* After a mode switch: the input and the bridge run again, steadily. A device can
+ * deliver in fits for a moment after it opens, and a stall moves the bridge (and so the
+ * delay) between the chirps. */
+static void settle(struct fa_mic* mic)
+{
+    int64_t now = fa_monotonic_ns(), end = now + (int64_t)SETTLE_MAX_MS * 1000000;
+    int64_t quiet_from = now;
+    uint32_t under = fa_load32(&mic->cap->underruns), u;
+    while ((now = fa_monotonic_ns()) < end && now - quiet_from < (int64_t)SETTLE_MS * 1000000) {
+        fa_sleep_ms(20);
+        u = fa_load32(&mic->cap->underruns);
+        if (u != under) {
+            under = u;
+            quiet_from = fa_monotonic_ns();
+        }
+    }
 }
 
 FA_API fa_result FA_CALL fa_mixer_measure_latency(fa_mixer* mixer, fa_mic* mic, const fa_latency_check_config* config,
@@ -433,9 +458,17 @@ FA_API fa_result FA_CALL fa_mixer_measure_latency(fa_mixer* mixer, fa_mic* mic, 
         if (mode != mixer->device->open_mode) {
             o->result = fa_mixer_switch_latency_mode(mixer, mode);
             if (o->result != FA_OK) continue;
-            fa_sleep_ms(SETTLE_MS);
+            settle(mic);
+            measure_mode(mixer, mic, &c, o);
+            /* Not heard right after a switch: once more, in case the input was still
+             * settling. */
+            if (o->result == FA_ERROR_NOT_FOUND) {
+                settle(mic);
+                measure_mode(mixer, mic, &c, o);
+            }
+        } else {
+            measure_mode(mixer, mic, &c, o);
         }
-        measure_mode(mixer, mic, &c, o);
         if (o->result == FA_OK) {
             /* Kept for this mic and mode: fa_mixer_get_latency and the vocals' alignment. */
             fa_mutex_lock(&mixer->lock);
