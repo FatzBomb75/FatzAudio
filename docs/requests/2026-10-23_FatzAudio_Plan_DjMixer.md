@@ -4,7 +4,7 @@ Answer to FatzBomb.MediaControl's request of 2026-10-23 ("robust but not ridicul
 karaoke app).
 
 **Status: approved 2026-10-23 with a smaller scope** (MediaControl's reply,
-`2026-10-23_MediaControl_Reply_DjMixerPlan.md`, and Keith in the project thread). Section A below is
+`../archive/dj/2026-10-23_MediaControl_Reply_DjMixerPlan.md`, and Keith in the project thread). Section A below is
 the agreed scope and order and wins over anything later in this document. Items marked *(future)* in the
 design sections are pinned in section 19 and not built now; the API leaves room for them.
 
