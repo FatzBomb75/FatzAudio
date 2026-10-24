@@ -89,7 +89,9 @@ enum {
                                         channel that its input device does not have */
     FA_ERROR_PERMISSION_DENIED = -20 /* the OS refused the microphone: the app has no
                                         permission (Android RECORD_AUDIO, the macOS and iOS
-                                        microphone prompt, Windows privacy settings) */
+                                        microphone prompt, Windows privacy settings) */,
+    FA_ERROR_OUT_OF_RANGE = -21      /* fa_deck_sync: the tempo it needs is outside the deck's
+                                        FA_DECK_SYNC_RANGE, also at half or double time */
 };
 
 typedef struct fa_engine fa_engine;   /* one per process is typical */
@@ -1324,8 +1326,8 @@ FA_API fa_result FA_CALL fa_mixer_get_crossfader_curve(fa_mixer* mixer, fa_xfade
  * are heard quickly; the cue point goes back to the stream's CUE_IN. A deck holds
  * one stream: fa_crossfade and fa_stream_set_next from a deck's stream to a stream
  * that is not attached yet are FA_ERROR_INVALID_ARG (load it on a deck instead).
- * Close a deck's stream only from the thread that drives the deck, or unload it
- * first. */
+ * A deck's stream may be closed from any thread: it leaves its deck first, under the
+ * mixer's lock, so a deck call running on another thread finishes before it goes. */
 FA_API fa_result FA_CALL fa_deck_load(fa_deck* deck, fa_stream* stream, uint32_t flags);
 FA_API fa_result FA_CALL fa_deck_get_stream(fa_deck* deck, fa_stream** out_stream);  /* NULL = empty */
 
@@ -1337,7 +1339,9 @@ typedef enum fa_deck_param {
     FA_DECK_EQ_HIGH_DB,
     FA_DECK_XFADER_SIDE,   /* 0 = thru (not on the crossfader), 1 = side A, 2 = side B;
                               default deck 1 on A, deck 2 on B. Not rampable. */
-    FA_DECK_CUE            /* 1 = sent to the headphones, 0 = not (default). Not rampable. */
+    FA_DECK_CUE,           /* 1 = sent to the headphones, 0 = not (default). Not rampable. */
+    FA_DECK_SYNC_RANGE     /* the most sync (fa_deck_sync, auto-mix uses its own) may move the
+                              deck's TEMPO away from 1: 0.01..1, default 0.16 (+-16%). Not rampable. */
 } fa_deck_param;
 FA_API fa_result FA_CALL fa_deck_set_param(fa_deck* deck, fa_deck_param param, float value);
 FA_API fa_result FA_CALL fa_deck_get_param(fa_deck* deck, fa_deck_param param, float* out_value);
@@ -1366,6 +1370,110 @@ FA_API fa_result FA_CALL fa_deck_get_loop(fa_deck* deck, fa_frames* out_loop_in,
  * heard now (like fa_stream_get_levels). Zeros while the deck is silent. */
 FA_API fa_result FA_CALL fa_deck_get_levels(fa_deck* deck, fa_time window, float* out_peak, float* out_rms,
                                             uint32_t channels);
+
+/* ---- Sync, beat loops and auto-mix ----
+ *
+ * Both decks need a beat grid (fa_stream_set_beat_grid from an analysis, or the exact
+ * grid of a MIDI file or tracker module): FA_ERROR_NOT_FOUND otherwise. Beats are
+ * measured where the decks are heard (fa_stream_get_clock), so they line up in the
+ * room, including any master delay. A deck's heard tempo is its grid's BPM where it
+ * plays x FA_PARAM_TEMPO x FA_PARAM_RATE. */
+typedef enum fa_sync_flags {
+    FA_SYNC_TEMPO = 1 << 0,   /* match the leader's heard BPM (half or double time when that
+                                 keeps the deck within FA_DECK_SYNC_RANGE) */
+    FA_SYNC_BEAT  = 1 << 1,   /* align beats */
+    FA_SYNC_BAR   = 1 << 2,   /* align bars (implies BEAT); bars are known for exact grids, other
+                                 grids count beat 0 as a downbeat (fa_beat_grid.bar_offset) */
+    FA_SYNC_LOCK  = 1 << 3    /* keep it so: follows the leader's tempo moves and tempo maps */
+} fa_sync_flags;
+
+/* Syncs `deck` to `leader` (the other deck). TEMPO sets the deck's FA_PARAM_TEMPO (pitch is
+ * kept: that is the stretcher). BEAT on a playing deck pulls a small phase error (under
+ * 30 ms) in by bending the tempo by up to 2% for about two beats, and jumps a larger
+ * one away on the deck's next beat (a seamless join, like a loop); on a deck that is not
+ * playing it applies once it plays (or start it with fa_deck_play_synced). Without LOCK
+ * the sync is done once; with LOCK the engine's event thread keeps the deck on the
+ * leader's beat (about 20 times a second), so the deck's FA_PARAM_TEMPO moves by itself.
+ * leader NULL or flags 0 ends a sync (the tempo stays where it is). Loading a stream on
+ * either deck ends it too. FA_ERROR_OUT_OF_RANGE (nothing changes) when the tempo is out
+ * of reach; FA_ERROR_INVALID_ARG for the deck itself as leader or another mixer's deck. */
+FA_API fa_result FA_CALL fa_deck_sync(fa_deck* deck, fa_deck* leader, uint32_t flags);
+/* Starts a deck that is not playing so that its next beat (BAR: downbeat) lands exactly
+ * on one of the leader's, at least 50 ms from now: a stopped deck from its cue point, a
+ * paused one from where it is. TEMPO matches the tempo first; LOCK keeps it locked
+ * afterwards. The leader must be playing (FA_ERROR_INVALID_ARG otherwise). A deck that
+ * plays already is synced as fa_deck_sync does. */
+FA_API fa_result FA_CALL fa_deck_play_synced(fa_deck* deck, fa_deck* leader, uint32_t flags);
+/* A loop of `beats` beats (1/16..32, e.g. 1, 2, 4, 8, 16) on the grid: from the beat
+ * heard now (for loops shorter than a beat, the last whole part of it), or, while a deck
+ * loop is on, from its in point (so halving and doubling keep the loop's start). 0 turns
+ * the loop off (fa_deck_set_loop with 0, 0). The deck must be playing or paused with a
+ * stream on it (FA_ERROR_NOT_FOUND when empty or without a grid). */
+FA_API fa_result FA_CALL fa_deck_set_loop_beats(fa_deck* deck, double beats);
+
+typedef struct fa_deck_beat_info {
+    uint32_t struct_size;      /* sizeof(fa_deck_beat_info) */
+    double   bpm;              /* heard: the grid's tempo where it plays x TEMPO x RATE */
+    double   beat;             /* heard position in beats (fractional; beat 0 = first_beat) */
+    double   bar;              /* heard position in bars (from bar_offset) */
+    double   phase_error_ms;   /* against the leader while synced with BEAT or BAR (+ = this
+                                  deck is ahead), else 0 */
+    int32_t  locked;           /* 1 while synced with FA_SYNC_LOCK */
+    int32_t  synced;           /* 1 while synced to a leader (fa_deck_sync) */
+} fa_deck_beat_info;
+/* FA_ERROR_NOT_FOUND when the deck is empty or its stream has no grid. */
+FA_API fa_result FA_CALL fa_deck_get_beat_info(fa_deck* deck, fa_deck_beat_info* out_info);
+
+/* Auto-mix: decks 1 and 2 take turns. While a deck plays, auto-mix starts the other one
+ * at the playing deck's mix point and moves the crossfader across over the transition,
+ * all scheduled on the device clock (sample-accurate, whatever the app's UI thread does).
+ *  - The mix point: the outgoing stream's MIX_POINT marker, else its FADE_OUT_START,
+ *    else its end (CUE_OUT, or the length) minus the transition's length.
+ *  - The incoming deck starts at its cue point (fa_deck_set_cue_point, default CUE_IN).
+ *  - Beat-aligned (ALIGN_BEATS, both grids at least min_confidence, the tempo within
+ *    reach): the incoming deck starts at its first downbeat at or after its cue point, on
+ *    the outgoing deck's downbeat nearest the mix point, the transition lasts whole bars,
+ *    and the incoming deck is locked to the outgoing one until it is done.
+ *  - Otherwise (no grid, low confidence, tempos too far apart) it is a plain timed
+ *    crossfade: auto-mix never fails unattended.
+ *  - The crossfader is ramped with its curve (fa_mixer_set_crossfader_curve) toward the
+ *    incoming deck's side; decks on the same side, or thru, are started but not faded.
+ *  - When the transition is done, the outgoing deck is stopped.
+ * Mixer events (fa_mixer_set_event_callback): FA_EVENT_AUTOMIX_STARTED when the incoming
+ * deck is heard, FA_EVENT_AUTOMIX_DONE when the crossfader is across (index and value =
+ * the incoming deck), and FA_EVENT_DECK_EMPTY (index = the idle deck) when a transition is
+ * done, and again 30 s before the next mix point while the idle deck still holds the song
+ * that was mixed out (or nothing). The app owns the playlist: load the next song with
+ * fa_deck_load. With nothing new loaded the outgoing song plays to its end. Auto-mix
+ * needs the outgoing song's length (a file, not a live stream), or a MIX_POINT or
+ * FADE_OUT_START marker. */
+typedef enum fa_automix_flags {
+    FA_AUTOMIX_MATCH_TEMPO   = 1 << 0,  /* bring the incoming deck to the outgoing BPM (within
+                                           max_tempo_change, half or double time allowed) */
+    FA_AUTOMIX_ALIGN_BEATS   = 1 << 1,  /* start on a bar, length in whole bars */
+    FA_AUTOMIX_BASS_SWAP     = 1 << 2,  /* (planned) */
+    FA_AUTOMIX_RESTORE_TEMPO = 1 << 3   /* (planned) */
+} fa_automix_flags;
+
+typedef struct fa_automix_options {
+    uint32_t struct_size;        /* set by fa_automix_options_init */
+    fa_time  length;             /* 0.5..60 s, default 8 s */
+    float    length_beats;       /* used instead of length when > 0 and both grids are good
+                                    (e.g. 32); 1..256 */
+    uint32_t flags;              /* fa_automix_flags, default MATCH_TEMPO | ALIGN_BEATS */
+    float    max_tempo_change;   /* 0..0.5, default 0.08: the most MATCH_TEMPO moves TEMPO from 1 */
+    float    min_confidence;     /* 0..1, default 0.5: grids below it count as unknown */
+    fa_time  restore_time;       /* (planned) */
+} fa_automix_options;
+FA_API void      FA_CALL fa_automix_options_init(fa_automix_options* options);
+/* Turns auto-mix on with `options` (or changes them for the next transition), NULL = off.
+ * Turning it off leaves a transition already scheduled to finish, without events.
+ * FA_ERROR_INVALID_ARG for values out of range or BASS_SWAP / RESTORE_TEMPO (planned). */
+FA_API fa_result FA_CALL fa_mixer_set_automix(fa_mixer* mixer, const fa_automix_options* options);
+/* Skip: starts the next transition now (on the next bar when beat-aligned).
+ * FA_ERROR_NOT_FOUND when auto-mix is off, no deck plays or the other deck has nothing new
+ * loaded; FA_ERROR_BUSY while a transition runs. */
+FA_API fa_result FA_CALL fa_mixer_automix_now(fa_mixer* mixer);
 
 /* ---- Normalization ---------------------------------------------------- */
 
@@ -2571,7 +2679,10 @@ typedef enum fa_event_type {
     FA_EVENT_SEEK_FAILED,     /* fa_stream_seek_async could not reach `frame` (value = the fa_result) */
     FA_EVENT_TRACKER_ROW,     /* a tracker module row is heard (FA_TRACKER_ROW_EVENTS) */
     FA_EVENT_INPUT_LOST,      /* a mixer mic's input device went away (fa_mixer_set_event_callback) */
-    FA_EVENT_CUE_LOST         /* a mixer's headphone device (FA_CUE_DEVICE) went away */
+    FA_EVENT_CUE_LOST,        /* a mixer's headphone device (FA_CUE_DEVICE) went away */
+    FA_EVENT_AUTOMIX_STARTED, /* auto-mix: the incoming deck is heard (fa_mixer_set_automix) */
+    FA_EVENT_AUTOMIX_DONE,    /* auto-mix: the transition is done */
+    FA_EVENT_DECK_EMPTY       /* auto-mix: the idle deck needs its next song */
 } fa_event_type;
 
 typedef struct fa_event {
@@ -3060,7 +3171,10 @@ FA_API fa_result FA_CALL fa_mixer_get_ducking(fa_mixer* mixer, fa_ducking* out_d
  *
  * type                 index       mic                        value
  * FA_EVENT_INPUT_LOST  the slot    the mic (valid in the call) 0
- * FA_EVENT_CUE_LOST    0           NULL                       0 */
+ * FA_EVENT_CUE_LOST    0           NULL                       0
+ * FA_EVENT_AUTOMIX_STARTED, FA_EVENT_AUTOMIX_DONE
+ *                      the incoming deck  NULL                the incoming deck
+ * FA_EVENT_DECK_EMPTY  the idle deck  NULL                    0 */
 typedef struct fa_mixer_event {
     fa_event_type type;
     fa_mixer* mixer;

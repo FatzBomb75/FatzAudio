@@ -709,6 +709,7 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
     uintptr_t self;
     if (!stream) return;
     e = stream->engine;
+    fa_mixer_stream_closing(stream);   /* the mixer's event thread lets go of a deck's stream */
     fa_stream_cdg_detach(stream);   /* CD+G surface calls on other threads finish first */
     /* A worker or an encoder may be waiting in a network read while holding
      * decode_lock: end the download first so the read returns. */
@@ -2112,6 +2113,67 @@ void fa_stream_get_loop_region(struct fa_stream* s, fa_frames* out_in, fa_frames
     const fa_frames* r = region_of(s);
     *out_in = r[0];
     *out_out = r[1];
+}
+
+/* A one-off jump (sync.c), joined like a deck loop: where playback reaches source
+ * frame `at` (as heard, so inside a deck loop too), it continues `delta` frames
+ * further on (or back), with positions following the jump. The join is at `at` when
+ * that is decoded ahead and at least FA_LOOP_MARGIN_MS ahead of the mix; `at` < 0 or
+ * already that close joins a margin ahead of the mix. FA_ERROR_BUSY while `at` (or
+ * the margin) is not decoded yet, or the stream is not playing from its ring: try
+ * again later. */
+fa_result fa_stream_jump(struct fa_stream* s, fa_frames at, fa_frames delta)
+{
+    fa_result r = FA_ERROR_BUSY;
+    if (!s) return FA_ERROR_INVALID_ARG;
+    if (s->push || !s->decoder.seekable) return FA_ERROR_NOT_SEEKABLE;
+    fa_mutex_lock(&s->api_lock);
+    if (!is_attached(s) || !s->ring.data || fa_load32(&s->state) != FA_STATE_PLAYING || fa_load64(&s->seek_pending) >= 0) {
+        fa_mutex_unlock(&s->api_lock);
+        return FA_ERROR_BUSY;
+    }
+    fa_mutex_lock(&s->decode_lock);   /* no worker decodes meanwhile */
+    {
+        double sr = (double)s->decoder.format.sample_rate, dr = (double)s->dev_rate, lj, lin, lp;
+        int64_t played, write, j, margin = (int64_t)s->dev_rate * FA_LOOP_MARGIN_MS / 1000;
+        fa_frames a, x, last = s->decoder.length > 0 ? s->decoder.length - 1 : -1;
+        fa_tmap* m = tmap_of(s);
+        if (!m) {
+            m = (fa_tmap*)calloc(1, sizeof(*m));
+            if (!m) { fa_mutex_unlock(&s->decode_lock); fa_mutex_unlock(&s->api_lock); return FA_ERROR_OUT_OF_MEMORY; }
+            fa_exchange_ptr(&s->tmap, m);
+        }
+        fa_store32(&s->flushing, 1);
+        fa_device_wait_quiescent(s->device);   /* the mixer skips the stream until unflush */
+        played = fa_load64(&s->played);
+        write = fa_load64(&s->ring.write);
+        j = played + margin;
+        if (j <= write && at >= 0) {
+            double target;
+            lp = linear_position(s, played);
+            target = lp + (double)(at - wrap_position(s, (fa_frames)(lp + 0.5)));
+            if (target > linear_position(s, write)) j = write + 1;   /* not decoded yet */
+            else if (target > linear_position(s, j)) j = played + frames_until(s, played, target);
+        }
+        if (j > write) {
+            unflush(s);
+        } else {
+            lj = linear_position(s, j);
+            a = wrap_position(s, (fa_frames)(lj + 0.5));   /* where it plays at j */
+            x = a + delta;
+            if (x < 0) x = 0;
+            if (last >= 0 && x > last) x = last;
+            lin = (double)x + (lj - floor(lj + 0.5));      /* keeps the fraction of a frame */
+            fa_store64(&s->ring.write, j);
+            fa_tmap_truncate(m, j);
+            fa_tmap_add(m, j, lin, sr / dr * speed_now(s, (int64_t)((double)j * sr / dr + 0.5), s->tempo && fa_tempo_engaged(s->tempo)));
+            unflush(s);
+            r = rejoin_chain_locked(s, j, lin, x);
+        }
+    }
+    fa_mutex_unlock(&s->decode_lock);
+    fa_mutex_unlock(&s->api_lock);
+    return r;
 }
 
 FA_API fa_result FA_CALL fa_stream_set_mute(fa_stream* stream, int32_t muted)

@@ -44,10 +44,43 @@ struct fa_deck {
     fa_lane lanes[DECK_LANES];
     fa_atomic32 side;            /* FA_DECK_XFADER_SIDE */
     fa_atomic_ptr tap;           /* fa_tap*, the channel meter (post fader) */
+    fa_atomic32 sync_range;      /* FA_DECK_SYNC_RANGE, float bits */
+    /* Sync (sync.c), mixer lock: leader NULL = not synced. */
+    struct fa_deck* leader;
+    uint32_t sync_flags;         /* fa_sync_flags */
+    double sync_factor;          /* the leader's beats per deck beat: 1, 2 (half time) or 0.5 */
+    double sync_base;            /* the TEMPO sync wants, before a phase bend */
+    float sync_tempo;            /* the TEMPO it set last */
+    fa_stream* sync_s;           /* the deck's and the leader's streams then: a new load ends it */
+    fa_stream* sync_ls;
+    int settling;                /* a one-off phase pull runs (BEAT without LOCK) */
+    int settled;                 /* ticks in a row within 1 ms */
+    int64_t settle_end;          /* monotonic ns: the pull gives up */
+    int64_t hold_until;          /* monotonic ns: not measured before a jump is heard */
+    int jumping;                 /* a jump waits for its beat to be decoded */
+    fa_frames jump_at, jump_by;
+    fa_tempo_segment* segs;      /* the grid's tempo map, read into here (sync.c) */
+    uint32_t segs_cap;
     /* audio thread */
     float side_w[3];             /* thru, A, B: glide between sides over 5 ms */
     float z[ISO_SECTIONS][2][2]; /* isolator filter memory, per section and channel */
 };
+
+/* Auto-mix (automix.c), mixer lock. */
+enum { AM_WATCH = 0, AM_SCHEDULED, AM_RUNNING };
+typedef struct fa_automix {
+    fa_automix_options o;
+    int on;
+    int phase;                   /* AM_*: watching the playing deck, or a transition is on */
+    int skip;                    /* fa_mixer_automix_now: start the next one now */
+    uint32_t out_deck, in_deck;
+    fa_stream* out_s;            /* the transition's streams (a new load cancels its events) */
+    fa_stream* in_s;
+    int64_t start, end;          /* device frames: the incoming deck is heard, the fade is done */
+    int aligned;                 /* beat-aligned: the incoming deck is locked meanwhile */
+    fa_stream* mixed_out;        /* the last outgoing song: the idle deck still holding it is empty */
+    fa_stream* warned;           /* the outgoing song DECK_EMPTY was raised for before its mix */
+} fa_automix;
 
 /* The master's alignment delay (master callback): a delay line after the limiter; a
  * change fades out, jumps and fades in. */
@@ -102,6 +135,9 @@ struct fa_mixer {
     fa_mutex cb_lock;
     fa_mixer_event_callback callback;
     void* callback_user;
+    fa_automix am;                                    /* automix.c, mixer lock */
+    int64_t test_now;                                 /* tests: the time sync reads; 0 = the monotonic clock */
+    int test_ticks;                                   /* tests: sync and auto-mix ticks run by hand */
     fa_atomic32 busy;                                 /* the event thread is in fa_mixer_service */
     fa_atomic32 doomed;                               /* destroyed from inside its own callback */
 };
@@ -334,6 +370,60 @@ int fa_mixer_cue_take_loss(struct fa_mixer* m);
 void fa_mixer_wait_callbacks(struct fa_mixer* m);
 /* After fa_mixer_service: lets go of fa_mixer_hold (frees a mixer its callback destroyed). */
 void fa_mixer_release(struct fa_mixer* m);
+
+/* ---- sync and auto-mix (sync.c, automix.c), event thread and API, mixer lock ---- */
+#define MIXER_TICK_NS 50000000   /* sync locks and auto-mix look 20 times a second */
+#define MIXER_EVENTS_MAX (FA_MIC_MAX + 8)
+/* A deck's grid as read from its stream, in grid frames (scale = grid frames per source frame). */
+typedef struct fa_grid_view {
+    fa_beat_grid g;
+    const fa_tempo_segment* segs;
+    uint32_t n;
+    double scale;
+} fa_grid_view;
+/* What a deck plays, as heard at monotonic time `now`. */
+typedef struct fa_deck_now {
+    fa_stream* s;
+    fa_grid_view v;
+    double sr;                   /* the stream's rate */
+    double src;                  /* heard source frame */
+    double tempo, rate;          /* FA_PARAM_TEMPO and FA_PARAM_RATE as set */
+    double beat;                 /* heard position in beats */
+    double grid_bpm;             /* the grid's tempo there */
+    double bpm;                  /* heard: grid_bpm x tempo x rate */
+    int32_t state;               /* fa_stream_state */
+} fa_deck_now;
+int64_t fa_mixer_now(struct fa_mixer* m);
+/* The event thread looks at the mixer again at monotonic `at` (the sooner one wins). */
+void fa_mixer_wake(struct fa_mixer* m, int64_t at);
+/* FA_ERROR_NOT_FOUND for an empty deck or one without a grid. */
+fa_result fa_deck_look(struct fa_deck* d, int64_t now, fa_deck_now* out);
+double fa_grid_beat_at(const fa_grid_view* v, double frame);   /* grid frames */
+double fa_grid_frame_at(const fa_grid_view* v, double beat);
+/* The first downbeat at or after `beat` (bars count from bar_offset). */
+double fa_grid_next_downbeat(const fa_grid_view* v, double beat);
+/* The TEMPO that makes a deck of `grid_bpm` (at `rate`) heard at `bpm`, or at half or
+ * double time when only that is within `range` of 1; 0 when none is. *out_factor = the
+ * target's beats per deck beat. */
+double fa_sync_tempo_for(double bpm, double grid_bpm, double rate, double range, double* out_factor);
+/* Locks `d` to `leader` from now (TEMPO already set to `tempo`): no measuring before `hold_until`. */
+void fa_deck_sync_set(struct fa_deck* d, struct fa_deck* leader, uint32_t flags, double factor, double tempo,
+                      int64_t hold_until);
+/* Ends a deck's sync; restore = puts back the TEMPO a phase bend moved. */
+void fa_deck_sync_end(struct fa_deck* d, int restore);
+/* fa_deck_load: syncs with `d` end (its stream is another now). */
+void fa_deck_sync_loaded(struct fa_deck* d);
+/* The cue point in force of a deck with a stream (mixer.c). */
+fa_frames fa_deck_cue_point_now(struct fa_deck* d);
+/* Event thread (fa_mixer_service) or a test: one look at the syncs and auto-mix; events go to ev[*n]. */
+void fa_mixer_tick(struct fa_mixer* m, int64_t now, fa_mixer_event* ev, uint32_t* n);
+void fa_automix_tick(struct fa_mixer* m, int64_t now, fa_mixer_event* ev, uint32_t* n, int64_t* next);
+/* fa_deck_load: `s` (may be NULL) is a new song on deck `d` to auto-mix, even at an old
+ * address; a transition with `d` in it is the app's now. */
+void fa_automix_loaded(struct fa_mixer* m, struct fa_deck* d, fa_stream* s);
+/* Tests: tick by hand at `now` (the event thread leaves the mixer's ticks alone from then
+ * on), delivering the events to the callback before it returns. */
+void fa_mixer_test_tick(fa_mixer* m, int64_t now);
 
 /* mic.c, called by mixer.c. */
 void fa_mixer_mics_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t frames);   /* audio thread */

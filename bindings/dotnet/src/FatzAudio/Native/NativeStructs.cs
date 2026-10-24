@@ -791,3 +791,27 @@ internal struct FaLatencyCheck
     public int Advice;
     public int AdvisedMode;
 }
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaDeckBeatInfo
+{
+    public uint StructSize;
+    public double Bpm;
+    public double Beat;
+    public double Bar;
+    public double PhaseErrorMs;
+    public int Locked;
+    public int Synced;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaAutomixOptions
+{
+    public uint StructSize;
+    public long Length;
+    public float LengthBeats;
+    public uint Flags;
+    public float MaxTempoChange;
+    public float MinConfidence;
+    public long RestoreTime;
+}

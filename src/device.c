@@ -359,7 +359,16 @@ static int needs_service(fa_device* d, int64_t now)
     return fa_load32(&d->lost) && now >= d->retry_at && now >= fa_load64(&d->lost_at) + FA_REROUTE_GRACE_NS;
 }
 
-static int wants_service(fa_device* d, int64_t now) { return needs_service(d, now) || fa_load32(&d->mixer_events); }
+static int tick_due(fa_device* d, int64_t now)
+{
+    int64_t t = fa_load64(&d->mixer_tick_at);
+    return t != 0 && now >= t;
+}
+
+static int wants_service(fa_device* d, int64_t now)
+{
+    return needs_service(d, now) || fa_load32(&d->mixer_events) || tick_due(d, now);
+}
 
 /* Event thread (it looks every few milliseconds). */
 void fa_devices_service(fa_engine* e)
@@ -375,7 +384,12 @@ void fa_devices_service(fa_engine* e)
             if (wants_service(d, now) && fa_mutex_trylock(&d->life_lock)) { pick = d; break; }
         fa_mutex_unlock(&e->list_lock);
         if (!pick) return;
-        if (fa_exchange32(&pick->mixer_events, 0)) mixer = fa_mixer_hold(pick);
+        {
+            int64_t t = fa_load64(&pick->mixer_tick_at);
+            /* A wake set meanwhile for later stays (the CAS fails, and it is not due yet). */
+            int tick = t != 0 && now >= t && fa_cas64(&pick->mixer_tick_at, t, 0);
+            if (fa_exchange32(&pick->mixer_events, 0) | tick) mixer = fa_mixer_hold(pick);
+        }
         if (fa_exchange32(&pick->rerouted, 0) && pick->device_ok) store_latency(pick);
         if (needs_service(pick, now)) {
             if (pick->device_ok && ma_device_is_started(&pick->device)) fa_store32(&pick->lost, 0); /* rerouted meanwhile */

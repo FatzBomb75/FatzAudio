@@ -892,6 +892,7 @@ struct fa_device {
     ma_device_id open_id;        /* the device asked for, when open_has_id (else the default) */
     int open_has_id;
     fa_atomic32 mixer_events;    /* the mixer has events for the event thread (fa_mixer_service) */
+    fa_atomic64 mixer_tick_at;   /* monotonic ns the mixer wants the event thread at (sync, auto-mix); 0 = none */
     /* A mixer's alignment delay on the output (FA_CUE_DEVICE), in frames: part of the
      * latency, so of every heard position; set by the audio thread. align_max is the most
      * it can be (taps keep that much more). */
@@ -1304,6 +1305,8 @@ void fa_mixer_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t f
 void fa_mixer_render(struct fa_mixer* m, fa_device* dev, float* out, uint32_t channels, uint32_t frames, int64_t now_ns);
 /* A stream left a deck's bus (moved elsewhere, detached or closed): the deck is empty. */
 void fa_mixer_bus_left(fa_bus* bus, struct fa_stream* s);
+/* fa_stream_close, first: a deck's stream leaves its deck under the mixer lock. */
+void fa_mixer_stream_closing(struct fa_stream* s);
 /* fa_device_close on a mixer's device closes the mixer (which closes the device). */
 void fa_mixer_destroy_from_device(struct fa_mixer* m);
 /* Event thread, under the device's life_lock: the device's mixer, kept alive until
@@ -1316,6 +1319,9 @@ void fa_mixer_service(struct fa_mixer* m);
  * a gap (see the comment there). */
 fa_result fa_stream_set_loop_region(struct fa_stream* s, fa_frames in, fa_frames out);
 void fa_stream_get_loop_region(struct fa_stream* s, fa_frames* out_in, fa_frames* out_out);
+/* A one-off jump of `delta` source frames where playback reaches `at` (sync.c's beat
+ * jumps); FA_ERROR_BUSY while that is not decoded yet. */
+fa_result fa_stream_jump(struct fa_stream* s, fa_frames at, fa_frames delta);
 /* Device frame at the speaker at monotonic time `now_ns` (latency included). */
 double fa_device_speaker_frame(fa_device* device, int64_t now_ns);
 void fa_device_wait_quiescent(fa_device* device);

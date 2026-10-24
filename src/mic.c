@@ -648,11 +648,45 @@ FA_API fa_result FA_CALL fa_mixer_set_event_callback(fa_mixer* mixer, fa_mixer_e
     return FA_OK;
 }
 
+/* Runs the events in ev[0..n) through the callback, without the mixer lock. */
+static void deliver(struct fa_mixer* m, fa_mixer_event* ev, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; i < n && !fa_load32(&m->doomed); i++) {
+        fa_mixer_event_callback cb;
+        void* user;
+        int still;
+        fa_mutex_lock(&m->lock);   /* a callback before may have removed it */
+        /* The same address may be a new mic (removed and added by a callback): only the
+         * one that took the loss has lost_reported. */
+        still = !ev[i].mic || (fa_load_ptr(&m->mics[ev[i].index]) == ev[i].mic && ev[i].mic->lost_reported);
+        fa_mutex_unlock(&m->lock);
+        if (!still) continue;
+        fa_mutex_lock(&m->cb_lock);
+        cb = m->callback;
+        user = m->callback_user;
+        fa_mutex_unlock(&m->cb_lock);
+        if (cb) cb(&ev[i], user);
+    }
+}
+
+void fa_mixer_test_tick(fa_mixer* m, int64_t now)
+{
+    fa_mixer_event ev[MIXER_EVENTS_MAX];
+    uint32_t n = 0;
+    fa_mutex_lock(&m->lock);
+    m->test_ticks = 1;
+    fa_mixer_tick(m, now, ev, &n);
+    fa_mutex_unlock(&m->lock);
+    deliver(m, ev, n);
+}
+
 void fa_mixer_service(struct fa_mixer* m)
 {
-    fa_mixer_event ev[FA_MIC_MAX + 1];
+    fa_mixer_event ev[MIXER_EVENTS_MAX];
     uint32_t n = 0, i;
     fa_mutex_lock(&m->lock);
+    if (!m->test_ticks) fa_mixer_tick(m, fa_monotonic_ns(), ev, &n);   /* sync locks, auto-mix */
     if (fa_mixer_cue_take_loss(m)) {
         memset(&ev[n], 0, sizeof(ev[n]));
         ev[n].type = FA_EVENT_CUE_LOST;
@@ -671,22 +705,7 @@ void fa_mixer_service(struct fa_mixer* m)
         n++;
     }
     fa_mutex_unlock(&m->lock);
-    for (i = 0; i < n && !fa_load32(&m->doomed); i++) {
-        fa_mixer_event_callback cb;
-        void* user;
-        int still;
-        fa_mutex_lock(&m->lock);   /* a callback before may have removed it */
-        /* The same address may be a new mic (removed and added by a callback): only the
-         * one that took the loss has lost_reported. */
-        still = !ev[i].mic || (fa_load_ptr(&m->mics[ev[i].index]) == ev[i].mic && ev[i].mic->lost_reported);
-        fa_mutex_unlock(&m->lock);
-        if (!still) continue;
-        fa_mutex_lock(&m->cb_lock);
-        cb = m->callback;
-        user = m->callback_user;
-        fa_mutex_unlock(&m->cb_lock);
-        if (cb) cb(&ev[i], user);
-    }
+    deliver(m, ev, n);
     fa_mixer_release(m);
 }
 
