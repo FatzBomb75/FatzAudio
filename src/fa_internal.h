@@ -892,7 +892,19 @@ struct fa_device {
     ma_device_id open_id;        /* the device asked for, when open_has_id (else the default) */
     int open_has_id;
     fa_atomic32 mixer_events;    /* the mixer has events for the event thread (fa_mixer_service) */
+    /* A mixer's alignment delay on the output (FA_CUE_DEVICE), in frames: part of the
+     * latency, so of every heard position; set by the audio thread. align_max is the most
+     * it can be (taps keep that much more). */
+    fa_atomic32 align_frames;
+    uint32_t align_max;
 };
+
+/* The alignment delay in ns (0 without one). */
+static inline int64_t fa_device_align_ns(struct fa_device* d)
+{
+    int32_t f = fa_load32(&d->align_frames);
+    return f && d->rate ? (int64_t)((double)f * 1e9 / (double)d->rate) : 0;
+}
 
 /* Event thread: reopens devices that went away on the system default. */
 void fa_devices_service(fa_engine* e);

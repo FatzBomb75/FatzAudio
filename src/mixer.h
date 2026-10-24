@@ -16,6 +16,7 @@
 static const double k_pi = 3.14159265358979323846;
 
 static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline float clip1(float v) { return v > 1.0f ? 1.0f : v < -1.0f ? -1.0f : v; }
 
 enum { DL_GAIN = 0, DL_TRIM, DL_LOW, DL_MID, DL_HIGH, DL_CUE, DECK_LANES };
 enum { ML_XF = 0, ML_MASTER, ML_CUE_MIX, ML_CUE_GAIN, MIX_LANES };
@@ -48,6 +49,16 @@ struct fa_deck {
     float z[ISO_SECTIONS][2][2]; /* isolator filter memory, per section and channel */
 };
 
+/* The master's alignment delay (master callback): a delay line after the limiter; a
+ * change fades out, jumps and fades in. */
+typedef struct fa_master_delay {
+    float* buf;                  /* FA_DEVICE_CHANNELS floats per frame */
+    uint32_t len;                /* a power of two */
+    uint32_t pos;
+    int64_t cur, want;           /* frames */
+    float gain;
+} fa_master_delay;
+
 struct fa_mixer {
     fa_engine* engine;
     fa_device* device;
@@ -58,6 +69,13 @@ struct fa_mixer {
     fa_atomic32 curve;           /* fa_xfader_curve */
     fa_cue_mode cue_mode;
     uint32_t cue_channel;
+    uint32_t flags;              /* FA_MIXER_* */
+    struct fa_cue_dev* cue_dev;  /* FA_CUE_DEVICE */
+    fa_master_delay mdelay;      /* FA_CUE_DEVICE: the master's alignment (audio thread) */
+    fa_atomic32 cue_trim;        /* FA_MIX_CUE_TRIM_MS, float bits */
+    fa_atomic64 align_ns;        /* published by the audio thread: fa_mixer_latency.cue_alignment */
+    fa_atomic32 align_kind;      /* fa_cue_align */
+    int64_t align_now;           /* audio thread: frames, + the cue delayed, - the master */
     /* The isolator: LR4 low/high at 250 Hz (2 + 2 sections), LR4 low/high at 2.5 kHz on
      * the upper band (2 + 2), and an allpass at 2.5 kHz on the low band so the three
      * sum flat. */
@@ -116,12 +134,75 @@ static inline void lane_span(const fa_lane* lanes, int n, int64_t clock, int64_t
     }
 }
 
+/* ---- the bridge between two clocks (bridge.c) --------------------------------------
+ * One device's callback writes a ring; another device's callback reads it through the
+ * varispeed resampler at the ratio of their rates, nudged so that what the bridge holds
+ * stays at its target: drift between two crystals and different rates are absorbed
+ * without a click. Mic inputs reach the master through one (the master reads); the
+ * second-device cue leaves it through another (the master writes). Positions count
+ * frames and wrap; nothing allocates or locks once it is sized. */
+#define BRIDGE_CHANNELS 2
+
+typedef struct fa_bridge {
+    float* ring;                 /* BRIDGE_CHANNELS floats per frame */
+    uint32_t ring_frames;        /* a power of two */
+    fa_atomic32 wpos, rpos;
+    fa_atomic32 overruns, underruns;
+    fa_atomic64 held_ns;         /* what it holds on average (its target, less `extra`) */
+    fa_atomic32 extra;           /* input frames held on top of the target: a delay (the cue's
+                                    alignment), set by any thread, taken by the reader */
+    fa_atomic32 reset;           /* the reader drops what is held and fills up again */
+    double max_adjust;           /* the most the ratio is nudged */
+    /* reader */
+    fa_varispeed vs;
+    uint32_t in_rate, out_rate;  /* in_rate set by the owner while no reader runs */
+    double in_period, out_period;
+    int primed;
+    int32_t extra_now;           /* `extra` in the target */
+    double nominal;              /* in_rate / out_rate */
+    double base;                 /* the periods, the resampler's look-ahead and 1 ms */
+    double grown;                /* added by underruns, up to BRIDGE_MAX_MS */
+    double target;               /* base + grown + extra_now */
+    double avg;                  /* the fill, smoothed over about a second */
+} fa_bridge;
+
+fa_result fa_bridge_init(fa_bridge* b, double max_adjust);
+void fa_bridge_free(fa_bridge* b);
+/* Owner, while no reader runs: a ring of at least `seconds` at `in_rate`, and the
+ * resampler's buffer for reads of up to FA_MIXER_BLOCK frames at `out_rate`. */
+fa_result fa_bridge_size(fa_bridge* b, uint32_t in_rate, uint32_t out_rate, double seconds);
+/* Owner, while no reader runs (a writer may): the resampler's buffer for another out_rate. */
+fa_result fa_bridge_reserve(fa_bridge* b, uint32_t out_rate);
+/* Writer: room for up to `n` frames from position *out_w (fewer when full: an overrun). */
+static inline uint32_t fa_bridge_space(fa_bridge* b, uint32_t n, uint32_t* out_w)
+{
+    uint32_t w = (uint32_t)fa_load32(&b->wpos), r = (uint32_t)fa_load32(&b->rpos), space = b->ring_frames - (w - r);
+    if (n > space) {
+        fa_fetch_add32(&b->overruns, 1);
+        n = space;
+    }
+    *out_w = w;
+    return n;
+}
+static inline float* fa_bridge_frame(fa_bridge* b, uint32_t pos)
+{
+    return b->ring + (size_t)(pos & (b->ring_frames - 1)) * BRIDGE_CHANNELS;
+}
+static inline void fa_bridge_commit(fa_bridge* b, uint32_t w, uint32_t n) { fa_store32(&b->wpos, (int32_t)(w + n)); }
+void fa_bridge_write(fa_bridge* b, const float* frames, uint32_t n);
+/* Reader: `frames` (at most FA_MIXER_BLOCK) at out_rate into `out`; what it can't give is
+ * silence. The periods are the writer's (input frames) and the reader's (output frames),
+ * 0 = unknown. `hold` keeps the ratio at the nominal one (a setup check timing the input:
+ * a drift correction would bend the delay it measures). Returns the frames given. */
+int64_t fa_bridge_pull(fa_bridge* b, float* out, uint32_t frames, uint32_t out_rate, double in_period,
+                       double out_period, int hold);
+/* Reader side or owner: input frames held now (ring plus resampler). */
+double fa_bridge_fill(fa_bridge* b);
+
 /* ---- mics (mic.c) ---------------------------------------------------------------
  * An input device, shared by the mics that read it. Its callback copies the two
- * channels the mics want ("lanes") into a ring; the master callback takes them out
- * through a resampler whose ratio follows the ring's fill, so the bridge holds a
- * steady few milliseconds whatever the two clocks' drift and rates. */
-#define CAPTURE_LANES 2
+ * channels the mics want ("lanes") into its bridge; the master callback takes them out. */
+#define CAPTURE_LANES BRIDGE_CHANNELS
 #define CAPTURE_LANE_ALL (-1)    /* every channel summed */
 #define CAPTURE_LANE_FREE (-2)
 
@@ -139,26 +220,33 @@ typedef struct fa_capture {
     int lane_users[CAPTURE_LANES];  /* mics reading each lane (mixer lock) */
     uint32_t channels, rate;     /* the input as opened */
     fa_atomic32 lane_src[CAPTURE_LANES];  /* the channel each lane carries, or CAPTURE_LANE_* */
-    /* The ring: CAPTURE_LANES floats per frame, written by the input callback, read by
-     * the master callback. Positions count frames and wrap. */
-    float* ring;
-    uint32_t ring_frames;        /* a power of two */
-    fa_atomic32 wpos, rpos;
+    fa_bridge br;                /* written by the input callback, read by the master callback */
     fa_atomic32 stopping;        /* fa_mic_remove or a test is stopping it: not a loss */
     fa_atomic32 lost;            /* 1 = gone (each mic reports it once: lost_reported) */
-    fa_atomic32 overruns, underruns;
     fa_atomic64 input_ns;        /* the input buffer the OS reported */
-    fa_atomic64 bridge_ns;       /* what the bridge holds on average (its target) */
     /* master callback */
-    fa_varispeed vs;
     uint64_t pulled;             /* fa_mixer.block of the last pull, + 1 */
-    int primed;
-    uint32_t out_rate;
-    double nominal;              /* input rate / output rate */
-    double target;               /* input frames held: ring plus resampler */
-    double avg;                  /* the fill, smoothed over about a second */
     float out[FA_MIXER_BLOCK * CAPTURE_LANES];
 } fa_capture;
+
+/* ---- the second-device cue (cue.c) -------------------------------------------------
+ * The master callback lays the cue out into a bridge; the headphones' callback reads it.
+ * Made once with the mixer (FA_CUE_DEVICE) and kept: only the device opens and closes. */
+typedef struct fa_cue_dev {
+    struct fa_mixer* mixer;
+    ma_device device;
+    int device_ok;               /* mixer lock */
+    int test_owned;              /* fa_mixer_test_cue_take_over: the test reads it */
+    int lost_reported;           /* FA_EVENT_CUE_LOST raised (mixer lock) */
+    char* id;                    /* as asked for; "" = the default output (mixer lock) */
+    fa_bridge br;
+    fa_atomic32 stopping;        /* closing it: not a loss */
+    fa_atomic32 lost;
+    fa_atomic32 running;         /* the headphones are open: the master lines up with them */
+    fa_atomic32 rate, period;    /* the headphones as opened (frames, at their rate) */
+    fa_atomic64 os_ns;           /* their buffer, as the OS reports it */
+    float cue[FA_MIXER_BLOCK * FA_DEVICE_CHANNELS];   /* master callback: this block's cue */
+} fa_cue_dev;
 
 enum { MIC_GAIN = 0, MIC_MUTE, MIC_PAN, MIC_MONITOR, MIC_LOW_CUT, MIC_REVERB, MIC_ECHO, MIC_LANES };
 
@@ -228,6 +316,20 @@ typedef struct fa_mic_check {
 void fa_mic_check_record(fa_mic_check* k, const float* in, int lane, uint32_t frames, int64_t clock);
 void fa_mic_check_render(fa_mic_check* k, float* master, uint32_t frames, int64_t clock);
 
+/* cue.c */
+fa_result fa_mixer_cue_create(struct fa_mixer* m, const char* id);   /* fa_mixer_create */
+void fa_mixer_cue_free(struct fa_mixer* m);                           /* the device closes */
+void fa_mixer_cue_reopen(struct fa_mixer* m, fa_latency_mode mode);  /* master closed, mixer lock */
+/* Master callback, FA_CUE_DEVICE: the cue (stereo; the device mute glides from mute0 to
+ * mute1 over the block) into the bridge, the alignment, and the master's delay on
+ * `master` in place. */
+void fa_mixer_cue_render(struct fa_mixer* m, fa_device* dev, float* master, uint32_t frames, float mute0,
+                         float mute1);
+/* fa_mixer_get_latency: the cue's latency, the alignment, its kind. */
+void fa_mixer_cue_latency(struct fa_mixer* m, fa_time* cue, fa_time* alignment, int32_t* kind);
+/* fa_mixer_service, mixer lock: whether a loss is to be reported (once). */
+int fa_mixer_cue_take_loss(struct fa_mixer* m);
+
 /* mixer.c: wait until no mixer callback runs (returns at once on the event thread). */
 void fa_mixer_wait_callbacks(struct fa_mixer* m);
 /* After fa_mixer_service: lets go of fa_mixer_hold (frees a mixer its callback destroyed). */
@@ -264,5 +366,13 @@ void fa_mic_test_take_over(fa_mic* mic, uint32_t rate, uint32_t channels);
 void fa_mic_test_feed(fa_mic* mic, const float* frames, uint32_t n);
 void fa_mic_test_lose(fa_mic* mic);
 void fa_mic_test_stats(fa_mic* mic, double* out_target, double* out_fill, int32_t* out_underruns);
+/* Tests: drive the headphones by hand. take_over stops their device and makes the bridge
+ * read at `rate` in periods of `period` frames, with `os_ns` as their reported latency;
+ * pull is what their callback does; lose is the backend's notification. */
+void fa_mixer_test_cue_take_over(fa_mixer* m, uint32_t rate, uint32_t period, fa_time os_ns);
+void fa_mixer_test_cue_pull(fa_mixer* m, float* out, uint32_t frames);
+void fa_mixer_test_cue_lose(fa_mixer* m);
+void fa_mixer_test_cue_stats(fa_mixer* m, double* out_target, double* out_fill, int32_t* out_underruns,
+                             int32_t* out_overruns);
 
 #endif

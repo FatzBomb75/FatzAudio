@@ -3,13 +3,9 @@
  * (mic_fx.c).
  *
  * An input device runs on its own clock. Its callback copies the channels the mics
- * read into a ring (capture_write); the master callback takes them out through the
- * varispeed resampler (resample.c) at the ratio of the two rates, nudged by up to
- * 0.2% so that what the bridge holds stays at its target: drift between the two
- * crystals is absorbed without a click, and so is a different rate (a 44.1 kHz mic
- * on a 48 kHz master). The target is one input period, one master period, the
- * resampler's look-ahead and a millisecond; an underrun raises it by 2 ms (up to
- * 50 ms), so a system with jittery callbacks settles at what it needs.
+ * read into a bridge (bridge.c, capture_write); the master callback takes them out
+ * through it, at the ratio of the two rates nudged by up to 0.2%, so drift and a
+ * different rate (a 44.1 kHz mic on a 48 kHz master) are absorbed without a click.
  *
  * Mics live in two slots the master callback reads; adding publishes a slot,
  * removing clears it and waits for the callback to be past it. Input loss is
@@ -29,12 +25,7 @@
 #define GATE_FOLLOW_MS 10.0      /* the level follower's decay */
 #define GATE_OFF_DB (-99.9f)
 #define BRIDGE_MAX_ADJUST 0.002  /* the most the ratio is nudged: 0.2%, about 3.5 cents */
-#define BRIDGE_SETTLE_S 2.0      /* a fill error is worked off over about this long */
-#define BRIDGE_JUMP_MS 30.0      /* more over the target than this is dropped at once */
-#define BRIDGE_STEP_MS 2.0       /* an underrun raises the target by this much */
-#define BRIDGE_MAX_MS 50.0
 #define RING_SECONDS 0.5
-#define VS_PREALLOC 8192         /* resampler frames reserved up front (at least): no allocation later */
 
 /* ---- the input side (capture callback) ------------------------------------------ */
 
@@ -48,24 +39,20 @@ static float pick(const float* frame, uint32_t ch, int32_t src)
     return s;
 }
 
-/* The capture callback's work: the lanes' channels into the ring. A full ring drops
+/* The capture callback's work: the lanes' channels into the bridge. A full ring drops
  * the newest frames (the reader catches up by dropping what it holds over target). */
 static void capture_write(fa_capture* c, const float* in, uint32_t n, uint32_t ch)
 {
-    uint32_t w = (uint32_t)fa_load32(&c->wpos), r = (uint32_t)fa_load32(&c->rpos);
-    uint32_t space = c->ring_frames - (w - r), mask = c->ring_frames - 1, i;
     int32_t s0 = fa_load32(&c->lane_src[0]), s1 = fa_load32(&c->lane_src[1]);
-    if (n > space) {
-        fa_fetch_add32(&c->overruns, 1);
-        n = space;
-    }
+    uint32_t w, i;
+    n = fa_bridge_space(&c->br, n, &w);
     for (i = 0; i < n; i++) {
-        float* f = c->ring + (size_t)((w + i) & mask) * CAPTURE_LANES;
+        float* f = fa_bridge_frame(&c->br, w + i);
         const float* x = in + (size_t)i * ch;
         f[0] = pick(x, ch, s0);
         f[1] = pick(x, ch, s1);
     }
-    fa_store32(&c->wpos, (int32_t)(w + n));
+    fa_bridge_commit(&c->br, w, n);
 }
 
 static void capture_callback(ma_device* d, void* out, const void* in, ma_uint32 frames)
@@ -91,99 +78,13 @@ static void capture_notification(const ma_device_notification* n)
     if (n->type == ma_device_notification_type_stopped) flag_lost(c);
 }
 
-/* ---- the bridge (master callback) ----------------------------------------------- */
-
-static void bridge_setup(fa_capture* c, fa_device* dev)
-{
-    double width, in_period, out_period;
-    c->out_rate = dev->rate;
-    c->nominal = (double)c->rate / (double)dev->rate;
-    width = (double)fa_varispeed_width(c->nominal * (1.0 + BRIDGE_MAX_ADJUST)) + 2.0;
-    in_period = c->device_ok ? (double)c->device.capture.internalPeriodSizeInFrames : 0.0;
-    if (in_period <= 0.0) in_period = (double)c->rate * 0.01;
-    out_period = (double)fa_load32(&dev->period_frames);
-    if (out_period <= 0.0) out_period = (double)dev->rate * 0.01;
-    c->target = in_period + out_period * c->nominal + width + (double)c->rate * 0.001;
-    c->primed = 0;
-    fa_varispeed_reset(&c->vs);
-    fa_store64(&c->bridge_ns, (int64_t)(c->target * 1e9 / (double)c->rate));
-}
-
-/* Drops `n` frames from the ring (the reader's side). */
-static void ring_skip(fa_capture* c, uint32_t n)
-{
-    fa_store32(&c->rpos, (int32_t)((uint32_t)fa_load32(&c->rpos) + n));
-}
-
 /* `frames` frames at the master rate into c->out, both lanes. `hold`: a setup check is
- * timing the input, so the ratio stays at the nominal one (a drift correction would bend
- * the delay it measures; the drift of two crystals over its 3 s is a fraction of a ms). */
+ * timing the input, so the ratio stays at the nominal one (the drift of two crystals over
+ * its 3 s is a fraction of a ms). */
 static void capture_pull(fa_capture* c, fa_device* dev, uint32_t frames, int hold)
 {
-    uint32_t w, r, avail, mask = c->ring_frames - 1;
-    double fill, err, adj, ratio;
-    int64_t need, got;
-    if (c->out_rate != dev->rate) bridge_setup(c, dev);
-    w = (uint32_t)fa_load32(&c->wpos);
-    r = (uint32_t)fa_load32(&c->rpos);
-    avail = w - r;
-    fill = (double)avail + fa_varispeed_pending(&c->vs);
-    if (!c->primed) {
-        if (fill < c->target) {   /* filling up: silence until the target is held */
-            memset(c->out, 0, (size_t)frames * CAPTURE_LANES * sizeof(float));
-            return;
-        }
-        if (fill > c->target) {   /* more than that (the input ran while we did not): drop it */
-            uint32_t drop = (uint32_t)(fill - c->target);
-            if (drop > avail) drop = avail;
-            ring_skip(c, drop);
-            r += drop;
-            avail -= drop;
-            fill -= (double)drop;
-        }
-        c->primed = 1;
-        c->avg = fill;
-    }
-    c->avg += (fill - c->avg) * fmin(1.0, (double)frames / (double)dev->rate);
-    err = c->avg - c->target;
-    if (!hold && err > (double)c->rate * BRIDGE_JUMP_MS / 1000.0) {
-        /* Far over (the master callback stalled): back to the target now, not over seconds.
-         * The average lags the fill, which may already be under the target. */
-        uint32_t drop = fill > c->target ? (uint32_t)(fill - c->target) : 0;
-        if (drop > avail) drop = avail;
-        ring_skip(c, drop);
-        r += drop;
-        avail -= drop;
-        fill -= (double)drop;
-        c->avg = fill;
-        err = fill - c->target;
-    }
-    adj = hold ? 0.0 : err / ((double)c->rate * BRIDGE_SETTLE_S);
-    if (adj > BRIDGE_MAX_ADJUST) adj = BRIDGE_MAX_ADJUST;
-    if (adj < -BRIDGE_MAX_ADJUST) adj = -BRIDGE_MAX_ADJUST;
-    ratio = c->nominal * (1.0 + adj);
-    /* Feed the resampler what this block reads, plus its look-ahead. */
-    need = (int64_t)ceil((double)frames * ratio) + fa_varispeed_width(ratio) + 2 - (int64_t)fa_varispeed_pending(&c->vs);
-    while (need > 0 && avail > 0) {
-        uint32_t at = r & mask, chunk = avail;
-        if (chunk > c->ring_frames - at) chunk = c->ring_frames - at;
-        if ((int64_t)chunk > need) chunk = (uint32_t)need;
-        if (fa_varispeed_write(&c->vs, c->ring + (size_t)at * CAPTURE_LANES, chunk) != FA_OK) break;
-        r += chunk;
-        avail -= chunk;
-        need -= chunk;
-    }
-    fa_store32(&c->rpos, (int32_t)r);
-    got = fa_varispeed_read(&c->vs, ratio, c->out, frames);
-    if (got < (int64_t)frames) {
-        /* Ran dry: the rest is silence, and the bridge holds more from now on. */
-        double most = (double)c->rate * BRIDGE_MAX_MS / 1000.0;
-        memset(c->out + (size_t)got * CAPTURE_LANES, 0, (size_t)(frames - got) * CAPTURE_LANES * sizeof(float));
-        fa_fetch_add32(&c->underruns, 1);
-        c->target = fmin(most, c->target + (double)c->rate * BRIDGE_STEP_MS / 1000.0);
-        c->primed = 0;
-        fa_store64(&c->bridge_ns, (int64_t)(c->target * 1e9 / (double)c->rate));
-    }
+    double in_period = c->device_ok ? (double)c->device.capture.internalPeriodSizeInFrames : 0.0;
+    fa_bridge_pull(&c->br, c->out, frames, dev->rate, in_period, (double)fa_load32(&dev->period_frames), hold);
 }
 
 /* ---- the channel strip (master callback) ---------------------------------------- */
@@ -335,8 +236,7 @@ static void capture_free(fa_capture* c)
         fa_store32(&c->stopping, 1);
         ma_device_uninit(&c->device);   /* waits for its callback */
     }
-    fa_varispeed_free(&c->vs);
-    free(c->ring);
+    fa_bridge_free(&c->br);
     free(c->id);
     free(c);
 }
@@ -352,8 +252,6 @@ static fa_result capture_start(fa_capture* c, fa_latency_mode mode)
     ma_result mr;
     fa_result r;
     int has_id;
-    uint32_t frames;
-    int64_t prealloc;
     r = fa_device_parse_id(e, FA_DEVICE_CAPTURE, c->id, &did, &has_id);
     if (r != FA_OK) return r;
     cfg = ma_device_config_init(ma_device_type_capture);
@@ -384,27 +282,8 @@ static fa_result capture_start(fa_capture* c, fa_latency_mode mode)
                (int64_t)((double)c->device.capture.internalPeriodSizeInFrames *
                          (double)c->device.capture.internalPeriods * 1e9 /
                          (double)c->device.capture.internalSampleRate));
-    for (frames = 1024; frames < (uint32_t)((double)c->rate * RING_SECONDS); frames *= 2) {}
-    if (frames != c->ring_frames) {
-        free(c->ring);
-        c->ring_frames = frames;
-        c->ring = (float*)calloc((size_t)frames * CAPTURE_LANES, sizeof(float));
-    }
-    fa_store32(&c->wpos, 0);
-    fa_store32(&c->rpos, 0);
-    c->out_rate = 0;                     /* the next pull sets the bridge up anew */
-    /* Reserve the resampler's buffer now: the master callback never allocates. */
-    fa_varispeed_set_keep(&c->vs, 64);
-    {
-        /* One block's input at the steepest ratio, the look-ahead on both sides and what
-         * the resampler keeps behind its position. */
-        double most = (double)c->rate / (double)m->device->rate * (1.0 + BRIDGE_MAX_ADJUST);
-        prealloc = (int64_t)ceil((double)FA_MIXER_BLOCK * most) + 2 * fa_varispeed_width(most) + 64 + 16;
-        if (prealloc < VS_PREALLOC) prealloc = VS_PREALLOC;
-    }
-    if (!c->ring || fa_varispeed_write(&c->vs, NULL, prealloc) != FA_OK) return FA_ERROR_OUT_OF_MEMORY;
-    fa_varispeed_reset(&c->vs);
-    return FA_OK;
+    /* The master callback never allocates: the bridge is sized for it now. */
+    return fa_bridge_size(&c->br, c->rate, m->device->rate, RING_SECONDS);
 }
 
 static fa_result capture_open(struct fa_mixer* m, const char* id, uint32_t mic_flags, fa_capture** out)
@@ -419,7 +298,7 @@ static fa_result capture_open(struct fa_mixer* m, const char* id, uint32_t mic_f
     c->mixer = m;
     c->os_processing = (mic_flags & FA_MIC_OS_PROCESSING) != 0;
     c->id = (char*)malloc(len + 1);
-    if (!c->id || fa_varispeed_init(&c->vs, CAPTURE_LANES) != FA_OK) {
+    if (!c->id || fa_bridge_init(&c->br, BRIDGE_MAX_ADJUST) != FA_OK) {
         free(c->id);
         free(c);
         return FA_ERROR_OUT_OF_MEMORY;
@@ -732,9 +611,11 @@ FA_API fa_result FA_CALL fa_mixer_get_latency(fa_mixer* mixer, fa_mixer_latency*
     memset(&l, 0, sizeof(l));
     l.struct_size = size;
     /* The OS's buffer and the limiter's look-ahead (always on for a mixer). */
-    l.master = fa_load64(&mixer->device->latency_ns) +
+    /* The OS's buffer, the limiter's look-ahead (always on for a mixer) and a cue alignment delay. */
+    l.master = fa_load64(&mixer->device->latency_ns) + fa_device_align_ns(mixer->device) +
                (fa_time)((double)mixer->device->limiter.delay * 1e9 / (double)mixer->device->rate);
     l.cue = fa_load64(&mixer->device->latency_ns);   /* the cue is not limited: no look-ahead */
+    fa_mixer_cue_latency(mixer, &l.cue, &l.cue_alignment, &l.cue_align);
     fa_mutex_lock(&mixer->lock);
     for (i = 0; i < FA_MIC_MAX; i++) {
         struct fa_mic* mic = (struct fa_mic*)fa_load_ptr(&mixer->mics[i]);
@@ -743,10 +624,11 @@ FA_API fa_result FA_CALL fa_mixer_get_latency(fa_mixer* mixer, fa_mixer_latency*
             l.mic_monitor[i] = -1;
             continue;
         }
-        l.mic_input[i] = fa_load64(&mic->cap->input_ns) + fa_load64(&mic->cap->bridge_ns);
+        l.mic_input[i] = fa_load64(&mic->cap->input_ns) + fa_load64(&mic->cap->br.held_ns);
         /* The setup check's measurement in this mode, when there is one. */
         l.mic_monitor[i] = fa_load64(&mic->measured[mixer->device->open_mode]);
         if (l.mic_monitor[i] <= 0) l.mic_monitor[i] = l.mic_input[i] + l.master;
+        else l.mic_monitor[i] += fa_device_align_ns(mixer->device);   /* measured without it */
     }
     fa_mutex_unlock(&mixer->lock);
     memcpy(out_latency, &l, size);
@@ -768,9 +650,15 @@ FA_API fa_result FA_CALL fa_mixer_set_event_callback(fa_mixer* mixer, fa_mixer_e
 
 void fa_mixer_service(struct fa_mixer* m)
 {
-    fa_mixer_event ev[FA_MIC_MAX];
+    fa_mixer_event ev[FA_MIC_MAX + 1];
     uint32_t n = 0, i;
     fa_mutex_lock(&m->lock);
+    if (fa_mixer_cue_take_loss(m)) {
+        memset(&ev[n], 0, sizeof(ev[n]));
+        ev[n].type = FA_EVENT_CUE_LOST;
+        ev[n].mixer = m;
+        n++;
+    }
     for (i = 0; i < FA_MIC_MAX; i++) {
         struct fa_mic* mic = (struct fa_mic*)fa_load_ptr(&m->mics[i]);
         if (!mic || fa_load32(&mic->cap->lost) == 0 || mic->lost_reported) continue;
@@ -790,7 +678,7 @@ void fa_mixer_service(struct fa_mixer* m)
         fa_mutex_lock(&m->lock);   /* a callback before may have removed it */
         /* The same address may be a new mic (removed and added by a callback): only the
          * one that took the loss has lost_reported. */
-        still = fa_load_ptr(&m->mics[ev[i].index]) == ev[i].mic && ev[i].mic->lost_reported;
+        still = !ev[i].mic || (fa_load_ptr(&m->mics[ev[i].index]) == ev[i].mic && ev[i].mic->lost_reported);
         fa_mutex_unlock(&m->lock);
         if (!still) continue;
         fa_mutex_lock(&m->cb_lock);
@@ -812,9 +700,10 @@ void fa_mic_test_take_over(fa_mic* mic, uint32_t rate, uint32_t channels)
     c->test_owned = 1;   /* a latency mode switch leaves it alone */
     c->rate = rate;
     c->channels = channels;
-    fa_store32(&c->wpos, 0);
-    fa_store32(&c->rpos, 0);
-    c->out_rate = 0;   /* set up again on the next pull */
+    c->br.in_rate = rate;
+    fa_store32(&c->br.wpos, 0);
+    fa_store32(&c->br.rpos, 0);
+    c->br.out_rate = 0;   /* set up again on the next pull */
 }
 
 void fa_mic_test_feed(fa_mic* mic, const float* frames, uint32_t n)
@@ -830,8 +719,7 @@ void fa_mic_test_lose(fa_mic* mic)
 void fa_mic_test_stats(fa_mic* mic, double* out_target, double* out_fill, int32_t* out_underruns)
 {
     fa_capture* c = mic->cap;
-    if (out_target) *out_target = c->target;
-    if (out_fill) *out_fill = (double)((uint32_t)fa_load32(&c->wpos) - (uint32_t)fa_load32(&c->rpos)) +
-                              fa_varispeed_pending(&c->vs);
-    if (out_underruns) *out_underruns = fa_load32(&c->underruns);
+    if (out_target) *out_target = c->br.target;
+    if (out_fill) *out_fill = fa_bridge_fill(&c->br);
+    if (out_underruns) *out_underruns = fa_load32(&c->br.underruns);
 }

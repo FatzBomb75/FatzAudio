@@ -207,16 +207,20 @@ public sealed class AudioEngine : IDisposable
         c.CueMode = options.Cue.Mode;
         c.CueChannel = (uint)options.Cue.FirstChannel;
         c.Latency = (int)options.Latency;
+        c.Flags = options.Cue.Mode == 2 && !options.Cue.LineUp ? 1u : 0u;   // FA_MIXER_CUE_LOWEST_LATENCY
         byte* id = options.Output?.Id is { } devId ? (byte*)Marshal.StringToCoTaskMemUTF8(devId) : null;
+        byte* cueId = options.Cue.Headphones?.Id is { } cueDev ? (byte*)Marshal.StringToCoTaskMemUTF8(cueDev) : null;
         nint native;
         try
         {
             c.DeviceId = id;
+            c.CueDeviceId = cueId;
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_create(h, &c, out native));
         }
         finally
         {
             if (id != null) Marshal.FreeCoTaskMem((nint)id);
+            if (cueId != null) Marshal.FreeCoTaskMem((nint)cueId);
         }
         // The mixer lives as long as its device: closing the device destroys it.
         NativeMethods.fa_mixer_get_device(native, out nint device);

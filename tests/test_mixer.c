@@ -633,9 +633,10 @@ static void test_config_errors(void)
     CHECK_EQ(fa_mixer_create(g_engine, &c, &m), FA_ERROR_NOT_IMPLEMENTED);
     fa_mixer_config_init(&c);
     c.cue_mode = FA_CUE_DEVICE;
-    CHECK_EQ(fa_mixer_create(g_engine, &c, &m), FA_ERROR_NOT_IMPLEMENTED);
+    c.cue_device_id = "zz";      /* not hex */
+    CHECK_EQ(fa_mixer_create(g_engine, &c, &m), FA_ERROR_INVALID_ARG);
     fa_mixer_config_init(&c);
-    c.flags = 1;
+    c.flags = 2;
     CHECK_EQ(fa_mixer_create(g_engine, &c, &m), FA_ERROR_INVALID_ARG);
     CHECK(m == NULL);
     CHECK(strcmp(fa_result_string(FA_ERROR_NOT_ENOUGH_CHANNELS), "unknown error") != 0);

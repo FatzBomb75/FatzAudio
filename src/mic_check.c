@@ -348,8 +348,9 @@ static void measure_mode(struct fa_mixer* m, struct fa_mic* mic, const fa_latenc
     float worst = 0.0f, heard_at = 0.0f, last_worst = -1.0f;
     out->result = FA_OK;
     /* What the OS's figures add up to (fa_mixer_get_latency before any measurement). */
-    out->reported = fa_load64(&mic->cap->input_ns) + fa_load64(&mic->cap->bridge_ns) +
-                    fa_load64(&m->device->latency_ns) + (fa_time)((double)look * 1e9 / rate);
+    out->reported = fa_load64(&mic->cap->input_ns) + fa_load64(&mic->cap->br.held_ns) +
+                    fa_load64(&m->device->latency_ns) + (fa_time)((double)look * 1e9 / rate) +
+                    fa_device_align_ns(m->device);
     /* Probes, getting louder until the mic hears them clearly (the noise of the full pass
      * then stands well over the room's). */
     for (;;) {
@@ -411,10 +412,10 @@ static void settle(struct fa_mic* mic)
 {
     int64_t now = fa_monotonic_ns(), end = now + (int64_t)SETTLE_MAX_MS * 1000000;
     int64_t quiet_from = now;
-    uint32_t under = fa_load32(&mic->cap->underruns), u;
+    uint32_t under = fa_load32(&mic->cap->br.underruns), u;
     while ((now = fa_monotonic_ns()) < end && now - quiet_from < (int64_t)SETTLE_MS * 1000000) {
         fa_sleep_ms(20);
-        u = fa_load32(&mic->cap->underruns);
+        u = fa_load32(&mic->cap->br.underruns);
         if (u != under) {
             under = u;
             quiet_from = fa_monotonic_ns();
@@ -470,9 +471,12 @@ FA_API fa_result FA_CALL fa_mixer_measure_latency(fa_mixer* mixer, fa_mic* mic, 
             measure_mode(mixer, mic, &c, o);
         }
         if (o->result == FA_OK) {
-            /* Kept for this mic and mode: fa_mixer_get_latency and the vocals' alignment. */
+            /* Kept for this mic and mode: fa_mixer_get_latency and the vocals' alignment.
+             * Without a cue alignment delay on the master, which fa_mixer_get_latency adds
+             * as it is then. */
+            fa_time keep = o->mic_to_speaker - fa_device_align_ns(mixer->device);
             fa_mutex_lock(&mixer->lock);
-            if (fa_load_ptr(&mixer->mics[slot]) == mic) fa_store64(&mic->measured[mode], o->mic_to_speaker);
+            if (fa_load_ptr(&mixer->mics[slot]) == mic) fa_store64(&mic->measured[mode], keep > 0 ? keep : 1);
             fa_mutex_unlock(&mixer->lock);
         }
     }

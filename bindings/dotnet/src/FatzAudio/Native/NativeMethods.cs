@@ -748,6 +748,9 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_mixer_get_latency_mode(nint mixer, out int mode);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mixer_set_cue_device(nint mixer, byte* deviceId);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial void fa_latency_check_config_init(FaLatencyCheckConfig* config);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

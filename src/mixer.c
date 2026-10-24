@@ -187,7 +187,6 @@ void fa_mixer_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t f
     for (i = 0; i < m->deck_count; i++) end_lanes(m->decks[i].lanes, DECK_LANES, clock, frames);
 }
 
-static float clip1(float v) { return v > 1.0f ? 1.0f : v < -1.0f ? -1.0f : v; }
 
 /* The master (after the limiter and the device mute) and the cue onto the device's channels.
  * The device mute silences the cue sends too, gliding as the master did over the block
@@ -197,6 +196,7 @@ static void lay_out(struct fa_mixer* m, const float* master, float* out, uint32_
 {
     uint32_t i, c, cue_at = m->cue_mode == FA_CUE_CHANNELS && channels >= m->cue_channel + 2 ? m->cue_channel : 0;
     float mute = mute0;
+    int cue_here = m->cue_mode == FA_CUE_CHANNELS || m->cue_mode == FA_CUE_SPLIT;   /* not a second device */
     if (channels == 2 && m->cue_mode != FA_CUE_SPLIT) {
         memcpy(out, master, (size_t)frames * 2 * sizeof(float));
         return;
@@ -205,7 +205,7 @@ static void lay_out(struct fa_mixer* m, const float* master, float* out, uint32_
         const float* mm = master + (size_t)i * 2;
         float* o = out + (size_t)i * channels;
         float cl = 0.0f, cr = 0.0f;
-        if (m->cue_mode != FA_CUE_NONE) {
+        if (cue_here) {
             const float* cs = m->cue + (size_t)i * 2;
             float audible;
             if (mute != mute1) mute = fa_mute_glide(mute, mute1, 1, rate);
@@ -240,6 +240,7 @@ void fa_mixer_render(struct fa_mixer* m, fa_device* dev, float* out, uint32_t ch
             fa_mic_check_render(m->check_now, m->master, n, clock);
             m->check_now = NULL;
         }
+        if (m->cue_dev) fa_mixer_cue_render(m, dev, m->master, n, mute0, dev->mute_level);   /* the headphones */
         lay_out(m, m->master, out + (size_t)done * channels, channels, n, mute0, dev->mute_level, dev->rate);
     }
 }
@@ -309,8 +310,8 @@ FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_confi
     if (c.deck_count == 0) c.deck_count = 2;
     if (c.deck_count > 2) return FA_ERROR_NOT_IMPLEMENTED;   /* 4 decks are planned */
     if (c.deck_count < 2) return FA_ERROR_INVALID_ARG;
-    if (c.cue_mode == FA_CUE_DEVICE) return FA_ERROR_NOT_IMPLEMENTED;
-    if ((uint32_t)c.cue_mode > FA_CUE_SPLIT || (uint32_t)c.latency > FA_LATENCY_EXCLUSIVE || c.flags != 0)
+    if ((uint32_t)c.cue_mode > FA_CUE_SPLIT || (uint32_t)c.latency > FA_LATENCY_EXCLUSIVE ||
+        (c.flags & ~FA_MIXER_CUE_LOWEST_LATENCY))
         return FA_ERROR_INVALID_ARG;
     if (c.cue_channel == 0) c.cue_channel = 2;
     if (c.cue_channel < 2 || c.cue_channel > 30) return FA_ERROR_INVALID_ARG;
@@ -341,6 +342,7 @@ FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_confi
     m->deck_count = c.deck_count;
     m->cue_mode = c.cue_mode;
     m->cue_channel = c.cue_channel;
+    m->flags = c.flags;
     fa_store32(&m->curve, FA_XFADER_CONSTANT_POWER);
     fa_lane_init(&m->lanes[ML_XF], 0.5f);
     fa_lane_init(&m->lanes[ML_MASTER], 1.0f);
@@ -378,6 +380,11 @@ FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_confi
             return r;
         }
     }
+    if (c.cue_mode == FA_CUE_DEVICE && (r = fa_mixer_cue_create(m, c.cue_device_id)) != FA_OK) {
+        fa_device_close(dev);
+        free_mixer(m);
+        return r;
+    }
     fa_exchange_ptr(&dev->mixer, m);
     r = fa_device_start(dev);
     if (r != FA_OK) {
@@ -408,6 +415,9 @@ FA_API void FA_CALL fa_mixer_destroy(fa_mixer* mixer)
     fa_device_stop(dev);
     fa_exchange_ptr(&dev->mixer, NULL);
     fa_device_wait_quiescent(dev);   /* no callback is in the mixer any more */
+    fa_mutex_lock(&mixer->lock);
+    fa_mixer_cue_free(mixer);        /* closes the headphones */
+    fa_mutex_unlock(&mixer->lock);
     fa_mixer_mics_free(mixer);       /* closes the inputs */
     fa_device_close(dev);
     /* After the close the event thread cannot pick the mixer up again; wait out a
@@ -457,7 +467,12 @@ FA_API fa_result FA_CALL fa_mixer_get_output_channels(fa_mixer* mixer, uint32_t*
     return FA_OK;
 }
 
-static void reopen_inputs(void* user, fa_latency_mode mode) { fa_mixer_captures_reopen((struct fa_mixer*)user, mode); }
+/* While the master is closed: the inputs and the headphones follow it to the new mode. */
+static void reopen_inputs(void* user, fa_latency_mode mode)
+{
+    fa_mixer_captures_reopen((struct fa_mixer*)user, mode);
+    fa_mixer_cue_reopen((struct fa_mixer*)user, mode);
+}
 
 fa_result fa_mixer_switch_latency_mode(struct fa_mixer* mixer, fa_latency_mode mode)
 {
@@ -495,6 +510,7 @@ static fa_result mix_range(fa_mix_param p, float* v)
     switch (p) {
     case FA_MIX_CROSSFADER: case FA_MIX_CUE_MIX: *v = clampf(*v, 0.0f, 1.0f); return FA_OK;
     case FA_MIX_MASTER_GAIN: case FA_MIX_CUE_GAIN: *v = clampf(*v, 0.0f, 4.0f); return FA_OK;
+    case FA_MIX_CUE_TRIM_MS: *v = clampf(*v, -250.0f, 250.0f); return FA_OK;
     default: return FA_ERROR_INVALID_ARG;
     }
 }
@@ -510,6 +526,11 @@ FA_API fa_result FA_CALL fa_mixer_set_param(fa_mixer* mixer, fa_mix_param param,
     fa_result r;
     if (!mixer) return FA_ERROR_INVALID_ARG;
     if ((r = mix_range(param, &value)) != FA_OK) return r;
+    if (param == FA_MIX_CUE_TRIM_MS) {   /* no glide: the audio thread lines the outputs up anew */
+        if (value != value) return FA_ERROR_INVALID_ARG;   /* NaN: clampf lets it through */
+        fa_store_float(&mixer->cue_trim, value);
+        return FA_OK;
+    }
     fa_mutex_lock(&mixer->lock);
     fa_lane_post(&mixer->lanes[param], value, MIXER_DEZIPPER_NS, NULL, 0, 0, -1, 0, NULL);
     fa_mutex_unlock(&mixer->lock);
@@ -520,6 +541,10 @@ FA_API fa_result FA_CALL fa_mixer_get_param(fa_mixer* mixer, fa_mix_param param,
 {
     float v = 0.0f;
     if (!mixer || !out_value || mix_range(param, &v) != FA_OK) return FA_ERROR_INVALID_ARG;
+    if (param == FA_MIX_CUE_TRIM_MS) {
+        *out_value = fa_load_float(&mixer->cue_trim);
+        return FA_OK;
+    }
     fa_mutex_lock(&mixer->lock);
     *out_value = fa_lane_get(&mixer->lanes[param]);
     fa_mutex_unlock(&mixer->lock);
@@ -531,7 +556,7 @@ FA_API fa_result FA_CALL fa_mixer_ramp_param(fa_mixer* mixer, fa_mix_param param
 {
     fa_shape shape;
     fa_result r;
-    if (!mixer || duration < 0 || device_time < 0) return FA_ERROR_INVALID_ARG;
+    if (!mixer || duration < 0 || device_time < 0 || param == FA_MIX_CUE_TRIM_MS) return FA_ERROR_INVALID_ARG;
     if ((r = fa_shape_from_ramp(ramp, FA_CURVE_LINEAR, &shape)) != FA_OK) return r;
     if ((r = mix_range(param, &target)) != FA_OK) return r;
     fa_mutex_lock(&mixer->lock);

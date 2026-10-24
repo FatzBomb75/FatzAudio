@@ -33,6 +33,40 @@ public class DjMixerTests
     }
 
     [Fact]
+    public void CueDevice_OpensTheHeadphonesAndLinesUp()
+    {
+        using var engine = CreateHeadless();
+        var output = new AudioDeviceInfo("x", "x", DeviceKind.Capture, false, 48000, 2);
+        Assert.Throws<ArgumentException>(() => CueOutput.Device(output));
+        using var mixer = engine.CreateDjMixer(new DjMixerOptions { Cue = CueOutput.Device(), Latency = LatencyMode.Normal });
+        Assert.Equal(2, mixer.OutputChannels);
+        Assert.Null(mixer.CueChannel);
+        mixer.CueTrim = TimeSpan.FromMilliseconds(400);
+        Assert.Equal(TimeSpan.FromMilliseconds(250), mixer.CueTrim);
+        mixer.CueTrim = TimeSpan.FromMilliseconds(-12);
+        Assert.Equal(TimeSpan.FromMilliseconds(-12), mixer.CueTrim);
+        Assert.True(Enum.IsDefined(mixer.Latency.CueAligned));
+        Assert.True(mixer.Latency.CueAlignment >= TimeSpan.Zero);
+        mixer.SetCueDevice(null);   // the default output again
+        Assert.Throws<ArgumentException>(() => mixer.SetCueDevice(output));
+        var ex = Assert.Throws<FatzAudioException>(() => mixer.SetCueDevice(new AudioDeviceInfo("zz", "zz", DeviceKind.Playback, false, 48000, 2)));
+        Assert.Equal(ErrorCode.InvalidArgument, ex.ErrorCode);
+    }
+
+    [Fact]
+    public void CueDevice_LineUpOffReportsOff()
+    {
+        using var engine = CreateHeadless();
+        using var mixer = engine.CreateDjMixer(new DjMixerOptions { Cue = CueOutput.Device(lineUp: false) });
+        Assert.Equal(CueAlign.Off, mixer.Latency.CueAligned);
+        Assert.Equal(TimeSpan.Zero, mixer.Latency.CueAlignment);
+        using var plain = engine.CreateDjMixer();
+        Assert.Equal(CueAlign.None, plain.Latency.CueAligned);
+        var ex = Assert.Throws<FatzAudioException>(() => plain.SetCueDevice(null));
+        Assert.Equal(ErrorCode.InvalidArgument, ex.ErrorCode);
+    }
+
+    [Fact]
     public void Planned_ModesReportNotImplemented()
     {
         using var engine = CreateHeadless();
