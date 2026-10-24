@@ -693,6 +693,27 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_mixer_get_latency(nint mixer, FaMixerLatency* latency);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_deck_sync(nint deck, nint leader, uint flags);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_deck_play_synced(nint deck, nint leader, uint flags);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_deck_set_loop_beats(nint deck, double beats);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_deck_get_beat_info(nint deck, FaDeckBeatInfo* info);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_automix_options_init(FaAutomixOptions* options);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mixer_set_automix(nint mixer, FaAutomixOptions* options);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_mixer_automix_now(nint mixer);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_mixer_set_event_callback(nint mixer, delegate* unmanaged[Cdecl]<FaMixerEvent*, void*, void> callback, void* user);
 
     // ---- DJ mixer: microphones ---------------------------------------------

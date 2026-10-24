@@ -54,6 +54,9 @@ public enum ErrorCode
     /// <summary>The app has no microphone permission (<see cref="DjMixer.AddMic"/>): ask for it first (Android
     /// manifest and prompt, macOS and iOS usage strings).</summary>
     PermissionDenied = -20,
+    /// <summary><see cref="DjDeck.SyncTo"/>: the tempo it needs is outside the deck's <see cref="DjDeck.SyncRange"/>,
+    /// also at half or double time.</summary>
+    OutOfRange = -21,
 }
 
 /// <summary>

@@ -260,7 +260,10 @@ FA_API void FA_CALL fa_mixer_config_init(fa_mixer_config* config)
 static void free_mixer(struct fa_mixer* m)
 {
     uint32_t i;
-    for (i = 0; i < m->deck_count; i++) fa_tap_free((fa_tap*)fa_load_ptr(&m->decks[i].tap));
+    for (i = 0; i < m->deck_count; i++) {
+        fa_tap_free((fa_tap*)fa_load_ptr(&m->decks[i].tap));
+        free(m->decks[i].segs);
+    }
     fa_mixer_mics_free_removed(m);
     fa_mic_bus_free((fa_mic_bus*)fa_load_ptr(&m->bus));
     fa_mutex_destroy(&m->cb_lock);
@@ -367,6 +370,7 @@ FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_confi
         fa_lane_init(&d->lanes[DL_HIGH], 0.0f);
         fa_lane_init(&d->lanes[DL_CUE], 0.0f);
         fa_store32(&d->side, side);
+        fa_store_float(&d->sync_range, 0.16f);
         d->side_w[side] = 1.0f;
         r = fa_bus_create(dev, &d->bus);
         if (r == FA_OK) {
@@ -585,6 +589,18 @@ static fa_stream* deck_stream(struct fa_deck* d) { return (fa_stream*)fa_load_pt
 
 void fa_mixer_bus_left(fa_bus* bus, struct fa_stream* s) { fa_cas_ptr(&bus->deck->stream, s, NULL); }
 
+void fa_mixer_stream_closing(struct fa_stream* s)
+{
+    fa_bus* bus = (fa_bus*)fa_load_ptr(&s->bus);
+    struct fa_deck* d = bus ? bus->deck : NULL;
+    if (!d) return;
+    /* Off the deck under the mixer lock: the event thread's sync and auto-mix use a
+     * deck's stream under it, and find the deck empty from here on. */
+    fa_mutex_lock(&d->mixer->lock);
+    if (fa_cas_ptr(&d->stream, s, NULL)) fa_deck_sync_loaded(d);
+    fa_mutex_unlock(&d->mixer->lock);
+}
+
 /* Whether the deck is heard now: playing, fader up, and the crossfader open on its
  * side. Caller holds the mixer lock. */
 static int deck_heard(struct fa_deck* d)
@@ -639,6 +655,8 @@ FA_API fa_result FA_CALL fa_deck_load(fa_deck* deck, fa_stream* stream, uint32_t
     }
     fa_exchange_ptr(&deck->stream, stream);
     deck->cue_point = FA_FRAMES_UNSET;
+    fa_deck_sync_loaded(deck);
+    fa_automix_loaded(m, deck, stream);
     if (old) {
         fa_stream_set_loop_region(old, 0, 0);
         fa_stream_detach(old);
@@ -669,6 +687,7 @@ static fa_result deck_range(fa_deck_param p, float* v)
         if (*v != 0.0f && *v != 1.0f && *v != 2.0f) return FA_ERROR_INVALID_ARG;
         return FA_OK;
     case FA_DECK_CUE: *v = *v != 0.0f ? 1.0f : 0.0f; return FA_OK;
+    case FA_DECK_SYNC_RANGE: *v = clampf(*v, 0.01f, 1.0f); return FA_OK;
     default: return FA_ERROR_INVALID_ARG;
     }
 }
@@ -696,6 +715,10 @@ FA_API fa_result FA_CALL fa_deck_set_param(fa_deck* deck, fa_deck_param param, f
         fa_store32(&deck->side, (int32_t)value);
         return FA_OK;
     }
+    if (param == FA_DECK_SYNC_RANGE) {    /* read by sync, not the audio thread */
+        fa_store_float(&deck->sync_range, value);
+        return FA_OK;
+    }
     fa_mutex_lock(&deck->mixer->lock);
     fa_lane_post(deck_lane(deck, param), value, MIXER_DEZIPPER_NS, NULL, 0, 0, -1, 0, NULL);
     fa_mutex_unlock(&deck->mixer->lock);
@@ -707,6 +730,7 @@ FA_API fa_result FA_CALL fa_deck_get_param(fa_deck* deck, fa_deck_param param, f
     float v = 0.0f;
     if (!deck || !out_value || deck_range(param, &v) != FA_OK) return FA_ERROR_INVALID_ARG;
     if (param == FA_DECK_XFADER_SIDE) { *out_value = (float)fa_load32(&deck->side); return FA_OK; }
+    if (param == FA_DECK_SYNC_RANGE) { *out_value = fa_load_float(&deck->sync_range); return FA_OK; }
     fa_mutex_lock(&deck->mixer->lock);
     *out_value = fa_lane_get(deck_lane(deck, param));
     fa_mutex_unlock(&deck->mixer->lock);
@@ -718,7 +742,8 @@ FA_API fa_result FA_CALL fa_deck_ramp_param(fa_deck* deck, fa_deck_param param, 
 {
     fa_shape shape;
     fa_result r;
-    if (!deck || duration < 0 || device_time < 0 || param == FA_DECK_XFADER_SIDE || param == FA_DECK_CUE)
+    if (!deck || duration < 0 || device_time < 0 || param == FA_DECK_XFADER_SIDE || param == FA_DECK_CUE ||
+        param == FA_DECK_SYNC_RANGE)
         return FA_ERROR_INVALID_ARG;
     if ((r = fa_shape_from_ramp(ramp, FA_CURVE_LINEAR, &shape)) != FA_OK) return r;
     if ((r = deck_range(param, &target)) != FA_OK) return r;
@@ -735,6 +760,8 @@ static fa_frames cue_point_of(struct fa_deck* d)
     if (f == FA_FRAMES_UNSET && (fa_stream_get_marker(deck_stream(d), FA_MARKER_CUE_IN, &f) != FA_OK || f == FA_FRAMES_UNSET)) f = 0;
     return f;
 }
+
+fa_frames fa_deck_cue_point_now(struct fa_deck* d) { return cue_point_of(d); }
 
 FA_API fa_result FA_CALL fa_deck_set_cue_point(fa_deck* deck, fa_frames source_frame)
 {

@@ -132,6 +132,7 @@ mixer.CueLost += (_, _) => Console.WriteLine("headphones gone; call SetCueDevice
 | `FA_DECK_EQ_LOW_DB`, `_MID_DB`, `_HIGH_DB` / `Eq.Low`, `Eq.Mid`, `Eq.High` | `FA_DECK_EQ_KILL_DB` (−60, silent) .. +6 dB | 0 |
 | `FA_DECK_XFADER_SIDE` / `Side` | thru (0), A (1), B (2) | deck 1 A, deck 2 B |
 | `FA_DECK_CUE` / `Cue` | off / on | off |
+| `FA_DECK_SYNC_RANGE` / `SyncRange` | 0.01..1: the most [sync](#sync-and-beat-loops) moves the deck's tempo away from 1, not rampable | 0.16 (±16%) |
 
 ## Rules
 
@@ -139,7 +140,7 @@ mixer.CueLost += (_, _) => Console.WriteLine("headphones gone; call SetCueDevice
 - The isolator splits the deck at 250 Hz and 2.5 kHz with fourth-order Linkwitz-Riley crossovers, so with every band at 0 dB the bands add back to the original exactly in level (the phase turns gently around the crossovers, as on hardware isolators). It runs always, so moving a knob never clicks.
 - `fa_deck_load` attaches the stream to the mixer's device through the deck, from wherever it was, keeping its position. Loading over a stream that is playing and heard (fader up and the crossfader not closed on its side) is `FA_ERROR_BUSY` unless `FA_DECK_LOAD_FORCE` (`force: true`). Loading a stream that isn't playing also shortens its decode-ahead to 60 ms, so tempo and pitch moves are heard quickly.
 - A deck holds one stream. `fa_crossfade` or `fa_stream_set_next` from a deck's stream to a stream that isn't attached yet is `FA_ERROR_INVALID_ARG`: load the next song on the other deck and use the crossfader. A crossfade between the streams of two decks works.
-- Close (dispose) a deck's stream on the thread that drives the deck, or unload it first: closing it while another thread is inside a call on that deck isn't safe.
+- A deck's stream may be closed (disposed) from any thread, also while it is loaded: it leaves its deck first, under the mixer's lock, so a deck call on another thread (or the engine's event thread driving [sync](#sync-and-beat-loops) and [auto-mix](#auto-mix)) finishes before it goes.
 - The device mute (`fa_device_set_mute`, `Output.Muted`) silences the headphones too.
 - The cue point (`fa_deck_set_cue_point`, `CuePoint`) defaults to the stream's CUE_IN marker, else 0. `fa_deck_cue` (`ReturnToCuePoint`) pauses the deck and goes back to it.
 - The meter (`fa_deck_get_levels`) shows the deck after trim, EQ and fader, before the crossfader, as heard now.
@@ -348,6 +349,98 @@ foreach (var m in check.Modes)
 - **Trying a rig.** `tools/mic-check/fa_mic_check` runs the check from a command line: `fa_mic_check --list`, then `fa_mic_check --mic Yeti --all` (`--out NAME` for the output, `--level DB`, `--repeat N`).
 - **Rules.** The call blocks (in .NET it runs on a thread pool thread); call it from a thread of your own, not the event callback. A second check, or `fa_mixer_set_latency_mode`, while one runs is `FA_ERROR_BUSY`; a mic of another mixer is `FA_ERROR_INVALID_ARG`. Keep the mic until it returns. Exclusive mode ignores the Windows volume, so a level that was quiet in a shared mode can be much louder there.
 
+## Sync and beat loops
+
+Sync needs a beat grid on both decks: one from [track analysis](analysis.md) set with `fa_stream_set_beat_grid` (`AudioStream.BeatGrid`), one the user corrected, or the exact grid of a MIDI file or tracker module (no analysis needed). Without one the calls return `FA_ERROR_NOT_FOUND`. Beats are measured where the decks are heard (the presentation clock), so they line up in the room, including any delay on the master.
+
+```c
+fa_stream_set_beat_grid(song_a, &grid_a, NULL, 0);   /* from fa_analysis_get_beat_grid */
+fa_stream_set_beat_grid(song_b, &grid_b, NULL, 0);
+fa_stream_play(song_a);
+
+/* B starts on A's next downbeat, at A's tempo, and stays locked to it. */
+fa_deck_play_synced(b, a, FA_SYNC_TEMPO | FA_SYNC_BAR | FA_SYNC_LOCK);
+
+fa_deck_set_loop_beats(b, 4);         /* a four-beat loop from the beat heard now */
+fa_deck_set_loop_beats(b, 2);         /* halved: the same start */
+fa_deck_set_loop_beats(b, 0);         /* off */
+
+fa_deck_beat_info info = { sizeof(info) };
+fa_deck_get_beat_info(b, &info);      /* bpm, beat, bar, phase_error_ms, locked */
+fa_deck_sync(b, NULL, 0);             /* unlock: the tempo stays */
+```
+
+```csharp
+songA.BeatGrid = (await engine.AnalyzeAsync(pathA)).Beats;
+songB.BeatGrid = (await engine.AnalyzeAsync(pathB)).Beats;
+songA.Play();
+b.PlaySynced(a, SyncMode.Tempo | SyncMode.Bar | SyncMode.Lock);
+b.LoopBeats(4);
+var info = b.BeatInfo;                // Bpm, Beat, Bar, PhaseErrorMs, Locked, Synced
+b.Unsync();
+```
+
+- **Tempo** (`FA_SYNC_TEMPO`): the deck's `FA_PARAM_TEMPO` becomes the leader's heard BPM (its grid's BPM where it plays × its tempo × its rate) over the deck's grid BPM × its rate. The pitch stays (the stretcher). When that is more than `FA_DECK_SYNC_RANGE` from 1, half or double time is tried (a 170 BPM leader plays an 85 BPM deck at its own tempo); still out of reach is `FA_ERROR_OUT_OF_RANGE` (`ErrorCode.OutOfRange`) and nothing changes.
+- **Phase** (`FA_SYNC_BEAT`, `FA_SYNC_BAR`): on a playing deck, an error under 30 ms is pulled in by bending the tempo by up to 2% for about two beats (not audible); a larger one is fixed by a jump on the deck's next beat, joined seamlessly like a loop. `FA_SYNC_BAR` lines up downbeats (it implies BEAT); bars are known for exact grids, others count beat 0 as a downbeat. On a deck that isn't playing, `fa_deck_sync` sets the tempo and the phase follows once it plays; `fa_deck_play_synced` starts it in phase instead.
+- **`fa_deck_play_synced`** (`PlaySynced`) starts a stopped deck from its cue point (a paused one from where it is) so that its next beat (BAR: downbeat) lands exactly on one of the leader's, at least 50 ms ahead. It is scheduled on the device clock, so it is exact to the frame. The leader must be playing (`FA_ERROR_INVALID_ARG`); a deck that plays already is synced as `fa_deck_sync` does.
+- **Lock** (`FA_SYNC_LOCK`): the engine's event thread looks about 20 times a second and keeps the deck on the leader's beat: it follows the leader's tempo moves and tempo-mapped songs, with a target error under 1 ms. The deck's `FA_PARAM_TEMPO` then moves by itself; set it by hand only after unlocking. Without LOCK a sync is done once (a phase pull ends within 1 ms, or after about eight beats).
+- **Ending it**: `fa_deck_sync(deck, NULL, 0)` (`Unsync`), or loading a stream on either deck. The tempo stays where it is.
+- **Beat loops** (`fa_deck_set_loop_beats`, `LoopBeats`): 1/16..32 beats on the grid, from the beat heard now (a loop shorter than a beat starts on the last whole part of the beat). While a deck loop is on the new one keeps its in point, so halving and doubling work like a DJ's loop buttons. 0 turns the loop off. It is an ordinary [deck loop](#deck-loops), read back with `fa_deck_get_loop` (`Loop`) in frames.
+- **Beat info** (`fa_deck_get_beat_info`, `BeatInfo`): the heard BPM, the position in beats and bars, and while synced the phase error against the leader in ms (positive: this deck is ahead). `FA_ERROR_NOT_FOUND` (null in .NET) for an empty deck or one without a grid.
+
+## Auto-mix
+
+Auto-mix makes the two decks take turns: while one plays, the other starts at the playing deck's mix point and the crossfader moves across. Everything is scheduled on the device clock a couple of seconds ahead, so it is sample-accurate however busy the app's UI thread is. The app owns the playlist and loads the next song when asked.
+
+```c
+static void FA_CALL on_mixer(const fa_mixer_event* e, void* user)
+{
+    if (e->type == FA_EVENT_DECK_EMPTY) {          /* the idle deck needs the next song */
+        fa_deck* d; fa_mixer_get_deck(e->mixer, e->index, &d);
+        fa_stream* old; fa_deck_get_stream(d, &old);
+        fa_deck_load(d, next_song(user), FA_DECK_LOAD_FORCE);
+        if (old) fa_stream_close(old);
+    }
+}
+
+fa_mixer_set_event_callback(mixer, on_mixer, playlist);
+fa_automix_options o;
+fa_automix_options_init(&o);          /* 8 s, match tempo, align beats */
+o.length_beats = 32;                  /* when both grids are good */
+fa_mixer_set_automix(mixer, &o);
+fa_stream_play(first_song);           /* on either deck: auto-mix takes it from here */
+fa_mixer_automix_now(mixer);          /* skip: the next transition now */
+fa_mixer_set_automix(mixer, NULL);    /* off */
+```
+
+```csharp
+mixer.AutoMix.DeckEmpty += (s, e) =>
+{
+    var old = e.Deck.Stream;
+    e.Deck.Load(engine.OpenFile(queue.Dequeue()), force: true);
+    old?.Dispose();
+};
+mixer.AutoMix.Start(new AutoMixOptions { LengthBeats = 32 });
+mixer.AutoMix.Skip();
+```
+
+- **The mix point** follows the rules of `fa_stream_set_next`: the outgoing song's `MIX_POINT` marker, else its `FADE_OUT_START`, else its end (`CUE_OUT`, or the length) minus the transition's length. The incoming deck starts at its cue point (`CUE_IN` unless set).
+- **Beat-aligned** when `FA_AUTOMIX_ALIGN_BEATS` is set, both grids have at least `min_confidence` and the tempo is within reach: the incoming deck starts on its first downbeat at or after its cue point, on the outgoing deck's downbeat nearest the mix point, and the transition lasts whole bars. With `FA_AUTOMIX_MATCH_TEMPO` the incoming deck is first brought to the outgoing BPM (within `max_tempo_change`, half or double time allowed), and it stays locked to the outgoing deck until the transition is done. Without MATCH_TEMPO beats align only when the tempos already match within 0.2%.
+- **Otherwise** (no grid, a low confidence, tempos too far apart) it is a plain timed crossfade over `length`: auto-mix never fails unattended.
+- **The crossfader** is ramped over the transition toward the incoming deck's side, so it follows the crossfader curve. Decks on the same side, or thru, are started but not faded.
+- **When it is done** the outgoing deck is stopped. The incoming deck keeps the tempo it was mixed in at.
+- **Events** (mixer events, on the engine's event thread): `FA_EVENT_AUTOMIX_STARTED` when the incoming deck is heard and `FA_EVENT_AUTOMIX_DONE` when the crossfader is across (index and value: the incoming deck; `Started`, `Done`), and `FA_EVENT_DECK_EMPTY` (index: the idle deck; `DeckEmpty`) when a transition is done, and again 30 s before the next mix point while the idle deck still holds the song that was mixed out, or nothing. If nothing new is loaded, the outgoing song plays to its end.
+- **Skip** (`fa_mixer_automix_now`, `Skip`): the next transition now (on the next bar when beat-aligned). `FA_ERROR_NOT_FOUND` when auto-mix is off, no deck plays, or the idle deck has nothing new; `FA_ERROR_BUSY` while a transition runs.
+- Auto-mix needs the outgoing song's length (a file, memory or disc track, not a live web stream) unless it has a `MIX_POINT` or `FADE_OUT_START` marker. Turning it off (`NULL`, `Stop`) lets a transition already scheduled finish, without events.
+
+| Option | Range | Default |
+|---|---|---|
+| `length` / `Length` | 0.5..60 s | 8 s |
+| `length_beats` / `LengthBeats` | 0 (use `length`) or 1..256, when both grids are good | 0 |
+| `flags` / `MatchTempo`, `AlignBeats` | `FA_AUTOMIX_MATCH_TEMPO`, `FA_AUTOMIX_ALIGN_BEATS` (`BASS_SWAP` and `RESTORE_TEMPO` are planned: `FA_ERROR_INVALID_ARG`) | both |
+| `max_tempo_change` / `MaxTempoChange` | 0..0.5 | 0.08 |
+| `min_confidence` / `MinConfidence` | 0..1 | 0.5 |
+
 ## Planned
 
-More than two decks, beat sync and beat loops (BPM analysis), and auto-mix are the next steps of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).
+More than two decks, beat jumps, a bass swap and a tempo glide back after an auto-mix are pinned in section 19 of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).

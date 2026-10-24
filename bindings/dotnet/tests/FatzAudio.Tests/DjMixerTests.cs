@@ -144,6 +144,67 @@ public class DjMixerTests
     }
 
     [Fact]
+    public void Sync_MatchesTempoAndReportsBeats()
+    {
+        using var engine = CreateHeadless();
+        using var mixer = engine.CreateDjMixer(new DjMixerOptions { Latency = LatencyMode.Normal });
+        using var sa = engine.OpenMemory(TestAudio.SineWav(seconds: 4));
+        using var sb = engine.OpenMemory(TestAudio.SineWav(seconds: 4));
+        DjDeck a = mixer.Decks[0], b = mixer.Decks[1];
+        a.Load(sa);
+        b.Load(sb);
+        Assert.Null(b.BeatInfo);                                   // no grid yet
+        Assert.Equal(ErrorCode.NotFound, Assert.Throws<FatzAudioException>(() => b.SyncTo(a)).ErrorCode);
+        Assert.Equal(ErrorCode.NotFound, Assert.Throws<FatzAudioException>(() => b.LoopBeats(4)).ErrorCode);
+        const int rate = 44100;   // TestAudio.SineWav
+        sa.BeatGrid = new BeatGrid(120, 0, rate);
+        sb.BeatGrid = new BeatGrid(125, 0, rate);
+        sa.Play();
+        b.SyncTo(a, SyncMode.Tempo);
+        Assert.Equal(0.96f, sb.Tempo, 4);
+        var info = b.BeatInfo!.Value;
+        Assert.Equal(120.0, info.Bpm, 2);
+        Assert.True(info.Synced);
+        Assert.False(info.Locked);
+        b.Unsync();
+        Assert.False(b.BeatInfo!.Value.Synced);
+        Assert.Equal(0.16f, b.SyncRange, 3);
+        b.SyncRange = 5f;
+        Assert.Equal(1f, b.SyncRange);
+        b.SyncRange = 0.05f;
+        sb.BeatGrid = new BeatGrid(150, 0, rate);
+        Assert.Equal(ErrorCode.OutOfRange, Assert.Throws<FatzAudioException>(() => b.SyncTo(a)).ErrorCode);
+        a.LoopBeats(2);
+        Assert.NotNull(a.Loop);
+        a.LoopBeats(0);
+        Assert.Null(a.Loop);
+    }
+
+    [Fact]
+    public async Task AutoMix_StartSkipStop()
+    {
+        using var engine = CreateHeadless();
+        using var mixer = engine.CreateDjMixer(new DjMixerOptions { Latency = LatencyMode.Normal });
+        using var sa = engine.OpenMemory(TestAudio.SineWav(seconds: 4));
+        using var sb = engine.OpenMemory(TestAudio.SineWav(seconds: 4));
+        Assert.Equal(ErrorCode.NotFound, Assert.Throws<FatzAudioException>(() => mixer.AutoMix.Skip()).ErrorCode);   // off
+        Assert.Equal(ErrorCode.InvalidArgument, Assert.Throws<FatzAudioException>(
+            () => mixer.AutoMix.Start(new AutoMixOptions { Length = TimeSpan.FromMilliseconds(100) })).ErrorCode);
+        var started = new TaskCompletionSource<DjDeck>(TaskCreationOptions.RunContinuationsAsynchronously);
+        mixer.AutoMix.Started += (s, e) => started.TrySetResult(e.Deck);
+        mixer.AutoMix.Start(new AutoMixOptions { Length = TimeSpan.FromSeconds(1) });
+        Assert.True(mixer.AutoMix.IsOn);
+        mixer.Decks[0].Load(sa);
+        Assert.Equal(ErrorCode.NotFound, Assert.Throws<FatzAudioException>(() => mixer.AutoMix.Skip()).ErrorCode);   // nothing plays
+        sa.Play();
+        mixer.Decks[1].Load(sb);
+        mixer.AutoMix.Skip();
+        Assert.Same(mixer.Decks[1], await started.Task.WaitAsync(TimeSpan.FromSeconds(10)));
+        mixer.AutoMix.Stop();
+        Assert.False(mixer.AutoMix.IsOn);
+    }
+
+    [Fact]
     public void DisposedStream_LeavesTheDeck()
     {
         using var engine = CreateHeadless();

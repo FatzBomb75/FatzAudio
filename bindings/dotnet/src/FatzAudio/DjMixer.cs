@@ -205,7 +205,7 @@ public readonly record struct DeckLoop(long In, long Out);
 /// var levels = a.GetLevels();
 /// </code>
 /// </example>
-public sealed class DjMixer : IDisposable
+public sealed partial class DjMixer : IDisposable
 {
     private readonly nint _mixer;
     private readonly DjDeck[] _decks;
@@ -223,6 +223,7 @@ public sealed class DjMixer : IDisposable
             _decks[i] = new DjDeck(this, i, d);
         }
         Crossfader = new DjCrossfader(this);
+        AutoMix = new DjAutoMix(this);
         // The state lives until the device closes (fa_mixer_destroy waits for running callbacks).
         var gc = output.Handle.Pin(new EventState(this));
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_set_event_callback(mixer, &OnNativeEvent, (void*)GCHandle.ToIntPtr(gc)));
@@ -616,7 +617,7 @@ public sealed class DjMixer : IDisposable
         {
             if (ev == null || user == null) return;
             if (GCHandle.FromIntPtr((nint)user).Target is EventState st && st.Mixer.TryGetTarget(out var mixer))
-                mixer.Raise(ev->Type, ev->Mic);
+                mixer.Raise(ev->Type, ev->Index, ev->Mic);
         }
         catch
         {
@@ -624,9 +625,10 @@ public sealed class DjMixer : IDisposable
         }
     }
 
-    private void Raise(int type, nint native)
+    private void Raise(int type, uint index, nint native)
     {
         const int inputLost = 16, cueLost = 17;
+        if (AutoMix.Raise(type, index)) return;
         if (type == cueLost)
         {
             try
@@ -781,7 +783,7 @@ public sealed class DeckEq
 /// ordinary <see cref="AudioStream"/>. Transport stays on the stream (<see cref="AudioStream.Play"/>,
 /// <see cref="AudioStream.Pause"/>, seeking, tempo and pitch).
 /// </summary>
-public sealed class DjDeck
+public sealed partial class DjDeck
 {
     private const int ParamXfaderSide = 5, ParamCue = 6;
     private readonly DjMixer _mixer;

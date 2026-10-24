@@ -50,6 +50,16 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   `fa_mixer_set_event_callback` reports an input that went away. Android captures unprocessed. New error
   `FA_ERROR_PERMISSION_DENIED`. .NET: `DjMixer.AddMic`, `Mic`, `MicOptions`, `DjMixer.Latency`, `DjMixer.InputLost`,
   `EqualizerPreset.LiveVocal`. See [docs/features/dj-mixer.md](docs/features/dj-mixer.md#microphones).
+- DJ mixer sync, beat loops and auto-mix: `fa_deck_sync` matches a deck's tempo to the other deck's heard BPM
+  (half and double time, within `FA_DECK_SYNC_RANGE`, else the new error `FA_ERROR_OUT_OF_RANGE`), aligns beats or bars
+  (a bend of up to 2% for small errors, a seamless jump on the next beat for large ones) and with `FA_SYNC_LOCK` keeps
+  it so from the event thread. `fa_deck_play_synced` starts a deck so its next beat or downbeat lands on the leader's,
+  to the frame. `fa_deck_set_loop_beats` loops 1/16..32 beats on the grid; `fa_deck_get_beat_info` reports the heard
+  BPM, beat, bar and phase error. `fa_mixer_set_automix` alternates the decks with timed or beat-aligned transitions
+  scheduled on the device clock, raising `FA_EVENT_AUTOMIX_STARTED`, `FA_EVENT_AUTOMIX_DONE` and `FA_EVENT_DECK_EMPTY`;
+  `fa_mixer_automix_now` skips. Closing a deck's stream is now safe from any thread. .NET: `DjDeck.SyncTo`,
+  `PlaySynced`, `Unsync`, `LoopBeats`, `BeatInfo`, `SyncRange`, `DjMixer.AutoMix` (`DjAutoMix`, `AutoMixOptions`),
+  `SyncMode`, `ErrorCode.OutOfRange`. See [docs/features/dj-mixer.md](docs/features/dj-mixer.md#sync-and-beat-loops).
 - DJ mixer second-device cue: `FA_CUE_DEVICE` with `cue_device_id` puts the headphones on another output device, its
   drift (and a different rate) absorbed by a resampler that moves by at most 0.05%. The faster output is delayed so
   the master in the headphones lands with the speakers, except that the master is never delayed while a mic is
