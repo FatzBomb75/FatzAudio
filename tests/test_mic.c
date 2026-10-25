@@ -519,6 +519,12 @@ static void test_input_lost(void)
     CHECK(sim_open(&s));
     CHECK(sim_mic(&s, -1, s.dev->rate, s.dev->rate, 1, &mic));
     CHECK_EQ(fa_mixer_set_event_callback(s.m, on_mixer_event, &r), FA_OK);
+    /* Stopped and moved to the new default by the backend: not reported. */
+    fa_mic_test_lose(mic);
+    fa_sleep_ms(50);
+    fa_mic_test_back(mic);
+    fa_sleep_ms(400);
+    CHECK_EQ(r.count, 0);
     fa_mic_test_lose(mic);
     CHECK_EQ(wait_lost(&r), 1);
     CHECK_EQ(r.index, 0);
@@ -1177,6 +1183,31 @@ static void test_check_errors(void)
     CHECK_EQ(fa_mixer_measure_latency(s.m, s.mic, &cfg, &a), FA_ERROR_DEVICE);
     sim_close(&s);
     sim_close(&t);
+}
+
+/* The mic removed while a check measures it (an INPUT_LOST handler on the event thread,
+ * say): the check keeps it until it returns, then frees it. */
+static void test_check_mic_removed(void)
+{
+    sim s;
+    check_job job;
+    fa_thread t;
+    CHECK(check_sim(&s));
+    memset(&job, 0, sizeof(job));
+    job.m = s.m;
+    job.mic = s.mic;
+    job.res.struct_size = (uint32_t)sizeof(job.res);
+    fa_latency_check_config_init(&job.cfg);
+    CHECK(fa_thread_create(&t, check_thread, &job) == 0);
+    while (!fa_load32(&s.m->checking) && !fa_load32(&job.done)) fa_sleep_ms(1);
+    fa_mic_remove(s.mic);   /* nobody renders: the check is waiting for the output */
+    s.mic = NULL;
+    CHECK(fa_load_ptr(&s.m->mics[0]) == NULL);
+    fa_thread_join(&t);
+    CHECK(job.r != FA_OK);
+    CHECK_EQ(fa_load32(&s.m->checking), 0);
+    CHECK(s.m->check_mic == NULL);
+    sim_close(&s);
 }
 
 static void test_latency_mode(void)
@@ -1869,6 +1900,7 @@ int main(void)
     RUN(test_check_advice);
     RUN(test_check_all_modes);
     RUN(test_check_errors);
+    RUN(test_check_mic_removed);
     RUN(test_latency_mode);
     RUN(test_cue_drift_fast);
     RUN(test_cue_drift_slow);

@@ -324,8 +324,14 @@ fa_result fa_midi_exact_grid(const struct fa_midi* m, fa_grid_data* out);
 fa_result fa_tracker_grid_start(struct fa_tracker* t);
 fa_result fa_tracker_grid_finish(struct fa_tracker* t, fa_frames length, fa_grid_data* out);
 /* Renders a freshly opened module through to the end, without interpolation, to
- * find its grid. */
-fa_result fa_tracker_grid_render(fa_decoder* dec, fa_grid_data* out);
+ * find its grid. Stops with FA_ERROR_BUSY once `cancel` (may be NULL) is set. */
+fa_result fa_tracker_grid_render(fa_decoder* dec, fa_grid_data* out, fa_atomic32* cancel);
+/* fa_stream_get_beat_grid for the mixer, which holds its lock: never renders a module
+ * itself but starts that in the background and is FA_ERROR_BUSY until it is done. */
+fa_result fa_stream_beat_grid_now(struct fa_stream* stream, fa_beat_grid* out_grid,
+                                  fa_tempo_segment* out_segments, uint32_t capacity, uint32_t* out_count);
+/* fa_stream_close: a background render stops, and is waited for. */
+void fa_stream_grid_closing(struct fa_stream* stream);
 
 /* Copies the fields `full` bytes of `src` has into `dst`, up to dst's struct_size
  * (its first uint32_t, at least 4), and sets that to what was filled. */
@@ -1270,8 +1276,11 @@ struct fa_stream {
     /* Beat grid (beat_grid.c), under grid_lock: the app's, else the file's exact one
      * (MIDI, trackers), looked for on the first request. */
     fa_mutex grid_lock;
-    int grid_state;              /* 0 not looked for, 1 grid holds one, 2 the file has none */
+    int grid_state;              /* 0 not looked for, 1 grid holds one, 2 the file has none,
+                                    3 a module's being rendered in the background */
     fa_grid_data grid;
+    fa_atomic32 grid_jobs;       /* background renders running (fa_stream_close waits) */
+    fa_atomic32 grid_cancel;     /* fa_stream_close: they stop early */
 
     struct fa_stream* next;      /* engine->streams or engine->graveyard */
 };
@@ -1310,8 +1319,13 @@ void fa_mixer_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t f
 void fa_mixer_render(struct fa_mixer* m, fa_device* dev, float* out, uint32_t channels, uint32_t frames, int64_t now_ns);
 /* A stream left a deck's bus (moved elsewhere, detached or closed): the deck is empty. */
 void fa_mixer_bus_left(fa_bus* bus, struct fa_stream* s);
-/* fa_stream_close, first: a deck's stream leaves its deck under the mixer lock. */
-void fa_mixer_stream_closing(struct fa_stream* s);
+/* fa_stream_close, fa_stream_attach and fa_stream_detach, first (no stream lock held):
+ * a deck's stream that goes elsewhere than `to` leaves its deck under the mixer lock. */
+void fa_mixer_stream_leaving(struct fa_stream* s, fa_bus* to);
+/* fa_stream_attach and fa_stream_detach for the mixer, which holds its lock and takes
+ * streams off its decks itself. */
+fa_result fa_stream_attach_internal(struct fa_stream* s, fa_device* device, fa_bus* bus);
+void fa_stream_detach_internal(struct fa_stream* s);
 /* fa_device_close on a mixer's device closes the mixer (which closes the device). */
 void fa_mixer_destroy_from_device(struct fa_mixer* m);
 /* Event thread, under the device's life_lock: the device's mixer, kept alive until
@@ -1332,6 +1346,7 @@ fa_result fa_stream_ramp_tempo_quiet(struct fa_stream* s, float target, fa_time 
 /* Device frame at the speaker at monotonic time `now_ns` (latency included). */
 double fa_device_speaker_frame(fa_device* device, int64_t now_ns);
 void fa_device_wait_quiescent(fa_device* device);
+void fa_device_wait_idle(fa_device* device);
 fa_result fa_device_add_voice(fa_device* device, struct fa_stream* stream);
 void fa_device_remove_voice(fa_device* device, struct fa_stream* stream);
 

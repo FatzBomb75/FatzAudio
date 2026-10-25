@@ -129,12 +129,12 @@ static void deck_process(struct fa_mixer* m, struct fa_deck* d, const mix_edges*
                 o[c] += y * xf;
             }
         }
-    }
-    /* Flush denormals so a deck left silent stays cheap. */
-    {
-        float* z = &d->z[0][0][0];
-        int i;
-        for (i = 0; i < ISO_SECTIONS * 4; i++) if (fabsf(z[i]) < 1e-20f) z[i] = 0.0f;
+        /* Flush denormals so a deck left silent stays cheap: every sub-block, since the
+         * upper sections decay from 1e-20 into the denormal range in about 180 frames. */
+        {
+            float* z = &d->z[0][0][0];
+            for (i = 0; i < ISO_SECTIONS * 4; i++) if (fabsf(z[i]) < 1e-20f) z[i] = 0.0f;
+        }
     }
     tap = (fa_tap*)fa_load_ptr(&d->tap);
     if (tap) fa_tap_write(tap, clock, buf, frames);
@@ -264,6 +264,7 @@ static void free_mixer(struct fa_mixer* m)
         fa_tap_free((fa_tap*)fa_load_ptr(&m->decks[i].tap));
         free(m->decks[i].segs);
     }
+    while (fa_load32(&m->refs)) fa_sleep_ms(0);   /* fa_mixer_stream_leaving finds the deck empty */
     fa_mixer_mics_free_removed(m);
     fa_mic_bus_free((fa_mic_bus*)fa_load_ptr(&m->bus));
     fa_mutex_destroy(&m->cb_lock);
@@ -292,8 +293,11 @@ struct fa_mixer* fa_mixer_hold(fa_device* dev)
 
 void fa_mixer_release(struct fa_mixer* m)
 {
+    /* Read first: once `busy` is 0, a destroying thread may free the mixer. Only this
+     * thread (the event thread, inside its own callback) sets `doomed`. */
+    int doomed = fa_load32(&m->doomed);
     fa_fetch_add32(&m->busy, -1);
-    if (fa_load32(&m->doomed)) free_mixer(m);   /* destroyed by its own callback */
+    if (doomed) free_mixer(m);   /* destroyed by its own callback */
 }
 
 FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_config* config, fa_mixer** out_mixer)
@@ -405,11 +409,12 @@ FA_API void FA_CALL fa_mixer_destroy(fa_mixer* mixer)
     uint32_t i;
     if (!mixer) return;
     fa_mutex_lock(&mixer->lock);
+    mixer->closing = 1;   /* a service waiting for the lock leaves the device alone */
     for (i = 0; i < mixer->deck_count; i++) {
         fa_stream* s = (fa_stream*)fa_exchange_ptr(&mixer->decks[i].stream, NULL);
         if (!s) continue;
         fa_stream_set_loop_region(s, 0, 0);
-        fa_stream_detach(s);
+        fa_stream_detach_internal(s);
     }
     fa_mutex_unlock(&mixer->lock);
     dev = mixer->device;
@@ -478,25 +483,37 @@ static void reopen_inputs(void* user, fa_latency_mode mode)
     fa_mixer_cue_reopen((struct fa_mixer*)user, mode);
 }
 
-fa_result fa_mixer_switch_latency_mode(struct fa_mixer* mixer, fa_latency_mode mode)
+/* Caller holds the mixer lock. */
+static fa_result switch_mode_locked(struct fa_mixer* mixer, fa_latency_mode mode)
 {
     fa_result r = FA_OK;
-    fa_mutex_lock(&mixer->lock);
     if (mode != mixer->device->open_mode) {
         fa_capture* c;
         r = fa_device_reopen_mode(mixer->device, mode, reopen_inputs, mixer);
         for (c = mixer->captures; c; c = c->next) c->mode_lost = 0;   /* lost for good now */
     }
+    return r;
+}
+
+fa_result fa_mixer_switch_latency_mode(struct fa_mixer* mixer, fa_latency_mode mode)
+{
+    fa_result r;
+    fa_mutex_lock(&mixer->lock);
+    r = switch_mode_locked(mixer, mode);
     fa_mutex_unlock(&mixer->lock);
     return r;
 }
 
 FA_API fa_result FA_CALL fa_mixer_set_latency_mode(fa_mixer* mixer, fa_latency_mode mode)
 {
+    fa_result r;
     if (!mixer || (uint32_t)mode > FA_LATENCY_EXCLUSIVE) return FA_ERROR_INVALID_ARG;
-    /* A setup check switches modes itself and times the devices: not under its feet. */
-    if (fa_load32(&mixer->checking)) return FA_ERROR_BUSY;
-    return fa_mixer_switch_latency_mode(mixer, mode);
+    fa_mutex_lock(&mixer->lock);
+    /* A setup check switches modes itself and times the devices: not under its feet.
+     * Tested under the lock, which the check takes to start. */
+    r = fa_load32(&mixer->checking) ? FA_ERROR_BUSY : switch_mode_locked(mixer, mode);
+    fa_mutex_unlock(&mixer->lock);
+    return r;
 }
 
 FA_API fa_result FA_CALL fa_mixer_get_latency_mode(fa_mixer* mixer, fa_latency_mode* out_mode)
@@ -589,16 +606,26 @@ static fa_stream* deck_stream(struct fa_deck* d) { return (fa_stream*)fa_load_pt
 
 void fa_mixer_bus_left(fa_bus* bus, struct fa_stream* s) { fa_cas_ptr(&bus->deck->stream, s, NULL); }
 
-void fa_mixer_stream_closing(struct fa_stream* s)
+void fa_mixer_stream_leaving(struct fa_stream* s, fa_bus* to)
 {
-    fa_bus* bus = (fa_bus*)fa_load_ptr(&s->bus);
-    struct fa_deck* d = bus ? bus->deck : NULL;
+    struct fa_deck* d = NULL;
+    struct fa_mixer* m;
+    fa_bus* bus;
+    /* The bus and its mixer are read under api_lock, which fa_mixer_destroy's detach
+     * takes too, and `refs` keeps the mixer until we are done with it. */
+    fa_mutex_lock(&s->api_lock);
+    bus = (fa_bus*)fa_load_ptr(&s->bus);
+    if (bus && bus != to) d = bus->deck;
+    if (d) fa_fetch_add32(&d->mixer->refs, 1);
+    fa_mutex_unlock(&s->api_lock);
     if (!d) return;
-    /* Off the deck under the mixer lock: the event thread's sync and auto-mix use a
-     * deck's stream under it, and find the deck empty from here on. */
-    fa_mutex_lock(&d->mixer->lock);
+    m = d->mixer;
+    /* Off the deck under the mixer lock: deck calls and the event thread's sync and
+     * auto-mix use a deck's stream under it, and find the deck empty from here on. */
+    fa_mutex_lock(&m->lock);
     if (fa_cas_ptr(&d->stream, s, NULL)) fa_deck_sync_loaded(d);
-    fa_mutex_unlock(&d->mixer->lock);
+    fa_mutex_unlock(&m->lock);
+    fa_fetch_add32(&m->refs, -1);
 }
 
 /* Whether the deck is heard now: playing, fader up, and the crossfader open on its
@@ -643,7 +670,7 @@ FA_API fa_result FA_CALL fa_deck_load(fa_deck* deck, fa_stream* stream, uint32_t
             }
         }
         /* From another deck too: that deck is empty then (fa_mixer_bus_left). */
-        r = fa_stream_attach(stream, m->device, deck->bus);
+        r = fa_stream_attach_internal(stream, m->device, deck->bus);
         if (r != FA_OK) {
             if (shortened) {   /* not loaded: the stream keeps its own decode-ahead */
                 o.latency_ms = old_latency;
@@ -654,12 +681,13 @@ FA_API fa_result FA_CALL fa_deck_load(fa_deck* deck, fa_stream* stream, uint32_t
         }
     }
     fa_exchange_ptr(&deck->stream, stream);
+    if (stream) fa_stream_beat_grid_now(stream, NULL, NULL, 0, NULL);   /* a module's grid starts rendering now */
     deck->cue_point = FA_FRAMES_UNSET;
     fa_deck_sync_loaded(deck);
     fa_automix_loaded(m, deck, stream);
     if (old) {
         fa_stream_set_loop_region(old, 0, 0);
-        fa_stream_detach(old);
+        fa_stream_detach_internal(old);
     }
     fa_mutex_unlock(&m->lock);
     return FA_OK;

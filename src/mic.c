@@ -26,6 +26,7 @@
 #define GATE_OFF_DB (-99.9f)
 #define BRIDGE_MAX_ADJUST 0.002  /* the most the ratio is nudged: 0.2%, about 3.5 cents */
 #define RING_SECONDS 0.5
+#define INPUT_LOST_GRACE_NS 300000000   /* as the master's reroute grace (device.c) */
 
 /* ---- the input side (capture callback) ------------------------------------------ */
 
@@ -62,20 +63,28 @@ static void capture_callback(ma_device* d, void* out, const void* in, ma_uint32 
     if (c && in) capture_write(c, (const float*)in, frames, c->channels);
 }
 
-static void flag_lost(fa_capture* c)
+static void capture_changed(fa_capture* c, int lost)
 {
     fa_device* dev = c->mixer->device;
-    fa_store32(&c->lost, 1);
+    if (lost) fa_store64(&c->lost_at, fa_monotonic_ns());
+    fa_store32(&c->lost, lost);
     fa_store32(&dev->mixer_events, 1);
     fa_cond_broadcast(&dev->engine->event_cond);
 }
 
-/* The backend's thread: an input that stops without being asked to has gone away. */
+static void flag_lost(fa_capture* c) { capture_changed(c, 1); }
+
+/* The backend's thread: an input that stops without being asked to has gone away. One
+ * on the default input that the backend moves to the new default (after stopping it),
+ * or a device the backend starts again, records on: not lost any more. The event thread
+ * reports a loss only when it lasts (INPUT_LOST_GRACE_NS). */
 static void capture_notification(const ma_device_notification* n)
 {
     fa_capture* c = (fa_capture*)n->pDevice->pUserData;
     if (!c || fa_load32(&c->stopping)) return;
     if (n->type == ma_device_notification_type_stopped) flag_lost(c);
+    else if ((n->type == ma_device_notification_type_rerouted || n->type == ma_device_notification_type_started) &&
+             fa_load32(&c->lost)) capture_changed(c, 0);
 }
 
 /* `frames` frames at the master rate into c->out, both lanes. `hold`: a setup check is
@@ -460,16 +469,22 @@ FA_API fa_result FA_CALL fa_mixer_add_mic(fa_mixer* mixer, const fa_mic_config* 
 /* Takes the mic out of its slot and closes its input if it was the last on it.
  * Caller holds the mixer lock. Returns 0 when it was out already (fa_mixer_destroy and
  * a callback's fa_mic_remove raced): whoever took it out frees it. */
+/* One user fewer on c; the last closes it. Caller holds the mixer lock. */
+static void capture_release(struct fa_mixer* m, fa_capture* c)
+{
+    if (--c->users == 0) {
+        capture_unlink(m, c);
+        capture_free(c);
+    }
+}
+
 static int mic_detach_locked(struct fa_mixer* m, struct fa_mic* mic)
 {
     fa_capture* c = mic->cap;
     if (!fa_cas_ptr(&m->mics[mic->index], mic, NULL)) return 0;
     fa_device_wait_quiescent(m->device);   /* the master callback is past it */
     if (--c->lane_users[mic->lane] == 0) fa_store32(&c->lane_src[mic->lane], CAPTURE_LANE_FREE);
-    if (--c->users == 0) {
-        capture_unlink(m, c);
-        capture_free(c);
-    }
+    capture_release(m, c);
     return 1;
 }
 
@@ -482,13 +497,49 @@ static void mic_free(struct fa_mic* mic)
 FA_API void FA_CALL fa_mic_remove(fa_mic* mic)
 {
     struct fa_mixer* m;
-    int mine;
+    int mine, checked;
     if (!mic) return;
     m = mic->mixer;
     fa_mutex_lock(&m->lock);
     mine = mic_detach_locked(m, mic);
+    /* A setup check on another thread still reads it (an INPUT_LOST handler removing
+     * the mic during a check): the check frees it when it ends. */
+    checked = mine && m->check_mic == mic;
+    if (checked) fa_store32(&m->check_mic_gone, 1);
     fa_mutex_unlock(&m->lock);
-    if (!mine) return;            /* fa_mixer_destroy took it out and frees it */
+    if (!mine || checked) return;   /* fa_mixer_destroy (or the check) frees it */
+    fa_mixer_wait_callbacks(m);     /* no event callback still has it */
+    mic_free(mic);
+}
+
+fa_result fa_mixer_check_begin(struct fa_mixer* m, struct fa_mic* mic)
+{
+    fa_result r = FA_OK;
+    fa_mutex_lock(&m->lock);
+    if (fa_load32(&m->checking)) r = FA_ERROR_BUSY;
+    else if (fa_load_ptr(&m->mics[mic->index]) != mic) r = FA_ERROR_INVALID_ARG;   /* removed */
+    else {
+        fa_store32(&m->checking, 1);
+        m->check_mic = mic;
+        fa_store32(&m->check_mic_gone, 0);
+        mic->cap->users++;   /* its input stays open while the check reads it */
+    }
+    fa_mutex_unlock(&m->lock);
+    return r;
+}
+
+void fa_mixer_check_end(struct fa_mixer* m)
+{
+    struct fa_mic* mic;
+    int gone;
+    fa_mutex_lock(&m->lock);
+    mic = m->check_mic;
+    gone = fa_load32(&m->check_mic_gone);
+    m->check_mic = NULL;
+    capture_release(m, mic->cap);
+    fa_store32(&m->checking, 0);
+    fa_mutex_unlock(&m->lock);
+    if (!gone) return;
     fa_mixer_wait_callbacks(m);   /* no event callback still has it */
     mic_free(mic);
 }
@@ -628,7 +679,7 @@ FA_API fa_result FA_CALL fa_mixer_get_latency(fa_mixer* mixer, fa_mixer_latency*
         /* The setup check's measurement in this mode, when there is one. */
         l.mic_monitor[i] = fa_load64(&mic->measured[mixer->device->open_mode]);
         if (l.mic_monitor[i] <= 0) l.mic_monitor[i] = l.mic_input[i] + l.master;
-        else l.mic_monitor[i] += fa_device_align_ns(mixer->device);   /* measured without it */
+        else l.mic_monitor[i] += fa_device_align_ns(mixer->device) + fa_load64(&mic->cap->br.held_ns);   /* measured without them */
     }
     fa_mutex_unlock(&mixer->lock);
     memcpy(out_latency, &l, size);
@@ -686,6 +737,11 @@ void fa_mixer_service(struct fa_mixer* m)
     fa_mixer_event ev[MIXER_EVENTS_MAX];
     uint32_t n = 0, i;
     fa_mutex_lock(&m->lock);
+    if (m->closing) {   /* fa_mixer_destroy may free the device meanwhile */
+        fa_mutex_unlock(&m->lock);
+        fa_mixer_release(m);
+        return;
+    }
     if (!m->test_ticks) fa_mixer_tick(m, fa_monotonic_ns(), ev, &n);   /* sync locks, auto-mix */
     if (fa_mixer_cue_take_loss(m)) {
         memset(&ev[n], 0, sizeof(ev[n]));
@@ -695,7 +751,20 @@ void fa_mixer_service(struct fa_mixer* m)
     }
     for (i = 0; i < FA_MIC_MAX; i++) {
         struct fa_mic* mic = (struct fa_mic*)fa_load_ptr(&m->mics[i]);
-        if (!mic || fa_load32(&mic->cap->lost) == 0 || mic->lost_reported) continue;
+        int64_t due;
+        if (!mic) continue;
+        if (fa_load32(&mic->cap->lost) == 0) {   /* back (rerouted): a later loss is reported again */
+            mic->lost_reported = 0;
+            continue;
+        }
+        if (mic->lost_reported) continue;
+        /* A default-device change stops the input for a moment before the backend
+         * moves it: only a loss that lasts is reported. */
+        due = fa_load64(&mic->cap->lost_at) + INPUT_LOST_GRACE_NS;
+        if (fa_monotonic_ns() < due) {
+            fa_mixer_wake(m, due);
+            continue;
+        }
         mic->lost_reported = 1;
         memset(&ev[n], 0, sizeof(ev[n]));
         ev[n].type = FA_EVENT_INPUT_LOST;
@@ -733,6 +802,11 @@ void fa_mic_test_feed(fa_mic* mic, const float* frames, uint32_t n)
 void fa_mic_test_lose(fa_mic* mic)
 {
     flag_lost(mic->cap);
+}
+
+void fa_mic_test_back(fa_mic* mic)
+{
+    capture_changed(mic->cap, 0);   /* as on a reroute */
 }
 
 void fa_mic_test_stats(fa_mic* mic, double* out_target, double* out_fill, int32_t* out_underruns)

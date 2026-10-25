@@ -72,7 +72,7 @@ fa_result fa_grid_data_get(const fa_grid_data* g, fa_beat_grid* out_grid, fa_tem
 
 /* The exact grid of the stream's file: MIDI from its events, a module from a silent
  * render of its own copy (playback is not touched). */
-static fa_result file_grid(struct fa_stream* s, fa_grid_data* out)
+static fa_result file_grid(struct fa_stream* s, fa_grid_data* out, fa_atomic32* cancel)
 {
     fa_source src;
     fa_decoder dec;
@@ -89,7 +89,7 @@ static fa_result file_grid(struct fa_stream* s, fa_grid_data* out)
     env.midi_rate = s->decoder.format.sample_rate;
     r = fa_decoder_open(&dec, &src, s->path && s->path_length > 0 ? s->path_name : s->path, NULL, s->audio_track, &env);
     if (r == FA_OK) {
-        r = fa_tracker_of(&dec) ? fa_tracker_grid_render(&dec, out) : FA_ERROR_NOT_FOUND;
+        r = fa_tracker_of(&dec) ? fa_tracker_grid_render(&dec, out, cancel) : FA_ERROR_NOT_FOUND;
         fa_decoder_close(&dec);
     }
     fa_source_close(&src);
@@ -133,22 +133,97 @@ FA_API fa_result FA_CALL fa_stream_set_beat_grid(fa_stream* stream, const fa_bea
     return FA_OK;
 }
 
+/* A render's result (grid_lock held): kept unless the app set a grid meanwhile. Any
+ * failure counts as none, so it is not tried again on every request. */
+static void grid_done(struct fa_stream* s, fa_grid_data* g, fa_result r)
+{
+    if (s->grid_state != 3) {
+        fa_grid_data_free(g);
+        return;
+    }
+    if (r == FA_OK) {
+        s->grid = *g;
+        s->grid_state = 1;
+    } else {
+        fa_grid_data_free(g);
+        s->grid_state = 2;
+    }
+}
+
+static void grid_thread(void* arg)
+{
+    struct fa_stream* s = (struct fa_stream*)arg;
+    fa_grid_data g;
+    fa_result r = file_grid(s, &g, &s->grid_cancel);
+    fa_mutex_lock(&s->grid_lock);
+    grid_done(s, &g, r);
+    fa_mutex_unlock(&s->grid_lock);
+    fa_fetch_add32(&s->grid_jobs, -1);
+}
+
+/* grid_lock held. `wait`: the app's call, which may take the time (it renders a module
+ * itself, or waits for the render in the background). Otherwise a module starts
+ * rendering in the background and the answer is FA_ERROR_BUSY until it is done: the
+ * mixer asks under its lock, which the event thread and every deck call need. */
+static fa_result grid_get_locked(struct fa_stream* s, fa_beat_grid* out_grid, fa_tempo_segment* out_segments,
+                                 uint32_t capacity, uint32_t* out_count, int wait)
+{
+    fa_result r = FA_OK;
+    while (s->grid_state == 3 && wait) {
+        fa_mutex_unlock(&s->grid_lock);
+        fa_sleep_ms(5);
+        fa_mutex_lock(&s->grid_lock);
+    }
+    if (s->grid_state == 0 && s->tracker && !wait) {
+        fa_thread t;
+        s->grid_state = 3;
+        fa_fetch_add32(&s->grid_jobs, 1);
+        if (fa_thread_create(&t, grid_thread, s) == 0) {
+            fa_thread_detach(&t);
+            return FA_ERROR_BUSY;
+        }
+        fa_fetch_add32(&s->grid_jobs, -1);
+        s->grid_state = 0;   /* no thread: rendered here after all */
+    }
+    if (s->grid_state == 0) {
+        fa_grid_data g;
+        s->grid_state = 3;
+        r = file_grid(s, &g, NULL);
+        grid_done(s, &g, r);
+    }
+    if (s->grid_state == 1) r = fa_grid_data_get(&s->grid, out_grid, out_segments, capacity, out_count);
+    else if (s->grid_state == 2) r = FA_ERROR_NOT_FOUND;
+    else r = FA_ERROR_BUSY;
+    return r;
+}
+
 FA_API fa_result FA_CALL fa_stream_get_beat_grid(fa_stream* stream, fa_beat_grid* out_grid,
                                                  fa_tempo_segment* out_segments, uint32_t capacity,
                                                  uint32_t* out_count)
 {
-    fa_result r = FA_OK;
+    fa_result r;
     if (out_count) *out_count = 0;
     if (!stream || (capacity && !out_segments) || (out_grid && out_grid->struct_size < sizeof(uint32_t)))
         return FA_ERROR_INVALID_ARG;
     fa_mutex_lock(&stream->grid_lock);
-    if (stream->grid_state == 0) {
-        r = file_grid(stream, &stream->grid);
-        if (r == FA_OK) stream->grid_state = 1;
-        else if (r == FA_ERROR_NOT_FOUND || r == FA_ERROR_UNSUPPORTED_FORMAT) stream->grid_state = 2;
-    }
-    if (stream->grid_state == 1) r = fa_grid_data_get(&stream->grid, out_grid, out_segments, capacity, out_count);
-    else if (stream->grid_state == 2) r = FA_ERROR_NOT_FOUND;
+    r = grid_get_locked(stream, out_grid, out_segments, capacity, out_count, 1);
     fa_mutex_unlock(&stream->grid_lock);
     return r;
+}
+
+fa_result fa_stream_beat_grid_now(struct fa_stream* stream, fa_beat_grid* out_grid,
+                                  fa_tempo_segment* out_segments, uint32_t capacity, uint32_t* out_count)
+{
+    fa_result r;
+    if (out_count) *out_count = 0;
+    fa_mutex_lock(&stream->grid_lock);
+    r = grid_get_locked(stream, out_grid, out_segments, capacity, out_count, 0);
+    fa_mutex_unlock(&stream->grid_lock);
+    return r;
+}
+
+void fa_stream_grid_closing(struct fa_stream* stream)
+{
+    fa_store32(&stream->grid_cancel, 1);
+    while (fa_load32(&stream->grid_jobs)) fa_sleep_ms(1);
 }
