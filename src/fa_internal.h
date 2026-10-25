@@ -223,6 +223,8 @@ extern const fa_decoder_vtable fa_decoder_adts;
 extern const fa_decoder_vtable fa_decoder_midi;
 /* Tracker modules, played by libopenmpt (dec_tracker.c). */
 extern const fa_decoder_vtable fa_decoder_tracker;
+/* Core Audio Format (demux_caf.c). */
+extern const fa_decoder_vtable fa_decoder_caf;
 /* ASF / Windows Media Audio (demux_asf.c). */
 extern const fa_decoder_vtable fa_decoder_asf;
 

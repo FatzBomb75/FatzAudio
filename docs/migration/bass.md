@@ -390,7 +390,7 @@ ALAC is a built-in format: ALAC tracks in `.m4a`/`.mp4`/`.mov` and Matroska file
 | BASS_ALAC_StreamCreateFile (ALAC in MP4/M4A) | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ |
 | BASS_ALAC_StreamCreateURL | `fa_stream_open_url` (M4A over HTTP) | `engine.OpenUrl` | ✅ |
 | BASS_ALAC_StreamCreateFileUser | `fa_stream_open_io` | `engine.OpenStream` | ✅ |
-| ALAC in CAF (Core Audio Format) files | Not supported: there is no CAF demuxer, so `.caf` files return `FA_ERROR_UNSUPPORTED_FORMAT` | — | 🗓️ |
+| ALAC in CAF (Core Audio Format) files | Built in: `.caf` files open with the same calls, bit exact, with exact length and seeks ([streams](../features/streams.md#supported-formats)) | `engine.OpenFile` | ✅ |
 | BASS_ChannelSetPosition on ALAC | `fa_stream_seek`: sample exact, in MP4 and Matroska alike | `stream.Position` | ✅ |
 | BASS_CTYPE_STREAM_ALAC (from BASS_ChannelGetInfo) | `fa_stream_get_info`: codec `alac` | `stream.Info` | ✅ |
 | ALAC packets from your own demuxer | `fa_stream_open_packets` with codec `alac` and the 24-byte ALACSpecificConfig (or the `alac` box holding it) as extradata ([FFmpeg hand-off](../features/ffmpeg.md)) | `engine.OpenPackets`, `PushPacket` | ✅ |
@@ -556,7 +556,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 |---|---|---|
 | bass_aac.dll | `BASS_AAC_StreamCreateFile`/`URL`/`User` → the normal open calls: MP4/M4A/MOV files (built-in demuxer, any audio track), `.aac` (ADTS) files and AAC radio, and AAC packets (`fa_stream_open_packets`), decoded by the built-in AAC decoder (LC, HE-AAC, HE-AAC v2, Main, LTP) on every platform | ✅ |
 | bass_ac3.dll | Built-in AC-3 and E-AC-3 decoder: raw `.ac3`/`.ec3` files, MP4/MKV tracks, web streams and HLS, and pushed packets, with dynamic range modes ([Dolby Digital](../features/dolby.md)) | ✅ (passthrough 🗓️) |
-| bassalac.dll | Built-in ALAC decoder: ALAC tracks in MP4/M4A/MOV and Matroska files, over HTTP, and pushed packets, bit exact on every platform ([bassalac](#bassalac-apple-lossless)) | ✅ (CAF files 🗓️) |
+| bassalac.dll | Built-in ALAC decoder: ALAC tracks in MP4/M4A/MOV and Matroska files, over HTTP, and pushed packets, bit exact on every platform ([bassalac](#bassalac-apple-lossless)) | ✅ |
 | bassflac.dll | Built-in: `.flac` files, Ogg FLAC (`.oga`), FLAC tracks in MP4 and Matroska, FLAC web streams and FLAC packets through `fa_stream_open_packets`, all with the same decoder ([bassflac](#bassflac)) | ✅ |
 | basshls.dll (if used) | Built-in: `fa_stream_open_url` plays `.m3u8` (MPEG-TS, fMP4, AES-128) | ✅ |
 | bassopus.dll | Built-in: `.opus` files, Opus web radio, Opus in WebM/MKV/MP4, and raw packets through `fa_stream_open_packets` ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |

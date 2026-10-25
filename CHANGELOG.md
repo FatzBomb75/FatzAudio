@@ -18,6 +18,8 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- Core Audio Format: `.caf` files open with the ordinary calls. ALAC (to the bit), linear PCM and MP3 play with exact
+  length and seeks; other codecs in CAF (AAC, µ-law, ...) return `FA_ERROR_UNSUPPORTED_FORMAT`.
 - DJ mixer: `fa_mixer_create` opens two decks on one output with channel faders, trim, a three-band isolator EQ with kills
   (Linkwitz-Riley crossovers at 250 Hz and 2.5 kHz), a crossfader with constant-power and linear curves, master gain,
   the limiter always on, and per-deck meters (`fa_deck_get_levels`). Headphone cue on two more outputs of the same
