@@ -40,6 +40,10 @@
 #define MIN_BEATS 8
 #define ONSET_HALF_RATIO 0.6     /* every other beat this much weaker: half tempo */
 #define ONSET_DELAY 0.42         /* attack to flux peak, in windows (calibrated) */
+#define CHROMA_LO_HZ 130.0       /* pitch classes for bars: C3 .. */
+#define CHROMA_HI_HZ 4000.0      /* ... about B7 */
+#define CHROMA_STEP 4            /* envelope frames per chroma frame */
+#define BAR_MIN_BEATS 32
 
 struct fa_onset {
     uint32_t rate;
@@ -56,6 +60,11 @@ struct fa_onset {
     float* env;                  /* the envelope, one value per frame (all bins) */
     float* low;                  /* the same below 200 Hz */
     int64_t nenv, cap;
+    uint8_t* bin_pc;             /* pitch class of each bin, 255 = not counted */
+    float acc[12];               /* the chroma frame being summed */
+    int acc_n;
+    float* chroma;               /* 12 per CHROMA_STEP envelope frames */
+    int64_t nchroma, chroma_cap;
     int64_t first_frame_end;     /* sample just after frame 0's window */
     int failed;
 };
@@ -91,7 +100,15 @@ fa_onset* fa_onset_new(uint32_t rate)
     o->prev = (float*)calloc(n / 2 + 1, sizeof(float));
     o->cur = (float*)calloc(n / 2 + 1, sizeof(float));
     o->until_hop = o->hop;
-    if (!o->tb || !o->ring || !o->pending || !o->re || !o->im || !o->prev || !o->cur) {
+    o->bin_pc = (uint8_t*)malloc(o->bins + 1);
+    if (o->bin_pc) {
+        uint32_t k;
+        for (k = 0; k <= o->bins; k++) {
+            double f = k * binhz;
+            o->bin_pc[k] = f >= CHROMA_LO_HZ && f <= CHROMA_HI_HZ ? (uint8_t)(((long)lround(12.0 * log2(f / 440.0)) % 12 + 21) % 12) : 255;
+        }
+    }
+    if (!o->tb || !o->ring || !o->pending || !o->re || !o->im || !o->prev || !o->cur || !o->bin_pc) {
         fa_onset_free(o);
         return NULL;
     }
@@ -109,6 +126,8 @@ void fa_onset_free(fa_onset* o)
     free(o->cur);
     free(o->env);
     free(o->low);
+    free(o->bin_pc);
+    free(o->chroma);
     free(o);
 }
 
@@ -130,6 +149,23 @@ static int env_push(fa_onset* o, float all, float low)
     return 1;
 }
 
+/* The summed chroma frame onto o->chroma. */
+static int chroma_push(fa_onset* o)
+{
+    if (o->nchroma == o->chroma_cap) {
+        int64_t cap = o->chroma_cap ? o->chroma_cap * 2 : 1024;
+        float* c = (float*)realloc(o->chroma, (size_t)cap * 12 * sizeof(float));
+        if (!c) return 0;
+        o->chroma = c;
+        o->chroma_cap = cap;
+    }
+    memcpy(o->chroma + o->nchroma * 12, o->acc, sizeof(o->acc));
+    o->nchroma++;
+    memset(o->acc, 0, sizeof(o->acc));
+    o->acc_n = 0;
+    return 1;
+}
+
 /* Log magnitudes of one frame's spectrum into o->cur, then its flux: of all bins,
  * and of those below 200 Hz in *low. */
 static float flux_of(fa_onset* o, const float* re, const float* im, int which, float* low)
@@ -145,6 +181,7 @@ static float flux_of(fa_onset* o, const float* re, const float* im, int which, f
         else { xr = 0.5f * (zi - ci); xi = -0.5f * (zr - cr); }
         mag = sqrtf(xr * xr + xi * xi) * scale;
         o->cur[k] = logf(1.0f + ONSET_LOG_GAIN * mag);
+        if (o->bin_pc[k] < 12) o->acc[o->bin_pc[k]] += mag;
         d = o->cur[k] - o->prev[k];
         if (d > 0.0f) {
             sum += d;
@@ -171,6 +208,7 @@ static void frame_ready(fa_onset* o)
     for (i = 0; i < 2 && !o->failed; i++) {
         float low, all = flux_of(o, o->re, o->im, (int)i, &low);
         if (!env_push(o, all, low)) o->failed = 1;
+        if (++o->acc_n == CHROMA_STEP && !o->failed && !chroma_push(o)) o->failed = 1;
     }
     o->have_pending = 0;
 }
@@ -420,14 +458,18 @@ static float peak_near(const float* e, int64_t n, double t)
     return v;
 }
 
-/* Beats tracked at one tempo, fitted to a constant grid. */
+/* Beats tracked at one tempo, and the grid they give: a constant one fitted to them,
+ * or a tempo map when the tempo changes or drifts. Beat 0 of either is the first
+ * beat on it. */
 typedef struct grid_try {
     double bpm;
     double* beats;
-    int64_t nb, first;           /* beats, and the first one on the grid */
+    int64_t nb, first;           /* beats, and the first one on the constant grid */
     int64_t* idx;
     int* keep;
     line_fit f;
+    fa_beat_seg* map;            /* NULL: the constant grid */
+    int nmap;
 } grid_try;
 
 static void try_free(grid_try* g)
@@ -435,7 +477,21 @@ static void try_free(grid_try* g)
     free(g->beats);
     free(g->idx);
     free(g->keep);
+    free(g->map);
     memset(g, 0, sizeof(*g));
+}
+
+/* Envelope frame of a beat of the grid, and the beat of a frame. */
+static double try_time(const grid_try* g, double beat)
+{
+    if (g->map) return fa_beat_map_time(g->map, g->nmap, beat);
+    return g->f.a + ((double)g->idx[g->first] + beat) * g->f.p;
+}
+
+static double try_beat(const grid_try* g, double t)
+{
+    if (g->map) return fa_beat_map_beat(g->map, g->nmap, t);
+    return (t - g->f.a) / g->f.p - (double)g->idx[g->first];
 }
 
 static int try_tempo(const float* e, int64_t n, double fr, double bpm, grid_try* g)
@@ -455,39 +511,150 @@ static int try_tempo(const float* e, int64_t n, double fr, double bpm, grid_try*
     if (!g->idx || !g->keep) return 0;
     g->f = fit_grid(g->beats, g->nb, period, g->idx, g->keep);
     for (i = 0; i < g->nb && g->first < 0; i++) if (g->keep[i]) g->first = i;
+    g->nmap = fa_beat_map(g->beats, g->nb, g->f.p > 0.0 ? g->f.p : period, fr, &g->map);
+    if (g->nmap < 0) return 0;   /* out of memory, as for idx and keep */
+    if (g->nmap <= 1) { g->map = NULL; g->nmap = 0; }
+    if (g->map) return 1;
     return g->f.inliers >= MIN_BEATS && g->f.p > 0.0 && g->first >= 0;
+}
+
+/* The tracked beats' agreement with the grid: the share on it (within 8% of a
+ * beat), the mean onset on its beats, and the mean envelope, over the span the
+ * beats cover. */
+static void try_measure(const float* e, int64_t n, const grid_try* g, double* share, double* on, double* mean)
+{
+    double k, kend, s = 0.0, m = 0.0;
+    int64_t i, cnt = 0, hits = 0, from = (int64_t)g->beats[0], to = (int64_t)g->beats[g->nb - 1];
+    for (i = 0; i < g->nb; i++) {
+        double j = floor(try_beat(g, g->beats[i]) + 0.5);
+        double p = try_time(g, j + 0.5) - try_time(g, j - 0.5);
+        hits += fabs(g->beats[i] - try_time(g, j)) <= 0.08 * p;
+    }
+    kend = try_beat(g, g->beats[g->nb - 1] + 0.5);
+    for (k = ceil(try_beat(g, g->beats[0] - 0.5)); k <= kend; k += 1.0) {
+        s += peak_near(e, n, try_time(g, k));
+        cnt++;
+    }
+    for (i = from; i <= to && i < n; i++) m += e[i];
+    *share = (double)hits / (double)g->nb;
+    *on = cnt ? s / (double)cnt : 0.0;
+    *mean = m / (double)(to - from + 1);
 }
 
 /* Mean onset on the grid's beats, times the squared share of tracked beats on it. */
 static double grid_strength(const float* e, int64_t n, const grid_try* g)
 {
-    double k, s = 0.0, share = (double)g->f.inliers / (double)g->nb;
-    int64_t c = 0;
-    for (k = g->f.a + g->idx[g->first] * g->f.p; k <= g->beats[g->nb - 1] + 0.5; k += g->f.p) {
-        s += peak_near(e, n, k);
-        c++;
-    }
-    return c ? s / (double)c * share * share : 0.0;
+    double share, on, mean;
+    try_measure(e, n, g, &share, &on, &mean);
+    return on * share * share;
 }
 
-/* Mean onset on the grid's even and odd beats (counting from its first). */
+/* Mean onset on the grid's even and odd beats. */
 static void parity_strength(const float* e, int64_t n, const grid_try* g, double* even, double* odd)
 {
-    double k, s[2] = { 0, 0 };
-    int64_t c[2] = { 0, 0 }, j = 0;
-    for (k = g->f.a + g->idx[g->first] * g->f.p; k <= g->beats[g->nb - 1] + 0.5; k += g->f.p, j++) {
-        s[j & 1] += peak_near(e, n, k);
-        c[j & 1]++;
+    double k, kend = try_beat(g, g->beats[g->nb - 1] + 0.5), s[2] = { 0, 0 };
+    int64_t c[2] = { 0, 0 };
+    for (k = ceil(try_beat(g, g->beats[0] - 0.5)); k <= kend; k += 1.0) {
+        int j = (int)((int64_t)k & 1);
+        s[j] += peak_near(e, n, try_time(g, k));
+        c[j]++;
     }
     *even = c[0] ? s[0] / (double)c[0] : 0.0;
     *odd = c[1] ? s[1] / (double)c[1] : 0.0;
 }
 
+/* Bars: per beat of the grid, how much the harmony changes there (one minus the
+ * cosine of the chroma of the two beats before and the two from it: a melody moves
+ * within a chord, the chord changes at a bar) and the low-band onset on it;
+ * fa_beat_bars picks the meter and the beat that starts a bar. `shift`: grid beat
+ * that is beat 0 of the result. */
+static void find_bars(const fa_onset* o, const grid_try* g, double shift, fa_beat_grid* grid)
+{
+    int64_t k0 = (int64_t)ceil(try_beat(g, g->beats[0] - 0.5)), k1 = (int64_t)floor(try_beat(g, g->beats[g->nb - 1] + 0.5));
+    int64_t nk = k1 - k0, k, i;
+    float *change, *accent;
+    double* c;
+    uint32_t bpb = 0, off = 0;
+    if (nk < BAR_MIN_BEATS || o->nchroma == 0) return;
+    change = (float*)malloc((size_t)nk * sizeof(float));
+    accent = (float*)malloc((size_t)nk * sizeof(float));
+    c = (double*)calloc((size_t)nk * 12, sizeof(double));
+    if (!change || !accent || !c) { free(change); free(accent); free(c); return; }
+    for (k = 0; k < nk; k++) {
+        double t0 = try_time(g, (double)(k0 + k)), t1 = try_time(g, (double)(k0 + k + 1));
+        int64_t a = (int64_t)floor(t0 / CHROMA_STEP), b = (int64_t)floor(t1 / CHROMA_STEP);
+        int p;
+        if (a < 0) a = 0;
+        if (b > o->nchroma) b = o->nchroma;
+        for (i = a; i < b; i++)
+            for (p = 0; p < 12; p++) c[k * 12 + p] += o->chroma[i * 12 + p];
+        accent[k] = peak_near(o->low, o->nenv, t0);
+    }
+    for (k = 0; k < nk; k++) {
+        double x = 0.0, y = 0.0, xy = 0.0;
+        int p;
+        change[k] = 0.0f;
+        if (k < 2 || k + 2 > nk) continue;
+        for (p = 0; p < 12; p++) {
+            double u = c[(k - 2) * 12 + p] + c[(k - 1) * 12 + p], v = c[k * 12 + p] + c[(k + 1) * 12 + p];
+            x += u * u;
+            y += v * v;
+            xy += u * v;
+        }
+        if (x > 0.0 && y > 0.0) change[k] = (float)(1.0 - xy / sqrt(x * y));
+    }
+    /* The first two and the last beat have no change measured: left out. */
+    if (fa_beat_bars(change + 2, accent + 2, nk - 3, &bpb, &off)) {
+        int64_t first = k0 + 2 + (int64_t)off - (int64_t)llround(shift);
+        grid->beats_per_bar = bpb;
+        grid->bar_offset = (uint32_t)(((first % (int64_t)bpb) + (int64_t)bpb) % (int64_t)bpb);
+        grid->flags |= FA_GRID_BARS;
+    }
+    free(change);
+    free(accent);
+    free(c);
+}
+
+/* The tempo map into `out` (sample frames; frame0 = the sample of envelope frame 0).
+ * Beat 0 is the first one in the song: the map may start a beat or two before it,
+ * where the tracker ran on from the intro. */
+static int map_out(const fa_onset* o, const grid_try* g, double frame0, double conf, fa_grid_data* out)
+{
+    double fr = (double)o->rate / o->hop, j = 0.0;
+    const fa_beat_seg* map = g->map;
+    int k, first = 0, nmap = g->nmap;
+    while (frame0 + fa_beat_map_time(map, nmap, j) * o->hop < -(double)(o->rate / 200)) j += 1.0;
+    while (first + 1 < nmap && map[first + 1].beat <= j) first++;
+    /* The output starts at beat j, inside stretch `first`; g->map stays as it is (it
+     * is still read by find_bars). */
+    map += first;
+    nmap -= first;
+    out->segs = (fa_tempo_segment*)malloc((size_t)nmap * sizeof(fa_tempo_segment));
+    if (!out->segs) return 0;
+    for (k = 0; k < nmap; k++) {
+        double t = k == 0 ? map[0].t + (j - map[0].beat) * map[0].period : map[k].t;
+        fa_frames at = (fa_frames)llround(frame0 + t * o->hop);
+        out->segs[k].start = k == 0 && at < 0 ? 0 : at;
+        out->segs[k].bpm = fr * 60.0 / map[k].period;
+        out->segs[k].beat = k == 0 ? 0.0 : map[k].beat - j;
+    }
+    out->grid.struct_size = sizeof(fa_beat_grid);
+    out->grid.sample_rate = o->rate;
+    out->grid.first_beat = out->segs[0].start;
+    out->grid.beats_per_bar = 4;
+    out->grid.bar_offset = 0;
+    out->grid.confidence = (float)conf;
+    out->grid.segment_count = (uint32_t)nmap;
+    fa_grid_data_finish(out, o->seen);
+    find_bars(o, g, j, &out->grid);
+    return 1;
+}
+
 int fa_onset_grid(fa_onset* o, double min_bpm, double max_bpm, double tag_bpm, fa_grid_data* out)
 {
-    double fr = (double)o->rate / o->hop, bpm, mean = 0.0, on = 0.0, conf, share, contrast, frame0, k, slow = 0.0;
+    double fr = (double)o->rate / o->hop, bpm, on, mean, conf, share, contrast, frame0, slow = 0.0, shift = 0.0;
     double cands[TEMPO_CANDIDATES];
-    int64_t n = o->nenv, i, cnt = 0, from, to;
+    int64_t n = o->nenv, i;
     int nc;
     grid_try g;
     fa_frames first_beat;
@@ -545,28 +712,28 @@ int fa_onset_grid(fa_onset* o, double min_bpm, double max_bpm, double tag_bpm, f
             else try_free(&h);
         }
     }
-    share = (double)g.f.inliers / (double)g.nb;
 
     /* How much the onsets on the grid stand out from the rest (the envelope has unit
-     * deviation per band), over the span the beats cover. */
-    from = (int64_t)g.beats[g.first];
-    to = (int64_t)g.beats[g.nb - 1];
-    for (i = from; i <= to && i < n; i++) mean += o->env[i];
-    mean /= (double)(to - from + 1);
-    for (k = g.f.a + g.idx[g.first] * g.f.p; k <= g.beats[g.nb - 1] + 0.5; k += g.f.p) {
-        on += peak_near(o->env, n, k);
-        cnt++;
-    }
-    contrast = cnt ? (on / (double)cnt - mean) / 2.0 : 0.0;
+     * deviation per band). */
+    try_measure(o->env, n, &g, &share, &on, &mean);
+    contrast = (on - mean) / 2.0;
     conf = share * share * (contrast <= 0.0 ? 0.0 : contrast >= 2.0 ? 1.0 : contrast / 2.0);
 
     /* Envelope frame t is the window ending at sample first_frame_end - 1 + t * hop;
      * an attack's flux peaks about ONSET_DELAY windows after it enters. */
     frame0 = (double)o->first_frame_end - 1.0 - ONSET_DELAY * o->n;
-    first_beat = (fa_frames)llround(frame0 + (g.f.a + g.idx[g.first] * g.f.p) * o->hop);
+    if (g.map) {
+        int ok = map_out(o, &g, frame0, conf, out);
+        try_free(&g);
+        return ok;
+    }
+    first_beat = (fa_frames)llround(frame0 + try_time(&g, 0.0) * o->hop);
     /* A beat a few ms before the start is the song's first (the estimate's own scatter). */
     if (first_beat < 0 && first_beat > -(fa_frames)(o->rate / 200)) first_beat = 0;
-    while (first_beat < 0) first_beat += (fa_frames)llround(g.f.p * o->hop);
+    while (first_beat < 0) {
+        first_beat += (fa_frames)llround(g.f.p * o->hop);
+        shift += 1.0;
+    }
 
     out->segs = (fa_tempo_segment*)malloc(sizeof(fa_tempo_segment));
     if (!out->segs) { try_free(&g); return 0; }
@@ -582,6 +749,7 @@ int fa_onset_grid(fa_onset* o, double min_bpm, double max_bpm, double tag_bpm, f
     out->segs[0].bpm = fr * 60.0 / g.f.p;
     out->segs[0].beat = 0.0;
     out->grid.bpm = out->segs[0].bpm;
+    find_bars(o, &g, shift, &out->grid);
     try_free(&g);
     return 1;
 }

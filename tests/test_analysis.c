@@ -139,6 +139,51 @@ static double beat_error_ms(const fa_beat_grid* g, double true_bpm, double phase
     return (fabs(e1) > fabs(e2) ? fabs(e1) : fabs(e2)) * 1000.0;
 }
 
+/* A grid with its tempo map, and beats and frames through it (as the docs say). */
+typedef struct map { fa_beat_grid g; fa_tempo_segment s[512]; uint32_t n; } map;
+
+static int get_map(const fa_analysis* a, map* m)
+{
+    if (!get_grid(a, &m->g)) return 0;
+    return fa_analysis_get_tempo_map(a, m->s, 512, &m->n) == FA_OK && m->n >= 1 && m->n <= 512;
+}
+
+static int stream_map(fa_stream* st, map* m)
+{
+    memset(&m->g, 0, sizeof(m->g));
+    m->g.struct_size = sizeof(m->g);
+    return fa_stream_get_beat_grid(st, &m->g, m->s, 512, &m->n) == FA_OK && m->n >= 1 && m->n <= 512;
+}
+
+static double map_frame(const map* m, double beat)
+{
+    uint32_t i = 0;
+    while (i + 1 < m->n && m->s[i + 1].beat <= beat) i++;
+    return (double)m->s[i].start + (beat - m->s[i].beat) * 60.0 * m->g.sample_rate / m->s[i].bpm;
+}
+
+static double map_beat(const map* m, double frame)
+{
+    uint32_t i = 0;
+    while (i + 1 < m->n && (double)m->s[i + 1].start <= frame) i++;
+    return m->s[i].beat + (frame - (double)m->s[i].start) * m->s[i].bpm / (60.0 * m->g.sample_rate);
+}
+
+/* The worst distance (ms) of the found grid's beats, from its first up to `until` s,
+ * from the true beats (`ratio` 2: the grid found double tempo, so half beats count). */
+static double map_error_ms(const map* found, const map* truth, double ratio, double until)
+{
+    double worst = 0.0, k, fr = found->g.sample_rate, tr = truth->g.sample_rate;
+    for (k = 0.0;; k += 1.0) {
+        double f = map_frame(found, k), q, e;
+        if (f / fr > until) break;
+        q = floor(map_beat(truth, f / fr * tr) * ratio + 0.5) / ratio;
+        e = fabs(f / fr - map_frame(truth, q) / tr) * 1000.0;
+        if (e > worst) worst = e;
+    }
+    return worst;
+}
+
 /* ---- synthesized drums --------------------------------------------------------- */
 
 static uint32_t g_rand = 12345;
@@ -179,6 +224,20 @@ static float* drums(double bpm, double phase, double seconds, int64_t* out_n)
     for (t = phase; t < seconds; t += p) {
         add_kick(x, n, t, 0.6f);
         add_hat(x, n, t + p / 2, 0.25f);
+    }
+    *out_n = n;
+    return x;
+}
+
+/* Kicks on beat times t[0..nb-1] (s), hats halfway between, mono. */
+static float* drums_at(const double* t, int nb, double seconds, int64_t* out_n)
+{
+    int64_t n = (int64_t)(seconds * RATE);
+    float* x = (float*)calloc((size_t)n, sizeof(float));
+    int i;
+    for (i = 0; i < nb; i++) {
+        add_kick(x, n, t[i], 0.6f);
+        if (i + 1 < nb) add_hat(x, n, 0.5 * (t[i] + t[i + 1]), 0.25f);
     }
     *out_n = n;
     return x;
@@ -420,12 +479,102 @@ static void test_drum_grids(void)
         CHECK(g.confidence > 0.7f);
         CHECK(g.flags & FA_GRID_CONSTANT);
         CHECK(!(g.flags & FA_GRID_EXACT));
+        CHECK(!(g.flags & FA_GRID_BARS));      /* every beat the same: no bar to find */
         CHECK_EQ(g.segment_count, 1);
         CHECK_EQ(g.sample_rate, RATE);
         CHECK(fa_analysis_get_tempo_map(a, seg, 2, &count) == FA_OK);
         CHECK_EQ(count, 1);
         CHECK_EQ(seg[0].start, g.first_beat);
         CHECK_NEAR(seg[0].bpm, g.bpm, 0.0);
+        fa_analysis_free(a);
+    }
+}
+
+/* The worst distance (ms) of the grid's beats from the true beat times t[from..nb-1]
+ * (each true beat against the grid beat nearest to it). */
+static double beats_error_ms(const map* m, const double* t, int from, int nb)
+{
+    double worst = 0.0;
+    int i;
+    for (i = from; i < nb; i++) {
+        double f = t[i] * m->g.sample_rate, e = fabs(map_frame(m, floor(map_beat(m, f) + 0.5)) - f) / m->g.sample_rate * 1000.0;
+        if (e > worst) worst = e;
+    }
+    return worst;
+}
+
+/* Tempo that changes: a step (120 to 132 BPM after 30 s), a ramp (100 to 112 BPM over
+ * 70 s) and a ramp played by a drummer (+-10 ms, measured against the beats he
+ * meant). A constant grid falls far off; the tempo map stays on the beats. */
+static void test_tempo_maps(void)
+{
+    static double t[400], ideal[400];
+    int kind;
+    g_rand = 777;   /* the same drummer whatever ran before */
+    for (kind = 0; kind < 3; kind++) {
+        int nb = 0, i;
+        double x = 0.5, secs, bpm_a, bpm_b, err, tol = kind == 2 ? 15.0 : 5.0;
+        int64_t n;
+        float* d;
+        buf w;
+        fa_analysis* a;
+        map m;
+        while (nb < 400) {
+            double frac = x / 70.0;
+            double bpm = kind == 0 ? (x < 30.0 ? 120.0 : 132.0) : 100.0 + 12.0 * (frac > 1.0 ? 1.0 : frac);
+            if (x > 70.0) break;
+            ideal[nb] = x;
+            t[nb++] = x + (kind == 2 ? (frand() - 0.5) * 0.02 : 0.0);
+            x += 60.0 / bpm;
+        }
+        secs = x + 1.0;
+        d = drums_at(t, nb, secs, &n);
+        w = make_wav(d, n, 1);
+        free(d);
+        a = analyze(&w, FA_ANALYZE_BEATS);
+        free(w.d);
+        CHECK(a && get_map(a, &m));
+        if (!a) continue;
+        bpm_a = m.s[0].bpm;
+        bpm_b = m.s[m.n - 1].bpm;
+        err = beats_error_ms(&m, ideal, 1, nb - 1);
+        printf("  %s: %u segments, %.2f .. %.2f BPM (main %.2f), worst beat %.1f ms, confidence %.2f\n",
+               kind == 0 ? "step" : kind == 1 ? "ramp" : "drummer", m.n, bpm_a, bpm_b, m.g.bpm, err, m.g.confidence);
+        CHECK(m.n >= 2);
+        CHECK(!(m.g.flags & FA_GRID_CONSTANT));
+        CHECK_EQ(m.g.segment_count, m.n);
+        CHECK_EQ(m.g.first_beat, m.s[0].start);
+        CHECK(err < tol);
+        CHECK(m.g.confidence > 0.5f);
+        for (i = 1; i < (int)m.n; i++) CHECK(m.s[i].start > m.s[i - 1].start && m.s[i].beat > m.s[i - 1].beat);
+        if (kind == 0) {
+            /* two tempos, the change within a beat of 30 s */
+            CHECK_NEAR(bpm_a, 120.0, 0.1);
+            CHECK_NEAR(bpm_b, 132.0, 0.1);
+            CHECK_NEAR(m.g.bpm, 132.0, 0.1);   /* 40 s of it against 30 */
+            for (i = 1; i < (int)m.n; i++)
+                if (fabs(m.s[i].bpm - m.s[i - 1].bpm) > 5.0) CHECK_NEAR((double)m.s[i].start / RATE, 30.0, 0.5);
+        } else {
+            CHECK_NEAR(bpm_a, 100.0, 2.0);
+            CHECK_NEAR(bpm_b, 112.0, 2.0);
+        }
+        /* the stream takes the map as it is */
+        {
+            float* quiet = (float*)calloc(RATE, sizeof(float));
+            buf w2 = make_wav(quiet, RATE, 1);
+            fa_stream* st = open_mem(&w2, NULL);
+            free(quiet);
+            map back;
+            CHECK(st != NULL);
+            if (st) {
+                CHECK_EQ(fa_stream_set_beat_grid(st, &m.g, m.s, m.n), FA_OK);
+                CHECK(stream_map(st, &back));
+                CHECK_EQ(back.n, m.n);
+                CHECK(memcmp(back.s, m.s, m.n * sizeof(m.s[0])) == 0);
+                fa_stream_close(st);
+            }
+            free(w2.d);
+        }
         fa_analysis_free(a);
     }
 }
@@ -473,6 +622,50 @@ static void test_midi_render_grid(void)
                (double)g.first_beat / RATE, g.confidence, beat_error_ms(&g, tempos[i], 0.0, secs - 2.0));
         CHECK_NEAR(g.bpm, tempos[i], 0.05);
         CHECK(beat_error_ms(&g, tempos[i], 0.0, secs - 2.0) < 10.0);
+        /* the chords change on the bar: bars found, the first beat starts one */
+        CHECK(g.flags & FA_GRID_BARS);
+        CHECK_EQ(g.beats_per_bar, 4);
+        CHECK_EQ(g.bar_offset, 0);
+        fa_analysis_free(a);
+    }
+}
+
+/* Bars from audio: a song that starts with a beat of pickup (the bar starts on beat
+ * 1, counting the first as 0), and a waltz (3 beats, the kick louder on the first). */
+static void test_bars(void)
+{
+    int kind;
+    for (kind = 0; kind < 2; kind++) {
+        static const int prog[4][3] = { { 0, 4, 7 }, { 5, 9, 12 }, { 7, 11, 14 }, { 9, 12, 16 } };
+        song s = { 0 };
+        buf m, w;
+        fa_analysis* a;
+        fa_beat_grid g;
+        uint32_t per = kind == 0 ? 4 : 3, pickup = kind == 0 ? 1 : 0, bar, b, i, t0;
+        for (b = 0; b < pickup; b++) {
+            note(&s, b * 480, 60, 9, 36, 100);
+            note(&s, b * 480, 200, 1, 43, 90);
+        }
+        for (bar = 0; bar < 24; bar++) {
+            const int* c = prog[bar % 4];
+            t0 = (pickup + bar * per) * 480;
+            for (i = 0; i < 3; i++) note(&s, t0, per * 480 - 20, 0, 60 + c[i], 90);
+            for (b = 0; b < per; b++) {
+                note(&s, t0 + b * 480, 200, 1, 36 + c[0], 100);
+                note(&s, t0 + b * 480, 60, 9, 36, b == 0 ? 127 : 70);
+            }
+        }
+        m = write_song(&s, 110.0, NULL, NULL, 0, (int)per, 2);
+        w = render(&m, g_font, NULL);
+        a = analyze(&w, FA_ANALYZE_BEATS);
+        free(s.e); free(m.d); free(w.d);
+        CHECK(a && get_grid(a, &g));
+        printf("  %s: %.2f BPM, bars %s, %u beats from beat %u\n", kind == 0 ? "pickup" : "waltz", g.bpm,
+               (g.flags & FA_GRID_BARS) ? "found" : "not found", g.beats_per_bar, g.bar_offset);
+        CHECK_NEAR(g.bpm, 110.0, 0.05);
+        CHECK(g.flags & FA_GRID_BARS);
+        CHECK_EQ(g.beats_per_bar, per);
+        CHECK_EQ(g.bar_offset, pickup);
         fa_analysis_free(a);
     }
 }
@@ -1100,13 +1293,16 @@ static const char* key_relation(const fa_key_info* got, int tonic, int minor)
     return "other";
 }
 
+static int truth_ratio_is_one(double found, double truth) { return fabs(found - truth) < 0.01 * truth; }
+
 static void run_report(const char* sf2)
 {
     static const char* const styles[4] = { "four on the floor", "rock", "half-time", "humanized, drifting" };
     fa_soundfont* font = NULL;
     report_song songs[REPORT_SONGS];
     int i, exact = 0, rel = 0, fifth = 0, par = 0, other = 0, tempo_ok[4] = { 0 }, count[4] = { 0 }, octave[4] = { 0 };
-    double secs_total = 0.0, wall_total = 0.0, worst_bpm[4] = { 0 }, worst_ms[4] = { 0 }, conf_sum[4] = { 0 };
+    double secs_total = 0.0, wall_total = 0.0, worst_bpm[4] = { 0 }, worst_ms[4] = { 0 }, conf_sum[4] = { 0 }, nseg_sum[4] = { 0 };
+    int bars_right[4] = { 0 }, bars_wrong[4] = { 0 };
     if (fa_soundfont_open_path(sf2, &font) != FA_OK) { fprintf(stderr, "cannot open %s\n", sf2); g_failures++; return; }
     for (i = 0; i < REPORT_SONGS; i++) {
         songs[i].bpm = floor((70.0 + frand() * 110.0) * 10.0 + 0.5) / 10.0;
@@ -1114,8 +1310,8 @@ static void run_report(const char* sf2)
         songs[i].minor = (i / 12) % 2;
         songs[i].style = i % 4;
     }
-    printf("| # | Style | BPM (file) | Found | Error (BPM) | Beat error (ms) | Confidence | Key | Found | |\n");
-    printf("|---|---|---|---|---|---|---|---|---|---|\n");
+    printf("| # | Style | BPM (file) | Found | Error (BPM) | Beat error (ms) | Confidence | Bars | Key | Found | |\n");
+    printf("|---|---|---|---|---|---|---|---|---|---|---|\n");
     for (i = 0; i < REPORT_SONGS; i++) {
         double truth, secs, ms, t0, t1, err;
         buf m, w;
@@ -1125,6 +1321,7 @@ static void run_report(const char* sf2)
         fa_beat_grid g;
         fa_key_info k, want;
         const char* rel_s;
+        const char* bar_s = "-";
         int st = songs[i].style;
         if (getenv("FA_REPORT_ONLY") && atoi(getenv("FA_REPORT_ONLY")) != i + 1) continue;
         m = report_midi(&songs[i], &truth);
@@ -1142,17 +1339,40 @@ static void run_report(const char* sf2)
         want.struct_size = sizeof(want);
         fa_key_make(songs[i].tonic, songs[i].minor, &want);
         if (!a || !get_grid(a, &g)) {
-            printf("| %d | %s | %.2f | none | | | | %s | | |\n", i + 1, styles[st], truth, want.name);
+            printf("| %d | %s | %.2f | none | | | | | %s | | |\n", i + 1, styles[st], truth, want.name);
             fa_analysis_free(a); free(m.d); free(w.d);
             continue;
         }
         count[st]++;
         conf_sum[st] += g.confidence;
-        /* Half or double tempo is counted apart, its error measured at that tempo. */
-        if (fabs(g.bpm - truth / 2.0) < 0.01 * truth) { octave[st]++; truth /= 2.0; }
-        else if (fabs(g.bpm - truth * 2.0) < 0.02 * truth) { octave[st]++; truth *= 2.0; }
-        err = g.bpm - truth;
-        ms = beat_error_ms(&g, truth, 0.0, st == 3 ? 4.0 : secs - 4.0);
+        {
+            /* The found grid's mean tempo over the song, and its beats against the file's
+             * (all of them, up to 2 s before the end). */
+            map fm, tm;
+            fa_stream* ms_ = open_mem(&m, font);
+            double ratio = 1.0, f0, f1, mean, file_bpm = truth;
+            int ok = get_map(a, &fm) && ms_ && stream_map(ms_, &tm);
+            fa_stream_close(ms_);
+            f0 = (double)fm.g.first_beat;
+            f1 = (secs - 2.0) * RATE;
+            mean = ok ? (map_beat(&fm, f1) - map_beat(&fm, f0)) / (f1 - f0) * 60.0 * RATE : g.bpm;
+            /* Half or double tempo is counted apart, its error measured at that tempo. */
+            if (fabs(mean - truth / 2.0) < 0.01 * truth) { octave[st]++; truth /= 2.0; }
+            else if (fabs(mean - truth * 2.0) < 0.02 * truth) { octave[st]++; truth *= 2.0; ratio = 2.0; }
+            err = mean - truth;
+            g.bpm = mean;
+            ms = ok ? map_error_ms(&fm, &tm, ratio, secs - 2.0) : 1e9;
+            nseg_sum[st] += ok ? fm.n : 0;
+            /* Bars (at the file's tempo only): the found downbeat on one of the file's. */
+            bar_s = ok && (fm.g.flags & FA_GRID_BARS) ? "half/double" : "-";
+            if (ok && (fm.g.flags & FA_GRID_BARS) && truth_ratio_is_one(mean, file_bpm)) {
+                double q = floor(map_beat(&tm, map_frame(&fm, (double)fm.g.bar_offset) / fm.g.sample_rate * tm.g.sample_rate) + 0.5);
+                int right = fm.g.beats_per_bar == 4 && fmod(q, 4.0) == 0.0;
+                bar_s = right ? "right" : "wrong";
+                bars_right[st] += right;
+                bars_wrong[st] += !right;
+            }
+        }
         if (fabs(err) <= 0.05) tempo_ok[st]++;
         if (fabs(err) > worst_bpm[st]) worst_bpm[st] = fabs(err);
         if (ms > worst_ms[st]) worst_ms[st] = ms;
@@ -1163,16 +1383,16 @@ static void run_report(const char* sf2)
         else if (!strcmp(rel_s, "fifth")) fifth++;
         else if (!strcmp(rel_s, "parallel")) par++;
         else other++;
-        printf("| %d | %s | %.2f | %.2f | %.3f | %.1f | %.2f | %s | %s | %s |\n", i + 1, styles[st], truth, g.bpm, err, ms,
-               g.confidence, want.name, k.name, rel_s);
+        printf("| %d | %s | %.2f | %.2f | %.3f | %.1f | %.2f | %s | %s | %s | %s |\n", i + 1, styles[st], truth, g.bpm, err, ms,
+               g.confidence, bar_s, want.name, k.name, rel_s);
         fa_analysis_free(a);
         free(m.d);
         free(w.d);
     }
-    printf("\n| Style | Songs | Tempo within 0.05 BPM | Of those, half or double | Worst tempo error | Worst beat error (ms) | Mean confidence |\n|---|---|---|---|---|---|---|\n");
+    printf("\n| Style | Songs | Tempo within 0.05 BPM | Of those, half or double | Worst tempo error | Worst beat error (ms) | Mean confidence | Mean segments | Bars right | Bars wrong |\n|---|---|---|---|---|---|---|---|---|---|\n");
     for (i = 0; i < 4; i++)
-        printf("| %s | %d | %d | %d | %.3f | %.1f | %.2f |\n", styles[i], count[i], tempo_ok[i], octave[i], worst_bpm[i],
-               worst_ms[i], count[i] ? conf_sum[i] / count[i] : 0.0);
+        printf("| %s | %d | %d | %d | %.3f | %.1f | %.2f | %.1f | %d | %d |\n", styles[i], count[i], tempo_ok[i], octave[i], worst_bpm[i],
+               worst_ms[i], count[i] ? conf_sum[i] / count[i] : 0.0, count[i] ? nseg_sum[i] / count[i] : 0.0, bars_right[i], bars_wrong[i]);
     printf("\nKeys: %d exact, %d relative, %d a fifth away, %d parallel, %d other (of %d)\n", exact, rel, fifth, par, other,
            REPORT_SONGS);
     printf("Speed: %.0f s of audio in %.2f s (%.0fx real time, one core, beats + key + waveform)\n", secs_total, wall_total,
@@ -1196,7 +1416,9 @@ int main(void)
         RUN(test_key_names);
         RUN(test_drum_grids);
         RUN(test_tempo_range);
+        RUN(test_tempo_maps);
         RUN(test_midi_render_grid);
+        RUN(test_bars);
         RUN(test_midi_render_key);
         RUN(test_midi_exact_grid);
         RUN(test_tracker_exact_grid);

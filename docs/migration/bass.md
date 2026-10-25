@@ -442,7 +442,8 @@ bass_fx needs a decode stream wrapped in a separate tempo stream; FatzAudio puts
 | Converting positions back with BASS_FX_TempoGetRateRatio | Not needed: positions, markers, the clock and CD+G stay in song time | — | ➖ (by design) |
 | BASS_FX_ReverseCreate / BASS_ATTRIB_REVERSE_DIR | Reverse playback | | 🗓️ |
 | BASS_FX_BPM_DecodeGet | `fa_analyze_path` with `FA_ANALYZE_BEATS`, then `fa_analysis_get_beat_grid` ([track analysis](../features/analysis.md)) | `AudioEngine.Analyze` / `AnalyzeAsync`, `TrackAnalysis.Beats` | ✅ |
-| BASS_FX_BPM_BeatDecodeGet | Beat times from the grid: `fa_beat_grid.first_beat` plus `bpm`, or the tempo segments for songs that change tempo | `BeatGrid.BeatToFrame` | ✅ |
+| BASS_FX_BPM_BeatDecodeGet | Beat times from the grid: `fa_beat_grid.first_beat` plus `bpm`, or the tempo segments for songs that change tempo (measured from the audio, so drifting songs stay on their beats) | `BeatGrid.BeatToFrame` | ✅ |
+| Bars and downbeats (BASS_FX has none) | `fa_beat_grid.beats_per_bar` and `bar_offset` with `FA_GRID_BARS`: from MIDI files, or found in the audio when chord changes and kicks mark them ([bars](../features/analysis.md#bars)) | `BeatGrid.BeatsPerBar`, `BarOffset`, `BeatGridFlags.Bars` | ✅ |
 | BASS_FX_BPM_CallbackSet / BPM of a live stream | Analyse the file instead: `fa_analyze_stream`. A web or push stream cannot be read twice (`FA_ERROR_NOT_SEEKABLE`) | `AudioStream.Analyze` | ✅ (file and memory streams; ➖ live streams) |
 | BASS_FX_BPM_Translate | Not needed: `bpm` is a double, so double or halve it yourself (to correct a grid, set a new one with `fa_stream_set_beat_grid`) | `BeatGrid.Constant`, `AudioStream.BeatGrid` | ➖ (by design) |
 | BASS_FX_BPM_Free | `fa_analysis_free` | Nothing to dispose: `TrackAnalysis` is a plain object | ✅ |

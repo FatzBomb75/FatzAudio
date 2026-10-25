@@ -18,6 +18,11 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- Track analysis: songs whose tempo changes or drifts get a tempo map measured from the audio (segments joined end to end;
+  on the drifting test songs every beat within 10 ms, where a constant grid was up to 359 ms off), and bars are found
+  from chord changes and kicks (`FA_GRID_BARS` with `beats_per_bar` 4 or 3 and `bar_offset`) when they are clear. Steady
+  songs keep their constant grid. Cached analyses are measured again once (the cache format version changed). See
+  [docs/features/analysis.md](docs/features/analysis.md#songs-that-change-tempo).
 - Core Audio Format: `.caf` files open with the ordinary calls. ALAC (to the bit), AAC (LC, HE-AAC, HE-AAC v2), linear
   PCM and MP3 play with exact length; other codecs in CAF (AAC-LD/ELD, µ-law, ...) return
   `FA_ERROR_UNSUPPORTED_FORMAT`.

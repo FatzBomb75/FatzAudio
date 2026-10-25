@@ -10,7 +10,7 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Volume, pan and ramps (7 curves, scheduled starts, ramp-done) | [ramps.md](ramps.md) | ✅ volume and pan |
 | Events | [events.md](events.md) | ✅ ended, ramp done, marker, started, loudness final, metadata, stalled/resumed, decode error, MIDI text |
 | Loudness normalization (R128 scans, tags, cache, limiter) | [normalization.md](normalization.md) | ✅ |
-| Track analysis (beat grid and BPM, musical key, waveform overview; exact grids from MIDI and tracker files; cache) | [analysis.md](analysis.md) | ✅ (tempo maps and bar detection from audio 🗓️) |
+| Track analysis (beat grid and BPM, musical key, waveform overview; exact grids from MIDI and tracker files; cache) | [analysis.md](analysis.md) | ✅ |
 | Crossfades, markers, queues and gapless, scheduled starts | [crossfade.md](crossfade.md) | ✅ |
 | Buses (decks, groups) and the channel matrix | [buses.md](buses.md) | ✅ |
 | DJ mixer (two decks, isolator EQ with kills, crossfader curves, headphone cue on outputs 3-4 or a Y-cable, seamless deck loops, cue points, meters, two karaoke mics with gate, EQ, reverb, echo, host ducking, latency report, a measured setup check with feedback-safe gain, opt-in Windows exclusive mode and aligned stem recording, a headphone cue on a second device, beat sync with lock, beat loops and auto-mix) | [dj-mixer.md](dj-mixer.md) | ✅ (more decks 🗓️) |
