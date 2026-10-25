@@ -100,6 +100,7 @@ set(FA_SOURCES
     src/codec_alac.c
     src/codec_os.c
     src/demux_asf.c
+    src/demux_caf.c
     src/stubs.c
     src/miniaudio_impl.c
     src/net_url.c

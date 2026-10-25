@@ -938,7 +938,7 @@ static void exercise_memory(const uint8_t* data, size_t size, int32_t track)
 static void test_damaged_files_do_not_crash(void)
 {
     static const char* names[] = { "av_tracks.mp4", "aac.m4a", "pcm.mov", "frag.mp4", "av_tracks.mkv", "opus.webm", "net/tone.aac",
-                                   "alac/alac16.mkv", "alac/alac51_24.m4a" };
+                                   "alac/alac16.mkv", "alac/alac51_24.m4a", "caf/alac16.caf", "caf/pcm16be.caf", "caf/mp3.caf" };
     size_t f;
     uint32_t seed = 12345;
     for (f = 0; f < sizeof(names) / sizeof(names[0]); f++) {
@@ -1280,6 +1280,130 @@ static void test_aac_51_channel_order(void)
     fa_stream_close(s);
 }
 
+/* ---- Core Audio Format (demux_caf.c) ------------------------------------------------- */
+
+static void test_caf_alac(void)
+{
+    check_alac("caf/alac51_24.caf", "alac/alac51_24.flac", 6, 48000);
+    check_alac("caf/alac16.caf", "alac/alac16.flac", 2, 44100);
+}
+
+/* The packet table in front of the audio (Apple's tools write it so) gives the same
+ * samples as the file with it behind, which ffmpeg writes. */
+static void test_caf_packet_table_first(void)
+{
+    size_t size = 0, pos = 8, i;
+    uint8_t* data = load_file("caf/alac16.caf", &size);
+    uint8_t* moved = (uint8_t*)malloc(size);
+    size_t data_at = 0, data_len = 0, pakt_at = 0, pakt_len = 0;
+    fa_open_options opt;
+    fa_stream *s, *f;
+    float *a, *b;
+    int64_t na, nb;
+    CHECK(data && moved);
+    if (!data || !moved) { free(data); free(moved); return; }
+    while (pos + 12 <= size) {
+        uint64_t len = 0;
+        for (i = 0; i < 8; i++) len = (len << 8) | data[pos + 4 + i];
+        if (memcmp(data + pos, "data", 4) == 0) { data_at = pos; data_len = 12 + (size_t)len; }
+        if (memcmp(data + pos, "pakt", 4) == 0) { pakt_at = pos; pakt_len = 12 + (size_t)len; }
+        pos += 12 + (size_t)len;
+    }
+    CHECK(data_at > 0 && pakt_at > data_at && pakt_at + pakt_len == size);
+    memcpy(moved, data, data_at);
+    memcpy(moved + data_at, data + pakt_at, pakt_len);
+    memcpy(moved + data_at + pakt_len, data + data_at, data_len);
+    fa_open_options_init(&opt);
+    opt.flags = FA_OPEN_DECODE_ONLY;
+    CHECK_EQ(fa_stream_open_memory(g_engine, moved, size, &opt, &s), FA_OK);
+    CHECK_EQ(open_file("caf/alac16.caf", -1, &f), FA_OK);
+    if (s && f) {
+        a = read_all(s, 2, &na);
+        b = read_all(f, 2, &nb);
+        CHECK_EQ(na, nb);
+        CHECK(na > 0 && memcmp(a, b, (size_t)na * 2 * sizeof(float)) == 0);
+        free(a);
+        free(b);
+    }
+    fa_stream_close(s);
+    fa_stream_close(f);
+    free(moved);
+    free(data);
+}
+
+static void check_caf_sine(const char* name, const char* codec, uint32_t rate, int64_t frames, double tol)
+{
+    static const int64_t targets[] = { 0, 1, 4095, 4096, 4097, 5999, 3000 };
+    fa_stream* s;
+    fa_stream_info info;
+    float* full;
+    int64_t n, i;
+    double worst = 0;
+    CHECK_EQ(open_file(name, -1, &s), FA_OK);
+    if (!s) return;
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.codec, codec) == 0);
+    CHECK(strcmp(info.container, "caf") == 0);
+    CHECK_EQ(info.format.sample_rate, rate);
+    CHECK_EQ(info.format.channels, 1);
+    CHECK_EQ(info.length_frames, frames);
+    full = read_all(s, 1, &n);
+    CHECK_EQ(n, frames);
+    for (i = 0; i < n; i++) {
+        double want = 0.5 * sin(2 * 3.14159265358979 * 440.0 * (double)i / rate);
+        double d = fabs(full[i] - want);
+        if (d > worst) worst = d;
+    }
+    CHECK(worst < tol);
+    CHECK(seek_matches(s, full, n, 1, targets, (int)(sizeof(targets) / sizeof(targets[0])), 0.0, &worst));
+    free(full);
+    fa_stream_close(s);
+}
+
+static void test_caf_pcm(void)
+{
+    check_caf_sine("caf/pcm16be.caf", "pcm_s16be", 8000, 6000, 1e-4);
+    check_caf_sine("caf/pcm24le.caf", "pcm_s24le", 8000, 6000, 1e-5);
+}
+
+static void test_caf_mp3(void)
+{
+    static const int64_t targets[] = { 0, 11024, 11025, 17000, 1 };
+    fa_stream* s;
+    fa_stream_info info;
+    float* full;
+    int64_t n;
+    double worst;
+    CHECK_EQ(open_file("caf/mp3.caf", -1, &s), FA_OK);
+    if (!s) return;
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.codec, "mp3") == 0);
+    CHECK_EQ(info.format.sample_rate, 22050);
+    full = read_all(s, 1, &n);
+    CHECK_EQ(n, info.length_frames);
+    CHECK_NEAR((double)n, 22050.0, 1700.0);
+    CHECK_NEAR(freq(full, n / 4, n * 3 / 4, 1, 22050), 440.0, 2.0);
+    CHECK(seek_matches(s, full, n, 1, targets, (int)(sizeof(targets) / sizeof(targets[0])), 0.0, &worst));
+    free(full);
+    fa_stream_close(s);
+}
+
+/* Not a CAF codec we decode (AAC, IMA ADPCM, ...) or not a CAF file at all: unsupported. */
+static void test_caf_unsupported(void)
+{
+    size_t size = 0;
+    uint8_t* data = load_file("caf/pcm16be.caf", &size);
+    fa_open_options opt;
+    fa_stream* s = NULL;
+    CHECK(data != NULL);
+    if (!data) return;
+    fa_open_options_init(&opt);
+    opt.flags = FA_OPEN_DECODE_ONLY;
+    data[8 + 12 + 8] = 'a'; data[8 + 12 + 9] = 'a'; data[8 + 12 + 10] = 'c'; data[8 + 12 + 11] = ' ';   /* desc: 'aac ' */
+    CHECK_EQ(fa_stream_open_memory(g_engine, data, size, &opt, &s), FA_ERROR_UNSUPPORTED_FORMAT);
+    free(data);
+}
+
 /* ---- MP3 files (dec_mp3.c) ---------------------------------------------------------- */
 
 /* Where a 440 Hz sine of phase 0 at sample 0 sits in channel 0 of p: its lag
@@ -1435,6 +1559,11 @@ int main(void)
     RUN(test_m4a_aac);
     RUN(test_m4a_alac);
     RUN(test_alac_against_flac);
+    RUN(test_caf_alac);
+    RUN(test_caf_packet_table_first);
+    RUN(test_caf_pcm);
+    RUN(test_caf_mp3);
+    RUN(test_caf_unsupported);
     RUN(test_aac_51_channel_order);
     RUN(test_mov_pcm);
     RUN(test_fragmented_mp4);
