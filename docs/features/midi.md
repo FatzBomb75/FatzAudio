@@ -8,10 +8,10 @@ FatzAudio plays MIDI files itself, with a built-in SoundFont 2 synthesizer. They
 | Karaoke (`.kar`) | Lyrics from the "Words" track, `@T` title and artist lines, line and paragraph marks |
 | RIFF MIDI (`.rmi`) | The Standard MIDI File inside it |
 | Instruments | A SoundFont 2 (`.sf2`, also SF3 with compressed samples) or DLS (`.dls`) bank you load, else the one the OS ships (Windows `gm.dls`, macOS `gs_instruments.dls`, a Linux GM `.sf2` package): General MIDI; GS/XG variation banks through bank select (falling back to bank 0 when the soundfont lacks them); drums on channel 10 and on the parts GS, XG and GM2 files make drum parts |
-| SysEx | GM, GM2, GS and XG resets, GS rhythm parts, XG drum parts and drum banks (127, and 120 in GM2), master volume and master tuning ([below](#sysex)) |
+| SysEx | GM, GM2, GS and XG resets, GS rhythm parts, XG drum parts and drum banks (127, and 120 in GM2), master volume and master tuning, GS and XG reverb and chorus settings, part volume, pan and effect sends ([below](#sysex)) |
 | Lyrics and other text | Lyric, text, marker, cue, track and instrument name, copyright: listed and raised as events |
 | Tempo and signatures | Tempo changes, time and key signatures, listed with their numbers |
-| Effects | Reverb and chorus, on by default: the soundfont's effect sends plus CC91 and CC93 ([below](#reverb-and-chorus)) |
+| Effects | Reverb and chorus, on by default: the soundfont's effect sends plus CC91 and CC93; the file's GS or XG SysEx picks their type, level and time ([below](#reverb-and-chorus)) |
 | Live controls | Transpose (the synthesizer plays the new notes), channel mute, plus every stream parameter (volume, tempo, pitch) |
 
 Files are detected from their content (`MThd`, or `RIFF....RMID`), never from the extension. `fa_stream_get_info` reports codec `midi`, container `smf` or `rmid`, and stereo F32 audio at the engine's `mix_sample_rate`, or 44100 Hz when that is 0 (device native).
@@ -244,7 +244,21 @@ song.SetMidiChannelMuted(3, true);
 
 Reverb and chorus are built in and on by default, as in BASSMIDI. Each voice sends part of its sound to them: the soundfont's own effect-send setting for that sound, plus the channel's CC91 (reverb) and CC93 (chorus) controllers, as the SoundFont 2.04 default modulators say (a controller value of 127 adds 20%, and the total is at most 100%). Channels start at CC91 = 40 and CC93 = 0, the GS and GM2 defaults, also after a GM, GS or XG reset; CC121 (reset all controllers) leaves them alone. A file that sets CC91 or CC93 therefore changes its own reverb and chorus. The master volume SysEx scales the effects too.
 
-The reverb is a Schroeder-Moorer design of comb and allpass filters that dies away in about 1.3 seconds (to -60 dB). The chorus is two delay taps per channel, modulated at 0.4 Hz between 10 and 16 ms. Both are fixed: their type and level are not adjustable ([SysEx](#sysex)).
+The reverb is a Schroeder-Moorer design of comb and allpass filters that dies away in about 1.3 seconds (to -60 dB). The chorus is two delay taps per channel, modulated at 0.4 Hz between 10 and 16 ms. That is how they sound unless the file says otherwise, and again after every GM, GS or XG reset; it is close to a GS module's default Hall 2 reverb and Chorus 3.
+
+GS and XG files can set the effects with SysEx, and FatzAudio follows them (many karaoke files do this):
+
+| Setting | GS (`40 01 xx`) | XG (`02 01 xx`) | What it does here |
+|---|---|---|---|
+| Reverb type | Macro `30`, character `31`: Room 1-3, Hall 1-2, Plate, Delay, Panning Delay | Type `00`/`01`: Hall 1-2, Room 1-3, Stage 1-2, Plate, White Room, Tunnel, Canyon, Basement, or no effect | Each room, hall and plate type has its own decay time and brightness. Delay is a feedback echo; Panning Delay bounces it between left and right |
+| Reverb time | `34` | `02` (0.3 to 30 seconds) | GS: 64 is the type's own time, each 32 steps doubles or halves it. Delay types: the echo time, 3.3 ms a step (up to 0.42 s) |
+| Reverb level | `33` | Return `0C` | 64 is the default level, 0 is none, 127 about +6 dB |
+| Reverb pre-LPF, delay feedback | `32`, `35` | | Darkens what goes into the reverb; the delay types' repeats |
+| Chorus type | Macro `38`: Chorus 1-4, Feedback Chorus, Flanger, Short Delay, Short Delay (FB) | Type `20`/`21`: Chorus, Celeste, Flanger (the later types play as a chorus), or no effect | Sets the delay, depth, rate and feedback below |
+| Chorus level | `3A` | Return `2C` | As the reverb level |
+| Chorus pre-LPF, feedback, delay, rate, depth | `39`, `3B`, `3C`, `3D`, `3E` | | Delay about 1 to 50 ms (80 is 13 ms), rate up to 10 Hz (3 is 0.4 Hz), depth up to 20 ms (19 is 3 ms) |
+
+Messages that carry several data bytes set consecutive addresses, as on the hardware. Roland and Yamaha don't publish the exact curves, so times and ranges are close approximations rather than a copy of a particular module. Not followed: GS reverb pre-delay and chorus send to reverb, the XG chorus's own parameters (LFO, feedback, delay offset) and the XG variation and insertion effects.
 
 `fa_stream_set_midi_effects` (`MidiEffects`) turns both off for a stream, which plays the dry synthesizer (BASSMIDI's `BASS_MIDI_NOFX`); the tails stop at once. It may be called from any thread.
 
@@ -273,12 +287,16 @@ The SysEx messages that change how a file sounds are applied; the rest are ignor
 | Bank select MSB 127 (and 126) after an XG reset, 120 after a GM2 reset | The channel plays drum kits from its next program change; other banks make it melodic, channel 10 included |
 | Master volume: universal (`7F 04 01`), GS (`40 00 04`), XG (`00 00 04`) | Scales the whole song, without a click |
 | Master fine and coarse tuning (`7F 04 03`, `7F 04 04`) | Retunes every channel, drums included |
+| GS and XG reverb and chorus (`40 01 30`-`3E`, `02 01 00`-`2C`) | Effect type, level and time ([reverb and chorus](#reverb-and-chorus)) |
+| GS part level, pan, chorus and reverb send (`40 1x 19`, `1C`, `21`, `22`); XG part volume, pan, chorus and reverb send (`08 nn 0B`, `0E`, `12`, `13`) | The same as CC7, CC10, CC93 and CC91 on that part's channel. Pan 0 ("random") is the middle |
 
 Without a reset, channel 10 is the drum channel and bank 127 is an ordinary (GS MT-32) melodic bank. A drum kit the soundfont doesn't have falls back to the standard kit (bank 128, program 0). A melodic program missing from the channel's bank comes from bank 0; when bank 0 lacks it too, the channel plays program 0 (with a soundfont that has no program 0, its first preset), never the instrument it played before.
 
 ## Seeking and length
 
-Seeking is sample-exact and fast: the events up to the target are replayed into a fresh synthesizer without rendering any audio, so programs, controllers, pitch bends, SysEx settings and the tempo are exactly as if the song had played up to there. Notes held across the target, by their key or by the sustain pedal, start again from their attack (as in BASSMIDI), so a chord or pad held across a seek is heard right away. A key struck several times and still held comes back as one note, at the loudest of those strikes, and ends with the last of their note-offs. Drum notes aren't restarted, since they'd sound as a new hit. A seek also clears the reverb and chorus tails. Where no note is held, the audio after a seek is therefore what playing through gives once the reverb of the notes before the target would have died away, or exactly that with effects off.
+Seeking is sample-exact and fast: the events up to the target are replayed into a fresh synthesizer without rendering any audio, so programs, controllers, pitch bends, SysEx settings and the tempo are exactly as if the song had played up to there. Notes held across the target, by their key or by the sustain pedal, start again from their attack (as in BASSMIDI), so a chord or pad held across a seek is heard right away. A key struck several times and still held comes back as one note, at the loudest of those strikes, and ends with the last of their note-offs. Drum notes aren't restarted, since they'd sound as a new hit. With effects off, where no note is held, the audio after a seek is exactly what playing through gives.
+
+With effects on (the default), a seek also renders the second before the target without playing it, so the reverb and chorus of what was playing just before ring on into the target instead of starting from silence. The replay then stops a second before the target, and notes held there start again at that point, so at the target they are a second into their sound. Within the first second of the song this makes a seek exactly the same as playing through; later, only the reverb of what played more than a second before is missing (at least 45 dB down with the default reverb). This makes a seek take longer: about 20 ms for a dense eight-part song on a desktop CPU, against well under a millisecond with effects off.
 
 The length is the time of the last event plus one second, so the final notes ring out. Audio from a given position is the same whatever the read size or the seeks before it, so loudness scans are cached like those of any other file (the cache key includes the soundfont and the sample rate).
 
@@ -296,4 +314,5 @@ Rendering runs on the engine's worker threads like decoding of any other format.
 - Each instrument's level (`initialAttenuation`) is applied as the SoundFont 2 spec states it, 0.1 dB per unit. FluidSynth applies 0.4 of that (an EMU hardware habit), so a bank tuned by ear in FluidSynth can sound with a wider gap between its quiet and loud instruments here.
 - SFZ soundfonts and MIDI input from devices aren't supported yet. See the [engineering notes](../engineering-notes.md).
 - Text in code pages other than UTF-8, Windows-1252 and Shift-JIS (Korean, Chinese, Cyrillic files) comes out as Windows-1252. Shift-JIS user-defined characters (lead bytes F0-F9) come out as U+FFFD.
-- SysEx other than the messages listed [above](#sysex) is ignored: GS and XG effect settings (reverb and chorus type and level, so the reverb and chorus stay the one built-in design), insertion effects, scale tuning and drum setup (per-note drum edits) have no effect.
+- SysEx other than the messages listed [above](#sysex) is ignored: insertion and variation effects, scale tuning, drum setup (per-note drum edits) and other part parameters have no effect.
+- The reverb's tail is cut at the end of the song (a second after the last event), so a long reverb time set by the file doesn't ring out fully at the very end.

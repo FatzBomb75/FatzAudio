@@ -15,16 +15,20 @@
  * restored, and notes held across the target (by a key or the pedal) start again
  * from their attack, as BASSMIDI does, so a held chord or pad is not silent after
  * a seek into it. Drum notes are not restarted (they would sound as a new hit).
+ * With effects on, the replay stops FA_MIDI_PREROLL_S before the target instead
+ * and the synth renders from there, unheard, so the reverb and chorus tails (and
+ * notes still ringing) of the time before the target are heard after it; held
+ * notes restart at that earlier point.
  *
  * SysEx: GM, GM2, GS and XG resets, GS rhythm parts and XG drum parts, XG and GM2
- * drum banks (bank select MSB 127 and 120), master volume (universal, GS, XG)
- * and master fine and coarse tuning. Other SysEx is ignored.
+ * drum banks (bank select MSB 127 and 120), master volume (universal, GS, XG),
+ * master fine and coarse tuning, GS and XG reverb and chorus settings (type,
+ * level, time and the GS chorus's parameters; midi_fx.c), and the GS and XG part
+ * volume, pan, reverb send and chorus send. Other SysEx is ignored.
  *
  * Reverb and chorus (src/midi_fx.c) are fed by each voice's send levels: CC91
  * and CC93 (40 and 0 after a reset, as on GS and GM2 devices) and the
  * soundfont's effect-send generators. They are on unless the app turns them off.
- * A seek clears their tails: what is heard after a seek equals reading through
- * once the reverb of the notes before the target would have died away.
  *
  * Live controls (transpose, channel mute, effects) are atomics the decode thread reads at
  * the start of each block. */
@@ -47,6 +51,7 @@
 #define FA_MIDI_TRANSPOSE_MAX 48
 #define FA_MIDI_SYSEX_MAX 64              /* longer SysEx (sample dumps, bulk data) is dropped by the parser */
 #define FA_MIDI_GAIN_RAMP 64              /* frames a master volume change glides over */
+#define FA_MIDI_PREROLL_S 1.0             /* rendered unheard before a seek target (effects on) */
 
 /* ---- Soundfonts ---------------------------------------------------------------- */
 
@@ -620,6 +625,7 @@ static void reset_channels(struct fa_midi* m, int mode, fa_frames frame)
     }
     set_master_gain(m, 1.0f, frame);
     m->tune_fine = m->tune_coarse = 0.0f;
+    fa_midi_fx_defaults(m->fx);
     if (!m->synth) return;
     tsf_set_tuning(m->synth, 0.0f);
     for (ch = 0; ch < 16; ch++) {
@@ -657,8 +663,44 @@ static void set_drum_part(struct fa_midi* m, int ch, int drum)
     select_program(m, ch);
 }
 
+/* A part's sends, level and pan, as the controllers set them (pan 0 is "random"
+ * on GS and XG devices: the middle here). */
+static void part_control(struct fa_midi* m, int ch, int cc, int v)
+{
+    if (cc == TML_PAN_MSB && v == 0) v = 64;
+    tsf_channel_midi_control(m->synth, ch, cc, v);
+}
+
+/* GS part parameters 40 1x `a`. Block 0 is part 10, 1..9 parts 1..9, A..F 11..16. */
+static void gs_part(struct fa_midi* m, int block, int a, int v)
+{
+    int ch = block == 0 ? 9 : block <= 9 ? block - 1 : block;
+    switch (a) {
+    case 0x15: set_drum_part(m, ch, v != 0); break;   /* use for rhythm part */
+    case 0x19: part_control(m, ch, TML_VOLUME_MSB, v); break;
+    case 0x1C: part_control(m, ch, TML_PAN_MSB, v); break;
+    case 0x21: part_control(m, ch, 93, v); break;      /* chorus send */
+    case 0x22: part_control(m, ch, 91, v); break;      /* reverb send */
+    default: break;
+    }
+}
+
+/* XG multi part parameters 08 `part` `a`. */
+static void xg_part(struct fa_midi* m, int ch, int a, int v)
+{
+    switch (a) {
+    case 0x07: set_drum_part(m, ch, v != 0); break;   /* part mode */
+    case 0x0B: part_control(m, ch, TML_VOLUME_MSB, v); break;
+    case 0x0E: part_control(m, ch, TML_PAN_MSB, v); break;
+    case 0x12: part_control(m, ch, 93, v); break;      /* chorus send */
+    case 0x13: part_control(m, ch, 91, v); break;      /* reverb send */
+    default: break;
+    }
+}
+
 /* The SysEx messages FatzAudio acts on (after the F0; device numbers are ignored,
- * checksums are not checked). */
+ * checksums are not checked). GS and XG messages may carry several data bytes for
+ * consecutive addresses. */
 static void apply_sysex(struct fa_midi* m, const uint8_t* d, size_t n, fa_frames frame)
 {
     if (n >= 4 && d[0] == 0x7E && d[2] == 0x09) {                    /* GM System On / GM2 On */
@@ -671,21 +713,23 @@ static void apply_sysex(struct fa_midi* m, const uint8_t* d, size_t n, fa_frames
         else if (d[3] == 0x04) { m->tune_coarse = (float)(d[5] - 64); tsf_set_tuning(m->synth, m->tune_coarse + m->tune_fine); }
     } else if (n >= 8 && d[0] == 0x41 && d[2] == 0x42 && d[3] == 0x12) {   /* Roland GS, DT1 */
         int a1 = d[4], a2 = d[5], a3 = d[6], v = d[7];
+        int end = (int)n - (d[n - 1] == 0xF7), nd = end - 8 > 1 ? end - 8 : 1, i;   /* data bytes: before the checksum (and F7) */
         if ((a1 == 0x40 && a2 == 0x00 && a3 == 0x7F) || (a1 == 0x00 && a2 == 0x00 && a3 == 0x7F)) {
             reset_channels(m, MODE_GS, frame);                        /* GS reset, system mode set */
         } else if (a1 == 0x40 && a2 == 0x00 && a3 == 0x04) {
             set_master_gain(m, (float)v / 127.0f, frame);
-        } else if (a1 == 0x40 && (a2 & 0xF0) == 0x10 && a3 == 0x15) {
-            /* Use for rhythm part: block 0 is part 10, 1..9 parts 1..9, A..F 11..16. */
-            int block = a2 & 0x0F;
-            int ch = block == 0 ? 9 : block <= 9 ? block - 1 : block;
-            set_drum_part(m, ch, v != 0);
+        } else if (a1 == 0x40 && a2 == 0x01) {                        /* reverb and chorus */
+            for (i = 0; i < nd; i++) fa_midi_fx_gs(m->fx, a3 + i, d[7 + i]);
+        } else if (a1 == 0x40 && (a2 & 0xF0) == 0x10) {
+            for (i = 0; i < nd; i++) gs_part(m, a2 & 0x0F, a3 + i, d[7 + i]);
         }
     } else if (n >= 7 && d[0] == 0x43 && (d[1] & 0xF0) == 0x10 && d[2] == 0x4C) {   /* Yamaha XG, parameter change */
         int a1 = d[3], a2 = d[4], a3 = d[5], v = d[6];
+        int end = (int)n - (d[n - 1] == 0xF7), nd = end - 6 > 1 ? end - 6 : 1, i;   /* data bytes: before the F7, if any */
         if (a1 == 0x00 && a2 == 0x00 && a3 == 0x7E) reset_channels(m, MODE_XG, frame);   /* XG System On */
         else if (a1 == 0x00 && a2 == 0x00 && a3 == 0x04) set_master_gain(m, (float)v / 127.0f, frame);
-        else if (a1 == 0x08 && a2 < 16 && a3 == 0x07) set_drum_part(m, a2, v != 0);   /* part mode */
+        else if (a1 == 0x02 && a2 == 0x01) for (i = 0; i < nd; i++) fa_midi_fx_xg(m->fx, a3 + i, d[6 + i]);   /* effects */
+        else if (a1 == 0x08 && a2 < 16) for (i = 0; i < nd; i++) xg_part(m, a2, a3 + i, d[6 + i]);
     }
 }
 
@@ -851,20 +895,28 @@ static void restart_held(struct fa_midi* m)
 static fa_result midi_seek(fa_decoder* dec, fa_frames frame)
 {
     struct fa_midi* m = (struct fa_midi*)dec->impl;
-    fa_frames block = frame - frame % FA_MIDI_BLOCK;
+    fa_frames block = frame - frame % FA_MIDI_BLOCK, from = block;
     tsf* fresh = synth_new(m->font, m->rate);
     if (!fresh) return FA_ERROR_OUT_OF_MEMORY;
     synth_free(m->font, m->synth);
     m->synth = fresh;
-    fa_midi_fx_reset(m->fx);   /* the reverb tail of what came before is not heard */
+    fa_midi_fx_reset(m->fx);
     start_song(m);   /* also forgets every held note */
-    /* Everything before the target's block, without sound; what is at its first
-     * frame is applied by render_block, as when playing through. */
-    for (m->next = 0; m->next < m->nev && m->ev[m->next].frame < block; m->next++) apply_event(m, &m->ev[m->next], 1);
+    /* With effects on, the time before the target is rendered and dropped, so the
+     * reverb and chorus of what was playing just before ring on into it. */
+    if (fa_load32(&m->effects) && frame < m->length) {
+        fa_frames k = (fa_frames)(FA_MIDI_PREROLL_S * m->rate);
+        from = block - (k - k % FA_MIDI_BLOCK);
+        if (from < 0) from = 0;
+    }
+    /* Everything before that block, without sound; what is at its first frame is
+     * applied by render_block, as when playing through. */
+    for (m->next = 0; m->next < m->nev && m->ev[m->next].frame < from; m->next++) apply_event(m, &m->ev[m->next], 1);
     restart_held(m);
-    m->rpos = block;
+    m->rpos = from;
     m->blk_len = m->blk_off = 0;
     if (frame < m->length) {
+        while (m->rpos < block) render_block(m);
         render_block(m);
         m->blk_off = (int)(frame - block);
     } else {

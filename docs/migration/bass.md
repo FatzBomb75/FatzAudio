@@ -534,7 +534,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | BASS_MIDI_StreamGetMark BASS_MIDI_MARK_KEYSIG / TIMESIG / TEMPO | `fa_stream_get_midi_marks`: type `FA_MIDI_MARK_KEY_SIGNATURE` / `TIME_SIGNATURE` / `TEMPO`, numbers in `value`/`value2`, text like `"3/4"` ([MIDI](../features/midi.md#tempo-time-and-key-signatures)) | `stream.MidiMarks` | ✅ |
 | BASS_SYNC_MIDI_KEYSIG / TIMESIG / TEMPO | Not raised as events: follow the clock through `fa_stream_get_midi_marks` | — | ➖ |
 | BASS_MIDI_MARK_TICK (positions in ticks) | Not provided: positions are frames and nanoseconds | — | ➖ |
-| GS/XG/GM2 SysEx (resets, drum parts, master volume and tuning), handled by BASSMIDI | Applied the same way ([SysEx](../features/midi.md#sysex)) | automatic | ✅ (effects SysEx ignored) |
+| GS/XG/GM2 SysEx (resets, drum parts, master volume and tuning), handled by BASSMIDI | Applied the same way, GS and XG reverb and chorus settings included ([SysEx](../features/midi.md#sysex)) | automatic | ✅ |
 | BASS_SYNC_MIDI_LYRIC / BASS_SYNC_MIDI_TEXT / BASS_SYNC_MIDI_MARK | `FA_EVENT_MIDI_TEXT` (`value` = text index) | `stream.MidiTextReached` | ✅ |
 | BASS_MIDI_StreamEvent MIDI_EVENT_TRANSPOSE | `fa_stream_set_midi_transpose` | `stream.MidiTranspose` | ✅ |
 | BASS_MIDI_StreamEvent MIDI_EVENT_MUTE | `fa_stream_set_midi_channel_mute` | `stream.SetMidiChannelMuted` | ✅ |
@@ -552,7 +552,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | BASS_MIDI_DECAYSEEK (let the sound before a seek decay) | Not provided: a seek starts from silence, with the held notes restarted | — | ➖ |
 | BASS_MIDI_NOFX (reverb and chorus) | Reverb and chorus are on by default; `fa_stream_set_midi_effects(stream, 0)` turns them off ([MIDI](../features/midi.md#reverb-and-chorus)) | `stream.MidiEffects` | ✅ |
 | BASS_MIDI_StreamEvent MIDI_EVENT_REVERB / MIDI_EVENT_CHORUS (send levels) | Set by the file's CC91 and CC93 controllers, with the soundfont's effect sends; not settable from the app | automatic | ✅ (in the file) |
-| BASS_MIDI_StreamEvent MIDI_EVENT_REVERB_MACRO / MIDI_EVENT_CHORUS_MACRO and other reverb or chorus type and level events | Not provided: one fixed reverb and chorus | — | ➖ |
+| BASS_MIDI_StreamEvent MIDI_EVENT_REVERB_MACRO / MIDI_EVENT_CHORUS_MACRO and other reverb or chorus type and level events | Taken from the file's GS and XG SysEx ([reverb and chorus](../features/midi.md#reverb-and-chorus)); not settable from the app | automatic | ✅ (in the file) |
 | BASS_ATTRIB_MIDI_SRC / BASS_MIDI_SINCINTER | Not configurable: the synthesizer's own interpolation | — | ➖ |
 
 ## 3. Add-on map

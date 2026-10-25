@@ -946,8 +946,11 @@ static void test_seek_restarts_held_notes(void)
         vol = make_sysex_note(m, n, 1, 0, -1);
     }
 
+    /* Effects off: with them on, a seek renders the time before the target
+     * (test_seek_keeps_tails). */
     s = open_bytes(&melody, FA_OPEN_DECODE_ONLY, NULL, NULL);
     CHECK(s);
+    fa_stream_set_midi_effects(s, 0);
     CHECK_EQ(read_all(s, x, RATE / 2, 512), RATE / 2);
     level = rms(x, 2000, RATE / 2);
     CHECK_EQ(fa_stream_seek(s, RATE / 2 + 7), FA_OK);
@@ -968,6 +971,7 @@ static void test_seek_restarts_held_notes(void)
 
     s = open_bytes(&pedal, FA_OPEN_DECODE_ONLY, NULL, NULL);
     CHECK(s);
+    fa_stream_set_midi_effects(s, 0);
     CHECK_EQ(fa_stream_seek(s, RATE), FA_OK);
     CHECK_EQ(read_all(s, x, RATE / 4, 512), RATE / 4);
     CHECK(rms(x, 1000, RATE / 4) > level * 0.8);   /* the pedal holds it */
@@ -979,6 +983,7 @@ static void test_seek_restarts_held_notes(void)
     /* Both strikes are held at 0.8 s: the first note-off ends one, the other rings on. */
     s = open_bytes(&twice, FA_OPEN_DECODE_ONLY, NULL, NULL);
     CHECK(s);
+    fa_stream_set_midi_effects(s, 0);
     CHECK_EQ(fa_stream_seek(s, RATE * 8 / 10), FA_OK);
     CHECK_EQ(read_all(s, x, RATE, 512), RATE);
     CHECK(rms(x, RATE / 2, RATE * 9 / 10) > level * 0.5);
@@ -986,6 +991,7 @@ static void test_seek_restarts_held_notes(void)
 
     s = open_bytes(&drums, FA_OPEN_DECODE_ONLY, NULL, NULL);
     CHECK(s);
+    fa_stream_set_midi_effects(s, 0);
     CHECK_EQ(fa_stream_seek(s, RATE / 2), FA_OK);
     CHECK_EQ(read_all(s, x, RATE / 4, 512), RATE / 4);
     CHECK(rms(x, 0, RATE / 4) < 1e-6);
@@ -993,6 +999,7 @@ static void test_seek_restarts_held_notes(void)
 
     s = open_bytes(&vol, FA_OPEN_DECODE_ONLY, NULL, NULL);
     CHECK(s);
+    fa_stream_set_midi_effects(s, 0);
     CHECK_EQ(fa_stream_seek(s, RATE / 2), FA_OK);
     CHECK_EQ(read_all(s, x, RATE / 4, 512), RATE / 4);
     CHECK_NEAR(rms(x, 1000, RATE / 4) / level, 0.5, 0.02);
@@ -1315,6 +1322,216 @@ static void test_effects(void)
     }
     fa_soundfont_close(sendfont);
     free(def.d); free(none.d); free(chorus.d); free(loud.d);
+}
+
+/* GS / XG effect SysEx. */
+#define GS(a, v) { 0x41, 0x10, 0x42, 0x12, 0x40, 0x01, (a), (v), 0x00, 0xF7 }
+#define GS_PART1(a, v) { 0x41, 0x10, 0x42, 0x12, 0x40, 0x11, (a), (v), 0x00, 0xF7 }
+#define XG(a, v) { 0x43, 0x10, 0x4C, 0x02, 0x01, (a), (v), 0xF7 }
+
+/* SysEx, then one note (channel 0, key 69, 0..1 s), and the song going on to 4.5 s
+ * (a controller at 3.5 s; the length is a second after the last event), so the
+ * reverb rings out. */
+static buf make_fx_song_ticks(const uint8_t* const* msgs, const size_t* lens, int count, uint32_t ticks)
+{
+    buf f = { 0 }, t = { 0 };
+    int i;
+    mthd(&f, 0, 1, 480);
+    for (i = 0; i < count; i++) sysex(&t, 0, msgs[i], lens[i]);
+    ev3(&t, 0, 0x90, 69, 127);
+    ev3(&t, ticks, 0x80, 69, 0);
+    ev3(&t, 3360 - ticks, 0xBF, 1, 0);
+    eot(&t, 0);
+    mtrk(&f, &t);
+    free(t.d);
+    return f;
+}
+
+static buf make_fx_sysex_song(const uint8_t* const* msgs, const size_t* lens, int count)
+{
+    return make_fx_song_ticks(msgs, lens, count, 960);
+}
+
+/* The note of make_fx_sysex_song after up to three SysEx. */
+static fa_frames render_sysex(const uint8_t* a, size_t na, const uint8_t* b, size_t nb, const uint8_t* c, size_t nc,
+                              int effects, float* out, fa_frames len, fa_frames chunk)
+{
+    const uint8_t* m[3];
+    size_t n[3];
+    int k = 0;
+    buf song;
+    fa_frames got;
+    if (a) { m[k] = a; n[k++] = na; }
+    if (b) { m[k] = b; n[k++] = nb; }
+    if (c) { m[k] = c; n[k++] = nc; }
+    song = make_fx_sysex_song(m, n, k);
+    got = render_fx(&song, g_font, effects, out, len, chunk);
+    free(song.d);
+    return got;
+}
+
+/* Last frame that is not silent, +1. */
+static fa_frames sound_end(const float* x, fa_frames len)
+{
+    while (len > 0 && x[len * 2 - 1] == 0.0f && x[len * 2 - 2] == 0.0f) len--;
+    return len;
+}
+
+/* Reverb and chorus type, level and time from GS and XG SysEx; part sends. */
+static void test_gs_xg_effects(void)
+{
+    static const uint8_t gs_reset[] = { 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x7F, 0x00, 0x41, 0xF7 };
+    static const uint8_t xg_on[] = { 0x43, 0x10, 0x4C, 0x00, 0x00, 0x7E, 0x00, 0xF7 };
+    static const uint8_t hall2[] = GS(0x30, 4), room1[] = GS(0x30, 0), long_time[] = GS(0x34, 127);
+    static const uint8_t level0[] = GS(0x33, 0), delay[] = GS(0x30, 6), pan_delay[] = GS(0x30, 7);
+    static const uint8_t delay_long[] = GS(0x34, 127), fb0[] = GS(0x35, 0), fb127[] = GS(0x35, 127);
+    static const uint8_t send0[] = GS_PART1(0x22, 0), chorus_send[] = GS_PART1(0x21, 127);
+    static const uint8_t chorus_level0[] = GS(0x3A, 0), flanger[] = GS(0x38, 5);
+    /* Several data bytes: reverb level 0 then time 127 (0x33, 0x34). */
+    static const uint8_t level_time[] = { 0x41, 0x10, 0x42, 0x12, 0x40, 0x01, 0x33, 0x00, 0x7F, 0x00, 0xF7 };
+    static const uint8_t xg_room1[] = { 0x43, 0x10, 0x4C, 0x02, 0x01, 0x00, 0x02, 0x00, 0xF7 };   /* type MSB and LSB */
+    static const uint8_t xg_time_max[] = XG(0x02, 69), xg_off[] = XG(0x00, 0), xg_return0[] = XG(0x0C, 0);
+    static const uint8_t xg_chorus_off[] = XG(0x20, 0);
+    static const uint8_t xg_chorus_send[] = { 0x43, 0x10, 0x4C, 0x08, 0x00, 0x12, 0x7F, 0xF7 };
+    static const uint8_t xg_send0[] = { 0x43, 0x10, 0x4C, 0x08, 0x00, 0x13, 0x00, 0xF7 };
+    const fa_frames len = 3 * RATE;
+    size_t bytes = (size_t)len * 2 * sizeof(float);
+    float* dry = (float*)calloc((size_t)len * 2, sizeof(float));
+    float* def = (float*)calloc((size_t)len * 2, sizeof(float));
+    float* x = (float*)calloc((size_t)len * 2, sizeof(float));
+    float* y = (float*)calloc((size_t)len * 2, sizeof(float));
+    fa_frames end, late0, late1, i, d;
+    double tail;
+
+    CHECK_EQ(render_sysex(NULL, 0, NULL, 0, NULL, 0, 0, dry, len, 1000), len);
+    CHECK_EQ(render_sysex(NULL, 0, NULL, 0, NULL, 0, 1, def, len, 1000), len);
+    end = sound_end(dry, len);
+    CHECK(end > RATE && end < 2 * RATE);
+    late0 = end + RATE / 2;
+    late1 = end + RATE;
+    tail = rms(def, late0, late1);
+    CHECK(tail > 1e-6);
+    /* GS reset and Hall 2 at its defaults: the reverb as without SysEx. */
+    CHECK_EQ(render_sysex(gs_reset, sizeof(gs_reset), hall2, sizeof(hall2), NULL, 0, 1, x, len, 1000), len);
+    CHECK(memcmp(x, def, bytes) == 0);
+    /* Room 1: a shorter tail; reverb time 127: a much longer one. */
+    CHECK_EQ(render_sysex(gs_reset, sizeof(gs_reset), room1, sizeof(room1), NULL, 0, 1, x, len, 1000), len);
+    CHECK(rms(x, late0, late1) < tail * 0.1);
+    CHECK(rms(x, end, end + RATE / 10) > 1e-5);
+    CHECK_EQ(render_sysex(gs_reset, sizeof(gs_reset), long_time, sizeof(long_time), NULL, 0, 1, x, len, 1000), len);
+    CHECK(rms(x, late0, late1) > tail * 5.0);
+    /* Level 0, or the part's reverb send 0: exactly the dry sound (CC93 is 0). */
+    CHECK_EQ(render_sysex(gs_reset, sizeof(gs_reset), level0, sizeof(level0), NULL, 0, 1, x, len, 1000), len);
+    CHECK(memcmp(x, dry, bytes) == 0);
+    CHECK_EQ(render_sysex(gs_reset, sizeof(gs_reset), send0, sizeof(send0), NULL, 0, 1, x, len, 1000), len);
+    CHECK(memcmp(x, dry, bytes) == 0);
+    CHECK_EQ(render_sysex(gs_reset, sizeof(gs_reset), level_time, sizeof(level_time), NULL, 0, 1, x, len, 1000), len);
+    CHECK(memcmp(x, dry, bytes) == 0);
+    /* A GS reset after them puts the default reverb back. */
+    CHECK_EQ(render_sysex(level0, sizeof(level0), room1, sizeof(room1), gs_reset, sizeof(gs_reset), 1, x, len, 1000), len);
+    CHECK(memcmp(x, def, bytes) == 0);
+
+    /* Delay (time 127: (127 + 1) * 3.3 ms), no feedback: one echo of the send, and
+     * after it silence. Panning delay: the first echo on the left only. */
+    d = (fa_frames)((127 + 1) * 3.3 * RATE / 1000.0);
+    CHECK_EQ(render_sysex(delay, sizeof(delay), delay_long, sizeof(delay_long), fb0, sizeof(fb0), 1, x, len, 1000), len);
+    CHECK(rms(x, end, end + d / 2) > 1e-4);
+    for (i = end + d + 2; i < len && x[i * 2] == 0.0f && x[i * 2 + 1] == 0.0f; i++) {}
+    CHECK_EQ(i, len);
+    CHECK_EQ(render_sysex(pan_delay, sizeof(pan_delay), delay_long, sizeof(delay_long), fb0, sizeof(fb0), 1, x, len, 1000), len);
+    {
+        double right = 0.0, left = 0.0;
+        for (i = 0; i < len; i++) {
+            left += fabs((double)x[i * 2] - dry[i * 2]);
+            right += fabs((double)x[i * 2 + 1] - dry[i * 2 + 1]);
+        }
+        CHECK(left > 1.0);
+        CHECK(right == 0.0);
+    }
+    /* With feedback the echoes go on past the first. */
+    CHECK_EQ(render_sysex(delay, sizeof(delay), delay_long, sizeof(delay_long), fb127, sizeof(fb127), 1, x, len, 1000), len);
+    CHECK(rms(x, end + d + 2, end + 2 * d) > 1e-5);
+    /* A short sound's echoes repeat on and on, though the line holds silence
+     * between them. */
+    {
+        const uint8_t* m[3] = { delay, delay_long, fb127 };
+        size_t n[3] = { sizeof(delay), sizeof(delay_long), sizeof(fb127) };
+        buf blip = make_fx_song_ticks(m, n, 3, 12);
+        CHECK_EQ(render_fx(&blip, g_font, 1, y, len, 1000), len);
+        for (i = 2; i <= 5; i++) CHECK(rms(y, i * d, i * d + d / 2) > 1e-5);
+        free(blip.d);
+    }
+    /* Read size changes nothing, with feedback too. */
+    CHECK_EQ(render_sysex(delay, sizeof(delay), delay_long, sizeof(delay_long), fb127, sizeof(fb127), 1, y, len, 4093), len);
+    CHECK(memcmp(x, y, bytes) == 0);
+
+    /* Chorus: the part's chorus send; level 0 takes it away again; the flanger
+     * differs from the default chorus and is the same at any read size. */
+    CHECK_EQ(render_sysex(gs_reset, sizeof(gs_reset), send0, sizeof(send0), chorus_send, sizeof(chorus_send), 1, x, len, 1000), len);
+    CHECK(memcmp(x, dry, bytes) != 0);
+    CHECK_EQ(render_sysex(send0, sizeof(send0), chorus_send, sizeof(chorus_send), chorus_level0, sizeof(chorus_level0), 1, y, len, 1000), len);
+    CHECK(memcmp(y, dry, bytes) == 0);
+    CHECK_EQ(render_sysex(send0, sizeof(send0), chorus_send, sizeof(chorus_send), flanger, sizeof(flanger), 1, y, len, 1000), len);
+    CHECK(memcmp(x, y, bytes) != 0);
+    CHECK(rms(y, 2000, RATE / 2) > 0.05);
+    CHECK_EQ(render_sysex(send0, sizeof(send0), chorus_send, sizeof(chorus_send), flanger, sizeof(flanger), 1, x, len, 777), len);
+    CHECK(memcmp(x, y, bytes) == 0);
+
+    /* XG: Room 1 (type 02 00), time 69 (30 s), no effect, return 0, part sends. */
+    CHECK_EQ(render_sysex(xg_on, sizeof(xg_on), xg_room1, sizeof(xg_room1), NULL, 0, 1, x, len, 1000), len);
+    CHECK(rms(x, late0, late1) < tail * 0.1);
+    CHECK_EQ(render_sysex(xg_on, sizeof(xg_on), xg_time_max, sizeof(xg_time_max), NULL, 0, 1, x, len, 1000), len);
+    CHECK(rms(x, late0, late1) > tail * 5.0);
+    CHECK_EQ(render_sysex(xg_on, sizeof(xg_on), xg_off, sizeof(xg_off), NULL, 0, 1, x, len, 1000), len);
+    CHECK(memcmp(x, dry, bytes) == 0);
+    CHECK_EQ(render_sysex(xg_on, sizeof(xg_on), xg_return0, sizeof(xg_return0), NULL, 0, 1, x, len, 1000), len);
+    CHECK(memcmp(x, dry, bytes) == 0);
+    CHECK_EQ(render_sysex(xg_on, sizeof(xg_on), xg_send0, sizeof(xg_send0), NULL, 0, 1, x, len, 1000), len);
+    CHECK(memcmp(x, dry, bytes) == 0);
+    CHECK_EQ(render_sysex(xg_send0, sizeof(xg_send0), xg_chorus_send, sizeof(xg_chorus_send), NULL, 0, 1, x, len, 1000), len);
+    CHECK(memcmp(x, dry, bytes) != 0);
+    CHECK_EQ(render_sysex(xg_send0, sizeof(xg_send0), xg_chorus_send, sizeof(xg_chorus_send), xg_chorus_off, sizeof(xg_chorus_off), 1, x, len, 1000), len);
+    CHECK(memcmp(x, dry, bytes) == 0);
+    free(dry); free(def); free(x); free(y);
+}
+
+/* With effects on, a seek renders the time before the target, so the reverb of
+ * what played just before rings on after it: within FA_MIDI_PREROLL_S (1 s) of
+ * the start it is exactly reading through. The effect settings at the target
+ * are kept. */
+static void test_seek_keeps_tails(void)
+{
+    static const uint8_t long_time[] = GS(0x34, 127);
+    const uint8_t* m[1] = { long_time };
+    size_t n[1] = { sizeof(long_time) };
+    buf song = make_fx_sysex_song(m, n, 1);
+    const fa_frames len = 4 * RATE, at = RATE * 9 / 10 + 33;
+    fa_frames far;
+    float* all = (float*)calloc((size_t)len * 2, sizeof(float));
+    float* part = (float*)calloc((size_t)len * 2, sizeof(float));
+    fa_stream* s = open_bytes(&song, FA_OPEN_DECODE_ONLY, g_font, NULL);
+    CHECK(s);
+    if (s) {
+        CHECK_EQ(read_all(s, all, len, 1000), len);
+        CHECK(rms(all, at, at + RATE / 10) > 1e-4);
+        CHECK_EQ(fa_stream_seek(s, at), FA_OK);
+        CHECK_EQ(read_all(s, part, len - at, 999), len - at);
+        CHECK(memcmp(all + at * 2, part, (size_t)(len - at) * 2 * sizeof(float)) == 0);
+        /* Half a second after the sound ends: the reverb rings on, at about the level
+         * of reading through (the reverb time set by the SysEx is kept). Not the
+         * same: the note held 1 s before the target restarted there, and the reverb
+         * of what came before is missing. */
+        CHECK_EQ(render_fx(&song, g_font, 0, part, len, 1000), len);
+        far = sound_end(part, len);
+        CHECK(far > RATE && far < 2 * RATE);
+        far += RATE / 2 + 11;
+        CHECK_EQ(fa_stream_seek(s, far), FA_OK);
+        CHECK_EQ(read_all(s, part, RATE / 2, 999), RATE / 2);
+        CHECK(rms(part, 0, RATE / 4) > 0.5 * rms(all + far * 2, 0, RATE / 4));
+        CHECK(rms(part, 0, RATE / 4) < 2.0 * rms(all + far * 2, 0, RATE / 4));
+        fa_stream_close(s);
+    }
+    free(all); free(part); free(song.d);
 }
 
 static void test_format2(void)
@@ -1960,6 +2177,8 @@ int main(void)
     RUN(test_tempo_and_signature_marks);
     RUN(test_sf3);
     RUN(test_effects);
+    RUN(test_gs_xg_effects);
+    RUN(test_seek_keeps_tails);
     RUN(test_format2);
     RUN(test_not_midi);
     RUN(test_soundfont_lifetime);
