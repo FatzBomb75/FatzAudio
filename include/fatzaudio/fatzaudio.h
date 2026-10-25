@@ -1592,12 +1592,13 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
  *
  * Accuracy, measured on General MIDI renders (docs/features/analysis.md has the
  * report): steady music gets its tempo within 0.05 BPM and beats within about
- * 2 ms; played-in tempo that drifts gets the right mean tempo but a low confidence,
- * as a constant grid cannot follow it. Half-time songs may read at half tempo. Real
- * recordings do worse than renders, the key most of all (misses are mostly the
+ * 2 ms; a tempo that changes or drifts (a live drummer) gets a tempo map that
+ * stays within about 10 ms of the beats. Half-time songs may read at half tempo.
+ * Real recordings do worse than renders, the key most of all (misses are mostly the
  * relative major/minor or a fifth away). Show the confidence, and let users correct
- * the grid (fa_stream_set_beat_grid). Bars (which beat starts a
- * bar) are known only for exact grids; other grids say beat 0 starts a bar. */
+ * the grid (fa_stream_set_beat_grid). Bars (the meter, and which beat starts a bar)
+ * are found from the harmony and the kicks when that is clear (FA_GRID_BARS);
+ * otherwise a grid says 4 beats and that beat 0 starts a bar. */
 typedef enum fa_analysis_kind {
     FA_ANALYZE_LOUDNESS = 1 << 0,
     FA_ANALYZE_BEATS    = 1 << 1,
@@ -1656,8 +1657,8 @@ typedef enum fa_grid_flags {
     FA_GRID_EXACT    = 1 << 1,  /* from the file (MIDI tempo events, tracker rows), not measured */
     FA_GRID_EDITED   = 1 << 2,  /* set by the app, e.g. after the user corrected it */
     FA_GRID_BARS     = 1 << 3   /* beats_per_bar and bar_offset are known (MIDI files
-                                   with one time signature from the start); else they
-                                   are 4 and 0 */
+                                   with one time signature from the start, or found
+                                   clearly in the audio); else they are 4 and 0 */
 } fa_grid_flags;
 
 typedef struct fa_beat_grid {

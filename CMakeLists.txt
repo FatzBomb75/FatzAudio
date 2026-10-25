@@ -72,6 +72,7 @@ set(FA_SOURCES
     src/analysis.c
     src/analyze.c
     src/beat.c
+    src/beat_map.c
     src/beat_grid.c
     src/key.c
     src/clock.c

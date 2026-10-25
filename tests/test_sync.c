@@ -582,6 +582,70 @@ static void test_beat_jump_synced(void)
     rig_close(&r);
 }
 
+/* Tempo maps (as an analysis gives for a song that changes tempo): 120 BPM, then 110
+ * from 4 s (beat 8). A beat jump counts the map's beats, and a locked deck follows the
+ * leader's tempo change and stays on its beat. */
+static fa_result set_map(fa_stream* s)
+{
+    fa_beat_grid g;
+    fa_tempo_segment segs[2];
+    memset(&g, 0, sizeof(g));
+    g.struct_size = sizeof(g);
+    g.bpm = 110.0;
+    g.first_beat = 0;
+    g.sample_rate = g_rate;
+    g.beats_per_bar = 4;
+    g.confidence = 1.0f;
+    segs[0].start = 0; segs[0].bpm = 120.0; segs[0].beat = 0.0;
+    segs[1].start = (fa_frames)seconds(4.0); segs[1].bpm = 110.0; segs[1].beat = 8.0;
+    return fa_stream_set_beat_grid(s, &g, segs, 2);
+}
+
+static void test_tempo_map_follow(void)
+{
+    rig r;
+    fa_stream *a, *b;
+    fa_deck_beat_info bi;
+    double after = 60.0 / 110.0;
+    CHECK(rig_open(&r));
+    a = load(r.a, (uint32_t)seconds(30), 0.0, 0);
+    b = load(r.b, (uint32_t)seconds(30), 120.0, 700);
+    CHECK(a && b);
+    CHECK_EQ(set_map(a), FA_OK);
+    /* Paused at beat 6 (3 s): 4 beats on is beat 10, two beats into the 110 BPM part. */
+    CHECK_EQ(fa_stream_seek(a, (fa_frames)seconds(3.0)), FA_OK);
+    CHECK_EQ(fa_deck_beat_jump(r.a, 4.0), FA_OK);
+    CHECK_EQ(pos(a), (fa_frames)floor(seconds(3.0) + floor(seconds(1.0 + 2.0 * after) + 0.5)));
+    CHECK_EQ(fa_deck_beat_jump(r.a, -4.0), FA_OK);
+    CHECK_EQ(pos(a), (fa_frames)seconds(3.0));
+    CHECK_EQ(fa_stream_seek(a, 0), FA_OK);
+    /* The lock: B (a constant 120) follows A across its change to 110. */
+    CHECK_EQ(fa_stream_play_at(a, at_frame(&r, 480)), FA_OK);
+    rig_run(&r, (uint32_t)seconds(0.2));
+    CHECK_EQ(fa_deck_play_synced(r.b, r.a, FA_SYNC_TEMPO | FA_SYNC_BEAT | FA_SYNC_LOCK), FA_OK);
+    rig_run(&r, (uint32_t)seconds(3.0));
+    CHECK_NEAR(tempo_of(b), 1.0, 0.002);
+    rig_run(&r, (uint32_t)seconds(4.0));   /* A is at about 7 s, 110 BPM */
+    CHECK_NEAR(tempo_of(b), 110.0 / 120.0, 0.002);
+    memset(&bi, 0, sizeof(bi));
+    bi.struct_size = sizeof(bi);
+    CHECK_EQ(fa_deck_get_beat_info(r.b, &bi), FA_OK);
+    CHECK_EQ(bi.locked, 1);
+    CHECK_NEAR(bi.bpm, 110.0, 0.3);
+    CHECK_NEAR(bi.phase_error_ms, 0.0, 1.0);
+    memset(&bi, 0, sizeof(bi));
+    bi.struct_size = sizeof(bi);
+    CHECK_EQ(fa_deck_get_beat_info(r.a, &bi), FA_OK);
+    CHECK_NEAR(bi.bpm, 110.0, 1e-6);
+    {   /* and from the positions: B's beat phase (120 BPM grid from 700) against A's map */
+        double ba = 8.0 + ((double)pos(a) - seconds(4.0)) / seconds(after), bb = ((double)pos(b) - 700.0) / seconds(0.5);
+        double x = (ba - floor(ba)) - (bb - floor(bb));
+        x -= floor(x + 0.5);
+        CHECK_NEAR(x, 0.0, 0.01);
+    }
+    rig_close(&r);
+}
+
 /* ---- auto-mix ---------------------------------------------------------------- */
 
 static int find_event(rig* r, fa_event_type type, int index)
@@ -870,6 +934,7 @@ int main(void)
     RUN(test_loop_beats);
     RUN(test_beat_jump);
     RUN(test_beat_jump_synced);
+    RUN(test_tempo_map_follow);
     RUN(test_automix_plain);
     RUN(test_automix_aligned);
     RUN(test_automix_empty_and_skip);

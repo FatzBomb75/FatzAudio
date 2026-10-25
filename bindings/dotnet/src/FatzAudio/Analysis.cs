@@ -28,7 +28,7 @@ public enum BeatGridFlags
     Exact = 2,
     /// <summary>Set by the app, for example after the user corrected it.</summary>
     Edited = 4,
-    /// <summary><see cref="BeatGrid.BeatsPerBar"/> and <see cref="BeatGrid.BarOffset"/> are known (exact grids with one time signature); otherwise they are 4 and 0.</summary>
+    /// <summary><see cref="BeatGrid.BeatsPerBar"/> and <see cref="BeatGrid.BarOffset"/> are known (exact grids with one time signature, or found clearly in the audio); otherwise they are 4 and 0.</summary>
     Bars = 8,
 }
 

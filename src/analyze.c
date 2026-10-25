@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define FA_ANALYSIS_MAGIC "FatzAudio-analysis 1\n"   /* bumped whenever a measurement changes */
+#define FA_ANALYSIS_MAGIC "FatzAudio-analysis 2\n"   /* bumped whenever a measurement changes */
 #define FA_ANALYSIS_READ 4096
 #define FA_ANALYSIS_MAX_CACHE ((size_t)64 << 20)
 #define FA_ANALYZE_ALL (FA_ANALYZE_LOUDNESS | FA_ANALYZE_BEATS | FA_ANALYZE_KEY | FA_ANALYZE_WAVEFORM)
