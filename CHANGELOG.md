@@ -18,6 +18,9 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- Reverse playback: `fa_stream_set_reverse` / `fa_stream_get_reverse` (.NET `AudioStream.Reverse`), bass_fx's
+  `BASS_FX_ReverseCreate` and `BASS_ATTRIB_REVERSE_DIR` on the stream itself, switchable while playing; works with tempo,
+  pitch, rate, loops and deck loops. See [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md#reverse-playback).
 - MIDI: GS and XG reverb and chorus SysEx are followed: reverb type (rooms, halls, plate, GS delay and panning delay,
   XG stage, tunnel and others), level and time; chorus type (chorus, celeste, flanger, short delay), level and the GS
   chorus parameters; GS and XG part volume, pan, reverb send and chorus send. A seek with effects on renders the second

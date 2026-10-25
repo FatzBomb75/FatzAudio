@@ -178,6 +178,12 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_stream_get_loop(StreamHandle stream, out int on);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_reverse(StreamHandle stream, int reverse);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_reverse(StreamHandle stream, out int reverse);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_set_mute(StreamHandle stream, int muted);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

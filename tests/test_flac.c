@@ -398,6 +398,44 @@ static void exercise_memory(const uint8_t* data, size_t size, int32_t track)
     fa_stream_close(s);
 }
 
+/* Reverse playback seeks back block by block: with exact seeks it gives exactly the
+ * forward decode, last frame first. */
+static void reverse_exact(const char* name)
+{
+    fa_stream* s;
+    fa_stream_info info;
+    float *fwd, *rev;
+    int64_t n = 0, m = 0, i;
+    uint32_t ch, c;
+    CHECK_EQ(open_file(name, 0, &s, &info), FA_OK);
+    ch = info.format.channels;
+    fwd = read_all(s, ch, &n);
+    CHECK(n > 0);
+    CHECK_EQ(fa_stream_set_reverse(s, 1), FA_OK);
+    rev = read_all(s, ch, &m);
+    CHECK_EQ(m, n);
+    for (i = 0; i < n; i++) {
+        for (c = 0; c < ch; c++)
+            if (rev[(size_t)i * ch + c] != fwd[(size_t)(n - 1 - i) * ch + c]) break;
+        if (c < ch) break;
+    }
+    if (i < n) fprintf(stderr, "  %s: differs at %lld of %lld\n", name, (long long)i, (long long)n);
+    CHECK_EQ(i, n);
+    free(fwd);
+    free(rev);
+    fa_stream_close(s);
+}
+
+static void test_reverse_exact(void)
+{
+    reverse_exact("tone.flac");
+    reverse_exact("tone.oga");
+    reverse_exact("tone_flac.mkv");
+    reverse_exact("tone_flac.mp4");
+    reverse_exact("surround.flac");
+    reverse_exact("../tone.mp3");
+}
+
 static void test_damaged_files_do_not_crash(void)
 {
     static const char* names[] = { "tone.oga", "tone_flac.mkv", "tone_flac.mp4" };
@@ -439,6 +477,7 @@ int main(void)
     RUN(test_packets_pushed);
     RUN(test_loudness_tags);
     RUN(test_forward_only);
+    RUN(test_reverse_exact);
     RUN(test_damaged_files_do_not_crash);
 
     fa_engine_destroy(g_engine);

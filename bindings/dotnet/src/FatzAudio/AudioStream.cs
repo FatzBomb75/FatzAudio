@@ -1119,6 +1119,27 @@ public unsafe class AudioStream : IDisposable
         set => FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_loop(Handle, value ? 1 : 0));
     }
 
+    /// <summary>
+    /// Plays backwards (bass_fx's <c>BASS_FX_ReverseCreate</c> and <c>BASS_ATTRIB_REVERSE_DIR</c>). Can be changed at any
+    /// time, also while playing: the stream restarts at the position heard, as a seek does. Reversed, the position and
+    /// the clock count down and the stream ends at the cue-in marker (or the start); playing from stopped or ended
+    /// starts at the cue-out marker (or the end), and a loop wraps from its start to its end. Tempo, pitch, rate and
+    /// fades work as forward. Marker, loop, MIDI text and tracker row events are not raised while reversed, and deck sync
+    /// does not pull a reversed deck into phase.
+    /// </summary>
+    /// <exception cref="FatzAudioException">Turning it on for a stream that cannot seek (push and packet streams):
+    /// <see cref="ErrorCode.NotSeekable"/>; for a web stream: <see cref="ErrorCode.NotImplemented"/>.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public bool Reverse
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_reverse(Handle, out int on));
+            return on != 0;
+        }
+        set => FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_reverse(Handle, value ? 1 : 0));
+    }
+
     /// <summary>Stereo pan from -1 (left) to 1 (right).</summary>
     public float Pan { get => GetParam(AudioParameter.Pan); set => SetParam(AudioParameter.Pan, value); }
 
