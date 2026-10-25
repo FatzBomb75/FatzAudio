@@ -1122,15 +1122,37 @@ static int64_t fill_target(struct fa_stream* s)
 
 /* ---- decode-ahead (worker threads) -------------------------------------- */
 
+/* A push stream with nothing pushed: no decoding until a push (which wakes the workers). */
+static int push_waiting(struct fa_stream* s)
+{
+    return s->push && !fa_push_has_input(s->push) && !fa_load32(&s->staged);
+}
+
 int fa_stream_needs_work(struct fa_stream* s)
 {
     if (s->ring.data && fa_load64(&s->seek_pending) >= 0) return 1;
     if (!s->ring.data || fa_load32(&s->eof) || fa_load32(&s->flushing)) return 0;
-    if (s->push && !fa_push_has_input(s->push) && !fa_load32(&s->staged)) return 0;   /* nothing pushed yet */
+    if (push_waiting(s)) return 0;   /* nothing pushed yet */
     if (fa_ring_readable(&s->ring) > fill_target(s) * 3 / 4) return 0;
     if (fa_tmap_full(tmap_of(s))) return 0;   /* waits for playback to catch up */
     /* Web streams: only once the bytes are downloaded, so a worker never waits. */
     return !s->net || fa_net_can_decode(s->net, NULL);
+}
+
+/* How long the polling worker may sleep before this stream could want it
+ * (worker_main): a quarter of what its ring still holds, so it is looked at several
+ * times before it could run dry. 0: nothing to decode until an API call (which
+ * wakes the workers): no ring, flushing, ended, or a push stream with nothing pushed. */
+uint32_t fa_stream_poll_ms(struct fa_stream* s)
+{
+    int64_t ms;
+    if (!s->ring.data || !s->dev_rate) return 0;
+    if (fa_load64(&s->seek_pending) >= 0) return FA_WORKER_POLL_MIN_MS;
+    /* Flushing ends with unflush, which wakes them (a failed rebuild leaves it set). */
+    if (fa_load32(&s->flushing) || fa_load32(&s->eof) || push_waiting(s)) return 0;
+    ms = (int64_t)fa_ring_readable(&s->ring) * 1000 / s->dev_rate / 4;
+    if (ms < FA_WORKER_POLL_MIN_MS) return FA_WORKER_POLL_MIN_MS;
+    return ms > FA_WORKER_POLL_MAX_MS ? FA_WORKER_POLL_MAX_MS : (uint32_t)ms;
 }
 
 /* Posts FA_EVENT_METADATA for the title in effect at `heard` if nobody has yet. */
@@ -1459,10 +1481,13 @@ static fa_frames target_position(struct fa_stream* s)
 }
 
 /* After a restart: the mixer may play again, unless a newer async target came
- * in meanwhile (a worker carries that out next). */
+ * in meanwhile (a worker carries that out next). The workers are woken: the ring
+ * holds only the prefill now, and the polling one may be sleeping for longer (it
+ * skips ended streams, see fa_stream_poll_ms). */
 static void unflush(struct fa_stream* s)
 {
     fa_store32(&s->flushing, fa_load64(&s->seek_pending) >= 0);
+    fa_engine_wake_workers(s->engine);
 }
 
 /* Drops buffered audio and restarts decoding at `frame`. Caller holds api_lock and

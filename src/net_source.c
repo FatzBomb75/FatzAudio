@@ -2,7 +2,8 @@
  *
  * One download thread per stream fetches the resource into a sliding window of
  * bytes (FA_NET_WINDOW, of which at most half is read ahead; a stream that can't
- * seek keeps only the part ahead, FA_NET_AHEAD plus one write). The decoder reads
+ * seek keeps only the part ahead, FA_NET_AHEAD plus one write, or less for radio
+ * with a stated bitrate, see radio_ahead_locked). The decoder reads
  * the window through ordinary fa_io_callbacks. A seek inside the window costs
  * nothing; outside it, the thread reconnects with a Range request at the new
  * position. A connection that drops is re-established for reconnect_ms: files
@@ -22,6 +23,7 @@
 
 #define FA_NET_WINDOW (4 * 1024 * 1024)
 #define FA_NET_AHEAD (FA_NET_WINDOW / 2)
+#define FA_NET_RADIO_AHEAD_MIN (256 * 1024)
 #define FA_NET_PIECE 65536                /* most bytes one window write adds */
 #define FA_NET_PLAYLIST_MAX (2 * 1024 * 1024)
 #define FA_NET_RESTART_GAP (256 * 1024)   /* forward seeks closer than this just wait for the data */
@@ -66,6 +68,17 @@ static int seekable_locked(const fa_net* n)
     return n->ranges && n->length >= 0 && !n->live && !n->hls;
 }
 
+/* Radio with a stated bitrate (icy-br): twice prebuffer_ms plus 5 s ahead, which
+ * covers the prebuffer (fa_net_can_decode asks at most 3/4 of the limit) and the
+ * server's burst on connect, instead of FA_NET_AHEAD for every station. A wrong
+ * icy-br only shortens the prebuffer. Caller holds the lock. */
+static int64_t radio_ahead_locked(const fa_net* n)
+{
+    int64_t ahead = (int64_t)n->icy_br * 125 * (2 * (int64_t)n->cfg.prebuffer_ms + 5000) / 1000;
+    if (ahead < FA_NET_RADIO_AHEAD_MIN) ahead = FA_NET_RADIO_AHEAD_MIN;
+    return ahead > FA_NET_AHEAD ? FA_NET_AHEAD : ahead;
+}
+
 /* Appends audio bytes, waiting while the reader is far enough behind.
  * Caller does not hold the lock. Returns 1 to stop the transfer. */
 static int window_write(fa_net* n, const uint8_t* data, size_t size)
@@ -75,7 +88,9 @@ static int window_write(fa_net* n, const uint8_t* data, size_t size)
         /* Made with the first audio, once it is known whether the decoder can seek:
          * radio and other streams that can't never read behind the read position,
          * so they keep only the part ahead (it can't fall behind it, see below). */
-        int64_t cap = seekable_locked(n) ? FA_NET_WINDOW : n->ahead_limit + FA_NET_PIECE;
+        int64_t cap;
+        if (!seekable_locked(n) && !n->hls && n->icy_br) n->ahead_limit = radio_ahead_locked(n);
+        cap = seekable_locked(n) ? FA_NET_WINDOW : n->ahead_limit + FA_NET_PIECE;
         n->buf = (uint8_t*)malloc((size_t)cap);
         if (!n->buf) {
             if (n->error == FA_OK) n->error = FA_ERROR_OUT_OF_MEMORY;

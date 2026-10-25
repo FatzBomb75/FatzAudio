@@ -69,13 +69,27 @@ void fa_engine_track_stream(fa_engine* e, struct fa_stream* s, int add)
     fa_mutex_unlock(&e->list_lock);
 }
 
+/* The polling worker's next sleep: until the stream whose ring empties first could
+ * want a top-up. Caller holds list_lock. */
+static uint32_t poll_ms_locked(fa_engine* e)
+{
+    uint32_t ms = FA_WORKER_POLL_IDLE_MS;
+    struct fa_stream* s;
+    for (s = e->streams; s; s = s->next) {
+        uint32_t t = fa_stream_poll_ms(s);
+        if (t && t < ms) ms = t;
+    }
+    return ms;
+}
+
 /* Each worker repeatedly takes the attached stream with the emptiest buffer that
  * nobody else is decoding (try-lock on its decode lock) and tops it up. A stream
  * another worker is busy with is skipped, so one slow source never keeps idle
  * workers from the others. The audio thread never has to signal anything: of the
- * workers with nothing to do, one polls every 5 ms (100 ms while the engine has no
- * streams at all: adding one wakes it), and the others sleep until it, or an API
- * call with work for them (a push, a seek, a new stream), wakes them. A worker that
+ * workers with nothing to do, one polls as often as the emptiest ring needs (a
+ * quarter of what it holds, 5 to 50 ms; 100 ms while no stream has anything to
+ * decode: the API calls that change that wake it), and the others sleep until it,
+ * or an API call with work for them (a push, a seek, a new stream), wakes them. A worker that
  * finds more streams wanting decoding than the one it takes wakes one more, which
  * does the same, so busy moments still get every worker. Workers with no decoding to
  * do render ahead for drawing surfaces that asked for it (cdg.c). */
@@ -125,7 +139,7 @@ static void worker_main(void* arg)
         e->workers_idle++;
         if (!e->work_poller) {
             e->work_poller = 1;
-            fa_cond_wait_ms(&e->work_cond, &e->list_lock, e->streams ? 5 : 100);
+            fa_cond_wait_ms(&e->work_cond, &e->list_lock, poll_ms_locked(e));
             e->work_poller = 0;
         } else {
             fa_cond_wait_ms(&e->work_cond, &e->list_lock, UINT32_MAX);   /* until woken */

@@ -241,6 +241,9 @@ int fa_probe_mp3_header(const uint8_t* data, size_t size, size_t start, uint32_t
 
 #define FA_MIDI_DEFAULT_RATE 44100
 #define FA_MIDI_BUFFER_MS 150       /* default decode-ahead of MIDI streams (live controls) */
+#define FA_WORKER_POLL_MIN_MS 5     /* the polling worker's shortest and longest sleep (worker_main) */
+#define FA_WORKER_POLL_MAX_MS 50
+#define FA_WORKER_POLL_IDLE_MS 100  /* ... while no stream has anything to decode */
 
 /* Soundfont references: retain returns `f` (NULL-safe); the last release frees it. */
 /* DLS banks (dls.c), turned into a SoundFont 2 image the synthesizer loads. */
@@ -1346,6 +1349,7 @@ fa_result fa_param_check(fa_param param, float* value);
  * block starting there (from_here 1) or ending there (0). */
 void fa_bus_gains_at(struct fa_bus* b, fa_device* dev, int64_t off, int from_here, float* gl, float* gr);
 int fa_stream_needs_work(struct fa_stream* s);
+uint32_t fa_stream_poll_ms(struct fa_stream* s);
 void fa_stream_fill(struct fa_stream* s, int64_t max_frames);  /* caller holds decode_lock */
 /* Workers: a pending fa_stream_seek_async, then fa_stream_fill. Caller holds decode_lock.
  * Returns 0 when nothing could be done yet (the API lock was busy). */

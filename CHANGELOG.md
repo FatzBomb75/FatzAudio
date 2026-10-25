@@ -171,6 +171,10 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
 ### Changed
+- The idle decode worker that watches playing streams wakes as often as the emptiest buffer needs (a quarter of what
+  it holds, 5 to 50 ms) instead of every 5 ms, so a playing engine wakes about 20 times a second instead of 200.
+- Radio with a stated bitrate (`icy-br`) reads ahead twice `prebuffer_ms` plus 5 s, at least 256 KB, instead of 2 MB:
+  about 1.8 MB less per 128 kbps station. Streams without `icy-br`, and HLS, keep 2 MB.
 - The surface bevel reaches at most half as far in as a stroke's middle, so a thin stroke is never filled in by it
   (CD+G and lyric surfaces). Wide strokes look as before.
 - CD+G: a surface allocates its own pixels on the first `fa_cdg_surface_update` instead of at create, so out of
