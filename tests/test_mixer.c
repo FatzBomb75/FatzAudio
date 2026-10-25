@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#  include <TargetConditionals.h>
+#endif
 
 static int g_failures = 0;
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); g_failures++; return; } } while (0)
@@ -634,7 +637,11 @@ static void test_config_errors(void)
     fa_mixer_config_init(&c);
     c.cue_mode = FA_CUE_DEVICE;
     c.cue_device_id = "zz";      /* not hex */
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    CHECK_EQ(fa_mixer_create(g_engine, &c, &m), FA_ERROR_NOT_IMPLEMENTED);   /* no second output on iOS */
+#else
     CHECK_EQ(fa_mixer_create(g_engine, &c, &m), FA_ERROR_INVALID_ARG);
+#endif
     fa_mixer_config_init(&c);
     c.flags = 2;
     CHECK_EQ(fa_mixer_create(g_engine, &c, &m), FA_ERROR_INVALID_ARG);

@@ -555,6 +555,26 @@ static void test_unsupported_configs(void)
 #  else
 #    define OS_AAC_OPEN fa_mc_codec_open
 #  endif
+/* Two second-order Butterworth low-pass sections (24 dB/octave) at `hz`. */
+static void lowpass(float* x, int64_t n, int stride, double hz, double rate)
+{
+    double w = 2 * 3.14159265358979 * hz / rate, al = sin(w) / (2 * sqrt(0.5)), c = cos(w);
+    double b0 = (1 - c) / 2, b1 = 1 - c, b2 = (1 - c) / 2, a0 = 1 + al, a1 = -2 * c, a2 = 1 - al;
+    int pass;
+    for (pass = 0; pass < 2; pass++) {
+        double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+        int64_t i;
+        for (i = 0; i < n; i++) {
+            double v = x[i * stride], y = (b0 * v + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2) / a0;
+            x2 = x1;
+            x1 = v;
+            y2 = y1;
+            y1 = y;
+            x[i * stride] = (float)y;
+        }
+    }
+}
+
 /* The system's own AAC decoder (Media Foundation, AudioToolbox, MediaCodec), which
  * the library uses for xHE-AAC: given HE-AAC here, it must give the built-in
  * decoder's audio (to within the two decoders' differences, after lining them up).
@@ -622,8 +642,14 @@ static void test_os_decoder(void)
     CHECK_EQ(c.rate, 44100);
     CHECK_EQ(c.channels, 2);
     fa_codec_close(&c);
-    /* The decoders' delays differ: line the left channels up over a stretch of music. */
+    /* SBR rebuilds the high band from noise and envelopes, differently in every
+     * decoder: only the LC core under it must match, so compare below 4 kHz. */
     frames = os.n / 2 < ref.n / 2 ? os.n / 2 : ref.n / 2;
+    for (k = 0; k < 2; k++) {
+        lowpass(ref.p + k, (int64_t)(ref.n / 2), 2, 4000, 44100);
+        lowpass(os.p + k, (int64_t)(os.n / 2), 2, 4000, 44100);
+    }
+    /* The decoders' delays differ: line the left channels up over a stretch of music. */
     CHECK(frames > from + span + 2048);
     for (lag = -2048; lag <= 2048; lag++) {
         double dot = 0;
@@ -637,7 +663,7 @@ static void test_os_decoder(void)
         sx += (double)ref.p[i * 2] * ref.p[i * 2] + (double)ref.p[i * 2 + 1] * ref.p[i * 2 + 1];
     }
     snr = se > 0 ? 10 * log10(sx / se) : 999;
-    printf("  lag %d frames, %.1f dB against the built-in decoder\n", best_lag, snr);
+    printf("  lag %d frames, %.1f dB against the built-in decoder below 4 kHz\n", best_lag, snr);
     CHECK(snr > 20);
     free(os.p);
     free(ref.p);
