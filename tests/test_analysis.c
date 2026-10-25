@@ -885,6 +885,8 @@ static void test_cache(void)
     if (!tmp || !*tmp) tmp = getenv("TMP");
 #if defined(_WIN32)
     if (!tmp || !*tmp) tmp = ".";
+#elif defined(__ANDROID__)
+    if (!tmp || !*tmp) tmp = "/data/local/tmp";   /* Android has no /tmp */
 #else
     if (!tmp || !*tmp) tmp = "/tmp";
 #endif
