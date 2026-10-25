@@ -486,12 +486,29 @@ static void test_loop_beats(void)
     rig_close(&r);
 }
 
+/* fa_deck_beat_jump, again after a callback while it is FA_ERROR_BUSY (its join is not
+ * decoded yet: slow machines). Returns the frames rendered meanwhile, -1 on an error. */
+static int64_t jump(rig* r, fa_deck* d, double beats)
+{
+    int64_t n = 0;
+    int i;
+    for (i = 0; i < 400; i++) {
+        fa_result e = fa_deck_beat_jump(d, beats);
+        if (e == FA_OK) return n;
+        if (e != FA_ERROR_BUSY) return -1;
+        rig_run(r, 480);
+        n += 480;
+    }
+    return -1;
+}
+
 /* Beat jumps: whole beats from where the deck is heard, at once; a loop moves along. */
 static void test_beat_jump(void)
 {
     rig r;
     fa_stream *a, *b;
     fa_frames p0, p1, in = 0, out = 0;
+    int64_t w;
     double beat = seconds(0.5);
     CHECK(rig_open(&r));
     a = load(r.a, (uint32_t)seconds(30), 120.0, 700);
@@ -508,20 +525,21 @@ static void test_beat_jump(void)
     CHECK_EQ(fa_stream_play_at(a, at_frame(&r, 480)), FA_OK);
     rig_run(&r, (uint32_t)seconds(1.0));
     p0 = pos(a);
-    CHECK_EQ(fa_deck_beat_jump(r.a, 8.0), FA_OK);
+    CHECK((w = jump(&r, r.a, 8.0)) >= 0);
     rig_run(&r, (uint32_t)seconds(1.0));
     p1 = pos(a);
-    CHECK_EQ(p1 - p0, (fa_frames)seconds(1.0) + (fa_frames)(8.0 * beat));
+    CHECK_EQ(p1 - p0, w + (fa_frames)seconds(1.0) + (fa_frames)(8.0 * beat));
     p0 = p1;
-    CHECK_EQ(fa_deck_beat_jump(r.a, -4.0), FA_OK);
+    CHECK((w = jump(&r, r.a, -4.0)) >= 0);
     rig_run(&r, (uint32_t)seconds(0.5));
-    CHECK_EQ(pos(a) - p0, (fa_frames)seconds(0.5) - (fa_frames)(4.0 * beat));
+    CHECK_EQ(pos(a) - p0, w + (fa_frames)seconds(0.5) - (fa_frames)(4.0 * beat));
     /* A 4-beat loop moves 4 beats on, and keeps looping there. */
     CHECK_EQ(fa_deck_set_loop_beats(r.a, 4.0), FA_OK);
     fa_deck_get_loop(r.a, &in, &out);
     CHECK_EQ(out - in, (fa_frames)(4.0 * beat));
     p0 = pos(a);
-    CHECK_EQ(fa_deck_beat_jump(r.a, 4.0), FA_OK);
+    CHECK((w = jump(&r, r.a, 4.0)) >= 0);
+    p0 += w;
     {
         fa_frames in2 = 0, out2 = 0;
         fa_deck_get_loop(r.a, &in2, &out2);
@@ -551,9 +569,9 @@ static void test_beat_jump_synced(void)
     rig_run(&r, (uint32_t)seconds(0.2));
     CHECK_EQ(fa_deck_play_synced(r.b, r.a, FA_SYNC_BEAT | FA_SYNC_LOCK), FA_OK);
     rig_run(&r, (uint32_t)seconds(1.5));
-    CHECK_EQ(fa_deck_beat_jump(r.b, 16.0), FA_OK);
+    CHECK(jump(&r, r.b, 16.0) >= 0);
     rig_run(&r, (uint32_t)seconds(1.0));
-    CHECK_EQ(fa_deck_beat_jump(r.b, -1.0), FA_OK);
+    CHECK(jump(&r, r.b, -1.0) >= 0);
     rig_run(&r, (uint32_t)seconds(1.0));
     memset(&bi, 0, sizeof(bi));
     bi.struct_size = sizeof(bi);
