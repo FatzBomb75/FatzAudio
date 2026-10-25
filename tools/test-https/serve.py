@@ -44,7 +44,9 @@ def main():
     ctx.load_cert_chain(os.path.join(out, "server.crt"), os.path.join(out, "server.key"))
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=root)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
-    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    # The handshake happens in each request's thread, not in accept(): a client that
+    # connects and stalls (a port probe) cannot hold up the next one.
+    server.socket = ctx.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
     print("serving %s on https://127.0.0.1:%d/" % (root, port), flush=True)
     server.serve_forever()
 

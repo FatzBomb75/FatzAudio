@@ -137,3 +137,6 @@ jobs:
           FA_TEST_REAL_SYSTEM: '1'
           FA_NET_HTTPS_URL: https://127.0.0.1:8443/net/tone_cbr.mp3
         run: ctest --test-dir build-iossim -j 3 --output-on-failure
+      - name: HTTPS test server log
+        if: failure()
+        run: cat "$RUNNER_TEMP/https.log"
