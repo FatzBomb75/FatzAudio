@@ -353,6 +353,24 @@ void fa_onset_free(fa_onset* o);
 fa_result fa_onset_process(fa_onset* o, const float* mono, int64_t frames);
 int fa_onset_grid(fa_onset* o, double min_bpm, double max_bpm, double tag_bpm, fa_grid_data* out);
 
+/* Tempo maps from tracked beats (beat_map.c): stretches of one tempo, joined end to
+ * end. Beat numbers count from the first beat kept (0); times are the beats' units. */
+typedef struct fa_beat_seg {
+    double beat;     /* beat number where the stretch starts */
+    double t;        /* its time */
+    double period;   /* time per beat in it */
+} fa_beat_seg;
+/* Beat times (rising) and their typical period, `fr` time units per second: the
+ * number of stretches (*out_segs malloc'ed) when the tempo changes, 0 when one tempo
+ * fits them (nothing allocated), -1 out of memory. */
+int fa_beat_map(const double* beats, int64_t nb, double period, double fr, fa_beat_seg** out_segs);
+double fa_beat_map_time(const fa_beat_seg* s, int n, double beat);
+double fa_beat_map_beat(const fa_beat_seg* s, int n, double t);
+/* Bars from per-beat harmony change and low-band accent (n beats): 1 with the beats
+ * per bar (4, or 3) and the beat (0 = the first given) that starts one, when that is
+ * clear; else 0. */
+int fa_beat_bars(const float* change, const float* accent, int64_t n, uint32_t* beats_per_bar, uint32_t* offset);
+
 /* Chroma and key (key.c): feed mono audio, then ask for the key (0 = none). */
 typedef struct fa_chroma fa_chroma;
 fa_chroma* fa_chroma_new(uint32_t rate);
