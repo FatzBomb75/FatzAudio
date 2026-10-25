@@ -702,6 +702,9 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_deck_set_loop_beats(nint deck, double beats);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_deck_beat_jump(nint deck, double beats);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_deck_get_beat_info(nint deck, FaDeckBeatInfo* info);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

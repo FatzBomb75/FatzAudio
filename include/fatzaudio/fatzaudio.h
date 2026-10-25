@@ -1410,6 +1410,18 @@ FA_API fa_result FA_CALL fa_deck_play_synced(fa_deck* deck, fa_deck* leader, uin
  * the loop off (fa_deck_set_loop with 0, 0). The deck must be playing or paused with a
  * stream on it (FA_ERROR_NOT_FOUND when empty or without a grid). */
 FA_API fa_result FA_CALL fa_deck_set_loop_beats(fa_deck* deck, double beats);
+/* Beat jump: moves the deck `beats` beats on its grid (negative = back; 1/16..1024 either
+ * way, e.g. 1, 4, 16, 32), at once and seamlessly (a join like a loop's). The distance is
+ * whole grid beats from where the deck is heard, so a jump of whole beats keeps the beat
+ * exactly where it was: a synced deck stays on the leader's beat. While a deck loop is on,
+ * the loop moves with it (the same beats), as a CDJ's loop move does. On a paused or
+ * stopped deck it moves the position. A jump past the song's end ends it; one before its
+ * start lands on frame 0. A locked deck (FA_SYNC_LOCK) is pulled back on its next beat
+ * unless the jump is whole beats (with FA_SYNC_BAR: whole bars). FA_ERROR_NOT_FOUND when
+ * the deck is empty or has no grid; FA_ERROR_BUSY while sync's own jump or the previous
+ * beat jump waits to be decoded (try again a moment later); FA_ERROR_NOT_SEEKABLE for live
+ * streams. */
+FA_API fa_result FA_CALL fa_deck_beat_jump(fa_deck* deck, double beats);
 
 typedef struct fa_deck_beat_info {
     uint32_t struct_size;      /* sizeof(fa_deck_beat_info) */
@@ -1438,6 +1450,16 @@ FA_API fa_result FA_CALL fa_deck_get_beat_info(fa_deck* deck, fa_deck_beat_info*
  *    crossfade: auto-mix never fails unattended.
  *  - The crossfader is ramped with its curve (fa_mixer_set_crossfader_curve) toward the
  *    incoming deck's side; decks on the same side, or thru, are started but not faded.
+ *  - BASS_SWAP: the incoming deck's low band is killed until the middle of the transition
+ *    (on a beat when beat-aligned), then the two decks' lows swap over one beat (0.5 s, or
+ *    a quarter of a short transition, when not aligned): the outgoing deck's low goes to
+ *    FA_DECK_EQ_KILL_DB as the incoming one's comes back to where it was. Auto-mix owns
+ *    both decks' FA_DECK_EQ_LOW_DB meanwhile; when it is done (or cut short) both go back
+ *    to their settings from before. Only for an incoming deck that auto-mix starts.
+ *  - RESTORE_TEMPO: when the transition is done, an incoming deck whose tempo auto-mix
+ *    moved (MATCH_TEMPO) glides back to the tempo it had before, over restore_time. Its
+ *    FA_PARAM_TEMPO ramps (no FA_EVENT_RAMP_DONE is raised); setting the tempo, a sync with
+ *    FA_SYNC_TEMPO or a new stream takes over from the glide (a sync without TEMPO does not).
  *  - When the transition is done, the outgoing deck is stopped.
  * Mixer events (fa_mixer_set_event_callback): FA_EVENT_AUTOMIX_STARTED when the incoming
  * deck is heard, FA_EVENT_AUTOMIX_DONE when the crossfader is across (index and value =
@@ -1451,8 +1473,9 @@ typedef enum fa_automix_flags {
     FA_AUTOMIX_MATCH_TEMPO   = 1 << 0,  /* bring the incoming deck to the outgoing BPM (within
                                            max_tempo_change, half or double time allowed) */
     FA_AUTOMIX_ALIGN_BEATS   = 1 << 1,  /* start on a bar, length in whole bars */
-    FA_AUTOMIX_BASS_SWAP     = 1 << 2,  /* (planned) */
-    FA_AUTOMIX_RESTORE_TEMPO = 1 << 3   /* (planned) */
+    FA_AUTOMIX_BASS_SWAP     = 1 << 2,  /* the incoming low killed until the middle, then the lows
+                                           swap over one beat */
+    FA_AUTOMIX_RESTORE_TEMPO = 1 << 3   /* afterwards the incoming deck glides back to its own tempo */
 } fa_automix_flags;
 
 typedef struct fa_automix_options {
@@ -1463,12 +1486,12 @@ typedef struct fa_automix_options {
     uint32_t flags;              /* fa_automix_flags, default MATCH_TEMPO | ALIGN_BEATS */
     float    max_tempo_change;   /* 0..0.5, default 0.08: the most MATCH_TEMPO moves TEMPO from 1 */
     float    min_confidence;     /* 0..1, default 0.5: grids below it count as unknown */
-    fa_time  restore_time;       /* (planned) */
+    fa_time  restore_time;       /* RESTORE_TEMPO's glide, 0..300 s (0 = at once), default 20 s */
 } fa_automix_options;
 FA_API void      FA_CALL fa_automix_options_init(fa_automix_options* options);
 /* Turns auto-mix on with `options` (or changes them for the next transition), NULL = off.
  * Turning it off leaves a transition already scheduled to finish, without events.
- * FA_ERROR_INVALID_ARG for values out of range or BASS_SWAP / RESTORE_TEMPO (planned). */
+ * FA_ERROR_INVALID_ARG for values out of range or unknown flags. */
 FA_API fa_result FA_CALL fa_mixer_set_automix(fa_mixer* mixer, const fa_automix_options* options);
 /* Skip: starts the next transition now (on the next bar when beat-aligned).
  * FA_ERROR_NOT_FOUND when auto-mix is off, no deck plays or the other deck has nothing new

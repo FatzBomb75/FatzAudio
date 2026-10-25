@@ -486,6 +486,84 @@ static void test_loop_beats(void)
     rig_close(&r);
 }
 
+/* Beat jumps: whole beats from where the deck is heard, at once; a loop moves along. */
+static void test_beat_jump(void)
+{
+    rig r;
+    fa_stream *a, *b;
+    fa_frames p0, p1, in = 0, out = 0;
+    double beat = seconds(0.5);
+    CHECK(rig_open(&r));
+    a = load(r.a, (uint32_t)seconds(30), 120.0, 700);
+    b = load(r.b, (uint32_t)seconds(30), 0.0, 0);   /* no grid */
+    CHECK(a && b);
+    CHECK_EQ(fa_deck_beat_jump(r.b, 4.0), FA_ERROR_NOT_FOUND);
+    CHECK_EQ(fa_deck_beat_jump(r.a, 0.0), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_deck_beat_jump(r.a, 2000.0), FA_ERROR_INVALID_ARG);
+    /* Paused (never played): the position moves. */
+    CHECK_EQ(fa_deck_beat_jump(r.a, 2.0), FA_OK);
+    CHECK_EQ(pos(a), (fa_frames)(2.0 * beat));
+    CHECK_EQ(fa_deck_beat_jump(r.a, -8.0), FA_OK);   /* before the start: frame 0 */
+    CHECK_EQ(pos(a), 0);
+    CHECK_EQ(fa_stream_play_at(a, at_frame(&r, 480)), FA_OK);
+    rig_run(&r, (uint32_t)seconds(1.0));
+    p0 = pos(a);
+    CHECK_EQ(fa_deck_beat_jump(r.a, 8.0), FA_OK);
+    rig_run(&r, (uint32_t)seconds(1.0));
+    p1 = pos(a);
+    CHECK_EQ(p1 - p0, (fa_frames)seconds(1.0) + (fa_frames)(8.0 * beat));
+    p0 = p1;
+    CHECK_EQ(fa_deck_beat_jump(r.a, -4.0), FA_OK);
+    rig_run(&r, (uint32_t)seconds(0.5));
+    CHECK_EQ(pos(a) - p0, (fa_frames)seconds(0.5) - (fa_frames)(4.0 * beat));
+    /* A 4-beat loop moves 4 beats on, and keeps looping there. */
+    CHECK_EQ(fa_deck_set_loop_beats(r.a, 4.0), FA_OK);
+    fa_deck_get_loop(r.a, &in, &out);
+    CHECK_EQ(out - in, (fa_frames)(4.0 * beat));
+    p0 = pos(a);
+    CHECK_EQ(fa_deck_beat_jump(r.a, 4.0), FA_OK);
+    {
+        fa_frames in2 = 0, out2 = 0;
+        fa_deck_get_loop(r.a, &in2, &out2);
+        CHECK_EQ(in2, in + (fa_frames)(4.0 * beat));
+        CHECK_EQ(out2, out + (fa_frames)(4.0 * beat));
+        rig_run(&r, (uint32_t)seconds(0.3));
+        CHECK_NEAR((double)pos(a), (double)p0 + 4.0 * beat + seconds(0.3), 1.0);
+        rig_run(&r, (uint32_t)seconds(5.0));   /* two and a half turns */
+        p1 = pos(a);
+        CHECK(p1 >= in2 && p1 < out2);
+        CHECK_NEAR((double)((p1 - in2) - (p0 + (fa_frames)(4.0 * beat) - in2)), seconds(5.3) - 2.0 * (double)(out2 - in2), 1.0);
+    }
+    rig_close(&r);
+}
+
+/* A beat jump on a locked deck keeps it on the leader's beat. */
+static void test_beat_jump_synced(void)
+{
+    rig r;
+    fa_stream *a, *b;
+    fa_deck_beat_info bi;
+    CHECK(rig_open(&r));
+    a = load(r.a, (uint32_t)seconds(30), 120.0, 0);
+    b = load(r.b, (uint32_t)seconds(30), 120.0, 700);
+    CHECK(a && b);
+    CHECK_EQ(fa_stream_play_at(a, at_frame(&r, 480)), FA_OK);
+    rig_run(&r, (uint32_t)seconds(0.2));
+    CHECK_EQ(fa_deck_play_synced(r.b, r.a, FA_SYNC_BEAT | FA_SYNC_LOCK), FA_OK);
+    rig_run(&r, (uint32_t)seconds(1.5));
+    CHECK_EQ(fa_deck_beat_jump(r.b, 16.0), FA_OK);
+    rig_run(&r, (uint32_t)seconds(1.0));
+    CHECK_EQ(fa_deck_beat_jump(r.b, -1.0), FA_OK);
+    rig_run(&r, (uint32_t)seconds(1.0));
+    memset(&bi, 0, sizeof(bi));
+    bi.struct_size = sizeof(bi);
+    CHECK_EQ(fa_deck_get_beat_info(r.b, &bi), FA_OK);
+    CHECK_NEAR(bi.phase_error_ms, 0.0, 1.0);
+    CHECK_NEAR(tempo_of(b), 1.0, 1e-6);   /* nothing to pull in */
+    CHECK_NEAR(frame_phase(a, 0, b, 700, seconds(0.5)), 0.0, 1.0);
+    rig_close(&r);
+}
+
 /* ---- auto-mix ---------------------------------------------------------------- */
 
 static int find_event(rig* r, fa_event_type type, int index)
@@ -607,7 +685,10 @@ static void test_automix_empty_and_skip(void)
     o.length = 100;
     CHECK_EQ(fa_mixer_set_automix(r.m, &o), FA_ERROR_INVALID_ARG);
     fa_automix_options_init(&o);
-    o.flags |= FA_AUTOMIX_BASS_SWAP;
+    o.flags |= 1u << 4;
+    CHECK_EQ(fa_mixer_set_automix(r.m, &o), FA_ERROR_INVALID_ARG);
+    fa_automix_options_init(&o);
+    o.restore_time = 301000000000LL;
     CHECK_EQ(fa_mixer_set_automix(r.m, &o), FA_ERROR_INVALID_ARG);
     rig_close(&r);
 }
@@ -628,6 +709,123 @@ static void test_automix_empty_warning(void)
     CHECK_EQ(r.nev, 1);
     rig_run(&r, (uint32_t)seconds(0.3));
     CHECK_EQ(r.nev, 1);                                    /* once per song */
+    rig_close(&r);
+}
+
+static float low_of(fa_deck* d)
+{
+    float v = 99.0f;
+    fa_deck_get_param(d, FA_DECK_EQ_LOW_DB, &v);
+    return v;
+}
+
+/* BASS_SWAP, beat-aligned: B's low killed until the middle (8 s into 8 bars, a downbeat),
+ * then the lows cross over one beat; A's goes back to its setting once it is stopped. */
+static void test_automix_bass_swap(void)
+{
+    rig r;
+    fa_stream *a, *b;
+    fa_automix_options o;
+    double start;
+    CHECK(rig_open(&r));
+    a = load(r.a, (uint32_t)seconds(40), 120.0, 0);
+    b = load(r.b, (uint32_t)seconds(40), 120.0, 0);
+    CHECK(a && b);
+    CHECK_EQ(fa_stream_set_marker(a, FA_MARKER_MIX_POINT, (fa_frames)seconds(3.0)), FA_OK);
+    CHECK_EQ(fa_deck_set_param(r.a, FA_DECK_EQ_LOW_DB, -3.0f), FA_OK);
+    CHECK_EQ(fa_deck_set_param(r.b, FA_DECK_EQ_LOW_DB, 2.0f), FA_OK);
+    fa_automix_options_init(&o);
+    o.length_beats = 32.0f;
+    o.flags |= FA_AUTOMIX_BASS_SWAP;
+    CHECK_EQ(fa_mixer_set_automix(r.m, &o), FA_OK);
+    CHECK_EQ(fa_stream_play_at(a, at_frame(&r, 480)), FA_OK);
+    rig_run(&r, (uint32_t)seconds(2.5));                 /* scheduled for bar 2 (4 s) */
+    CHECK(r.m->am.phase == AM_SCHEDULED);
+    CHECK_NEAR(low_of(r.b), FA_DECK_EQ_KILL_DB, 1e-6);   /* killed before it starts */
+    start = (double)r.m->am.start;
+    CHECK_NEAR((double)(r.m->am.end - r.m->am.start), seconds(16.0), 1.0);
+    rig_run(&r, (uint32_t)(start + seconds(7.9) - (double)fa_load64(&r.dev->clock)));
+    CHECK_NEAR(low_of(r.b), FA_DECK_EQ_KILL_DB, 1e-6);
+    CHECK_NEAR(low_of(r.a), -3.0, 1e-6);
+    rig_run(&r, (uint32_t)seconds(0.35));                 /* halfway through the beat */
+    CHECK(low_of(r.b) > -40.0f && low_of(r.b) < -10.0f);
+    CHECK(low_of(r.a) > -40.0f && low_of(r.a) < -10.0f);
+    rig_run(&r, (uint32_t)seconds(0.4));
+    CHECK_NEAR(low_of(r.b), 2.0, 1e-6);
+    CHECK_NEAR(low_of(r.a), FA_DECK_EQ_KILL_DB, 1e-6);
+    rig_run(&r, (uint32_t)seconds(8.5));
+    CHECK(find_event(&r, FA_EVENT_AUTOMIX_DONE, 1) >= 0);
+    CHECK_NEAR(low_of(r.a), -3.0, 1e-6);                 /* stopped, and back */
+    CHECK_NEAR(low_of(r.b), 2.0, 1e-6);
+    rig_close(&r);
+}
+
+/* Not aligned: the swap lasts 0.5 s from the middle. Cut short (the incoming deck is
+ * stopped), both lows go back. */
+static void test_automix_bass_swap_cut_short(void)
+{
+    rig r;
+    fa_stream *a, *b;
+    fa_automix_options o;
+    double start;
+    CHECK(rig_open(&r));
+    a = load(r.a, (uint32_t)seconds(10), 0.0, 0);
+    b = load(r.b, (uint32_t)seconds(10), 0.0, 0);
+    CHECK(a && b);
+    fa_automix_options_init(&o);
+    o.length = 4000000000LL;
+    o.flags |= FA_AUTOMIX_BASS_SWAP;
+    CHECK_EQ(fa_mixer_set_automix(r.m, &o), FA_OK);
+    CHECK_EQ(fa_stream_play_at(a, at_frame(&r, 480)), FA_OK);
+    rig_run(&r, (uint32_t)seconds(4.5));
+    start = (double)r.m->am.start;
+    CHECK(r.m->am.phase != AM_WATCH);
+    rig_run(&r, (uint32_t)(start + seconds(2.25) - (double)fa_load64(&r.dev->clock)));
+    CHECK(low_of(r.b) > -40.0f && low_of(r.b) < -10.0f);
+    rig_run(&r, (uint32_t)seconds(0.3));
+    CHECK_NEAR(low_of(r.b), 0.0, 1e-6);
+    CHECK_NEAR(low_of(r.a), FA_DECK_EQ_KILL_DB, 1e-6);
+    CHECK_EQ(fa_mixer_set_automix(r.m, NULL), FA_OK);   /* else it would start B again */
+    CHECK_EQ(fa_stream_stop(b), FA_OK);
+    rig_run(&r, (uint32_t)seconds(0.1));
+    CHECK(r.m->am.phase == AM_WATCH);
+    CHECK_NEAR(low_of(r.a), 0.0, 1e-6);
+    CHECK_NEAR(low_of(r.b), 0.0, 1e-6);
+    rig_close(&r);
+}
+
+/* RESTORE_TEMPO: after the transition the incoming deck glides from the matched tempo
+ * back to its own over restore_time. */
+static void test_automix_restore_tempo(void)
+{
+    rig r;
+    fa_stream *a, *b;
+    fa_automix_options o;
+    float t0, t1;
+    CHECK(rig_open(&r));
+    a = load(r.a, (uint32_t)seconds(30), 120.0, 0);
+    b = load(r.b, (uint32_t)seconds(30), 125.0, 0);
+    CHECK(a && b);
+    CHECK_EQ(fa_stream_set_marker(a, FA_MARKER_MIX_POINT, (fa_frames)seconds(3.0)), FA_OK);
+    fa_automix_options_init(&o);
+    o.length_beats = 8.0f;
+    o.flags |= FA_AUTOMIX_RESTORE_TEMPO;
+    o.restore_time = 4000000000LL;
+    CHECK_EQ(fa_mixer_set_automix(r.m, &o), FA_OK);
+    CHECK_EQ(fa_stream_play_at(a, at_frame(&r, 480)), FA_OK);
+    rig_run(&r, (uint32_t)seconds(7.0));
+    CHECK(find_event(&r, FA_EVENT_AUTOMIX_DONE, 1) < 0);
+    CHECK_NEAR(tempo_of(b), 0.96, 0.02);                 /* matched (and locked), 4 s to 8 s */
+    rig_run(&r, (uint32_t)seconds(1.5));
+    CHECK(find_event(&r, FA_EVENT_AUTOMIX_DONE, 1) >= 0);
+    CHECK(r.b->leader == NULL);
+    rig_run(&r, (uint32_t)seconds(1.0));
+    t0 = tempo_of(b);
+    rig_run(&r, (uint32_t)seconds(1.0));
+    t1 = tempo_of(b);
+    CHECK(t0 > 0.965f && t1 > t0 && t1 < 0.995f);        /* gliding */
+    rig_run(&r, (uint32_t)seconds(3.0));
+    CHECK_NEAR(tempo_of(b), 1.0, 1e-6);
     rig_close(&r);
 }
 
@@ -652,10 +850,15 @@ int main(void)
     RUN(test_lock_follows);
     RUN(test_stream_jump);
     RUN(test_loop_beats);
+    RUN(test_beat_jump);
+    RUN(test_beat_jump_synced);
     RUN(test_automix_plain);
     RUN(test_automix_aligned);
     RUN(test_automix_empty_and_skip);
     RUN(test_automix_empty_warning);
+    RUN(test_automix_bass_swap);
+    RUN(test_automix_bass_swap_cut_short);
+    RUN(test_automix_restore_tempo);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

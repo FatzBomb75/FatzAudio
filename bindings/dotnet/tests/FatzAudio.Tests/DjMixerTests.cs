@@ -178,6 +178,13 @@ public class DjMixerTests
         Assert.NotNull(a.Loop);
         a.LoopBeats(0);
         Assert.Null(a.Loop);
+        Assert.Equal(ErrorCode.InvalidArgument, Assert.Throws<FatzAudioException>(() => a.BeatJump(0)).ErrorCode);
+        sb.BeatGrid = null;
+        Assert.Equal(ErrorCode.NotFound, Assert.Throws<FatzAudioException>(() => b.BeatJump(4)).ErrorCode);
+        long before = sb.PositionFrames;
+        sb.BeatGrid = new BeatGrid(120, 0, rate);
+        b.BeatJump(4);                                              // paused: the position moves 2 s
+        Assert.Equal(before + 2 * rate, sb.PositionFrames);
     }
 
     [Fact]
@@ -190,9 +197,11 @@ public class DjMixerTests
         Assert.Equal(ErrorCode.NotFound, Assert.Throws<FatzAudioException>(() => mixer.AutoMix.Skip()).ErrorCode);   // off
         Assert.Equal(ErrorCode.InvalidArgument, Assert.Throws<FatzAudioException>(
             () => mixer.AutoMix.Start(new AutoMixOptions { Length = TimeSpan.FromMilliseconds(100) })).ErrorCode);
+        Assert.Equal(ErrorCode.InvalidArgument, Assert.Throws<FatzAudioException>(
+            () => mixer.AutoMix.Start(new AutoMixOptions { RestoreTempo = true, RestoreTime = TimeSpan.FromMinutes(6) })).ErrorCode);
         var started = new TaskCompletionSource<DjDeck>(TaskCreationOptions.RunContinuationsAsynchronously);
         mixer.AutoMix.Started += (s, e) => started.TrySetResult(e.Deck);
-        mixer.AutoMix.Start(new AutoMixOptions { Length = TimeSpan.FromSeconds(1) });
+        mixer.AutoMix.Start(new AutoMixOptions { Length = TimeSpan.FromSeconds(1), BassSwap = true, RestoreTempo = true });
         Assert.True(mixer.AutoMix.IsOn);
         mixer.Decks[0].Load(sa);
         Assert.Equal(ErrorCode.NotFound, Assert.Throws<FatzAudioException>(() => mixer.AutoMix.Skip()).ErrorCode);   // nothing plays

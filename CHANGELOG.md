@@ -20,6 +20,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 - Core Audio Format: `.caf` files open with the ordinary calls. ALAC (to the bit), linear PCM and MP3 play with exact
   length and seeks; other codecs in CAF (AAC, µ-law, ...) return `FA_ERROR_UNSUPPORTED_FORMAT`.
+- DJ mixer: beat jumps (`fa_deck_beat_jump`, .NET `DjDeck.BeatJump`) by whole grid beats, seamless, keeping a synced
+  deck on its leader's beat; a deck loop that is on moves along. Auto-mix bass swap (`FA_AUTOMIX_BASS_SWAP`,
+  `AutoMixOptions.BassSwap`): the incoming low is killed until the middle, then the lows swap over one beat. Auto-mix
+  tempo glide back (`FA_AUTOMIX_RESTORE_TEMPO`, `restore_time`, `AutoMixOptions.RestoreTempo` and `RestoreTime`):
+  the incoming deck returns to its own tempo after the transition. See
+  [docs/features/dj-mixer.md](docs/features/dj-mixer.md#auto-mix).
 - DJ mixer: `fa_mixer_create` opens two decks on one output with channel faders, trim, a three-band isolator EQ with kills
   (Linkwitz-Riley crossovers at 250 Hz and 2.5 kHz), a crossfader with constant-power and linear curves, master gain,
   the limiter always on, and per-deck meters (`fa_deck_get_levels`). Headphone cue on two more outputs of the same

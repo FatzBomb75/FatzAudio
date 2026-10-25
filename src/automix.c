@@ -10,11 +10,12 @@
 #include <math.h>
 #include <string.h>
 
-#define AUTOMIX_FLAGS_ALL (FA_AUTOMIX_MATCH_TEMPO | FA_AUTOMIX_ALIGN_BEATS)
+#define AUTOMIX_FLAGS_ALL (FA_AUTOMIX_MATCH_TEMPO | FA_AUTOMIX_ALIGN_BEATS | FA_AUTOMIX_BASS_SWAP | FA_AUTOMIX_RESTORE_TEMPO)
 #define AUTOMIX_COMMIT_NS 2000000000LL     /* a transition is scheduled this far ahead */
 #define AUTOMIX_EMPTY_NS 30000000000LL     /* DECK_EMPTY this long before a mix */
 #define AUTOMIX_LEAD_NS 50000000           /* the earliest start: this far after the device clock */
 #define AUTOMIX_SAME_TEMPO 0.002           /* without MATCH_TEMPO, beats align only this close */
+#define AUTOMIX_SWAP_S 0.5                 /* a bass swap that is not beat-aligned lasts this long */
 
 FA_API void FA_CALL fa_automix_options_init(fa_automix_options* options)
 {
@@ -25,6 +26,7 @@ FA_API void FA_CALL fa_automix_options_init(fa_automix_options* options)
     options->flags = FA_AUTOMIX_MATCH_TEMPO | FA_AUTOMIX_ALIGN_BEATS;
     options->max_tempo_change = 0.08f;
     options->min_confidence = 0.5f;
+    options->restore_time = 20000000000LL;
 }
 
 static fa_stream* stream_of(struct fa_mixer* m, uint32_t i) { return (fa_stream*)fa_load_ptr(&m->decks[i].stream); }
@@ -153,6 +155,52 @@ static int plan(struct fa_mixer* m, uint32_t o, uint32_t i, int skip, int64_t no
     return 1;
 }
 
+/* The bass swap: the incoming deck's low killed now (it is not heard yet), and from the
+ * middle (a beat of the outgoing deck when aligned) the lows cross over `swap` frames.
+ * Ramps on the device clock, like the crossfader's. */
+static void swap_post(struct fa_mixer* m, struct fa_deck* dout, struct fa_deck* din, const am_plan* p, int64_t start,
+                      int64_t len, double rate)
+{
+    fa_automix* am = &m->am;
+    double beat = 60.0 / p->on.bpm * rate, swap = p->aligned ? beat : AUTOMIX_SWAP_S * rate, mid = (double)len / 2.0;
+    int64_t at;
+    if (swap > (double)len / 4.0 && !p->aligned) swap = (double)len / 4.0;
+    if (swap > (double)len / 2.0) swap = (double)len / 2.0;
+    if (p->aligned) mid = floor(mid / beat + 0.5) * beat;
+    if (mid + swap > (double)len) mid = (double)len - swap;
+    at = start + (int64_t)floor(mid + 0.5);
+    am->low_in = fa_lane_get(&din->lanes[DL_LOW]);
+    am->low_out = fa_lane_get(&dout->lanes[DL_LOW]);
+    /* A plain set of no length, then the ramp from it (a ramp posted before the set is
+     * taken still starts from the set's value). */
+    fa_lane_post(&din->lanes[DL_LOW], FA_DECK_EQ_KILL_DB, 0, NULL, 0, 0, -1, 0, NULL);
+    fa_lane_post(&din->lanes[DL_LOW], am->low_in, (int64_t)(swap / rate * 1e9), NULL, 0, 1, at, 0, NULL);
+    fa_lane_post(&dout->lanes[DL_LOW], FA_DECK_EQ_KILL_DB, (int64_t)(swap / rate * 1e9), NULL, 0, 1, at, 0, NULL);
+    am->swap = 1;
+}
+
+/* The lows back to their settings from before the swap: the outgoing deck's (stopped) when
+ * the transition is done, both when it is cut short. */
+static void swap_undo(struct fa_mixer* m, int both)
+{
+    fa_automix* am = &m->am;
+    if (!am->swap) return;
+    am->swap = 0;
+    fa_lane_post(&m->decks[am->out_deck].lanes[DL_LOW], am->low_out, MIXER_DEZIPPER_NS, NULL, 0, 0, -1, 0, NULL);
+    if (both) fa_lane_post(&m->decks[am->in_deck].lanes[DL_LOW], am->low_in, MIXER_DEZIPPER_NS, NULL, 0, 0, -1, 0, NULL);
+}
+
+/* A transition ends before it is done: the lows go back, the lock ends, no glide. */
+static void cut_short(struct fa_mixer* m)
+{
+    fa_automix* am = &m->am;
+    struct fa_deck* din = &m->decks[am->in_deck];
+    if (am->aligned && din->leader) fa_deck_sync_end(din, 1);
+    swap_undo(m, 1);
+    am->restore = 0;
+    am->phase = AM_WATCH;
+}
+
 /* Schedules the planned transition from deck `o` to deck `i`. */
 static void commit(struct fa_mixer* m, uint32_t o, uint32_t i, am_plan* p, int64_t now)
 {
@@ -195,12 +243,19 @@ static void commit(struct fa_mixer* m, uint32_t o, uint32_t i, am_plan* p, int64
         fa_lane_post(&m->lanes[ML_XF], side_in == 1 ? 0.0f : 1.0f, (int64_t)(p->len * 1e9), &shape, 0, 1,
                      (int64_t)floor(fs + 0.5), 0, NULL);
     }
-    if (p->aligned && st != FA_STATE_PLAYING) {
-        /* Locked to the outgoing deck until the transition is done, measured once heard. */
-        fa_deck_sync_end(din, 0);
-        /* Tempo follows only when MATCH_TEMPO set it (within max_tempo_change). */
-        fa_deck_sync_set(din, &m->decks[o], (p->tempo > 0.0 ? FA_SYNC_TEMPO : 0) | FA_SYNC_BAR | FA_SYNC_BEAT | FA_SYNC_LOCK,
-                         p->factor, p->tempo > 0.0 ? p->tempo : p->in.tempo, now + (int64_t)((fs - speaker) / rate * 1e9) + 150000000);
+    m->am.swap = m->am.restore = 0;
+    if (st != FA_STATE_PLAYING) {   /* only a deck auto-mix starts gets the swap, the glide and the lock */
+        if (m->am.o.flags & FA_AUTOMIX_BASS_SWAP) swap_post(m, &m->decks[o], din, p, (int64_t)floor(fs + 0.5), len, rate);
+        m->am.restore = (m->am.o.flags & FA_AUTOMIX_RESTORE_TEMPO) && p->tempo > 0.0 && fabs(p->tempo - p->in.tempo) > 1e-6;
+        m->am.restore_to = (float)p->in.tempo;
+        m->am.restore_ns = m->am.o.restore_time;
+        if (p->aligned) {
+            /* Locked to the outgoing deck until the transition is done, measured once heard. */
+            fa_deck_sync_end(din, 0);
+            /* Tempo follows only when MATCH_TEMPO set it (within max_tempo_change). */
+            fa_deck_sync_set(din, &m->decks[o], (p->tempo > 0.0 ? FA_SYNC_TEMPO : 0) | FA_SYNC_BAR | FA_SYNC_BEAT | FA_SYNC_LOCK,
+                             p->factor, p->tempo > 0.0 ? p->tempo : p->in.tempo, now + (int64_t)((fs - speaker) / rate * 1e9) + 150000000);
+        }
     }
     m->am.phase = AM_SCHEDULED;
     m->am.out_deck = o;
@@ -227,8 +282,7 @@ void fa_automix_tick(struct fa_mixer* m, int64_t now, fa_mixer_event* ev, uint32
         if (stream_of(m, am->out_deck) != am->out_s || stream_of(m, am->in_deck) != am->in_s ||
             (ist = state_of(am->in_s)) == FA_STATE_STOPPED || ist == FA_STATE_PAUSED) {
             /* A deck was loaded, or the incoming one stopped, meanwhile: the transition is the app's now. */
-            if (am->aligned && din->leader) fa_deck_sync_end(din, 1);
-            am->phase = AM_WATCH;
+            cut_short(m);
             return;
         }
         if (am->phase == AM_SCHEDULED && heard >= (double)am->start) {
@@ -237,7 +291,11 @@ void fa_automix_tick(struct fa_mixer* m, int64_t now, fa_mixer_event* ev, uint32
         }
         if (am->phase == AM_RUNNING && heard >= (double)am->end) {
             fa_stream_stop(am->out_s);
-            if (am->aligned && din->leader) fa_deck_sync_end(din, 1);   /* stays at the tempo it has */
+            /* Stays at the tempo it has, or glides back from there (a bend still on included). */
+            if (am->aligned && din->leader) fa_deck_sync_end(din, !am->restore);
+            if (am->restore) fa_stream_ramp_tempo_quiet(am->in_s, am->restore_to, am->restore_ns);
+            am->restore = 0;
+            swap_undo(m, 0);
             am->mixed_out = am->out_s;
             am->phase = AM_WATCH;
             if (am->on) {
@@ -270,8 +328,7 @@ void fa_automix_loaded(struct fa_mixer* m, struct fa_deck* d, fa_stream* s)
     fa_automix* am = &m->am;
     if (am->phase != AM_WATCH && (d == &m->decks[am->out_deck] || d == &m->decks[am->in_deck])) {
         /* The same address may be a new stream (closed and reopened): the transition ends here. */
-        if (am->aligned && m->decks[am->in_deck].leader) fa_deck_sync_end(&m->decks[am->in_deck], 1);
-        am->phase = AM_WATCH;
+        cut_short(m);
     }
     if (!s) return;
     if (m->am.mixed_out == s) m->am.mixed_out = NULL;
@@ -289,7 +346,7 @@ FA_API fa_result FA_CALL fa_mixer_set_automix(fa_mixer* mixer, const fa_automix_
         o.struct_size = sizeof(o);
         if (o.length < 500000000LL || o.length > 60000000000LL || !(o.length_beats == 0.0f || (o.length_beats >= 1.0f && o.length_beats <= 256.0f)) ||
             (o.flags & ~(uint32_t)AUTOMIX_FLAGS_ALL) || !(o.max_tempo_change >= 0.0f && o.max_tempo_change <= 0.5f) ||
-            !(o.min_confidence >= 0.0f && o.min_confidence <= 1.0f))
+            !(o.min_confidence >= 0.0f && o.min_confidence <= 1.0f) || o.restore_time < 0 || o.restore_time > 300000000000LL)
             return FA_ERROR_INVALID_ARG;
     }
     fa_mutex_lock(&mixer->lock);

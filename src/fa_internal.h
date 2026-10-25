@@ -1324,6 +1324,8 @@ void fa_stream_get_loop_region(struct fa_stream* s, fa_frames* out_in, fa_frames
 /* A one-off jump of `delta` source frames where playback reaches `at` (sync.c's beat
  * jumps); FA_ERROR_BUSY while that is not decoded yet. */
 fa_result fa_stream_jump(struct fa_stream* s, fa_frames at, fa_frames delta);
+/* A TEMPO ramp from where it is that raises no FA_EVENT_RAMP_DONE (auto-mix's glide back). */
+fa_result fa_stream_ramp_tempo_quiet(struct fa_stream* s, float target, fa_time duration);
 /* Device frame at the speaker at monotonic time `now_ns` (latency included). */
 double fa_device_speaker_frame(fa_device* device, int64_t now_ns);
 void fa_device_wait_quiescent(fa_device* device);

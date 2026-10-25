@@ -89,6 +89,20 @@ public sealed partial class DjDeck
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_set_loop_beats(_deck, beats));
     }
 
+    /// <summary>
+    /// Beat jump: moves the deck <paramref name="beats"/> beats on its grid (negative = back; 1/16..1024 either way,
+    /// e.g. 1, 4, 16, 32), at once and seamlessly. Whole beats keep the beat where it was, so a synced deck stays on
+    /// the leader's beat. While a loop is on, the loop moves with it. On a paused or stopped deck it moves the
+    /// position. A locked deck pulls a jump back unless it is whole beats (whole bars with <see cref="SyncMode.Bar"/>).
+    /// </summary>
+    /// <exception cref="FatzAudioException"><see cref="ErrorCode.NotFound"/> when the deck is empty or has no grid;
+    /// <see cref="ErrorCode.Busy"/> while the previous jump waits to be decoded (try again a moment later).</exception>
+    public void BeatJump(double beats)
+    {
+        using var _ = _mixer.Lease();
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_beat_jump(_deck, beats));
+    }
+
     /// <summary>The beat position heard now; null when the deck is empty or its stream has no beat grid.</summary>
     public unsafe DeckBeatInfo? BeatInfo
     {
@@ -124,6 +138,22 @@ public sealed class AutoMixOptions
 
     /// <summary>Grids below this confidence count as unknown, 0..1 (default 0.5).</summary>
     public float MinConfidence { get; init; } = 0.5f;
+
+    /// <summary>
+    /// Bass swap (default false): the incoming deck's low band is killed until the middle of the transition, then the
+    /// two decks' lows swap over one beat (0.5 s when not beat-aligned). Auto-mix owns both decks'
+    /// <see cref="DeckEq.Low"/> meanwhile and puts them back afterwards.
+    /// </summary>
+    public bool BassSwap { get; init; }
+
+    /// <summary>
+    /// After the transition, an incoming deck whose tempo <see cref="MatchTempo"/> moved glides back to its own
+    /// tempo over <see cref="RestoreTime"/> (default false). Setting the tempo, a sync with <see cref="SyncMode.Tempo"/> or a new stream takes over from the glide.
+    /// </summary>
+    public bool RestoreTempo { get; init; }
+
+    /// <summary>How long the <see cref="RestoreTempo"/> glide takes, 0..300 s (default 20 s; 0 = at once).</summary>
+    public TimeSpan RestoreTime { get; init; } = TimeSpan.FromSeconds(20);
 }
 
 /// <summary>A deck in a <see cref="DjAutoMix"/> event.</summary>
@@ -169,7 +199,8 @@ public sealed class DjAutoMix
         NativeMethods.fa_automix_options_init(&n);
         n.Length = TimeConvert.ToNanoseconds(o.Length);
         n.LengthBeats = o.LengthBeats;
-        n.Flags = (o.MatchTempo ? 1u : 0u) | (o.AlignBeats ? 2u : 0u);
+        n.Flags = (o.MatchTempo ? 1u : 0u) | (o.AlignBeats ? 2u : 0u) | (o.BassSwap ? 4u : 0u) | (o.RestoreTempo ? 8u : 0u);
+        n.RestoreTime = TimeConvert.ToNanoseconds(o.RestoreTime);
         n.MaxTempoChange = o.MaxTempoChange;
         n.MinConfidence = o.MinConfidence;
         using (_mixer.Lease()) FatzAudioException.ThrowIfFailed(NativeMethods.fa_mixer_set_automix(_mixer.Native, &n));
