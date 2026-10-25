@@ -1,6 +1,8 @@
 #!/bin/sh
 # Regenerates the Core Audio Format test files of test_demux.c with the ffmpeg CLI.
-# The two ALAC files carry the samples of ../alac/alac16.flac and alac51_24.flac, so
+# ffmpeg cannot write AAC in CAF, so adts_to_caf.py wraps the frames of ADTS test files
+# as Apple's tools do; the reader must give the ADTS file's samples, priming and
+# remainder cut. The two ALAC files carry the samples of ../alac/alac16.flac and alac51_24.flac, so
 # the built-in ALAC decoder must match FLAC to the bit; the others are sines.
 set -e
 cd "$(dirname "$0")"
@@ -29,4 +31,7 @@ for name, frames in (("alac16.caf", 44541), ("alac51_24.caf", 19200)):
         p += 12 + size
     open(name, "wb").write(d)
 PY
+python3 adts_to_caf.py ../tone.aac aac_lc.caf 'aac ' 1024 300
+python3 adts_to_caf.py ../aac/he_stereo.aac aac_he.caf aach 2048 500 5 4        # explicit SBR
+python3 adts_to_caf.py ../aac/he_v2.aac aac_hev2.caf aacp 2048 1000 29 4 --vf   # explicit PS, esds version kept
 ls -l *.caf
