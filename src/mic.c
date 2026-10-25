@@ -799,7 +799,11 @@ void fa_mic_test_feed(fa_mic* mic, const float* frames, uint32_t n)
 
 void fa_mic_test_lose(fa_mic* mic)
 {
-    flag_lost(mic->cap);
+    fa_capture* c = mic->cap;
+    /* As a backend does: the input stops, so its start notification (sent after
+     * ma_device_start returns, and clearing a loss) cannot come after the loss. */
+    if (c->device_ok && ma_device_is_started(&c->device)) ma_device_stop(&c->device);
+    flag_lost(c);
 }
 
 void fa_mic_test_back(fa_mic* mic)
