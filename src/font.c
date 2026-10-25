@@ -1043,6 +1043,17 @@ static void read_info(fa_font* f)
         }
     }
     if (in->descender > 0) in->descender = -in->descender;
+    /* A damaged face's metrics can make a line thousands of ems tall (lyric layers are
+     * sized from them): outside 0.5-3 em, or an ascender outside 0-2.5 em, the usual
+     * 0.9 em ascender and 1.2 em line instead. */
+    {
+        int u = in->units_per_em, a = in->ascender, h = in->ascender - in->descender;
+        if (2 * h < u || h > 3 * u || a < 0 || 2 * a > 5 * u) {
+            in->ascender = (9 * u + 5) / 10;
+            in->descender = in->ascender - (12 * u + 5) / 10;
+        }
+        if (in->line_gap < 0 || in->line_gap > 2 * u) in->line_gap = 0;
+    }
     in->monospace = u32(f->post, 12) != 0;
     read_name(f->name, 1, in->legacy_family, sizeof(in->legacy_family));
     if (!read_name(f->name, 16, in->family, sizeof(in->family))) memcpy(in->family, in->legacy_family, sizeof(in->family));

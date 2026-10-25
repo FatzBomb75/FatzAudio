@@ -464,7 +464,7 @@ static fa_result measure(const job* j, uint32_t kinds, fa_analysis* a)
     struct fa_midi* midi;
     wave_state wave;
     fa_meter meter;
-    int have_meter = 0, want_wave = (kinds & FA_ANALYZE_WAVEFORM) != 0;
+    int have_meter = 0, want_wave = (kinds & FA_ANALYZE_WAVEFORM) != 0, counted = 0;
     float *buf = NULL, *mono = NULL;
     fa_frames total = 0;
     uint32_t ch, rate;
@@ -499,12 +499,18 @@ static fa_result measure(const job* j, uint32_t kinds, fa_analysis* a)
         r = fa_meter_init(&meter, rate, ch, 1, 0);
         have_meter = r == FA_OK;
     }
-    if (r == FA_OK) {
+    /* Only a MIDI file's exact grid wanted: its length is known, so the song is not
+     * rendered just to count its frames. */
+    if (r == FA_OK && midi && !onset && !chroma && !want_wave && !have_meter && dec.length >= 0) {
+        total = dec.length;
+        counted = 1;
+    }
+    if (r == FA_OK && !counted) {
         buf = (float*)malloc((size_t)FA_ANALYSIS_READ * ch * sizeof(float));
         mono = (float*)malloc((size_t)FA_ANALYSIS_READ * sizeof(float));
         if (!buf || !mono) r = FA_ERROR_OUT_OF_MEMORY;
     }
-    while (r == FA_OK) {
+    while (r == FA_OK && !counted) {
         fa_frames got = 0, i;
         fa_result rr = fa_decoder_read(&dec, buf, FA_ANALYSIS_READ, &got);
         if (got <= 0) { if (rr != FA_ERROR_END_OF_STREAM && rr != FA_OK) r = rr; break; }

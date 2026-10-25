@@ -13,6 +13,10 @@
 
 #define RASTER_TOLERANCE 0.04f        /* flattening error, pixels */
 #define RASTER_MAX_STEPS 256
+/* Curve pieces of one path: a glyph has at most FONT_MAX_COMMANDS commands, and 256
+ * pieces each would cost a crafted glyph seconds. Past it, curves are drawn as single
+ * lines (the outline stays closed, only coarser). */
+#define RASTER_MAX_SEGMENTS (1 << 20)
 
 int fa_raster_begin(fa_raster* r, int w, int h)
 {
@@ -89,18 +93,25 @@ void fa_raster_line(fa_raster* r, float x0, float y0, float x1, float y1)
     }
 }
 
-static int steps_for(float dev)
+static int steps_for(float dev, long* budget)
 {
-    float n;
-    if (!(dev < 1e8f)) return RASTER_MAX_STEPS;   /* also NaN */
-    n = ceilf(sqrtf(dev / RASTER_TOLERANCE));
-    return n < 1.0f ? 1 : n > (float)RASTER_MAX_STEPS ? RASTER_MAX_STEPS : (int)n;
+    float f;
+    int n;
+    if (!(dev < 1e8f)) n = RASTER_MAX_STEPS;   /* also NaN */
+    else {
+        f = ceilf(sqrtf(dev / RASTER_TOLERANCE));
+        n = f < 1.0f ? 1 : f > (float)RASTER_MAX_STEPS ? RASTER_MAX_STEPS : (int)f;
+    }
+    if (n > *budget) n = *budget > 1 ? (int)*budget : 1;
+    *budget -= n;
+    return n;
 }
 
 void fa_raster_path(fa_raster* r, const fa_path* p, float sx, float sy, float dx, float dy)
 {
     float cx = 0, cy = 0, mx = 0, my = 0;
     int open = 0;
+    long budget = RASTER_MAX_SEGMENTS;
     size_t i;
     for (i = 0; i < p->count; i++) {
         const fa_path_cmd* c = &p->cmd[i];
@@ -118,7 +129,7 @@ void fa_raster_path(fa_raster* r, const fa_path* p, float sx, float sy, float dx
         case FA_PATH_QUAD: {
             float x1 = c->x1 * sx + dx, y1 = c->y1 * sy + dy;
             float ex = cx - 2 * x1 + x, ey = cy - 2 * y1 + y;
-            int n = steps_for(0.25f * sqrtf(ex * ex + ey * ey)), k;
+            int n = steps_for(0.25f * sqrtf(ex * ex + ey * ey), &budget), k;
             float px = cx, py = cy;
             for (k = 1; k <= n; k++) {
                 float t = (float)k / (float)n, u = 1 - t;
@@ -134,7 +145,7 @@ void fa_raster_path(fa_raster* r, const fa_path* p, float sx, float sy, float dx
             float x1 = c->x1 * sx + dx, y1 = c->y1 * sy + dy, x2 = c->x2 * sx + dx, y2 = c->y2 * sy + dy;
             float ax = cx - 2 * x1 + x2, ay = cy - 2 * y1 + y2, bx = x1 - 2 * x2 + x, by = y1 - 2 * y2 + y;
             float da = sqrtf(ax * ax + ay * ay), db = sqrtf(bx * bx + by * by);
-            int n = steps_for(0.75f * (da > db ? da : db)), k;
+            int n = steps_for(0.75f * (da > db ? da : db), &budget), k;
             float px = cx, py = cy;
             for (k = 1; k <= n; k++) {
                 float t = (float)k / (float)n, u = 1 - t;

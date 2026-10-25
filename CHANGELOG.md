@@ -179,6 +179,13 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
 ### Changed
+- Render-ahead (CD+G and lyric surfaces) is not used on an engine with one worker thread: a 2160p frame with effects
+  there could hold the only worker longer than a tempo stream's buffer lasts. `update_into` draws on your thread.
+- Lyric surfaces: the animation lengths follow `FA_PARAM_TEMPO` in steps of 0.25%, so render-ahead keeps working
+  during a tempo ramp or a DJ sync (every frame used to be drawn on the caller's thread then), and they read the tempo
+  without waiting for a seek in progress. `fa_lyric_surface_set_style` keeps the open font when the font fields are
+  unchanged, and a `font_data` font is held once instead of twice; about 10 MB less line cache at 1080p (14 lines
+  instead of 24).
 - The idle decode worker that watches playing streams wakes as often as the emptiest buffer needs (a quarter of what
   it holds, 5 to 50 ms) instead of every 5 ms, so a playing engine wakes about 20 times a second instead of 200.
 - Radio with a stated bitrate (`icy-br`) reads ahead twice `prebuffer_ms` plus 5 s, at least 256 KB, instead of 2 MB:
@@ -245,6 +252,21 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- CD+G and lyric surfaces with render-ahead: `fa_surface_update_into` could copy from a frame buffer that another
+  thread's `fa_surface_set_presentation_size` (and a new layout) or `fa_surface_set_render_ahead(s, 0)` was freeing.
+- Lyric surfaces: a damaged font's vertical metrics (a tiny em with huge ascender and descender) made line layers and
+  the intro card of gigabytes; such a font now gets the usual 0.9 em ascender and 1.2 em line, layers are never taller
+  than the area, and a line that cannot be drawn is not tried again every frame. One glyph's outline is flattened
+  into at most 2^20 pieces, so a crafted glyph cannot take seconds.
+- CAF: a `pakt` chunk is read in growing pieces, so a source of unknown length no longer allocates its claimed size
+  (up to 256 MB) up front, and the packet table never has more entries than the chunk can hold.
+- MIDI: a Set Tempo under 600 µs a quarter no longer makes the exact beat grid invalid (which made the analysis cache
+  be rewritten on every analysis); a beats-only analysis of a MIDI file no longer renders the song to count its
+  frames. Shift-JIS lyrics with a stray byte (at most one in 50 characters), or a character cut between two events,
+  are no longer read as Windows-1252.
+- .NET: `DjDeck.Load` holds a reference on the stream for the call, so a `Dispose` on another thread cannot free it
+  under the native call. `DjMixer.Mics` no longer copies the list on every read, and `TrackAnalysis.Waveform` is
+  read without a second copy.
 - CD+G: copies of a memory preset (repeat count above 0) no longer clear the screen again when a border or tiles
   were drawn between the copies (reported by FatzBomb.MediaControl).
 - CD+G from discs: packs that fail their P/Q parity are corrected (one damaged symbol) or dropped, instead of

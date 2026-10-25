@@ -295,6 +295,48 @@ static void test_composite_bomb(void)
     fa_font_close(f);
 }
 
+static uint32_t be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+static void put16(uint8_t* p, int v) { p[0] = (uint8_t)((unsigned)v >> 8); p[1] = (uint8_t)v; }
+
+/* The offset of table `tag` in a single-face file, or 0. */
+static size_t table_at(const blob* b, const char* tag)
+{
+    uint32_t n = (uint32_t)b->p[4] << 8 | b->p[5], i;
+    for (i = 0; i < n && 12 + 16 * (size_t)(i + 1) <= b->n; i++)
+        if (memcmp(b->p + 12 + 16 * i, tag, 4) == 0) return be32(b->p + 12 + 16 * i + 8);
+    return 0;
+}
+
+/* A damaged face with a tiny em and the largest ascender and descender: the usual
+ * 0.9 / 1.2 em instead of a line 4000 ems tall. */
+static void test_bad_metrics(void)
+{
+    blob b = load("tt.ttf");
+    size_t head, hhea, os2;
+    fa_font* f = NULL;
+    const fa_font_info* in;
+    CHECK(b.n);
+    head = table_at(&b, "head");
+    hhea = table_at(&b, "hhea");
+    os2 = table_at(&b, "OS/2");
+    CHECK(head && hhea && head + 20 <= b.n && hhea + 10 <= b.n);
+    put16(b.p + head + 18, 16);
+    put16(b.p + hhea + 4, 32767);
+    put16(b.p + hhea + 6, -32767);
+    put16(b.p + hhea + 8, 30000);
+    if (os2 && os2 + 74 <= b.n) {
+        put16(b.p + os2 + 68, 32767);
+        put16(b.p + os2 + 70, -32767);
+    }
+    CHECK_EQ(fa_font_open(b.p, b.n, 0, 1, &f), FA_OK);
+    in = fa_font_get_info(f);
+    CHECK_EQ(in->units_per_em, 16);
+    CHECK_EQ(in->ascender, 14);
+    CHECK_EQ(in->descender, -5);
+    CHECK_EQ(in->line_gap, 0);
+    fa_font_close(f);
+}
+
 static uint32_t g_rand = 12345;
 static uint32_t rnd(void)
 {
@@ -492,6 +534,7 @@ int main(void)
     RUN(test_outlines);
     RUN(test_collection);
     RUN(test_composite_bomb);
+    RUN(test_bad_metrics);
     RUN(test_damage);
     RUN(test_find);
     RUN(test_font_dir);
