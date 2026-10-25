@@ -364,6 +364,8 @@ fa_deck_play_synced(b, a, FA_SYNC_TEMPO | FA_SYNC_BAR | FA_SYNC_LOCK);
 fa_deck_set_loop_beats(b, 4);         /* a four-beat loop from the beat heard now */
 fa_deck_set_loop_beats(b, 2);         /* halved: the same start */
 fa_deck_set_loop_beats(b, 0);         /* off */
+fa_deck_beat_jump(b, 16);             /* 16 beats on, at once, still on A's beat */
+fa_deck_beat_jump(b, -4);             /* 4 back */
 
 fa_deck_beat_info info = { sizeof(info) };
 fa_deck_get_beat_info(b, &info);      /* bpm, beat, bar, phase_error_ms, locked */
@@ -376,6 +378,7 @@ songB.BeatGrid = (await engine.AnalyzeAsync(pathB)).Beats;
 songA.Play();
 b.PlaySynced(a, SyncMode.Tempo | SyncMode.Bar | SyncMode.Lock);
 b.LoopBeats(4);
+b.BeatJump(16);                       // a loop that is on moves along
 var info = b.BeatInfo;                // Bpm, Beat, Bar, PhaseErrorMs, Locked, Synced
 b.Unsync();
 ```
@@ -386,6 +389,7 @@ b.Unsync();
 - **Lock** (`FA_SYNC_LOCK`): the engine's event thread looks about 20 times a second and keeps the deck on the leader's beat: it follows the leader's tempo moves and tempo-mapped songs, with a target error under 1 ms. The deck's `FA_PARAM_TEMPO` then moves by itself; set it by hand only after unlocking. Without LOCK a sync is done once (a phase pull ends within 1 ms, or after about eight beats).
 - **Ending it**: `fa_deck_sync(deck, NULL, 0)` (`Unsync`), or loading a stream on either deck. The tempo stays where it is.
 - **Beat loops** (`fa_deck_set_loop_beats`, `LoopBeats`): 1/16..32 beats on the grid, from the beat heard now (a loop shorter than a beat starts on the last whole part of the beat). While a deck loop is on the new one keeps its in point, so halving and doubling work like a DJ's loop buttons. 0 turns the loop off. It is an ordinary [deck loop](#deck-loops), read back with `fa_deck_get_loop` (`Loop`) in frames.
+- **Beat jumps** (`fa_deck_beat_jump`, `BeatJump`): moves the deck by whole grid beats (negative is back; 1/16..1024 either way, e.g. 1, 4, 16, 32) at once, joined seamlessly like a loop. The distance is counted on the grid from the beat heard now, so a jump of whole beats keeps the beat exactly where it was (also on a tempo map) and a synced deck stays on the leader's beat. While a deck loop is on the loop moves along by the same beats, as a CDJ's loop move does (kept inside the song). On a paused or stopped deck the position moves. A jump past the end ends the song; one before the start lands on frame 0. A locked deck is pulled back on its next beat unless the jump keeps what the lock aligns: whole beats with `FA_SYNC_BEAT | FA_SYNC_LOCK`, whole bars with `FA_SYNC_BAR | FA_SYNC_LOCK`. `FA_ERROR_BUSY` while sync's own jump or the previous jump still waits to be decoded (try again a moment later); `FA_ERROR_NOT_SEEKABLE` for live streams.
 - **Beat info** (`fa_deck_get_beat_info`, `BeatInfo`): the heard BPM, the position in beats and bars, and while synced the phase error against the leader in ms (positive: this deck is ahead). `FA_ERROR_NOT_FOUND` (null in .NET) for an empty deck or one without a grid.
 
 ## Auto-mix
@@ -407,6 +411,7 @@ fa_mixer_set_event_callback(mixer, on_mixer, playlist);
 fa_automix_options o;
 fa_automix_options_init(&o);          /* 8 s, match tempo, align beats */
 o.length_beats = 32;                  /* when both grids are good */
+o.flags |= FA_AUTOMIX_BASS_SWAP | FA_AUTOMIX_RESTORE_TEMPO;
 fa_mixer_set_automix(mixer, &o);
 fa_stream_play(first_song);           /* on either deck: auto-mix takes it from here */
 fa_mixer_automix_now(mixer);          /* skip: the next transition now */
@@ -420,7 +425,7 @@ mixer.AutoMix.DeckEmpty += (s, e) =>
     e.Deck.Load(engine.OpenFile(queue.Dequeue()), force: true);
     old?.Dispose();
 };
-mixer.AutoMix.Start(new AutoMixOptions { LengthBeats = 32 });
+mixer.AutoMix.Start(new AutoMixOptions { LengthBeats = 32, BassSwap = true, RestoreTempo = true });
 mixer.AutoMix.Skip();
 ```
 
@@ -428,7 +433,9 @@ mixer.AutoMix.Skip();
 - **Beat-aligned** when `FA_AUTOMIX_ALIGN_BEATS` is set, both grids have at least `min_confidence` and the tempo is within reach: the incoming deck starts on its first downbeat at or after its cue point, on the outgoing deck's downbeat nearest the mix point, and the transition lasts whole bars. With `FA_AUTOMIX_MATCH_TEMPO` the incoming deck is first brought to the outgoing BPM (within `max_tempo_change`, half or double time allowed), and it stays locked to the outgoing deck until the transition is done. Without MATCH_TEMPO beats align only when the tempos already match within 0.2%.
 - **Otherwise** (no grid, a low confidence, tempos too far apart) it is a plain timed crossfade over `length`: auto-mix never fails unattended.
 - **The crossfader** is ramped over the transition toward the incoming deck's side, so it follows the crossfader curve. Decks on the same side, or thru, are started but not faded.
-- **When it is done** the outgoing deck is stopped. The incoming deck keeps the tempo it was mixed in at.
+- **Bass swap** (`FA_AUTOMIX_BASS_SWAP`, `BassSwap`): two basslines at once sound muddy, so the incoming deck's low band is killed until the middle of the transition, and then the lows swap: the outgoing deck's low goes to `FA_DECK_EQ_KILL_DB` while the incoming one's comes back to its setting, over one beat. When beat-aligned the swap starts on the outgoing deck's beat nearest the middle; otherwise it lasts 0.5 s (a quarter of a transition shorter than 2 s). It is scheduled on the device clock like the crossfader. Auto-mix owns both decks' `FA_DECK_EQ_LOW_DB` (`Eq.Low`) during the transition; afterwards (or when it is cut short by a load or a stop) both go back to their settings from before. Only for an incoming deck that auto-mix starts itself.
+- **Tempo glide back** (`FA_AUTOMIX_RESTORE_TEMPO`, `RestoreTempo`): when the transition is done, an incoming deck whose tempo `MATCH_TEMPO` moved glides back to the tempo it had before, over `restore_time` (`RestoreTime`, default 20 s, slow enough not to be noticed; 0 jumps back at once). It is a ramp of the stream's `FA_PARAM_TEMPO` that raises no `FA_EVENT_RAMP_DONE`; setting the tempo, a sync with `FA_SYNC_TEMPO` or a new stream takes over from it (a sync without TEMPO leaves the glide running). Without the flag the incoming deck keeps the tempo it was mixed in at.
+- **When it is done** the outgoing deck is stopped.
 - **Events** (mixer events, on the engine's event thread): `FA_EVENT_AUTOMIX_STARTED` when the incoming deck is heard and `FA_EVENT_AUTOMIX_DONE` when the crossfader is across (index and value: the incoming deck; `Started`, `Done`), and `FA_EVENT_DECK_EMPTY` (index: the idle deck; `DeckEmpty`) when a transition is done, and again 30 s before the next mix point while the idle deck still holds the song that was mixed out, or nothing. If nothing new is loaded, the outgoing song plays to its end.
 - **Skip** (`fa_mixer_automix_now`, `Skip`): the next transition now (on the next bar when beat-aligned). `FA_ERROR_NOT_FOUND` when auto-mix is off, no deck plays, or the idle deck has nothing new; `FA_ERROR_BUSY` while a transition runs.
 - Auto-mix needs the outgoing song's length (a file, memory or disc track, not a live web stream) unless it has a `MIX_POINT` or `FADE_OUT_START` marker. Turning it off (`NULL`, `Stop`) lets a transition already scheduled finish, without events.
@@ -437,10 +444,11 @@ mixer.AutoMix.Skip();
 |---|---|---|
 | `length` / `Length` | 0.5..60 s | 8 s |
 | `length_beats` / `LengthBeats` | 0 (use `length`) or 1..256, when both grids are good | 0 |
-| `flags` / `MatchTempo`, `AlignBeats` | `FA_AUTOMIX_MATCH_TEMPO`, `FA_AUTOMIX_ALIGN_BEATS` (`BASS_SWAP` and `RESTORE_TEMPO` are planned: `FA_ERROR_INVALID_ARG`) | both |
+| `flags` / `MatchTempo`, `AlignBeats`, `BassSwap`, `RestoreTempo` | `FA_AUTOMIX_MATCH_TEMPO`, `FA_AUTOMIX_ALIGN_BEATS`, `FA_AUTOMIX_BASS_SWAP`, `FA_AUTOMIX_RESTORE_TEMPO` | MATCH_TEMPO and ALIGN_BEATS |
 | `max_tempo_change` / `MaxTempoChange` | 0..0.5 | 0.08 |
 | `min_confidence` / `MinConfidence` | 0..1 | 0.5 |
+| `restore_time` / `RestoreTime` | 0..300 s (RESTORE_TEMPO's glide) | 20 s |
 
 ## Planned
 
-More than two decks, beat jumps, a bass swap and a tempo glide back after an auto-mix are pinned in section 19 of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).
+More than two decks, tempo maps from audio and bar detection are pinned in section 19 of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).

@@ -2440,6 +2440,16 @@ static fa_result post_tempo_locked(struct fa_stream* s, fa_param param, float ta
     return FA_OK;
 }
 
+fa_result fa_stream_ramp_tempo_quiet(struct fa_stream* s, float target, fa_time duration)
+{
+    fa_result r = check_param(FA_PARAM_TEMPO, &target);
+    if (r != FA_OK || duration < 0) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&s->api_lock);
+    r = post_tempo_locked(s, FA_PARAM_TEMPO, target, duration, NULL, 0, 0, 0);
+    fa_mutex_unlock(&s->api_lock);
+    return r;
+}
+
 FA_API fa_result FA_CALL fa_stream_set_param(fa_stream* stream, fa_param param, float value)
 {
     fa_result r;

@@ -78,6 +78,11 @@ typedef struct fa_automix {
     fa_stream* in_s;
     int64_t start, end;          /* device frames: the incoming deck is heard, the fade is done */
     int aligned;                 /* beat-aligned: the incoming deck is locked meanwhile */
+    int swap;                    /* BASS_SWAP posted: both decks' lows are auto-mix's until done */
+    float low_in, low_out;       /* their FA_DECK_EQ_LOW_DB before */
+    int restore;                 /* RESTORE_TEMPO: the incoming deck glides back to restore_to when done */
+    float restore_to;
+    fa_time restore_ns;          /* restore_time as committed */
     fa_stream* mixed_out;        /* the last outgoing song: the idle deck still holding it is empty */
     fa_stream* warned;           /* the outgoing song DECK_EMPTY was raised for before its mix */
 } fa_automix;

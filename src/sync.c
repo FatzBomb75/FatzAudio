@@ -455,6 +455,61 @@ FA_API fa_result FA_CALL fa_deck_set_loop_beats(fa_deck* deck, double beats)
     return r;
 }
 
+FA_API fa_result FA_CALL fa_deck_beat_jump(fa_deck* deck, double beats)
+{
+    struct fa_mixer* m;
+    fa_deck_now dn;
+    fa_frames in = 0, out = 0, oin, oout, last;
+    double delta;
+    fa_result r;
+    if (!deck || !(fabs(beats) >= 1.0 / 16.0 - 1e-9 && fabs(beats) <= 1024.0)) return FA_ERROR_INVALID_ARG;
+    m = deck->mixer;
+    fa_mutex_lock(&m->lock);
+    if ((r = fa_deck_look(deck, fa_mixer_now(m), &dn)) != FA_OK) goto done;
+    if (dn.s->push || !dn.s->decoder.seekable) { r = FA_ERROR_NOT_SEEKABLE; goto done; }
+    if (deck->jumping) { r = FA_ERROR_BUSY; goto done; }   /* sync's own jump waits for its beat */
+    /* Whole grid beats from the beat heard now: the phase is kept, also on a tempo map. */
+    delta = floor(src_of_beat(&dn.v, dn.beat + beats) - src_of_beat(&dn.v, dn.beat) + 0.5);
+    last = dn.s->decoder.length > 0 ? dn.s->decoder.length : -1;
+    fa_stream_get_loop_region(dn.s, &in, &out);
+    oin = in;
+    oout = out;
+    if (out > in) {   /* the loop moves along: within the song, its length kept */
+        fa_frames len = out - in, nin = in + (fa_frames)delta;
+        if (nin < 0) nin = 0;
+        if (last > 0 && nin + len > last) nin = last - len;
+        if (nin < 0) nin = 0;
+        delta = (double)(nin - in);
+        in = nin;
+        out = nin + len;
+    }
+    if (!playing(&dn)) {
+        fa_frames at = 0;
+        double p;
+        fa_stream_get_position(dn.s, &at);   /* a pending async seek's target counts */
+        p = (double)at + delta;
+        if (p < 0.0) p = 0.0;
+        if (last > 0 && p > (double)last) p = (double)last;
+        r = fa_stream_seek(dn.s, (fa_frames)p);
+        if (r == FA_OK && out > in) r = fa_stream_set_loop_region(dn.s, in, out);
+        goto done;
+    }
+    if (out > in) {
+        /* Off, the jump (into the moved loop), on again there: each join is seamless. */
+        if ((r = fa_stream_set_loop_region(dn.s, 0, 0)) != FA_OK) goto done;
+        if ((r = fa_stream_jump(dn.s, -1, (fa_frames)delta)) != FA_OK) {
+            fa_stream_set_loop_region(dn.s, oin, oout);
+            goto done;
+        }
+        r = fa_stream_set_loop_region(dn.s, in, out);
+        goto done;
+    }
+    r = fa_stream_jump(dn.s, -1, (fa_frames)delta);
+done:
+    fa_mutex_unlock(&m->lock);
+    return r;
+}
+
 FA_API fa_result FA_CALL fa_deck_get_beat_info(fa_deck* deck, fa_deck_beat_info* out_info)
 {
     fa_deck_beat_info info;
