@@ -5,6 +5,7 @@
 #include "miniaudio.h"
 #include "fa_platform.h"
 #include "tempo.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -921,14 +922,31 @@ static inline int64_t fa_device_align_ns(struct fa_device* d)
 /* Event thread: reopens devices that went away on the system default. */
 void fa_devices_service(fa_engine* e);
 void fa_device_simulate(fa_device* d, int lost);   /* tests: a reroute (0) or a removal (1) */
+/* 1 when the engine's backend can open `mode`: exclusive mode is WASAPI only. */
+static inline int fa_device_mode_supported(const fa_engine* e, fa_latency_mode mode)
+{
+    return mode != FA_LATENCY_EXCLUSIVE || e->context.backend == ma_backend_wasapi;
+}
 
-/* Mute level (0 = audible, 1 = silent) after `n` frames gliding toward `target`:
- * a full mute or unmute takes 5 ms, like a volume change. */
-static inline float fa_mute_glide(float level, float target, int64_t n, uint32_t rate)
+/* A 0..1 level after `n` frames gliding toward `target`, 5 ms end to end like a volume
+ * change: mutes (0 = audible, 1 = silent), a deck's crossfader side, the curve blend. */
+static inline float fa_glide(float level, float target, int64_t n, uint32_t rate)
 {
     float step = rate ? (float)n / ((float)rate * 0.005f) : 1.0f;
     if (level < target) return level + step < target ? level + step : target;
     return level - step > target ? level - step : target;
+}
+
+/* dB to linear gain. */
+static inline float fa_db_to_lin(float db) { return powf(10.0f, db / 20.0f); }
+
+/* 1 when all `n` samples are exactly zero, so an idle effect can skip its block. */
+static inline int fa_all_zero(const float* x, uint32_t n)
+{
+    uint32_t i;
+    for (i = 0; i < n; i++)
+        if (x[i] != 0.0f) return 0;
+    return 1;
 }
 /* ---- Equalizer (eq.c) --------------------------------------------------------
  * API threads write the bands (one at a time: `seq` odd while writing); the audio
@@ -1075,6 +1093,27 @@ float fa_lane_value_at_frame(const fa_param_voice* v, int64_t clock, int64_t fra
 /* Advances a device-clock lane to clock + frames; returns 1 when its ramp finished. */
 int fa_lane_advance(fa_param_voice* v, int64_t clock, int64_t frames);
 
+/* Device-clock lanes in a row (buses, mixer, decks, mics), on the audio thread: take the
+ * posted ramps at a block's start, advance them and publish the values at its end. */
+static inline void fa_lanes_take(fa_lane* lanes, int n, uint32_t rate)
+{
+    int i;
+    for (i = 0; i < n; i++) fa_lane_take(&lanes[i], 1, rate, NULL);
+}
+static inline void fa_lanes_end(fa_lane* lanes, int n, int64_t clock, int64_t frames)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        fa_lane_advance(&lanes[i].v, clock, frames);
+        fa_store_float(&lanes[i].current, lanes[i].v.value);
+    }
+}
+/* The device frame a ramp starts at for `device_time` (0 = at once: -1). */
+static inline int64_t fa_ramp_frame(uint32_t rate, fa_time device_time)
+{
+    return device_time ? (int64_t)((double)device_time * (double)rate / 1e9 + 0.5) : -1;
+}
+
 struct fa_bus {
     fa_device* device;
     fa_lane lanes[FA_MIX_PARAMS];  /* VOLUME, PAN on the device clock */
@@ -1105,7 +1144,8 @@ struct fa_stream {
                                     under decode_lock, or while the mixer skips the stream */
     /* A loop between two source frames (fa_deck_set_loop), over the CUE_IN..CUE_OUT one:
      * region[region_idx] = { in, out }, out 0 = none. Written under api_lock + decode_lock
-     * into the other slot, then region_idx flips, so readers never see half a change. */
+     * into the other slot, then region_idx (a change count; slot = idx & 1) moves on, so
+     * readers never see half a change. */
     fa_frames region[2][2];
     fa_atomic32 region_idx;
     fa_atomic32 muted;           /* fa_stream_set_mute */

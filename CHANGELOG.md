@@ -255,6 +255,9 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- DJ mixer: changing the crossfader curve with the crossfader away from the ends glides over 5 ms instead of
+  stepping the decks by up to 3 dB. `fa_stream_get_loop_region` no longer returns the in point of one change with the
+  out point of another.
 - DJ mixer: deck loops, beat jumps and sync's jumps no longer drop a playing deck out for a moment. A jump waiting for
   its target to be decoded no longer pauses the deck's mix on every retry (about 90 times per sync jump), the cut is
   made between two audio callbacks, and waits for a callback yield instead of sleeping (`Sleep(1)` on Windows can take

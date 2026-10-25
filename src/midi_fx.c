@@ -141,18 +141,10 @@ void fa_midi_fx_reset(fa_midi_fx* fx)
     fx->lfo_next = -1;
 }
 
-static int all_zero(const float* x, int n)
-{
-    int i;
-    for (i = 0; i < n; i++)
-        if (x[i] != 0.0f) return 0;
-    return 1;
-}
-
 static void reverb_process(fa_midi_fx* fx, const float* in, float* out, int frames)
 {
     float peak = 0.0f;
-    int quiet_in = all_zero(in, frames * 2), f, ch, i;
+    int quiet_in = fa_all_zero(in, (uint32_t)frames * 2), f, ch, i;
     if (quiet_in && fx->reverb_idle) return;
     fx->reverb_idle = 0;
     fx->reverb_quiet = quiet_in ? fx->reverb_quiet + frames : 0;
@@ -191,7 +183,7 @@ static void chorus_process(fa_midi_fx* fx, const float* in, float* out, int fram
     const double step = FX_CHORUS_RATE_HZ / fx->rate;
     double s, c;
     int f, ch, t;
-    if (all_zero(in, frames * 2)) {
+    if (fa_all_zero(in, (uint32_t)frames * 2)) {
         if (fx->chorus_quiet >= fx->chorus_len) return;   /* the lines hold only zeros */
         fx->chorus_quiet += frames;
     } else {
