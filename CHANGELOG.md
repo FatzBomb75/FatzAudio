@@ -18,6 +18,11 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- MIDI: GS and XG reverb and chorus SysEx are followed: reverb type (rooms, halls, plate, GS delay and panning delay,
+  XG stage, tunnel and others), level and time; chorus type (chorus, celeste, flanger, short delay), level and the GS
+  chorus parameters; GS and XG part volume, pan, reverb send and chorus send. A seek with effects on renders the second
+  before the target, so reverb and chorus tails ring on across it. See
+  [docs/features/midi.md](docs/features/midi.md#reverb-and-chorus).
 - Core Audio Format: `.caf` files open with the ordinary calls. ALAC (to the bit), linear PCM and MP3 play with exact
   length and seeks; other codecs in CAF (AAC, µ-law, ...) return `FA_ERROR_UNSUPPORTED_FORMAT`.
 - DJ mixer: beat jumps (`fa_deck_beat_jump`, .NET `DjDeck.BeatJump`) by whole grid beats, seamless, keeping a synced
