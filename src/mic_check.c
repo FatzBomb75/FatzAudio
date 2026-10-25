@@ -443,7 +443,8 @@ FA_API fa_result FA_CALL fa_mixer_measure_latency(fa_mixer* mixer, fa_mic* mic, 
     if (c.flags & ~FA_CHECK_ALL_MODES) return FA_ERROR_INVALID_ARG;
     c.max_level_db = clampf(c.max_level_db != c.max_level_db ? -12.0f : c.max_level_db, -40.0f, -6.0f);
     if (c.max_monitor <= 0) c.max_monitor = 25000000;
-    if (fa_exchange32(&mixer->checking, 1)) return FA_ERROR_BUSY;
+    r = fa_mixer_check_begin(mixer, mic);
+    if (r != FA_OK) return r;
     slot = mic->index;
     memset(&res, 0, sizeof(res));
     size = out_result->struct_size < sizeof(res) ? out_result->struct_size : (uint32_t)sizeof(res);
@@ -455,6 +456,7 @@ FA_API fa_result FA_CALL fa_mixer_measure_latency(fa_mixer* mixer, fa_mic* mic, 
         if (!(c.flags & FA_CHECK_ALL_MODES) && i > 0) break;
         o->mode = mode;
         res.count++;
+        if (fa_load32(&mixer->check_mic_gone)) { o->result = FA_ERROR_DEVICE; continue; }   /* removed meanwhile */
         if (!mode_available(mixer, mode)) { o->result = FA_ERROR_NOT_IMPLEMENTED; continue; }
         if (mode != mixer->device->open_mode) {
             o->result = fa_mixer_switch_latency_mode(mixer, mode);
@@ -472,9 +474,10 @@ FA_API fa_result FA_CALL fa_mixer_measure_latency(fa_mixer* mixer, fa_mic* mic, 
         }
         if (o->result == FA_OK) {
             /* Kept for this mic and mode: fa_mixer_get_latency and the vocals' alignment.
-             * Without a cue alignment delay on the master, which fa_mixer_get_latency adds
-             * as it is then. */
-            fa_time keep = o->mic_to_speaker - fa_device_align_ns(mixer->device);
+             * Without a cue alignment delay on the master and without what the bridge
+             * holds, which fa_mixer_get_latency adds as they are then (the bridge grows
+             * after underruns and gives it back later). */
+            fa_time keep = o->mic_to_speaker - fa_device_align_ns(mixer->device) - fa_load64(&mic->cap->br.held_ns);
             fa_mutex_lock(&mixer->lock);
             if (fa_load_ptr(&mixer->mics[slot]) == mic) fa_store64(&mic->measured[mode], keep > 0 ? keep : 1);
             fa_mutex_unlock(&mixer->lock);
@@ -483,7 +486,7 @@ FA_API fa_result FA_CALL fa_mixer_measure_latency(fa_mixer* mixer, fa_mic* mic, 
     /* Back to the mixer's own mode; when that fails the mixer stays in the last mode
      * measured, and the call says so (the measurements are still filled in). */
     if (mixer->device->open_mode != home) r = fa_mixer_switch_latency_mode(mixer, home);
-    fa_store32(&mixer->checking, 0);
+    fa_mixer_check_end(mixer);   /* `mic` may be freed from here on */
     /* Only the mixer's own mode measured, and that failed: the check's result. */
     if (res.count == 1 && res.modes[0].result != FA_OK && res.modes[0].result != FA_ERROR_NOT_FOUND)
         r = res.modes[0].result;

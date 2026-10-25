@@ -207,6 +207,7 @@ static void echo_process(struct fa_mixer* m, fa_mic_bus* b, uint32_t frames)
         i1 = i0 + 1 == b->echo_len ? 0 : i0 + 1;
         y = b->echo[i0] + (b->echo[i1] - b->echo[i0]) * fr;
         b->echo_lp = y + (b->echo_lp - y) * a;
+        if (fabsf(b->echo_lp) < 1e-20f) b->echo_lp = 0.0f;   /* no denormals as a repeat dies away */
         b->echo_fb += fb_step;
         b->echo[b->echo_pos] = b->esend[i] + b->echo_lp * b->echo_fb;
         if (++b->echo_pos == b->echo_len) b->echo_pos = 0;
@@ -218,7 +219,6 @@ static void echo_process(struct fa_mixer* m, fa_mic_bus* b, uint32_t frames)
     }
     b->echo_quiet = since;
     b->echo_fb = fb_to;
-    if (fabsf(b->echo_lp) < 1e-20f) b->echo_lp = 0.0f;
     /* Cleared once the last input has had time to come back and the repeats are gone:
      * not on a quiet block between two repeats, which a short phrase leaves. */
     if (b->echo_quiet > (int64_t)b->echo_len) {

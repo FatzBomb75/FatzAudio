@@ -323,13 +323,14 @@ The legacy app doesn't ship bassmix.dll, but mixer-style code built on `BASS_Cha
 
 ### bass_aac (AAC)
 
-AAC plays through the ordinary open calls, in MP4/M4A files, video files, `.aac` (ADTS) files, AAC radio and HLS. FatzAudio's own decoder handles AAC-LC, HE-AAC, HE-AAC v2, AAC Main and AAC-LTP, mono to 7.1, the same on every platform, with no FFmpeg and no system codec ([AAC](../features/streams.md#aac)). Only xHE-AAC goes to the system's decoder (Media Foundation, AudioToolbox, MediaCodec, where the system has one); without one it returns `FA_ERROR_UNSUPPORTED_FORMAT` (an app can still decode it with its own FFmpeg and push the frames). ALAC in M4A and Matroska is decoded by the library's own decoder on every platform, to the bit.
+AAC plays through the ordinary open calls, in MP4/M4A files, video files, CAF (`.caf`) files, `.aac` (ADTS) files, AAC radio and HLS. FatzAudio's own decoder handles AAC-LC, HE-AAC, HE-AAC v2, AAC Main and AAC-LTP, mono to 7.1, the same on every platform, with no FFmpeg and no system codec ([AAC](../features/streams.md#aac)). Only xHE-AAC goes to the system's decoder (Media Foundation, AudioToolbox, MediaCodec, where the system has one); without one it returns `FA_ERROR_UNSUPPORTED_FORMAT` (an app can still decode it with its own FFmpeg and push the frames). ALAC in M4A and Matroska is decoded by the library's own decoder on every platform, to the bit.
 
 | bass_aac | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
 | BASS_AAC_StreamCreateFile / BASS_MP4_StreamCreateFile | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ |
 | BASS_AAC_StreamCreateURL / BASS_MP4_StreamCreateURL | `fa_stream_open_url` (AAC radio with song titles, `.aac` and MP4 over HTTP, AAC in HLS) | `engine.OpenUrl` | ✅ |
 | BASS_AAC_StreamCreateFileUser / BASS_MP4_StreamCreateFileUser | `fa_stream_open_io` | `engine.OpenStream` | ✅ |
+| AAC in CAF (Core Audio Format) files | Built in: `.caf` files open with the same calls, exact length and start from the packet table ([streams](../features/streams.md#supported-formats)) | `engine.OpenFile` | ✅ |
 | BASS_PluginLoad("bass_aac.dll") | Not needed: built in | — | ➖ (by design) |
 
 ### bass_ac3 (Dolby Digital and Dolby Digital Plus)
@@ -441,7 +442,8 @@ bass_fx needs a decode stream wrapped in a separate tempo stream; FatzAudio puts
 | Converting positions back with BASS_FX_TempoGetRateRatio | Not needed: positions, markers, the clock and CD+G stay in song time | — | ➖ (by design) |
 | BASS_FX_ReverseCreate / BASS_ATTRIB_REVERSE_DIR | Reverse playback | | 🗓️ |
 | BASS_FX_BPM_DecodeGet | `fa_analyze_path` with `FA_ANALYZE_BEATS`, then `fa_analysis_get_beat_grid` ([track analysis](../features/analysis.md)) | `AudioEngine.Analyze` / `AnalyzeAsync`, `TrackAnalysis.Beats` | ✅ |
-| BASS_FX_BPM_BeatDecodeGet | Beat times from the grid: `fa_beat_grid.first_beat` plus `bpm`, or the tempo segments for songs that change tempo | `BeatGrid.BeatToFrame` | ✅ |
+| BASS_FX_BPM_BeatDecodeGet | Beat times from the grid: `fa_beat_grid.first_beat` plus `bpm`, or the tempo segments for songs that change tempo (measured from the audio, so drifting songs stay on their beats) | `BeatGrid.BeatToFrame` | ✅ |
+| Bars and downbeats (BASS_FX has none) | `fa_beat_grid.beats_per_bar` and `bar_offset` with `FA_GRID_BARS`: from MIDI files, or found in the audio when chord changes and kicks mark them ([bars](../features/analysis.md#bars)) | `BeatGrid.BeatsPerBar`, `BarOffset`, `BeatGridFlags.Bars` | ✅ |
 | BASS_FX_BPM_CallbackSet / BPM of a live stream | Analyse the file instead: `fa_analyze_stream`. A web or push stream cannot be read twice (`FA_ERROR_NOT_SEEKABLE`) | `AudioStream.Analyze` | ✅ (file and memory streams; ➖ live streams) |
 | BASS_FX_BPM_Translate | Not needed: `bpm` is a double, so double or halve it yourself (to correct a grid, set a new one with `fa_stream_set_beat_grid`) | `BeatGrid.Constant`, `AudioStream.BeatGrid` | ➖ (by design) |
 | BASS_FX_BPM_Free | `fa_analysis_free` | Nothing to dispose: `TrackAnalysis` is a plain object | ✅ |

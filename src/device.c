@@ -349,10 +349,6 @@ fa_result fa_device_reopen_mode(fa_device* d, fa_latency_mode mode, void (*betwe
     return r;
 }
 
-/* How long a backend gets to reroute a default device itself before it counts as lost
- * (WASAPI stops the stream when the default goes, then restarts it on the new one). */
-#define FA_REROUTE_GRACE_NS 300000000
-
 static int needs_service(fa_device* d, int64_t now)
 {
     if (fa_load32(&d->rerouted)) return 1;
@@ -416,11 +412,26 @@ void fa_device_simulate(fa_device* d, int lost)
     fa_mutex_unlock(&d->life_lock);
 }
 
+/* Both waits yield for the first few milliseconds instead of sleeping: a callback
+ * takes well under one, and Sleep(1) on Windows can take a whole timer tick (15.6 ms),
+ * during which a stream the mixer skips (flushing) drops out. */
 void fa_device_wait_quiescent(fa_device* dev)
 {
-    int64_t e = fa_load64(&dev->epoch);
+    int64_t e = fa_load64(&dev->epoch), spin_until;
     if (!(e & 1)) return;                 /* not inside the callback: nothing to wait for */
-    while (fa_load64(&dev->epoch) == e) fa_sleep_ms(1);
+    spin_until = fa_monotonic_ns() + 3000000;
+    while (fa_load64(&dev->epoch) == e) fa_sleep_ms(fa_monotonic_ns() < spin_until ? 0 : 1);
+}
+
+/* Returns between two callbacks (or at once when none runs), so a join that makes
+ * the mixer skip a stream for a moment starts right after a callback and is done long
+ * before the next. Gives up after 20 ms: a callback that long has bigger trouble. */
+void fa_device_wait_idle(fa_device* dev)
+{
+    int64_t until;
+    if (!(fa_load64(&dev->epoch) & 1)) return;
+    until = fa_monotonic_ns() + 20000000;
+    while ((fa_load64(&dev->epoch) & 1) && fa_monotonic_ns() < until) fa_sleep_ms(0);
 }
 
 /* Publishes a new voice list; the old one is freed once the callback is done with it. */

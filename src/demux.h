@@ -145,4 +145,9 @@ extern const uint32_t fa_aac_rates[13];
 #define FA_AAC_ASC_MAX 16
 size_t fa_aac_build_asc(uint8_t out[FA_AAC_ASC_MAX], int object_type, uint32_t rate, uint32_t channels, uint32_t sbr_rate);
 
+/* An MPEG-4 ES_Descriptor (an MP4 esds box after its version and flags): the object
+ * type indication and the DecoderSpecificInfo (*dsi NULL when there is none, which
+ * points into p). 0 when it is not one. In demux_mp4.c. */
+int fa_mp4_es_descriptor(const uint8_t* p, size_t n, uint8_t* oti, const uint8_t** dsi, size_t* dsi_len);
+
 #endif

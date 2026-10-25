@@ -1277,6 +1277,7 @@ int main(void)
     buf sf = make_sf2();
     fa_engine_config_init(&cfg);
     cfg.flags = FA_ENGINE_NULL_OUTPUT;
+    cfg.worker_threads = 2;   /* render-ahead needs two (ra_request) */
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) { fprintf(stderr, "engine create failed\n"); return 1; }
     if (fa_soundfont_open_memory(sf.d, sf.n, &g_font) != FA_OK) { fprintf(stderr, "test soundfont rejected\n"); return 1; }
     free(sf.d);

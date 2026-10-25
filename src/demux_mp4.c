@@ -349,11 +349,11 @@ static size_t desc_len(const uint8_t* p, size_t n, size_t* used)
     return v;
 }
 
-/* esds (14496-1 ES_Descriptor): object type and DecoderSpecificInfo. */
-static int parse_esds(const box* esds, uint8_t* oti, const uint8_t** dsi, size_t* dsi_len)
+/* An ES_Descriptor (14496-1; an esds box after its version and flags, also CAF's
+ * AAC cookie): object type and DecoderSpecificInfo. */
+int fa_mp4_es_descriptor(const uint8_t* p, size_t n, uint8_t* oti, const uint8_t** dsi, size_t* dsi_len)
 {
-    const uint8_t* p = esds->p + 4;   /* FullBox */
-    size_t n = esds->len >= 4 ? esds->len - 4 : 0, used, len;
+    size_t used, len;
     *dsi = NULL;
     *dsi_len = 0;
     if (n < 2 || p[0] != 0x03) return 0;
@@ -366,7 +366,7 @@ static int parse_esds(const box* esds, uint8_t* oti, const uint8_t** dsi, size_t
         uint8_t fl = p[2];
         size_t skip = 3;
         if (fl & 0x80) skip += 2;
-        if (fl & 0x40) skip += 1 + (n > 3 ? p[3] : 0);
+        if (fl & 0x40) skip += 1 + (skip < n ? p[skip] : 0);   /* URL length, after the dependsOn_ES_ID */
         if (fl & 0x20) skip += 2;
         if (skip >= n) return 0;
         p += skip;
@@ -477,7 +477,7 @@ static fa_result parse_stsd(mp4* m, const box* stbl, fa_codec_params* cp)
         size_t dsi_len;
         if (!find_box(kids, klen, FOURCC('e', 's', 'd', 's'), &b) && !(have_wave && find_box(wave.p, wave.len, FOURCC('e', 's', 'd', 's'), &b)))
             return FA_ERROR_UNSUPPORTED_FORMAT;
-        if (!parse_esds(&b, &oti, &dsi, &dsi_len)) return FA_ERROR_UNSUPPORTED_FORMAT;
+        if (b.len < 4 || !fa_mp4_es_descriptor(b.p + 4, b.len - 4, &oti, &dsi, &dsi_len)) return FA_ERROR_UNSUPPORTED_FORMAT;   /* after the FullBox */
         switch (oti) {
         case 0x40: case 0x66: case 0x67: case 0x68: name = "aac"; break;
         case 0x69: case 0x6B: name = "mp3"; break;

@@ -3764,6 +3764,7 @@ int main(void)
 #endif
     fa_engine_config_init(&cfg);
     cfg.flags = FA_ENGINE_NULL_OUTPUT;
+    cfg.worker_threads = 2;   /* render-ahead needs two (ra_request) */
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) { fprintf(stderr, "engine\n"); return 1; }
     RUN(test_inflate_vectors);
     RUN(test_zip_pair);
