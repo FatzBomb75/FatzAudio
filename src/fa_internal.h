@@ -271,6 +271,13 @@ void fa_midi_fx_process(fa_midi_fx* fx, const float* reverb_in, const float* cho
  * Call set_reverb on the thread that processes; it takes effect at once. */
 void fa_midi_fx_set_reverb(fa_midi_fx* fx, float room, float damp, float in_gain, float wet);
 void fa_midi_fx_reverb(fa_midi_fx* fx, const float* in, float* out, int frames);
+/* GS and XG effect SysEx (dec_midi.c, on the thread that processes): defaults puts
+ * back the reverb and chorus every reset gives; gs takes Roland's 40 01 `addr`
+ * (reverb 30-35, chorus 38-3E), xg Yamaha's 02 01 `addr` (reverb 00-0C, chorus
+ * 20-2C), one data byte each. Others are ignored. */
+void fa_midi_fx_defaults(fa_midi_fx* fx);
+void fa_midi_fx_gs(fa_midi_fx* fx, int addr, int value);
+void fa_midi_fx_xg(fa_midi_fx* fx, int addr, int value);
 struct fa_soundfont* fa_soundfont_retain(struct fa_soundfont* f);
 void fa_soundfont_release(struct fa_soundfont* f);
 /* A fingerprint of the soundfont's content, for the loudness cache. */
