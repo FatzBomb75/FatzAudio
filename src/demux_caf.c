@@ -232,7 +232,11 @@ static fa_result build_table(caf* c, const caf_desc* d, const uint8_t* pakt, siz
     int64_t n = (int64_t)fa_be64(pakt);
     size_t pos = 24, i, cap;
     int64_t off = c->data_off, pts = 0;
-    if (n < 0 || (uint64_t)n > pakt_len) n = (int64_t)pakt_len;   /* each packet takes a byte or more */
+    /* Never more entries than the table can hold: one VLQ byte or more for each of the
+     * size and the duration that are not constant. */
+    size_t per = (size_t)(d->bytes_per_packet == 0) + (size_t)(d->frames_per_packet == 0);
+    size_t most = per ? (pakt_len - 24) / per : pakt_len;
+    if (n < 0 || (uint64_t)n > most) n = (int64_t)most;
     if (n > CAF_MAX_PACKETS) n = CAF_MAX_PACKETS;
     cap = (size_t)n;
     c->pk = (caf_pkt*)malloc((cap ? cap : 1) * sizeof(caf_pkt));
@@ -298,11 +302,26 @@ static fa_result caf_open(fa_decoder* dec)
             c->kuki_len = fa_br_read(&c->br, c->kuki, (size_t)size);
         } else if (type == FOURCC('p', 'a', 'k', 't') && size >= 24 && size <= (int64_t)CAF_MAX_PAKT && !pakt) {
             int64_t want = size;    /* never more than the source holds: a lying size must not allocate 256 MB */
+            size_t cap = 0;
             if (src->length > 0 && want > src->length - pos - 12) want = src->length - pos - 12;
             if (want < 24) want = 0;
-            pakt = (uint8_t*)malloc(want ? (size_t)want : 1);
-            if (!pakt) { r = FA_ERROR_OUT_OF_MEMORY; goto fail; }
-            pakt_len = want ? fa_br_read(&c->br, pakt, (size_t)want) : 0;
+            /* In pieces that double, so a source of unknown length allocates only what
+             * it really holds. */
+            while ((int64_t)pakt_len < want) {
+                size_t step, got;
+                if (pakt_len == cap) {
+                    uint8_t* np;
+                    cap = cap ? cap * 2 : 65536;
+                    if ((int64_t)cap > want) cap = (size_t)want;
+                    np = (uint8_t*)realloc(pakt, cap);
+                    if (!np) { r = FA_ERROR_OUT_OF_MEMORY; goto fail; }
+                    pakt = np;
+                }
+                step = cap - pakt_len;
+                got = fa_br_read(&c->br, pakt + pakt_len, step);
+                pakt_len += got;
+                if (got < step) break;
+            }
             if (pakt_len < 24) { free(pakt); pakt = NULL; pakt_len = 0; }
         } else if (type == FOURCC('d', 'a', 't', 'a') && !have_data) {
             if (!have_desc) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }

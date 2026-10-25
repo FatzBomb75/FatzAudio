@@ -870,7 +870,7 @@ fa_result fa_tracker_grid_finish(struct fa_tracker* t, fa_frames length, fa_grid
     return FA_OK;
 }
 
-fa_result fa_tracker_grid_render(fa_decoder* dec, fa_grid_data* out)
+fa_result fa_tracker_grid_render(fa_decoder* dec, fa_grid_data* out, fa_atomic32* cancel)
 {
     struct fa_tracker* t = fa_tracker_of(dec);
     float* buf;
@@ -884,7 +884,9 @@ fa_result fa_tracker_grid_render(fa_decoder* dec, fa_grid_data* out)
     fa_store32(&t->interpolation, 1);
     buf = (float*)malloc(4096 * 2 * sizeof(float));
     if (!buf) return FA_ERROR_OUT_OF_MEMORY;
-    while (tracker_read(dec, buf, 4096, &got) == FA_OK && got > 0) {}
+    while (tracker_read(dec, buf, 4096, &got) == FA_OK && got > 0)
+        if (cancel && fa_load32(cancel)) break;
     free(buf);
+    if (cancel && fa_load32(cancel)) return FA_ERROR_BUSY;
     return fa_tracker_grid_finish(t, t->length, out);
 }

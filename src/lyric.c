@@ -28,7 +28,9 @@
 
 #define LY_DESIGN_W 1920u
 #define LY_DESIGN_H 1080u
-#define LY_CACHE 24
+/* Line layers kept: every line a frame shows, and two more so a scroll or a page turn
+ * does not draw again the line it just let go of. */
+#define LY_CACHE (LY_MAX_SHOW + 2)
 #define LY_MS 1000000LL
 /* The intro's top and bottom bands, its card, the ending card. */
 #define LY_PAGES 4
@@ -212,6 +214,7 @@ typedef struct ly_layer {
     uint8_t* px;                  /* w x h premultiplied BGRA: the masks coloured */
     ly_wipe pw;                   /* the wipe px is coloured for */
     int pw_valid;
+    int failed;                   /* `line` could not be drawn: not tried again while cached */
 } ly_layer;
 
 /* A line or a page placed in one frame. */
@@ -429,17 +432,16 @@ static void coverage(const fa_lyric* l, const fa_font* f, uint32_t* missing, uin
     }
 }
 
-static fa_result font_open(fa_lyric* l, const fa_lyric_style* st, fa_font** out, float* bold)
+/* `data`: the lyric's own copy of st->font_data, which the font then reads in place
+ * (it outlives the font: style_take frees both together). */
+static fa_result font_open(fa_lyric* l, const fa_lyric_style* st, const void* data, fa_font** out, float* bold)
 {
     fa_font* f = NULL;
     fa_result r;
     int want = st->font_weight;
     *out = NULL;
     if (st->font_data) {
-        uint8_t* copy = (uint8_t*)malloc(st->font_data_size);
-        if (!copy) return FA_ERROR_OUT_OF_MEMORY;
-        memcpy(copy, st->font_data, st->font_data_size);
-        r = fa_font_open(copy, st->font_data_size, st->font_face, 1, &f);
+        r = fa_font_open((const uint8_t*)data, st->font_data_size, st->font_face, 0, &f);
     } else if (st->font_path) {
         r = fa_font_open_file(st->font_path, st->font_face, &f);
     } else {
@@ -831,6 +833,10 @@ static int layer_make(fa_lyric* l, uint32_t index, ly_layer* L)
     if (!x || !g) goto fail;
     tw = shape(l, line->text, line->text_len, x, g) * size;
     if (tw < 1.0f) tw = 1.0f;
+    /* Never taller than the area, nor wider than 8 times it (a long line without a
+     * place to break is shrunk to fit later): a damaged font's metrics must not make a
+     * layer of gigabytes. */
+    if (!(tw <= 8.0f * (float)l->area_w) || !(lh <= (float)l->area_h)) goto fail;
     L->w = (int)ceilf(tw) + 2 * l->pad;
     L->h = (int)ceilf(lh) + 2 * l->pad;
     L->text_x = (float)l->pad;
@@ -907,16 +913,22 @@ static ly_layer* layer_get(fa_lyric* l, uint32_t index)
 {
     int i, best = 0;
     for (i = 0; i < LY_CACHE; i++)
-        if (l->cache[i].line == (int)index && l->cache[i].m) {
+        if (l->cache[i].line == (int)index && (l->cache[i].m || l->cache[i].failed)) {
             l->cache[i].used = ++l->stamp;
-            return &l->cache[i];
+            return l->cache[i].failed ? NULL : &l->cache[i];
         }
-    /* The least recently used. */
+    /* The least recently used; a line that failed holds its entry like a drawn one, so
+     * it is not tried again every frame (as pg_failed). */
+#define LY_HELD(L) ((L)->m || (L)->failed)
     for (i = 1; i < LY_CACHE; i++)
-        if (!l->cache[i].m || (l->cache[best].m && l->cache[i].used < l->cache[best].used)) best = i;
-    if (!layer_make(l, index, &l->cache[best])) return NULL;
+        if (!LY_HELD(&l->cache[i]) || (LY_HELD(&l->cache[best]) && l->cache[i].used < l->cache[best].used)) best = i;
+#undef LY_HELD
+    if (!layer_make(l, index, &l->cache[best])) {
+        l->cache[best].line = (int)index;
+        l->cache[best].failed = 1;
+    }
     l->cache[best].used = ++l->stamp;
-    return &l->cache[best];
+    return l->cache[best].failed ? NULL : &l->cache[best];
 }
 
 /* ---- colours -------------------------------------------------------------------- */
@@ -1636,6 +1648,7 @@ static int card_build(fa_lyric* l, ly_layer* L, int ending, float* at_x, float* 
     }
     cv.w = (int)ceilf(boxw + 8.0f * k) + 2 * m;
     cv.h = (int)ceilf(boxh + 10.0f * k) + 2 * m;
+    if (!(boxh <= 2.0f * H)) return 0;   /* a damaged font's metrics: no card of gigabytes */
     cv.px = (float*)calloc((size_t)cv.w * (size_t)cv.h * 4, sizeof(float));
     if (!cv.px) return 0;
     cv_rect(&cv, (float)m + 8.0f * k, (float)m + 10.0f * k, (float)m + 8.0f * k + boxw, (float)m + 10.0f * k + boxh, r, 0xFF000000u,
@@ -1788,7 +1801,7 @@ static int frame_list(fa_lyric* l, fa_time t, ly_inst* out)
         ly_inst* in = &out[m];
         ly_layer* L = layer_get(l, sh[i].line);
         float maxw = (float)l->block_w;
-        if (!L) return -1;
+        if (!L) continue;   /* could not be drawn (failed): left out, as a page is */
         memset(in, 0, sizeof(*in));
         in->page = -1;
         in->line = sh[i].line;
@@ -1972,6 +1985,20 @@ static void labels_split(fa_lyric* l)
     }
 }
 
+static int same_str(const char* a, const char* b) { return a == b || (a && b && strcmp(a, b) == 0); }
+
+/* The style asks for the font already open: only colours or placement changed. */
+static int same_font(const fa_lyric* l, const fa_lyric_style* st)
+{
+    const fa_lyric_style* o = &l->st;
+    if (!l->font || st->font_face != o->font_face || st->font_explicit != o->font_explicit ||
+        st->font_weight != o->font_weight || !same_str(st->font_family, o->font_family) ||
+        !same_str(st->font_path, o->font_path) || !st->font_data != !o->font_data)
+        return 0;
+    return !st->font_data || (st->font_data_size == o->font_data_size &&
+                              (st->font_data == o->font_data || memcmp(st->font_data, o->font_data, st->font_data_size) == 0));
+}
+
 static fa_result style_take(fa_lyric* l, const fa_lyric_style* st)
 {
     char* family = dup_str(st->font_family);
@@ -1983,35 +2010,44 @@ static fa_result style_take(fa_lyric* l, const fa_lyric_style* st)
     fa_font *font = NULL, *font2 = NULL;
     float bold = 0.0f, bold2 = 0.0f;
     fa_result r = FA_OK;
+    int keep = same_font(l, st);
     if ((st->font_family && !family) || (st->font_path && !path) || (st->fallback_title && !fallback) ||
         (st->labels && (!labels || !label_buf)))
         r = FA_ERROR_OUT_OF_MEMORY;
-    if (r == FA_OK && st->font_data) {
+    if (keep) {
+        font = l->font;
+        font2 = l->font2;
+        bold = l->bold;
+        bold2 = l->bold2;
+        data = l->data;
+    } else if (r == FA_OK && st->font_data) {
         data = malloc(st->font_data_size);
         if (data) memcpy(data, st->font_data, st->font_data_size);
         else r = FA_ERROR_OUT_OF_MEMORY;
     }
-    if (r == FA_OK) r = font_open(l, st, &font, &bold);
+    if (r == FA_OK && !keep) r = font_open(l, st, data, &font, &bold);
     if (r != FA_OK) {
         free(family);
         free(path);
         free(fallback);
         free(labels);
         free(label_buf);
-        free(data);
+        if (!keep) free(data);
         return r;
     }
-    if (!st->font_data && !st->font_path && fa_font_get_info(font)->weight > 500) {
+    if (!keep && !st->font_data && !st->font_path && fa_font_get_info(font)->weight > 500) {
         /* The pages' smaller text in the family's regular weight (none: the font). */
         fa_lyric_style reg = *st;
         reg.font_weight = 400;
-        if (font_open(l, &reg, &font2, &bold2) != FA_OK) font2 = NULL;
+        if (font_open(l, &reg, NULL, &font2, &bold2) != FA_OK) font2 = NULL;
     }
-    if (l->font) fa_font_close(l->font);
-    if (l->font2) fa_font_close(l->font2);
+    if (!keep) {
+        if (l->font) fa_font_close(l->font);
+        if (l->font2) fa_font_close(l->font2);
+        free(l->data);
+    }
     free(l->family);
     free(l->path);
-    free(l->data);
     free(l->fallback);
     free(l->labels);
     free(l->label_buf);

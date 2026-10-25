@@ -69,7 +69,8 @@ long beat = songB.Info.Format.SampleRate * 60 / 128;
 b.Loop = new DeckLoop(songB.PositionFrames, songB.PositionFrames + 4 * beat);
 b.Loop = null;                        // off
 
-var levels = a.GetLevels();           // the channel meter
+Span<float> peak = stackalloc float[2], rms = stackalloc float[2];
+a.GetLevels(peak, rms);               // the channel meter, per frame without allocating (GetLevels() allocates)
 ```
 
 `DjMixer.Dispose` unloads the decks (even playing ones) and closes the output; the streams stay open for you to dispose. A stream that is disposed, or played on another device or bus, leaves its deck by itself.
@@ -219,7 +220,7 @@ TimeSpan delay = mic.MonitorLatency;            // voice to speaker
 - **Fade-in.** A new mic is silent for 50 ms, then fades in over 10 ms, so adding one never pops.
 - **Unprocessed capture.** Mics ask for the input without the system's voice processing (automatic gain, noise suppression, echo cancelling: made for calls, they spoil singing and add latency). That is WASAPI's raw mode on Windows (`AUDCLNT_STREAMOPTIONS_RAW`, where the driver offers it) and Android's UNPROCESSED input preset; macOS, iOS and Linux give the input as the system delivers it. `FA_MIC_OS_PROCESSING` (`KeepOsProcessing`) keeps the processing; two mics on one device share its input, so the first mic added decides for both.
 - **Permission.** The app asks for the microphone permission before adding a mic: Android needs `RECORD_AUDIO` in the manifest and the runtime prompt; macOS and iOS need `NSMicrophoneUsageDescription` (and a sandboxed macOS app the audio-input entitlement). Where the system refuses at open, adding a mic is `FA_ERROR_PERMISSION_DENIED` (`ErrorCode.PermissionDenied`); some systems deliver silence instead.
-- **Input lost.** An input that goes away (unplugged, taken by another app) goes silent, the mix carries on, and the mixer raises `FA_EVENT_INPUT_LOST` once per mic on `fa_mixer_set_event_callback` (`InputLost`), on the engine's event thread. Remove the mic there or later and add it again when the device is back. `fa_mic_remove` works inside the callback, also for the event's own mic.
+- **Input lost.** An input that goes away (unplugged, taken by another app) goes silent, the mix carries on, and the mixer raises `FA_EVENT_INPUT_LOST` once per mic on `fa_mixer_set_event_callback` (`InputLost`), on the engine's event thread, once the input has been gone for 300 ms. A mic on the default input carries on when the system's default recording device changes (the backend stops it for a moment and moves it): that is not reported, and neither is a device the backend starts again within the 300 ms. A loss after one that came back is reported again. Remove the mic there or later and add it again when the device is back. `fa_mic_remove` works inside the callback, also for the event's own mic.
 - **Host mics.** `FA_MIC_DUCKS_MUSIC` (`DucksMusic`) marks a host's mic: its voice ducks the music (below). Leave it off for singers.
 
 ### Reverb and echo
@@ -311,7 +312,7 @@ mixer.StartRecording([master, vocals]);
 | `mic_input[i]` | the input device's buffer plus the bridge's fill; −1 when slot `i` has no mic |
 | `mic_monitor[i]` | voice to speaker: measured by the setup check, else `mic_input[i]` plus `master` (with any delay on it); −1 when no mic |
 
-Times the system does not report are estimated from the buffer sizes. Below about 20 ms voice to speaker a singer does not notice; at 30 ms and more it sounds like a slap-back. With the low-latency default the bridge holds about one input period, one master period and a millisecond. The [setup check](#setup-check) measures the real total; after it, `mic_monitor[i]` is the measured time for that mic in the mode measured (`mic_input[i]` stays the reported one).
+Times the system does not report are estimated from the buffer sizes. Below about 20 ms voice to speaker a singer does not notice; at 30 ms and more it sounds like a slap-back. With the low-latency default the bridge holds about one input period, one master period and a millisecond; after an underrun it holds 2 ms more (up to 50 ms in all), and gives a millisecond back after each 30 s without one. The [setup check](#setup-check) measures the real total; after it, `mic_monitor[i]` is the measured time for that mic in the mode measured, with the bridge as it holds now (`mic_input[i]` stays the reported one).
 
 ### Setup check
 
@@ -351,7 +352,7 @@ foreach (var m in check.Modes)
 
 ## Sync and beat loops
 
-Sync needs a beat grid on both decks: one from [track analysis](analysis.md) set with `fa_stream_set_beat_grid` (`AudioStream.BeatGrid`), one the user corrected, or the exact grid of a MIDI file or tracker module (no analysis needed). Without one the calls return `FA_ERROR_NOT_FOUND`. Beats are measured where the decks are heard (the presentation clock), so they line up in the room, including any delay on the master.
+Sync needs a beat grid on both decks: one from [track analysis](analysis.md) set with `fa_stream_set_beat_grid` (`AudioStream.BeatGrid`), one the user corrected, or the exact grid of a MIDI file or tracker module (no analysis needed). Without one the calls return `FA_ERROR_NOT_FOUND`. A module's grid is a silent render of the whole song, worked out in the background from `fa_deck_load` on (a few hundred ms for a long module): until it is ready sync, beat loops and beat jumps on that deck are `FA_ERROR_BUSY` (try again a moment later) and `fa_deck_get_beat_info` is `FA_ERROR_NOT_FOUND`, so no deck call and no engine event waits for it. Beats are measured where the decks are heard (the presentation clock), so they line up in the room, including any delay on the master.
 
 ```c
 fa_stream_set_beat_grid(song_a, &grid_a, NULL, 0);   /* from fa_analysis_get_beat_grid */
@@ -384,7 +385,7 @@ b.Unsync();
 ```
 
 - **Tempo** (`FA_SYNC_TEMPO`): the deck's `FA_PARAM_TEMPO` becomes the leader's heard BPM (its grid's BPM where it plays × its tempo × its rate) over the deck's grid BPM × its rate. The pitch stays (the stretcher). When that is more than `FA_DECK_SYNC_RANGE` from 1, half or double time is tried (a 170 BPM leader plays an 85 BPM deck at its own tempo); still out of reach is `FA_ERROR_OUT_OF_RANGE` (`ErrorCode.OutOfRange`) and nothing changes.
-- **Phase** (`FA_SYNC_BEAT`, `FA_SYNC_BAR`): on a playing deck, an error under 30 ms is pulled in by bending the tempo by up to 2% for about two beats (not audible); a larger one is fixed by a jump on the deck's next beat, joined seamlessly like a loop. `FA_SYNC_BAR` lines up downbeats (it implies BEAT); bars are known for exact grids, others count beat 0 as a downbeat. On a deck that isn't playing, `fa_deck_sync` sets the tempo and the phase follows once it plays; `fa_deck_play_synced` starts it in phase instead.
+- **Phase** (`FA_SYNC_BEAT`, `FA_SYNC_BAR`): on a playing deck, an error under 30 ms is pulled in by bending the tempo by up to 2% for about two beats (not audible); a larger one is fixed by a jump on the deck's next beat, joined seamlessly like a loop. `FA_SYNC_BAR` lines up downbeats (it implies BEAT); bars are known for exact grids and for analysed grids flagged `FA_GRID_BARS` (found in the audio), others count beat 0 as a downbeat. Grids with a tempo map (a song that changes tempo or a drummer who drifts, from an analysis or a MIDI file) are followed: the heard BPM is the map's tempo where the deck is, and a locked deck's tempo follows the leader's map as it plays. On a deck that isn't playing, `fa_deck_sync` sets the tempo and the phase follows once it plays; `fa_deck_play_synced` starts it in phase instead.
 - **`fa_deck_play_synced`** (`PlaySynced`) starts a stopped deck from its cue point (a paused one from where it is) so that its next beat (BAR: downbeat) lands exactly on one of the leader's, at least 50 ms ahead. It is scheduled on the device clock, so it is exact to the frame. The leader must be playing (`FA_ERROR_INVALID_ARG`); a deck that plays already is synced as `fa_deck_sync` does.
 - **Lock** (`FA_SYNC_LOCK`): the engine's event thread looks about 20 times a second and keeps the deck on the leader's beat: it follows the leader's tempo moves and tempo-mapped songs, with a target error under 1 ms. The deck's `FA_PARAM_TEMPO` then moves by itself; set it by hand only after unlocking. Without LOCK a sync is done once (a phase pull ends within 1 ms, or after about eight beats).
 - **Ending it**: `fa_deck_sync(deck, NULL, 0)` (`Unsync`), or loading a stream on either deck. The tempo stays where it is.
@@ -451,4 +452,4 @@ mixer.AutoMix.Skip();
 
 ## Planned
 
-More than two decks, tempo maps from audio and bar detection are pinned in section 19 of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).
+More than two decks is pinned in section 19 of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).

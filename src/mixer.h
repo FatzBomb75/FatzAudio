@@ -133,7 +133,9 @@ struct fa_mixer {
     fa_atomic64 duck_attack, duck_hold, duck_release; /* ns */
     fa_atomic_ptr encoders;                           /* fa_enc_list* on the taps (encode.c) */
     fa_atomic_ptr check;                              /* struct fa_mic_check*: a setup check pass */
-    fa_atomic32 checking;                             /* fa_mixer_measure_latency runs */
+    fa_atomic32 checking;                             /* fa_mixer_measure_latency runs (set under the lock) */
+    struct fa_mic* check_mic;                         /* the mic it measures, kept until it ends (lock) */
+    fa_atomic32 check_mic_gone;                       /* fa_mic_remove ran on it meanwhile: the check frees it */
     struct fa_mic_check* check_now;                   /* audio thread: `check` for this block */
     uint64_t block;                                   /* audio thread: fa_mixer_process calls */
     /* Events (fa_mixer_set_event_callback), run by the event thread (fa_mixer_service). */
@@ -145,6 +147,8 @@ struct fa_mixer {
     int test_ticks;                                   /* tests: sync and auto-mix ticks run by hand */
     fa_atomic32 busy;                                 /* the event thread is in fa_mixer_service */
     fa_atomic32 doomed;                               /* destroyed from inside its own callback */
+    fa_atomic32 refs;                                 /* fa_mixer_stream_leaving between api_lock and the mixer lock */
+    int closing;                                      /* fa_mixer_destroy started (mixer lock): no more ticks */
 };
 
 
@@ -202,7 +206,9 @@ typedef struct fa_bridge {
     int32_t extra_now;           /* `extra` in the target */
     double nominal;              /* in_rate / out_rate */
     double base;                 /* the periods, the resampler's look-ahead and 1 ms */
-    double grown;                /* added by underruns, up to BRIDGE_MAX_MS */
+    double grown;                /* added by underruns, up to BRIDGE_MAX_MS; given back slowly */
+    double calm;                 /* output frames since the last underrun or give-back */
+    uint32_t seen_overruns;      /* `overruns` as last seen */
     double target;               /* base + grown + extra_now */
     double avg;                  /* the fill, smoothed over about a second */
 } fa_bridge;
@@ -264,6 +270,7 @@ typedef struct fa_capture {
     fa_bridge br;                /* written by the input callback, read by the master callback */
     fa_atomic32 stopping;        /* fa_mic_remove or a test is stopping it: not a loss */
     fa_atomic32 lost;            /* 1 = gone (each mic reports it once: lost_reported) */
+    fa_atomic64 lost_at;         /* when `lost` was set (fa_monotonic_ns) */
     fa_atomic64 input_ns;        /* the input buffer the OS reported */
     /* master callback */
     uint64_t pulled;             /* fa_mixer.block of the last pull, + 1 */
@@ -437,6 +444,11 @@ void fa_mixer_mics_free_removed(struct fa_mixer* m);   /* free_mixer: frees what
 void fa_mixer_captures_reopen(struct fa_mixer* m, fa_latency_mode mode);   /* fa_mixer_set_latency_mode */
 /* fa_mixer_set_latency_mode without the setup check's guard (mixer.c; mic_check.c uses it). */
 fa_result fa_mixer_switch_latency_mode(struct fa_mixer* m, fa_latency_mode mode);
+/* fa_mixer_measure_latency, start and end: sets `checking` (FA_ERROR_BUSY when a check
+ * runs, FA_ERROR_INVALID_ARG when the mic is gone) and keeps the mic and its input until
+ * the end, which frees them when fa_mic_remove ran meanwhile. */
+fa_result fa_mixer_check_begin(struct fa_mixer* m, struct fa_mic* mic);
+void fa_mixer_check_end(struct fa_mixer* m);
 /* mic_fx.c */
 fa_result fa_mic_bus_make(struct fa_mixer* m);     /* lock: the bus, once */
 void fa_mic_bus_free(fa_mic_bus* b);
@@ -460,6 +472,7 @@ biquad fa_mixer_design(int type, double hz, double rate);
 void fa_mic_test_take_over(fa_mic* mic, uint32_t rate, uint32_t channels);
 void fa_mic_test_feed(fa_mic* mic, const float* frames, uint32_t n);
 void fa_mic_test_lose(fa_mic* mic);
+void fa_mic_test_back(fa_mic* mic);    /* tests: the input came back (a reroute) */
 void fa_mic_test_stats(fa_mic* mic, double* out_target, double* out_fill, int32_t* out_underruns);
 /* Tests: drive the headphones by hand. take_over stops their device and makes the bridge
  * read at `rate` in periods of `period` frames, with `os_ns` as their reported latency;

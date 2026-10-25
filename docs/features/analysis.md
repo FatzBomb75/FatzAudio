@@ -66,7 +66,7 @@ Each getter returns `FA_ERROR_NOT_FOUND` when its kind was not asked for, or whe
 | `bpm` | The main tempo: the one that lasts longest. A double: the grid is fitted to the beats, so on steady music it is finer than 0.05 BPM |
 | `first_beat` | Source frame of the first beat heard. The grid goes on backwards from it, at the first segment's tempo |
 | `sample_rate` | Of the source frames (`first_beat` and the segments) |
-| `beats_per_bar`, `bar_offset` | 4 and 0, unless the grid says it knows (`FA_GRID_BARS`). `bar_offset` is the number of the beat that starts a bar, counting `first_beat` as 0 |
+| `beats_per_bar`, `bar_offset` | The meter (4, or 3 for a waltz) and the number of the beat that starts a bar, counting `first_beat` as 0. Known when the grid says so (`FA_GRID_BARS`: from the file, or found clearly in the audio); otherwise 4 and 0 |
 | `confidence` | 0 to 1; 1 for exact grids. See [Accuracy](#accuracy) |
 | `flags` | `FA_GRID_CONSTANT` (one tempo), `FA_GRID_EXACT` (from the file), `FA_GRID_EDITED` (set by your app), `FA_GRID_BARS` (bars known) |
 | `segment_count` | Tempo segments; 1 is a constant tempo |
@@ -88,6 +88,22 @@ long nextBar = grid.BeatToFrame(Math.Ceiling(grid.FrameToBeat(position) / grid.B
 ```
 
 (The last line is right while `BarOffset` is 0; add the offset otherwise.)
+
+### Songs that change tempo
+
+A song whose tempo changes (a slower bridge, a live band that speeds up, a drummer who drifts) gets a **tempo map** from the analysis: a few segments, each at one tempo, joined end to end so the beats never jump. `FA_GRID_CONSTANT` is then not set, `segment_count` says how many segments there are, and `bpm` is the tempo that lasts longest. A steady song keeps one segment.
+
+- **A tempo change** (120 BPM, then 132) gives two segments, the second starting where the change is (its beat number may fall between two beats).
+- **A tempo that drifts** gives a segment every few bars, each at the tempo of its stretch, so the grid stays on the beats from the first to the last. On the test songs of a drummer who drifts by 1% and plays up to 12 ms early or late, the grid stays within 10 ms of the beats he meant ([Accuracy](#accuracy)).
+- A beat that is off on its own (a fill, a beat the tracker caught on a hat) does not start a segment.
+
+Decks follow the map: the heard BPM is the tempo where the deck plays, sync locks on through the changes, and beat loops and beat jumps count the map's beats ([DJ mixer](dj-mixer.md#sync-and-beat-loops)). Draw beat lines from the map with the formula above.
+
+### Bars
+
+The analysis also looks for the bars: which beat is the first of a bar, and whether there are 4 beats to a bar or 3. It listens for the two things that mark a bar in most music, the chords changing and the kick drum landing on the first beat, and sets `FA_GRID_BARS` with `beats_per_bar` and `bar_offset` only when one beat of every 4 (or 3) clearly stands out. A song that starts with a pickup beat gets `bar_offset` 1, a waltz `beats_per_bar` 3. When nothing stands out (drums alone, every beat the same) the flag is not set and the grid says 4 and 0, as before.
+
+`FA_SYNC_BAR` and the auto-mix's downbeats use these bars. A bar found in the audio is a good guess, not a fact: let the user move it (set the grid again with another `bar_offset`), as DJ software does.
 
 ### Key
 
@@ -179,7 +195,7 @@ A MIDI file holds its tempo changes and time signature, and a tracker module hol
 - **Tempo changes are segments.** A song that changes tempo gets one segment per tempo; `bpm` is the one that lasts longest, and beat numbers carry on across the changes.
 - **Bars** are known for MIDI files with one time signature (`FA_GRID_BARS`, with `beats_per_bar` from the signature and `bar_offset` 0). Modules have no time signature, so their grids say 4 and 0 without the flag.
 - **MIDI** counts 120 BPM until the file's first tempo event, as the standard says, and `first_beat` is frame 0.
-- For a module, the first `fa_stream_get_beat_grid` renders the song once without sound, about 0.25 s for a 4-minute song.
+- For a module, the first `fa_stream_get_beat_grid` renders the song once without sound, about 0.25 s for a 4-minute song. On a DJ deck that render runs in the background (see [DJ mixer sync](dj-mixer.md#sync-and-beat-loops)); `fa_stream_get_beat_grid` waits for it.
 
 C:
 ```c
@@ -255,6 +271,8 @@ All of it is written for FatzAudio from published methods; no analysis library i
 4. Half or double: when a tempo and its double are both in range, the faster is tracked, and the slower is kept when every other beat is clearly weaker. A BPM tag helps decide.
 5. Beats: dynamic-programming beat tracking (Ellis 2007), each beat refined to a fraction of a frame on its onset peak. Weak beats at the ends are dropped.
 6. The constant grid: a robust straight-line fit of beat time over beat number, with outliers dropped and the line fitted again. This gives the tempo far more finely than the envelope's frames. The confidence is the share of beats on the grid, squared, times how much the grid's onsets stand out.
+7. The tempo map (`src/beat_map.c`): the tracked beats are numbered by the local beat length, lone outliers are dropped, and the timing scatter is measured from how far each beat is from the line through its neighbours. Beat time over beat number is then cut into straight stretches by optimal segmentation (least squares, with a penalty per stretch of 3 times the scatter squared times the log of the number of beats, a BIC; stretches of 8 beats or more; found with PELT, Killick, Fearnhead and Eckley 2012). One stretch means a constant grid. Otherwise neighbouring stretches are joined where their lines cross (a tempo change) or halfway between them, so the map is continuous. The candidate tempos and half or double are judged on each candidate's own map.
+8. Bars: per beat, the change of the chroma (pitch classes from 130 Hz to 4 kHz, from the same FFT) between the two beats before and the two from it, and the low-band onset on it, each scaled to a mean of 1 and added. The beat of every 4 (or 3) with the highest mean starts a bar when it is at least 1.4 times the others' mean; 3 is taken only when it is 1.2 times clearer than 4.
 
 **Key** (`src/key.c`): every half window (an FFT of about 0.17 s) the spectral peaks from 55 Hz to 5 kHz are placed on a pitch circle of 120 steps (10 cents each), weighted by magnitude, with each frame counting equally so loud passages do not outvote quiet ones. The circle gives the tuning (songs are often a little sharp or flat) and is folded into the 12 pitch classes. The key is the one of the 24 whose Krumhansl-Kessler profile correlates best with that chroma. The confidence grows with the correlation and with its lead over the runner-up.
 
@@ -271,23 +289,26 @@ Accuracy was measured on **48 General MIDI songs** made by the test suite. Each 
 
 All have eighth-note hi-hats.
 
-| Style | Songs | Tempo within 0.05 BPM | Of those, half or double | Worst tempo error (BPM) | Worst beat error (ms) | Mean confidence |
-|---|---|---|---|---|---|---|
-| four on the floor | 12 | 12 | 0 | 0.000 | 1.7 | 1.00 |
-| rock | 12 | 12 | 0 | 0.000 | 1.4 | 1.00 |
-| half-time | 12 | 12 | 4 | 0.000 | 2.0 | 1.00 |
-| humanized, drifting | 12 | 12 | 3 | 0.038 | 359.1 | 0.38 |
+| Style | Songs | Tempo within 0.05 BPM | Of those, half or double | Worst tempo error (BPM) | Worst beat error (ms) | Mean confidence | Mean segments | Bars right | Bars wrong |
+|---|---|---|---|---|---|---|---|---|---|
+| four on the floor | 12 | 12 | 0 | 0.000 | 1.7 | 1.00 | 1.0 | 12 | 0 |
+| rock | 12 | 12 | 0 | 0.000 | 1.4 | 1.00 | 1.0 | 12 | 0 |
+| half-time | 12 | 12 | 4 | 0.000 | 2.0 | 1.00 | 1.0 | 8 | 0 |
+| humanized, drifting | 12 | 12 | 0 | 0.020 | 10.0 | 1.00 | 4.4 | 12 | 0 |
+
+The tempo is the grid's mean tempo over the song (for a tempo map, its beats over its time). The beat error is the worst of all the grid's beats, from the first to 2 s before the end, against the file's beats (for the humanized songs, the beats as written, before the drummer's 12 ms). Bars are counted for the songs found at the file's tempo: right when the grid's downbeat is one of the file's.
 
 **Key:** 48 of 48 exactly right (0 relative, 0 a fifth away, 0 parallel, 0 other).
 
-**Speed:** 4791 s of audio in 27.8 s, which is **172 times real time on one core** for beats, key and waveform together. A 4-minute song takes about 1.4 s.
+**Speed:** 4791 s of audio in 25.1 s, which is **about 190 times real time on one core** for beats, key and waveform together (tempo maps and bars cost nothing measurable). A 4-minute song takes about 1.3 s.
 
 What this says, and what it does not:
 
-- **Steady, quantized music is read very well.** Tempo within 0.05 BPM and beats within 2 ms, with confidence 1. That is what most pop, dance and karaoke backing tracks are like.
-- **Half and double are counted apart.** In 4 of the half-time songs and 3 of the humanized ones the analysis found half or double the tempo of the file. That is a reasonable reading of the same music (a half-time groove can be counted either way), but it is not the file's tempo. The table measures those songs against the tempo found, and the per-song table below shows the tempo each was compared with. This is what the preferred range and the user's correction ([above](#correcting-a-grid)) are for.
-- **Drifting songs are not followed.** The grid is one constant tempo, and a drummer who wanders or a song that speeds up leaves it behind: beat errors up to 359 ms in this set, with a low confidence (0.24 to 0.67) that says so. The average tempo is still right (within 0.04 BPM here). Following a drifting tempo needs a tempo map measured from audio, which is not done yet (see [Limits](#limits)).
-- **These songs are synthetic.** Clean drums, one tempo, one key, one set of General MIDI instruments. Real recordings are harder: dense mixes, swing, tempo that breathes, modulations, unclear keys. Expect them to do worse, **especially the key**. Published key finders of this kind are typically right roughly 6 or 7 times in 10 on real pop, with most misses the relative major or minor, or a fifth away. The 48 of 48 here says the method works, not that your library will do as well. Show the Camelot code, let the user correct it, and treat a key as a good suggestion for mixing rather than a fact.
+- **Steady, quantized music is read very well.** Tempo within 0.05 BPM and beats within 2 ms, with confidence 1, and one segment. That is what most pop, dance and karaoke backing tracks are like.
+- **Drifting tempo is followed.** The humanized songs speed up by 1% in steps over the song; their tempo maps (4.4 segments on average) keep every beat within 10 ms of the written one, though each kick and snare is played up to 12 ms off it. A constant grid (before tempo maps) was up to 359 ms off on the same songs, with confidence 0.38.
+- **Bars are found where the music marks them.** All 44 songs found at the file's tempo got their bars right, none wrong. These songs change chord on the bar, which most music does; music without that cue (drums alone, a riff that runs across bars) gets no bars rather than wrong ones.
+- **Half and double are counted apart.** In 4 of the half-time songs the analysis found half the tempo of the file. That is a reasonable reading of the same music (a half-time groove can be counted either way), but it is not the file's tempo. The table measures those songs against the tempo found. Their bars (4 of the grid's beats) then span two of the file's bars, so they are left out of the bar count. This is what the preferred range and the user's correction ([above](#correcting-a-grid)) are for.
+- **These songs are synthetic.** Clean drums, one key, one set of General MIDI instruments. Real recordings are harder: dense mixes, swing, tempo that breathes, modulations, unclear keys. Expect them to do worse, **especially the key and the bars**. Published key finders of this kind are typically right roughly 6 or 7 times in 10 on real pop, with most misses the relative major or minor, or a fifth away. The 48 of 48 here says the method works, not that your library will do as well. Show the Camelot code, let the user correct it, and treat a key as a good suggestion for mixing rather than a fact.
 - Use `confidence` to decide when to trust a grid, for example before a long locked overlap.
 
 To run the report yourself, build the library and run the test with a General MIDI SoundFont:
@@ -301,68 +322,68 @@ The songs come from a fixed random sequence, so they are the same on every run. 
 
 ## Limits
 
-- **Constant grids only from audio.** There is no tempo map measured from audio, so a song that changes tempo, or a band that drifts, gets one average tempo and a lower confidence. MIDI and tracker grids do have tempo maps, and `fa_stream_set_beat_grid` takes one from your app.
-- **No bar detection from audio.** `beats_per_bar` is 4 and `bar_offset` 0 without `FA_GRID_BARS`: beat 0, the first beat heard, is taken as a bar start, and it may not be one. Use bars only if the user has confirmed them.
+- **Tempo maps follow the beat tracker.** A tempo change the tracker cannot follow (a jump of more than about 20%, or to half time) or a stretch with no beat (a breakdown) can still leave the map off there; the confidence drops when many beats are off the map. Rubato (a ballad whose tempo breathes from beat to beat) gets a coarse map, as the stretches are 8 beats or more.
+- **Bars are found from chord changes and kicks only.** Without `FA_GRID_BARS`, `beats_per_bar` is 4 and `bar_offset` 0: beat 0, the first beat heard, is taken as a bar start, and it may not be one. The meter is one for the whole song (4 or 3; no 6/8, 5/4 or changes of meter). On a grid at half or double the music's tempo, a bar found is two bars of the music, or half of one.
 - **One key per song.** A song that modulates gets its main key.
 - Audio that is not music (speech, silence) has no grid or key, and the getters say so.
-- Tempo maps from audio, bar detection and bar sync, beat jump and quantized seeks, and automatic key matching in an auto-mix are on the list of later work (section 19 of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md)).
+- Quantized seeks and automatic key matching in an auto-mix are on the list of later work (section 19 of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md)).
 
 ## Per-song results
 
 <details>
 <summary>All 48 songs of the accuracy report</summary>
 
-"BPM (file)" is the tempo the result was compared with: the file's tempo, or half or double of it where the analysis found that (the 7 songs counted as half or double above). "Key match" says how the found key relates to the file's key.
+"BPM (file)" is the tempo the result was compared with: the file's mean tempo, or half or double of it where the analysis found that (the 4 songs counted as half or double above). "Bars" is right or wrong, "-" when none were found, and "half/double" for bars on a grid at another tempo than the file's. "Key match" says how the found key relates to the file's key.
 
-| # | Style | BPM (file) | Found | Error (BPM) | Beat error (ms) | Confidence | Key | Found | Key match |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | four on the floor | 72.20 | 72.20 | -0.000 | 1.4 | 1.00 | C | C | exact |
-| 2 | rock | 71.80 | 71.80 | 0.000 | 1.2 | 1.00 | Db | Db | exact |
-| 3 | half-time | 129.70 | 129.70 | -0.000 | 2.0 | 1.00 | D | D | exact |
-| 4 | humanized, drifting | 70.22 | 70.22 | -0.000 | 359.1 | 0.63 | Eb | Eb | exact |
-| 5 | four on the floor | 170.10 | 170.10 | -0.000 | 1.5 | 1.00 | E | E | exact |
-| 6 | rock | 82.40 | 82.40 | 0.000 | 1.2 | 1.00 | F | F | exact |
-| 7 | half-time | 124.50 | 124.50 | -0.000 | 1.8 | 1.00 | F# | F# | exact |
-| 8 | humanized, drifting | 130.90 | 130.90 | 0.001 | 83.1 | 0.33 | G | G | exact |
-| 9 | four on the floor | 135.60 | 135.60 | -0.000 | 1.7 | 1.00 | Ab | Ab | exact |
-| 10 | rock | 156.20 | 156.20 | -0.000 | 1.4 | 1.00 | A | A | exact |
-| 11 | half-time | 74.40 | 74.40 | -0.000 | 1.7 | 1.00 | Bb | Bb | exact |
-| 12 | humanized, drifting | 76.25 | 76.24 | -0.003 | 331.1 | 0.67 | B | B | exact |
-| 13 | four on the floor | 176.20 | 176.20 | 0.000 | 1.5 | 1.00 | Cm | Cm | exact |
-| 14 | rock | 78.10 | 78.10 | -0.000 | 1.2 | 1.00 | C#m | C#m | exact |
-| 15 | half-time | 73.50 | 73.50 | 0.000 | 1.0 | 1.00 | Dm | Dm | exact |
-| 16 | humanized, drifting | 121.15 | 121.16 | 0.013 | 96.1 | 0.34 | Ebm | Ebm | exact |
-| 17 | four on the floor | 113.60 | 113.60 | 0.000 | 1.6 | 1.00 | Em | Em | exact |
-| 18 | rock | 175.50 | 175.50 | 0.000 | 1.3 | 1.00 | Fm | Fm | exact |
-| 19 | half-time | 114.70 | 114.70 | -0.000 | 1.7 | 1.00 | F#m | F#m | exact |
-| 20 | humanized, drifting | 87.80 | 87.80 | -0.000 | 287.1 | 0.54 | Gm | Gm | exact |
-| 21 | four on the floor | 179.30 | 179.30 | 0.000 | 1.7 | 1.00 | G#m | G#m | exact |
-| 22 | rock | 143.00 | 143.00 | 0.000 | 1.4 | 1.00 | Am | Am | exact |
-| 23 | half-time | 116.50 | 116.50 | 0.000 | 1.7 | 1.00 | Bbm | Bbm | exact |
-| 24 | humanized, drifting | 125.57 | 125.56 | -0.009 | 84.6 | 0.26 | Bm | Bm | exact |
-| 25 | four on the floor | 101.60 | 101.60 | 0.000 | 1.4 | 1.00 | C | C | exact |
-| 26 | rock | 116.60 | 116.60 | -0.000 | 1.3 | 1.00 | Db | Db | exact |
-| 27 | half-time | 72.15 | 72.15 | 0.000 | 1.1 | 1.00 | D | D | exact |
-| 28 | humanized, drifting | 87.50 | 87.49 | -0.004 | 124.9 | 0.24 | Eb | Eb | exact |
-| 29 | four on the floor | 79.80 | 79.80 | -0.000 | 1.4 | 1.00 | E | E | exact |
-| 30 | rock | 163.80 | 163.80 | 0.000 | 1.3 | 1.00 | F | F | exact |
-| 31 | half-time | 104.30 | 104.30 | -0.000 | 1.8 | 1.00 | F# | F# | exact |
-| 32 | humanized, drifting | 71.12 | 71.13 | 0.003 | 158.4 | 0.28 | G | G | exact |
-| 33 | four on the floor | 120.90 | 120.90 | -0.000 | 1.7 | 1.00 | Ab | Ab | exact |
-| 34 | rock | 102.10 | 102.10 | 0.000 | 1.3 | 1.00 | A | A | exact |
-| 35 | half-time | 133.00 | 133.00 | 0.000 | 1.7 | 1.00 | Bb | Bb | exact |
-| 36 | humanized, drifting | 176.70 | 176.74 | 0.038 | 68.5 | 0.37 | B | B | exact |
-| 37 | four on the floor | 71.70 | 71.70 | 0.000 | 1.4 | 1.00 | Cm | Cm | exact |
-| 38 | rock | 155.80 | 155.80 | -0.000 | 1.3 | 1.00 | C#m | C#m | exact |
-| 39 | half-time | 103.20 | 103.20 | 0.000 | 2.0 | 1.00 | Dm | Dm | exact |
-| 40 | humanized, drifting | 105.78 | 105.78 | -0.006 | 102.0 | 0.26 | Ebm | Ebm | exact |
-| 41 | four on the floor | 175.00 | 175.00 | -0.000 | 1.5 | 1.00 | Em | Em | exact |
-| 42 | rock | 130.20 | 130.20 | 0.000 | 1.2 | 1.00 | Fm | Fm | exact |
-| 43 | half-time | 71.70 | 71.70 | 0.000 | 1.1 | 1.00 | F#m | F#m | exact |
-| 44 | humanized, drifting | 142.95 | 142.97 | 0.017 | 80.5 | 0.31 | Gm | Gm | exact |
-| 45 | four on the floor | 138.60 | 138.60 | 0.000 | 1.5 | 1.00 | G#m | G#m | exact |
-| 46 | rock | 87.70 | 87.70 | -0.000 | 1.3 | 1.00 | Am | Am | exact |
-| 47 | half-time | 86.10 | 86.10 | -0.000 | 1.4 | 1.00 | Bbm | Bbm | exact |
-| 48 | humanized, drifting | 155.11 | 155.12 | 0.013 | 72.6 | 0.33 | Bm | Bm | exact |
+| # | Style | BPM (file) | Found | Error (BPM) | Beat error (ms) | Confidence | Bars | Key | Found | Key match |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | four on the floor | 72.20 | 72.20 | -0.000 | 1.4 | 1.00 | right | C | C | exact |
+| 2 | rock | 71.80 | 71.80 | 0.000 | 1.2 | 1.00 | right | Db | Db | exact |
+| 3 | half-time | 129.70 | 129.70 | -0.000 | 2.0 | 1.00 | right | D | D | exact |
+| 4 | humanized, drifting | 140.44 | 140.43 | -0.009 | 7.8 | 1.00 | right | Eb | Eb | exact |
+| 5 | four on the floor | 170.10 | 170.10 | -0.000 | 1.5 | 1.00 | right | E | E | exact |
+| 6 | rock | 82.40 | 82.40 | 0.000 | 1.2 | 1.00 | right | F | F | exact |
+| 7 | half-time | 124.50 | 124.50 | -0.000 | 1.7 | 1.00 | right | F# | F# | exact |
+| 8 | humanized, drifting | 130.90 | 130.89 | -0.001 | 7.8 | 1.00 | right | G | G | exact |
+| 9 | four on the floor | 135.60 | 135.60 | -0.000 | 1.7 | 1.00 | right | Ab | Ab | exact |
+| 10 | rock | 156.20 | 156.20 | -0.000 | 1.4 | 1.00 | right | A | A | exact |
+| 11 | half-time | 74.40 | 74.40 | -0.000 | 1.7 | 1.00 | right | Bb | Bb | exact |
+| 12 | humanized, drifting | 152.49 | 152.49 | -0.004 | 7.8 | 1.00 | right | B | B | exact |
+| 13 | four on the floor | 176.20 | 176.20 | 0.000 | 1.5 | 1.00 | right | Cm | Cm | exact |
+| 14 | rock | 78.10 | 78.10 | -0.000 | 1.2 | 1.00 | right | C#m | C#m | exact |
+| 15 | half-time | 73.50 | 73.50 | 0.000 | 1.0 | 1.00 | half/double | Dm | Dm | exact |
+| 16 | humanized, drifting | 121.15 | 121.14 | -0.013 | 9.9 | 1.00 | right | Ebm | Ebm | exact |
+| 17 | four on the floor | 113.60 | 113.60 | 0.000 | 1.6 | 1.00 | right | Em | Em | exact |
+| 18 | rock | 175.50 | 175.50 | 0.000 | 1.3 | 1.00 | right | Fm | Fm | exact |
+| 19 | half-time | 114.70 | 114.70 | -0.000 | 1.7 | 1.00 | right | F#m | F#m | exact |
+| 20 | humanized, drifting | 175.60 | 175.58 | -0.018 | 5.7 | 1.00 | right | Gm | Gm | exact |
+| 21 | four on the floor | 179.30 | 179.30 | 0.000 | 1.7 | 1.00 | right | G#m | G#m | exact |
+| 22 | rock | 143.00 | 143.00 | 0.000 | 1.4 | 1.00 | right | Am | Am | exact |
+| 23 | half-time | 116.50 | 116.50 | 0.000 | 1.8 | 1.00 | right | Bbm | Bbm | exact |
+| 24 | humanized, drifting | 125.57 | 125.57 | -0.002 | 5.9 | 1.00 | right | Bm | Bm | exact |
+| 25 | four on the floor | 101.60 | 101.60 | 0.000 | 1.5 | 1.00 | right | C | C | exact |
+| 26 | rock | 116.60 | 116.60 | -0.000 | 1.2 | 1.00 | right | Db | Db | exact |
+| 27 | half-time | 72.15 | 72.15 | 0.000 | 1.1 | 1.00 | half/double | D | D | exact |
+| 28 | humanized, drifting | 87.50 | 87.50 | -0.001 | 6.4 | 1.00 | right | Eb | Eb | exact |
+| 29 | four on the floor | 79.80 | 79.80 | -0.000 | 1.4 | 1.00 | right | E | E | exact |
+| 30 | rock | 163.80 | 163.80 | 0.000 | 1.3 | 1.00 | right | F | F | exact |
+| 31 | half-time | 104.30 | 104.30 | -0.000 | 1.7 | 1.00 | right | F# | F# | exact |
+| 32 | humanized, drifting | 71.12 | 71.12 | -0.000 | 8.9 | 1.00 | right | G | G | exact |
+| 33 | four on the floor | 120.90 | 120.90 | -0.000 | 1.6 | 1.00 | right | Ab | Ab | exact |
+| 34 | rock | 102.10 | 102.10 | 0.000 | 1.3 | 1.00 | right | A | A | exact |
+| 35 | half-time | 133.00 | 133.00 | 0.000 | 1.7 | 1.00 | right | Bb | Bb | exact |
+| 36 | humanized, drifting | 176.70 | 176.69 | -0.020 | 7.0 | 1.00 | right | B | B | exact |
+| 37 | four on the floor | 71.70 | 71.70 | 0.000 | 1.4 | 1.00 | right | Cm | Cm | exact |
+| 38 | rock | 155.80 | 155.80 | -0.000 | 1.3 | 1.00 | right | C#m | C#m | exact |
+| 39 | half-time | 103.20 | 103.20 | 0.000 | 2.0 | 1.00 | right | Dm | Dm | exact |
+| 40 | humanized, drifting | 105.78 | 105.78 | -0.005 | 10.0 | 1.00 | right | Ebm | Ebm | exact |
+| 41 | four on the floor | 175.00 | 175.00 | -0.000 | 1.6 | 1.00 | right | Em | Em | exact |
+| 42 | rock | 130.20 | 130.20 | 0.000 | 1.2 | 1.00 | right | Fm | Fm | exact |
+| 43 | half-time | 71.70 | 71.70 | 0.000 | 1.1 | 1.00 | half/double | F#m | F#m | exact |
+| 44 | humanized, drifting | 142.95 | 142.94 | -0.011 | 6.8 | 1.00 | right | Gm | Gm | exact |
+| 45 | four on the floor | 138.60 | 138.60 | 0.000 | 1.5 | 1.00 | right | G#m | G#m | exact |
+| 46 | rock | 87.70 | 87.70 | -0.000 | 1.3 | 1.00 | right | Am | Am | exact |
+| 47 | half-time | 86.10 | 86.10 | -0.000 | 1.4 | 1.00 | half/double | Bbm | Bbm | exact |
+| 48 | humanized, drifting | 155.11 | 155.10 | -0.004 | 6.3 | 1.00 | right | Bm | Bm | exact |
 
 </details>

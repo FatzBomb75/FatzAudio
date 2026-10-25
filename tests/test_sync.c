@@ -582,6 +582,70 @@ static void test_beat_jump_synced(void)
     rig_close(&r);
 }
 
+/* Tempo maps (as an analysis gives for a song that changes tempo): 120 BPM, then 110
+ * from 4 s (beat 8). A beat jump counts the map's beats, and a locked deck follows the
+ * leader's tempo change and stays on its beat. */
+static fa_result set_map(fa_stream* s)
+{
+    fa_beat_grid g;
+    fa_tempo_segment segs[2];
+    memset(&g, 0, sizeof(g));
+    g.struct_size = sizeof(g);
+    g.bpm = 110.0;
+    g.first_beat = 0;
+    g.sample_rate = g_rate;
+    g.beats_per_bar = 4;
+    g.confidence = 1.0f;
+    segs[0].start = 0; segs[0].bpm = 120.0; segs[0].beat = 0.0;
+    segs[1].start = (fa_frames)seconds(4.0); segs[1].bpm = 110.0; segs[1].beat = 8.0;
+    return fa_stream_set_beat_grid(s, &g, segs, 2);
+}
+
+static void test_tempo_map_follow(void)
+{
+    rig r;
+    fa_stream *a, *b;
+    fa_deck_beat_info bi;
+    double after = 60.0 / 110.0;
+    CHECK(rig_open(&r));
+    a = load(r.a, (uint32_t)seconds(30), 0.0, 0);
+    b = load(r.b, (uint32_t)seconds(30), 120.0, 700);
+    CHECK(a && b);
+    CHECK_EQ(set_map(a), FA_OK);
+    /* Paused at beat 6 (3 s): 4 beats on is beat 10, two beats into the 110 BPM part. */
+    CHECK_EQ(fa_stream_seek(a, (fa_frames)seconds(3.0)), FA_OK);
+    CHECK_EQ(fa_deck_beat_jump(r.a, 4.0), FA_OK);
+    CHECK_EQ(pos(a), (fa_frames)floor(seconds(3.0) + floor(seconds(1.0 + 2.0 * after) + 0.5)));
+    CHECK_EQ(fa_deck_beat_jump(r.a, -4.0), FA_OK);
+    CHECK_EQ(pos(a), (fa_frames)seconds(3.0));
+    CHECK_EQ(fa_stream_seek(a, 0), FA_OK);
+    /* The lock: B (a constant 120) follows A across its change to 110. */
+    CHECK_EQ(fa_stream_play_at(a, at_frame(&r, 480)), FA_OK);
+    rig_run(&r, (uint32_t)seconds(0.2));
+    CHECK_EQ(fa_deck_play_synced(r.b, r.a, FA_SYNC_TEMPO | FA_SYNC_BEAT | FA_SYNC_LOCK), FA_OK);
+    rig_run(&r, (uint32_t)seconds(3.0));
+    CHECK_NEAR(tempo_of(b), 1.0, 0.002);
+    rig_run(&r, (uint32_t)seconds(4.0));   /* A is at about 7 s, 110 BPM */
+    CHECK_NEAR(tempo_of(b), 110.0 / 120.0, 0.002);
+    memset(&bi, 0, sizeof(bi));
+    bi.struct_size = sizeof(bi);
+    CHECK_EQ(fa_deck_get_beat_info(r.b, &bi), FA_OK);
+    CHECK_EQ(bi.locked, 1);
+    CHECK_NEAR(bi.bpm, 110.0, 0.3);
+    CHECK_NEAR(bi.phase_error_ms, 0.0, 1.0);
+    memset(&bi, 0, sizeof(bi));
+    bi.struct_size = sizeof(bi);
+    CHECK_EQ(fa_deck_get_beat_info(r.a, &bi), FA_OK);
+    CHECK_NEAR(bi.bpm, 110.0, 1e-6);
+    {   /* and from the positions: B's beat phase (120 BPM grid from 700) against A's map */
+        double ba = 8.0 + ((double)pos(a) - seconds(4.0)) / seconds(after), bb = ((double)pos(b) - 700.0) / seconds(0.5);
+        double x = (ba - floor(ba)) - (bb - floor(bb));
+        x -= floor(x + 0.5);
+        CHECK_NEAR(x, 0.0, 0.01);
+    }
+    rig_close(&r);
+}
+
 /* ---- auto-mix ---------------------------------------------------------------- */
 
 static int find_event(rig* r, fa_event_type type, int index)
@@ -847,6 +911,85 @@ static void test_automix_restore_tempo(void)
     rig_close(&r);
 }
 
+/* ---- a module's grid -------------------------------------------------------------- */
+
+/* A ProTracker module: one pattern (speed 6, tempo 125, a click every beat) played
+ * `orders` times. */
+static fa_stream* open_mod(unsigned orders)
+{
+    size_t n = 20 + 31 * 30 + 2 + 128 + 4 + 1024 + 512, o;
+    uint8_t* b = (uint8_t*)calloc(1, n);
+    fa_stream* s = NULL;
+    unsigned i, row;
+    if (!b) return NULL;
+    memcpy(b, "Grid Module", 11);
+    o = 20;
+    b[o + 22] = 1;        /* sample 1: 512 bytes (256 words), volume 64, no loop */
+    b[o + 25] = 64;
+    b[o + 29] = 1;
+    o += 31 * 30;
+    b[o++] = (uint8_t)orders;
+    b[o++] = 127;
+    o += 128;             /* every order plays pattern 0 */
+    memcpy(b + o, "M.K.", 4);
+    o += 4;
+    for (row = 0; row < 64; row += 4) {
+        uint8_t* c = b + o + row * 16;
+        c[0] = 0x00; c[1] = 214; c[2] = 0x10;   /* sample 1, period 214 */
+    }
+    b[o + 3 * 4 + 2] = 0x0F;                    /* speed 6 on row 0, channel 3 */
+    b[o + 3 * 4 + 3] = 6;
+    o += 1024;
+    for (i = 0; i < 512; i++) b[o + i] = (uint8_t)(int8_t)lrint(sin(2.0 * 3.14159265358979 * i / 16) * 120.0 * exp(-i / 100.0));
+    if (fa_stream_open_memory(g_engine, b, n, NULL, &s) != FA_OK) s = NULL;
+    free(b);
+    return s;
+}
+
+/* A module's grid is a silent render of the whole song: on a deck it is worked out in
+ * the background, so the mixer's lock (and the event thread) never waits for it. */
+static void test_module_grid_background(void)
+{
+    rig r;
+    fa_stream* s;
+    fa_deck_beat_info info;
+    fa_beat_grid g;
+    uint32_t count = 0;
+    fa_result res = FA_ERROR_BUSY;
+    int i;
+    CHECK(rig_open(&r));
+    s = open_mod(100);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_deck_load(r.a, s, 0), FA_OK);
+    for (i = 0; i < 10000 && res != FA_OK; i++) {
+        memset(&info, 0, sizeof(info));
+        info.struct_size = sizeof(info);
+        res = fa_deck_get_beat_info(r.a, &info);
+        CHECK(res == FA_OK || res == FA_ERROR_NOT_FOUND);   /* NOT_FOUND while it renders */
+        if (res != FA_OK) fa_sleep_ms(1);
+    }
+    CHECK_EQ(res, FA_OK);
+    CHECK_NEAR(info.bpm, 125.0, 1e-6);
+    memset(&g, 0, sizeof(g));
+    g.struct_size = sizeof(g);
+    CHECK_EQ(fa_stream_get_beat_grid(s, &g, NULL, 0, &count), FA_OK);
+    CHECK(g.flags & FA_GRID_EXACT);
+    rig_close(&r);
+
+    /* Closed while it renders: the render stops and is waited for. */
+    s = open_mod(127);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_beat_grid_now(s, NULL, NULL, 0, NULL), FA_ERROR_BUSY);
+    fa_stream_close(s);
+    /* The app's own call waits for a render in progress instead. */
+    s = open_mod(20);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_beat_grid_now(s, NULL, NULL, 0, NULL), FA_ERROR_BUSY);
+    CHECK_EQ(fa_stream_get_beat_grid(s, &g, NULL, 0, &count), FA_OK);
+    CHECK_EQ(count, 1);
+    fa_stream_close(s);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -870,6 +1013,7 @@ int main(void)
     RUN(test_loop_beats);
     RUN(test_beat_jump);
     RUN(test_beat_jump_synced);
+    RUN(test_tempo_map_follow);
     RUN(test_automix_plain);
     RUN(test_automix_aligned);
     RUN(test_automix_empty_and_skip);
@@ -877,6 +1021,7 @@ int main(void)
     RUN(test_automix_bass_swap);
     RUN(test_automix_bass_swap_cut_short);
     RUN(test_automix_restore_tempo);
+    RUN(test_module_grid_background);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

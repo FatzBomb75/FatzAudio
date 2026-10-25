@@ -331,8 +331,14 @@ fa_result fa_midi_exact_grid(const struct fa_midi* m, fa_grid_data* out);
 fa_result fa_tracker_grid_start(struct fa_tracker* t);
 fa_result fa_tracker_grid_finish(struct fa_tracker* t, fa_frames length, fa_grid_data* out);
 /* Renders a freshly opened module through to the end, without interpolation, to
- * find its grid. */
-fa_result fa_tracker_grid_render(fa_decoder* dec, fa_grid_data* out);
+ * find its grid. Stops with FA_ERROR_BUSY once `cancel` (may be NULL) is set. */
+fa_result fa_tracker_grid_render(fa_decoder* dec, fa_grid_data* out, fa_atomic32* cancel);
+/* fa_stream_get_beat_grid for the mixer, which holds its lock: never renders a module
+ * itself but starts that in the background and is FA_ERROR_BUSY until it is done. */
+fa_result fa_stream_beat_grid_now(struct fa_stream* stream, fa_beat_grid* out_grid,
+                                  fa_tempo_segment* out_segments, uint32_t capacity, uint32_t* out_count);
+/* fa_stream_close: a background render stops, and is waited for. */
+void fa_stream_grid_closing(struct fa_stream* stream);
 
 /* Copies the fields `full` bytes of `src` has into `dst`, up to dst's struct_size
  * (its first uint32_t, at least 4), and sets that to what was filled. */
@@ -352,6 +358,24 @@ fa_onset* fa_onset_new(uint32_t rate);
 void fa_onset_free(fa_onset* o);
 fa_result fa_onset_process(fa_onset* o, const float* mono, int64_t frames);
 int fa_onset_grid(fa_onset* o, double min_bpm, double max_bpm, double tag_bpm, fa_grid_data* out);
+
+/* Tempo maps from tracked beats (beat_map.c): stretches of one tempo, joined end to
+ * end. Beat numbers count from the first beat kept (0); times are the beats' units. */
+typedef struct fa_beat_seg {
+    double beat;     /* beat number where the stretch starts */
+    double t;        /* its time */
+    double period;   /* time per beat in it */
+} fa_beat_seg;
+/* Beat times (rising) and their typical period, `fr` time units per second: the
+ * number of stretches (*out_segs malloc'ed) when the tempo changes, 0 when one tempo
+ * fits them (nothing allocated), -1 out of memory. */
+int fa_beat_map(const double* beats, int64_t nb, double period, double fr, fa_beat_seg** out_segs);
+double fa_beat_map_time(const fa_beat_seg* s, int n, double beat);
+double fa_beat_map_beat(const fa_beat_seg* s, int n, double t);
+/* Bars from per-beat harmony change and low-band accent (n beats): 1 with the beats
+ * per bar (4, or 3) and the beat (0 = the first given) that starts one, when that is
+ * clear; else 0. */
+int fa_beat_bars(const float* change, const float* accent, int64_t n, uint32_t* beats_per_bar, uint32_t* offset);
 
 /* Chroma and key (key.c): feed mono audio, then ask for the key (0 = none). */
 typedef struct fa_chroma fa_chroma;
@@ -1277,8 +1301,11 @@ struct fa_stream {
     /* Beat grid (beat_grid.c), under grid_lock: the app's, else the file's exact one
      * (MIDI, trackers), looked for on the first request. */
     fa_mutex grid_lock;
-    int grid_state;              /* 0 not looked for, 1 grid holds one, 2 the file has none */
+    int grid_state;              /* 0 not looked for, 1 grid holds one, 2 the file has none,
+                                    3 a module's being rendered in the background */
     fa_grid_data grid;
+    fa_atomic32 grid_jobs;       /* background renders running (fa_stream_close waits) */
+    fa_atomic32 grid_cancel;     /* fa_stream_close: they stop early */
 
     struct fa_stream* next;      /* engine->streams or engine->graveyard */
 };
@@ -1317,8 +1344,13 @@ void fa_mixer_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t f
 void fa_mixer_render(struct fa_mixer* m, fa_device* dev, float* out, uint32_t channels, uint32_t frames, int64_t now_ns);
 /* A stream left a deck's bus (moved elsewhere, detached or closed): the deck is empty. */
 void fa_mixer_bus_left(fa_bus* bus, struct fa_stream* s);
-/* fa_stream_close, first: a deck's stream leaves its deck under the mixer lock. */
-void fa_mixer_stream_closing(struct fa_stream* s);
+/* fa_stream_close, fa_stream_attach and fa_stream_detach, first (no stream lock held):
+ * a deck's stream that goes elsewhere than `to` leaves its deck under the mixer lock. */
+void fa_mixer_stream_leaving(struct fa_stream* s, fa_bus* to);
+/* fa_stream_attach and fa_stream_detach for the mixer, which holds its lock and takes
+ * streams off its decks itself. */
+fa_result fa_stream_attach_internal(struct fa_stream* s, fa_device* device, fa_bus* bus);
+void fa_stream_detach_internal(struct fa_stream* s);
 /* fa_device_close on a mixer's device closes the mixer (which closes the device). */
 void fa_mixer_destroy_from_device(struct fa_mixer* m);
 /* Event thread, under the device's life_lock: the device's mixer, kept alive until
@@ -1338,7 +1370,12 @@ fa_result fa_stream_jump(struct fa_stream* s, fa_frames at, fa_frames delta);
 fa_result fa_stream_ramp_tempo_quiet(struct fa_stream* s, float target, fa_time duration);
 /* Device frame at the speaker at monotonic time `now_ns` (latency included). */
 double fa_device_speaker_frame(fa_device* device, int64_t now_ns);
+/* How long a backend gets to reroute a default device itself before it counts as lost
+ * (WASAPI stops the stream when the default goes, then restarts it on the new one): the
+ * master (device.c) and the mic inputs (mic.c). */
+#define FA_REROUTE_GRACE_NS 300000000
 void fa_device_wait_quiescent(fa_device* device);
+void fa_device_wait_idle(fa_device* device);
 fa_result fa_device_add_voice(fa_device* device, struct fa_stream* stream);
 void fa_device_remove_voice(fa_device* device, struct fa_stream* stream);
 

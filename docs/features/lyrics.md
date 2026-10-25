@@ -257,7 +257,7 @@ A page is the group of lines shown together; the lines of the page before and af
 
 ## Timing
 
-Lyric times follow the stream's clock (`FA_SURFACE_NOW` is `fa_stream_get_clock`), so they follow seeks, pauses and `FA_PARAM_TEMPO`. The animations (wipes, scrolls, page fades, countdown, end fade) run in real time, with the lengths in the style, whatever the tempo: a song played at half speed does not scroll twice as slowly.
+Lyric times follow the stream's clock (`FA_SURFACE_NOW` is `fa_stream_get_clock`), so they follow seeks, pauses and `FA_PARAM_TEMPO`. The animations (wipes, scrolls, page fades, countdown, end fade) run in real time, with the lengths in the style, whatever the tempo: a song played at half speed does not scroll twice as slowly. The animation lengths follow the tempo in steps of 0.25% (a millisecond or two of a scroll), so a tempo ramp or a DJ sync, which move the tempo every few milliseconds, does not schedule the lines again each frame; the words' times are exact.
 
 | What | Default |
 |---|---|
@@ -278,7 +278,7 @@ The font is chosen in this order: `font_data`, `font_path`, `font_family` (found
 
 A song whose text the chosen font mostly cannot show, such as a Japanese, Korean or Chinese `.kar` with a Latin font, is drawn with the system's font for its script instead, unless `font_explicit` is 1. A family without a face as heavy as `font_weight` gets a synthetic bold.
 
-Creating a surface fails with `FA_ERROR_NOT_FOUND` when no font could be opened (a `font_path` that is missing, or no system font at all) and with `FA_ERROR_UNSUPPORTED_FORMAT` when `font_data` or `font_path` is not a font. `fa_lyric_surface_set_style` returns the same errors and keeps the old style.
+Creating a surface fails with `FA_ERROR_NOT_FOUND` when no font could be opened (a `font_path` that is missing, or no system font at all) and with `FA_ERROR_UNSUPPORTED_FORMAT` when `font_data` or `font_path` is not a font. `fa_lyric_surface_set_style` returns the same errors and keeps the old style. A new style with the same font fields (`font_data` of the same bytes, `font_path`, `font_family`, `font_face`, `font_weight`, `font_explicit`) keeps the font open, so changing colours or placement does not read the font again. A font whose line height is outside 0.5-3 em, or ascender outside 0-2.5 em (a damaged file), is laid out with a 0.9 em ascender and a 1.2 em line instead; a line that cannot be drawn is left out until the next layout.
 
 ## Threads and lifetime
 

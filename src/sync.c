@@ -46,7 +46,7 @@ static fa_result load_grid(struct fa_deck* d, fa_stream* s, fa_grid_view* v)
     memset(v, 0, sizeof(*v));
     for (;;) {
         v->g.struct_size = sizeof(v->g);
-        r = fa_stream_get_beat_grid(s, &v->g, d->segs, d->segs_cap, &n);
+        r = fa_stream_beat_grid_now(s, &v->g, d->segs, d->segs_cap, &n);   /* a module's: BUSY at first */
         if (r != FA_OK) return r;
         if (n <= d->segs_cap) break;
         {   /* the map grew (or is read for the first time) */
@@ -532,6 +532,7 @@ FA_API fa_result FA_CALL fa_deck_get_beat_info(fa_deck* deck, fa_deck_beat_info*
         info.locked = deck->leader && (deck->sync_flags & FA_SYNC_LOCK);
     }
     fa_mutex_unlock(&deck->mixer->lock);
+    if (r == FA_ERROR_BUSY) r = FA_ERROR_NOT_FOUND;   /* a module's grid is still being worked out */
     if (r == FA_OK) fa_copy_sized(out_info, &info, sizeof(info));
     return r;
 }

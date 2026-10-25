@@ -5,3 +5,4 @@ out/
 legacy/
 build-*/
 __pycache__/
+fa_analysis_cache/

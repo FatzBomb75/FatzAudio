@@ -407,7 +407,8 @@ static char* text_utf8(const char* in, size_t n) { return text_utf8_as(in, n, CO
 
 /* Counts, for one text event read as Shift-JIS: double-byte characters, those in the
  * rows of kana and Japanese punctuation (81-83, most of any Japanese lyric), and
- * bytes that cannot be Shift-JIS. */
+ * bytes that cannot be Shift-JIS. A lead byte that ends the event is not counted:
+ * files often cut a character between two syllable events. */
 static void sjis_score(const uint8_t* s, size_t n, uint32_t* pairs, uint32_t* kana, uint32_t* bad)
 {
     size_t i;
@@ -418,7 +419,7 @@ static void sjis_score(const uint8_t* s, size_t n, uint32_t* pairs, uint32_t* ka
             (*pairs)++;
             if (c >= 0x81 && c <= 0x83 && sjis_char(c, s[i + 1])) (*kana)++;
             i++;
-        } else {
+        } else if (!(i + 1 == n && ((c >= 0x81 && c <= 0x9F) || (c >= 0xE0 && c <= 0xFC)))) {
             (*bad)++;
         }
     }
@@ -1302,16 +1303,16 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
     free(text_per_track);
 
     /* The text encoding, for the whole file: what the app says, else UTF-8 if all of
-     * it is, else Shift-JIS when every byte reads as Shift-JIS and enough of it is
-     * kana (Windows-1252 accents often pair up as Shift-JIS kanji, never as kana),
-     * else Windows-1252. */
+     * it is, else Shift-JIS when nearly every byte reads as Shift-JIS (a stray byte
+     * in 50 characters is let pass) and enough of it is kana (Windows-1252 accents
+     * often pair up as Shift-JIS kanji, never as kana), else Windows-1252. */
     switch (m->text_code_page) {
     case FA_CODE_PAGE_UTF8: m->credits.code_page = FA_CODE_PAGE_UTF8; break;
     case FA_CODE_PAGE_WINDOWS_1252: conv = CONV_1252; m->credits.code_page = FA_CODE_PAGE_WINDOWS_1252; break;
     case FA_CODE_PAGE_SHIFT_JIS: conv = CONV_SJIS; m->credits.code_page = FA_CODE_PAGE_SHIFT_JIS; break;
     default:
         if (!any_high || all_utf8) m->credits.code_page = FA_CODE_PAGE_UTF8;
-        else if (sj_bad == 0 && sj_pairs >= 2 && sj_kana * 4 >= sj_pairs) { conv = CONV_SJIS; m->credits.code_page = FA_CODE_PAGE_SHIFT_JIS; }
+        else if (sj_bad * 50 <= sj_pairs && sj_pairs >= 2 && sj_kana * 4 >= sj_pairs) { conv = CONV_SJIS; m->credits.code_page = FA_CODE_PAGE_SHIFT_JIS; }
         else m->credits.code_page = FA_CODE_PAGE_WINDOWS_1252;
         break;
     }
@@ -1619,8 +1620,10 @@ fa_result fa_midi_exact_grid(const struct fa_midi* m, fa_grid_data* out)
         beat += (double)(k->frame - at) / m->rate * 1e6 / us;
         if (fabs(beat - floor(beat + 0.5)) < 1e-4) beat = floor(beat + 0.5);
         at = k->frame;
-        us = (double)k->value;
-        if (out->segs[n - 1].start == at) n--;          /* a later event at the same time wins */
+        /* Under 600 µs a quarter is over FA_GRID_MAX_BPM, which fa_grid_valid refuses
+         * (and with it the analysis cache, rewritten on every analysis). */
+        us = k->value < 600 ? 600.0 : (double)k->value;
+        if (out->segs[n - 1].start == at) n--;         /* a later event at the same time wins */
         else if (out->segs[n - 1].bpm == 60000000.0 / us) continue;   /* the same tempo again */
         out->segs[n].start = at;
         out->segs[n].bpm = 60000000.0 / us;

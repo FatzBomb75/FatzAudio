@@ -28,7 +28,7 @@ public enum BeatGridFlags
     Exact = 2,
     /// <summary>Set by the app, for example after the user corrected it.</summary>
     Edited = 4,
-    /// <summary><see cref="BeatGrid.BeatsPerBar"/> and <see cref="BeatGrid.BarOffset"/> are known (exact grids with one time signature); otherwise they are 4 and 0.</summary>
+    /// <summary><see cref="BeatGrid.BeatsPerBar"/> and <see cref="BeatGrid.BarOffset"/> are known (exact grids with one time signature, or found clearly in the audio); otherwise they are 4 and 0.</summary>
     Bars = 8,
 }
 
@@ -368,6 +368,7 @@ public sealed class MusicalKey : IEquatable<MusicalKey>
 /// <param name="Low">RMS level below 250 Hz (a sine at full scale is 1).</param>
 /// <param name="Mid">RMS level from 250 Hz to 2.5 kHz.</param>
 /// <param name="High">RMS level above 2.5 kHz.</param>
+[StructLayout(LayoutKind.Sequential)]   // read straight from the native fa_waveform_point (ReadWaveform)
 public readonly record struct WaveformPoint(float Peak, float Low, float Mid, float High)
 {
     /// <summary>The length of audio each point covers.</summary>
@@ -468,13 +469,12 @@ public sealed class TrackAnalysis
     {
         uint count = 0;
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_analysis_get_waveform(analysis, null, 0, &count));
-        var native = new FaWaveformPoint[count];
+        var points = new WaveformPoint[count];
+        // Read in place: WaveformPoint is FaWaveformPoint's four floats, in the same order.
         if (count > 0)
-            fixed (FaWaveformPoint* p = native)
-                FatzAudioException.ThrowIfFailed(NativeMethods.fa_analysis_get_waveform(analysis, p, count, &count));
-        var points = new WaveformPoint[Math.Min(count, (uint)native.Length)];
-        for (int i = 0; i < points.Length; i++)
-            points[i] = new WaveformPoint(native[i].Peak, native[i].Low, native[i].Mid, native[i].High);
+            fixed (WaveformPoint* p = points)
+                FatzAudioException.ThrowIfFailed(NativeMethods.fa_analysis_get_waveform(analysis, (FaWaveformPoint*)p, count, &count));
+        if (count < points.Length) Array.Resize(ref points, (int)count);
         return points;
     }
 
