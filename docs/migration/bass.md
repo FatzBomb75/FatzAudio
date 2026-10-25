@@ -323,13 +323,14 @@ The legacy app doesn't ship bassmix.dll, but mixer-style code built on `BASS_Cha
 
 ### bass_aac (AAC)
 
-AAC plays through the ordinary open calls, in MP4/M4A files, video files, `.aac` (ADTS) files, AAC radio and HLS. FatzAudio's own decoder handles AAC-LC, HE-AAC, HE-AAC v2, AAC Main and AAC-LTP, mono to 7.1, the same on every platform, with no FFmpeg and no system codec ([AAC](../features/streams.md#aac)). Only xHE-AAC goes to the system's decoder (Media Foundation, AudioToolbox, MediaCodec, where the system has one); without one it returns `FA_ERROR_UNSUPPORTED_FORMAT` (an app can still decode it with its own FFmpeg and push the frames). ALAC in M4A and Matroska is decoded by the library's own decoder on every platform, to the bit.
+AAC plays through the ordinary open calls, in MP4/M4A files, video files, CAF (`.caf`) files, `.aac` (ADTS) files, AAC radio and HLS. FatzAudio's own decoder handles AAC-LC, HE-AAC, HE-AAC v2, AAC Main and AAC-LTP, mono to 7.1, the same on every platform, with no FFmpeg and no system codec ([AAC](../features/streams.md#aac)). Only xHE-AAC goes to the system's decoder (Media Foundation, AudioToolbox, MediaCodec, where the system has one); without one it returns `FA_ERROR_UNSUPPORTED_FORMAT` (an app can still decode it with its own FFmpeg and push the frames). ALAC in M4A and Matroska is decoded by the library's own decoder on every platform, to the bit.
 
 | bass_aac | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
 | BASS_AAC_StreamCreateFile / BASS_MP4_StreamCreateFile | `fa_stream_open_path` / `fa_stream_open_memory` | `engine.OpenFile` / `engine.OpenMemory` | ✅ |
 | BASS_AAC_StreamCreateURL / BASS_MP4_StreamCreateURL | `fa_stream_open_url` (AAC radio with song titles, `.aac` and MP4 over HTTP, AAC in HLS) | `engine.OpenUrl` | ✅ |
 | BASS_AAC_StreamCreateFileUser / BASS_MP4_StreamCreateFileUser | `fa_stream_open_io` | `engine.OpenStream` | ✅ |
+| AAC in CAF (Core Audio Format) files | Built in: `.caf` files open with the same calls, exact length and start from the packet table ([streams](../features/streams.md#supported-formats)) | `engine.OpenFile` | ✅ |
 | BASS_PluginLoad("bass_aac.dll") | Not needed: built in | — | ➖ (by design) |
 
 ### bass_ac3 (Dolby Digital and Dolby Digital Plus)

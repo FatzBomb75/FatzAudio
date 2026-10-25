@@ -10,9 +10,11 @@
  * the end. Chunks may come in any order, so a seekable source is read through to
  * its last chunk; a forward-only one is read up to the 'data' chunk.
  *
- * Supported: ALAC (the cookie is ALAC's, as in MP4), linear PCM (integer and
- * float, either byte order) and MP3. Everything else (AAC, µ-law and A-law, other
- * codecs) is reported as unsupported. The channel layout chunk is not used: ALAC
+ * Supported: ALAC (the cookie is ALAC's, as in MP4), AAC (LC, HE-AAC and HE-AAC v2;
+ * the cookie is an MPEG-4 ES descriptor holding the AudioSpecificConfig, as in an
+ * MP4 esds box), linear PCM (integer and float, either byte order) and MP3.
+ * Everything else (AAC-LD and ELD, µ-law and A-law, other codecs) is reported as
+ * unsupported. The channel layout chunk is not used: ALAC
  * says its layout in its cookie, the other formats are mono and stereo or in
  * WAVE's order. Packets of constant size (PCM) are found by arithmetic; the others
  * from a table built from 'pakt'. */
@@ -39,6 +41,7 @@ typedef struct caf {
     fa_track track;
     uint8_t* kuki;
     size_t kuki_len;
+    uint8_t asc[FA_AAC_ASC_MAX];  /* AAC with no config in a cookie: built from 'desc' */
     uint8_t* data;
     size_t data_cap;
     caf_pkt* pk;              /* packets from 'pakt' (NULL: constant size) */
@@ -74,10 +77,29 @@ typedef struct caf_desc {
     uint32_t format, flags, bytes_per_packet, frames_per_packet, channels, bits;
 } caf_desc;
 
+/* The ES_Descriptor in an AAC cookie. Apple's tools write it bare (it is what
+ * AudioToolbox takes as the cookie); some writers keep the esds box's version and
+ * flags in front of it, or the whole box. */
+static int aac_cookie(const uint8_t* k, size_t n, uint8_t* oti, const uint8_t** asc, size_t* asc_len)
+{
+    size_t at = 0;
+    *asc = NULL;
+    *asc_len = 0;
+    if (!k || n < 2) return 0;
+    if (k[0] != 0x03) {
+        if (n > 12 && memcmp(k + 4, "esds", 4) == 0 && k[12] == 0x03) at = 12;
+        else if (n > 4 && k[4] == 0x03) at = 4;
+        else return 0;
+    }
+    return fa_mp4_es_descriptor(k + at, n - at, oti, asc, asc_len);
+}
+
 /* The codec for the description. `constant` is set for constant-size formats. */
-static fa_result codec_for(const caf_desc* d, const uint8_t* kuki, size_t kuki_len, fa_codec_params* cp, int* constant)
+static fa_result codec_for(caf* c, const caf_desc* d, fa_codec_params* cp, int* constant)
 {
     const char* name = NULL;
+    const uint8_t* asc = NULL;
+    size_t asc_len = 0;
     uint32_t rate;
     if (!(d->rate >= 1 && d->rate <= 768000) || d->channels == 0 || d->channels > 32) return FA_ERROR_UNSUPPORTED_FORMAT;
     rate = (uint32_t)(d->rate + 0.5);
@@ -95,12 +117,28 @@ static fa_result codec_for(const caf_desc* d, const uint8_t* kuki, size_t kuki_l
         break;
     }
     case FOURCC('a', 'l', 'a', 'c'):
-        if (!kuki) return FA_ERROR_UNSUPPORTED_FORMAT;
+        if (!c->kuki) return FA_ERROR_UNSUPPORTED_FORMAT;
         name = "alac";
         break;
     case FOURCC('.', 'm', 'p', '3'):
         name = "mp3";
         break;
+    case FOURCC('a', 'a', 'c', ' '):     /* AAC-LC (also Main and LTP) */
+    case FOURCC('a', 'a', 'c', 'h'):     /* HE-AAC: the rate and frames per packet are after SBR */
+    case FOURCC('a', 'a', 'c', 'p'): {   /* HE-AAC v2 */
+        uint8_t oti = 0x40;     /* no cookie: MPEG-4 AAC, the config from 'desc' */
+        if (c->kuki && (!aac_cookie(c->kuki, c->kuki_len, &oti, &asc, &asc_len) || !(oti == 0x40 || (oti >= 0x66 && oti <= 0x68))))
+            return FA_ERROR_UNSUPPORTED_FORMAT;
+        if (!asc || asc_len == 0) {
+            /* MPEG-2 AAC says its profile in the object type: Main, LC, SSR. */
+            int aot = oti == 0x66 ? 1 : oti == 0x68 ? 3 : 2;
+            if (d->format != FOURCC('a', 'a', 'c', ' ')) return FA_ERROR_UNSUPPORTED_FORMAT;
+            asc_len = fa_aac_build_asc(c->asc, aot, rate, d->channels, 0);
+            asc = c->asc;
+        }
+        name = "aac";
+        break;
+    }
     default:
         break;
     }
@@ -109,8 +147,11 @@ static fa_result codec_for(const caf_desc* d, const uint8_t* kuki, size_t kuki_l
     cp->sample_rate = rate;
     cp->channels = d->channels;
     if (d->format == FOURCC('a', 'l', 'a', 'c')) {
-        cp->extradata = kuki;
-        cp->extradata_size = kuki_len;
+        cp->extradata = c->kuki;
+        cp->extradata_size = c->kuki_len;
+    } else if (asc) {
+        cp->extradata = asc;
+        cp->extradata_size = asc_len;
     }
     if (*constant) cp->block_align = d->bytes_per_packet;
     return FA_OK;
@@ -282,7 +323,7 @@ static fa_result caf_open(fa_decoder* dec)
 
     memset(&tp, 0, sizeof(tp));
     fa_codec_params_init(&tp.codec);
-    r = codec_for(&d, c->kuki, c->kuki_len, &tp.codec, &constant);
+    r = codec_for(c, &d, &tp.codec, &constant);
     if (r != FA_OK) goto fail;
 
     if (pakt) {
@@ -354,6 +395,6 @@ static int caf_probe(const uint8_t* d, size_t n, size_t id3)
 }
 
 const fa_decoder_vtable fa_decoder_caf = {
-    "caf", "Core Audio Format (ALAC, PCM, MP3)", "caf", "audio/x-caf;audio/caf",
+    "caf", "Core Audio Format (ALAC, AAC, PCM, MP3)", "caf", "audio/x-caf;audio/caf",
     caf_probe, caf_open, caf_read, caf_seek, caf_close, 1, NULL, NULL
 };

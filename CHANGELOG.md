@@ -23,8 +23,9 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   chorus parameters; GS and XG part volume, pan, reverb send and chorus send. A seek with effects on renders the second
   before the target, so reverb and chorus tails ring on across it. See
   [docs/features/midi.md](docs/features/midi.md#reverb-and-chorus).
-- Core Audio Format: `.caf` files open with the ordinary calls. ALAC (to the bit), linear PCM and MP3 play with exact
-  length and seeks; other codecs in CAF (AAC, µ-law, ...) return `FA_ERROR_UNSUPPORTED_FORMAT`.
+- Core Audio Format: `.caf` files open with the ordinary calls. ALAC (to the bit), AAC (LC, HE-AAC, HE-AAC v2), linear
+  PCM and MP3 play with exact length; other codecs in CAF (AAC-LD/ELD, µ-law, ...) return
+  `FA_ERROR_UNSUPPORTED_FORMAT`.
 - DJ mixer: beat jumps (`fa_deck_beat_jump`, .NET `DjDeck.BeatJump`) by whole grid beats, seamless, keeping a synced
   deck on its leader's beat; a deck loop that is on moves along. Auto-mix bass swap (`FA_AUTOMIX_BASS_SWAP`,
   `AutoMixOptions.BassSwap`): the incoming low is killed until the middle, then the lows swap over one beat. Auto-mix
