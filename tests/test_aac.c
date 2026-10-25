@@ -578,8 +578,8 @@ static void lowpass(float* x, int64_t n, int stride, double hz, double rate)
 /* The system's own AAC decoder (Media Foundation, AudioToolbox, MediaCodec), which
  * the library uses for xHE-AAC: given HE-AAC here, it must give the built-in
  * decoder's audio (to within the two decoders' differences, after lining them up).
- * Where none can be reached (the Android chroot, a Windows without Media
- * Foundation) it skips, unless FA_TEST_REAL_SYSTEM=1 says the system has one. */
+ * Where none can be reached (a Windows without Media Foundation) it skips, unless
+ * FA_TEST_REAL_SYSTEM=1 says the system has one; on Android it needs that. */
 static void test_os_decoder(void)
 {
     const char* real = getenv("FA_TEST_REAL_SYSTEM");
@@ -597,6 +597,15 @@ static void test_os_decoder(void)
     double best = -1, se = 0, sx = 0, snr;
     size_t frames, i, from = 2048, span = 8192;   /* the file is 16384 frames */
     CHECK(data != NULL);
+#if defined(__ANDROID__)
+    /* Outside a booted system (tools/android-test/run.sh's chroot, no binder)
+     * MediaCodec waits for its service forever. */
+    if (!(real && strcmp(real, "1") == 0)) {
+        printf("  skipped (MediaCodec needs a booted Android: FA_TEST_REAL_SYSTEM=1)\n");
+        free(data);
+        return;
+    }
+#endif
     n = split_adts(data, size, fr, MAX_FRAMES);
     CHECK(n > 4);
     for (k = 0; k < n; k++) {
