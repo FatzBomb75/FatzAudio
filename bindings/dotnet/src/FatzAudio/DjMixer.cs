@@ -202,7 +202,8 @@ public readonly record struct DeckLoop(long In, long Out);
 /// a.Eq.High = DeckEq.Kill;
 /// b.Cue = true;                                        // in the headphones
 /// mixer.Crossfader.Ramp(1f, TimeSpan.FromSeconds(8));  // to side B over 8 s
-/// var levels = a.GetLevels();
+/// Span&lt;float&gt; peak = stackalloc float[2], rms = stackalloc float[2];
+/// a.GetLevels(peak, rms);                              // the channel meter, each frame without allocating
 /// </code>
 /// </example>
 public sealed partial class DjMixer : IDisposable
@@ -210,6 +211,7 @@ public sealed partial class DjMixer : IDisposable
     private readonly nint _mixer;
     private readonly DjDeck[] _decks;
     private readonly List<Mic> _mics = new();
+    private IReadOnlyList<Mic> _micsView = Array.Empty<Mic>();   // what Mics returns: made again only when a mic comes or goes
 
     internal unsafe DjMixer(AudioEngine engine, nint mixer, OutputDevice output)
     {
@@ -320,7 +322,7 @@ public sealed partial class DjMixer : IDisposable
     {
         get
         {
-            lock (_mics) return _mics.ToArray();
+            lock (_mics) return _micsView;
         }
     }
 
@@ -369,13 +371,20 @@ public sealed partial class DjMixer : IDisposable
             handle.Dispose();
             throw;
         }
-        lock (_mics) _mics.Add(mic);
+        lock (_mics)
+        {
+            _mics.Add(mic);
+            _micsView = Array.AsReadOnly(_mics.ToArray());
+        }
         return mic;
     }
 
     internal void Forget(Mic mic)
     {
-        lock (_mics) _mics.Remove(mic);
+        lock (_mics)
+        {
+            if (_mics.Remove(mic)) _micsView = Array.AsReadOnly(_mics.ToArray());
+        }
     }
 
     /// <summary>
@@ -835,8 +844,17 @@ public sealed partial class DjDeck
         using (_mixer.Lease())
         {
             var sh = stream?.Handle;
-            FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_load(_deck, sh is null ? 0 : sh.DangerousGetHandle(), force ? 1u : 0u));
-            GC.KeepAlive(sh);
+            bool added = false;
+            try
+            {
+                // A reference for the call: a Dispose on another thread must not free the stream under it.
+                sh?.DangerousAddRef(ref added);
+                FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_load(_deck, sh is null ? 0 : sh.DangerousGetHandle(), force ? 1u : 0u));
+            }
+            finally
+            {
+                if (added) sh!.DangerousRelease();
+            }
         }
         old?.LeftDeck();
         stream?.JoinedDeck(_mixer.Output);

@@ -319,6 +319,27 @@ static void test_text_encoding(void)
     CHECK_EQ(fa_stream_get_midi_credits(s, &c), FA_OK);
     CHECK_EQ(c.code_page, FA_CODE_PAGE_UTF8);
     fa_stream_close(s);
+    free(f.d);
+    memset(&f, 0, sizeof(f));
+
+    /* Shift-JIS with one stray byte in 52 characters, and a character cut between
+     * two events: still Shift-JIS. */
+    {
+        int k;
+        mthd(&f, 0, 1, 480);
+        for (k = 0; k < 26; k++) meta(&t, k ? 120 : 0, 0x05, "\x82\xb3\x82\xad");   /* さく */
+        meta(&t, 120, 0x05, "\x80");
+        meta(&t, 120, 0x05, "\x82\xb3\x82");
+        eot(&t, 0);
+        mtrk(&f, &t);
+        s = open_bytes_cp(&f, 0);
+        CHECK(s);
+        CHECK_EQ(fa_stream_get_midi_credits(s, &c), FA_OK);
+        CHECK_EQ(c.code_page, FA_CODE_PAGE_SHIFT_JIS);
+        lyric_string(s, got, sizeof(got));
+        CHECK(strncmp(got, "\xe3\x81\x95\xe3\x81\x8f|", 7) == 0);
+        fa_stream_close(s);
+    }
     free(f.d); free(t.d);
 }
 

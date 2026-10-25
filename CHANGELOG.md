@@ -180,6 +180,15 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
 ### Changed
+- Linux and Android: the library is about 460 KB smaller (4.49 to 4.05 MiB on Linux x64): FatzAudio's own code,
+  miniaudio and the Xiph codecs are now built with a section per function, so the linker drops what is never called.
+- Render-ahead (CD+G and lyric surfaces) is not used on an engine with one worker thread: a 2160p frame with effects
+  there could hold the only worker longer than a tempo stream's buffer lasts. `update_into` draws on your thread.
+- Lyric surfaces: the animation lengths follow `FA_PARAM_TEMPO` in steps of 0.25%, so render-ahead keeps working
+  during a tempo ramp or a DJ sync (every frame used to be drawn on the caller's thread then), and they read the tempo
+  without waiting for a seek in progress. `fa_lyric_surface_set_style` keeps the open font when the font fields are
+  unchanged, and a `font_data` font is held once instead of twice; about 10 MB less line cache at 1080p (14 lines
+  instead of 24).
 - The idle decode worker that watches playing streams wakes as often as the emptiest buffer needs (a quarter of what
   it holds, 5 to 50 ms) instead of every 5 ms, so a playing engine wakes about 20 times a second instead of 200.
 - Radio with a stated bitrate (`icy-br`) reads ahead twice `prebuffer_ms` plus 5 s, at least 256 KB, instead of 2 MB:
@@ -246,6 +255,37 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- DJ mixer: deck loops, beat jumps and sync's jumps no longer drop a playing deck out for a moment. A jump waiting for
+  its target to be decoded no longer pauses the deck's mix on every retry (about 90 times per sync jump), the cut is
+  made between two audio callbacks, and waits for a callback yield instead of sleeping (`Sleep(1)` on Windows can take
+  15.6 ms). Seeks and closes wait less for the same reason.
+- DJ mixer: a deck's stream moved elsewhere or detached (not only closed) now leaves its deck under the mixer's lock, so
+  a deck call or the event thread can no longer use it after it is freed. `fa_mixer_destroy` racing the event thread,
+  or a stream closed on another thread, could touch the freed device or mixer.
+- DJ mixer: a tracker module's exact grid is rendered in the background instead of under the mixer's lock (which held
+  up the event thread and every deck call for up to a second); see
+  [docs/features/dj-mixer.md](docs/features/dj-mixer.md#sync-and-beat-loops).
+- DJ mixer mics: removing a mic (an `InputLost` handler, say) while the setup check measures it no longer frees memory
+  the check still reads. A mic on the default input is no longer reported lost when the system's default recording
+  device changes (only a loss that lasts 300 ms is). `fa_mixer_set_latency_mode` can no longer slip in while a setup
+  check starts. The mic bridge gives back the latency it added after underruns (1 ms per 30 s without one), drops
+  what it held from before a stall instead of playing it late, and `mic_monitor` follows what it holds now. No more
+  denormals as the echo dies away or a deck's isolator goes quiet.
+- CD+G and lyric surfaces with render-ahead: `fa_surface_update_into` could copy from a frame buffer that another
+  thread's `fa_surface_set_presentation_size` (and a new layout) or `fa_surface_set_render_ahead(s, 0)` was freeing.
+- Lyric surfaces: a damaged font's vertical metrics (a tiny em with huge ascender and descender) made line layers and
+  the intro card of gigabytes; such a font now gets the usual 0.9 em ascender and 1.2 em line, layers are never taller
+  than the area, and a line that cannot be drawn is not tried again every frame. One glyph's outline is flattened
+  into at most 2^20 pieces, so a crafted glyph cannot take seconds.
+- CAF: a `pakt` chunk is read in growing pieces, so a source of unknown length no longer allocates its claimed size
+  (up to 256 MB) up front, and the packet table never has more entries than the chunk can hold.
+- MIDI: a Set Tempo under 600 µs a quarter no longer makes the exact beat grid invalid (which made the analysis cache
+  be rewritten on every analysis); a beats-only analysis of a MIDI file no longer renders the song to count its
+  frames. Shift-JIS lyrics with a stray byte (at most one in 50 characters), or a character cut between two events,
+  are no longer read as Windows-1252.
+- .NET: `DjDeck.Load` holds a reference on the stream for the call, so a `Dispose` on another thread cannot free it
+  under the native call. `DjMixer.Mics` no longer copies the list on every read, and `TrackAnalysis.Waveform` is
+  read without a second copy.
 - CD+G: copies of a memory preset (repeat count above 0) no longer clear the screen again when a border or tiles
   were drawn between the copies (reported by FatzBomb.MediaControl).
 - CD+G from discs: packs that fail their P/Q parity are corrected (one damaged symbol) or dropped, instead of

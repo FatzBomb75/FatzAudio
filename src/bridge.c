@@ -19,6 +19,7 @@
 #define BRIDGE_STEP_MS 2.0       /* an underrun raises the target by this much */
 #define BRIDGE_MAX_MS 50.0
 #define BRIDGE_GLIDE_MS 5.0      /* a change of `extra` up to this is steered in, not jumped */
+#define BRIDGE_CALM_S 30.0       /* this long without an underrun gives 1 ms of the growth back */
 #define VS_PREALLOC 8192         /* resampler frames reserved up front (at least): no allocation later */
 
 fa_result fa_bridge_init(fa_bridge* b, double max_adjust)
@@ -103,6 +104,8 @@ static void setup(fa_bridge* b, uint32_t out_rate, double in_period, double out_
     if (outp <= 0.0) outp = (double)out_rate * 0.01;
     b->base = inp + outp * b->nominal + width + (double)b->in_rate * 0.001;
     b->grown = 0.0;
+    b->calm = 0.0;
+    b->seen_overruns = (uint32_t)fa_load32(&b->overruns);
     b->extra_now = fa_load32(&b->extra);
     b->target = b->base + (double)b->extra_now;
     b->primed = 0;
@@ -125,8 +128,12 @@ int64_t fa_bridge_pull(fa_bridge* b, float* out, uint32_t frames, uint32_t out_r
     int32_t extra;
     if (b->out_rate != out_rate || b->in_period != in_period || b->out_period != out_period)
         setup(b, out_rate, in_period, out_period);
-    if (fa_load32(&b->reset) && fa_exchange32(&b->reset, 0)) {
-        /* Start over: what is held goes, and the bridge fills up again. */
+    if ((fa_load32(&b->reset) && fa_exchange32(&b->reset, 0)) ||
+        (uint32_t)fa_load32(&b->overruns) != b->seen_overruns) {
+        /* Start over: what is held goes, and the bridge fills up again. Also after the
+         * ring ran full (the reader stalled, the master was lost): what it holds is from
+         * before, and would play late. */
+        b->seen_overruns = (uint32_t)fa_load32(&b->overruns);
         fa_store32(&b->rpos, fa_load32(&b->wpos));
         fa_varispeed_reset(&b->vs);
         b->primed = 0;
@@ -200,7 +207,16 @@ int64_t fa_bridge_pull(fa_bridge* b, float* out, uint32_t frames, uint32_t out_r
             b->grown += step;
             b->target += step;
         }
+        b->calm = 0.0;
         b->primed = 0;
+        publish_held(b);
+    } else if (b->grown > 0.0 && (b->calm += frames) >= (double)out_rate * BRIDGE_CALM_S) {
+        /* Steady for a while: a millisecond of the growth back, so one bad moment early in
+         * a long set does not keep the monitoring late for the rest of it. */
+        double step = fmin(b->grown, (double)b->in_rate * 0.001);
+        b->grown -= step;
+        b->target -= step;
+        b->calm = 0.0;
         publish_held(b);
     }
     return got;

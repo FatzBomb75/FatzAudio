@@ -12,6 +12,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(_WIN32)
+#  include <direct.h>
+#  include <io.h>
+#else
+#  include <dirent.h>
+#  include <unistd.h>
+#endif
 
 static int g_failures = 0;
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); g_failures++; return; } } while (0)
@@ -780,8 +787,41 @@ static uint32_t info_kinds(const fa_analysis* a)
     return info.kinds;
 }
 
+/* Deletes the files in `dir` (no subfolders), then the folder. */
+static void remove_dir(const char* dir)
+{
+    char path[1024 + 300];   /* the folder and a name */
+#if defined(_WIN32)
+    struct _finddata_t fd;
+    intptr_t h;
+    snprintf(path, sizeof(path), "%s/*", dir);
+    h = _findfirst(path, &fd);
+    if (h != -1) {
+        do {
+            if (fd.attrib & _A_SUBDIR) continue;
+            snprintf(path, sizeof(path), "%s/%s", dir, fd.name);
+            remove(path);
+        } while (_findnext(h, &fd) == 0);
+        _findclose(h);
+    }
+    _rmdir(dir);
+#else
+    DIR* d = opendir(dir);
+    struct dirent* e;
+    if (d) {
+        while ((e = readdir(d)) != NULL) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+            snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+            remove(path);
+        }
+        closedir(d);
+    }
+    rmdir(dir);
+#endif
+}
+
 /* Results are cached by content; asking for more measures the union. */
-static void test_cache(void)
+static void cache_checks(const char* dir)
 {
     fa_engine_config cfg;
     fa_engine* e = NULL;
@@ -792,7 +832,7 @@ static void test_cache(void)
     float* x;
     fa_engine_config_init(&cfg);
     cfg.flags |= FA_ENGINE_NULL_OUTPUT;
-    cfg.cache_directory = "fa_analysis_cache";
+    cfg.cache_directory = dir;
     CHECK(fa_engine_create(&cfg, &e) == FA_OK);
     x = drums(111.0, 0.1, 20.0, &n);
     (void)s; (void)m;
@@ -834,6 +874,25 @@ static void test_cache(void)
     fa_analysis_free(a);
     free(w.d);
     fa_engine_destroy(e);
+}
+
+/* In a folder of the system's temp directory, deleted after. */
+static void test_cache(void)
+{
+    char dir[1024];
+    const char* tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = getenv("TEMP");
+    if (!tmp || !*tmp) tmp = getenv("TMP");
+#if defined(_WIN32)
+    if (!tmp || !*tmp) tmp = ".";
+#elif defined(__ANDROID__)
+    if (!tmp || !*tmp) tmp = "/data/local/tmp";   /* Android has no /tmp */
+#else
+    if (!tmp || !*tmp) tmp = "/tmp";
+#endif
+    snprintf(dir, sizeof(dir), "%s/fa_analysis_cache_%ld_%ld", tmp, (long)time(NULL), (long)clock());
+    cache_checks(dir);
+    remove_dir(dir);
 }
 
 static void test_stream_grid(void)
