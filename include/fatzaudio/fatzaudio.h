@@ -924,6 +924,22 @@ FA_API fa_result FA_CALL fa_stream_get_position(fa_stream* stream, fa_frames* ou
 FA_API fa_result FA_CALL fa_stream_set_loop(fa_stream* stream, int32_t on);
 FA_API fa_result FA_CALL fa_stream_get_loop(fa_stream* stream, int32_t* out_on);
 
+/* Reverse playback (bass_fx's BASS_FX_ReverseCreate and BASS_ATTRIB_REVERSE_DIR), on
+ * or off at any time, also while playing. Reversed, the stream plays backwards from
+ * where it is: the position and the clock count down, and it ends (FA_EVENT_ENDED)
+ * at CUE_IN or the start. Playing from stopped or ended starts at CUE_OUT or the end.
+ * A loop (fa_stream_set_loop, a deck loop) wraps from its start to its end. Tempo,
+ * pitch, rate, volume, effects and the fade markers work as forward. Changing the
+ * direction restarts at the position heard, as fa_stream_seek does. While reversed,
+ * marker, loop, MIDI text and tracker row events are not raised, CUE_OUT does not end the
+ * stream, a queued stream starts when this one ends (no crossfade), deck sync does
+ * not pull the deck into phase, and fa_deck_beat_jump and deck loop changes take
+ * effect at once rather than on a beat. The source is decoded forward in half-second
+ * blocks, one seek each. Push, packet and forward-only streams return
+ * FA_ERROR_NOT_SEEKABLE, web streams FA_ERROR_NOT_IMPLEMENTED. */
+FA_API fa_result FA_CALL fa_stream_set_reverse(fa_stream* stream, int32_t reverse);
+FA_API fa_result FA_CALL fa_stream_get_reverse(fa_stream* stream, int32_t* out_reverse);
+
 /* Mute: silent without touching FA_PARAM_VOLUME, so unmuting brings back the volume
  * (and any fade or ramp, which keeps running while muted). It glides over 5 ms, like
  * a volume change, so it never clicks. The stream keeps playing and its position,
