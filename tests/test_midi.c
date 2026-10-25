@@ -1311,19 +1311,24 @@ static void test_effects(void)
 /* SysEx, then one note (channel 0, key 69, 0..1 s), and the song going on to 4.5 s
  * (a controller at 3.5 s; the length is a second after the last event), so the
  * reverb rings out. */
-static buf make_fx_sysex_song(const uint8_t* const* msgs, const size_t* lens, int count)
+static buf make_fx_song_ticks(const uint8_t* const* msgs, const size_t* lens, int count, uint32_t ticks)
 {
     buf f = { 0 }, t = { 0 };
     int i;
     mthd(&f, 0, 1, 480);
     for (i = 0; i < count; i++) sysex(&t, 0, msgs[i], lens[i]);
     ev3(&t, 0, 0x90, 69, 127);
-    ev3(&t, 960, 0x80, 69, 0);
-    ev3(&t, 2400, 0xBF, 1, 0);
+    ev3(&t, ticks, 0x80, 69, 0);
+    ev3(&t, 3360 - ticks, 0xBF, 1, 0);
     eot(&t, 0);
     mtrk(&f, &t);
     free(t.d);
     return f;
+}
+
+static buf make_fx_sysex_song(const uint8_t* const* msgs, const size_t* lens, int count)
+{
+    return make_fx_song_ticks(msgs, lens, count, 960);
 }
 
 /* The note of make_fx_sysex_song after up to three SysEx. */
@@ -1425,6 +1430,16 @@ static void test_gs_xg_effects(void)
     /* With feedback the echoes go on past the first. */
     CHECK_EQ(render_sysex(delay, sizeof(delay), delay_long, sizeof(delay_long), fb127, sizeof(fb127), 1, x, len, 1000), len);
     CHECK(rms(x, end + d + 2, end + 2 * d) > 1e-5);
+    /* A short sound's echoes repeat on and on, though the line holds silence
+     * between them. */
+    {
+        const uint8_t* m[3] = { delay, delay_long, fb127 };
+        size_t n[3] = { sizeof(delay), sizeof(delay_long), sizeof(fb127) };
+        buf blip = make_fx_song_ticks(m, n, 3, 12);
+        CHECK_EQ(render_fx(&blip, g_font, 1, y, len, 1000), len);
+        for (i = 2; i <= 5; i++) CHECK(rms(y, i * d, i * d + d / 2) > 1e-5);
+        free(blip.d);
+    }
     /* Read size changes nothing, with feedback too. */
     CHECK_EQ(render_sysex(delay, sizeof(delay), delay_long, sizeof(delay_long), fb127, sizeof(fb127), 1, y, len, 4093), len);
     CHECK(memcmp(x, y, bytes) == 0);

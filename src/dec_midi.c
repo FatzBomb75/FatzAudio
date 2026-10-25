@@ -712,7 +712,7 @@ static void apply_sysex(struct fa_midi* m, const uint8_t* d, size_t n, fa_frames
         else if (d[3] == 0x04) { m->tune_coarse = (float)(d[5] - 64); tsf_set_tuning(m->synth, m->tune_coarse + m->tune_fine); }
     } else if (n >= 8 && d[0] == 0x41 && d[2] == 0x42 && d[3] == 0x12) {   /* Roland GS, DT1 */
         int a1 = d[4], a2 = d[5], a3 = d[6], v = d[7];
-        int nd = n >= 10 ? (int)n - 9 : 1, i;               /* data bytes: before the checksum and F7 */
+        int end = (int)n - (d[n - 1] == 0xF7), nd = end - 8 > 1 ? end - 8 : 1, i;   /* data bytes: before the checksum (and F7) */
         if ((a1 == 0x40 && a2 == 0x00 && a3 == 0x7F) || (a1 == 0x00 && a2 == 0x00 && a3 == 0x7F)) {
             reset_channels(m, MODE_GS, frame);                        /* GS reset, system mode set */
         } else if (a1 == 0x40 && a2 == 0x00 && a3 == 0x04) {
@@ -724,7 +724,7 @@ static void apply_sysex(struct fa_midi* m, const uint8_t* d, size_t n, fa_frames
         }
     } else if (n >= 7 && d[0] == 0x43 && (d[1] & 0xF0) == 0x10 && d[2] == 0x4C) {   /* Yamaha XG, parameter change */
         int a1 = d[3], a2 = d[4], a3 = d[5], v = d[6];
-        int nd = n >= 8 ? (int)n - 7 : 1, i;                /* data bytes: before the F7 */
+        int end = (int)n - (d[n - 1] == 0xF7), nd = end - 6 > 1 ? end - 6 : 1, i;   /* data bytes: before the F7, if any */
         if (a1 == 0x00 && a2 == 0x00 && a3 == 0x7E) reset_channels(m, MODE_XG, frame);   /* XG System On */
         else if (a1 == 0x00 && a2 == 0x00 && a3 == 0x04) set_master_gain(m, (float)v / 127.0f, frame);
         else if (a1 == 0x02 && a2 == 0x01) for (i = 0; i < nd; i++) fa_midi_fx_xg(m->fx, a3 + i, d[6 + i]);   /* effects */

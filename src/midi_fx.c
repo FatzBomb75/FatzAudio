@@ -119,8 +119,10 @@ struct fa_midi_fx {
     float* echo;                        /* the delay types' line, stereo, made when first needed */
     int echo_cap, echo_len, echo_pos;
     float echo_fb;
+    fa_frames echo_soft;                /* frames since a sample of -140 dB or more went into it */
     float* chorus_buf[2];
     int chorus_len, chorus_pos, chorus_idle;
+    fa_frames chorus_soft;              /* frames since a sample of -140 dB or more went into the line */
     double delay_ms, depth_ms, rate_hz; /* the chorus's tuning */
     float chorus_fb, chorus_wet, chorus_pre_a;
     float chorus_z[2], chorus_last[2];  /* its input lowpass and its last output, per channel */
@@ -207,6 +209,7 @@ static void reverb_clear(fa_midi_fx* fx)
     }
     if (fx->echo) memset(fx->echo, 0, 2 * (size_t)fx->echo_cap * sizeof(float));
     fx->echo_pos = 0;
+    fx->echo_soft = 0;
     fx->pre_z = 0.0f;
     fx->reverb_idle = 1;
     fx->reverb_quiet = 0;
@@ -220,6 +223,7 @@ static void chorus_clear(fa_midi_fx* fx)
     fx->chorus_last[0] = fx->chorus_last[1] = 0.0f;
     fx->chorus_idle = 1;
     fx->chorus_quiet = 0;
+    fx->chorus_soft = 0;
 }
 
 void fa_midi_fx_reset(fa_midi_fx* fx)
@@ -228,6 +232,12 @@ void fa_midi_fx_reset(fa_midi_fx* fx)
     reverb_clear(fx);
     chorus_clear(fx);
     fx->lfo_next = -1;
+}
+
+/* The one-pole lowpass of the GS pre-LPF (a: 0 is none). */
+static float lowpass(float x, float a, float* z)
+{
+    return a > 0.0f ? (*z = x * (1.0f - a) + *z * a) : x;
 }
 
 static int all_zero(const float* x, int n)
@@ -239,24 +249,24 @@ static int all_zero(const float* x, int n)
 }
 
 /* The GS Delay and Panning Delay types: one echo, repeated by the feedback; the
- * panning one bounces between the channels. */
-static float echo_process(fa_midi_fx* fx, const float* in, float* out, int frames)
+ * panning one bounces between the channels. echo_soft counts the frames since
+ * the line was last given a sample that is not below -140 dB: past its length,
+ * the whole line (and so every repeat still to come) is below that. */
+static void echo_process(fa_midi_fx* fx, const float* in, float* out, int frames)
 {
-    float peak = 0.0f, wet = fx->wet * (FX_ECHO_WET / FX_REVERB_WET);
+    float wet = fx->wet * (FX_ECHO_WET / FX_REVERB_WET);
     int f, pan = fx->kind == KIND_PAN_DELAY;
     for (f = 0; f < frames; f++) {
         float* d = fx->echo + (size_t)fx->echo_pos * 2;
         float x = (in[f * 2] + in[f * 2 + 1]) * 0.5f, l = d[0], r = d[1];
-        if (fx->pre_a > 0.0f) x = fx->pre_z = x * (1.0f - fx->pre_a) + fx->pre_z * fx->pre_a;
+        x = lowpass(x, fx->pre_a, &fx->pre_z);
         d[0] = x + (pan ? r : l) * fx->echo_fb;
         d[1] = pan ? l * fx->echo_fb : x + r * fx->echo_fb;
+        fx->echo_soft = fabsf(d[0]) >= FX_QUIET || fabsf(d[1]) >= FX_QUIET ? 0 : fx->echo_soft + 1;
         if (++fx->echo_pos >= fx->echo_len) fx->echo_pos = 0;
         out[f * 2] += l * wet;
         out[f * 2 + 1] += r * wet;
-        if (fabsf(l) > peak) peak = fabsf(l);
-        if (fabsf(r) > peak) peak = fabsf(r);
     }
-    return peak * wet;
 }
 
 static void reverb_process(fa_midi_fx* fx, const float* in, float* out, int frames)
@@ -269,13 +279,13 @@ static void reverb_process(fa_midi_fx* fx, const float* in, float* out, int fram
     fx->reverb_idle = 0;
     fx->reverb_quiet = quiet_in ? fx->reverb_quiet + frames : 0;
     if (fx->kind != KIND_ROOM) {
-        peak = echo_process(fx, in, out, frames);
-        if (fx->reverb_quiet > fx->echo_len && peak < FX_QUIET) reverb_clear(fx);
+        echo_process(fx, in, out, frames);
+        if (fx->reverb_quiet > fx->echo_len && fx->echo_soft > fx->echo_len) reverb_clear(fx);
         return;
     }
     for (f = 0; f < frames; f++) {
         float x = (in[f * 2] + in[f * 2 + 1]) * fx->in_gain;
-        if (fx->pre_a > 0.0f) x = fx->pre_z = x * (1.0f - fx->pre_a) + fx->pre_z * fx->pre_a;
+        x = lowpass(x, fx->pre_a, &fx->pre_z);
         for (ch = 0; ch < 2; ch++) {
             float y = 0.0f;
             for (i = 0; i < FX_COMBS; i++) {
@@ -308,7 +318,6 @@ static void chorus_process(fa_midi_fx* fx, const float* in, float* out, int fram
     const double base = fx->delay_ms * fx->rate / 1000.0, depth = fx->depth_ms * fx->rate / 1000.0;
     const double step = fx->rate_hz / fx->rate;
     const float gain = fx->chorus_wet * (1.0f / FX_CHORUS_TAPS);
-    float peak = 0.0f;
     double s, c;
     int f, ch, t, quiet_in;
     if (!fx->cho_on) return;
@@ -339,6 +348,7 @@ static void chorus_process(fa_midi_fx* fx, const float* in, float* out, int fram
         int w = fx->chorus_pos;
         fa_frames g = song_frame + f;
         double lfo[2], s1;
+        int loud = 0;
         if (g % FX_LFO_SEED == 0) {
             double ph = 2.0 * 3.14159265358979323846 * fmod((double)g * step, 1.0);
             s = sin(ph);
@@ -352,11 +362,12 @@ static void chorus_process(fa_midi_fx* fx, const float* in, float* out, int fram
         c = c * fx->lfo_cos - s * fx->lfo_sin;
         s = s1;
         for (ch = 0; ch < 2; ch++) {
-            float x = in[f * 2 + ch];
-            if (fx->chorus_pre_a > 0.0f) x = fx->chorus_z[ch] = x * (1.0f - fx->chorus_pre_a) + fx->chorus_z[ch] * fx->chorus_pre_a;
+            float x = lowpass(in[f * 2 + ch], fx->chorus_pre_a, &fx->chorus_z[ch]);
             if (fx->chorus_fb != 0.0f) x += fx->chorus_last[ch] * fx->chorus_fb;
             fx->chorus_buf[ch][w] = x;
+            if (fabsf(x) >= FX_QUIET) loud = 1;
         }
+        fx->chorus_soft = loud ? 0 : fx->chorus_soft + 1;
         for (ch = 0; ch < 2; ch++) {
             float y = 0.0f;
             for (t = 0; t < FX_CHORUS_TAPS; t++) {
@@ -373,16 +384,15 @@ static void chorus_process(fa_midi_fx* fx, const float* in, float* out, int fram
             }
             fx->chorus_last[ch] = y * (1.0f / FX_CHORUS_TAPS);
             out[f * 2 + ch] += y * gain;
-            if (fabsf(y) > peak) peak = fabsf(y);
         }
         if (++fx->chorus_pos == fx->chorus_len) fx->chorus_pos = 0;
     }
     fx->lfo_s = s;
     fx->lfo_c = c;
     fx->lfo_next = song_frame + frames;
-    /* As the reverb: once the last input has left the line (and with feedback, its
-     * repeats have died away). */
-    if (fx->chorus_quiet > fx->chorus_len && peak < FX_QUIET) chorus_clear(fx);
+    /* As the echo: once nothing above -140 dB has gone into the line for its whole
+     * length (with feedback, its repeats have died away too). */
+    if (fx->chorus_quiet > fx->chorus_len && fx->chorus_soft > fx->chorus_len) chorus_clear(fx);
 }
 
 void fa_midi_fx_set_reverb(fa_midi_fx* fx, float room, float damp, float in_gain, float wet)
@@ -412,17 +422,18 @@ static void reverb_update(fa_midi_fx* fx)
 {
     const fx_reverb_type* t = &reverb_types[fx->rev_type < 0 ? GS_HALL2 : fx->rev_type];
     int kind = fx->rev_type < 0 ? KIND_OFF : t->kind;
+    float time = fx->rev_time;
     if ((kind == KIND_DELAY || kind == KIND_PAN_DELAY) && !fx->echo) {
         fx->echo_cap = (int)(FX_ECHO_MAX_S * fx->rate) + 1;
         fx->echo = (float*)calloc(2 * (size_t)fx->echo_cap, sizeof(float));
-        if (!fx->echo) { kind = KIND_ROOM; t = &reverb_types[GS_HALL2]; }   /* no memory: the default reverb */
+        if (!fx->echo) { kind = KIND_ROOM; t = &reverb_types[GS_HALL2]; time = t->time; }   /* no memory: the default reverb */
     }
     if (kind != fx->kind) {
         fx->kind = kind;
         reverb_clear(fx);
     }
     /* g^n = 0.001 after n trips round a comb: log g goes as 1 / time. */
-    fx->room = powf(FX_ROOM, FX_ROOM_TIME / (fx->rev_time > 0.1f ? fx->rev_time : 0.1f));
+    fx->room = powf(FX_ROOM, FX_ROOM_TIME / (time > 0.1f ? time : 0.1f));
     if (fx->room > FX_ROOM_MAX) fx->room = FX_ROOM_MAX;
     fx->damp = t->damp;
     fx->in_gain = FX_INPUT_GAIN;
