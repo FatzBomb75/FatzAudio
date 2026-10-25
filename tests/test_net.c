@@ -1131,6 +1131,11 @@ static void test_icy_radio_decode_only(void)
     CHECK_STR(md.station, "Test FM");
     CHECK_STR(md.genre, "Testing");
     CHECK_EQ(md.bitrate_kbps, 128);
+    /* 128 kbps with the default 1 s prebuffer: the smallest read-ahead, not 2 MB. */
+    fa_mutex_lock(&s->net->lock);
+    CHECK_EQ(s->net->ahead_limit, 256 * 1024);
+    CHECK(s->net->cap < 512 * 1024);
+    fa_mutex_unlock(&s->net->lock);
     CHECK_STR(md.content_type, "audio/mpeg");
     CHECK_STR(md.stream_title, "Artist A - Song 1");
     CHECK_STR(md.artist, "Artist A");
