@@ -1388,7 +1388,109 @@ static void test_caf_mp3(void)
     fa_stream_close(s);
 }
 
-/* Not a CAF codec we decode (AAC, IMA ADPCM, ...) or not a CAF file at all: unsupported. */
+/* AAC in CAF (made from ADTS files by adts_to_caf.py): the ADTS file's samples with the
+ * packet table's priming and remainder cut, for LC, HE-AAC and HE-AAC v2, before and
+ * after seeks. */
+static void check_caf_aac(const char* name, const char* adts, uint32_t rate, int64_t remainder)
+{
+    static const int64_t targets[] = { 0, 1, 2047, 2048, 2049, 9000, 5000 };
+    fa_stream *s, *a;
+    fa_stream_info info;
+    float *got, *want;
+    int64_t n, na, i;
+    double worst = 0;
+    CHECK_EQ(open_file(name, -1, &s), FA_OK);
+    CHECK_EQ(open_file(adts, -1, &a), FA_OK);
+    if (!s || !a) { fa_stream_close(s); fa_stream_close(a); return; }
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.codec, "aac") == 0);
+    CHECK(strcmp(info.container, "caf") == 0);
+    CHECK_EQ(info.format.sample_rate, rate);
+    CHECK_EQ(info.format.channels, 2);
+    got = read_all(s, 2, &n);
+    want = read_all(a, 2, &na);
+    CHECK_EQ(n, na - remainder);
+    CHECK_EQ(info.length_frames, n);
+    for (i = 0; i < n * 2 && i < na * 2; i++)
+        if (fabs((double)got[i] - want[i]) > worst) worst = fabs((double)got[i] - want[i]);
+    printf("  %s against ADTS: max difference %.2g\n", name, worst);
+    CHECK(worst == 0.0);
+    /* Seeks land where the ADTS file's do (AAC seeks are not sample exact; that is
+     * the decoder's, the same in every container). */
+    for (i = 0; i < (int64_t)(sizeof(targets) / sizeof(targets[0])); i++) {
+        int64_t gs, ga;
+        float* ps = read_at(s, 2, targets[i], 3000, &gs);
+        float* pa = read_at(a, 2, targets[i], 3000, &ga);
+        CHECK_EQ(gs, ga);
+        CHECK(gs > 0 && memcmp(ps, pa, (size_t)gs * 2 * sizeof(float)) == 0);
+        free(ps);
+        free(pa);
+    }
+    free(got);
+    free(want);
+    fa_stream_close(s);
+    fa_stream_close(a);
+}
+
+static void test_caf_aac(void)
+{
+    check_caf_aac("caf/aac_lc.caf", "tone.aac", 48000, 300);
+    check_caf_aac("caf/aac_he.caf", "aac/he_stereo.aac", 44100, 500);    /* 'aach', explicit SBR */
+    check_caf_aac("caf/aac_hev2.caf", "aac/he_v2.aac", 44100, 1000);     /* 'aacp', esds version in the cookie */
+}
+
+/* AAC-LD, ELD and the like, or an AAC cookie that is not an ES descriptor: unsupported.
+ * LC with no cookie at all plays from 'desc' alone. */
+static void test_caf_aac_unsupported(void)
+{
+    size_t size = 0, pos = 8;
+    uint8_t* data = load_file("caf/aac_lc.caf", &size);
+    uint8_t* copy = data ? (uint8_t*)malloc(size) : NULL;
+    fa_open_options opt;
+    fa_stream *s = NULL, *ref = NULL;
+    CHECK(data != NULL && copy != NULL);
+    if (!data || !copy) { free(data); free(copy); return; }
+    fa_open_options_init(&opt);
+    opt.flags = FA_OPEN_DECODE_ONLY;
+    memcpy(copy, data, size);
+    copy[8 + 12 + 11] = 'e';    /* desc: 'aace', AAC-ELD */
+    CHECK_EQ(fa_stream_open_memory(g_engine, copy, size, &opt, &s), FA_ERROR_UNSUPPORTED_FORMAT);
+    fa_stream_close(s);
+    s = NULL;
+    memcpy(copy, data, size);
+    while (pos + 12 <= size && memcmp(copy + pos, "kuki", 4) != 0) {
+        uint64_t len = 0;
+        size_t i;
+        for (i = 0; i < 8; i++) len = (len << 8) | copy[pos + 4 + i];
+        pos += 12 + (size_t)len;
+    }
+    CHECK(pos + 12 < size);
+    if (pos + 12 < size) {
+        copy[pos + 12] = 0x04;   /* not an ES descriptor */
+        CHECK_EQ(fa_stream_open_memory(g_engine, copy, size, &opt, &s), FA_ERROR_UNSUPPORTED_FORMAT);
+        fa_stream_close(s);
+        s = NULL;
+        memcpy(copy, data, size);
+        memcpy(copy + pos, "free", 4);   /* no cookie: the LC config comes from 'desc' */
+        CHECK_EQ(fa_stream_open_memory(g_engine, copy, size, &opt, &s), FA_OK);
+        CHECK_EQ(open_file("caf/aac_lc.caf", -1, &ref), FA_OK);
+        if (s && ref) {
+            int64_t na, nb;
+            float* a = read_all(s, 2, &na);
+            float* b = read_all(ref, 2, &nb);
+            CHECK_EQ(na, nb);
+            CHECK(na > 0 && na == nb && memcmp(a, b, (size_t)na * 2 * sizeof(float)) == 0);
+            free(a);
+            free(b);
+        }
+        fa_stream_close(s);
+        fa_stream_close(ref);
+    }
+    free(copy);
+    free(data);
+}
+
+/* Not a CAF codec we decode (IMA ADPCM, ...) or not a CAF file at all: unsupported. */
 static void test_caf_unsupported(void)
 {
     size_t size = 0;
@@ -1399,7 +1501,7 @@ static void test_caf_unsupported(void)
     if (!data) return;
     fa_open_options_init(&opt);
     opt.flags = FA_OPEN_DECODE_ONLY;
-    data[8 + 12 + 8] = 'a'; data[8 + 12 + 9] = 'a'; data[8 + 12 + 10] = 'c'; data[8 + 12 + 11] = ' ';   /* desc: 'aac ' */
+    data[8 + 12 + 8] = 'i'; data[8 + 12 + 9] = 'm'; data[8 + 12 + 10] = 'a'; data[8 + 12 + 11] = '4';   /* desc: 'ima4' */
     CHECK_EQ(fa_stream_open_memory(g_engine, data, size, &opt, &s), FA_ERROR_UNSUPPORTED_FORMAT);
     free(data);
 }
@@ -1563,6 +1665,8 @@ int main(void)
     RUN(test_caf_packet_table_first);
     RUN(test_caf_pcm);
     RUN(test_caf_mp3);
+    RUN(test_caf_aac);
+    RUN(test_caf_aac_unsupported);
     RUN(test_caf_unsupported);
     RUN(test_aac_51_channel_order);
     RUN(test_mov_pcm);
