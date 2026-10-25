@@ -54,6 +54,22 @@ jobs:
       - name: Install LAME (macOS)
         if: runner.os == 'macOS'
         run: brew install lame
+      # Real audio output and HTTPS through URLSession (FA_TEST_REAL_SYSTEM: the
+      # device test and the HTTPS check must run, not skip). The runner has no sound
+      # device, so BlackHole's virtual one; the HTTPS server's test certificate
+      # authority is trusted system-wide, as an app's server certificate would be.
+      - name: Sound device and HTTPS test server (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install --cask blackhole-2ch
+          sudo killall coreaudiod || true
+          python3 tools/test-https/serve.py tests/data "$RUNNER_TEMP/https" > "$RUNNER_TEMP/https.log" 2>&1 &
+          for i in $(seq 100); do nc -z 127.0.0.1 8443 && break; sleep 0.2; done
+          # Without this, trusting a root needs a user to confirm it, and a runner has none.
+          sudo security authorizationdb write com.apple.trust-settings.admin allow
+          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$RUNNER_TEMP/https/ca.crt"
+          echo "FA_TEST_REAL_SYSTEM=1" >> "$GITHUB_ENV"
+          echo "FA_NET_HTTPS_URL=https://127.0.0.1:8443/net/tone_cbr.mp3" >> "$GITHUB_ENV"
       # Only the built libmp3lame.dll is cached (a vcpkg install is over a minute);
       # bump the key to refresh it.
       - name: Restore LAME (Windows)

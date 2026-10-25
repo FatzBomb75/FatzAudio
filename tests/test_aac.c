@@ -547,6 +547,101 @@ static void test_unsupported_configs(void)
     }
 }
 
+#if defined(_WIN32) || defined(__APPLE__) || defined(__ANDROID__)
+#  if defined(_WIN32)
+#    define OS_AAC_OPEN fa_mf_codec_open
+#  elif defined(__APPLE__)
+#    define OS_AAC_OPEN fa_at_codec_open
+#  else
+#    define OS_AAC_OPEN fa_mc_codec_open
+#  endif
+/* The system's own AAC decoder (Media Foundation, AudioToolbox, MediaCodec), which
+ * the library uses for xHE-AAC: given HE-AAC here, it must give the built-in
+ * decoder's audio (to within the two decoders' differences, after lining them up).
+ * Where none can be reached (the Android chroot, a Windows without Media
+ * Foundation) it skips, unless FA_TEST_REAL_SYSTEM=1 says the system has one. */
+static void test_os_decoder(void)
+{
+    const char* real = getenv("FA_TEST_REAL_SYSTEM");
+    size_t size, n, k;
+    uint8_t* data = load_file("aac/he_stereo.aac", &size);
+    adts_frame fr[MAX_FRAMES];
+    const uint8_t* pk[MAX_FRAMES];
+    size_t len[MAX_FRAMES];
+    pcm_buf ref, os;
+    bitw w;
+    fa_codec_params p;
+    fa_codec c;
+    fa_result r;
+    int ri, cfg, lag, best_lag = 0;
+    double best = -1, se = 0, sx = 0, snr;
+    size_t frames, i, from = 8192, span = 16384;
+    CHECK(data != NULL);
+    n = split_adts(data, size, fr, MAX_FRAMES);
+    CHECK(n > 4);
+    for (k = 0; k < n; k++) {
+        pk[k] = fr[k].p;
+        len[k] = fr[k].len;
+    }
+    CHECK(decode_packets(pk, len, n, NULL, 0, &ref));
+    /* HE-AAC said explicitly: 44.1 kHz SBR on a 22.05 kHz LC core. */
+    ri = (fr[0].p[2] >> 2) & 15;
+    cfg = ((fr[0].p[2] & 1) << 2) | (fr[0].p[3] >> 6);
+    memset(&w, 0, sizeof(w));
+    put(&w, 5, 5);
+    put(&w, (uint32_t)ri, 4);
+    put(&w, (uint32_t)cfg, 4);
+    put(&w, 4, 4);
+    put(&w, 2, 5);
+    put(&w, 0, 3);
+    fa_codec_params_init(&p);
+    p.codec = "aac";
+    p.sample_rate = 44100;
+    p.channels = 2;
+    p.extradata = w.b;
+    p.extradata_size = (size_t)(w.pos + 7) / 8;
+    memset(&c, 0, sizeof(c));
+    r = OS_AAC_OPEN(&c, &p);
+    if (r != FA_OK && !(real && strcmp(real, "1") == 0)) {
+        printf("  skipped (no system AAC decoder here: %s)\n", fa_result_string(r));
+        free(ref.p);
+        free(data);
+        return;
+    }
+    CHECK_EQ(r, FA_OK);
+    memset(&os, 0, sizeof(os));
+    for (k = 0; k < n; k++) {
+        CHECK_EQ(c.vt->decode(&c, fr[k].p + fr[k].header, fr[k].len - fr[k].header), FA_OK);
+        if (c.out_frames > 0) append(&os, c.out, (int)c.out_frames, (int)c.channels);
+    }
+    printf("  %s: %u Hz, %u channels, %zu frames (built-in %zu)\n", c.vt->name, c.rate, c.channels,
+           os.n / (c.channels ? c.channels : 1), ref.n / 2);
+    CHECK_EQ(c.rate, 44100);
+    CHECK_EQ(c.channels, 2);
+    fa_codec_close(&c);
+    /* The decoders' delays differ: line the left channels up over a stretch of music. */
+    frames = os.n / 2 < ref.n / 2 ? os.n / 2 : ref.n / 2;
+    CHECK(frames > from + span + 4096);
+    for (lag = -4096; lag <= 4096; lag++) {
+        double dot = 0;
+        for (i = from; i < from + span; i++) dot += (double)ref.p[i * 2] * os.p[(size_t)((long)i + lag) * 2];
+        if (dot > best) { best = dot; best_lag = lag; }
+    }
+    for (i = from; i < frames - 4096; i++) {
+        size_t j = (size_t)((long)i + best_lag);
+        double e0 = ref.p[i * 2] - os.p[j * 2], e1 = ref.p[i * 2 + 1] - os.p[j * 2 + 1];
+        se += e0 * e0 + e1 * e1;
+        sx += (double)ref.p[i * 2] * ref.p[i * 2] + (double)ref.p[i * 2 + 1] * ref.p[i * 2 + 1];
+    }
+    snr = se > 0 ? 10 * log10(sx / se) : 999;
+    printf("  lag %d frames, %.1f dB against the built-in decoder\n", best_lag, snr);
+    CHECK(snr > 20);
+    free(os.p);
+    free(ref.p);
+    free(data);
+}
+#endif
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -560,6 +655,9 @@ int main(void)
     RUN(test_several_blocks_and_crc);
     RUN(test_damaged_frames);
     RUN(test_unsupported_configs);
+#if defined(_WIN32) || defined(__APPLE__) || defined(__ANDROID__)
+    RUN(test_os_decoder);
+#endif
 
     fa_engine_destroy(g_engine);
     if (g_failures) { printf("%d failure(s)\n", g_failures); return 1; }

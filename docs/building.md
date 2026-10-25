@@ -7,10 +7,10 @@ loaded at runtime if the app has them.
 | Platform | Output | Built and tested |
 |---|---|---|
 | Windows x64 | `fatzaudio.dll` | CI: build and all tests |
-| macOS | `libfatzaudio.dylib` | CI: build and all tests |
+| macOS | `libfatzaudio.dylib` | CI: build and all tests, with real audio output and HTTPS ([below](#tests-on-real-systems)) |
 | Linux x64 | `libfatzaudio.so` | CI: build and all tests (including a dependency and export check), plus ASan/UBSan |
-| Android arm64-v8a, x86_64, armeabi-v7a, x86 | `libfatzaudio.so` per ABI | CI: build of every ABI with a dependency and export check; all tests on x86_64 and arm64 in an Android 14 user space ([below](#run-the-tests-without-a-device)) |
-| iOS device (arm64), simulator (arm64, x86_64) | `fatzaudio.xcframework` | CI: build only (iOS programs need a signed app to run) |
+| Android arm64-v8a, x86_64, armeabi-v7a, x86 | `libfatzaudio.so` per ABI | CI: build of every ABI with a dependency and export check; all tests on x86_64 and arm64 in an Android 14 user space ([below](#run-the-tests-without-a-device)), and on an Android 14 emulator ([below](#tests-on-real-systems)) |
+| iOS device (arm64), simulator (arm64, x86_64) | `fatzaudio.xcframework` | CI: build, and all tests in the iOS simulator ([below](#tests-on-real-systems)); never run on a device |
 
 ## Windows, macOS, Linux
 
@@ -167,9 +167,8 @@ IPv6 support in its kernel (CI runners have it).
 
 It needs root (`chroot` and bind mounts). What it cannot cover is anything that
 needs Android's system services: real audio output (AAudio, OpenSL ES) and the
-MediaCodec decoders. Those need an emulator or a phone: copy
-`build-android-<abi>/bin` to `/data/local/tmp` with `adb push` and run the test
-programs there with `LD_LIBRARY_PATH=/data/local/tmp/bin`.
+MediaCodec decoders. Those need an emulator or a phone: `tools/android-test/run-adb.py`
+runs the suite there ([below](#tests-on-real-systems)).
 
 ## iOS
 
@@ -193,7 +192,8 @@ cmake --build build-ios-device --config Release
 ```
 
 - Tests and tools are off by default for iOS (`FA_BUILD_TESTS`, `FA_BUILD_TOOLS`):
-  iOS programs only run inside a signed app bundle.
+  on a device, programs only run inside a signed app bundle. The simulator runs the
+  tests ([below](#tests-on-real-systems)).
 - The framework's bundle identifier is `com.fatzaudio.fatzaudio`; set
   `-DFA_IOS_BUNDLE_ID=...` for your own.
 - It links only system frameworks: Foundation, CFNetwork, CoreFoundation,
@@ -206,3 +206,69 @@ In Xcode, add `fatzaudio.xcframework` to the app target with "Embed & Sign" and
 `#include <fatzaudio/fatzaudio.h>`. A .NET for iOS app references it as
 `<NativeReference Include="fatzaudio.xcframework" Kind="Framework" />`; that
 route has not been tried with the binding yet ([engineering notes](engineering-notes.md)).
+
+## Tests on real systems
+
+Every test plays into a silent "null" output, so on their own they never touch a
+system's sound devices, and they skip what a build machine cannot offer. The
+`devices` CI workflow (`.github/workflows/devices.yml`) and the macOS build job
+run them where those services are real, with `FA_TEST_REAL_SYSTEM=1`, which makes
+the tests that need them fail instead of skipping:
+
+- `device` (`tests/test_device.c`): the system's audio output is a real backend
+  (not the null one) and pulls a stream in real time; a mic opens and runs
+  (not on iOS, where a program needs an app's microphone usage string). Without
+  the variable it skips.
+- `aac`: the system's AAC decoder (Media Foundation, AudioToolbox, MediaCodec, the
+  ones used for xHE-AAC) decodes HE-AAC like the built-in decoder.
+- `net`: HTTPS through URLSession (macOS, iOS) against a local server, and the
+  Android HTTPS tests, which need the device's Java runtime.
+
+| Where | What runs | When |
+|---|---|---|
+| Android 14 emulator (x86_64, KVM on a Linux runner) | every test, over adb: AAudio, MediaCodec, HttpURLConnection | `devices` workflow |
+| iOS simulator (arm64) | every test: Core Audio output, AudioToolbox, URLSession | `devices` workflow |
+| macOS runner | the build job's tests, with a virtual sound device (BlackHole) and a trusted local HTTPS server | every build |
+
+The `devices` workflow runs on every push to `main`, on demand, and on pull
+requests that touch the code these systems run differently (the list is in the
+workflow). Real CD drives and real phones stay untested.
+
+### Android emulator or phone
+
+`tools/android-test/run-adb.py` runs a build's suite over adb. The tests find their
+data by absolute path and a device can only write under `/data/local/tmp`, so the
+source and build folders must be there on the build machine too; they are copied
+to the same paths on the device:
+
+```bash
+sudo mkdir -p /data/local/tmp/fa && sudo chown "$USER" /data/local/tmp/fa
+rsync -a --exclude .git ./ /data/local/tmp/fa/src/
+cmake -S /data/local/tmp/fa/src -B /data/local/tmp/fa/build -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=x86_64 -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release -DFA_BUILD_TOOLS=OFF
+cmake --build /data/local/tmp/fa/build
+FA_TEST_REAL_SYSTEM=1 tools/android-test/run-adb.py /data/local/tmp/fa/build
+```
+
+### iOS simulator
+
+Configure the simulator slice with tests, and `tools/ios-sim/run.sh` as the
+program that starts each one (`xcrun simctl spawn` in the booted simulator, which
+shares the Mac's files):
+
+```bash
+cmake -S . -B build-iossim -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_BUILD_TYPE=Release -DFA_BUILD_TESTS=ON -DFA_BUILD_TOOLS=OFF \
+  -DCMAKE_CROSSCOMPILING_EMULATOR="$PWD/tools/ios-sim/run.sh"
+cmake --build build-iossim
+xcrun simctl boot "iPhone 16"          # any iPhone simulator
+ctest --test-dir build-iossim
+```
+
+### HTTPS through the system's TLS stack
+
+`tools/test-https/serve.py DIR OUT` makes a test certificate authority and server
+certificate in `OUT` and serves `DIR` on `https://127.0.0.1:8443/`. Trust `OUT/ca.crt`
+(`security add-trusted-cert` on macOS, `xcrun simctl keychain booted add-root-cert`
+for the simulator) and set `FA_NET_HTTPS_URL` to a file it serves.

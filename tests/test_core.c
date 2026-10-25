@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#  include <unistd.h>
+#endif
 #ifdef _WIN32
 #  include <windows.h>
 static void sleep_ms(unsigned ms) { Sleep(ms); }
@@ -783,6 +786,10 @@ static void test_play_to_end(void)
 int main(void)
 {
     fa_engine_config cfg;
+#if defined(__APPLE__)
+    /* The iOS simulator starts programs elsewhere: tools/ios-sim/run.sh names the folder. */
+    if (getenv("FA_TEST_CWD") && chdir(getenv("FA_TEST_CWD")) != 0) return 1;
+#endif
     fa_engine_config_init(&cfg);
     cfg.flags = FA_ENGINE_NULL_OUTPUT; /* real-time silent output: works on CI without audio hardware */
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) { fprintf(stderr, "engine create failed\n"); return 1; }

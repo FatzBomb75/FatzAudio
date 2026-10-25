@@ -1630,6 +1630,16 @@ static void test_hls_ac3(void)
     fa_stream_close(s);
 }
 
+/* FA_TEST_REAL_SYSTEM=1: the system's services are there, so a test that needs them
+ * fails instead of skipping (the same test as test_aac.c and test_device.c). */
+#if defined(__APPLE__) || defined(__ANDROID__)
+static int real_system(void)
+{
+    const char* v = getenv("FA_TEST_REAL_SYSTEM");
+    return v != NULL && strcmp(v, "1") == 0;
+}
+#endif
+
 /* HTTPS through the system's TLS stack, when FA_NET_HTTPS_URL names an audio file
  * (CI sets none by default: the test must not depend on the internet). */
 static void test_https_optional(void)
@@ -1641,6 +1651,10 @@ static void test_https_optional(void)
     float buf[4096 * 2];
     fa_frames got = 0;
     fa_result r;
+#if defined(__APPLE__)
+    /* The macOS and iOS simulator CI jobs serve one over a trusted test certificate. */
+    CHECK(url != NULL || !real_system());
+#endif
     if (!url) { printf("  skipped (set FA_NET_HTTPS_URL)\n"); return; }
     fa_open_options_init(&o);
     o.flags = FA_OPEN_DECODE_ONLY;
@@ -1768,7 +1782,11 @@ static void test_android_https(void)
     g_scheme = "https";
     CHECK_EQ(fetch("/tone.wav", &f), FA_ERROR_PROVIDER_MISSING);
     g_scheme = "http";
-    if (tls_front_start(FA_TEST_DATA_DIR "/net/tls", g_port, &port, &vm) != 0) { printf("  skipped (no Java VM here)\n"); return; }
+    if (tls_front_start(FA_TEST_DATA_DIR "/net/tls", g_port, &port, &vm) != 0) {
+        CHECK(!real_system());   /* a device or emulator always has one */
+        printf("  skipped (no Java VM here)\n");
+        return;
+    }
     printf("  https front on 127.0.0.1:%d\n", port);
     g_scheme = "https";
     g_url_port = port;

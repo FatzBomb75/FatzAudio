@@ -13,6 +13,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#  include <TargetConditionals.h>
+#  include <unistd.h>
+#endif
 
 static int g_failures = 0;
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); g_failures++; return; } } while (0)
@@ -246,10 +250,16 @@ static int g_have_flac_cli = -1;
 static int flac_cli_ok(const char* path)
 {
     char cmd[512];
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    (void)cmd;
+    (void)path;
+    return 1;   /* no system() on iOS */
+#else
     if (g_have_flac_cli < 0) g_have_flac_cli = system("flac --version > /dev/null 2>&1") == 0;
     if (!g_have_flac_cli) return 1;
     snprintf(cmd, sizeof(cmd), "flac -t -s \"%s\" 2> /dev/null", path);
     return system(cmd) == 0;
+#endif
 }
 
 static void test_flac_lossless(void)
@@ -766,6 +776,10 @@ static void test_mp3(void)
 int main(void)
 {
     fa_engine_config cfg;
+#if defined(__APPLE__)
+    /* The iOS simulator starts programs elsewhere: tools/ios-sim/run.sh names the folder. */
+    if (getenv("FA_TEST_CWD") && chdir(getenv("FA_TEST_CWD")) != 0) return 1;
+#endif
     fa_engine_config_init(&cfg);
     cfg.flags = FA_ENGINE_NULL_OUTPUT;
     cfg.worker_threads = 2;
