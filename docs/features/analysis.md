@@ -179,7 +179,7 @@ A MIDI file holds its tempo changes and time signature, and a tracker module hol
 - **Tempo changes are segments.** A song that changes tempo gets one segment per tempo; `bpm` is the one that lasts longest, and beat numbers carry on across the changes.
 - **Bars** are known for MIDI files with one time signature (`FA_GRID_BARS`, with `beats_per_bar` from the signature and `bar_offset` 0). Modules have no time signature, so their grids say 4 and 0 without the flag.
 - **MIDI** counts 120 BPM until the file's first tempo event, as the standard says, and `first_beat` is frame 0.
-- For a module, the first `fa_stream_get_beat_grid` renders the song once without sound, about 0.25 s for a 4-minute song.
+- For a module, the first `fa_stream_get_beat_grid` renders the song once without sound, about 0.25 s for a 4-minute song. On a DJ deck that render runs in the background (see [DJ mixer sync](dj-mixer.md#sync-and-beat-loops)); `fa_stream_get_beat_grid` waits for it.
 
 C:
 ```c

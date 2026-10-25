@@ -179,6 +179,8 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
 ### Changed
+- Linux and Android: the library is about 460 KB smaller (4.49 to 4.05 MiB on Linux x64): FatzAudio's own code,
+  miniaudio and the Xiph codecs are now built with a section per function, so the linker drops what is never called.
 - Render-ahead (CD+G and lyric surfaces) is not used on an engine with one worker thread: a 2160p frame with effects
   there could hold the only worker longer than a tempo stream's buffer lasts. `update_into` draws on your thread.
 - Lyric surfaces: the animation lengths follow `FA_PARAM_TEMPO` in steps of 0.25%, so render-ahead keeps working
@@ -252,6 +254,22 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- DJ mixer: deck loops, beat jumps and sync's jumps no longer drop a playing deck out for a moment. A jump waiting for
+  its target to be decoded no longer pauses the deck's mix on every retry (about 90 times per sync jump), the cut is
+  made between two audio callbacks, and waits for a callback yield instead of sleeping (`Sleep(1)` on Windows can take
+  15.6 ms). Seeks and closes wait less for the same reason.
+- DJ mixer: a deck's stream moved elsewhere or detached (not only closed) now leaves its deck under the mixer's lock, so
+  a deck call or the event thread can no longer use it after it is freed. `fa_mixer_destroy` racing the event thread,
+  or a stream closed on another thread, could touch the freed device or mixer.
+- DJ mixer: a tracker module's exact grid is rendered in the background instead of under the mixer's lock (which held
+  up the event thread and every deck call for up to a second); see
+  [docs/features/dj-mixer.md](docs/features/dj-mixer.md#sync-and-beat-loops).
+- DJ mixer mics: removing a mic (an `InputLost` handler, say) while the setup check measures it no longer frees memory
+  the check still reads. A mic on the default input is no longer reported lost when the system's default recording
+  device changes (only a loss that lasts 300 ms is). `fa_mixer_set_latency_mode` can no longer slip in while a setup
+  check starts. The mic bridge gives back the latency it added after underruns (1 ms per 30 s without one), drops
+  what it held from before a stall instead of playing it late, and `mic_monitor` follows what it holds now. No more
+  denormals as the echo dies away or a deck's isolator goes quiet.
 - CD+G and lyric surfaces with render-ahead: `fa_surface_update_into` could copy from a frame buffer that another
   thread's `fa_surface_set_presentation_size` (and a new layout) or `fa_surface_set_render_ahead(s, 0)` was freeing.
 - Lyric surfaces: a damaged font's vertical metrics (a tiny em with huge ascender and descender) made line layers and

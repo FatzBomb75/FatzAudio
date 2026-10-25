@@ -220,7 +220,7 @@ TimeSpan delay = mic.MonitorLatency;            // voice to speaker
 - **Fade-in.** A new mic is silent for 50 ms, then fades in over 10 ms, so adding one never pops.
 - **Unprocessed capture.** Mics ask for the input without the system's voice processing (automatic gain, noise suppression, echo cancelling: made for calls, they spoil singing and add latency). That is WASAPI's raw mode on Windows (`AUDCLNT_STREAMOPTIONS_RAW`, where the driver offers it) and Android's UNPROCESSED input preset; macOS, iOS and Linux give the input as the system delivers it. `FA_MIC_OS_PROCESSING` (`KeepOsProcessing`) keeps the processing; two mics on one device share its input, so the first mic added decides for both.
 - **Permission.** The app asks for the microphone permission before adding a mic: Android needs `RECORD_AUDIO` in the manifest and the runtime prompt; macOS and iOS need `NSMicrophoneUsageDescription` (and a sandboxed macOS app the audio-input entitlement). Where the system refuses at open, adding a mic is `FA_ERROR_PERMISSION_DENIED` (`ErrorCode.PermissionDenied`); some systems deliver silence instead.
-- **Input lost.** An input that goes away (unplugged, taken by another app) goes silent, the mix carries on, and the mixer raises `FA_EVENT_INPUT_LOST` once per mic on `fa_mixer_set_event_callback` (`InputLost`), on the engine's event thread. Remove the mic there or later and add it again when the device is back. `fa_mic_remove` works inside the callback, also for the event's own mic.
+- **Input lost.** An input that goes away (unplugged, taken by another app) goes silent, the mix carries on, and the mixer raises `FA_EVENT_INPUT_LOST` once per mic on `fa_mixer_set_event_callback` (`InputLost`), on the engine's event thread, once the input has been gone for 300 ms. A mic on the default input carries on when the system's default recording device changes (the backend stops it for a moment and moves it): that is not reported, and neither is a device the backend starts again within the 300 ms. A loss after one that came back is reported again. Remove the mic there or later and add it again when the device is back. `fa_mic_remove` works inside the callback, also for the event's own mic.
 - **Host mics.** `FA_MIC_DUCKS_MUSIC` (`DucksMusic`) marks a host's mic: its voice ducks the music (below). Leave it off for singers.
 
 ### Reverb and echo
@@ -312,7 +312,7 @@ mixer.StartRecording([master, vocals]);
 | `mic_input[i]` | the input device's buffer plus the bridge's fill; −1 when slot `i` has no mic |
 | `mic_monitor[i]` | voice to speaker: measured by the setup check, else `mic_input[i]` plus `master` (with any delay on it); −1 when no mic |
 
-Times the system does not report are estimated from the buffer sizes. Below about 20 ms voice to speaker a singer does not notice; at 30 ms and more it sounds like a slap-back. With the low-latency default the bridge holds about one input period, one master period and a millisecond. The [setup check](#setup-check) measures the real total; after it, `mic_monitor[i]` is the measured time for that mic in the mode measured (`mic_input[i]` stays the reported one).
+Times the system does not report are estimated from the buffer sizes. Below about 20 ms voice to speaker a singer does not notice; at 30 ms and more it sounds like a slap-back. With the low-latency default the bridge holds about one input period, one master period and a millisecond; after an underrun it holds 2 ms more (up to 50 ms in all), and gives a millisecond back after each 30 s without one. The [setup check](#setup-check) measures the real total; after it, `mic_monitor[i]` is the measured time for that mic in the mode measured, with the bridge as it holds now (`mic_input[i]` stays the reported one).
 
 ### Setup check
 
@@ -352,7 +352,7 @@ foreach (var m in check.Modes)
 
 ## Sync and beat loops
 
-Sync needs a beat grid on both decks: one from [track analysis](analysis.md) set with `fa_stream_set_beat_grid` (`AudioStream.BeatGrid`), one the user corrected, or the exact grid of a MIDI file or tracker module (no analysis needed). Without one the calls return `FA_ERROR_NOT_FOUND`. Beats are measured where the decks are heard (the presentation clock), so they line up in the room, including any delay on the master.
+Sync needs a beat grid on both decks: one from [track analysis](analysis.md) set with `fa_stream_set_beat_grid` (`AudioStream.BeatGrid`), one the user corrected, or the exact grid of a MIDI file or tracker module (no analysis needed). Without one the calls return `FA_ERROR_NOT_FOUND`. A module's grid is a silent render of the whole song, worked out in the background from `fa_deck_load` on (a few hundred ms for a long module): until it is ready sync, beat loops and beat jumps on that deck are `FA_ERROR_BUSY` (try again a moment later) and `fa_deck_get_beat_info` is `FA_ERROR_NOT_FOUND`, so no deck call and no engine event waits for it. Beats are measured where the decks are heard (the presentation clock), so they line up in the room, including any delay on the master.
 
 ```c
 fa_stream_set_beat_grid(song_a, &grid_a, NULL, 0);   /* from fa_analysis_get_beat_grid */
