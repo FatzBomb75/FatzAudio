@@ -7,7 +7,7 @@ loaded at runtime if the app has them.
 | Platform | Output | Built and tested |
 |---|---|---|
 | Windows x64 | `fatzaudio.dll` | CI: build and all tests |
-| macOS | `libfatzaudio.dylib` | CI: build and all tests, with real audio output and HTTPS ([below](#tests-on-real-systems)) |
+| macOS | `libfatzaudio.dylib` | CI: build and all tests, with real audio output ([below](#tests-on-real-systems)) |
 | Linux x64 | `libfatzaudio.so` | CI: build and all tests (including a dependency and export check), plus ASan/UBSan |
 | Android arm64-v8a, x86_64, armeabi-v7a, x86 | `libfatzaudio.so` per ABI | CI: build of every ABI with a dependency and export check; all tests on x86_64 and arm64 in an Android 14 user space ([below](#run-the-tests-without-a-device)), and on an Android 14 emulator ([below](#tests-on-real-systems)) |
 | iOS device (arm64), simulator (arm64, x86_64) | `fatzaudio.xcframework` | CI: build, and all tests in the iOS simulator ([below](#tests-on-real-systems)); never run on a device |
@@ -221,14 +221,14 @@ the tests that need them fail instead of skipping:
   the variable it skips.
 - `aac`: the system's AAC decoder (Media Foundation, AudioToolbox, MediaCodec, the
   ones used for xHE-AAC) decodes HE-AAC like the built-in decoder.
-- `net`: HTTPS through URLSession (macOS, iOS) against a local server, and the
+- `net`: HTTPS through URLSession (iOS simulator) against a local server, and the
   Android HTTPS tests, which need the device's Java runtime.
 
 | Where | What runs | When |
 |---|---|---|
 | Android 14 emulator (x86_64, KVM on a Linux runner) | every test, over adb: AAudio, MediaCodec, HttpURLConnection | `devices` workflow |
 | iOS simulator (arm64) | every test: Core Audio output, AudioToolbox, URLSession | `devices` workflow |
-| macOS runner | the build job's tests, with a virtual sound device (BlackHole) and a trusted local HTTPS server | every build |
+| macOS runner | the build job's tests, with a virtual sound device (BlackHole); HTTPS is left to the simulator (a hosted Mac will not trust a test root without a person confirming it) | every build |
 
 The `devices` workflow runs on every push to `main`, on demand, and on pull
 requests that touch the code these systems run differently (the list is in the

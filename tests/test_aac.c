@@ -575,7 +575,7 @@ static void test_os_decoder(void)
     fa_result r;
     int ri, cfg, lag, best_lag = 0;
     double best = -1, se = 0, sx = 0, snr;
-    size_t frames, i, from = 8192, span = 16384;
+    size_t frames, i, from = 2048, span = 8192;   /* the file is 16384 frames */
     CHECK(data != NULL);
     n = split_adts(data, size, fr, MAX_FRAMES);
     CHECK(n > 4);
@@ -610,24 +610,27 @@ static void test_os_decoder(void)
     }
     CHECK_EQ(r, FA_OK);
     memset(&os, 0, sizeof(os));
-    for (k = 0; k < n; k++) {
-        CHECK_EQ(c.vt->decode(&c, fr[k].p + fr[k].header, fr[k].len - fr[k].header), FA_OK);
+    /* MediaCodec's output trails its input by a few packets, so the file goes in
+     * twice: what is compared all comes out of the first pass. */
+    for (k = 0; k < 2 * n; k++) {
+        const adts_frame* f = &fr[k % n];
+        CHECK_EQ(c.vt->decode(&c, f->p + f->header, f->len - f->header), FA_OK);
         if (c.out_frames > 0) append(&os, c.out, (int)c.out_frames, (int)c.channels);
     }
-    printf("  %s: %u Hz, %u channels, %zu frames (built-in %zu)\n", c.vt->name, c.rate, c.channels,
-           os.n / (c.channels ? c.channels : 1), ref.n / 2);
+    printf("  %s: %u Hz, %u channels, %zu frames from the file twice (built-in %zu from it once)\n", c.vt->name,
+           c.rate, c.channels, os.n / (c.channels ? c.channels : 1), ref.n / 2);
     CHECK_EQ(c.rate, 44100);
     CHECK_EQ(c.channels, 2);
     fa_codec_close(&c);
     /* The decoders' delays differ: line the left channels up over a stretch of music. */
     frames = os.n / 2 < ref.n / 2 ? os.n / 2 : ref.n / 2;
-    CHECK(frames > from + span + 4096);
-    for (lag = -4096; lag <= 4096; lag++) {
+    CHECK(frames > from + span + 2048);
+    for (lag = -2048; lag <= 2048; lag++) {
         double dot = 0;
         for (i = from; i < from + span; i++) dot += (double)ref.p[i * 2] * os.p[(size_t)((long)i + lag) * 2];
         if (dot > best) { best = dot; best_lag = lag; }
     }
-    for (i = from; i < frames - 4096; i++) {
+    for (i = from; i < frames - 2048; i++) {
         size_t j = (size_t)((long)i + best_lag);
         double e0 = ref.p[i * 2] - os.p[j * 2], e1 = ref.p[i * 2 + 1] - os.p[j * 2 + 1];
         se += e0 * e0 + e1 * e1;

@@ -54,6 +54,11 @@ endif()
 if(APPLE)
     set_source_files_properties(${PROJECT_SOURCE_DIR}/src/net_https_apple.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 endif()
+if(IOS)
+    # As for the library: miniaudio sets up the AVAudioSession on iOS, in Objective-C
+    # (source file properties do not carry over from the top-level directory).
+    set_source_files_properties(${PROJECT_SOURCE_DIR}/src/miniaudio_impl.c PROPERTIES LANGUAGE OBJC)
+endif()
 target_link_libraries(fa_test_internal PRIVATE Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
 if(UNIX)
     target_link_libraries(fa_test_internal PRIVATE m)

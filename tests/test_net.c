@@ -17,6 +17,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#  include <TargetConditionals.h>
+#endif
 
 #if defined(_WIN32)
 #  include <winsock2.h>
@@ -1632,7 +1635,7 @@ static void test_hls_ac3(void)
 
 /* FA_TEST_REAL_SYSTEM=1: the system's services are there, so a test that needs them
  * fails instead of skipping (the same test as test_aac.c and test_device.c). */
-#if defined(__APPLE__) || defined(__ANDROID__)
+#if (defined(__APPLE__) && TARGET_OS_IPHONE) || defined(__ANDROID__)
 static int real_system(void)
 {
     const char* v = getenv("FA_TEST_REAL_SYSTEM");
@@ -1651,8 +1654,8 @@ static void test_https_optional(void)
     float buf[4096 * 2];
     fa_frames got = 0;
     fa_result r;
-#if defined(__APPLE__)
-    /* The macOS and iOS simulator CI jobs serve one over a trusted test certificate. */
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    /* The iOS simulator CI job serves one over a trusted test certificate. */
     CHECK(url != NULL || !real_system());
 #endif
     if (!url) { printf("  skipped (set FA_NET_HTTPS_URL)\n"); return; }
