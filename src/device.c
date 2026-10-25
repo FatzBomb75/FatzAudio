@@ -349,10 +349,6 @@ fa_result fa_device_reopen_mode(fa_device* d, fa_latency_mode mode, void (*betwe
     return r;
 }
 
-/* How long a backend gets to reroute a default device itself before it counts as lost
- * (WASAPI stops the stream when the default goes, then restarts it on the new one). */
-#define FA_REROUTE_GRACE_NS 300000000
-
 static int needs_service(fa_device* d, int64_t now)
 {
     if (fa_load32(&d->rerouted)) return 1;

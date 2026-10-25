@@ -26,7 +26,6 @@
 #define GATE_OFF_DB (-99.9f)
 #define BRIDGE_MAX_ADJUST 0.002  /* the most the ratio is nudged: 0.2%, about 3.5 cents */
 #define RING_SECONDS 0.5
-#define INPUT_LOST_GRACE_NS 300000000   /* as the master's reroute grace (device.c) */
 
 /* ---- the input side (capture callback) ------------------------------------------ */
 
@@ -77,7 +76,7 @@ static void flag_lost(fa_capture* c) { capture_changed(c, 1); }
 /* The backend's thread: an input that stops without being asked to has gone away. One
  * on the default input that the backend moves to the new default (after stopping it),
  * or a device the backend starts again, records on: not lost any more. The event thread
- * reports a loss only when it lasts (INPUT_LOST_GRACE_NS). */
+ * reports a loss only when it lasts (FA_REROUTE_GRACE_NS). */
 static void capture_notification(const ma_device_notification* n)
 {
     fa_capture* c = (fa_capture*)n->pDevice->pUserData;
@@ -466,9 +465,6 @@ FA_API fa_result FA_CALL fa_mixer_add_mic(fa_mixer* mixer, const fa_mic_config* 
     return FA_OK;
 }
 
-/* Takes the mic out of its slot and closes its input if it was the last on it.
- * Caller holds the mixer lock. Returns 0 when it was out already (fa_mixer_destroy and
- * a callback's fa_mic_remove raced): whoever took it out frees it. */
 /* One user fewer on c; the last closes it. Caller holds the mixer lock. */
 static void capture_release(struct fa_mixer* m, fa_capture* c)
 {
@@ -477,6 +473,10 @@ static void capture_release(struct fa_mixer* m, fa_capture* c)
         capture_free(c);
     }
 }
+
+/* Takes the mic out of its slot and closes its input if it was the last on it.
+ * Caller holds the mixer lock. Returns 0 when it was out already (fa_mixer_destroy and
+ * a callback's fa_mic_remove raced): whoever took it out frees it. */
 
 static int mic_detach_locked(struct fa_mixer* m, struct fa_mic* mic)
 {
@@ -760,7 +760,7 @@ void fa_mixer_service(struct fa_mixer* m)
         if (mic->lost_reported) continue;
         /* A default-device change stops the input for a moment before the backend
          * moves it: only a loss that lasts is reported. */
-        due = fa_load64(&mic->cap->lost_at) + INPUT_LOST_GRACE_NS;
+        due = fa_load64(&mic->cap->lost_at) + FA_REROUTE_GRACE_NS;
         if (fa_monotonic_ns() < due) {
             fa_mixer_wake(m, due);
             continue;

@@ -716,7 +716,7 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
      * decode_lock: end the download first so the read returns. */
     fa_net_interrupt(stream->net);
     fa_encode_stream_closing(stream);   /* encoders recording or reading it lose their source */
-    fa_stream_detach(stream);
+    fa_stream_detach_internal(stream);   /* off its deck already (above) */
 
     /* A scan of this stream reads its file or memory: stop it before they go. */
     fa_mutex_lock(&stream->norm_lock);
@@ -1702,6 +1702,10 @@ static int64_t carry_timeline(struct fa_stream* s, uint32_t dev_rate)
 FA_API fa_result FA_CALL fa_stream_attach(fa_stream* stream, fa_device* device, fa_bus* bus)
 {
     if (!stream || !device) return FA_ERROR_INVALID_ARG;
+    /* The argument checks of attach_internal first: a call refused for them leaves the
+     * stream on its deck. */
+    if ((bus && bus->device != device) || (stream->flags & FA_OPEN_DECODE_ONLY) || device->engine != stream->engine)
+        return FA_ERROR_INVALID_ARG;
     fa_mixer_stream_leaving(stream, bus);   /* off a deck first, under the mixer lock */
     return fa_stream_attach_internal(stream, device, bus);
 }

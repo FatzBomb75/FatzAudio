@@ -833,9 +833,10 @@ static int layer_make(fa_lyric* l, uint32_t index, ly_layer* L)
     if (!x || !g) goto fail;
     tw = shape(l, line->text, line->text_len, x, g) * size;
     if (tw < 1.0f) tw = 1.0f;
-    /* Never larger than the area (twice its width for a line still to be fitted):
-     * a damaged font's advances must not make a layer of gigabytes. */
-    if (!(tw <= 2.0f * (float)l->area_w) || !(lh <= (float)l->area_h)) goto fail;
+    /* Never taller than the area, nor wider than 8 times it (a long line without a
+     * place to break is shrunk to fit later): a damaged font's metrics must not make a
+     * layer of gigabytes. */
+    if (!(tw <= 8.0f * (float)l->area_w) || !(lh <= (float)l->area_h)) goto fail;
     L->w = (int)ceilf(tw) + 2 * l->pad;
     L->h = (int)ceilf(lh) + 2 * l->pad;
     L->text_x = (float)l->pad;
@@ -1800,7 +1801,7 @@ static int frame_list(fa_lyric* l, fa_time t, ly_inst* out)
         ly_inst* in = &out[m];
         ly_layer* L = layer_get(l, sh[i].line);
         float maxw = (float)l->block_w;
-        if (!L) return -1;
+        if (!L) continue;   /* could not be drawn (failed): left out, as a page is */
         memset(in, 0, sizeof(*in));
         in->page = -1;
         in->line = sh[i].line;

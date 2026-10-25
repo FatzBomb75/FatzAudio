@@ -161,29 +161,29 @@ static void grid_thread(void* arg)
     fa_fetch_add32(&s->grid_jobs, -1);
 }
 
-/* grid_lock held. `wait`: the app's call, which may take the time (it renders a module
- * itself, or waits for the render in the background). Otherwise a module starts
- * rendering in the background and the answer is FA_ERROR_BUSY until it is done: the
- * mixer asks under its lock, which the event thread and every deck call need. */
+/* grid_lock held. A module renders in the background, never under grid_lock: the
+ * mixer asks under its own lock, which the event thread and every deck call need.
+ * `wait`: the app's call, which may take the time and waits for that render; otherwise
+ * the answer is FA_ERROR_BUSY until it is done. */
 static fa_result grid_get_locked(struct fa_stream* s, fa_beat_grid* out_grid, fa_tempo_segment* out_segments,
                                  uint32_t capacity, uint32_t* out_count, int wait)
 {
     fa_result r = FA_OK;
-    while (s->grid_state == 3 && wait) {
-        fa_mutex_unlock(&s->grid_lock);
-        fa_sleep_ms(5);
-        fa_mutex_lock(&s->grid_lock);
-    }
-    if (s->grid_state == 0 && s->tracker && !wait) {
+    if (s->grid_state == 0 && s->tracker) {
         fa_thread t;
         s->grid_state = 3;
         fa_fetch_add32(&s->grid_jobs, 1);
         if (fa_thread_create(&t, grid_thread, s) == 0) {
             fa_thread_detach(&t);
-            return FA_ERROR_BUSY;
+        } else {
+            fa_fetch_add32(&s->grid_jobs, -1);
+            s->grid_state = 0;   /* no thread: rendered here after all */
         }
-        fa_fetch_add32(&s->grid_jobs, -1);
-        s->grid_state = 0;   /* no thread: rendered here after all */
+    }
+    while (s->grid_state == 3 && wait) {
+        fa_mutex_unlock(&s->grid_lock);
+        fa_sleep_ms(5);
+        fa_mutex_lock(&s->grid_lock);
     }
     if (s->grid_state == 0) {
         fa_grid_data g;

@@ -1345,6 +1345,10 @@ fa_result fa_stream_jump(struct fa_stream* s, fa_frames at, fa_frames delta);
 fa_result fa_stream_ramp_tempo_quiet(struct fa_stream* s, float target, fa_time duration);
 /* Device frame at the speaker at monotonic time `now_ns` (latency included). */
 double fa_device_speaker_frame(fa_device* device, int64_t now_ns);
+/* How long a backend gets to reroute a default device itself before it counts as lost
+ * (WASAPI stops the stream when the default goes, then restarts it on the new one): the
+ * master (device.c) and the mic inputs (mic.c). */
+#define FA_REROUTE_GRACE_NS 300000000
 void fa_device_wait_quiescent(fa_device* device);
 void fa_device_wait_idle(fa_device* device);
 fa_result fa_device_add_voice(fa_device* device, struct fa_stream* stream);
