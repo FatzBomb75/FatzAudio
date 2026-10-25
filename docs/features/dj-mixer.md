@@ -69,7 +69,8 @@ long beat = songB.Info.Format.SampleRate * 60 / 128;
 b.Loop = new DeckLoop(songB.PositionFrames, songB.PositionFrames + 4 * beat);
 b.Loop = null;                        // off
 
-var levels = a.GetLevels();           // the channel meter
+Span<float> peak = stackalloc float[2], rms = stackalloc float[2];
+a.GetLevels(peak, rms);               // the channel meter, per frame without allocating (GetLevels() allocates)
 ```
 
 `DjMixer.Dispose` unloads the decks (even playing ones) and closes the output; the streams stay open for you to dispose. A stream that is disposed, or played on another device or bus, leaves its deck by itself.
