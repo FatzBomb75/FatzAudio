@@ -41,8 +41,8 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_Start / BASS_Stop | `fa_device_start` / `fa_device_stop` (both idempotent) | `device.Start()` / `Stop()` | ✅ |
 | BASS_Pause | `fa_device_stop` (streams keep their position) | `device.Stop()` | ✅ |
 | BASS_IsStarted | `fa_device_is_started` | `device.IsStarted` | ✅ |
-| BASS_SetVolume / BASS_GetVolume | `fa_device_set_volume` / `get_volume` | `device.Volume` | ✅ |
-| Mute by saving the volume, setting BASS_ATTRIB_VOL (or BASS_SetVolume) to 0 and restoring it | `fa_stream_set_mute` / `fa_device_set_mute`: the volume is kept, fades keep running, 5 ms glide | `stream.Muted`, `device.Muted` | ✅ |
+| BASS_SetVolume / BASS_GetVolume | `fa_device_set_volume` / `fa_device_get_volume` | `device.Volume` | ✅ |
+| Mute by saving the volume, setting BASS_ATTRIB_VOL (or BASS_SetVolume) to 0 and restoring it | `fa_stream_set_mute` / `fa_device_set_mute` (read with `fa_stream_get_mute` / `fa_device_get_mute`): the volume is kept, fades keep running, 5 ms glide | `stream.Muted`, `device.Muted` | ✅ |
 | BASS_SetConfig / GetConfig (+Ptr) | `fa_engine_config` fields at creation; per-stream options | `AudioEngineOptions` | ✅ partially (rate, period, threads, cache dir) |
 | BASS_CONFIG_BUFFER | `fa_open_options.buffer_ms` per stream, default 500 ms ([playback](../features/playback.md#buffer-length)) | `StreamOptions.BufferLength` | ✅ |
 | BASS_CONFIG_NET_TIMEOUT / NET_READTIMEOUT | `fa_net_options.timeout_ms` per stream: connecting, and the longest the server may stay silent ([web streams](../features/web-streams.md#connection-settings)) | `NetworkOptions.Timeout` | ✅ |
@@ -106,6 +106,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_ChannelGetPosition with BASS_POS_DECODE | Not needed: the position always counts what was played, never what was decoded ahead | — | ➖ (by design) |
 | BASS_ChannelBytes2Seconds / Seconds2Bytes | Not needed: frames ÷ sample rate, or use TimeSpan in .NET | — | ➖ (by design) |
 | BASS_ChannelSetAttribute VOL / PAN | `fa_stream_set_param` VOLUME / PAN, de-zippered over 5 ms ([ramps](../features/ramps.md)) | `Volume` / `Pan` | ✅ |
+| BASS_ChannelGetAttribute VOL / PAN / FREQ | `fa_stream_get_param`: the value being applied right now (mid-ramp values included) | `Volume`, `Pan`, `Rate` | ✅ |
 | BASS_ChannelSetAttribute FREQ (playback speed and pitch together) | `FA_PARAM_RATE` as a multiplier: `new_freq / original_freq`, e.g. 1.02 for +2 %; sinc resampling, exact ([tempo and pitch](../features/tempo-pitch.md)) | `Rate` | ✅ |
 | BASS_ChannelSetAttributeEx / GetAttributeEx | Typed functions per feature instead | | ➖ (by design) |
 | BASS_ChannelSlideAttribute | `fa_stream_ramp_param` with 7 curves and an optional exact start time ([ramps](../features/ramps.md)) | `Ramp(...)` / `await RampAsync(...)` | ✅ volume, pan |
@@ -117,7 +118,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_SYNC_STALL | `FA_EVENT_STALLED` and `FA_EVENT_RESUMED` (two events instead of one with a flag) | `Stalled`, `Resumed` | ✅ |
 | BASS_SYNC_DOWNLOAD | `fa_net_status.finished` | `NetworkStatus.Finished` | ✅ (polled, no event) |
 | BASS_SYNC_HLS_SEGMENT | Not provided | — | ➖ |
-| BASS_SYNC_POS | `fa_stream_add_position_event` + `FA_EVENT_POSITION` | `AddPositionEvent`, `PositionReached` | 🧩 |
+| BASS_SYNC_POS | `fa_stream_add_position_event` + `FA_EVENT_POSITION` (declared; returns `FA_ERROR_NOT_IMPLEMENTED` until built, so use the two rows below) | `AddPositionEvent`, `PositionReached` | 🧩 |
 | BASS_SYNC_POS used to start a crossfade or the next track | Markers (`FA_MARKER_MIX_POINT`, fades) and `fa_stream_set_next` ([crossfade](../features/crossfade.md)) | `stream.Markers`, `QueueNext` | ✅ |
 | BASS_SYNC_POS used to end playback early (trim) | `FA_MARKER_CUE_OUT` (exact end) and `FA_MARKER_CUE_IN` | `Markers.CueOut`, `Markers.CueIn` | ✅ |
 | `FA_EVENT_MARKER` has no BASS equivalent | Raised when playback passes a marker | `MarkerReached` | ✅ |
@@ -128,14 +129,14 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | `BASS_DATA_FFT_NOWINDOW` / `BASS_DATA_FFT_INDIVIDUAL` | `FA_SPECTRUM_NO_WINDOW`; one call per channel with `FA_SPECTRUM_LEFT` / `FA_SPECTRUM_RIGHT` | `SpectrumOptions` | ✅ |
 | `BASS_DATA_FFT_COMPLEX` / `BASS_DATA_FFT_REMOVEDC` | Not provided: magnitudes only; skip bin 0 | — | ➖ |
 | Levels or FFT of the whole output (a `BASS_ChannelGetLevel` on a mixer, or `BASS_WASAPI_GetLevel`) | `fa_device_get_levels` / `fa_device_get_spectrum`: everything the device plays, after the limiter | `output.GetLevels()`, `output.GetSpectrum()` | ✅ |
-| BASS_ChannelGetTags | `fa_stream_get_tags` for an open stream, or `fa_tags_read_path`/`_memory` without one: one reader for every format, common fields with `fa_tags_get(tags, FA_TAG_ARTIST)`, every item with `fa_tags_get_item` ([tags](../features/tags.md)) | `stream.GetTags()`, `Tags.Read(path)`: `tags.Artist`, `tags.Title`, ... | ✅ |
+| BASS_ChannelGetTags | `fa_stream_get_tags` for an open stream, or `fa_tags_read_path` / `fa_tags_read_memory` (a file already in memory) without one: one reader for every format, common fields with `fa_tags_get(tags, FA_TAG_ARTIST)`, every item with `fa_tags_get_item` ([tags](../features/tags.md)) | `stream.GetTags()`, `Tags.Read(path)`: `tags.Artist`, `tags.Title`, ... | ✅ |
 | BASS_ChannelGetTags `BASS_TAG_ID3` (ID3v1) / `BASS_TAG_ID3V2` / `BASS_TAG_APE` / `BASS_TAG_MP4` / `BASS_TAG_RIFF_INFO` | Parsed for you: no raw blocks to decode. Items keep their format's own keys (`TIT2`, `©nam`, `INAM`, ...) and `format` says which tag they came from; ID3v2 wins over APEv2 over ID3v1 for the common fields | `tags.Items` (`Key`, `Value`, `Format`), `tags["KEY"]` | ✅ |
 | BASS_ChannelGetTags `BASS_TAG_APE_BINARY` / ID3v2 `APIC` / MP4 `covr` (cover art) | `fa_tags_get_cover`, or every picture with `fa_tags_get_picture` (type, MIME, description, data) | `tags.Cover`, `tags.Pictures` | ✅ |
 | Tags add-on (tags.dll) `TAGS_Read(h, "%ARTI - %TITL")` | No format strings: build the text from `fa_tags_get` fields | String interpolation on `Tags` | ➖ (formatting is the app's) |
 | BASS_ChannelGetTags `BASS_TAG_META` (ICY StreamTitle) | `fa_stream_get_metadata`: the title heard now, split into artist and title ([song titles](../features/web-streams.md#song-titles-icy-metadata)) | `stream.Metadata` | ✅ |
 | BASS_ChannelGetTags `BASS_TAG_ICY` / `BASS_TAG_HTTP` | `fa_stream_get_metadata` (station, genre, bitrate, ...) or any header by name with `fa_stream_get_http_header` | `stream.Metadata`, `GetHttpHeader(name)` | ✅ |
 | BASS_ChannelGetTags `BASS_TAG_HLS_*` | `fa_stream_get_info` (container `hls`, codec) and `fa_stream_get_net_status` (`is_hls`, media playlist URL) | `Info`, `NetworkStatus` | ✅ |
-| BASS_ChannelFlags (BASS_SAMPLE_LOOP), at open or while playing | `FA_OPEN_LOOP` at open, `fa_stream_set_loop` at any time; loops between the cue-in and cue-out markers | `StreamOptions.Loop`, `stream.Loop` | ✅ |
+| BASS_ChannelFlags (BASS_SAMPLE_LOOP), at open or while playing, and reading the flag back | `FA_OPEN_LOOP` at open, `fa_stream_set_loop` at any time, `fa_stream_get_loop` to read it; loops between the cue-in and cue-out markers | `StreamOptions.Loop`, `stream.Loop` | ✅ |
 | BASS_SYNC_END on a looping channel, to notice a loop | `FA_EVENT_LOOPED` for each jump (raised as it is mixed, like markers): frame = the loop end it left, value = where it went | `stream.Looped` | ✅ |
 | BASS_POS_LOOP / BASS_POS_END (loop start, end position) | `FA_MARKER_CUE_IN` / `FA_MARKER_CUE_OUT` | `Markers.CueIn` / `Markers.CueOut` | ✅ |
 | BASS_ChannelSetLink / RemoveLink | `fa_stream_play_at` with the same time starts streams on the same frame; a bus ([buses](../features/buses.md)) groups their volume and pan | `PlayAt`, `MixBus` | ✅ |
@@ -440,7 +441,7 @@ bass_fx needs a decode stream wrapped in a separate tempo stream; FatzAudio puts
 | Formant-preserving pitch (not in bass_fx) | `fa_tempo_options.keep_formants = 1` | `TempoOptions.KeepFormants` | ✅ |
 | Keeping the buffer short so tempo changes respond quickly | `fa_tempo_options.latency_ms` (default 150) | `TempoOptions.Latency` | ✅ |
 | Converting positions back with BASS_FX_TempoGetRateRatio | Not needed: positions, markers, the clock and CD+G stay in song time | — | ➖ (by design) |
-| BASS_FX_ReverseCreate / BASS_ATTRIB_REVERSE_DIR | `fa_stream_set_reverse` on the stream itself, switchable while playing; no separate reverse stream or decode block size ([reverse playback](../features/tempo-pitch.md#reverse-playback)) | `AudioStream.Reverse` | ✅ |
+| BASS_FX_ReverseCreate / BASS_ATTRIB_REVERSE_DIR (set and get) | `fa_stream_set_reverse` / `fa_stream_get_reverse` on the stream itself, switchable while playing; no separate reverse stream or decode block size ([reverse playback](../features/tempo-pitch.md#reverse-playback)) | `AudioStream.Reverse` | ✅ |
 | BASS_FX_BPM_DecodeGet | `fa_analyze_path` with `FA_ANALYZE_BEATS`, then `fa_analysis_get_beat_grid` ([track analysis](../features/analysis.md)) | `AudioEngine.Analyze` / `AnalyzeAsync`, `TrackAnalysis.Beats` | ✅ |
 | BASS_FX_BPM_BeatDecodeGet | Beat times from the grid: `fa_beat_grid.first_beat` plus `bpm`, or the tempo segments for songs that change tempo (measured from the audio, so drifting songs stay on their beats) | `BeatGrid.BeatToFrame` | ✅ |
 | Bars and downbeats (BASS_FX has none) | `fa_beat_grid.beats_per_bar` and `bar_offset` with `FA_GRID_BARS`: from MIDI files, or found in the audio when chord changes and kicks mark them ([bars](../features/analysis.md#bars)) | `BeatGrid.BeatsPerBar`, `BarOffset`, `BeatGridFlags.Bars` | ✅ |

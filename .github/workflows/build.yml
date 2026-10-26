@@ -100,6 +100,15 @@ jobs:
       - name: Build
         shell: bash
         run: cmake --build build --config Release --parallel "$JOBS"
+      - name: Library size
+        continue-on-error: true   # a report: never keeps the tests from running
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Windows) tools/lib-size.sh "Windows x64" build/bin/fatzaudio.dll ;;
+            macOS) tools/lib-size.sh "macOS" build/bin/libfatzaudio.dylib ;;
+            *) tools/lib-size.sh "Linux x64" build/bin/libfatzaudio.so ;;
+          esac
       - name: Test
         shell: bash
         env:
@@ -229,6 +238,15 @@ jobs:
               -DFA_BUILD_TESTS=OFF -DFA_BUILD_TOOLS=OFF
             cmake --build build-android-$abi --parallel "$(nproc)"
           done
+      - name: Library size
+        continue-on-error: true   # a report: never keeps the checks below from running
+        run: |
+          args=()
+          for so in build-android-*/bin/libfatzaudio.so; do
+            abi=${so#build-android-}; abi=${abi%%/*}
+            args+=("Android $abi" "$so")
+          done
+          STRIP=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip tools/lib-size.sh "${args[@]}"
       - name: Check dependencies and exports
         run: |
           readelf=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf
@@ -277,3 +295,6 @@ jobs:
           max-size: 500M
       - name: Build fatzaudio.xcframework
         run: tools/build-xcframework.sh build-ios
+      - name: Library size
+        continue-on-error: true
+        run: tools/lib-size.sh "iOS arm64" build-ios/iphoneos/bin/fatzaudio.framework/fatzaudio

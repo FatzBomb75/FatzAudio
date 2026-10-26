@@ -25,6 +25,7 @@ static int g_failures = 0;
 #define FA_TRACKER_STEP_TEST 64      /* dec_tracker.c notes row starts to within this */
 #define PI 3.14159265358979323846
 #define ROW_S 0.06                 /* speed 3 at tempo 125: 3 ticks of 20 ms */
+#define LOOP_ROWS 40               /* rows a looping play_rows raises at least (2.5 s) */
 
 static fa_engine* g_engine;
 
@@ -477,7 +478,7 @@ static void play_rows(const buf* mod, int32_t mode, int loop, fa_frames seek, ro
     fa_stream* s = NULL;
     fa_open_options o;
     float out[512 * 2];
-    int64_t rendered = 0, total;
+    int64_t rendered = 0, total, deadline;
     int tries;
     memset(rec, 0, sizeof(*rec));
     fa_mutex_init(&rec->lock);
@@ -501,10 +502,12 @@ static void play_rows(const buf* mod, int32_t mode, int loop, fa_frames seek, ro
         fa_fetch_add64(&dev->epoch, 1);
         rendered += 512;
     }
-    for (tries = 0; tries < 400 && !loop; tries++) {
+    /* Events reach the callback on the event thread, after the render: wait for
+     * them (the end, or a looping song's rows) by the clock, not by sleeps. */
+    for (deadline = fa_monotonic_ns() + 2000000000LL; fa_monotonic_ns() < deadline;) {
         int done;
         fa_mutex_lock(&rec->lock);
-        done = rec->ended;
+        done = loop ? rec->count >= LOOP_ROWS : rec->ended;
         fa_mutex_unlock(&rec->lock);
         if (done) break;
         fa_sleep_ms(5);
@@ -550,7 +553,7 @@ static void test_row_events_on_device(void)
     fa_mutex_destroy(&rec.lock);
     /* Looping: the song's rows, then the first ones again from frame 0. */
     play_rows(&mod, 1, 1, 0, &rec);
-    CHECK(rec.count >= 40);
+    CHECK(rec.count >= LOOP_ROWS);
     for (i = 0; i < rec.count; i++) {
         CHECK_EQ(rec.values[i] >> 16, (i % 32) / 16);
         CHECK_EQ(rec.values[i] & 0xFFFF, i % 16);

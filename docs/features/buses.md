@@ -52,6 +52,7 @@ songB.PlayOn(output);   // back to the master mix
 
 ## Rules
 
+- `fa_bus_get_param` (`MixBus.Volume`, `Pan`) reads the bus's current value.
 - Bus volume (≥ 0) and pan (−1..1) behave like a stream's: changes glide over 5 ms, ramps take any curve and an optional start time on the device clock (`device_time` / `startAt`).
 - Bus ramps run whenever the device runs, even with no stream playing. They raise no events.
 - `fa_stream_attach` on the device the stream is already on only changes its bus, instantly and without a gap.

@@ -700,7 +700,8 @@ static void xg_part(struct fa_midi* m, int ch, int a, int v)
 
 /* The SysEx messages FatzAudio acts on (after the F0; device numbers are ignored,
  * checksums are not checked). GS and XG messages may carry several data bytes for
- * consecutive addresses. */
+ * consecutive addresses. A message cut short (its F7 where a value should be) is
+ * ignored: data bytes are 7-bit. */
 static void apply_sysex(struct fa_midi* m, const uint8_t* d, size_t n, fa_frames frame)
 {
     if (n >= 4 && d[0] == 0x7E && d[2] == 0x09) {                    /* GM System On / GM2 On */
@@ -708,12 +709,14 @@ static void apply_sysex(struct fa_midi* m, const uint8_t* d, size_t n, fa_frames
         else if (d[3] == 0x03) reset_channels(m, MODE_GM2, frame);
     } else if (n >= 6 && d[0] == 0x7F && d[2] == 0x04) {             /* universal real-time device control */
         int v = d[4] | (d[5] << 7);
+        if ((d[4] | d[5]) & 0x80) return;
         if (d[3] == 0x01) set_master_gain(m, (float)v / 16383.0f, frame);   /* master volume */
         else if (d[3] == 0x03) { m->tune_fine = ((float)v - 8192.0f) / 8192.0f; tsf_set_tuning(m->synth, m->tune_coarse + m->tune_fine); }
         else if (d[3] == 0x04) { m->tune_coarse = (float)(d[5] - 64); tsf_set_tuning(m->synth, m->tune_coarse + m->tune_fine); }
     } else if (n >= 8 && d[0] == 0x41 && d[2] == 0x42 && d[3] == 0x12) {   /* Roland GS, DT1 */
         int a1 = d[4], a2 = d[5], a3 = d[6], v = d[7];
         int end = (int)n - (d[n - 1] == 0xF7), nd = end - 8 > 1 ? end - 8 : 1, i;   /* data bytes: before the checksum (and F7) */
+        for (i = 0; i < nd; i++) if (d[7 + i] & 0x80) return;
         if ((a1 == 0x40 && a2 == 0x00 && a3 == 0x7F) || (a1 == 0x00 && a2 == 0x00 && a3 == 0x7F)) {
             reset_channels(m, MODE_GS, frame);                        /* GS reset, system mode set */
         } else if (a1 == 0x40 && a2 == 0x00 && a3 == 0x04) {
@@ -726,6 +729,7 @@ static void apply_sysex(struct fa_midi* m, const uint8_t* d, size_t n, fa_frames
     } else if (n >= 7 && d[0] == 0x43 && (d[1] & 0xF0) == 0x10 && d[2] == 0x4C) {   /* Yamaha XG, parameter change */
         int a1 = d[3], a2 = d[4], a3 = d[5], v = d[6];
         int end = (int)n - (d[n - 1] == 0xF7), nd = end - 6 > 1 ? end - 6 : 1, i;   /* data bytes: before the F7, if any */
+        for (i = 0; i < nd; i++) if (d[6 + i] & 0x80) return;
         if (a1 == 0x00 && a2 == 0x00 && a3 == 0x7E) reset_channels(m, MODE_XG, frame);   /* XG System On */
         else if (a1 == 0x00 && a2 == 0x00 && a3 == 0x04) set_master_gain(m, (float)v / 127.0f, frame);
         else if (a1 == 0x02 && a2 == 0x01) for (i = 0; i < nd; i++) fa_midi_fx_xg(m->fx, a3 + i, d[6 + i]);   /* effects */

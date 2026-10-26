@@ -49,7 +49,7 @@ song.TempoOptions = new TempoOptions { KeepFormants = true, Latency = TimeSpan.F
 | `keep_formants` | `KeepFormants` | off | A pitch change keeps the character of voices, so a key change for a singer doesn't sound like a chipmunk or a giant. Affects `PITCH` only |
 | `latency_ms` | `Latency` | 150 | How far ahead the stream is decoded while any of the three is in use, so how soon a change is heard. Clamped to 50 … the stream's `buffer_ms` |
 
-`fa_stream_set_tempo_options` takes effect at once; `NULL` (.NET `null`) restores the defaults. Changing `quality` on a playing stream restarts the processing from the position being heard, like a seek to the same place; on a stream that can't seek (live web streams, push streams) the new quality applies after the next stop, seek or attach.
+`fa_stream_set_tempo_options` (`fa_stream_get_tempo_options`) takes effect at once; `NULL` (.NET `null`) restores the defaults. Changing `quality` on a playing stream restarts the processing from the position being heard, like a seek to the same place; on a stream that can't seek (live web streams, push streams) the new quality applies after the next stop, seek or attach.
 
 ## How it behaves
 
@@ -114,7 +114,7 @@ Both take `--tempo` (multiplier), `--pitch` (semitones) and `--rate` (multiplier
 
 ## Reverse playback
 
-`fa_stream_set_reverse` (`AudioStream.Reverse` in .NET) plays a stream backwards, as bass_fx's `BASS_FX_ReverseCreate` with `BASS_ATTRIB_REVERSE_DIR` does, but on the stream itself: there is no second stream to make. It can be switched at any time, also while playing; the stream then restarts at the position heard, the way a seek does.
+`fa_stream_set_reverse` / `fa_stream_get_reverse` (`AudioStream.Reverse` in .NET) plays a stream backwards, as bass_fx's `BASS_FX_ReverseCreate` with `BASS_ATTRIB_REVERSE_DIR` does, but on the stream itself: there is no second stream to make. It can be switched at any time, also while playing; the stream then restarts at the position heard, the way a seek does.
 
 ```c
 fa_stream_set_reverse(deck, 1);                  /* backwards from here */
