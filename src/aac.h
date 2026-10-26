@@ -143,12 +143,13 @@ extern const uint32_t fa_aac_rates[13];        /* sampling frequency index -> Hz
 typedef struct fa_aac_sbr fa_aac_sbr;
 typedef struct fa_aac_qmf fa_aac_qmf;
 
-/* The QMF banks' transform tables (80 KB), shared by a decoder's elements. */
+/* The QMF banks' transform tables (80 KB) and the SBR scratch, shared by a decoder's
+ * elements (decoded one after another, never at the same time). */
 fa_aac_qmf* fa_aac_qmf_create(void);
 void fa_aac_qmf_destroy(fa_aac_qmf* q);
 /* One element's SBR: `rate` is the core's sampling rate (the output runs at
  * twice it). `qmf` must outlive it. */
-fa_aac_sbr* fa_aac_sbr_create(uint32_t rate, int channels, const fa_aac_qmf* qmf);
+fa_aac_sbr* fa_aac_sbr_create(uint32_t rate, int channels, fa_aac_qmf* qmf);
 void fa_aac_sbr_destroy(fa_aac_sbr* s);
 void fa_aac_sbr_reset(fa_aac_sbr* s);
 /* Reads an SBR extension payload (EXT_SBR_DATA or EXT_SBR_DATA_CRC) of `bits`

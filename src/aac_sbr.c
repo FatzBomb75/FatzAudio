@@ -74,11 +74,9 @@ struct fa_aac_sbr {
     int num_patches, patch_n[MAX_PATCH], patch_start[MAX_PATCH];
     int kx_last, M_last;
     float x[2][XSLOTS][64][2];          /* the QMF matrix of each output channel */
-    float xhigh[SLOTS + 8][64][2];      /* HF generator output, one channel at a time */
-    float y[SLOTS + 8][64][2];          /* HF adjuster output (this frame's high band), the same */
     float syn[2][1280];                 /* synthesis delay lines v of each output channel, from syn_pos (rings) */
     int syn_pos[2];
-    const fa_aac_qmf* qmf;              /* transform tables, shared by the decoder's elements */
+    fa_aac_qmf* qmf;                    /* transform tables and scratch, shared by the decoder's elements */
     fa_aac_ps* ps;
     int ps_seen;
     int ps_data;                        /* PS data came with this frame */
@@ -89,11 +87,15 @@ struct fa_aac_sbr {
 
 struct fa_aac_qmf {
     fa_mdct dct4;                       /* 64 points, for the analysis and the synthesis */
+    /* Scratch used one channel at a time, so the decoder's elements (decoded one
+     * after another) share it too. */
+    float xhigh[SLOTS + 8][64][2];      /* HF generator output */
+    float y[SLOTS + 8][64][2];          /* HF adjuster output (this frame's high band) */
 };
 
 fa_aac_qmf* fa_aac_qmf_create(void)
 {
-    fa_aac_qmf* q = (fa_aac_qmf*)malloc(sizeof(*q));
+    fa_aac_qmf* q = (fa_aac_qmf*)calloc(1, sizeof(*q));
     if (!q) return NULL;
     if (fa_imdct_init(&q->dct4, 64) != FA_OK) {
         free(q);
@@ -109,7 +111,7 @@ void fa_aac_qmf_destroy(fa_aac_qmf* q)
     free(q);
 }
 
-fa_aac_sbr* fa_aac_sbr_create(uint32_t rate, int channels, const fa_aac_qmf* qmf)
+fa_aac_sbr* fa_aac_sbr_create(uint32_t rate, int channels, fa_aac_qmf* qmf)
 {
     fa_aac_sbr* s = (fa_aac_sbr*)calloc(1, offsetof(fa_aac_sbr, ch) + (size_t)(channels > 1 ? 2 : 1) * sizeof(sbr_chan));
     if (!s) return NULL;
@@ -978,6 +980,10 @@ static void hf_generate(fa_aac_sbr* s, sbr_chan* ch, float (*xhigh)[64][2])
             }
         }
     }
+    /* Bands no patch reaches (a last patch under 3 bands is dropped) have no high
+     * band: zero, as the scratch is shared with the other elements. */
+    for (; k < s->kx + s->M; k++)
+        for (l = lo; l < hi; l++) xhigh[l + HFADJ][k][0] = xhigh[l + HFADJ][k][1] = 0.0f;
     for (i = 0; i < s->N_Q; i++) {
         ch->bw_last[i] = bw[i];
         ch->invf_last[i] = ch->invf[i];
@@ -1157,7 +1163,7 @@ int fa_aac_sbr_apply(fa_aac_sbr* s, const float* const in[2], float* out[2])
     for (c = 0; c < s->nch; c++) {
         sbr_chan* ch = &s->ch[c];
         float (*x)[64][2] = s->x[c];
-        float (*ycur)[64][2] = s->y;
+        float (*ycur)[64][2] = s->qmf->y;
         int kx = data ? s->kx : s->kx_last, M = data ? s->M : 0;
         int t_old = 2 * ch->t_last - SLOTS;                   /* slots the last frame's envelopes reach into this one */
         if (t_old < 0) t_old = 0;
@@ -1168,8 +1174,8 @@ int fa_aac_sbr_apply(fa_aac_sbr* s, const float* const in[2], float* out[2])
          * are cleared. */
         if (data) {
             for (l = 0; l < SLOTS + 8; l++) memset(ycur[l][kx], 0, sizeof(float) * 2 * (size_t)M);
-            hf_generate(s, ch, s->xhigh);
-            hf_adjust(s, ch, s->xhigh, ycur);
+            hf_generate(s, ch, s->qmf->xhigh);
+            hf_adjust(s, ch, s->qmf->xhigh, ycur);
         }
         /* The QMF matrix: low band delayed by t_HFAdj, the high band from the
          * envelopes covering each slot (the last frame's for its overhang). Each
