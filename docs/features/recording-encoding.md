@@ -151,11 +151,11 @@ Invalid values (FLAC at 32 bits, MP3 at 96 kHz, an unknown format) fail at creat
 - **Exact lengths.** Resampled output has exactly `input × out_rate / in_rate` frames (rounded), with the resampler's look-ahead flushed at the end. FLAC and WAV keep every frame; MP3 files carry LAME's delay and padding in the LAME header, so decoders that read it (FatzAudio, FFmpeg, most players) give back exactly the frames encoded.
 - **Dither.** 16-bit output (WAV or FLAC) gets TPDF dither, except for samples that already are exact 16-bit values. So a 16-bit source played or converted at unity gain stays bit exact: WAV to FLAC is lossless, and so is FLAC to WAV. 24-bit output is rounded without dither.
 - **Outputs that cannot seek.** When `fa_encoder_output.seek` is NULL (or the .NET stream can't seek), the header can't be completed at the end. WAV keeps "length unknown" sizes and FLAC an unknown length and no MD5 (both decode fine, including with FatzAudio); MP3 is written without the LAME header.
-- **Threads.** One thread per encoder does the conversion, encoding and writing; your output callbacks run there. FLAC level 5 encodes 44.1 kHz stereo at about 90× real time on one core (level 8: about 20×), so recording costs almost nothing. The calls are thread-safe; `fa_encoder_write` calls must not overlap each other.
+- **Threads.** One thread per encoder does the conversion, encoding and writing; your output callbacks run there. FLAC level 5 encodes 44.1 kHz stereo at about 400× real time on one x64 core (level 8: about 170×, level 0: about 650×), so recording costs almost nothing. The calls are thread-safe; `fa_encoder_write` calls must not overlap each other.
 
 ## FLAC compression
 
-FatzAudio's FLAC encoder is written from the format specification and tries, for every block and channel, a constant, raw samples, the fixed predictors and LPC of every order up to the level's maximum, plus the four stereo decorrelations, and keeps whichever is smallest. Measured on 30 s of 16-bit stereo test music against the reference encoder (`flac` 1.4):
+FatzAudio's FLAC encoder is written from the format specification and tries, for every block and channel, a constant, raw samples, the fixed predictors and LPC of every order up to the level's maximum, plus the four stereo decorrelations, and keeps whichever is smallest. From level 3 on, the LPC candidates are first sized on short pieces of each block and only the most promising few are costed in full (files come out within 0.01% of trying them all, at a fraction of the time). Measured on 30 s of 16-bit stereo test music against the reference encoder (`flac` 1.4):
 
 | Level | FatzAudio | flac | 
 |---|---|---|
