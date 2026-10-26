@@ -311,6 +311,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- Output limiter: after a reduction the gain now releases all the way back to 1. It used to stop about 0.002 dB short
+  (float rounding in the release step), so everything after the first loud peak played that much quieter until the
+  device was reset. Output after a reduction changes by that amount; audio that never reached the ceiling is unchanged.
+- Text that claims to be UTF-8 (ID3v2, Vorbis, APE and MP4 tags, ICY stream titles and `icy-*` headers) is checked the
+  same strict way MIDI text already was: overlong forms, UTF-16 surrogates and code points above U+10FFFF are no longer
+  passed through as UTF-8 but read as Latin-1, as other text that is not UTF-8. Well-formed UTF-8 is unchanged.
+- HTTPS: every backend (curl, WinHTTP, Apple, Android) now refuses a response whose headers exceed 64 KB with
+  `FA_ERROR_NETWORK`, as plain HTTP already did. Before, only plain HTTP had a limit and the others took any size.
 - MIDI: a GS, XG or universal SysEx message cut short (its F7 where the value goes) is ignored. It used to read the
   F7 as the value, so a broken GS master volume message nearly doubled the level.
 - DJ mixer: changing the crossfader curve with the crossfader away from the ends glides over 5 ms instead of

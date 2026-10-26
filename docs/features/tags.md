@@ -15,7 +15,7 @@ FatzAudio reads the title, artist, album and the rest of a file's tags, its embe
 | Matroska tags | MKV, MKA, WebM | Global and album-level `SimpleTag`s; the segment title as a fallback | Image attachments (`cover.*` is the front cover) |
 | MIDI | MID, KAR, RMI (from a stream: see below) | Title, artist, copyright | - |
 
-A ZIP (MP3+G) is read through the audio file inside it: the one named like the `.cdg`, else the first audio file. Text in any encoding the format allows (Latin-1, UTF-16 with or without BOM, UTF-8) comes out as UTF-8; a file that claims UTF-8 but isn't is read as Latin-1, so nothing is lost.
+A ZIP (MP3+G) is read through the audio file inside it: the one named like the `.cdg`, else the first audio file. Text in any encoding the format allows (Latin-1, UTF-16 with or without BOM, UTF-8) comes out as UTF-8; a file that claims UTF-8 but isn't is read as Latin-1, so nothing is lost. "Isn't UTF-8" is strict: overlong forms, UTF-16 surrogates and code points above U+10FFFF count as not UTF-8, the same check MIDI text, stream titles and HTTP headers use.
 
 ## Common fields
 

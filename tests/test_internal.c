@@ -168,6 +168,32 @@ static void test_pkt_index(void)
     fa_pkt_free(&x);
 }
 
+/* The one UTF-8 check that tags, stream titles, HTTP headers and MIDI text share:
+ * well-formed RFC 3629 only. */
+static void test_utf8_valid(void)
+{
+    static const struct { const char* s; int ok; } cases[] = {
+        { "", 1 }, { "plain", 1 }, { "Caf\xc3\xa9", 1 }, { "\xe2\x82\xac", 1 }, { "\xf0\x9f\x8e\xa4", 1 },
+        { "\xed\x9f\xbf", 1 }, { "\xee\x80\x80", 1 }, { "\xf4\x8f\xbf\xbf", 1 },
+        { "Caf\xe9", 0 },                         /* Latin-1 */
+        { "\xc0\xaf", 0 }, { "\xc1\xbf", 0 },    /* overlong two-byte */
+        { "\xe0\x80\xaf", 0 }, { "\xe0\x9f\xbf", 0 }, { "\xf0\x8f\xbf\xbf", 0 },   /* overlong */
+        { "\xed\xa0\x80", 0 }, { "\xed\xbf\xbf", 0 },                                 /* surrogates */
+        { "\xf4\x90\x80\x80", 0 }, { "\xf5\x80\x80\x80", 0 }, { "\xff", 0 },        /* above U+10FFFF */
+        { "\xe2\x82", 0 }, { "\x80", 0 }, { "\xc3\x28", 0 },                               /* cut off, stray */
+    };
+    size_t i;
+    char out[4];
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        if (fa_utf8_valid(cases[i].s, strlen(cases[i].s)) != cases[i].ok) { CHECK_EQ((int)i, -1); }
+    }
+    CHECK(!fa_utf8_valid("\xe2\x82\xac", 2));                  /* the length counts, not a NUL */
+    CHECK_EQ(fa_put_utf8(out, 0x1F3A4), 4);
+    CHECK(memcmp(out, "\xf0\x9f\x8e\xa4", 4) == 0);
+    CHECK_EQ(fa_put_utf8(out, 0x20AC), 3);
+    CHECK(memcmp(out, "\xe2\x82\xac", 3) == 0);
+}
+
 static void test_ring_wraps(void)
 {
     fa_ring r;
@@ -1835,6 +1861,7 @@ int main(void)
     RUN(test_dsp_order_and_remove);
     RUN(test_dsp_on_decode_only);
     RUN(test_pkt_index);
+    RUN(test_utf8_valid);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

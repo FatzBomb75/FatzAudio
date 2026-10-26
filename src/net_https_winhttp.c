@@ -227,6 +227,7 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
                         &status, &size, WINHTTP_NO_HEADER_INDEX);
     size = 0;
     WinHttpQueryHeaders(request, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, NULL, &size, WINHTTP_NO_HEADER_INDEX);
+    if (size / sizeof(wchar_t) > FA_HTTP_HEAD_MAX) goto done;   /* a network error, as the other backends */
     if (size > 0) {
         wchar_t* wh = (wchar_t*)malloc(size + sizeof(wchar_t));
         if (wh && WinHttpQueryHeaders(request, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX, wh, &size,

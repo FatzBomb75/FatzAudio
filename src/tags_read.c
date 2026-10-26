@@ -36,56 +36,18 @@ static uint8_t* read_block(fa_source* src, int64_t pos, size_t n)
 
 /* ---- text ------------------------------------------------------------------------- */
 
-static int valid_utf8(const uint8_t* s, size_t n)
-{
-    size_t i = 0;
-    while (i < n) {
-        uint8_t c = s[i];
-        size_t m, k;
-        if (c < 0x80) { i++; continue; }
-        m = (c & 0xE0) == 0xC0 ? 1 : (c & 0xF0) == 0xE0 ? 2 : (c & 0xF8) == 0xF0 ? 3 : 0;
-        if (m == 0 || i + m >= n) return 0;
-        for (k = 1; k <= m; k++) if ((s[i + k] & 0xC0) != 0x80) return 0;
-        i += m + 1;
-    }
-    return 1;
-}
-
 /* Up to the first NUL: UTF-8 as it is, else Latin-1 converted. Malloc'ed. */
 static char* text_8bit(const uint8_t* p, size_t n, int latin1)
 {
     size_t len = 0, i, k = 0;
     char* out;
     while (len < n && p[len]) len++;
-    if (!latin1 && valid_utf8(p, len)) {
-        out = (char*)malloc(len + 1);
-        if (!out) return NULL;
-        memcpy(out, p, len);
-        out[len] = '\0';
-        return out;
-    }
+    if (!latin1 && fa_utf8_valid(p, len)) return fa_strndup((const char*)p, len);
     out = (char*)malloc(len * 2 + 1);
     if (!out) return NULL;
-    for (i = 0; i < len; i++) {
-        uint8_t c = p[i];
-        if (c < 0x80) out[k++] = (char)c;
-        else { out[k++] = (char)(0xC0 | (c >> 6)); out[k++] = (char)(0x80 | (c & 63)); }
-    }
+    for (i = 0; i < len; i++) k += fa_put_utf8(out + k, p[i]);
     out[k] = '\0';
     return out;
-}
-
-static size_t put_utf8(char* out, uint32_t u)
-{
-    if (u < 0x80) { out[0] = (char)u; return 1; }
-    if (u < 0x800) { out[0] = (char)(0xC0 | (u >> 6)); out[1] = (char)(0x80 | (u & 63)); return 2; }
-    if (u < 0x10000) {
-        out[0] = (char)(0xE0 | (u >> 12)); out[1] = (char)(0x80 | ((u >> 6) & 63)); out[2] = (char)(0x80 | (u & 63));
-        return 3;
-    }
-    out[0] = (char)(0xF0 | (u >> 18)); out[1] = (char)(0x80 | ((u >> 12) & 63));
-    out[2] = (char)(0x80 | ((u >> 6) & 63)); out[3] = (char)(0x80 | (u & 63));
-    return 4;
 }
 
 /* UTF-16 (`big` endian unless a BOM says otherwise) to UTF-8 up to a NUL. Malloc'ed. */
@@ -107,7 +69,7 @@ static char* text_utf16(const uint8_t* p, size_t n, int big)
         } else if (u >= 0xD800 && u < 0xE000) {
             u = 0xFFFD;
         }
-        k += put_utf8(out + k, u);
+        k += fa_put_utf8(out + k, u);
     }
     out[k] = '\0';
     return out;

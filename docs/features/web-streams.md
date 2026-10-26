@@ -85,6 +85,8 @@ if (fa_stream_get_http_header(s, "Content-Type", type, sizeof(type)) == FA_OK)
 
 `fa_net_status` also says whether the stream is live (`is_live`), HLS (`is_hls`) or seekable, whether a connection is open right now, the last HTTP status, the file size (`content_length`, -1 for live), and why the last connection failed (`last_error`).
 
+A response whose headers exceed 64 KB is refused as a network error, with every HTTP and HTTPS backend alike.
+
 ## C#
 
 ```csharp
@@ -165,7 +167,7 @@ Radio servers send the title of the song inside the audio data, every few KB. Th
 
 Ogg radio (Opus or Vorbis) has no ICY titles: every song starts a new Ogg link with its own comment header, and its `ARTIST` and `TITLE` become `stream_title` ("Artist - Title"), announced the same way at the song's first sample.
 
-`stream_title` is the title exactly as the station sends it; `artist` and `title` split it at the first `" - "`. Titles in Latin-1, which older servers send, are converted to UTF-8. Station details (`station`, `genre`, `description`, `station_url`, `bitrate_kbps`) come from the `icy-*` response headers.
+`stream_title` is the title exactly as the station sends it; `artist` and `title` split it at the first `" - "`. Titles in Latin-1, which older servers send, are converted to UTF-8 (anything that is not well-formed UTF-8 is taken as Latin-1). Station details (`station`, `genre`, `description`, `station_url`, `bitrate_kbps`) come from the `icy-*` response headers.
 
 ## HLS
 
