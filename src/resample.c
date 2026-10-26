@@ -336,6 +336,20 @@ static void phased_frame(const fa_varispeed* v, const fa_vs_phases* p, uint32_t 
     uint32_t c;
     row += from;
     if (ch == 2) {
+#if VS_SSE
+        /* The scalar loop below, its four sums as the lanes l0 r0 l1 r1 of one
+         * register: the same products added in the same order. */
+        __m128 a = _mm_setzero_ps();
+        float t[4];
+        for (k = 0; k + 1 < m; k += 2) {
+            __m128 h = load_upto4(row + k, 2);
+            a = _mm_add_ps(a, _mm_mul_ps(_mm_loadu_ps(x + k * 2), _mm_unpacklo_ps(h, h)));
+        }
+        _mm_storeu_ps(t, a);
+        if (k < m) { t[0] += x[k * 2] * row[k]; t[1] += x[k * 2 + 1] * row[k]; }
+        o[0] = t[0] + t[2];
+        o[1] = t[1] + t[3];
+#else
         /* Two sums per channel, so the adds overlap. */
         float l0 = 0.0f, r0 = 0.0f, l1 = 0.0f, r1 = 0.0f;
         for (k = 0; k + 1 < m; k += 2) {
@@ -347,6 +361,7 @@ static void phased_frame(const fa_varispeed* v, const fa_vs_phases* p, uint32_t 
         if (k < m) { l0 += x[k * 2] * row[k]; r0 += x[k * 2 + 1] * row[k]; }
         o[0] = l0 + l1;
         o[1] = r0 + r1;
+#endif
     } else if (ch == 1) {
         float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
         for (k = 0; k + 3 < m; k += 4) {

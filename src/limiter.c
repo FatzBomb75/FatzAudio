@@ -48,7 +48,6 @@ fa_result fa_limiter_init(fa_limiter* l, uint32_t rate, uint32_t channels)
     }
     l->box_sum = (double)l->attack;
     l->gain = 1.0f;
-    l->reduction = 1.0f;
     l->release = (float)exp(-1.0 / (rate * FA_LIMITER_RELEASE_MS / 1000.0));
     l->mix_step = (float)(1000.0 / (rate * FA_LIMITER_SWITCH_MS));
     l->mix = -1.0f;                       /* set from the first call: no fade at start */
@@ -135,10 +134,55 @@ static float limit_frame(fa_limiter* l, float* frame, float need, float ceiling,
     return ge;
 }
 
+/* 1 when the gain has released as far as it will: the box average is 1 and the
+ * release step leaves the gain where it is. That is 1 before the first reduction,
+ * and after one a value a little under 1 (about 0.9998), where 1 + (gain - 1) *
+ * release rounds back to gain. */
+static int released(const fa_limiter* l)
+{
+    float box_avg = (float)(l->box_sum / (double)l->attack);
+    if (box_avg > 1.0f) box_avg = 1.0f;
+    return box_avg == 1.0f && box_avg + (l->gain - box_avg) * l->release == l->gain;
+}
+
+/* A block while nothing in the window needs a reduction, the gain has released
+ * (see released) and no switch is fading: what limit_frame does with need 1 for
+ * every frame, without the deque, box and release arithmetic (none of it moves). */
+static void pass_block(fa_limiter* l, float* b, uint32_t n, float ceiling)
+{
+    uint32_t i, c, ch = l->channels;
+    float ge = l->mix >= 1.0f ? l->gain : 1.0f + l->mix * (l->gain - 1.0f);
+    for (i = 0; i < n; i++) {
+        float* slot = l->audio + (size_t)l->apos * ch;
+        float* frame = b + (size_t)i * ch;
+        float limit = l->ceil_line[l->apos];
+        for (c = 0; c < ch; c++) {
+            float in = frame[c], out = slot[c] * ge;
+            if (l->mix >= 1.0f) {
+                if (out > limit) out = limit;
+                else if (out < -limit) out = -limit;
+            }
+            slot[c] = in;
+            frame[c] = out;
+        }
+        l->ceil_line[l->apos] = ceiling;
+        if (++l->apos == l->delay) l->apos = 0;
+    }
+    /* The deque holds just the newest frame's 1; the box is all ones, and its sum
+     * re-summed where limit_frame would have (exactly `attack`). */
+    if (((l->n + n - 1) >> 16) != ((l->n - 1) >> 16)) l->box_sum = (double)l->attack;
+    l->n += n;
+    l->dq_head = 0;
+    l->dq_count = 1;
+    l->dq_idx[0] = l->n - 1;
+    l->dq_val[0] = 1.0f;
+    l->bpos = (int)(((uint32_t)l->bpos + n) % (uint32_t)l->attack);
+}
+
 void fa_limiter_process(fa_limiter* l, float* x, uint32_t count, float ceiling, int on)
 {
     uint32_t i, at, ch = l->channels;
-    float least = 1.0f, target = on ? 1.0f : 0.0f;
+    float target = on ? 1.0f : 0.0f;
     float peaks[FA_TP_PUSH_BLOCK];
     if (!l->audio) return;
     if (l->mix < 0.0f) l->mix = target;
@@ -148,11 +192,15 @@ void fa_limiter_process(fa_limiter* l, float* x, uint32_t count, float ceiling, 
         uint32_t n = count - at < FA_TP_PUSH_BLOCK ? count - at : FA_TP_PUSH_BLOCK;
         float* b = x + (size_t)at * ch;
         int measured = fa_truepeak_push_block(&l->tp, b, n, peaks, ceiling);
+        if (!measured && l->quiet >= l->window + l->attack && l->mix == target && released(l)) {
+            pass_block(l, b, n, ceiling);
+            continue;
+        }
         for (i = 0; i < n; i++) {
             float need = measured && peaks[i] > ceiling ? ceiling / peaks[i] : 1.0f;
-            float ge = limit_frame(l, b + (size_t)i * ch, need, ceiling, target);
-            if (ge < least) least = ge;
+            limit_frame(l, b + (size_t)i * ch, need, ceiling, target);
+            if (need != 1.0f) l->quiet = 0;
+            else if (l->quiet < l->window + l->attack) l->quiet++;
         }
     }
-    l->reduction = least;
 }

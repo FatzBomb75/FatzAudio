@@ -147,7 +147,7 @@ static void render_block(fa_device* dev, float* out, uint32_t frames, int64_t no
     }
     if (!dev->xf_busy) fa_mutex_unlock(&dev->xf_lock);   /* commands taken */
     fa_buses_end(dev, frames);
-    fa_limiter_process(&dev->limiter, out, frames, powf(10.0f, fa_load_float(&dev->engine->limiter_ceiling) / 20.0f),
+    fa_limiter_process(&dev->limiter, out, frames, fa_db_to_lin(fa_load_float(&dev->engine->limiter_ceiling)),
                        mixer || limiter_on(dev->engine));   /* a DJ mixer's master is always limited */
     {
         /* Device mute, after the limiter: glides sample by sample, costs nothing unmuted. */

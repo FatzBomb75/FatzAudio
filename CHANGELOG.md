@@ -197,6 +197,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
 ### Changed
+
+- Faster, with output identical to the bit (deep audit, 2026-10-26): the output limiter skips its gain tracking
+  while nothing comes near the ceiling (about half the cost of a quiet callback); the device resampler's stereo path
+  (a 44.1 kHz file on a 48 kHz device) runs both channels in one SSE register, about 2x; raw PCM in MKV, MOV, CAF and
+  push streams converts with one loop per sample format, 3-8x; HE-AAC clears only the bands it reads (4-10% less
+  work); the lyric surface draws with SSE on x86, about 2x (a 4K partial frame 8.4 to 4.1 ms).
 - FLAC encoding is faster (level 0: 1.2 times, level 5: 2.2 times, level 8: 3.4 times; about 400× real time on one
   x64 core at level 5, 170× at level 8) and level 5 to 8 files are smaller (against `flac` 1.4.3 on 8 music files:
   level 5 went from 6% larger to 0.3%, level 8 from 13% to 1.8%, mostly on 24-bit files; pure tones and sweeps

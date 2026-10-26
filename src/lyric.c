@@ -26,6 +26,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#  include <emmintrin.h>
+#  define LY_SSE 1
+#else
+#  define LY_SSE 0
+#endif
 
 #define LY_DESIGN_W 1920u
 #define LY_DESIGN_H 1080u
@@ -1110,6 +1116,27 @@ static int ensure_tmp(fa_lyric* l, size_t floats)
     return 1;
 }
 
+#if LY_SSE
+/* One RGBA pixel to four floats and back (clamped at 255, truncated): the SSE
+ * paths below do the scalar arithmetic in the same order, so the result is the
+ * same to the bit. */
+static inline __m128 px_to_ps(const uint8_t* p)
+{
+    uint32_t v;
+    __m128i z = _mm_setzero_si128(), x;
+    memcpy(&v, p, 4);
+    x = _mm_cvtsi32_si128((int)v);
+    x = _mm_unpacklo_epi16(_mm_unpacklo_epi8(x, z), z);
+    return _mm_cvtepi32_ps(x);
+}
+static inline void ps_to_px(uint8_t* p, __m128 m)
+{
+    __m128i x = _mm_cvttps_epi32(_mm_min_ps(m, _mm_set1_ps(255.0f)));
+    uint32_t v = (uint32_t)_mm_cvtsi128_si32(_mm_packus_epi16(_mm_packs_epi32(x, x), x));
+    memcpy(p, &v, 4);
+}
+#endif
+
 /* Draws a layer's picture over the master inside [x0, x1) x [y0, y1), its point
  * (L->cx, L->cy) at (cx, cy), scaled by sc, at opacity op: resampled with the tent
  * filter, rows first, over the columns each row has anything in. */
@@ -1139,6 +1166,21 @@ static void draw_place(fa_lyric* l, const ly_layer* L, float cx, float cy, float
             if (b > x1) b = x1;
             d = l->master + ((size_t)y * (size_t)l->bw + (size_t)a) * 4;
             src = L->px + ((size_t)v * (size_t)L->w + (size_t)(a - ox)) * 4;
+#if LY_SSE
+            {
+                __m128 vop = _mm_set1_ps(op), v255 = _mm_set1_ps(255.0f), vh = _mm_set1_ps(0.5f), one = _mm_set1_ps(1.0f);
+                for (x = a; x < b; x++, d += 4, src += 4) {
+                    __m128 sp, dd, keep, m;
+                    uint32_t sv;
+                    memcpy(&sv, src, 4);
+                    if (!sv) continue;
+                    sp = px_to_ps(src); dd = px_to_ps(d);
+                    keep = _mm_sub_ps(one, _mm_div_ps(_mm_mul_ps(_mm_shuffle_ps(sp, sp, 0xFF), vop), v255));
+                    m = _mm_add_ps(_mm_add_ps(_mm_mul_ps(sp, vop), _mm_mul_ps(dd, keep)), vh);
+                    ps_to_px(d, m);
+                }
+            }
+#else
             for (x = a; x < b; x++, d += 4, src += 4) {
                 float keep = 1.0f - (float)src[3] * op / 255.0f;
                 for (k = 0; k < 4; k++) {
@@ -1146,6 +1188,7 @@ static void draw_place(fa_lyric* l, const ly_layer* L, float cx, float cy, float
                     d[k] = (uint8_t)(m >= 255.0f ? 255.0f : m);
                 }
             }
+#endif
         }
         return;
     }
@@ -1184,16 +1227,38 @@ static void draw_place(fa_lyric* l, const ly_layer* L, float cx, float cy, float
             if (b > sb) sb = b;
             src = L->px + ((size_t)v * (size_t)L->w + (size_t)a) * 4;
             o = l->tmp + (size_t)(a - ua) * 4;
+#if LY_SSE
+            {
+                __m128 vw = _mm_set1_ps(w);
+                for (i = a; i < b; i++, src += 4, o += 4)
+                    _mm_storeu_ps(o, _mm_add_ps(_mm_loadu_ps(o), _mm_mul_ps(vw, px_to_ps(src))));
+            }
+#else
             for (i = a; i < b; i++, src += 4, o += 4) {
                 o[0] += w * (float)src[0];
                 o[1] += w * (float)src[1];
                 o[2] += w * (float)src[2];
                 o[3] += w * (float)src[3];
             }
+#endif
         }
         if (sa >= sb) continue;
         for (x = x0; x < x1; x++, d += 4) {
             const taps* t = &cols[x - x0];
+#if LY_SSE
+            __m128 acc = _mm_setzero_ps(), a3, kp;
+            const float* s;
+            if (!t->n || t->first >= sb || t->first + t->n <= sa) continue;
+            s = l->tmp + (size_t)(t->first - ua) * 4;
+            for (k = 0; k < t->n; k++, s += 4)
+                acc = _mm_add_ps(acc, _mm_mul_ps(_mm_set1_ps(t->w[k]), _mm_loadu_ps(s)));
+            a3 = _mm_shuffle_ps(acc, acc, 0xFF);
+            if (_mm_cvtss_f32(a3) <= 0.0f) continue;
+            kp = _mm_sub_ps(_mm_set1_ps(1.0f), _mm_div_ps(_mm_mul_ps(a3, _mm_set1_ps(op)), _mm_set1_ps(255.0f)));
+            acc = _mm_add_ps(_mm_add_ps(_mm_mul_ps(acc, _mm_set1_ps(op)), _mm_mul_ps(px_to_ps(d), kp)), _mm_set1_ps(0.5f));
+            ps_to_px(d, acc);
+        }
+#else
             float m0 = 0.0f, m1 = 0.0f, m2 = 0.0f, m3 = 0.0f, keep;
             const float* s;
             if (!t->n || t->first >= sb || t->first + t->n <= sa) continue;
@@ -1217,6 +1282,7 @@ static void draw_place(fa_lyric* l, const ly_layer* L, float cx, float cy, float
             d[2] = (uint8_t)(m2 >= 255.0f ? 255.0f : m2);
             d[3] = (uint8_t)(m3 >= 255.0f ? 255.0f : m3);
         }
+#endif
         memset(l->tmp + (size_t)(sa - ua) * 4, 0, (size_t)(sb - sa) * 4 * sizeof(float));
     }
     free(cols);
