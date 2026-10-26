@@ -372,9 +372,9 @@ static void render(fa_stream* s, float* out, uint32_t frames)
 
 typedef struct recorder {
     fa_mutex lock;
-    int ended, ramp_done, markers;
+    int ended, ramp_done, markers, positions;
     int64_t last_tag;
-    fa_frames ended_at, ramp_done_at;
+    fa_frames ended_at, ramp_done_at, position_at[8];
 } recorder;
 
 static void FA_CALL on_event(const fa_event* ev, void* user)
@@ -384,6 +384,7 @@ static void FA_CALL on_event(const fa_event* ev, void* user)
     if (ev->type == FA_EVENT_ENDED) { r->ended++; r->ended_at = ev->frame; }
     if (ev->type == FA_EVENT_RAMP_DONE) { r->ramp_done++; r->last_tag = ev->value; r->ramp_done_at = ev->frame; }
     if (ev->type == FA_EVENT_MARKER) r->markers++;
+    if (ev->type == FA_EVENT_POSITION && r->positions < 8) r->position_at[r->positions++] = ev->frame;
     fa_mutex_unlock(&r->lock);
 }
 
@@ -1336,6 +1337,147 @@ static void test_reverse_api(void)
     fa_stream_close(s);
 }
 
+/* ---- position events -------------------------------------------------------------- */
+
+/* Renders 512 frames at a time until at most `armed` position events are left;
+ * *before and *after are the positions around the callback that raised the last
+ * one. 0 if that never happens within `max` callbacks. */
+static int render_until_armed(fa_stream* s, float* out, int armed, int max, fa_frames* before, fa_frames* after)
+{
+    int i;
+    for (i = 0; i < max; i++) {
+        fa_stream_get_position(s, before);
+        render(s, out, 512);
+        fa_stream_get_position(s, after);
+        if (fa_load32(&s->pos_armed) <= armed) return 1;
+    }
+    return 0;
+}
+
+static void test_position_event_api(void)
+{
+    fa_stream* s = open_wav(RATE, sine440, 0);
+    int i;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_add_position_event(NULL, 0), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_add_position_event(s, -2), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_add_position_event(s, RATE + 1), FA_ERROR_INVALID_ARG);   /* past the end */
+    CHECK_EQ(fa_stream_add_position_event(s, RATE), FA_OK);                      /* the end itself */
+    CHECK_EQ(fa_stream_add_position_event(s, RATE), FA_OK);                      /* already armed */
+    CHECK_EQ(fa_load32(&s->pos_armed), 1);
+    for (i = 1; i < FA_POSITION_EVENT_SLOTS; i++) CHECK_EQ(fa_stream_add_position_event(s, i), FA_OK);
+    CHECK_EQ(fa_stream_add_position_event(s, 1000), FA_ERROR_BUSY);
+    CHECK_EQ(fa_stream_add_position_event(s, 5), FA_OK);                         /* armed: needs no slot */
+    CHECK_EQ(fa_stream_add_position_event(s, FA_FRAMES_UNSET), FA_OK);           /* removes them all */
+    CHECK_EQ(fa_load32(&s->pos_armed), 0);
+    CHECK_EQ(fa_stream_add_position_event(s, 1000), FA_OK);
+    fa_stream_close(s);
+}
+
+/* Raised in the callback that plays the frame, in the order heard, once; a seek
+ * over a frame leaves it armed; the end itself is reached. */
+static void test_position_event_exact(void)
+{
+    fa_stream* s = open_attached(2 * RATE, ramp_sig, 0);
+    float* out = (float*)malloc(512 * 2 * sizeof(float));
+    fa_frames before = 0, after = 0;
+    recorder rec;
+    CHECK(s != NULL);
+    memset(&rec, 0, sizeof(rec));
+    fa_mutex_init(&rec.lock);
+    fa_stream_set_event_callback(s, on_event, &rec);
+    CHECK_EQ(fa_stream_add_position_event(s, 20001), FA_OK);    /* armed out of order */
+    CHECK_EQ(fa_stream_add_position_event(s, 20000), FA_OK);
+    CHECK_EQ(fa_stream_add_position_event(s, 30000), FA_OK);
+    CHECK_EQ(fa_stream_add_position_event(s, 2 * RATE), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    CHECK(render_until_armed(s, out, 3, 100, &before, &after));
+    CHECK(before <= 20000 && 20000 < after);
+    if (fa_load32(&s->pos_armed) == 2) CHECK(20001 < after);   /* the same callback */
+    else CHECK(render_until_armed(s, out, 2, 100, &before, &after) && before <= 20001 && 20001 < after);
+    CHECK(wait_for(&rec, &rec.positions, 2));
+    CHECK_EQ(rec.position_at[0], 20000);
+    CHECK_EQ(rec.position_at[1], 20001);
+    /* Seeking over 30000 doesn't raise it; playing to the end raises the end. */
+    CHECK_EQ(fa_stream_seek(s, 40000), FA_OK);
+    CHECK(render_until_armed(s, out, 1, 200, &before, &after));
+    CHECK(wait_for(&rec, &rec.ended, 1));
+    CHECK(wait_for(&rec, &rec.positions, 3));
+    CHECK_EQ(rec.position_at[2], 2 * RATE);
+    /* Still armed: reached after seeking back. */
+    CHECK_EQ(fa_stream_seek(s, 25000), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    CHECK(render_until_armed(s, out, 0, 100, &before, &after));
+    CHECK(before <= 30000 && 30000 < after);
+    CHECK(wait_for(&rec, &rec.positions, 4));
+    CHECK_EQ(rec.position_at[3], 30000);
+    fa_stream_set_event_callback(s, NULL, NULL);
+    fa_stream_close(s);
+    fa_mutex_destroy(&rec.lock);
+    free(out);
+}
+
+/* At 1.5x tempo the frame is still raised in the callback whose positions span it. */
+static void test_position_event_tempo(void)
+{
+    fa_stream* s = open_wav(4 * RATE, sine440, 0);
+    float* out = (float*)malloc(512 * 2 * sizeof(float));
+    fa_frames before = 0, after = 0;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_TEMPO, 1.5f), FA_OK);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_add_position_event(s, 50000), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    CHECK(render_until_armed(s, out, 0, 200, &before, &after));
+    CHECK(before <= 50000 && 50000 < after);
+    CHECK_NEAR((double)(after - before), 512.0 * 1.5 * RATE / g_dev->rate, 4.0);
+    fa_stream_close(s);
+    free(out);
+}
+
+/* Looping: raised in the callback that wraps, and again on the next turn once
+ * armed again. Reversed: raised as the position counts down past it, also where a
+ * reversed loop wraps from its start to its end. */
+static void test_position_event_loop_and_reverse(void)
+{
+    fa_stream* s = open_attached(RATE, ramp_sig, FA_OPEN_LOOP);
+    float* out = (float*)malloc(512 * 2 * sizeof(float));
+    fa_frames before = 0, after = 0;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_seek(s, RATE - 300), FA_OK);
+    CHECK_EQ(fa_stream_add_position_event(s, 100), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    CHECK(render_until_armed(s, out, 0, 10, &before, &after));
+    CHECK(after < before && 100 < after);                       /* the wrap */
+    CHECK_EQ(fa_stream_add_position_event(s, 100), FA_OK);
+    CHECK(render_until_armed(s, out, 0, 200, &before, &after));
+    CHECK(after < before && 100 < after);                       /* the next turn's wrap */
+
+    CHECK_EQ(fa_stream_set_reverse(s, 1), FA_OK);
+    CHECK_EQ(fa_stream_seek(s, 600), FA_OK);
+    CHECK_EQ(fa_stream_add_position_event(s, 400), FA_OK);
+    CHECK_EQ(fa_stream_add_position_event(s, RATE - 100), FA_OK);
+    CHECK(render_until_armed(s, out, 1, 10, &before, &after));
+    CHECK(after <= 400 && 400 < before);
+    CHECK(render_until_armed(s, out, 0, 10, &before, &after));
+    CHECK(after > before && after <= RATE - 100);               /* wrapped from 0 to the end */
+    fa_stream_close(s);
+
+    s = open_attached(4 * RATE, ramp_sig, 0);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_seek(s, 3 * RATE), FA_OK);
+    CHECK_EQ(fa_stream_set_reverse(s, 1), FA_OK);
+    CHECK_EQ(fa_stream_add_position_event(s, 2 * RATE), FA_OK);
+    CHECK_EQ(fa_stream_add_position_event(s, 0), FA_OK);        /* the start, where it ends */
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    CHECK(render_until_armed(s, out, 1, 200, &before, &after));
+    CHECK(after <= 2 * RATE && 2 * RATE < before);
+    CHECK(render_until_armed(s, out, 0, 400, &before, &after));
+    CHECK_EQ(after, 0);
+    fa_stream_close(s);
+    free(out);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -1373,6 +1515,10 @@ int main(void)
     RUN(test_reverse_with_rate);
     RUN(test_reverse_attached);
     RUN(test_reverse_api);
+    RUN(test_position_event_api);
+    RUN(test_position_event_exact);
+    RUN(test_position_event_tempo);
+    RUN(test_position_event_loop_and_reverse);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

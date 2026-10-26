@@ -117,7 +117,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_SYNC_STALL | `FA_EVENT_STALLED` and `FA_EVENT_RESUMED` (two events instead of one with a flag) | `Stalled`, `Resumed` | ✅ |
 | BASS_SYNC_DOWNLOAD | `fa_net_status.finished` | `NetworkStatus.Finished` | ✅ (polled, no event) |
 | BASS_SYNC_HLS_SEGMENT | Not provided | — | ➖ |
-| BASS_SYNC_POS | `fa_stream_add_position_event` + `FA_EVENT_POSITION` | `AddPositionEvent`, `PositionReached` | 🧩 |
+| BASS_SYNC_POS (with or without BASS_SYNC_ONETIME) | `fa_stream_add_position_event` + `FA_EVENT_POSITION`: always one-shot, like BASS_SYNC_ONETIME; for a sync that fires on every pass, add it again in the callback. Frame-exact through tempo and loops, raised in reverse too; `FA_FRAMES_UNSET` removes them all (BASS_ChannelRemoveSync) ([position events](../features/events.md#position-events)) | `AddPositionEvent`, `PositionReached`, `ClearPositionEvents` | ✅ |
 | BASS_SYNC_POS used to start a crossfade or the next track | Markers (`FA_MARKER_MIX_POINT`, fades) and `fa_stream_set_next` ([crossfade](../features/crossfade.md)) | `stream.Markers`, `QueueNext` | ✅ |
 | BASS_SYNC_POS used to end playback early (trim) | `FA_MARKER_CUE_OUT` (exact end) and `FA_MARKER_CUE_IN` | `Markers.CueOut`, `Markers.CueIn` | ✅ |
 | `FA_EVENT_MARKER` has no BASS equivalent | Raised when playback passes a marker | `MarkerReached` | ✅ |

@@ -931,10 +931,11 @@ FA_API fa_result FA_CALL fa_stream_get_loop(fa_stream* stream, int32_t* out_on);
  * A loop (fa_stream_set_loop, a deck loop) wraps from its start to its end. Tempo,
  * pitch, rate, volume, effects and the fade markers work as forward. Changing the
  * direction restarts at the position heard, as fa_stream_seek does. While reversed,
- * marker, loop, MIDI text and tracker row events are not raised, CUE_OUT does not end the
- * stream, a queued stream starts when this one ends (no crossfade), deck sync does
- * not pull the deck into phase, and fa_deck_beat_jump and deck loop changes take
- * effect at once rather than on a beat. The source is decoded forward in half-second
+ * marker, loop, MIDI text and tracker row events are not raised (position events
+ * are), CUE_OUT does not end the stream, a queued stream starts when this one ends
+ * (no crossfade), deck sync does not pull the deck into phase, and fa_deck_beat_jump
+ * and deck loop changes take effect at once rather than on a beat. The source is
+ * decoded forward in half-second
  * blocks, one seek each. Push, packet and forward-only streams return
  * FA_ERROR_NOT_SEEKABLE, web streams FA_ERROR_NOT_IMPLEMENTED. */
 FA_API fa_result FA_CALL fa_stream_set_reverse(fa_stream* stream, int32_t reverse);
@@ -2696,7 +2697,7 @@ FA_API fa_result FA_CALL fa_stream_get_tracker_channel_mute(fa_stream* stream, u
  * FA_EVENT_SEEK_FAILED     the target not reached the fa_result (fa_stream_seek_async)
  * FA_EVENT_TRACKER_ROW     the row's first frame  order << 16 | row (FA_TRACKER_ROW_EVENTS)
  *
- * Delivered today: ENDED, MARKER, LOOPED, CDG_CHANGED (when asked for), LOUDNESS_FINAL, RAMP_DONE, STARTED, SEEK_FAILED and DEVICE_CHANGED; MIDI_TEXT from MIDI
+ * Delivered today: ENDED, POSITION, MARKER, LOOPED, CDG_CHANGED (when asked for), LOUDNESS_FINAL, RAMP_DONE, STARTED, SEEK_FAILED and DEVICE_CHANGED; MIDI_TEXT from MIDI
  * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); TRACKER_ROW from
  * tracker modules played on a device (when asked for); METADATA from web
  * streams; STALLED and RESUMED from push, packet and web streams; DECODE_ERROR from packet
@@ -2744,6 +2745,20 @@ typedef void (FA_CALL *fa_event_callback)(const fa_event* event, void* user);
  * longer running (unless you call them from inside that callback), so its `user`
  * data can be freed. */
 FA_API fa_result FA_CALL fa_stream_set_event_callback(fa_stream* stream, fa_event_callback callback, void* user);
+
+/* Raises FA_EVENT_POSITION once, the first time playback passes source frame
+ * `frame` (frame = the requested frame, value 0); the request is then gone. Add it
+ * again from the callback to hear about the next pass (a loop's next turn, or after
+ * seeking back). Frame-exact like markers: it follows tempo, rate and loops, and is
+ * raised as that audio is mixed, about one device latency before it is heard.
+ * Unlike markers it is raised playing reversed too, when the position counts down
+ * past the frame. A seek over the frame doesn't raise it: it stays armed. Streams
+ * played on a device only (decode-only streams raise none).
+ * Up to 64 frames are armed at once per stream; adding one that is already armed
+ * does nothing. FA_FRAMES_UNSET removes all of the stream's armed frames.
+ * FA_ERROR_INVALID_ARG for any other negative frame or one past a known length;
+ * FA_ERROR_BUSY when 64 are armed. Best effort like markers: dropped in the rare
+ * case that the device's event queue is full. */
 FA_API fa_result FA_CALL fa_stream_add_position_event(fa_stream* stream, fa_frames frame);
 
 /* ---- Encoding and recording ------------------------------------------------

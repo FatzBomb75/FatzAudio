@@ -178,6 +178,27 @@ public class PlaybackTests
     }
 
     [Fact]
+    public async Task AddPositionEvent_RaisesPositionReachedOnce()
+    {
+        using var engine = CreateHeadless();
+        using var output = engine.OpenOutput();
+        using var s = engine.OpenMemory(TestAudio.SineWav(seconds: 0.5));
+        var reached = new List<long>();
+        var ended = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        s.PositionReached += (_, e) => { lock (reached) reached.Add(e.Frame); };
+        s.Ended += (_, _) => ended.TrySetResult();
+        s.AddPositionEvent(TimeSpan.FromSeconds(0.1));
+        s.AddPositionEvent(TimeSpan.FromSeconds(0.2));
+        s.AddPositionEvent(TimeSpan.FromSeconds(0.4));
+        s.ClearPositionEvents();
+        s.AddPositionEvent(TimeSpan.FromSeconds(0.3));
+        s.AddPositionEvent(TimeSpan.FromSeconds(0.1));
+        s.PlayOn(output);
+        await ended.Task.WaitAsync(TimeSpan.FromSeconds(5));   // events arrive in order: both came before ENDED
+        lock (reached) Assert.Equal(new long[] { 4410, 13230 }, reached);
+    }
+
+    [Fact]
     public void Reverse_ReadsBackwards()
     {
         using var engine = CreateHeadless();

@@ -192,6 +192,7 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
     fa_store32(&s->state, FA_STATE_STOPPED);
     fa_store64(&s->meta_frame, INT64_MAX);
     for (i = 0; i < FA_MARKER_COUNT; i++) fa_store64(&s->markers[i], FA_FRAMES_UNSET);
+    for (i = 0; i < FA_POSITION_EVENT_SLOTS; i++) fa_store64(&s->pos_events[i], FA_FRAMES_UNSET);
     for (i = 0; i < FA_STREAM_LANES; i++) fa_lane_init(&s->lanes[i], i == FA_PARAM_PAN ? 0.0f : 1.0f);
     {
         fa_shape eq;
@@ -2753,6 +2754,28 @@ FA_API fa_result FA_CALL fa_stream_get_marker(fa_stream* stream, fa_marker which
     return FA_OK;
 }
 
+/* ---- position events ------------------------------------------------------ */
+
+FA_API fa_result FA_CALL fa_stream_add_position_event(fa_stream* stream, fa_frames frame)
+{
+    int i;
+    if (!stream || frame < FA_FRAMES_UNSET) return FA_ERROR_INVALID_ARG;
+    if (frame == FA_FRAMES_UNSET) {
+        for (i = 0; i < FA_POSITION_EVENT_SLOTS; i++)
+            if (fa_exchange64(&stream->pos_events[i], FA_FRAMES_UNSET) != FA_FRAMES_UNSET)
+                fa_fetch_add32(&stream->pos_armed, -1);
+        return FA_OK;
+    }
+    if (stream->decoder.length >= 0 && frame > stream->decoder.length) return FA_ERROR_INVALID_ARG;
+    fa_fetch_add32(&stream->pos_armed, 1);   /* first, so the mixer never skips an armed slot */
+    for (i = 0; i < FA_POSITION_EVENT_SLOTS; i++)
+        if (fa_load64(&stream->pos_events[i]) == frame) { fa_fetch_add32(&stream->pos_armed, -1); return FA_OK; }
+    for (i = 0; i < FA_POSITION_EVENT_SLOTS; i++)
+        if (fa_cas64(&stream->pos_events[i], FA_FRAMES_UNSET, frame)) return FA_OK;
+    fa_fetch_add32(&stream->pos_armed, -1);
+    return FA_ERROR_BUSY;
+}
+
 FA_API fa_result FA_CALL fa_stream_set_fade_curve(fa_stream* stream, fa_fade fade, const fa_ramp* shape)
 {
     fa_shape sh;
@@ -3298,9 +3321,57 @@ static void frame_events(struct fa_stream* s, fa_device* dev, int64_t played0, i
     }
 }
 
+/* FA_EVENT_POSITION for each armed frame heard between `played0` and `played1`, in
+ * the order heard; raising one frees its slot. Forward, the frames heard are
+ * [w0, w1) (with w1 itself at the end); a wrap into the loop gives [w0, end] and
+ * [back, w1), counting the loop end as passed like markers do. Reversed, they are
+ * [w1, w0), or [back, w0) and [w1, end) where the loop wraps at its start. */
+static void position_events(struct fa_stream* s, fa_device* dev, int64_t played0, int64_t played1, int ended)
+{
+    fa_frames p0, p1, end, back, len, w0, w1, at[FA_POSITION_EVENT_SLOTS];
+    int64_t dist[FA_POSITION_EVENT_SLOTS];
+    int rev, looping, whole, i, j, n = 0;
+    if (fa_load32(&s->pos_armed) <= 0) return;
+    rev = reversed(s);
+    p0 = (fa_frames)(linear_position(s, played0) + 0.5);
+    p1 = (fa_frames)(linear_position(s, played1) + 0.5);
+    if (rev ? p1 >= p0 : (p1 <= p0 && !ended)) return;
+    end = end_frame(s);
+    back = loop_start(s);
+    len = end - back;
+    looping = loops(s) && end > 0 && len > 0;
+    whole = looping && (rev ? p0 - p1 : p1 - p0) >= len;   /* a whole turn or more: every frame */
+    w0 = wrap_position(s, p0);
+    w1 = wrap_position(s, p1);
+    for (i = 0; i < FA_POSITION_EVENT_SLOTS; i++) {
+        fa_frames m = fa_load64(&s->pos_events[i]);
+        int64_t d;
+        int hit;
+        if (m == FA_FRAMES_UNSET) continue;
+        if (rev) {
+            if (whole) hit = m >= back && m < end;
+            else if (looping && w1 > w0) hit = (m >= back && m < w0) || (m >= w1 && m < end);
+            else hit = m >= w1 && m < w0;
+            d = m < w0 ? w0 - 1 - m : (w0 - back) + (end - 1 - m);
+        } else {
+            if (whole) hit = m >= back && m <= end;
+            else if (looping && w1 < w0) hit = (m >= w0 && m <= end) || (m >= back && m < w1);
+            else hit = m >= w0 && (m < w1 || (ended && m == w1));
+            d = m >= w0 ? m - w0 : (end + 1 - w0) + (m - back);
+        }
+        if (!hit || !fa_cas64(&s->pos_events[i], m, FA_FRAMES_UNSET)) continue;
+        fa_fetch_add32(&s->pos_armed, -1);
+        for (j = n++; j > 0 && dist[j - 1] > d; j--) { at[j] = at[j - 1]; dist[j] = dist[j - 1]; }
+        at[j] = m;
+        dist[j] = d;
+    }
+    for (i = 0; i < n; i++) fa_audio_post_event(dev, s, FA_EVENT_POSITION, at[i], 0);
+}
+
 static void heard_events(struct fa_stream* s, fa_device* dev, int64_t played0, int64_t played1, int ended)
 {
     heard_ramps_due(s, dev, played1, ended);
+    position_events(s, dev, played0, played1, ended);
     if (reversed(s)) return;   /* texts and rows are raised playing forward only */
     if (s->midi) frame_events(s, dev, played0, played1, ended, post_midi_texts);
     if (s->tracker && fa_tracker_row_events_on(s->tracker)) frame_events(s, dev, played0, played1, ended, post_tracker_rows);

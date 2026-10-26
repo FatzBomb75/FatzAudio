@@ -18,6 +18,10 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- Position events: `fa_stream_add_position_event` (.NET `AddPositionEvent`, `PositionReached`, new `ClearPositionEvents`)
+  now works instead of returning `FA_ERROR_NOT_IMPLEMENTED`. BASS_SYNC_POS: one `FA_EVENT_POSITION` the first time
+  playback passes a frame, frame-exact through tempo, loops and seeks, and in reverse playback too; up to 64 armed per
+  stream. See [docs/features/events.md](docs/features/events.md#position-events).
 - Reverse playback: `fa_stream_set_reverse` / `fa_stream_get_reverse` (.NET `AudioStream.Reverse`), bass_fx's
   `BASS_FX_ReverseCreate` and `BASS_ATTRIB_REVERSE_DIR` on the stream itself, switchable while playing; works with tempo,
   pitch, rate, loops and deck loops. See [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md#reverse-playback).
