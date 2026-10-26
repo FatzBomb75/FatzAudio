@@ -13,6 +13,8 @@ ctest --test-dir build -C Release
 The library is written to `build/bin/<Config>/` (`fatzaudio.dll`, `libfatzaudio.dylib` or `libfatzaudio.so`).
 For Android and iOS, see [Building](building.md).
 
+`fa_version()` returns the version of the loaded library as `(major << 16) | (minor << 8) | patch`; compare it with `FA_VERSION_MAJOR` and `FA_VERSION_MINOR` from the header you built against. In .NET, `AudioEngine.NativeVersion` is the same value as a `Version`, and the binding refuses to run against a library with another major.minor.
+
 ## Play a file (C)
 
 ```c

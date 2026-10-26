@@ -21,6 +21,8 @@ Each stream has one event callback. The audio thread queues events without locki
 | `FA_EVENT_TRACKER_ROW` | the row's first frame | `order << 16 \| row` | ✅ tracker modules with `FA_TRACKER_ROW_EVENTS` on; raised as the audio is mixed, like markers ([trackers](trackers.md#row-events)) |
 | `FA_EVENT_SEEK_FAILED` | the target of `fa_stream_seek_async` that was not reached | the `fa_result` | ✅ a worker could not seek there (a web server refusing the range); playback goes on where it was ([seek cost](playback.md#what-a-seek-costs)) |
 
+`FA_EVENT_POSITION` is for `fa_stream_add_position_event(stream, frame)` (.NET `AddPositionEvent`, `PositionReached`), a one-shot event at a frame of your choice, as BASS's `BASS_SYNC_POS`. It is declared but not built yet: the call returns `FA_ERROR_NOT_IMPLEMENTED`. Use a marker ([markers](crossfade.md#markers)) for a point inside a track you set before playing, or poll `fa_stream_get_position`.
+
 ## C
 
 ```c

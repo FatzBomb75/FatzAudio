@@ -63,6 +63,7 @@ Unlike BASSMIDI there are no font handles per preset, no font stacks and no samp
 ```c
 fa_soundfont* gm = NULL;
 if (fa_soundfont_open_path("GeneralUser.sf2", &gm) != FA_OK) { /* missing or not SF2 */ }
+/* fa_soundfont_open_memory(data, size, &gm) loads a bank you already hold in memory; it copies the bytes */
 fa_engine_set_soundfont(engine, gm);
 fa_soundfont_close(gm);                  /* the engine keeps its own reference */
 
@@ -222,8 +223,8 @@ Text events are best effort, like markers: under heavy load an event can be drop
 
 | Control | C | C# | Notes |
 |---|---|---|---|
-| Transpose | `fa_stream_set_midi_transpose(s, semitones)` | `MidiTranspose` | -48..48 semitones on every channel but the drums, from the next note on. The synthesizer plays the new notes, so the sound stays as clean as the original. |
-| Channel mute | `fa_stream_set_midi_channel_mute(s, channel, 1)` | `SetMidiChannelMuted(channel, true)` | Channel 0..15 (MIDI 1..16) goes silent at once; for a karaoke "guide melody off". |
+| Transpose | `fa_stream_set_midi_transpose(s, semitones)` / `fa_stream_get_midi_transpose` | `MidiTranspose` | -48..48 semitones on every channel but the drums, from the next note on. The synthesizer plays the new notes, so the sound stays as clean as the original. |
+| Channel mute | `fa_stream_set_midi_channel_mute(s, channel, 1)` / `fa_stream_get_midi_channel_mute` | `SetMidiChannelMuted(channel, true)` / `IsMidiChannelMuted(channel)` | Channel 0..15 (MIDI 1..16) goes silent at once; for a karaoke "guide melody off". |
 | Master volume | `FA_PARAM_VOLUME` | `Volume` | As for every stream, with ramps. |
 | Tempo | `FA_PARAM_TEMPO` | `Tempo` | The stream's time-stretch: lyrics, markers and the clock follow. |
 | Key without resynthesis | `FA_PARAM_PITCH` | `Pitch` | Shifts the rendered audio, drums included. Prefer transpose for MIDI. |

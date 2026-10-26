@@ -235,7 +235,7 @@ p.scale = 1;                          /* full colour at a whole multiple */
 p.safety_zone = FA_SAFETY_AUTO;       /* the border only when the song draws in it */
 p.smoothness = 2;
 p.edge_blend = 1;
-fa_cdg_surface_set_presentation(cdg, &p);
+fa_cdg_surface_set_presentation(cdg, &p);   /* fa_cdg_surface_get_presentation reads it back */
 fa_surface_set_presentation_size(cdg, 1920, 1080);   /* the window's size, in physical pixels */
 
 fa_surface_layout lay = { sizeof(lay) };
@@ -277,7 +277,7 @@ At 5-10 the colours meet along shared outlines, so two colours that touch never 
 
 **Scrolls are moves, not redraws.** The surface keeps the picture it drew (its master) and moves it when the screen scrolls, drawing only the band that came in and what touches it. Smooth-scroll offsets draw nothing: they move the window copied out of the master. A colour-table change draws the master again.
 
-**Effects** (`fa_surface_set_effects`; .NET `Effects`) put an outline, a shadow and a bevel around everything that is not the background, with presentation scaling on (the classic picture ignores them). All three come from one exact distance field of the picture's shape at the output size, corrected to sub-pixel accuracy from the edge pixels' coverage, so the outline is a true stroke: round at corners and the same width on diagonals as on straight edges.
+**Effects** (`fa_surface_set_effects` / `fa_surface_get_effects`; .NET `Effects`) put an outline, a shadow and a bevel around everything that is not the background, with presentation scaling on (the classic picture ignores them). All three come from one exact distance field of the picture's shape at the output size, corrected to sub-pixel accuracy from the edge pixels' coverage, so the outline is a true stroke: round at corners and the same width on diagonals as on straight edges.
 
 ```c
 fa_surface_effects fx;
@@ -355,7 +355,7 @@ Pack *n* of a `.cdg` belongs at *n* / 300 seconds of the audio. `fa_cdg_surface_
 
 - **Pause, seek, loop, crossfade, queue:** the clock follows the audio, and so do the graphics.
 - **Tempo and pitch:** the clock is a position in the song, so slower or faster playback moves the graphics with it.
-- **Out-of-sync files:** `fa_stream_set_cdg_offset(song, 150000000)` shows the graphics 150 ms later (negative: earlier).
+- **Out-of-sync files:** `fa_stream_set_cdg_offset(song, 150000000)` (`fa_stream_get_cdg_offset`; .NET `CdgOffset`) shows the graphics 150 ms later (negative: earlier).
 - **Your own clock** (rendering a karaoke video, a scrub preview): `fa_cdg_surface_update_at(cdg, time, &frame)` draws the picture at any time you choose. The CD+G offset still applies.
 
 The exact rule, for apps that compare their own decoder frame for frame: at time *t* (in seconds, after subtracting the offset) the picture shows packs [0, ceil(*t* × 300)) applied. Pack *n* occupies [*n*/300, (*n*+1)/300) and counts as soon as its slot starts, so at *t* = 1 s exactly packs 0..299 are applied, and at 1 s + 1 ns packs 0..300. *t* ≤ 0 shows no pack.
