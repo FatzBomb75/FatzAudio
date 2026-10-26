@@ -28,6 +28,14 @@ typedef struct ps_config {
     const int8_t* k_to_i;
 } ps_config;
 
+/* Constant tables, built once per process by ps_tables_init (same pattern as ac3_init_tables). */
+typedef struct ps_tables {
+    float phi_fract[2][MAX_BANDS][2];
+    float q_fract[2][MAX_BANDS][AP_LINKS][2];
+    float f8[8][13][2], f12[12][13][2], f8_34[8][13][2], f4[4][13][2];
+    float pd_smooth[512][2];
+} ps_tables;
+
 struct fa_aac_ps {
     /* header */
     int header_seen;
@@ -48,10 +56,7 @@ struct fa_aac_ps {
     float h_last[4][MAX_PAR][2];             /* mixing matrix at the end of the last envelope (re, im) */
     uint8_t ipd_hist[MAX_PAR], opd_hist[MAX_PAR];
     /* tables */
-    float phi_fract[2][MAX_BANDS][2];
-    float q_fract[2][MAX_BANDS][AP_LINKS][2];
-    float f8[8][13][2], f12[12][13][2], f8_34[8][13][2], f4[4][13][2];
-    float pd_smooth[512][2];
+    const struct ps_tables* t;               /* shared, built once per process */
     /* work */
     float s[MAX_BANDS][SLOTS][2], d[MAX_BANDS][SLOTS][2];
     float hybrid_in[5][6 + 38][2];
@@ -97,12 +102,55 @@ static void make_filter(float (*f)[13][2], const float* proto, int bands)
         }
 }
 
-fa_aac_ps* fa_aac_ps_create(void)
+static ps_tables g_tables;
+static fa_atomic32 g_tables_state;   /* 0 not done, 1 in progress, 2 done */
+
+static void ps_tables_init(void)
 {
     static const float q_link[AP_LINKS] = { 0.43f, 0.75f, 0.347f };
-    fa_aac_ps* p = (fa_aac_ps*)calloc(1, sizeof(*p));
+    ps_tables* t = &g_tables;
     int c, k, m, i;
+    if (fa_load32(&g_tables_state) == 2) return;
+    if (!fa_cas32(&g_tables_state, 0, 1)) {
+        while (fa_load32(&g_tables_state) != 2) fa_sleep_ms(1);
+        return;
+    }
+    for (c = 0; c < 2; c++) {
+        int nbands = c ? 91 : 71, nhybrid = c ? 32 : 10, qsplit = c ? 5 : 3;
+        for (k = 0; k < nbands; k++) {
+            float f;
+            if (k < nhybrid) f = c ? f_center_34[k] / 24.0f : f_center_20[k] / 8.0f;
+            else f = (float)(k - nhybrid + qsplit) + 0.5f;
+            t->phi_fract[c][k][0] = (float)cos(-FA_PI * 0.39 * f);
+            t->phi_fract[c][k][1] = (float)sin(-FA_PI * 0.39 * f);
+            for (m = 0; m < AP_LINKS; m++) {
+                t->q_fract[c][k][m][0] = (float)cos(-FA_PI * q_link[m] * f);
+                t->q_fract[c][k][m][1] = (float)sin(-FA_PI * q_link[m] * f);
+            }
+        }
+    }
+    make_filter(t->f8, fa_aac_ps_p8_13_20, 8);
+    make_filter(t->f12, fa_aac_ps_p12_13_34, 12);
+    make_filter(t->f8_34, fa_aac_ps_p8_13_34, 8);
+    make_filter(t->f4, fa_aac_ps_p4_13_34, 4);
+    for (i = 0; i < 512; i++) {
+        /* Phase smoothing: 0.25, 0.5 and 1 times the last three phases. */
+        double a0 = FA_PI / 4 * (i >> 6), a1 = FA_PI / 4 * ((i >> 3) & 7), a2 = FA_PI / 4 * (i & 7);
+        double re = 0.25 * cos(a0) + 0.5 * cos(a1) + cos(a2), im = 0.25 * sin(a0) + 0.5 * sin(a1) + sin(a2);
+        double mag = sqrt(re * re + im * im);
+        t->pd_smooth[i][0] = (float)(mag > 0 ? re / mag : 1.0);
+        t->pd_smooth[i][1] = (float)(mag > 0 ? im / mag : 0.0);
+    }
+    fa_store32(&g_tables_state, 2);
+}
+
+fa_aac_ps* fa_aac_ps_create(void)
+{
+    fa_aac_ps* p = (fa_aac_ps*)calloc(1, sizeof(*p));
+    int c;
     if (!p) return NULL;
+    ps_tables_init();
+    p->t = &g_tables;
     for (c = 0; c < 2; c++) {
         ps_config* cf = &p->cfg[c];
         cf->nbands = c ? 91 : 71;
@@ -114,29 +162,6 @@ fa_aac_ps* fa_aac_ps_create(void)
         cf->decay_cutoff = c ? 32 : 10;
         cf->nipd = c ? 17 : 11;
         cf->k_to_i = c ? k_to_i_34 : k_to_i_20;
-        for (k = 0; k < cf->nbands; k++) {
-            float f;
-            if (k < cf->nhybrid) f = c ? f_center_34[k] / 24.0f : f_center_20[k] / 8.0f;
-            else f = (float)(k - cf->nhybrid + cf->qsplit) + 0.5f;
-            p->phi_fract[c][k][0] = (float)cos(-FA_PI * 0.39 * f);
-            p->phi_fract[c][k][1] = (float)sin(-FA_PI * 0.39 * f);
-            for (m = 0; m < AP_LINKS; m++) {
-                p->q_fract[c][k][m][0] = (float)cos(-FA_PI * q_link[m] * f);
-                p->q_fract[c][k][m][1] = (float)sin(-FA_PI * q_link[m] * f);
-            }
-        }
-    }
-    make_filter(p->f8, fa_aac_ps_p8_13_20, 8);
-    make_filter(p->f12, fa_aac_ps_p12_13_34, 12);
-    make_filter(p->f8_34, fa_aac_ps_p8_13_34, 8);
-    make_filter(p->f4, fa_aac_ps_p4_13_34, 4);
-    for (i = 0; i < 512; i++) {
-        /* Phase smoothing: 0.25, 0.5 and 1 times the last three phases. */
-        double a0 = FA_PI / 4 * (i >> 6), a1 = FA_PI / 4 * ((i >> 3) & 7), a2 = FA_PI / 4 * (i & 7);
-        double re = 0.25 * cos(a0) + 0.5 * cos(a1) + cos(a2), im = 0.25 * sin(a0) + 0.5 * sin(a1) + sin(a2);
-        double mag = sqrt(re * re + im * im);
-        p->pd_smooth[i][0] = (float)(mag > 0 ? re / mag : 1.0);
-        p->pd_smooth[i][1] = (float)(mag > 0 ? im / mag : 0.0);
     }
     fa_aac_ps_reset(p);
     return p;
@@ -415,7 +440,7 @@ static void hybrid_analysis(fa_aac_ps* p, float (*l)[64][2])
         float (*o8[8])[SLOTS][2];
         int q;
         for (q = 0; q < 8; q++) o8[q] = &tmp[q];
-        hybrid_complex((const float (*)[2])p->hybrid_in[0], (const float (*)[13][2])p->f8, 8, o8);
+        hybrid_complex((const float (*)[2])p->hybrid_in[0], (const float (*)[13][2])p->t->f8, 8, o8);
         for (n = 0; n < SLOTS; n++) {
             int c;
             for (c = 0; c < 2; c++) {
@@ -447,12 +472,12 @@ static void hybrid_analysis(fa_aac_ps* p, float (*l)[64][2])
         float (*o[12])[SLOTS][2];
         int q;
         for (q = 0; q < 12; q++) o[q] = &p->s[q];
-        hybrid_complex((const float (*)[2])p->hybrid_in[0], (const float (*)[13][2])p->f12, 12, o);
+        hybrid_complex((const float (*)[2])p->hybrid_in[0], (const float (*)[13][2])p->t->f12, 12, o);
         for (q = 0; q < 8; q++) o[q] = &p->s[12 + q];
-        hybrid_complex((const float (*)[2])p->hybrid_in[1], (const float (*)[13][2])p->f8_34, 8, o);
+        hybrid_complex((const float (*)[2])p->hybrid_in[1], (const float (*)[13][2])p->t->f8_34, 8, o);
         for (k = 2; k < 5; k++) {
             for (q = 0; q < 4; q++) o[q] = &p->s[20 + 4 * (k - 2) + q];
-            hybrid_complex((const float (*)[2])p->hybrid_in[k], (const float (*)[13][2])p->f4, 4, o);
+            hybrid_complex((const float (*)[2])p->hybrid_in[k], (const float (*)[13][2])p->t->f4, 4, o);
         }
     }
     /* The QMF bands above, as they are. */
@@ -535,7 +560,7 @@ static void decorrelate(fa_aac_ps* p, int top)
         if (k < cf->allpass_bands) {
             float slope = k > cf->decay_cutoff ? 1.0f - 0.05f * (float)(k - cf->decay_cutoff) : 1.0f;
             float ag[AP_LINKS];
-            const float* phi = p->phi_fract[p->is34][k];
+            const float* phi = p->t->phi_fract[p->is34][k];
             if (slope < 0.0f) slope = 0.0f;
             for (m = 0; m < AP_LINKS; m++) {
                 ag[m] = a_link[m] * slope;
@@ -547,7 +572,7 @@ static void decorrelate(fa_aac_ps* p, int top)
                 float re = x[0] * phi[0] - x[1] * phi[1];
                 float im = x[0] * phi[1] + x[1] * phi[0];
                 for (m = 0; m < AP_LINKS; m++) {
-                    const float* q = p->q_fract[p->is34][k][m];
+                    const float* q = p->t->q_fract[p->is34][k][m];
                     const float* w = p->ap[m][MAX_AP_DELAY + n - d_link[m]];
                     float ar = w[0] * q[0] - w[1] * q[1] - ag[m] * re;
                     float ai = w[0] * q[1] + w[1] * q[0] - ag[m] * im;
@@ -629,8 +654,8 @@ static void stereo(fa_aac_ps* p)
             }
             if (ipd && b < cf->nipd) {
                 int oi = p->opd_hist[b] * 8 + (opdp[b] & 7), ii = p->ipd_hist[b] * 8 + (ipdp[b] & 7);
-                float o_re = p->pd_smooth[oi][0], o_im = p->pd_smooth[oi][1];
-                float i_re = p->pd_smooth[ii][0], i_im = p->pd_smooth[ii][1];
+                float o_re = p->t->pd_smooth[oi][0], o_im = p->t->pd_smooth[oi][1];
+                float i_re = p->t->pd_smooth[ii][0], i_im = p->t->pd_smooth[ii][1];
                 float a_re = o_re * i_re + o_im * i_im, a_im = o_im * i_re - o_re * i_im;   /* OPD - IPD */
                 p->opd_hist[b] = (uint8_t)(oi & 0x3F);
                 p->ipd_hist[b] = (uint8_t)(ii & 0x3F);

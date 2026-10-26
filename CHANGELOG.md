@@ -198,6 +198,7 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- HE-AAC v2 streams share the parametric-stereo constant tables (14 KB) built once per process instead of one copy per stream. Output is unchanged.
 - Faster and smaller, with the same output (deep audit, small items, 2026-10-26): the DJ deck isolator runs both
   channels and four filter sections per SSE step (a mixer callback takes about 38% fewer instructions, output identical
   to the bit); the running loudness estimate (about 7% of decoding) runs only with normalization on or once the app asks
