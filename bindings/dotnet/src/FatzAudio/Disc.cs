@@ -166,7 +166,7 @@ public sealed class Disc : IDisposable
             for (uint i = 0; i < count; i++)
             {
                 if (NativeMethods.fa_disc_drive_get_info(i, out FaDiscDriveInfo d) < 0) continue;
-                list.Add(new DiscDriveInfo(Str(d.Id), Str(d.Name), Str(d.Vendor), Str(d.Product), Str(d.Revision)));
+                list.Add(new DiscDriveInfo(NativeText.Read(d.Id), NativeText.Read(d.Name), NativeText.Read(d.Vendor), NativeText.Read(d.Product), NativeText.Read(d.Revision)));
             }
             return list;
         }
@@ -224,7 +224,7 @@ public sealed class Disc : IDisposable
                                              n.StartSector, n.Sectors, n.Frames, TimeSpan.FromTicks(n.Duration / 100)));
                 }
                 return new DiscToc(t->FirstTrack, t->LastTrack, tracks, t->AudioTrackCount, t->LeadoutSector,
-                                   TimeSpan.FromTicks(t->Duration / 100), t->FreedbId, Str(t->FreedbQuery), Str(t->MusicBrainzId),
+                                   TimeSpan.FromTicks(t->Duration / 100), t->FreedbId, NativeText.Read(t->FreedbQuery), NativeText.Read(t->MusicBrainzId),
                                    t->HasCdText != 0);
             }
             finally
@@ -281,6 +281,4 @@ public sealed class Disc : IDisposable
 
     /// <summary>Releases the drive. Streams opened from it keep working until they are disposed.</summary>
     public void Dispose() => _handle.Dispose();
-
-    private static unsafe string Str(byte* p) => Marshal.PtrToStringUTF8((nint)p) ?? "";
 }

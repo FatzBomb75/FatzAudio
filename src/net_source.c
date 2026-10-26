@@ -29,17 +29,6 @@
 #define FA_NET_RESTART_GAP (256 * 1024)   /* forward seeks closer than this just wait for the data */
 #define FA_NET_PLAYLIST_HOPS 4
 
-static char* dup_str(const char* s)
-{
-    char* d;
-    size_t n;
-    if (!s) return NULL;
-    n = strlen(s) + 1;
-    d = (char*)malloc(n);
-    if (d) memcpy(d, s, n);
-    return d;
-}
-
 static void free_config(fa_net_config* c)
 {
     free(c->url); free(c->user_agent); free(c->headers); free(c->proxy);
@@ -315,7 +304,7 @@ static int on_head(void* user, const fa_http_response* resp)
     n->connections++;
     n->http_status = resp->status;
     free(n->headers);
-    n->headers = dup_str(resp->headers);
+    n->headers = fa_strdup(resp->headers);
     snprintf(n->final_url, sizeof(n->final_url), "%s", resp->final_url);
     if (resp->status >= 400) {
         fa_mutex_unlock(&n->lock);
@@ -435,7 +424,7 @@ static void backoff_locked(fa_net* n, uint32_t ms)
 static void download_main(void* arg)
 {
     fa_net* n = (fa_net*)arg;
-    char* url = dup_str(n->cfg.url);
+    char* url = fa_strdup(n->cfg.url);
     int hops = 0;
     uint32_t backoff = 250;
     int64_t fail_start = 0;
@@ -493,7 +482,7 @@ static void download_main(void* arg)
                 }
                 /* Follow the playlist: a fresh start on its first entry. */
                 free(url);
-                url = dup_str(next);
+                url = fa_strdup(next);
                 free(n->playlist);
                 n->playlist = NULL;
                 n->playlist_len = 0;
@@ -725,15 +714,6 @@ void fa_net_note_decoded(fa_net* n, int64_t frames)
     fa_mutex_lock(&n->lock);
     n->frames += frames;
     fa_mutex_unlock(&n->lock);
-}
-
-int fa_net_finished(fa_net* n)
-{
-    int f;
-    fa_mutex_lock(&n->lock);
-    f = n->finished;
-    fa_mutex_unlock(&n->lock);
-    return f;
 }
 
 double fa_net_bytes_per_frame(fa_net* n)

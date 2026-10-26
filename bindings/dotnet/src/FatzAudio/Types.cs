@@ -260,8 +260,8 @@ public sealed record StreamInfo(
         fixed (byte* container = n.Container)
             return new StreamInfo(
                 AudioFormat.FromNative(n.Format),
-                Marshal.PtrToStringUTF8((nint)codec) ?? "",
-                Marshal.PtrToStringUTF8((nint)container) ?? "",
+                NativeText.Read(codec),
+                NativeText.Read(container),
                 duration, n.LengthFrames, n.Seekable != 0, n.AudioTrackCount, n.HasCdg != 0,
                 n.FileSize >= 0 ? n.FileSize : null, n.AudioBytes >= 0 ? n.AudioBytes : null,
                 (int)Math.Min(n.Bitrate, int.MaxValue), (int)n.BitsPerSample);

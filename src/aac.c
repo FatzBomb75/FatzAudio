@@ -26,10 +26,6 @@
 #include <stdio.h>
 #endif
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 /* Sampling frequency index -> Hz (shared with the demuxers, demux.h). */
 const uint32_t fa_aac_rates[13] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000,
                                     22050, 16000, 12000, 11025, 8000, 7350 };
@@ -113,7 +109,6 @@ typedef struct aac_elem {
     uint8_t ms_used[MAX_GROUPS][MAX_SFB];
     aac_chan* ch[2];
     fa_aac_sbr* sbr;
-    int sbr_data;                  /* SBR data came with the current block */
     int stereo_out;                /* produced two channels (a CPE, or a mono element with PS) */
     int order;                     /* position among the block's elements of its type */
 } aac_elem;
@@ -206,7 +201,7 @@ static void kbd_window(float* w, int n, double alpha)
     int i;
     for (i = 0; i <= n; i++) {
         double r = (double)(i - n / 2) / (n / 2);
-        k[i] = bessel_i0(M_PI * alpha * sqrt(1.0 - r * r));
+        k[i] = bessel_i0(FA_PI * alpha * sqrt(1.0 - r * r));
         sum += k[i];
     }
     for (i = 0; i < n; i++) {
@@ -228,8 +223,8 @@ static void build_shared(void)
     while (fa_load32(&shared.state) != 2) {
         if (fa_cas32(&shared.state, 0, 1)) {
             int i;
-            for (i = 0; i < 1024; i++) shared.sine_long[i] = (float)sin(M_PI / 2048.0 * (i + 0.5));
-            for (i = 0; i < 128; i++) shared.sine_short[i] = (float)sin(M_PI / 256.0 * (i + 0.5));
+            for (i = 0; i < 1024; i++) shared.sine_long[i] = (float)sin(FA_PI / 2048.0 * (i + 0.5));
+            for (i = 0; i < 128; i++) shared.sine_short[i] = (float)sin(FA_PI / 256.0 * (i + 0.5));
             kbd_window(shared.kbd_long, 1024, 4.0);
             kbd_window(shared.kbd_short, 128, 6.0);
             for (i = 0; i < 256; i++) shared.iq[i] = (float)pow((double)i, 4.0 / 3.0);
@@ -569,8 +564,8 @@ static int read_tns(fa_aac_bits* b, const aac_ics* ics, aac_tns* t, int max_orde
                 int c = (int)fa_aac_get(b, bits);
                 double iqfac;
                 if (c & (1 << (bits - 1))) c -= 1 << bits;      /* sign extend */
-                iqfac = c >= 0 ? ((1 << (coef_res + 2)) - 0.5) / (M_PI / 2.0)
-                               : ((1 << (coef_res + 2)) + 0.5) / (M_PI / 2.0);
+                iqfac = c >= 0 ? ((1 << (coef_res + 2)) - 0.5) / (FA_PI / 2.0)
+                               : ((1 << (coef_res + 2)) + 0.5) / (FA_PI / 2.0);
                 if (i < TNS_MAX_ORDER) tmp[i] = (float)sin(c / iqfac);
             }
             /* Reflection coefficients to the direct form. */
@@ -1201,7 +1196,6 @@ static int read_fil(fa_aac* d, fa_aac_bits* b, aac_elem* prev)
                 if (!prev->sbr) prev->sbr = sbr_create(d, prev->nch);
                 if (prev->sbr) {
                     fa_aac_sbr_parse(prev->sbr, b, count * 8 - 4, type == EXT_SBR_DATA_CRC);
-                    prev->sbr_data = 1;
                     d->sbr_on = 1;
                 }
             }
@@ -1401,7 +1395,6 @@ static int decode_block(fa_aac* d, fa_aac_bits* b, int* frames, int* nch, mix_la
     size_t start = b->pos;
     for (i = 0; i < d->nelem; i++) {
         d->elem[i]->present = 0;
-        d->elem[i]->sbr_data = 0;
     }
     for (;;) {
         int id = (int)fa_aac_get(b, 3);

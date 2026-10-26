@@ -57,9 +57,6 @@ static const asf_guid g_audio_media = G(0xF8699E40, 0x5B4D, 0x11CF, 0xA8, 0xFD, 
 static const asf_guid g_audio_spread = G(0xBFC3CD50, 0x618F, 0x11CF, 0x8B, 0xB2, 0x00, 0xAA, 0x00, 0xB4, 0xE2, 0x20);
 
 static int guid_is(const uint8_t* p, const asf_guid g) { return memcmp(p, g, 16) == 0; }
-static uint16_t le16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-static uint32_t le32(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
-static uint64_t le64(const uint8_t* p) { return (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32); }
 
 /* The next child object in [*cur, end): its GUID, body and body size. 0 at the
  * end or when the size does not fit. */
@@ -67,7 +64,7 @@ static int next_object(const uint8_t** cur, const uint8_t* end, const uint8_t** 
 {
     uint64_t size;
     if ((size_t)(end - *cur) < 24) return 0;
-    size = le64(*cur + 16);
+    size = fa_le64(*cur + 16);
     if (size < 24 || size > (uint64_t)(end - *cur)) return 0;
     *guid = *cur;
     *body = *cur + 24;
@@ -84,13 +81,13 @@ static void utf16_to_utf8(const uint8_t* p, size_t n, char* out, size_t cap)
     size_t i = 0, k = 0;
     if (cap == 0) return;
     while (i + 1 < n) {
-        uint32_t u = le16(p + i);
+        uint32_t u = fa_le16(p + i);
         uint8_t b[4];
         size_t m;
         i += 2;
         if (u == 0) break;
-        if (u >= 0xD800 && u < 0xDC00 && i + 1 < n && le16(p + i) >= 0xDC00 && le16(p + i) < 0xE000) {
-            u = 0x10000 + ((u - 0xD800) << 10) + (le16(p + i) - 0xDC00u);
+        if (u >= 0xD800 && u < 0xDC00 && i + 1 < n && fa_le16(p + i) >= 0xDC00 && fa_le16(p + i) < 0xE000) {
+            u = 0x10000 + ((u - 0xD800) << 10) + (fa_le16(p + i) - 0xDC00u);
             i += 2;
         } else if (u >= 0xD800 && u < 0xE000) {
             u = 0xFFFD;
@@ -138,7 +135,7 @@ static void tag_item(fa_tag_sink* sink, const uint8_t* name, size_t name_len, si
         sink->text(sink, FA_TAG_FORMAT_ASF, key, num);
     } else if (type == 1 && sink->picture && fa_tags_key_is(key, "WM/Picture") && value_len >= 5) {
         /* type, data size, MIME and description (NUL-terminated UTF-16), data. */
-        uint32_t size = le32(value + 1);
+        uint32_t size = fa_le32(value + 1);
         size_t pos = 5, mime_at, desc_at;
         char mime[64], desc[256];
         mime_at = pos;
@@ -162,7 +159,7 @@ static void parse_content_desc(const uint8_t* p, size_t n, fa_tag_sink* sink)
     static const char* const names[5] = { "Title", "Author", "Copyright", "Description", "Rating" };
     size_t len[5], pos = 10, i;
     if (n < 10) return;
-    for (i = 0; i < 5; i++) len[i] = le16(p + 2 * i);
+    for (i = 0; i < 5; i++) len[i] = fa_le16(p + 2 * i);
     for (i = 0; i < 5; i++) {
         if (pos > n || len[i] > n - pos) return;
         if (len[i] > 0) {
@@ -181,18 +178,18 @@ static void parse_ext_content_desc(const uint8_t* p, size_t n, fa_tag_sink* sink
     size_t pos = 2;
     uint32_t count, i;
     if (n < 2) return;
-    count = le16(p);
+    count = fa_le16(p);
     for (i = 0; i < count; i++) {
         size_t name_len, value_len, type;
         const uint8_t* name;
         if (n - pos < 2) return;
-        name_len = le16(p + pos);
+        name_len = fa_le16(p + pos);
         pos += 2;
         if (n - pos < name_len + 4) return;
         name = p + pos;
         pos += name_len;
-        type = le16(p + pos);
-        value_len = le16(p + pos + 2);
+        type = fa_le16(p + pos);
+        value_len = fa_le16(p + pos + 2);
         pos += 4;
         if (n - pos < value_len) return;
         tag_item(sink, name, name_len, type, p + pos, value_len);
@@ -207,14 +204,14 @@ static void parse_metadata(const uint8_t* p, size_t n, fa_tag_sink* sink)
     size_t pos = 2;
     uint32_t count, i;
     if (n < 2) return;
-    count = le16(p);
+    count = fa_le16(p);
     for (i = 0; i < count; i++) {
         size_t name_len, type;
         uint32_t value_len;
         if (n - pos < 12) return;
-        name_len = le16(p + pos + 4);
-        type = le16(p + pos + 6);
-        value_len = le32(p + pos + 8);
+        name_len = fa_le16(p + pos + 4);
+        type = fa_le16(p + pos + 6);
+        value_len = fa_le32(p + pos + 8);
         pos += 12;
         if (n - pos < name_len || n - pos - name_len < value_len) return;
         if (type != 6) tag_item(sink, p + pos, name_len, type, p + pos + name_len, value_len);   /* 6 = GUID */
@@ -227,7 +224,7 @@ static int ext_children(const uint8_t* p, size_t n, const uint8_t** first, const
 {
     uint32_t size;
     if (n < 22) return 0;
-    size = le32(p + 18);
+    size = fa_le32(p + 18);
     if (size > n - 22) return 0;
     *first = p + 22;
     *end = p + 22 + size;
@@ -255,7 +252,7 @@ int fa_asf_read_tags(fa_source* src, fa_tag_sink* sink)
     uint8_t* body;
     uint64_t size;
     if (fa_source_seek(src, 0) != FA_OK || fa_source_read(src, h, 30) != 30 || !guid_is(h, g_header)) return 0;
-    size = le64(h + 16);
+    size = fa_le64(h + 16);
     if (size < 30 || size - 30 > ASF_MAX_HEADER) return 1;
     body = (uint8_t*)malloc((size_t)(size - 30) + 1);
     if (!body) return 1;
@@ -333,8 +330,8 @@ static uint32_t read_var(const uint8_t* p, int type)
 {
     switch (type) {
     case 1: return p[0];
-    case 2: return le16(p);
-    case 3: return le32(p);
+    case 2: return fa_le16(p);
+    case 3: return fa_le32(p);
     default: return 0;
     }
 }
@@ -366,7 +363,7 @@ static int parse_packet(asf* a, int64_t* out_send)
     i += var_size(len_type) + var_size(seq_type);
     pad = read_var(p + i, pad_type);
     i += var_size(pad_type);
-    if (out_send) *out_send = le32(p + i);
+    if (out_send) *out_send = fa_le32(p + i);
     i += 6;                                   /* send time, duration */
     /* An explicit length shorter than the packet: the rest is padding too. */
     len = len_type && plen > 0 && plen < n ? plen : n;
@@ -520,8 +517,8 @@ static fa_result read_object(asf* a, asf_ref* out)
             continue;
         }
         {
-            size_t size = rep_len >= 8 ? le32(rep) : len;
-            int64_t pts = rep_len >= 8 ? (int64_t)le32(rep + 4) : FA_DEMUX_NO_PTS;
+            size_t size = rep_len >= 8 ? fa_le32(rep) : len;
+            int64_t pts = rep_len >= 8 ? (int64_t)fa_le32(rep + 4) : FA_DEMUX_NO_PTS;
             const uint8_t* d = p + a->pos;
             a->pos += len;
             a->payload++;
@@ -705,7 +702,7 @@ static const char* codec_name(uint16_t tag, uint32_t bits, const uint8_t* extra,
     case 0x0003: return bits == 64 ? "pcm_f64le" : "pcm_f32le";
     case 0xFFFE:
         /* WAVE_FORMAT_EXTENSIBLE: the subformat GUID starts with the real tag. */
-        if (extra_len >= 22) return codec_name(le16(extra + 6), bits, NULL, 0);
+        if (extra_len >= 22) return codec_name(fa_le16(extra + 6), bits, NULL, 0);
         return NULL;
     case 0x0001:
         return bits == 8 ? "pcm_u8" : bits == 16 ? "pcm_s16le" : bits == 24 ? "pcm_s24le" : bits == 32 ? "pcm_s32le" : NULL;
@@ -720,27 +717,27 @@ static void parse_stream(const uint8_t* p, size_t n, asf_audio* list, int* count
     const uint8_t *ts, *ec;
     asf_audio s;
     if (n < 54 || !guid_is(p, g_audio_media)) return;
-    ts_len = le32(p + 40);
-    ec_len = le32(p + 44);
+    ts_len = fa_le32(p + 40);
+    ec_len = fa_le32(p + 44);
     if (ts_len > n - 54 || ec_len > n - 54 - ts_len) return;
-    number = le16(p + 48) & 0x7F;
+    number = fa_le16(p + 48) & 0x7F;
     for (k = 0; k < (uint32_t)*count; k++)
         if (list[k].number == number) return;
     if (*count >= ASF_MAX_STREAMS || number == 0) return;
     memset(&s, 0, sizeof(s));
     s.number = number;
-    s.encrypted = (le16(p + 48) & 0x8000) != 0;
+    s.encrypted = (fa_le16(p + 48) & 0x8000) != 0;
     ts = p + 54;
     ec = ts + ts_len;
     if (ts_len >= 16) {
-        uint16_t tag = le16(ts);
-        s.channels = le16(ts + 2);
-        s.rate = le32(ts + 4);
-        s.avg_bytes = le32(ts + 8);
-        s.block_align = le16(ts + 12);
-        s.bits = le16(ts + 14);
+        uint16_t tag = fa_le16(ts);
+        s.channels = fa_le16(ts + 2);
+        s.rate = fa_le32(ts + 4);
+        s.avg_bytes = fa_le32(ts + 8);
+        s.block_align = fa_le16(ts + 12);
+        s.bits = fa_le16(ts + 14);
         if (ts_len >= 18) {
-            size_t cb = le16(ts + 16);
+            size_t cb = fa_le16(ts + 16);
             s.extra = ts + 18;
             s.extra_len = cb < ts_len - 18 ? cb : ts_len - 18;
         }
@@ -748,8 +745,8 @@ static void parse_stream(const uint8_t* p, size_t n, asf_audio* list, int* count
     }
     if (guid_is(p + 16, g_audio_spread) && ec_len >= 5) {
         s.span = ec[0];
-        s.vp_len = le16(ec + 1);
-        s.chunk_len = le16(ec + 3);
+        s.vp_len = fa_le16(ec + 1);
+        s.chunk_len = fa_le16(ec + 3);
         if (s.chunk_len == 0 || s.vp_len == 0) s.span = 0;
     }
     list[(*count)++] = s;
@@ -772,13 +769,13 @@ static void parse_header_objects(const uint8_t* cur, const uint8_t* end, asf_hea
     while (next_object(&cur, end, &guid, &body, &len)) {
         if (guid_is(guid, g_file_props) && len >= 80) {
             h->have_props = 1;
-            h->packets = le64(body + 32);
-            h->play_100ns = le64(body + 40);
-            h->send_100ns = le64(body + 48);
-            h->preroll_ms = le64(body + 56);
-            h->flags = le32(body + 64);
-            h->min_packet = le32(body + 68);
-            h->max_packet = le32(body + 72);
+            h->packets = fa_le64(body + 32);
+            h->play_100ns = fa_le64(body + 40);
+            h->send_100ns = fa_le64(body + 48);
+            h->preroll_ms = fa_le64(body + 56);
+            h->flags = fa_le32(body + 64);
+            h->min_packet = fa_le32(body + 68);
+            h->max_packet = fa_le32(body + 72);
         } else if (guid_is(guid, g_stream_props)) {
             h->all_streams++;
             parse_stream(body, len, h->streams, &h->count);
@@ -790,16 +787,16 @@ static void parse_header_objects(const uint8_t* cur, const uint8_t* end, asf_hea
             if (ext_children(body, len, &c2, &e2)) parse_header_objects(c2, e2, h, 1);
         } else if (guid_is(guid, g_ext_stream_props) && len >= 64) {
             /* Names and payload extension systems, then maybe a Stream Properties Object. */
-            size_t pos = 64, k, names = le16(body + 60), exts = le16(body + 62);
+            size_t pos = 64, k, names = fa_le16(body + 60), exts = fa_le16(body + 62);
             const uint8_t *g2, *b2, *c2;
             size_t l2;
             for (k = 0; k < names && pos <= len; k++) {
                 if (len - pos < 4) { pos = len + 1; break; }
-                pos += 4 + (size_t)le16(body + pos + 2);
+                pos += 4 + (size_t)fa_le16(body + pos + 2);
             }
             for (k = 0; k < exts && pos <= len; k++) {
                 if (len - pos < 22) { pos = len + 1; break; }
-                pos += 22 + (size_t)le32(body + pos + 18);
+                pos += 22 + (size_t)fa_le32(body + pos + 18);
             }
             if (pos >= len) continue;
             c2 = body + pos;
@@ -822,13 +819,13 @@ static fa_result read_index(asf* a, int64_t from)
         uint64_t size;
         if (src->length > 0 && from + 24 > src->length) break;
         if (fa_br_seek(&a->br, from) != FA_OK || fa_br_read(&a->br, h, 24) != 24) break;
-        size = le64(h + 16);
+        size = fa_le64(h + 16);
         if (size < 24 || size > (uint64_t)INT64_MAX - (uint64_t)from) break;
         if (guid_is(h, g_simple_index) && size >= 56) {
             uint64_t interval, count, i;
             if (fa_br_read(&a->br, h + 24, 32) != 32) break;
-            interval = le64(h + 40);
-            count = le32(h + 52);
+            interval = fa_le64(h + 40);
+            count = fa_le32(h + 52);
             if (count > (size - 56) / 6) count = (size - 56) / 6;
             if (count > ASF_MAX_INDEX || interval < 10000 || count == 0) break;
             a->index = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
@@ -836,7 +833,7 @@ static fa_result read_index(asf* a, int64_t from)
             for (i = 0; i < count; i++) {
                 uint8_t e[6];
                 if (fa_br_read(&a->br, e, 6) != 6) break;
-                a->index[i] = le32(e);
+                a->index[i] = fa_le32(e);
                 /* Entries never go back; a damaged one would mislead the search. */
                 if (i > 0 && a->index[i] < a->index[i - 1]) a->index[i] = a->index[i - 1];
             }
@@ -932,7 +929,7 @@ static fa_result asf_open(fa_decoder* dec)
 
     /* Header Object: read whole (the Data Object follows it). */
     if (fa_br_read(&a->br, head, 30) != 30 || !guid_is(head, g_header)) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
-    size = le64(head + 16);
+    size = fa_le64(head + 16);
     if (size < 30 || size - 30 > ASF_MAX_HEADER) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
     r = fa_br_read_alloc(&a->br, (size_t)(size - 30), ASF_MAX_HEADER, &body, &body_cap);
     if (r != FA_OK) { r = r == FA_ERROR_OUT_OF_MEMORY ? r : FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
@@ -965,12 +962,12 @@ static fa_result asf_open(fa_decoder* dec)
         goto fail;
     }
     if (fa_br_read(&a->br, head, 50) != 50 || !guid_is(head, g_data)) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
-    data_size = le64(head + 16);
+    data_size = fa_le64(head + 16);
     a->data_start = (int64_t)size + 50;
     a->data_end = -1;
     a->npackets = -1;
     if (data_size >= 50 && data_size < (uint64_t)INT64_MAX / 2) a->data_end = (int64_t)size + (int64_t)data_size;
-    if (le64(head + 40) > 0 && le64(head + 40) < (1ull << 40)) a->npackets = (int64_t)le64(head + 40);
+    if (fa_le64(head + 40) > 0 && fa_le64(head + 40) < (1ull << 40)) a->npackets = (int64_t)fa_le64(head + 40);
     else if (!broadcast && h->packets > 0 && h->packets < (1ull << 40)) a->npackets = (int64_t)h->packets;
     if (a->npackets < 0 && a->data_end > a->data_start)
         a->npackets = (a->data_end - a->data_start) / a->packet_size;
@@ -1058,7 +1055,7 @@ static int asf_probe(const uint8_t* d, size_t n, size_t id3)
 {
     (void)id3;
     if (n < 30 || !guid_is(d, g_header)) return 0;
-    return le64(d + 16) >= 30 ? 100 : 0;
+    return fa_le64(d + 16) >= 30 ? 100 : 0;
 }
 
 const fa_decoder_vtable fa_decoder_asf = {

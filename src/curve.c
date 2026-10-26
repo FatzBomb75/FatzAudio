@@ -4,8 +4,6 @@
 #include <math.h>
 #include <string.h>
 
-#define FA_PI 3.14159265358979323846
-
 /* CSS cubic-bezier: P0 = (0,0), P1 = (x1,y1), P2 = (x2,y2), P3 = (1,1).
  * Solve x(u) = t for u (Newton, then bisection as a fallback), return y(u). */
 static double bez(double a1, double a2, double u)

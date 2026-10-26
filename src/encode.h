@@ -28,7 +28,6 @@ fa_result fa_sink_write_u8(fa_enc_sink* s, uint32_t v);
 fa_result fa_sink_write_le16(fa_enc_sink* s, uint32_t v);
 fa_result fa_sink_write_le32(fa_enc_sink* s, uint32_t v);
 fa_result fa_sink_write_le64(fa_enc_sink* s, uint64_t v);
-fa_result fa_sink_write_be32(fa_enc_sink* s, uint32_t v);
 /* Only when s->seekable. Flushes first. */
 fa_result fa_sink_seek(fa_enc_sink* s, int64_t pos);
 fa_result fa_sink_flush(fa_enc_sink* s);

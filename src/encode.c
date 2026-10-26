@@ -149,12 +149,6 @@ fa_result fa_sink_write_le64(fa_enc_sink* s, uint64_t v)
     return r != FA_OK ? r : fa_sink_write_le32(s, (uint32_t)(v >> 32));
 }
 
-fa_result fa_sink_write_be32(fa_enc_sink* s, uint32_t v)
-{
-    uint8_t b[4] = { (uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v };
-    return fa_sink_write(s, b, 4);
-}
-
 fa_result fa_sink_seek(fa_enc_sink* s, int64_t pos)
 {
     fa_result r;
@@ -214,12 +208,9 @@ FA_API void FA_CALL fa_encoder_options_init(fa_encoder_options* o)
 static char* dup_str(const char* s, int* oom)
 {
     char* d;
-    size_t n;
     if (!s || !s[0]) return NULL;
-    n = strlen(s);
-    d = (char*)malloc(n + 1);
-    if (!d) { *oom = 1; return NULL; }
-    memcpy(d, s, n + 1);
+    d = fa_strdup(s);
+    if (!d) *oom = 1;
     return d;
 }
 

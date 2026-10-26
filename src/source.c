@@ -276,6 +276,38 @@ fa_result fa_source_read_all(fa_source* src, size_t max_size, uint8_t** out_data
     return FA_OK;
 }
 
+fa_result fa_source_read_rest(fa_source* src, size_t max_size, uint8_t** out_data, size_t* out_size)
+{
+    /* One byte of slack: the read that finds the end needs no extra room, and a
+     * source of exactly max_size bytes fits. */
+    size_t cap, n = 0;
+    uint8_t* buf;
+    *out_data = NULL;
+    *out_size = 0;
+    if (src->length > (int64_t)max_size) return FA_ERROR_UNSUPPORTED_FORMAT;
+    cap = (src->length > 0 ? (size_t)src->length : 65536) + 1;
+    buf = (uint8_t*)malloc(cap);
+    if (!buf) return FA_ERROR_OUT_OF_MEMORY;
+    for (;;) {
+        int64_t got;
+        if (n == cap) {
+            uint8_t* grown;
+            if (cap > max_size) { free(buf); return FA_ERROR_UNSUPPORTED_FORMAT; }
+            cap = cap * 2 > max_size + 1 ? max_size + 1 : cap * 2;
+            grown = (uint8_t*)realloc(buf, cap);
+            if (!grown) { free(buf); return FA_ERROR_OUT_OF_MEMORY; }
+            buf = grown;
+        }
+        got = fa_source_read(src, buf + n, cap - n);
+        if (got < 0) { free(buf); return (fa_result)got; }
+        if (got == 0) break;
+        n += (size_t)got;
+    }
+    *out_data = buf;
+    *out_size = n;
+    return FA_OK;
+}
+
 fa_result fa_source_set_window(fa_source* src, int64_t base, int64_t size)
 {
     int64_t whole = src->windowed ? src->whole_length : src->length;

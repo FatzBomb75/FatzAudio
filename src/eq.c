@@ -18,8 +18,6 @@
 #define EQ_MIN_HZ 10.0f
 #define EQ_MAX_DB 24.0f
 
-static const double k_pi = 3.14159265358979323846;
-
 /* ---- shared (API side) ------------------------------------------------------ */
 
 /* Writers hold the stream's api_lock; seq tells the audio thread a write is under way. */
@@ -210,7 +208,7 @@ static void design(fa_eq_bandstate* b, uint32_t rate)
 {
     double f = b->f, w0, cw, sw, alpha, A, sq, b0, b1, b2, a0, a1, a2;
     if (f > 0.49 * rate) f = 0.49 * rate;
-    w0 = 2.0 * k_pi * f / (double)rate;
+    w0 = 2.0 * FA_PI * f / (double)rate;
     cw = cos(w0);
     sw = sin(w0);
     alpha = sw / (2.0 * (double)b->q);

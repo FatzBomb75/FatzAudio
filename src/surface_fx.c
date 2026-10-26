@@ -17,6 +17,7 @@
  * and the bevel there is at most half of that, so the middle of a thin stroke keeps
  * its colour (a one-pixel stroke gets none). */
 #include "surface_fx.h"
+#include "fa_util.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -54,7 +55,7 @@ static void color_pm(uint32_t c, float opacity, int rgba, float out[4])
 int fa_fx_plan_make(fa_fx_plan* p, const fa_surface_effects* e, float outline, float shadow_size,
                     float shadow_distance, float bevel, int rgba)
 {
-    const double rad = 3.14159265358979323846 / 180.0;
+    const double rad = FA_PI / 180.0;
     float w = e->outline.size * outline, reach = 0.0f;
     memset(p, 0, sizeof(*p));
     p->outline = e->outline.on;

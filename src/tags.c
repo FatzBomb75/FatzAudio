@@ -53,9 +53,6 @@ void fa_tags_handle(const char* key, const char* value, fa_tag_loudness* out)
     else if (ieq(key, "REPLAYGAIN_ALBUM_PEAK") && v > 0.0) out->album_peak_db = 20.0 * log10(v);
 }
 
-static uint32_t le32(const uint8_t* p) { return ((uint32_t)p[3] << 24) | ((uint32_t)p[2] << 16) | ((uint32_t)p[1] << 8) | p[0]; }
-static uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
-
 const char* fa_tags_image_mime(const uint8_t* d, size_t n)
 {
     if (n >= 3 && d[0] == 0xFF && d[1] == 0xD8 && d[2] == 0xFF) return "image/jpeg";
@@ -75,14 +72,14 @@ void fa_tags_parse_flac_picture(const uint8_t* p, size_t n, int format, fa_tag_s
     char mime[64];
     char* desc;
     if (!sink->picture || n < 32) return;
-    type = be32(p);
-    ml = be32(p + 4);
+    type = fa_be32(p);
+    ml = fa_be32(p + 4);
     pos = 8;
     if (ml > n - pos) return;
     snprintf(mime, sizeof(mime), "%.*s", (int)(ml < 63 ? ml : 63), (const char*)(p + pos));
     pos += ml;
     if (n - pos < 4) return;
-    dl = be32(p + pos);
+    dl = fa_be32(p + pos);
     pos += 4;
     if (dl > n - pos) return;
     desc = (char*)malloc(dl + 1);
@@ -92,7 +89,7 @@ void fa_tags_parse_flac_picture(const uint8_t* p, size_t n, int format, fa_tag_s
     pos += dl;
     if (n - pos < 20) { free(desc); return; }
     pos += 16;                            /* width, height, depth, colours */
-    size = be32(p + pos);
+    size = fa_be32(p + pos);
     pos += 4;
     if (size <= n - pos && type <= 20) sink->picture(sink, format, (int)type, mime, desc, p + pos, size);
     free(desc);
@@ -132,12 +129,12 @@ void fa_tags_parse_vorbis_comments(const uint8_t* p, size_t n, fa_tag_sink* sink
     size_t pos = 0;
     uint32_t count, i;
     if (n < 8) return;
-    pos = 4 + (size_t)le32(p);            /* vendor string */
+    pos = 4 + (size_t)fa_le32(p);            /* vendor string */
     if (pos + 4 > n || pos < 4) return;
-    count = le32(p + pos);
+    count = fa_le32(p + pos);
     pos += 4;
     for (i = 0; i < count && pos + 4 <= n; i++) {
-        uint32_t len = le32(p + pos);
+        uint32_t len = fa_le32(p + pos);
         const uint8_t* item;
         size_t k;
         pos += 4;
@@ -379,23 +376,14 @@ static const field_map field_maps[] = {
     { FA_TAG_FORMAT_TRACKER, "COMMENT", FA_TAG_COMMENT }
 };
 
-static char* dup_n(const char* s, size_t n)
-{
-    char* d = (char*)malloc(n + 1);
-    if (d) { memcpy(d, s, n); d[n] = '\0'; }
-    return d;
-}
-
-static char* dup_str(const char* s) { return dup_n(s, strlen(s)); }
-
 /* The first format to give a field owns it; more values of the same key from that
  * format (repeated Vorbis comments) are joined with "; ". */
 static void set_field(fa_tags* t, int field, int format, const char* key, const char* value)
 {
     if (!value[0]) return;
     if (!t->fields[field]) {
-        t->fields[field] = dup_str(value);
-        t->field_key[field] = dup_str(key);
+        t->fields[field] = fa_strdup(value);
+        t->field_key[field] = fa_strdup(key);
         t->field_format[field] = format;
     } else if (t->field_format[field] == format && t->field_key[field] && ieq(t->field_key[field], key) &&
                strcmp(t->fields[field], value) != 0) {
@@ -421,7 +409,7 @@ static void map_item(fa_tags* t, int format, const char* key, const char* value)
             /* "3/12": number and total. */
             const char* slash = strchr(value, '/');
             if (slash) {
-                char* no = dup_n(value, (size_t)(slash - value));
+                char* no = fa_strndup(value, (size_t)(slash - value));
                 if (no) { set_field(t, field, format, key, no); free(no); }
                 set_field(t, field + 1, format, key, slash + 1);
             } else {
@@ -456,8 +444,8 @@ static void collect_text(fa_tag_sink* sink, int format, const char* key, const c
         t->cap_items = cap;
     }
     it = &t->items[t->nitems];
-    it->key = dup_str(key);
-    it->value = dup_str(value);
+    it->key = fa_strdup(key);
+    it->value = fa_strdup(value);
     it->format = format;
     if (!it->key || !it->value) { free(it->key); free(it->value); return; }
     t->nitems++;
@@ -483,8 +471,8 @@ static void collect_picture(fa_tag_sink* sink, int format, int type, const char*
     if (strcmp(mime, "-->") == 0) return;
     p->type = type >= 0 && type <= 20 ? type : FA_PICTURE_OTHER;
     p->format = format;
-    p->mime = dup_str(mime);
-    p->description = dup_str(description ? description : "");
+    p->mime = fa_strdup(mime);
+    p->description = fa_strdup(description ? description : "");
     p->data = (uint8_t*)malloc(size);
     p->size = size;
     if (!p->mime || !p->description || !p->data) { free(p->mime); free(p->description); free(p->data); return; }

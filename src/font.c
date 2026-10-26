@@ -1054,7 +1054,6 @@ static void read_info(fa_font* f)
         }
         if (in->line_gap < 0 || in->line_gap > 2 * u) in->line_gap = 0;
     }
-    in->monospace = u32(f->post, 12) != 0;
     read_name(f->name, 1, in->legacy_family, sizeof(in->legacy_family));
     if (!read_name(f->name, 16, in->family, sizeof(in->family))) memcpy(in->family, in->legacy_family, sizeof(in->family));
     if (!read_name(f->name, 17, in->style, sizeof(in->style))) read_name(f->name, 2, in->style, sizeof(in->style));

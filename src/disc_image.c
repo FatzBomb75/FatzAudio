@@ -122,14 +122,6 @@ static int64_t parse_msf(const char* s)
     return ((int64_t)mm * 60 + ss) * 75 + ff;
 }
 
-static char* dup_str(const char* s)
-{
-    size_t n = strlen(s) + 1;
-    char* d = (char*)malloc(n);
-    if (d) memcpy(d, s, n);
-    return d;
-}
-
 /* WAVE files: the data chunk must be 44.1 kHz 16-bit stereo PCM. */
 static fa_result open_wave(img_file* f)
 {
@@ -357,7 +349,7 @@ static fa_result parse_cue(image* m, const char* cue_path, char* text)
             next_token(p, arg, sizeof(arg));
             slot = cur ? &cur->text[field] : &m->album[field];
             free(*slot);
-            *slot = dup_str(arg);
+            *slot = fa_strdup(arg);
         } else if (word_is(word, "REM")) {
             p = next_token(p, arg2, sizeof(arg2));
             if (word_is(arg2, "SESSION")) {
@@ -366,7 +358,7 @@ static fa_result parse_cue(image* m, const char* cue_path, char* text)
             } else if (word_is(arg2, "GENRE") && !cur) {
                 next_token(p, arg, sizeof(arg));
                 free(m->album[6]);
-                m->album[6] = dup_str(arg);
+                m->album[6] = fa_strdup(arg);
             }
         }
         *end = saved;

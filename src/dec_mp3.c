@@ -48,7 +48,6 @@ typedef struct mp3_dec {
     uint8_t key[3];
     int spf;                     /* samples per frame */
     uint32_t channels;
-    int64_t first_off;           /* first audio frame (after ID3v2 and the Xing frame) */
     int64_t skip;                /* decoded samples before the audio (delays) */
     int64_t end;                 /* decoded samples up to the end of the audio, -1 = to the last frame */
     /* Frame offsets: frames 0..known-1 have been visited in order from the start,
@@ -319,7 +318,7 @@ static int xing(const uint8_t* p, const mp3_hdr* h, int64_t* frames, int* delay,
     uint32_t flags;
     if (t + 8 > end) return 0;
     if (memcmp(t, "Xing", 4) != 0 && memcmp(t, "Info", 4) != 0) return 0;
-    flags = ((uint32_t)t[4] << 24) | ((uint32_t)t[5] << 16) | ((uint32_t)t[6] << 8) | t[7];
+    flags = fa_be32(t + 4);
     t += 8;
     if (flags & 1) {
         if (t + 4 > end) return 1;
@@ -383,7 +382,6 @@ static fa_result mp3_open(fa_decoder* dec)
     m->channels = (uint32_t)h.channels;
     p = window(m, off, (size_t)h.size, &avail);
     if (avail >= (size_t)h.size && xing(p, &h, &xframes, &delay, &padding)) off += h.size;
-    m->first_off = off;
     m->known_off = off;
     m->next_off = off;
 

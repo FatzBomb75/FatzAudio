@@ -143,7 +143,6 @@ struct fa_net {
     int restart;             /* the reader moved outside the window */
     int64_t restart_pos;
     int64_t skip;            /* bytes of the current response to drop (Range ignored) */
-    int requested_range;     /* the current request asked for a range */
     int connections;         /* responses received */
     int failed_since;        /* a connection failed since the last good one */
     int starving;
@@ -173,7 +172,6 @@ struct fa_net {
     int hls_seek;            /* a seek to hls_seek_to seconds is pending */
     double hls_seek_to;
     double hls_seek_done;    /* where the restarted data begins, seconds */
-    int hls_generation;      /* +1 for every seek: the window starts over at 0 */
     double hls_duration;     /* total seconds of a VOD playlist, -1 = live */
 };
 
@@ -210,8 +208,6 @@ int fa_net_is_hls(const fa_net* n);
 int fa_net_can_decode(fa_net* n, int* out_starving);
 /* The decoder produced `frames` more source frames: refines the byte rate. */
 void fa_net_note_decoded(fa_net* n, int64_t frames);
-/* 1 once the download is over (complete, or given up after reconnecting). */
-int fa_net_finished(fa_net* n);
 
 /* ICY metadata: a title change heard at source frame `frame`. */
 typedef struct fa_net_meta {
@@ -246,9 +242,6 @@ fa_result fa_net_get_station(fa_net* n, fa_metadata* out);  /* icy-name etc.; ti
 double fa_net_bytes_per_frame(fa_net* n);
 
 /* ---- HLS (net_hls.c) -------------------------------------------------------- */
-
-/* 1 if the response looks like an HLS playlist (content type or "#EXTM3U"). */
-int fa_hls_detect(const char* content_type, const uint8_t* head, size_t n, const char* url);
 
 typedef struct fa_hls fa_hls;
 /* Parses playlists: helpers exposed for tests. */

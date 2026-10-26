@@ -374,11 +374,6 @@ static void alac_close(fa_codec* c)
 
 static const fa_codec_vtable alac_vtable = { "alac", alac_decode, alac_flush, alac_close };
 
-static uint32_t be32(const uint8_t* p)
-{
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
-}
-
 /* The 24-byte ALACSpecificConfig in the containers' extradata: the bare config,
  * the 'alac' box (MP4, and Matroska's A_ALAC as this library passes it), or a
  * Core Audio cookie with a 'frma' box in front. */
@@ -392,10 +387,10 @@ int fa_alac_parse_config(const uint8_t* p, size_t n, fa_alac_info* out)
     else if (n >= 48 && memcmp(p + 4, "frma", 4) == 0 && memcmp(p + 16, "alac", 4) == 0) c = p + 24;
     if (!c) return 0;
     out->config = c;
-    out->frame_length = be32(c);
+    out->frame_length = fa_be32(c);
     out->bit_depth = c[5];
     out->channels = c[9];
-    out->rate = be32(c + 20);
+    out->rate = fa_be32(c + 20);
     if (c[4] != 0 || out->frame_length == 0 || out->frame_length > ALAC_MAX_FRAME || out->channels == 0 ||
         out->channels > 8 || out->rate == 0 || out->rate > 768000 ||
         (out->bit_depth != 16 && out->bit_depth != 20 && out->bit_depth != 24 && out->bit_depth != 32))

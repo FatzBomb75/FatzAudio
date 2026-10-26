@@ -29,10 +29,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 #define AC3_BLOCK 256
 #define AC3_MAX_BLOCKS 6
 #define AC3_MAX_FBW 5
@@ -174,7 +170,7 @@ static void ac3_init_tables(void)
     /* KBD window: cumulative Kaiser kernel of length N/2 + 1. */
     for (i = 0; i <= AC3_BLOCK; i++) {
         double r = 2.0 * i / AC3_BLOCK - 1.0;
-        w[i] = bessel_i0(M_PI * 5.0 * sqrt(1.0 - r * r));
+        w[i] = bessel_i0(FA_PI * 5.0 * sqrt(1.0 - r * r));
         total += w[i];
     }
     for (i = 0; i < AC3_BLOCK; i++) {
@@ -219,7 +215,7 @@ static void ac3_init_tables(void)
      * (checked on test streams). */
     for (i = 0; i < 6; i++)
         for (k = 0; k < 6; k++)
-            aht_idct[i][k] = (float)((k == 0 ? 1.0 : sqrt(2.0)) * cos(M_PI * (2 * i + 1) * k / 12.0));
+            aht_idct[i][k] = (float)((k == 0 ? 1.0 : sqrt(2.0)) * cos(FA_PI * (2 * i + 1) * k / 12.0));
     {
         static const uint8_t mant[4] = { 0x1b, 0x17, 0x13, 0x10 };
         ecplamptab[0] = 1.0f;
@@ -383,7 +379,7 @@ typedef struct frame {
     int blksw[AC3_MAX_FBW], dithflag[AC3_MAX_FBW];
     float dynrng[2];
     int cplinu, chincpl[AC3_MAX_FBW], phsflginu;
-    int cplbegf, cplendf, ncplbnd;
+    int cplbegf, ncplbnd;
     uint8_t cplbndstrc[18];
     int cplbndsz[18];
     float cplco[AC3_MAX_FBW][18];
@@ -616,16 +612,6 @@ done:
     f->ba_ok[ch] = 1;
     return 0;
 }
-
-#ifdef FA_AC3_STATS
-/* Test builds: which coding tools the decoded streams used. */
-long fa_ac3_stats[20];
-#define STAT(i) (fa_ac3_stats[i]++)
-#else
-#define STAT(i) ((void)0)
-#endif
-enum { ST_BLOCKS, ST_CPL, ST_SHORT, ST_REMAT, ST_DBA, ST_SPX, ST_SPXATTEN, ST_PHSFLG, ST_DEP, ST_DYNRNG,
-       ST_EXPREUSE, ST_D25, ST_D45, ST_SNRBLK, ST_FGAIN, ST_FRMEXP, ST_AHT, ST_ECPL };
 
 /* ---- syntax helpers ------------------------------------------------------------- */
 
@@ -1402,14 +1388,12 @@ static int parse_block(fa_ac3* d, bits* b, int blk)
                 for (ch = 0; ch < nfch; ch++) f->snroffset[ch] = ((csnr - 15) * 16 + (int)gb(b, 4)) * 4;
                 if (h->lfeon) f->snroffset[AC3_LFE] = ((csnr - 15) * 16 + (int)gb(b, 4)) * 4;
             }
-            STAT(ST_SNRBLK);
         }
         /* Fast gains: sent, or the default in every block that has none. */
         if (f->frmfgaincode && gb1(b)) {
             if (cplinu) f->fgain[AC3_CPL] = fastgain[gb(b, 3)];
             for (ch = 0; ch < nfch; ch++) f->fgain[ch] = fastgain[gb(b, 3)];
             if (h->lfeon) f->fgain[AC3_LFE] = fastgain[gb(b, 3)];
-            STAT(ST_FGAIN);
         } else {
             for (ch = 0; ch < AC3_NCH; ch++) if (ch != AC3_CPL || cplinu) f->fgain[ch] = fastgain[4];
         }
@@ -1448,23 +1432,6 @@ static int parse_block(fa_ac3* d, bits* b, int blk)
     /* Skip field. */
     if ((!eac3 || f->skipflde) && gb1(b)) skipb(b, (size_t)gb(b, 9) * 8);
     if (b->overrun) return -1;
-
-    STAT(ST_BLOCKS);
-    if (cplinu) STAT(ST_CPL);
-    for (ch = 0; ch < nfch; ch++) {
-        if (f->blksw[ch]) STAT(ST_SHORT);
-        if (f->expstr[blk][ch] == 0) STAT(ST_EXPREUSE);
-        if (f->expstr[blk][ch] == 2) STAT(ST_D25);
-        if (f->expstr[blk][ch] == 3) STAT(ST_D45);
-    }
-    for (bnd = 0; bnd < f->nrematbd; bnd++) if (f->rematflg[bnd]) { STAT(ST_REMAT); break; }
-    for (ch = 0; ch < AC3_NCH; ch++) if (f->deltbae[ch] <= 1 && f->deltnseg[ch]) { STAT(ST_DBA); break; }
-    if (f->spxinu) STAT(ST_SPX);
-    if (f->spxinu) for (ch = 0; ch < nfch; ch++) if (f->chinspx[ch] && f->spxattencod[ch] >= 0) { STAT(ST_SPXATTEN); break; }
-    if (cplinu && f->phsflginu) STAT(ST_PHSFLG);
-    if (cplinu && f->ecplinu) STAT(ST_ECPL);
-    if (blk == 0) for (ch = 0; ch < AC3_NCH; ch++) if (f->ahtinu[ch]) { STAT(ST_AHT); break; }
-    if (f->dynrng[0] != 1.0f) STAT(ST_DYNRNG);
 
     /* Bit allocation (skipped for a channel whose inputs did not change).
      * AHT channels' (hebap) only in block 0, where all their mantissas are. */
@@ -1894,7 +1861,6 @@ fa_result fa_ac3_decode(fa_ac3* d, const uint8_t* data, size_t size, int drc,
             at = blocks - h.blocks;
             if (at < 0) { pos += h.frame_size; continue; }
             state = 1 + h.substreamid;
-            STAT(ST_DEP);
         }
         memset(wrote, 0, sizeof(wrote));
         if (!d->sub[state]) {

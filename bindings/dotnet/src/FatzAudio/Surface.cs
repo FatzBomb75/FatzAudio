@@ -337,7 +337,7 @@ internal static unsafe class SurfaceInterop
 
     public static SurfaceLayout FromNative(FaSurfaceLayout* l)
     {
-        string font = Marshal.PtrToStringUTF8((nint)l->FontUsed) ?? "";
+        string font = NativeText.Read(l->FontUsed);
         return new SurfaceLayout((int)l->Width, (int)l->Height, l->BitmapX, l->BitmapY,
             new PixelRect((int)l->ContentX, (int)l->ContentY, (int)l->ContentWidth, (int)l->ContentHeight), l->Scale,
             new PixelRect((int)l->CropX, (int)l->CropY, (int)l->CropWidth, (int)l->CropHeight), (SafetyZone)l->SafetyZone,

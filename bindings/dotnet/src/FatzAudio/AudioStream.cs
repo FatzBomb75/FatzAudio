@@ -85,7 +85,7 @@ public unsafe class AudioStream : IDisposable
     private int _channels;
     private OutputDevice? _device;
 
-    internal AudioStream(AudioEngine engine, StreamHandle handle, GCHandle? ioHandle, IoState? io, AudioFormat? knownFormat = null)
+    internal AudioStream(AudioEngine engine, StreamHandle handle, GCHandle? ioHandle, AudioFormat? knownFormat = null)
     {
         Engine = engine;
         _handle = handle;
@@ -112,12 +112,12 @@ public unsafe class AudioStream : IDisposable
         }
     }
 
-    internal static AudioStream Wrap(AudioEngine engine, int result, nint native, GCHandle? io, IoState? state = null)
+    internal static AudioStream Wrap(AudioEngine engine, int result, nint native, GCHandle? io)
     {
         FatzAudioException.ThrowIfFailed(result);
         var h = new StreamHandle();
         h.Initialize(native, engine.Handle);
-        return new AudioStream(engine, h, io, state);
+        return new AudioStream(engine, h, io);
     }
 
     /// <summary>The engine this stream belongs to.</summary>
@@ -213,8 +213,8 @@ public unsafe class AudioStream : IDisposable
             FaMetadata m;
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_metadata(Handle, &m));
             return new StreamMetadata(
-                Str(m.StreamTitle), Str(m.Artist), Str(m.Title), Str(m.Url), Str(m.Station), Str(m.Genre),
-                Str(m.Description), Str(m.StationUrl), Str(m.ContentType), (int)m.BitrateKbps, m.Seq);
+                NativeText.Read(m.StreamTitle), NativeText.Read(m.Artist), NativeText.Read(m.Title), NativeText.Read(m.Url), NativeText.Read(m.Station), NativeText.Read(m.Genre),
+                NativeText.Read(m.Description), NativeText.Read(m.StationUrl), NativeText.Read(m.ContentType), (int)m.BitrateKbps, m.Seq);
         }
     }
 
@@ -231,7 +231,7 @@ public unsafe class AudioStream : IDisposable
             return new NetworkStatus(
                 n.Connected != 0, n.HttpStatus, n.IsLive != 0, n.IsHls != 0, n.Seekable != 0, n.Finished != 0,
                 n.ContentLength, n.Downloaded, n.BufferedBytes, TimeConvert.FromNanoseconds(n.Buffered),
-                (int)n.Reconnects, (ErrorCode)n.LastError, Str(n.Url));
+                (int)n.Reconnects, (ErrorCode)n.LastError, NativeText.Read(n.Url));
         }
     }
 
@@ -248,8 +248,6 @@ public unsafe class AudioStream : IDisposable
         FatzAudioException.ThrowIfFailed(rc);
         return Marshal.PtrToStringUTF8((nint)buf);
     }
-
-    private static unsafe string Str(byte* p) => Marshal.PtrToStringUTF8((nint)p) ?? "";
 
     internal TimeSpan FramesToTime(long frames) => TimeConvert.FromFrames(frames, _sampleRate);
     internal long TimeToFrames(TimeSpan time) => TimeConvert.ToFrames(time, _sampleRate);
@@ -654,7 +652,7 @@ public unsafe class AudioStream : IDisposable
             int rc = NativeMethods.fa_stream_get_tracker_info(Handle, &n);
             if (rc == (int)ErrorCode.InvalidArgument) return null;
             FatzAudioException.ThrowIfFailed(rc);
-            return new TrackerInfo(Str(n.Type), Str(n.TypeName), Str(n.Tracker), Str(n.Title), Str(n.Artist),
+            return new TrackerInfo(NativeText.Read(n.Type), NativeText.Read(n.TypeName), NativeText.Read(n.Tracker), NativeText.Read(n.Title), NativeText.Read(n.Artist),
                 TrackerText(0, 0), (int)n.Channels, (int)n.Orders, (int)n.Patterns, n.RestartOrder, n.RestartRow,
                 TimeSpan.FromSeconds(n.Duration), TrackerTexts(1, n.Instruments), TrackerTexts(2, n.Samples),
                 TrackerTexts(3, n.Channels), TrackerTexts(4, n.Patterns), TrackerTexts(5, n.Subsongs)) { Subsong = n.Subsong };
@@ -837,7 +835,7 @@ public unsafe class AudioStream : IDisposable
             int rc = NativeMethods.fa_stream_get_midi_info(Handle, &n);
             if (rc == (int)ErrorCode.InvalidArgument) return null;
             FatzAudioException.ThrowIfFailed(rc);
-            return new MidiInfo(Str(n.Title), Str(n.Artist), Str(n.Copyright), n.Format, (int)n.Tracks,
+            return new MidiInfo(NativeText.Read(n.Title), NativeText.Read(n.Artist), NativeText.Read(n.Copyright), n.Format, (int)n.Tracks,
                 (int)n.TextCount, (int)n.LyricCount, n.Karaoke != 0);
         }
     }
@@ -856,9 +854,9 @@ public unsafe class AudioStream : IDisposable
             int rc = NativeMethods.fa_stream_get_midi_credits(Handle, &n);
             if (rc == (int)ErrorCode.InvalidArgument) return null;
             FatzAudioException.ThrowIfFailed(rc);
-            string other = Str(n.Other);
-            return new MidiCredits((TextCodePage)n.CodePage, Str(n.Title), Str(n.Artist), Str(n.Writer), Str(n.Lyricist),
-                Str(n.Year), Str(n.Copyright), Str(n.Key), Str(n.Tempo), Str(n.TimeSignature),
+            string other = NativeText.Read(n.Other);
+            return new MidiCredits((TextCodePage)n.CodePage, NativeText.Read(n.Title), NativeText.Read(n.Artist), NativeText.Read(n.Writer), NativeText.Read(n.Lyricist),
+                NativeText.Read(n.Year), NativeText.Read(n.Copyright), NativeText.Read(n.Key), NativeText.Read(n.Tempo), NativeText.Read(n.TimeSignature),
                 other.Length == 0 ? [] : other.Split('\n'));
         }
     }
@@ -914,7 +912,7 @@ public unsafe class AudioStream : IDisposable
             foreach (var m in native)
             {
                 var t = m;
-                list.Add(new MidiMark((MidiMarkType)t.Type, t.Value, t.Value2, Str(t.Text), TimeConvert.FromNanoseconds(t.Time), t.Frame, t.Track));
+                list.Add(new MidiMark((MidiMarkType)t.Type, t.Value, t.Value2, NativeText.Read(t.Text), TimeConvert.FromNanoseconds(t.Time), t.Frame, t.Track));
             }
             return list;
         }
@@ -924,7 +922,7 @@ public unsafe class AudioStream : IDisposable
     {
         FaMidiText t;
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_midi_text(Handle, (uint)index, &t));
-        return new MidiText(index, (MidiTextType)t.Type, Str(t.Text), (MidiTextFlags)t.Flags,
+        return new MidiText(index, (MidiTextType)t.Type, NativeText.Read(t.Text), (MidiTextFlags)t.Flags,
             TimeConvert.FromNanoseconds(t.Time), t.Frame, t.Track);
     }
 

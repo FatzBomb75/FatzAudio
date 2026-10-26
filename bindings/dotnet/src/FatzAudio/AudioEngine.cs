@@ -120,8 +120,8 @@ public sealed class AudioEngine : IDisposable
             {
                 FatzAudioException.ThrowIfFailed(NativeMethods.fa_format_get_info(i, out FaFormatInfo f));
                 list.Add(new AudioFormatInfo(
-                    Marshal.PtrToStringUTF8((nint)f.Name) ?? "",
-                    Marshal.PtrToStringUTF8((nint)f.Description) ?? "",
+                    NativeText.Read(f.Name),
+                    NativeText.Read(f.Description),
                     Split(Marshal.PtrToStringUTF8((nint)f.Extensions)),
                     Split(Marshal.PtrToStringUTF8((nint)f.MimeTypes))));
             }
@@ -150,8 +150,8 @@ public sealed class AudioEngine : IDisposable
         {
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_device_get_info(h, (int)kind, i, out FaDeviceInfo info));
             list.Add(new AudioDeviceInfo(
-                Marshal.PtrToStringUTF8((nint)info.Id) ?? "",
-                Marshal.PtrToStringUTF8((nint)info.Name) ?? "",
+                NativeText.Read(info.Id),
+                NativeText.Read(info.Name),
                 (DeviceKind)info.Type,
                 info.IsDefault != 0,
                 (int)info.NativeSampleRate,
@@ -338,7 +338,7 @@ public sealed class AudioEngine : IDisposable
             gc.Free();
             throw new FatzAudioException((ErrorCode)rc);
         }
-        return AudioStream.Wrap(this, rc, s, gc, state);
+        return AudioStream.Wrap(this, rc, s, gc);
     }
 
     /// <summary>
@@ -676,7 +676,7 @@ internal unsafe ref struct NativeOptions
         return o;
     }
 
-    private static byte* Utf8(string? s) => s is null ? null : (byte*)Marshal.StringToCoTaskMemUTF8(s);
+    private static byte* Utf8(string? s) => (byte*)NativeText.Alloc(s);
 
     private static uint Millis(TimeSpan? t) =>
         t is { } v ? (uint)Math.Clamp(Math.Ceiling(v.TotalMilliseconds), 1, uint.MaxValue) : 0;

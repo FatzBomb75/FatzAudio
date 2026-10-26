@@ -359,7 +359,7 @@ static void run_merge(fa_scan_job* j)
         at += j->chunks[k].nsubs;
     }
     set_result(j, fa_loudness_integrated(all, total), fa_loudness_range(all, total),
-               peak > 0.0f ? 20.0 * log10((double)peak) : -HUGE_VAL, FA_LOUDNESS_SCAN);
+               fa_lin_to_db(peak), FA_LOUDNESS_SCAN);
     free(all);
     if (j->have_key) cache_write(j, &j->result);
 }
@@ -488,14 +488,6 @@ static void job_free(fa_scan_job* j)
     free(j);
 }
 
-static char* dup_string(const char* s)
-{
-    size_t n = strlen(s) + 1;
-    char* d = (char*)malloc(n);
-    if (d) memcpy(d, s, n);
-    return d;
-}
-
 fa_scan_job* fa_scan_start_stream(struct fa_stream* s, int use_tags)
 {
     fa_scan_job* j;
@@ -507,7 +499,7 @@ fa_scan_job* fa_scan_start_stream(struct fa_stream* s, int use_tags)
     j->audio_track = s->audio_track;
     j->env.soundfont = fa_soundfont_retain(s->soundfont);
     if (s->path) {
-        j->path = dup_string(s->path);
+        j->path = fa_strdup(s->path);
         if (!j->path) { job_free(j); return NULL; }
         j->path_offset = s->path_offset;
         j->path_length = s->path_length;
@@ -563,7 +555,7 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
     if (!engine || !path || !out_loudness) return FA_ERROR_INVALID_ARG;
     j = job_new(engine);
     if (!j) return FA_ERROR_OUT_OF_MEMORY;
-    j->path = dup_string(path);
+    j->path = fa_strdup(path);
     if (!j->path) { job_free(j); return FA_ERROR_OUT_OF_MEMORY; }
     j->name_hint = j->path;
     j->env.soundfont = fa_engine_soundfont(engine);

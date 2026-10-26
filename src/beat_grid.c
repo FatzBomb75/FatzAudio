@@ -47,17 +47,6 @@ void fa_grid_data_finish(fa_grid_data* g, fa_frames length)
     else g->grid.flags &= ~(uint32_t)FA_GRID_CONSTANT;
 }
 
-fa_result fa_grid_data_copy(fa_grid_data* dst, const fa_grid_data* src)
-{
-    size_t bytes = (size_t)src->grid.segment_count * sizeof(fa_tempo_segment);
-    memset(dst, 0, sizeof(*dst));
-    dst->segs = (fa_tempo_segment*)malloc(bytes ? bytes : 1);
-    if (!dst->segs) return FA_ERROR_OUT_OF_MEMORY;
-    if (bytes) memcpy(dst->segs, src->segs, bytes);
-    dst->grid = src->grid;
-    return FA_OK;
-}
-
 fa_result fa_grid_data_get(const fa_grid_data* g, fa_beat_grid* out_grid, fa_tempo_segment* out_segments,
                            uint32_t capacity, uint32_t* out_count)
 {

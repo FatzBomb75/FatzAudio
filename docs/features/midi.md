@@ -118,7 +118,7 @@ MIDI files don't say which character set their text uses. FatzAudio picks one pe
 fa_open_options o = { sizeof(o) };
 o.text_code_page = FA_CODE_PAGE_SHIFT_JIS;     /* this one is Japanese */
 fa_stream* song = NULL;
-fa_stream_open_file(engine, "enka.kar", &o, &song);
+fa_stream_open_path(engine, "enka.kar", &o, &song);
 ```
 
 ```csharp

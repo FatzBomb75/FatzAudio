@@ -12,7 +12,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define FOURCC(a, b, c, d) (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
 #define MP4_MAX_BOX (1u << 30)        /* moov / moof read into memory */
 #define MP4_MAX_PACKET (64u << 20)
 #define MP4_PCM_FRAMES 4096
@@ -35,7 +34,7 @@ typedef struct mp4 {
     int64_t limit;                /* bound for counts read from the file */
     uint32_t track_id, timescale, movie_timescale;
     uint32_t frame_bytes;         /* PCM: bytes per frame (packets are grouped) */
-    int fragmented, lazy;
+    int lazy;
     int64_t next_box;             /* fragments: the next top-level box to look at */
     uint32_t trex_duration, trex_size;
     uint8_t* data;
@@ -145,14 +144,14 @@ static fa_result build_packets(mp4* m, const box* stbl)
     int64_t pts = 0;
     fa_result r;
 
-    if (!find_box(stbl->p, stbl->len, FOURCC('s', 't', 't', 's'), &stts) || stts.len < 8) return FA_ERROR_UNSUPPORTED_FORMAT;
-    if (!find_box(stbl->p, stbl->len, FOURCC('s', 't', 's', 'c'), &stsc) || stsc.len < 8) return FA_ERROR_UNSUPPORTED_FORMAT;
-    if (!find_box(stbl->p, stbl->len, FOURCC('s', 't', 's', 'z'), &stsz)) {
-        if (!find_box(stbl->p, stbl->len, FOURCC('s', 't', 'z', '2'), &stsz)) return FA_ERROR_UNSUPPORTED_FORMAT;
+    if (!find_box(stbl->p, stbl->len, FA_FOURCC('s', 't', 't', 's'), &stts) || stts.len < 8) return FA_ERROR_UNSUPPORTED_FORMAT;
+    if (!find_box(stbl->p, stbl->len, FA_FOURCC('s', 't', 's', 'c'), &stsc) || stsc.len < 8) return FA_ERROR_UNSUPPORTED_FORMAT;
+    if (!find_box(stbl->p, stbl->len, FA_FOURCC('s', 't', 's', 'z'), &stsz)) {
+        if (!find_box(stbl->p, stbl->len, FA_FOURCC('s', 't', 'z', '2'), &stsz)) return FA_ERROR_UNSUPPORTED_FORMAT;
         z2 = 1;
     }
-    if (!find_box(stbl->p, stbl->len, FOURCC('s', 't', 'c', 'o'), &stco)) {
-        if (!find_box(stbl->p, stbl->len, FOURCC('c', 'o', '6', '4'), &stco)) return FA_ERROR_UNSUPPORTED_FORMAT;
+    if (!find_box(stbl->p, stbl->len, FA_FOURCC('s', 't', 'c', 'o'), &stco)) {
+        if (!find_box(stbl->p, stbl->len, FA_FOURCC('c', 'o', '6', '4'), &stco)) return FA_ERROR_UNSUPPORTED_FORMAT;
         co64 = 1;
     }
     if (stsz.len < 12 || stco.len < 8) return FA_ERROR_UNSUPPORTED_FORMAT;
@@ -225,8 +224,8 @@ static fa_result parse_moof(mp4* m, const uint8_t* p, size_t len, int64_t moof_o
         int64_t pts = m->end_pts;
         int first = 1;
         size_t o;
-        if (traf.type != FOURCC('t', 'r', 'a', 'f')) continue;
-        if (!find_box(traf.p, traf.len, FOURCC('t', 'f', 'h', 'd'), &tfhd) || tfhd.len < 8) continue;
+        if (traf.type != FA_FOURCC('t', 'r', 'a', 'f')) continue;
+        if (!find_box(traf.p, traf.len, FA_FOURCC('t', 'f', 'h', 'd'), &tfhd) || tfhd.len < 8) continue;
         flags = fa_be32(tfhd.p) & 0xFFFFFF;
         if (fa_be32(tfhd.p + 4) != m->track_id) continue;
         o = 8;
@@ -234,13 +233,13 @@ static fa_result parse_moof(mp4* m, const uint8_t* p, size_t len, int64_t moof_o
         if (flags & 0x2) o += 4;
         if ((flags & 0x8) && o + 4 <= tfhd.len) { def_dur = fa_be32(tfhd.p + o); o += 4; }
         if ((flags & 0x10) && o + 4 <= tfhd.len) { def_size = fa_be32(tfhd.p + o); }
-        if (find_box(traf.p, traf.len, FOURCC('t', 'f', 'd', 't'), &b) && b.len >= 8)
+        if (find_box(traf.p, traf.len, FA_FOURCC('t', 'f', 'd', 't'), &b) && b.len >= 8)
             pts = b.p[0] == 1 && b.len >= 12 ? (int64_t)fa_be64(b.p + 4) : (int64_t)fa_be32(b.p + 4);
         next_off = base;
         while (next_box(&c2, traf.p + traf.len, &b)) {
             uint32_t tf, count, i, rec;
             int64_t off;
-            if (b.type != FOURCC('t', 'r', 'u', 'n') || b.len < 8) continue;
+            if (b.type != FA_FOURCC('t', 'r', 'u', 'n') || b.len < 8) continue;
             tf = fa_be32(b.p) & 0xFFFFFF;
             count = fa_be32(b.p + 4);
             o = 8;
@@ -311,7 +310,7 @@ static int load_fragment(mp4* m, fa_result* err)
         size_t before = m->npk;
         if (!read_box_header(m, pos, &type, &size, &hdr)) break;
         m->next_box = size < 0 ? -1 : pos + size;
-        if (type != FOURCC('m', 'o', 'o', 'f')) continue;
+        if (type != FA_FOURCC('m', 'o', 'o', 'f')) continue;
         if (size < 0 || size - hdr > (int64_t)MP4_MAX_BOX) break;
         *err = fa_br_read_alloc(&m->br, (size_t)(size - hdr), MP4_MAX_BOX, &buf, &cap);
         if (*err != FA_OK) {
@@ -326,7 +325,7 @@ static int load_fragment(mp4* m, fa_result* err)
             uint32_t t2;
             int64_t s2;
             int h2;
-            if (read_box_header(m, m->next_box, &t2, &s2, &h2) && t2 == FOURCC('m', 'd', 'a', 't'))
+            if (read_box_header(m, m->next_box, &t2, &s2, &h2) && t2 == FA_FOURCC('m', 'd', 'a', 't'))
                 m->next_box = s2 < 0 ? -1 : m->next_box + s2;
         }
         if (m->npk > before) { free(buf); return 1; }
@@ -426,7 +425,7 @@ static fa_result parse_stsd(mp4* m, const box* stbl, fa_codec_params* cp)
     int have_wave, little = -1, qt_float = 0, qt_big = 1;
     const char* name = NULL;
 
-    if (!find_box(stbl->p, stbl->len, FOURCC('s', 't', 's', 'd'), &stsd) || stsd.len < 16) return FA_ERROR_UNSUPPORTED_FORMAT;
+    if (!find_box(stbl->p, stbl->len, FA_FOURCC('s', 't', 's', 'd'), &stsd) || stsd.len < 16) return FA_ERROR_UNSUPPORTED_FORMAT;
     {
         const uint8_t* cur = stsd.p + 8;
         box entry;
@@ -457,25 +456,25 @@ static fa_result parse_stsd(mp4* m, const box* stbl, fa_codec_params* cp)
         lpcm_flags = fa_be32(e + 52);
         qt_float = (lpcm_flags & 1) != 0;
         qt_big = (lpcm_flags & 2) != 0;
-        if (fourcc == FOURCC('l', 'p', 'c', 'm') && !(lpcm_flags & 4) && !qt_float && bits == 8) bits = 0x108; /* unsigned 8 */
+        if (fourcc == FA_FOURCC('l', 'p', 'c', 'm') && !(lpcm_flags & 4) && !qt_float && bits == 8) bits = 0x108; /* unsigned 8 */
         kids = e + 64;
         klen = elen - 64;
     }
-    have_wave = find_box(kids, klen, FOURCC('w', 'a', 'v', 'e'), &wave);
-    if (find_box(kids, klen, FOURCC('e', 'n', 'd', 'a'), &b) || (have_wave && find_box(wave.p, wave.len, FOURCC('e', 'n', 'd', 'a'), &b)))
+    have_wave = find_box(kids, klen, FA_FOURCC('w', 'a', 'v', 'e'), &wave);
+    if (find_box(kids, klen, FA_FOURCC('e', 'n', 'd', 'a'), &b) || (have_wave && find_box(wave.p, wave.len, FA_FOURCC('e', 'n', 'd', 'a'), &b)))
         if (b.len >= 2) little = fa_be16(b.p) != 0;
     if (rate == 0) rate = m->timescale;
 
     /* Common Encryption ('enca' with the real format in 'sinf') and iTunes
      * FairPlay ('drms') need a licence this library does not have. */
-    if (fourcc == FOURCC('e', 'n', 'c', 'a') || fourcc == FOURCC('d', 'r', 'm', 's')) return FA_ERROR_PROTECTED_CONTENT;
+    if (fourcc == FA_FOURCC('e', 'n', 'c', 'a') || fourcc == FA_FOURCC('d', 'r', 'm', 's')) return FA_ERROR_PROTECTED_CONTENT;
 
     switch (fourcc) {
-    case FOURCC('m', 'p', '4', 'a'): {
+    case FA_FOURCC('m', 'p', '4', 'a'): {
         uint8_t oti = 0;
         const uint8_t* dsi;
         size_t dsi_len;
-        if (!find_box(kids, klen, FOURCC('e', 's', 'd', 's'), &b) && !(have_wave && find_box(wave.p, wave.len, FOURCC('e', 's', 'd', 's'), &b)))
+        if (!find_box(kids, klen, FA_FOURCC('e', 's', 'd', 's'), &b) && !(have_wave && find_box(wave.p, wave.len, FA_FOURCC('e', 's', 'd', 's'), &b)))
             return FA_ERROR_UNSUPPORTED_FORMAT;
         if (b.len < 4 || !fa_mp4_es_descriptor(b.p + 4, b.len - 4, &oti, &dsi, &dsi_len)) return FA_ERROR_UNSUPPORTED_FORMAT;   /* after the FullBox */
         switch (oti) {
@@ -495,21 +494,21 @@ static fa_result parse_stsd(mp4* m, const box* stbl, fa_codec_params* cp)
         }
         break;
     }
-    case FOURCC('.', 'm', 'p', '3'): case FOURCC('m', 's', 0, 0x55): name = "mp3"; break;
-    case FOURCC('a', 'c', '-', '3'): case FOURCC('s', 'a', 'c', '3'): name = "ac3"; break;
-    case FOURCC('e', 'c', '-', '3'): name = "eac3"; break;
-    case FOURCC('d', 't', 's', 'c'): case FOURCC('d', 't', 's', 'h'): case FOURCC('d', 't', 's', 'l'):
-    case FOURCC('d', 't', 's', 'e'): name = "dts"; break;
-    case FOURCC('m', 'l', 'p', 'a'): name = "truehd"; break;
-    case FOURCC('s', 'a', 'm', 'r'): name = "amrnb"; break;
-    case FOURCC('s', 'a', 'w', 'b'): name = "amrwb"; break;
-    case FOURCC('u', 'l', 'a', 'w'): name = "pcm_mulaw"; m->frame_bytes = channels; break;
-    case FOURCC('a', 'l', 'a', 'w'): name = "pcm_alaw"; m->frame_bytes = channels; break;
-    case FOURCC('O', 'p', 'u', 's'): {
+    case FA_FOURCC('.', 'm', 'p', '3'): case FA_FOURCC('m', 's', 0, 0x55): name = "mp3"; break;
+    case FA_FOURCC('a', 'c', '-', '3'): case FA_FOURCC('s', 'a', 'c', '3'): name = "ac3"; break;
+    case FA_FOURCC('e', 'c', '-', '3'): name = "eac3"; break;
+    case FA_FOURCC('d', 't', 's', 'c'): case FA_FOURCC('d', 't', 's', 'h'): case FA_FOURCC('d', 't', 's', 'l'):
+    case FA_FOURCC('d', 't', 's', 'e'): name = "dts"; break;
+    case FA_FOURCC('m', 'l', 'p', 'a'): name = "truehd"; break;
+    case FA_FOURCC('s', 'a', 'm', 'r'): name = "amrnb"; break;
+    case FA_FOURCC('s', 'a', 'w', 'b'): name = "amrwb"; break;
+    case FA_FOURCC('u', 'l', 'a', 'w'): name = "pcm_mulaw"; m->frame_bytes = channels; break;
+    case FA_FOURCC('a', 'l', 'a', 'w'): name = "pcm_alaw"; m->frame_bytes = channels; break;
+    case FA_FOURCC('O', 'p', 'u', 's'): {
         /* dOps (Opus in ISOBMFF) -> the OpusHead of RFC 7845, little endian. */
         uint8_t head[19 + 2 + 255];
         size_t n = 19;
-        if (!find_box(kids, klen, FOURCC('d', 'O', 'p', 's'), &b) || b.len < 11) return FA_ERROR_UNSUPPORTED_FORMAT;
+        if (!find_box(kids, klen, FA_FOURCC('d', 'O', 'p', 's'), &b) || b.len < 11) return FA_ERROR_UNSUPPORTED_FORMAT;
         memcpy(head, "OpusHead", 8);
         head[8] = 1;
         head[9] = b.p[1];
@@ -529,37 +528,37 @@ static fa_result parse_stsd(mp4* m, const box* stbl, fa_codec_params* cp)
         rate = 48000;
         break;
     }
-    case FOURCC('f', 'L', 'a', 'C'):
+    case FA_FOURCC('f', 'L', 'a', 'C'):
         /* dfLa: FullBox, then FLAC metadata blocks; the decoder wants STREAMINFO. */
-        if (!find_box(kids, klen, FOURCC('d', 'f', 'L', 'a'), &b) || b.len < 8 + 34 || (b.p[4] & 0x7F) != 0)
+        if (!find_box(kids, klen, FA_FOURCC('d', 'f', 'L', 'a'), &b) || b.len < 8 + 34 || (b.p[4] & 0x7F) != 0)
             return FA_ERROR_UNSUPPORTED_FORMAT;
         if (!set_extra(m, b.p + 8, 34)) return FA_ERROR_OUT_OF_MEMORY;
         name = "flac";
         break;
-    case FOURCC('a', 'l', 'a', 'c'): {
+    case FA_FOURCC('a', 'l', 'a', 'c'): {
         /* The decoder wants the whole 'alac' child box, header included. */
         box a;
-        if (!find_box(kids, klen, FOURCC('a', 'l', 'a', 'c'), &a)) {
-            if (!have_wave || !find_box(wave.p, wave.len, FOURCC('a', 'l', 'a', 'c'), &a)) return FA_ERROR_UNSUPPORTED_FORMAT;
+        if (!find_box(kids, klen, FA_FOURCC('a', 'l', 'a', 'c'), &a)) {
+            if (!have_wave || !find_box(wave.p, wave.len, FA_FOURCC('a', 'l', 'a', 'c'), &a)) return FA_ERROR_UNSUPPORTED_FORMAT;
         }
         if (a.len < 28) return FA_ERROR_UNSUPPORTED_FORMAT;
         if (!set_extra(m, a.p - 8, a.len + 8)) return FA_ERROR_OUT_OF_MEMORY;
         name = "alac";
         break;
     }
-    case FOURCC('r', 'a', 'w', ' '): name = "pcm_u8"; bits = 8; break;
-    case FOURCC('t', 'w', 'o', 's'):
+    case FA_FOURCC('r', 'a', 'w', ' '): name = "pcm_u8"; bits = 8; break;
+    case FA_FOURCC('t', 'w', 'o', 's'):
         name = bits == 8 ? "pcm_s8" : bits == 24 ? (little == 1 ? "pcm_s24le" : "pcm_s24be")
              : bits == 32 ? (little == 1 ? "pcm_s32le" : "pcm_s32be") : (little == 1 ? "pcm_s16le" : "pcm_s16be");
         break;
-    case FOURCC('s', 'o', 'w', 't'):
+    case FA_FOURCC('s', 'o', 'w', 't'):
         name = bits == 8 ? "pcm_s8" : bits == 24 ? "pcm_s24le" : bits == 32 ? "pcm_s32le" : "pcm_s16le";
         break;
-    case FOURCC('i', 'n', '2', '4'): name = little == 1 ? "pcm_s24le" : "pcm_s24be"; bits = 24; break;
-    case FOURCC('i', 'n', '3', '2'): name = little == 1 ? "pcm_s32le" : "pcm_s32be"; bits = 32; break;
-    case FOURCC('f', 'l', '3', '2'): name = little == 1 ? "pcm_f32le" : "pcm_f32be"; bits = 32; break;
-    case FOURCC('f', 'l', '6', '4'): name = little == 1 ? "pcm_f64le" : "pcm_f64be"; bits = 64; break;
-    case FOURCC('l', 'p', 'c', 'm'):
+    case FA_FOURCC('i', 'n', '2', '4'): name = little == 1 ? "pcm_s24le" : "pcm_s24be"; bits = 24; break;
+    case FA_FOURCC('i', 'n', '3', '2'): name = little == 1 ? "pcm_s32le" : "pcm_s32be"; bits = 32; break;
+    case FA_FOURCC('f', 'l', '3', '2'): name = little == 1 ? "pcm_f32le" : "pcm_f32be"; bits = 32; break;
+    case FA_FOURCC('f', 'l', '6', '4'): name = little == 1 ? "pcm_f64le" : "pcm_f64be"; bits = 64; break;
+    case FA_FOURCC('l', 'p', 'c', 'm'):
         if (bits == 0x108) name = "pcm_u8", bits = 8;
         else if (qt_float) name = bits == 64 ? (qt_big ? "pcm_f64be" : "pcm_f64le") : (qt_big ? "pcm_f32be" : "pcm_f32le");
         else if (bits == 8) name = "pcm_s8";
@@ -568,10 +567,10 @@ static fa_result parse_stsd(mp4* m, const box* stbl, fa_codec_params* cp)
         else if (bits == 32) name = qt_big ? "pcm_s32be" : "pcm_s32le";
         else return FA_ERROR_UNSUPPORTED_FORMAT;
         break;
-    case FOURCC('i', 'p', 'c', 'm'): case FOURCC('f', 'p', 'c', 'm'): {
+    case FA_FOURCC('i', 'p', 'c', 'm'): case FA_FOURCC('f', 'p', 'c', 'm'): {
         /* ISO/IEC 23003-5: pcmC holds the byte order and the sample size. */
-        int le, fl = fourcc == FOURCC('f', 'p', 'c', 'm');
-        if (!find_box(kids, klen, FOURCC('p', 'c', 'm', 'C'), &b) || b.len < 6) return FA_ERROR_UNSUPPORTED_FORMAT;
+        int le, fl = fourcc == FA_FOURCC('f', 'p', 'c', 'm');
+        if (!find_box(kids, klen, FA_FOURCC('p', 'c', 'm', 'C'), &b) || b.len < 6) return FA_ERROR_UNSUPPORTED_FORMAT;
         le = b.p[4] & 1;
         bits = b.p[5];
         if (fl) name = bits == 64 ? (le ? "pcm_f64le" : "pcm_f64be") : bits == 32 ? (le ? "pcm_f32le" : "pcm_f32be") : NULL;
@@ -600,21 +599,21 @@ static fa_result parse_stsd(mp4* m, const box* stbl, fa_codec_params* cp)
 
 static int is_audio(const box* trak)
 {
-    static const uint32_t path[2] = { FOURCC('m', 'd', 'i', 'a'), FOURCC('h', 'd', 'l', 'r') };
+    static const uint32_t path[2] = { FA_FOURCC('m', 'd', 'i', 'a'), FA_FOURCC('h', 'd', 'l', 'r') };
     box h;
-    return find_path(trak, path, 2, &h) && h.len >= 12 && fa_be32(h.p + 8) == FOURCC('s', 'o', 'u', 'n');
+    return find_path(trak, path, 2, &h) && h.len >= 12 && fa_be32(h.p + 8) == FA_FOURCC('s', 'o', 'u', 'n');
 }
 
 static int track_enabled(const box* trak)
 {
     box t;
-    return find_box(trak->p, trak->len, FOURCC('t', 'k', 'h', 'd'), &t) && t.len >= 4 && (fa_be32(t.p) & 1);
+    return find_box(trak->p, trak->len, FA_FOURCC('t', 'k', 'h', 'd'), &t) && t.len >= 4 && (fa_be32(t.p) & 1);
 }
 
 static uint32_t track_id(const box* trak)
 {
     box t;
-    if (!find_box(trak->p, trak->len, FOURCC('t', 'k', 'h', 'd'), &t) || t.len < 24) return 0;
+    if (!find_box(trak->p, trak->len, FA_FOURCC('t', 'k', 'h', 'd'), &t) || t.len < 24) return 0;
     return fa_be32(t.p + (t.p[0] == 1 ? 20 : 12));
 }
 
@@ -628,7 +627,7 @@ static int pick_track(const box* moov, int32_t want, box* out)
     memset(&first_b, 0, sizeof(first_b));
     memset(&enabled_b, 0, sizeof(enabled_b));
     while (next_box(&cur, moov->p + moov->len, &b)) {
-        if (b.type != FOURCC('t', 'r', 'a', 'k') || !is_audio(&b)) continue;
+        if (b.type != FA_FOURCC('t', 'r', 'a', 'k') || !is_audio(&b)) continue;
         if (count == want) *out = b;
         if (first < 0) { first = count; first_b = b; }
         if (enabled < 0 && track_enabled(&b)) { enabled = count; enabled_b = b; }
@@ -705,8 +704,8 @@ static fa_result mp4_open(fa_decoder* dec)
     int qt = 1, have_moov = 0, count;
     box moov, trak, b;
     fa_result r;
-    static const uint32_t mdhd_path[2] = { FOURCC('m', 'd', 'i', 'a'), FOURCC('m', 'd', 'h', 'd') };
-    static const uint32_t stbl_path[3] = { FOURCC('m', 'd', 'i', 'a'), FOURCC('m', 'i', 'n', 'f'), FOURCC('s', 't', 'b', 'l') };
+    static const uint32_t mdhd_path[2] = { FA_FOURCC('m', 'd', 'i', 'a'), FA_FOURCC('m', 'd', 'h', 'd') };
+    static const uint32_t stbl_path[3] = { FA_FOURCC('m', 'd', 'i', 'a'), FA_FOURCC('m', 'i', 'n', 'f'), FA_FOURCC('s', 't', 'b', 'l') };
 
     if (!m) return FA_ERROR_OUT_OF_MEMORY;
     r = fa_br_init(&m->br, src);
@@ -723,11 +722,11 @@ static fa_result mp4_open(fa_decoder* dec)
         int64_t size;
         int hdr;
         if (!read_box_header(m, pos, &type, &size, &hdr)) break;
-        if (pos == 0 && type == FOURCC('f', 't', 'y', 'p')) {
+        if (pos == 0 && type == FA_FOURCC('f', 't', 'y', 'p')) {
             uint8_t brand[4];
-            if (fa_br_read(&m->br, brand, 4) == 4) qt = fa_be32(brand) == FOURCC('q', 't', ' ', ' ');
+            if (fa_br_read(&m->br, brand, 4) == 4) qt = fa_be32(brand) == FA_FOURCC('q', 't', ' ', ' ');
         }
-        if (type == FOURCC('m', 'o', 'o', 'v')) {
+        if (type == FA_FOURCC('m', 'o', 'o', 'v')) {
             int64_t len = size < 0 ? (src->length > 0 ? src->length - pos - hdr : 0) : size - hdr;
             if (len <= 0 || len > (int64_t)MP4_MAX_BOX || (src->length > 0 && len > src->length)) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
             m->moov = (uint8_t*)malloc((size_t)len);
@@ -737,16 +736,16 @@ static fa_result mp4_open(fa_decoder* dec)
             m->next_box = size < 0 ? -1 : pos + size;
             break;
         }
-        if (type == FOURCC('m', 'd', 'a', 't') && !src->seekable) { r = FA_ERROR_NOT_SEEKABLE; goto fail; }
+        if (type == FA_FOURCC('m', 'd', 'a', 't') && !src->seekable) { r = FA_ERROR_NOT_SEEKABLE; goto fail; }
         if (size < 0) break;
         pos += size;
     }
     if (!have_moov) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
-    moov.type = FOURCC('m', 'o', 'o', 'v');
+    moov.type = FA_FOURCC('m', 'o', 'o', 'v');
     moov.p = m->moov;
     moov.len = m->moov_len;
 
-    if (find_box(moov.p, moov.len, FOURCC('m', 'v', 'h', 'd'), &b) && b.len >= 24)
+    if (find_box(moov.p, moov.len, FA_FOURCC('m', 'v', 'h', 'd'), &b) && b.len >= 24)
         m->movie_timescale = fa_be32(b.p + (b.p[0] == 1 ? 20 : 12));
     count = pick_track(&moov, dec->audio_track, &trak);
     dec->track_count = count;
@@ -771,12 +770,11 @@ static fa_result mp4_open(fa_decoder* dec)
     }
 
     /* Fragments: trex holds the track's sample defaults. */
-    if (find_box(moov.p, moov.len, FOURCC('m', 'v', 'e', 'x'), &b)) {
+    if (find_box(moov.p, moov.len, FA_FOURCC('m', 'v', 'e', 'x'), &b)) {
         const uint8_t* cur = b.p;
         box x;
-        m->fragmented = 1;
         while (next_box(&cur, b.p + b.len, &x))
-            if (x.type == FOURCC('t', 'r', 'e', 'x') && x.len >= 20 && fa_be32(x.p + 4) == m->track_id) {
+            if (x.type == FA_FOURCC('t', 'r', 'e', 'x') && x.len >= 20 && fa_be32(x.p + 4) == m->track_id) {
                 m->trex_duration = fa_be32(x.p + 12);
                 m->trex_size = fa_be32(x.p + 16);
             }
@@ -795,7 +793,7 @@ static fa_result mp4_open(fa_decoder* dec)
     tp.start = 0;
     tp.end = m->lazy ? FA_DEMUX_NO_PTS : m->end_pts;
     {
-        static const uint32_t elst_path[2] = { FOURCC('e', 'd', 't', 's'), FOURCC('e', 'l', 's', 't') };
+        static const uint32_t elst_path[2] = { FA_FOURCC('e', 'd', 't', 's'), FA_FOURCC('e', 'l', 's', 't') };
         box e;
         if (find_path(&trak, elst_path, 2, &e) && e.len >= 8 && m->movie_timescale > 0) {
             int v1 = e.p[0] == 1;
@@ -866,9 +864,9 @@ static int mp4_probe(const uint8_t* d, size_t n, size_t id3)
     if (n < 8) return 0;
     size = fa_be32(d);
     type = fa_be32(d + 4);
-    if (type == FOURCC('f', 't', 'y', 'p')) return size >= 8 ? 100 : 0;
-    if ((type == FOURCC('m', 'o', 'o', 'v') || type == FOURCC('m', 'd', 'a', 't') || type == FOURCC('f', 'r', 'e', 'e') ||
-         type == FOURCC('w', 'i', 'd', 'e') || type == FOURCC('s', 'k', 'i', 'p')) && (size == 0 || size == 1 || size >= 8))
+    if (type == FA_FOURCC('f', 't', 'y', 'p')) return size >= 8 ? 100 : 0;
+    if ((type == FA_FOURCC('m', 'o', 'o', 'v') || type == FA_FOURCC('m', 'd', 'a', 't') || type == FA_FOURCC('f', 'r', 'e', 'e') ||
+         type == FA_FOURCC('w', 'i', 'd', 'e') || type == FA_FOURCC('s', 'k', 'i', 'p')) && (size == 0 || size == 1 || size >= 8))
         return 100;
     return 0;
 }

@@ -389,14 +389,12 @@ public sealed unsafe class AudioEncoder : IDisposable
             v.Quality = o.Quality;
             v.QueueMs = (uint)Math.Min(o.QueueLength.TotalMilliseconds, uint.MaxValue);
             v.TrackNumber = (uint)o.TrackNumber;
-            _title = Utf8(o.Title); _artist = Utf8(o.Artist); _album = Utf8(o.Album);
-            _genre = Utf8(o.Genre); _date = Utf8(o.Date); _comment = Utf8(o.Comment);
+            _title = NativeText.Alloc(o.Title); _artist = NativeText.Alloc(o.Artist); _album = NativeText.Alloc(o.Album);
+            _genre = NativeText.Alloc(o.Genre); _date = NativeText.Alloc(o.Date); _comment = NativeText.Alloc(o.Comment);
             v.Title = (byte*)_title; v.Artist = (byte*)_artist; v.Album = (byte*)_album;
             v.Genre = (byte*)_genre; v.Date = (byte*)_date; v.Comment = (byte*)_comment;
             Value = v;
         }
-
-        private static nint Utf8(string? s) => s is null ? 0 : Marshal.StringToCoTaskMemUTF8(s);
 
         public void Free()
         {

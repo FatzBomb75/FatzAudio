@@ -22,7 +22,7 @@
  * the same prewarp), so low (allpassed at 2.5 kHz) + mid + high is flat. */
 biquad fa_mixer_design(int type, double hz, double rate)
 {
-    double w = 2.0 * k_pi * hz / rate, c = cos(w), alpha = sin(w) / (2.0 * 0.70710678118654752);
+    double w = 2.0 * FA_PI * hz / rate, c = cos(w), alpha = sin(w) / (2.0 * 0.70710678118654752);
     double a0 = 1.0 + alpha, b0, b1, b2;
     biquad q;
     if (type == 0) { b0 = (1.0 - c) / 2.0; b1 = 1.0 - c; b2 = b0; }             /* low-pass */
@@ -62,7 +62,7 @@ static void xfader_gains(float lin, float x, float* ga, float* gb)
 {
     float a = 1.0f - x, b = x;
     if (lin < 1.0f) {
-        float ca = cosf(x * (float)(k_pi / 2.0)), cb = sinf(x * (float)(k_pi / 2.0));
+        float ca = cosf(x * (float)(FA_PI / 2.0)), cb = sinf(x * (float)(FA_PI / 2.0));
         a = ca + (a - ca) * lin;
         b = cb + (b - cb) * lin;
     }

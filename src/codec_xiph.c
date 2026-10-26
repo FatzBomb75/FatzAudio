@@ -56,8 +56,6 @@ static void xiph_reorder(const float* const* planes, const float* inter, uint32_
     }
 }
 
-static uint16_t le16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-
 /* ---- Opus ---------------------------------------------------------------------- */
 
 #define OPUS_MAX_FRAME 5760          /* 120 ms at 48 kHz */
@@ -76,8 +74,8 @@ static int parse_opus_head(const uint8_t* p, size_t n, opus_head* h)
     memset(h, 0, sizeof(*h));
     if (n < 19 || memcmp(p, "OpusHead", 8) != 0 || (p[8] >> 4) != 0 || p[9] == 0) return 0;
     h->channels = p[9];
-    h->preskip = le16(p + 10);
-    h->gain = (int16_t)le16(p + 16);
+    h->preskip = fa_le16(p + 10);
+    h->gain = (int16_t)fa_le16(p + 16);
     h->family = p[18];
     if (h->family == 0) {
         if (h->channels > 2) return 0;

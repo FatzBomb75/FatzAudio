@@ -21,7 +21,6 @@
 #define FA_ANALYSIS_READ 4096
 #define FA_ANALYSIS_MAX_CACHE ((size_t)64 << 20)
 #define FA_ANALYZE_ALL (FA_ANALYZE_LOUDNESS | FA_ANALYZE_BEATS | FA_ANALYZE_KEY | FA_ANALYZE_WAVEFORM)
-#define FA_PI 3.14159265358979323846
 #define FA_FNV_BASIS 0xcbf29ce484222325ULL
 
 struct fa_analysis {
@@ -549,7 +548,7 @@ static fa_result measure(const job* j, uint32_t kinds, fa_analysis* a)
         peak = meter.tp->peak;
         a->loudness.integrated_lufs = fa_loudness_integrated(meter.subs, meter.nsubs);
         a->loudness.range_lu = fa_loudness_range(meter.subs, meter.nsubs);
-        a->loudness.true_peak_dbtp = peak > 0.0 ? 20.0 * log10(peak) : -HUGE_VAL;
+        a->loudness.true_peak_dbtp = fa_lin_to_db(peak);
         a->loudness.is_final = 1;
         a->loudness.source = FA_LOUDNESS_SCAN;
         a->have_loudness = 1;

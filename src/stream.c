@@ -604,13 +604,8 @@ FA_API fa_result FA_CALL fa_stream_open_packets(fa_engine* engine, const fa_code
 
 static char* copy_str(const char* text, fa_result* r)
 {
-    char* c;
-    size_t n;
-    if (!text) return NULL;
-    n = strlen(text) + 1;
-    c = (char*)malloc(n);
-    if (c) memcpy(c, text, n);
-    else *r = FA_ERROR_OUT_OF_MEMORY;
+    char* c = fa_strdup(text);
+    if (text && !c) *r = FA_ERROR_OUT_OF_MEMORY;
     return c;
 }
 

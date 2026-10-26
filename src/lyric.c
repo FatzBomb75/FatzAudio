@@ -15,6 +15,7 @@
 #include "lyric.h"
 #include "lyric_time.h"
 #include "fa_platform.h"
+#include "fa_util.h"
 #include "font.h"
 #include "font_find.h"
 #include "raster.h"
@@ -300,17 +301,6 @@ struct fa_lyric {
     size_t tmp_cap;
 };
 
-static char* dup_str(const char* s)
-{
-    size_t n;
-    char* d;
-    if (!s) return NULL;
-    n = strlen(s);
-    d = (char*)malloc(n + 1);
-    if (d) memcpy(d, s, n + 1);
-    return d;
-}
-
 static void layer_clear(ly_layer* L)
 {
     free(L->m);
@@ -490,7 +480,7 @@ static fa_result read_song(fa_lyric* l, fa_stream* s)
     if (!l->song) return FA_ERROR_OUT_OF_MEMORY;
     for (i = 0; i < mi.text_count && n < mi.lyric_count; i++) {
         if (fa_stream_get_midi_text(s, i, &t) != FA_OK || t.type != FA_MIDI_LYRIC) continue;
-        l->song[n].text = dup_str(t.text);
+        l->song[n].text = fa_strdup(t.text);
         if (!l->song[n].text) return FA_ERROR_OUT_OF_MEMORY;
         l->song[n].time = t.time;
         l->song[n].flags = t.flags;
@@ -2001,11 +1991,11 @@ static int same_font(const fa_lyric* l, const fa_lyric_style* st)
 
 static fa_result style_take(fa_lyric* l, const fa_lyric_style* st)
 {
-    char* family = dup_str(st->font_family);
-    char* path = dup_str(st->font_path);
-    char* fallback = dup_str(st->fallback_title);
-    char* labels = dup_str(st->labels);
-    char* label_buf = dup_str(st->labels);
+    char* family = fa_strdup(st->font_family);
+    char* path = fa_strdup(st->font_path);
+    char* fallback = fa_strdup(st->fallback_title);
+    char* labels = fa_strdup(st->labels);
+    char* label_buf = fa_strdup(st->labels);
     void* data = NULL;
     fa_font *font = NULL, *font2 = NULL;
     float bold = 0.0f, bold2 = 0.0f;
