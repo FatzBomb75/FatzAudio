@@ -105,6 +105,7 @@ struct fa_mixer {
     struct fa_deck decks[MIXER_MAX_DECKS];
     fa_lane lanes[MIX_LANES];
     fa_atomic32 curve;           /* fa_xfader_curve */
+    float curve_w;               /* audio thread: blend toward the linear curve (0..1), glides 5 ms */
     fa_cue_mode cue_mode;
     uint32_t cue_channel;
     uint32_t flags;              /* FA_MIXER_* */
@@ -153,21 +154,6 @@ struct fa_mixer {
 
 
 /* ---- parameter lanes on the device clock (audio thread) ---- */
-
-static inline void take_lanes(fa_lane* lanes, int n, uint32_t rate)
-{
-    int i;
-    for (i = 0; i < n; i++) fa_lane_take(&lanes[i], 1, rate, NULL);
-}
-
-static inline void end_lanes(fa_lane* lanes, int n, int64_t clock, int64_t frames)
-{
-    int i;
-    for (i = 0; i < n; i++) {
-        fa_lane_advance(&lanes[i].v, clock, frames);
-        fa_store_float(&lanes[i].current, lanes[i].v.value);
-    }
-}
 
 /* Values of `lanes` at the start and the end of [at, at + n). */
 static inline void lane_span(const fa_lane* lanes, int n, int64_t clock, int64_t at, int64_t len, float* v0, float* v1)

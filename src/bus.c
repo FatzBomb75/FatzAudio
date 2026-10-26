@@ -110,7 +110,7 @@ FA_API fa_result FA_CALL fa_bus_ramp_param(fa_bus* bus, fa_param param, float ta
     if (r != FA_OK) return r;
     r = fa_param_check(param, &target);
     if (r != FA_OK) return r;
-    at = device_time ? (int64_t)((double)device_time * (double)bus->device->rate / 1e9 + 0.5) : -1;
+    at = fa_ramp_frame(bus->device->rate, device_time);
     fa_mutex_lock(&bus->device->lock);
     fa_lane_post(&bus->lanes[param], target, duration, &shape, 0, 1, at, 0, NULL);
     fa_mutex_unlock(&bus->device->lock);
@@ -121,10 +121,8 @@ void fa_buses_begin(fa_device* dev)
 {
     fa_bus_list* list = (fa_bus_list*)fa_load_ptr(&dev->buses);
     uint32_t i;
-    int p;
     if (!list) return;
-    for (i = 0; i < list->count; i++)
-        for (p = 0; p < FA_MIX_PARAMS; p++) fa_lane_take(&list->items[i]->lanes[p], 1, dev->rate, NULL);
+    for (i = 0; i < list->count; i++) fa_lanes_take(list->items[i]->lanes, FA_MIX_PARAMS, dev->rate);
 }
 
 void fa_buses_end(fa_device* dev, uint32_t frames)
@@ -132,12 +130,6 @@ void fa_buses_end(fa_device* dev, uint32_t frames)
     fa_bus_list* list = (fa_bus_list*)fa_load_ptr(&dev->buses);
     int64_t clock = fa_load64(&dev->clock);
     uint32_t i;
-    int p;
     if (!list) return;
-    for (i = 0; i < list->count; i++)
-        for (p = 0; p < FA_MIX_PARAMS; p++) {
-            fa_lane* l = &list->items[i]->lanes[p];
-            fa_lane_advance(&l->v, clock, frames);
-            fa_store_float(&l->current, l->v.value);
-        }
+    for (i = 0; i < list->count; i++) fa_lanes_end(list->items[i]->lanes, FA_MIX_PARAMS, clock, frames);
 }

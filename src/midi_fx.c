@@ -240,14 +240,6 @@ static float lowpass(float x, float a, float* z)
     return a > 0.0f ? (*z = x * (1.0f - a) + *z * a) : x;
 }
 
-static int all_zero(const float* x, int n)
-{
-    int i;
-    for (i = 0; i < n; i++)
-        if (x[i] != 0.0f) return 0;
-    return 1;
-}
-
 /* The GS Delay and Panning Delay types: one echo, repeated by the feedback; the
  * panning one bounces between the channels. echo_soft counts the frames since
  * the line was last given a sample that is not below -140 dB: past its length,
@@ -274,7 +266,7 @@ static void reverb_process(fa_midi_fx* fx, const float* in, float* out, int fram
     float peak = 0.0f;
     int quiet_in, f, ch, i;
     if (fx->kind == KIND_OFF) return;
-    quiet_in = all_zero(in, frames * 2);
+    quiet_in = fa_all_zero(in, (uint32_t)frames * 2);
     if (quiet_in && fx->reverb_idle) return;
     fx->reverb_idle = 0;
     fx->reverb_quiet = quiet_in ? fx->reverb_quiet + frames : 0;
@@ -321,7 +313,7 @@ static void chorus_process(fa_midi_fx* fx, const float* in, float* out, int fram
     double s, c;
     int f, ch, t, quiet_in;
     if (!fx->cho_on) return;
-    quiet_in = all_zero(in, frames * 2);
+    quiet_in = fa_all_zero(in, (uint32_t)frames * 2);
     if (quiet_in && fx->chorus_idle) return;
     fx->chorus_idle = 0;
     fx->chorus_quiet = quiet_in ? fx->chorus_quiet + frames : 0;

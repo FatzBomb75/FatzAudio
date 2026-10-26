@@ -1211,10 +1211,10 @@ static const fa_frames* region_of(struct fa_stream* s) { return s->region[fa_loa
  * worker carrying out a restart). */
 static void region_store(struct fa_stream* s, fa_frames in, fa_frames out)
 {
-    int32_t next = (fa_load32(&s->region_idx) + 1) & 1;
-    s->region[next][0] = out > 0 ? in : 0;
-    s->region[next][1] = out > 0 ? out : 0;
-    fa_store32(&s->region_idx, next);
+    uint32_t next = (uint32_t)fa_load32(&s->region_idx) + 1;
+    s->region[next & 1][0] = out > 0 ? in : 0;
+    s->region[next & 1][1] = out > 0 ? out : 0;
+    fa_store32(&s->region_idx, (int32_t)next);
 }
 
 /* Only a seekable source loops (looping seeks back); a forward-only one ends. */
@@ -2267,9 +2267,15 @@ fa_result fa_stream_set_loop_region(struct fa_stream* s, fa_frames in, fa_frames
 
 void fa_stream_get_loop_region(struct fa_stream* s, fa_frames* out_in, fa_frames* out_out)
 {
-    const fa_frames* r = region_of(s);
-    *out_in = r[0];
-    *out_out = r[1];
+    /* region_idx counts the changes: if it did not move during the copy, no second
+     * change rewrote the slot being read. The second read is a read-modify-write so the
+     * copy cannot move past it. */
+    int32_t idx;
+    do {
+        idx = fa_load32(&s->region_idx);
+        *out_in = s->region[idx & 1][0];
+        *out_out = s->region[idx & 1][1];
+    } while (fa_fetch_add32(&s->region_idx, 0) != idx);
 }
 
 /* Where fa_stream_jump joins the ring (decode_lock held), for the mix at `played`:
@@ -3130,7 +3136,7 @@ static void mix_region(float* out, const float* in, int64_t n, float l0, float r
     }
 }
 
-static float db_to_gain(float db) { return db == 0.0f ? 1.0f : powf(10.0f, db / 20.0f); }
+static float db_to_gain(float db) { return db == 0.0f ? 1.0f : fa_db_to_lin(db); }
 
 /* Moves the normalization gain toward its target: down at most 12 dB/s, up at
  * most 6 dB/s, so a corrected estimate glides instead of jumping. */
@@ -3722,7 +3728,7 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
         }
         g0 = v0[FA_PARAM_VOLUME] * v0[FA_LANE_FADE] * marker_gain(&mk, pos0);
         g1 = v1[FA_PARAM_VOLUME] * v1[FA_LANE_FADE] * marker_gain(&mk, pos1);
-        mute1 = fa_mute_glide(mute0, mute_target, blk, dev->rate);
+        mute1 = fa_glide(mute0, mute_target, blk, dev->rate);
         g0 *= 1.0f - mute0;
         g1 *= 1.0f - mute1;
         mute0 = mute1;

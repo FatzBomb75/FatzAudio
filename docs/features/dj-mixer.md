@@ -127,7 +127,7 @@ mixer.CueLost += (_, _) => Console.WriteLine("headphones gone; call SetCueDevice
 | `FA_MIX_CUE_MIX` / `CueMix` | 0 (cue) .. 1 (master) | 0 |
 | `FA_MIX_CUE_GAIN` / `CueGain` | 0..4, linear | 1 |
 | `FA_MIX_CUE_TRIM_MS` / `CueTrim` | −250..250 ms, [second-device cue](#second-device-cue) only, not rampable | 0 |
-| `fa_mixer_set_crossfader_curve` / `Crossfader.Curve` | constant power (each side −3 dB in the middle, steady loudness) or linear (−6 dB, a slight dip) | constant power |
+| `fa_mixer_set_crossfader_curve` / `Crossfader.Curve` | constant power (each side −3 dB in the middle, steady loudness) or linear (−6 dB, a slight dip); a change mid-set glides over 5 ms | constant power |
 | `FA_DECK_GAIN` / `Gain` | 0..1, the channel fader | 1 |
 | `FA_DECK_TRIM_DB` / `TrimDb` | −12..+12 dB, on top of loudness normalization | 0 |
 | `FA_DECK_EQ_LOW_DB`, `_MID_DB`, `_HIGH_DB` / `Eq.Low`, `Eq.Mid`, `Eq.High` | `FA_DECK_EQ_KILL_DB` (−60, silent) .. +6 dB | 0 |

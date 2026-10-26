@@ -51,31 +51,29 @@ static inline float isolate(const struct fa_mixer* m, float (*z)[2][2], int c, f
 /* dB to linear for trim and EQ: the kill setting is silence. */
 static float band_gain(float db)
 {
-    return db <= FA_DECK_EQ_KILL_DB + 0.001f ? 0.0f : powf(10.0f, db / 20.0f);
+    return db <= FA_DECK_EQ_KILL_DB + 0.001f ? 0.0f : fa_db_to_lin(db);
 }
 
 /* ---- the crossfader ----------------------------------------------------------- */
 
-static void xfader_gains(int curve, float x, float* ga, float* gb)
+/* The two sides' gains at crossfader position `x`; `lin` blends from constant power (0)
+ * to linear (1), so a curve change glides instead of stepping by up to 3 dB. */
+static void xfader_gains(float lin, float x, float* ga, float* gb)
 {
-    if (curve == FA_XFADER_LINEAR) {
-        *ga = 1.0f - x;
-        *gb = x;
-    } else {
-        *ga = cosf(x * (float)(k_pi / 2.0));
-        *gb = sinf(x * (float)(k_pi / 2.0));
+    float a = 1.0f - x, b = x;
+    if (lin < 1.0f) {
+        float ca = cosf(x * (float)(k_pi / 2.0)), cb = sinf(x * (float)(k_pi / 2.0));
+        a = ca + (a - ca) * lin;
+        b = cb + (b - cb) * lin;
     }
+    *ga = a;
+    *gb = b;
 }
+
+static float curve_lin(struct fa_mixer* m) { return fa_load32(&m->curve) == FA_XFADER_LINEAR ? 1.0f : 0.0f; }
 
 /* ---- audio thread ------------------------------------------------------------- */
 
-
-static float side_glide(float w, float target, int64_t n, uint32_t rate)
-{
-    float step = (float)n / ((float)rate * 0.005f);
-    if (w < target) return w + step < target ? w + step : target;
-    return w - step > target ? w - step : target;
-}
 
 /* Mixer lane values at every MIXER_SUB edge of the block (index k = frame k x MIXER_SUB,
  * the last one at the block's end): sub-block k runs from edge[k] to edge[k + 1]. */
@@ -83,6 +81,7 @@ static float side_glide(float w, float target, int64_t n, uint32_t rate)
 typedef struct mix_edges {
     float v[MIX_LANES][MIXER_EDGES];     /* the value from that edge on */
     float e[MIX_LANES][MIXER_EDGES];     /* the value up to that edge (differs where a jump starts) */
+    float lin[MIXER_EDGES];              /* the crossfader curve blend (fa_mixer.curve_w) */
 } mix_edges;
 
 /* One deck channel over the block: trim, isolator, cue send, fader, meter, crossfader. */
@@ -90,7 +89,7 @@ static void deck_process(struct fa_mixer* m, struct fa_deck* d, const mix_edges*
                          float* out, uint32_t frames)
 {
     float* buf = d->bus->buf;
-    int curve = fa_load32(&m->curve), side = fa_load32(&d->side), cue_on = m->cue_mode != FA_CUE_NONE;
+    int side = fa_load32(&d->side), cue_on = m->cue_mode != FA_CUE_NONE;
     uint32_t off, k;
     fa_tap* tap;
     for (off = 0, k = 0; off < frames; off += MIXER_SUB, k++) {
@@ -100,18 +99,18 @@ static void deck_process(struct fa_mixer* m, struct fa_deck* d, const mix_edges*
         lane_span(d->lanes, DECK_LANES, clock, clock + off, n, v0, v1);
         for (j = 0; j < 3; j++) {
             w0[j] = d->side_w[j];
-            d->side_w[j] = side_glide(d->side_w[j], (int)j == side ? 1.0f : 0.0f, n, rate);
+            d->side_w[j] = fa_glide(d->side_w[j], (int)j == side ? 1.0f : 0.0f, n, rate);
             w1[j] = d->side_w[j];
         }
-        t0 = powf(10.0f, v0[DL_TRIM] / 20.0f); t1 = powf(10.0f, v1[DL_TRIM] / 20.0f);
+        t0 = fa_db_to_lin(v0[DL_TRIM]); t1 = fa_db_to_lin(v1[DL_TRIM]);
         l0 = band_gain(v0[DL_LOW]); l1 = band_gain(v1[DL_LOW]);
         mi0 = band_gain(v0[DL_MID]); mi1 = band_gain(v1[DL_MID]);
         h0 = band_gain(v0[DL_HIGH]); h1 = band_gain(v1[DL_HIGH]);
         g0 = v0[DL_GAIN]; g1 = v1[DL_GAIN];
         c0 = v0[DL_CUE]; c1 = v1[DL_CUE];
         /* This deck's crossfader gain (its side mix) at both ends of the sub-block. */
-        xfader_gains(curve, me->v[ML_XF][k], &ga0, &gb0);
-        xfader_gains(curve, me->e[ML_XF][k + 1], &ga1, &gb1);
+        xfader_gains(me->lin[k], me->v[ML_XF][k], &ga0, &gb0);
+        xfader_gains(me->lin[k + 1], me->e[ML_XF][k + 1], &ga1, &gb1);
         x0 = w0[0] + w0[1] * ga0 + w0[2] * gb0;
         x1 = w1[0] + w1[1] * ga1 + w1[2] * gb1;
         for (i = 0; i < n; i++) {
@@ -146,17 +145,20 @@ void fa_mixer_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t f
     int64_t clock = fa_load64(&dev->clock);
     uint32_t i, off, k;
     int p;
+    float lin = curve_lin(m);
     mix_edges me;
     m->check_now = (struct fa_mic_check*)fa_load_ptr(&m->check);   /* the same for the mics and the render */
-    take_lanes(m->lanes, MIX_LANES, dev->rate);
-    for (i = 0; i < m->deck_count; i++) take_lanes(m->decks[i].lanes, DECK_LANES, dev->rate);
+    fa_lanes_take(m->lanes, MIX_LANES, dev->rate);
+    for (i = 0; i < m->deck_count; i++) fa_lanes_take(m->decks[i].lanes, DECK_LANES, dev->rate);
     for (off = 0, k = 0;; off += MIXER_SUB, k++) {
         uint32_t at = off < frames ? off : frames;
         for (p = 0; p < MIX_LANES; p++) {
             me.v[p][k] = fa_lane_value_at_frame(&m->lanes[p].v, clock, clock + at, 1);
             me.e[p][k] = fa_lane_value_at_frame(&m->lanes[p].v, clock, clock + at, 0);
         }
+        me.lin[k] = m->curve_w;
         if (off >= frames) break;
+        m->curve_w = fa_glide(m->curve_w, lin, frames - off < MIXER_SUB ? frames - off : MIXER_SUB, dev->rate);
     }
     if (m->cue_mode != FA_CUE_NONE) memset(m->cue, 0, (size_t)frames * FA_DEVICE_CHANNELS * sizeof(float));
     for (i = 0; i < m->deck_count; i++) deck_process(m, &m->decks[i], &me, clock, dev->rate, out, frames);
@@ -183,8 +185,8 @@ void fa_mixer_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t f
             }
         }
     }
-    end_lanes(m->lanes, MIX_LANES, clock, frames);
-    for (i = 0; i < m->deck_count; i++) end_lanes(m->decks[i].lanes, DECK_LANES, clock, frames);
+    fa_lanes_end(m->lanes, MIX_LANES, clock, frames);
+    for (i = 0; i < m->deck_count; i++) fa_lanes_end(m->decks[i].lanes, DECK_LANES, clock, frames);
 }
 
 
@@ -208,7 +210,7 @@ static void lay_out(struct fa_mixer* m, const float* master, float* out, uint32_
         if (cue_here) {
             const float* cs = m->cue + (size_t)i * 2;
             float audible;
-            if (mute != mute1) mute = fa_mute_glide(mute, mute1, 1, rate);
+            if (mute != mute1) mute = fa_glide(mute, mute1, 1, rate);
             audible = 1.0f - mute;
             cl = clip1(cs[0] * audible + m->cue_master[i] * mm[0]);
             cr = clip1(cs[1] * audible + m->cue_master[i] * mm[1]);
@@ -536,12 +538,6 @@ static fa_result mix_range(fa_mix_param p, float* v)
     }
 }
 
-/* Device frame of `device_time` (0 = at once) for a lane ramp. */
-static int64_t ramp_at(fa_device* dev, fa_time device_time)
-{
-    return device_time ? (int64_t)((double)device_time * (double)dev->rate / 1e9 + 0.5) : -1;
-}
-
 FA_API fa_result FA_CALL fa_mixer_set_param(fa_mixer* mixer, fa_mix_param param, float value)
 {
     fa_result r;
@@ -581,7 +577,7 @@ FA_API fa_result FA_CALL fa_mixer_ramp_param(fa_mixer* mixer, fa_mix_param param
     if ((r = fa_shape_from_ramp(ramp, FA_CURVE_LINEAR, &shape)) != FA_OK) return r;
     if ((r = mix_range(param, &target)) != FA_OK) return r;
     fa_mutex_lock(&mixer->lock);
-    fa_lane_post(&mixer->lanes[param], target, duration, &shape, 0, 1, ramp_at(mixer->device, device_time), 0, NULL);
+    fa_lane_post(&mixer->lanes[param], target, duration, &shape, 0, 1, fa_ramp_frame(mixer->device->rate, device_time), 0, NULL);
     fa_mutex_unlock(&mixer->lock);
     return FA_OK;
 }
@@ -638,7 +634,7 @@ static int deck_heard(struct fa_deck* d)
     int side = fa_load32(&d->side);
     fa_stream* s = deck_stream(d);
     if (!s || fa_stream_get_state(s, &st) != FA_OK || st != FA_STATE_PLAYING) return 0;
-    xfader_gains(fa_load32(&m->curve), fa_lane_get(&m->lanes[ML_XF]), &ga, &gb);
+    xfader_gains(curve_lin(m), fa_lane_get(&m->lanes[ML_XF]), &ga, &gb);
     g = fa_lane_get(&d->lanes[DL_GAIN]) * (side == 1 ? ga : side == 2 ? gb : 1.0f);
     return g > 0.001f;   /* -60 dB */
 }
@@ -776,7 +772,7 @@ FA_API fa_result FA_CALL fa_deck_ramp_param(fa_deck* deck, fa_deck_param param, 
     if ((r = fa_shape_from_ramp(ramp, FA_CURVE_LINEAR, &shape)) != FA_OK) return r;
     if ((r = deck_range(param, &target)) != FA_OK) return r;
     fa_mutex_lock(&deck->mixer->lock);
-    fa_lane_post(deck_lane(deck, param), target, duration, &shape, 0, 1, ramp_at(deck->mixer->device, device_time), 0, NULL);
+    fa_lane_post(deck_lane(deck, param), target, duration, &shape, 0, 1, fa_ramp_frame(deck->mixer->device->rate, device_time), 0, NULL);
     fa_mutex_unlock(&deck->mixer->lock);
     return FA_OK;
 }

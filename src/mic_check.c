@@ -400,11 +400,6 @@ static void measure_mode(struct fa_mixer* m, struct fa_mic* mic, const fa_latenc
 
 /* ---- the API -------------------------------------------------------------------------- */
 
-static int mode_available(struct fa_mixer* m, fa_latency_mode mode)
-{
-    return mode != FA_LATENCY_EXCLUSIVE || m->engine->context.backend == ma_backend_wasapi;
-}
-
 /* After a mode switch: the input and the bridge run again, steadily. A device can
  * deliver in fits for a moment after it opens, and a stall moves the bridge (and so the
  * delay) between the chirps. */
@@ -457,7 +452,7 @@ FA_API fa_result FA_CALL fa_mixer_measure_latency(fa_mixer* mixer, fa_mic* mic, 
         o->mode = mode;
         res.count++;
         if (fa_load32(&mixer->check_mic_gone)) { o->result = FA_ERROR_DEVICE; continue; }   /* removed meanwhile */
-        if (!mode_available(mixer, mode)) { o->result = FA_ERROR_NOT_IMPLEMENTED; continue; }
+        if (!fa_device_mode_supported(mixer->engine, mode)) { o->result = FA_ERROR_NOT_IMPLEMENTED; continue; }
         if (mode != mixer->device->open_mode) {
             o->result = fa_mixer_switch_latency_mode(mixer, mode);
             if (o->result != FA_OK) continue;
