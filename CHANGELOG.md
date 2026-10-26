@@ -198,6 +198,11 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Faster, with output identical to the bit (deep audit, 2026-10-26): the output limiter skips its gain tracking
+  while nothing comes near the ceiling (about half the cost of a quiet callback); the device resampler's stereo path
+  (a 44.1 kHz file on a 48 kHz device) runs both channels in one SSE register, about 2x; raw PCM in MKV, MOV, CAF and
+  push streams converts with one loop per sample format, 3-8x; HE-AAC clears only the bands it reads (4-10% less
+  work); the lyric surface draws with SSE on x86, about 2x (a 4K partial frame 8.4 to 4.1 ms).
 - Internal clean-up from the 2026-10-26 deep audit, no change in behaviour: six internal functions nothing called,
   nine struct fields that were written but never read, two unused macros and the never-built AC-3 statistics
   counters are gone; the byte-order readers, string copies, pi and the peak-to-dB conversion that a dozen source files

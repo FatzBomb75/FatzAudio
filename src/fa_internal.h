@@ -748,7 +748,7 @@ typedef struct fa_limiter {
     float gain;                 /* after release smoothing */
     float release;              /* per-frame release coefficient */
     fa_truepeak tp;
-    float reduction;            /* smallest gain of the last block (for metering) */
+    int quiet;                  /* frames in a row that needed no reduction (up to window + attack) */
 } fa_limiter;
 
 fa_result fa_limiter_init(fa_limiter* l, uint32_t rate, uint32_t channels);

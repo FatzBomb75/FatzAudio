@@ -45,59 +45,80 @@ static int native_big_endian(void)
     return *(const uint8_t*)&one == 0;
 }
 
-/* One sample at `p` as float. `swap`: the bytes are in the other order. */
-static float sample_at(const uint8_t* p, int kind, int swap)
+/* Unsigned integers of 2, 4 and 8 bytes in the given byte order. */
+static uint32_t rd16(const uint8_t* p, int big) { return big ? fa_be16(p) : fa_le16(p); }
+static uint32_t rd32(const uint8_t* p, int big) { return big ? fa_be32(p) : fa_le32(p); }
+static uint64_t rd64(const uint8_t* p, int big) { return big ? fa_be64(p) : fa_le64(p); }
+
+/* n samples of one kind, `step` bytes apart, to floats `out_step` apart. One
+ * loop per kind, so the format is not looked at again for every sample.
+ * `swap`: the bytes are in the other order than this machine's. */
+static void convert_run(const uint8_t* p, size_t step, int kind, int swap, float* out, size_t out_step, size_t n)
 {
-    uint8_t t[8];
-    int n = sample_bytes(kind), i;
-    if (swap && n > 1 && kind != FA_SAMPLE_S24) {
-        for (i = 0; i < n; i++) t[i] = p[n - 1 - i];
-        p = t;
-    }
+    int big = swap ? !native_big_endian() : native_big_endian();
+    size_t i;
     switch (kind) {
-    case FA_SAMPLE_U8: return ((float)p[0] - 128.0f) * (1.0f / 128.0f);
-    case FA_SAMPLE_S8: return (float)(int8_t)p[0] * (1.0f / 128.0f);
-    case FA_SAMPLE_S16: { int16_t v; memcpy(&v, p, 2); return (float)v * (1.0f / 32768.0f); }
-    case FA_SAMPLE_S24: {
-        /* Packed 3 bytes: little endian unless the data is big endian. */
-        int big = swap ? !native_big_endian() : native_big_endian();
-        /* Assembled unsigned: shifting a byte into a signed int's sign bit is undefined. */
-        uint32_t u = big ? ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8)
-                         : ((uint32_t)p[2] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[0] << 8);
-        int32_t v = (int32_t)u;
-        return (float)(v >> 8) * (1.0f / 8388608.0f);
-    }
-    case FA_SAMPLE_S32: { int32_t v; memcpy(&v, p, 4); return (float)((double)v * (1.0 / 2147483648.0)); }
-    case FA_SAMPLE_S64: { int64_t v; memcpy(&v, p, 8); return (float)((double)v * (1.0 / 9223372036854775808.0)); }
-    case FA_SAMPLE_F32: { float v; memcpy(&v, p, 4); return v; }
-    default: { double v; memcpy(&v, p, 8); return (float)v; }
+    case FA_SAMPLE_U8:
+        for (i = 0; i < n; i++) out[i * out_step] = ((float)p[i * step] - 128.0f) * (1.0f / 128.0f);
+        break;
+    case FA_SAMPLE_S8:
+        for (i = 0; i < n; i++) out[i * out_step] = (float)(int8_t)p[i * step] * (1.0f / 128.0f);
+        break;
+    case FA_SAMPLE_S16:
+        for (i = 0; i < n; i++) out[i * out_step] = (float)(int16_t)rd16(p + i * step, big) * (1.0f / 32768.0f);
+        break;
+    case FA_SAMPLE_S24:
+        /* Packed 3 bytes, assembled unsigned: shifting a byte into a signed int's
+         * sign bit is undefined. */
+        for (i = 0; i < n; i++) {
+            const uint8_t* q = p + i * step;
+            uint32_t u = big ? ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8)
+                             : ((uint32_t)q[2] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[0] << 8);
+            out[i * out_step] = (float)((int32_t)u >> 8) * (1.0f / 8388608.0f);
+        }
+        break;
+    case FA_SAMPLE_S32:
+        for (i = 0; i < n; i++)
+            out[i * out_step] = (float)((double)(int32_t)rd32(p + i * step, big) * (1.0 / 2147483648.0));
+        break;
+    case FA_SAMPLE_S64:
+        for (i = 0; i < n; i++)
+            out[i * out_step] = (float)((double)(int64_t)rd64(p + i * step, big) * (1.0 / 9223372036854775808.0));
+        break;
+    case FA_SAMPLE_F32:
+        for (i = 0; i < n; i++) {
+            uint32_t u = rd32(p + i * step, big);
+            float v;
+            memcpy(&v, &u, 4);
+            out[i * out_step] = v;
+        }
+        break;
+    default:
+        for (i = 0; i < n; i++) {
+            uint64_t u = rd64(p + i * step, big);
+            double v;
+            memcpy(&v, &u, 8);
+            out[i * out_step] = (float)v;
+        }
+        break;
     }
 }
 
 void fa_convert_to_f32(const void* const* planes, int kind, int planar, int big_endian,
                        uint32_t channels, fa_frames frames, float* out)
 {
-    int bytes = sample_bytes(kind);
+    size_t bytes = (size_t)sample_bytes(kind);
     int swap = big_endian && !native_big_endian();
-    fa_frames f;
     uint32_t c;
     if (kind == FA_SAMPLE_F32 && !planar && !swap) {
         memcpy(out, planes[0], (size_t)frames * channels * sizeof(float));
         return;
     }
-    if (planar) {
-        for (c = 0; c < channels; c++) {
-            const uint8_t* p = (const uint8_t*)planes[c];
-            if (kind == FA_SAMPLE_F32 && !swap)
-                for (f = 0; f < frames; f++) memcpy(&out[(size_t)f * channels + c], p + (size_t)f * 4, 4);
-            else
-                for (f = 0; f < frames; f++) out[(size_t)f * channels + c] = sample_at(p + (size_t)f * bytes, kind, swap);
-        }
-    } else {
-        const uint8_t* p = (const uint8_t*)planes[0];
-        size_t i, n = (size_t)frames * channels;
-        for (i = 0; i < n; i++) out[i] = sample_at(p + i * (size_t)bytes, kind, swap);
-    }
+    if (planar)
+        for (c = 0; c < channels; c++)
+            convert_run((const uint8_t*)planes[c], bytes, kind, swap, out + c, channels, (size_t)frames);
+    else
+        convert_run((const uint8_t*)planes[0], bytes, kind, swap, out, 1, (size_t)frames * channels);
 }
 
 /* ---- shared helpers ----------------------------------------------------------- */

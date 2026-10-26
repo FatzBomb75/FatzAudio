@@ -1164,21 +1164,29 @@ int fa_aac_sbr_apply(fa_aac_sbr* s, const float* const in[2], float* out[2])
         /* QMF analysis: 32 new slots after 8 of history. */
         memmove(ch->xlow[0], ch->xlow[SLOTS], sizeof(float) * HFGEN * 32 * 2);
         for (l = 0; l < SLOTS; l++) qmf_analysis(s, ch, in[c] + 32 * l, ch->xlow[HFGEN + l]);
-        /* This frame's high band. */
-        memset(ycur, 0, sizeof(s->y));
+        /* This frame's high band: only bands kx..kx+M are read back, so only those
+         * are cleared. */
         if (data) {
+            for (l = 0; l < SLOTS + 8; l++) memset(ycur[l][kx], 0, sizeof(float) * 2 * (size_t)M);
             hf_generate(s, ch, s->xhigh);
             hf_adjust(s, ch, s->xhigh, ycur);
         }
         /* The QMF matrix: low band delayed by t_HFAdj, the high band from the
-         * envelopes covering each slot (the last frame's for its overhang). */
-        memset(x, 0, sizeof(s->x[c]));
+         * envelopes covering each slot (the last frame's for its overhang). Each
+         * slot's bands are written once: low, zeros, high, zeros. */
         for (l = 0; l < XSLOTS; l++) {
-            int kxl = l < t_old ? s->kx_last : kx;
-            for (k = 0; k < kxl && k < 32; k++) {
+            int kxl = l < t_old ? s->kx_last : kx, low = kxl < 32 ? kxl : 32, hs, he;
+            for (k = 0; k < low; k++) {
                 x[l][k][0] = ch->xlow[l + HFADJ][k][0];
                 x[l][k][1] = ch->xlow[l + HFADJ][k][1];
             }
+            if (l >= SLOTS) hs = he = low;
+            else if (l < t_old) { hs = s->kx_last; he = s->kx_last + s->M_last; }
+            else { hs = kx; he = kx + M; }
+            if (hs < low) hs = low;
+            if (he < hs) he = hs;
+            if (hs > low) memset(x[l][low], 0, sizeof(float) * 2 * (size_t)(hs - low));
+            if (he < 64) memset(x[l][he], 0, sizeof(float) * 2 * (size_t)(64 - he));
             if (l >= SLOTS) continue;
             if (l < t_old) {
                 for (k = s->kx_last; k < s->kx_last + s->M_last; k++) {
