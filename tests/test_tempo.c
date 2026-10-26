@@ -1474,6 +1474,11 @@ static void test_position_event_loop_and_reverse(void)
     CHECK(after <= 2 * RATE && 2 * RATE < before);
     CHECK(render_until_armed(s, out, 0, 400, &before, &after));
     CHECK_EQ(after, 0);
+    /* Played again, it starts at the end: the end is reached at once. */
+    CHECK_EQ(fa_stream_add_position_event(s, 4 * RATE), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    CHECK(render_until_armed(s, out, 0, 1, &before, &after));
+    CHECK_EQ(before, 4 * RATE);
     fa_stream_close(s);
     free(out);
 }

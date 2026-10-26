@@ -2758,22 +2758,31 @@ FA_API fa_result FA_CALL fa_stream_get_marker(fa_stream* stream, fa_marker which
 
 FA_API fa_result FA_CALL fa_stream_add_position_event(fa_stream* stream, fa_frames frame)
 {
+    fa_result r = FA_ERROR_BUSY;
     int i;
     if (!stream || frame < FA_FRAMES_UNSET) return FA_ERROR_INVALID_ARG;
+    if (frame != FA_FRAMES_UNSET && stream->decoder.length >= 0 && frame > stream->decoder.length)
+        return FA_ERROR_INVALID_ARG;
+    /* api_lock serializes adds and clears; the mixer only ever frees a slot (CAS). */
+    fa_mutex_lock(&stream->api_lock);
     if (frame == FA_FRAMES_UNSET) {
         for (i = 0; i < FA_POSITION_EVENT_SLOTS; i++)
             if (fa_exchange64(&stream->pos_events[i], FA_FRAMES_UNSET) != FA_FRAMES_UNSET)
                 fa_fetch_add32(&stream->pos_armed, -1);
-        return FA_OK;
+        r = FA_OK;
+    } else {
+        int armed = 0;
+        for (i = 0; i < FA_POSITION_EVENT_SLOTS && !armed; i++) armed = fa_load64(&stream->pos_events[i]) == frame;
+        if (!armed) {
+            fa_fetch_add32(&stream->pos_armed, 1);   /* first, so the mixer never skips an armed slot */
+            for (i = 0; i < FA_POSITION_EVENT_SLOTS && !armed; i++)
+                armed = fa_cas64(&stream->pos_events[i], FA_FRAMES_UNSET, frame);
+            if (!armed) fa_fetch_add32(&stream->pos_armed, -1);
+        }
+        r = armed ? FA_OK : FA_ERROR_BUSY;
     }
-    if (stream->decoder.length >= 0 && frame > stream->decoder.length) return FA_ERROR_INVALID_ARG;
-    fa_fetch_add32(&stream->pos_armed, 1);   /* first, so the mixer never skips an armed slot */
-    for (i = 0; i < FA_POSITION_EVENT_SLOTS; i++)
-        if (fa_load64(&stream->pos_events[i]) == frame) { fa_fetch_add32(&stream->pos_armed, -1); return FA_OK; }
-    for (i = 0; i < FA_POSITION_EVENT_SLOTS; i++)
-        if (fa_cas64(&stream->pos_events[i], FA_FRAMES_UNSET, frame)) return FA_OK;
-    fa_fetch_add32(&stream->pos_armed, -1);
-    return FA_ERROR_BUSY;
+    fa_mutex_unlock(&stream->api_lock);
+    return r;
 }
 
 FA_API fa_result FA_CALL fa_stream_set_fade_curve(fa_stream* stream, fa_fade fade, const fa_ramp* shape)
@@ -3325,7 +3334,8 @@ static void frame_events(struct fa_stream* s, fa_device* dev, int64_t played0, i
  * the order heard; raising one frees its slot. Forward, the frames heard are
  * [w0, w1) (with w1 itself at the end); a wrap into the loop gives [w0, end] and
  * [back, w1), counting the loop end as passed like markers do. Reversed, they are
- * [w1, w0), or [back, w0) and [w1, end) where the loop wraps at its start. */
+ * [w1, w0), or [back, w0) and [w1, end] where the loop wraps at its start; the end
+ * also counts when playback starts there. */
 static void position_events(struct fa_stream* s, fa_device* dev, int64_t played0, int64_t played1, int ended)
 {
     fa_frames p0, p1, end, back, len, w0, w1, at[FA_POSITION_EVENT_SLOTS];
@@ -3349,10 +3359,11 @@ static void position_events(struct fa_stream* s, fa_device* dev, int64_t played0
         int hit;
         if (m == FA_FRAMES_UNSET) continue;
         if (rev) {
-            if (whole) hit = m >= back && m < end;
-            else if (looping && w1 > w0) hit = (m >= back && m < w0) || (m >= w1 && m < end);
-            else hit = m >= w1 && m < w0;
-            d = m < w0 ? w0 - 1 - m : (w0 - back) + (end - 1 - m);
+            /* The end itself is reached where playback starts from it or wraps to it. */
+            if (whole) hit = m >= back && m <= end;
+            else if (looping && w1 > w0) hit = (m >= back && m < w0) || (m >= w1 && m <= end);
+            else hit = m >= w1 && (m < w0 || (m == w0 && w0 == end));
+            d = m < w0 ? w0 - 1 - m : m == w0 ? -1 : (w0 - back) + (end - m);
         } else {
             if (whole) hit = m >= back && m <= end;
             else if (looping && w1 < w0) hit = (m >= w0 && m <= end) || (m >= back && m < w1);

@@ -58,7 +58,7 @@ song.MidiTextReached += (_, e) => Console.WriteLine($"lyric: {e.Text.Text}");
 - **Frame-exact.** It is raised in the mix callback that plays that frame, about one device latency before it is heard, and follows tempo, rate, loops and deck loops. A loop that wraps over the frame raises it on the wrap.
 - **Seeks.** Seeking over the frame doesn't raise it; it stays armed until playback passes it.
 - **Reverse.** Unlike markers, it is raised in [reverse playback](tempo-pitch.md#reverse-playback) too, when the position counts down past the frame (and where a reversed loop wraps from its start to its end).
-- **Limits.** Up to 64 frames can be armed per stream (`FA_ERROR_BUSY` after that); adding one that is already armed does nothing. A frame past a known length is `FA_ERROR_INVALID_ARG`; the length itself is reached as the stream ends. `FA_FRAMES_UNSET` removes every armed frame. Only streams played on a device raise it; decode-only streams don't.
+- **Limits.** Up to 64 frames can be armed per stream (`FA_ERROR_BUSY` after that); adding one that is already armed does nothing. A frame past a known length is `FA_ERROR_INVALID_ARG`; the length itself is reached as the stream ends (reversed, as playback starts there). `FA_FRAMES_UNSET` removes every armed frame. Only streams played on a device raise it; decode-only streams don't.
 - **Best effort**, like markers (see below).
 
 ```c

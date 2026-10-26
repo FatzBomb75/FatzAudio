@@ -1647,10 +1647,14 @@ public unsafe class AudioStream : IDisposable
     /// device only. Up to 64 positions are armed at once; adding one that is already armed does nothing.
     /// </summary>
     /// <param name="position">The position to watch.</param>
-    /// <exception cref="FatzAudioException">The position is past the stream's length
+    /// <exception cref="FatzAudioException">The position is negative or past the stream's length
     /// (<see cref="ErrorCode.InvalidArgument"/>), or 64 are armed already (<see cref="ErrorCode.Busy"/>).</exception>
-    public void AddPositionEvent(TimeSpan position) =>
-        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_add_position_event(Handle, TimeToFrames(position)));
+    public void AddPositionEvent(TimeSpan position)
+    {
+        long frame = TimeToFrames(position);
+        // -1 would be FA_FRAMES_UNSET (remove all); any negative position is an invalid argument.
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_add_position_event(Handle, frame < 0 ? -2 : frame));
+    }
 
     /// <summary>Removes every position armed with <see cref="AddPositionEvent"/> that has not been reached.</summary>
     public void ClearPositionEvents() =>

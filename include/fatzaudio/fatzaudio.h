@@ -935,9 +935,9 @@ FA_API fa_result FA_CALL fa_stream_get_loop(fa_stream* stream, int32_t* out_on);
  * are), CUE_OUT does not end the stream, a queued stream starts when this one ends
  * (no crossfade), deck sync does not pull the deck into phase, and fa_deck_beat_jump
  * and deck loop changes take effect at once rather than on a beat. The source is
- * decoded forward in half-second
- * blocks, one seek each. Push, packet and forward-only streams return
- * FA_ERROR_NOT_SEEKABLE, web streams FA_ERROR_NOT_IMPLEMENTED. */
+ * decoded forward in half-second blocks, one seek each. Push, packet and
+ * forward-only streams return FA_ERROR_NOT_SEEKABLE, web streams
+ * FA_ERROR_NOT_IMPLEMENTED. */
 FA_API fa_result FA_CALL fa_stream_set_reverse(fa_stream* stream, int32_t reverse);
 FA_API fa_result FA_CALL fa_stream_get_reverse(fa_stream* stream, int32_t* out_reverse);
 
