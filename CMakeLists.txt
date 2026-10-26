@@ -202,7 +202,8 @@ elseif(ANDROID)
 endif()
 # --gc-sections drops whole sections: give our own code, miniaudio (its decoders,
 # engine and backends we never call) and the Xiph codecs a section per function too.
-# About 460 KB off the Linux library. (Apple's linker splits by symbol already.)
+# About 460 KB off the Linux library. (The NDK's toolchain already compiles this way,
+# so it changes nothing on Android; Apple's linker splits by symbol already.)
 if(NOT MSVC AND NOT APPLE)
     foreach(t fatzaudio fa_opus fa_vorbis)
         target_compile_options(${t} PRIVATE -ffunction-sections -fdata-sections)

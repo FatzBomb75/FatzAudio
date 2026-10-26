@@ -870,6 +870,9 @@ static void test_sysex(void)
     static const uint8_t gs_master_half[] = { 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x04, 0x40, 0x7C, 0xF7 };
     static const uint8_t coarse_up[] = { 0x7F, 0x7F, 0x04, 0x04, 0x00, 0x4C, 0xF7 };       /* +12 semitones */
     static const uint8_t fine_down[] = { 0x7F, 0x7F, 0x04, 0x03, 0x00, 0x20, 0xF7 };       /* 4096: -0.5 semitone */
+    static const uint8_t gs_master_cut[] = { 0x41, 0x10, 0x42, 0x12, 0x40, 0x00, 0x04, 0xF7 };   /* no value */
+    static const uint8_t xg_master_cut[] = { 0x43, 0x10, 0x4C, 0x00, 0x00, 0x04, 0xF7 };
+    static const uint8_t master_cut[] = { 0x7F, 0x7F, 0x04, 0x01, 0x7F, 0xF7 };
     buf sf = make_sf2_ex(0, 12);
     fa_soundfont* font = NULL;
     const uint8_t* m[2];
@@ -910,6 +913,16 @@ static void test_sysex(void)
     m[0] = gs_master_half; n[0] = sizeof(gs_master_half);
     CHECK_NEAR(note_frequency(font, m, n, 1, 9, -1, &half), 880.0, 5.0);
     CHECK_NEAR(half / full, 64.0 / 127.0, 0.01);
+    /* Messages cut short (the F7 where the value goes) change nothing. */
+    m[0] = gs_master_cut; n[0] = sizeof(gs_master_cut);
+    CHECK_NEAR(note_frequency(font, m, n, 1, 9, -1, &half), 880.0, 5.0);
+    CHECK_NEAR(half / full, 1.0, 0.01);
+    m[0] = xg_master_cut; n[0] = sizeof(xg_master_cut);
+    CHECK_NEAR(note_frequency(font, m, n, 1, 9, -1, &half), 880.0, 5.0);
+    CHECK_NEAR(half / full, 1.0, 0.01);
+    m[0] = master_cut; n[0] = sizeof(master_cut);
+    CHECK_NEAR(note_frequency(font, m, n, 1, 9, -1, &half), 880.0, 5.0);
+    CHECK_NEAR(half / full, 1.0, 0.01);
     m[0] = coarse_up; n[0] = sizeof(coarse_up);
     CHECK_NEAR(note_frequency(font, m, n, 1, 0, -1, NULL), 880.0, 5.0);
     m[1] = fine_down; n[1] = sizeof(fine_down);

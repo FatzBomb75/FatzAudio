@@ -29,6 +29,7 @@ fa_eq_band custom[2] = {
 fa_stream_set_eq(song, custom, 2);
 
 fa_stream_set_eq_enabled(song, 0);            /* the EQ "off" button: glides to flat, keeps the bands */
+/* fa_stream_get_eq_enabled reads the switch back (.NET EqualizerEnabled) */
 fa_stream_set_eq(song, NULL, 0);              /* no bands at all */
 
 for (int p = 0; p < FA_EQ_PRESET_COUNT; p++)  /* fill a preset menu */

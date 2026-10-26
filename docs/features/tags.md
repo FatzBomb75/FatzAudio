@@ -86,6 +86,10 @@ A library scan that only needs text and a duration:
 fa_tags_read_path(path, FA_TAGS_NO_PICTURES, &tags);    /* pictures are skipped unread */
 ```
 
+Every picture, not only the cover: `fa_tags_get_picture_count` and `fa_tags_get_picture(tags, i, &pic)` list them in file order (none with `FA_TAGS_NO_PICTURES`; .NET `Tags.Pictures`).
+
+A file you already hold in memory (downloaded, or from a database): `fa_tags_read_memory(data, size, flags, &tags)` reads it like `fa_tags_read_path`. The bytes are used only during the call, not copied (.NET `Tags.Read` from a byte span).
+
 A stream that is already open:
 
 ```c

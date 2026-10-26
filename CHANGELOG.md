@@ -197,8 +197,13 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
 ### Changed
-- Linux and Android: the library is about 460 KB smaller (4.49 to 4.05 MiB on Linux x64): FatzAudio's own code,
-  miniaudio and the Xiph codecs are now built with a section per function, so the linker drops what is never called.
+- Linux: the library is about 460 KB smaller (4.49 to 4.05 MiB on Linux x64): FatzAudio's own code, miniaudio and
+  the Xiph codecs are now built with a section per function, so the linker drops what is never called. Android
+  builds were already made this way by the NDK, so their size did not change.
+- CI prints the shipped size of every library it builds (Windows, Linux, macOS, each Android ABI, iOS) in the job
+  summary and as a notice (`tools/lib-size.sh`).
+- CI runs every test suite on an Android 14 emulator and in the iOS simulator (`devices.yml`): on pull requests that
+  touch platform code, on every push to main, and by hand. See [docs/building.md](docs/building.md).
 - Render-ahead (CD+G and lyric surfaces) is not used on an engine with one worker thread: a 2160p frame with effects
   there could hold the only worker longer than a tempo stream's buffer lasts. `update_into` draws on your thread.
 - Lyric surfaces: the animation lengths follow `FA_PARAM_TEMPO` in steps of 0.25%, so render-ahead keeps working
@@ -272,6 +277,8 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- MIDI: a GS, XG or universal SysEx message cut short (its F7 where the value goes) is ignored. It used to read the
+  F7 as the value, so a broken GS master volume message nearly doubled the level.
 - DJ mixer: changing the crossfader curve with the crossfader away from the ends glides over 5 ms instead of
   stepping the decks by up to 3 dB. `fa_stream_get_loop_region` no longer returns the in point of one change with the
   out point of another.

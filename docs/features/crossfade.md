@@ -99,9 +99,9 @@ fa_stream_set_marker(s, FA_MARKER_CUE_OUT, 186 * rate);
 fa_stream_set_marker(s, FA_MARKER_MIX_POINT, 182 * rate);      /* next one starts here */
 
 fa_ramp out = { FA_CURVE_SCURVE };
-fa_stream_set_fade_curve(s, FA_FADE_OUT, &out);
+fa_stream_set_fade_curve(s, FA_FADE_OUT, &out);   /* fa_stream_get_fade_curve reads it back */
 
-fa_stream_set_marker(s, FA_MARKER_MIX_POINT, FA_FRAMES_UNSET); /* clear one */
+fa_stream_set_marker(s, FA_MARKER_MIX_POINT, FA_FRAMES_UNSET); /* clear one; fa_stream_get_marker reads one back */
 ```
 
 ```csharp
@@ -161,6 +161,7 @@ All of these multiply, so they never fight:
 
 ## Pitfalls
 
+- `fa_stream_get_next` returns the stream queued after one (NULL when none, or when it has started already; .NET `AudioStream.Next`).
 - `fa_crossfade` and `fa_stream_set_next` attach the next stream for you, but only to the same device. Attach it to another bus first if it should play through one.
 - Don't stop the outgoing stream yourself when a crossfade starts. It ends by itself when its fade is done (`await CrossfadeTo(...)` in .NET).
 - In C, `fa_device_close` releases the device's buses. Don't call `fa_bus_destroy` after it.

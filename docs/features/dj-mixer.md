@@ -114,7 +114,7 @@ mixer.CueLost += (_, _) => Console.WriteLine("headphones gone; call SetCueDevice
 - **Heard positions.** A delay on the master is part of what the crowd hears, so it is part of `fa_stream_get_clock` (`Clock`), and with it CD+G and lyric surfaces and video that follows the clock, deck meters, `fa_device_get_latency` and `mic_monitor`. `fa_stream_get_position`, which counts frames handed to the device, has no output latency in it.
 - **Trim.** The latencies the system reports are not exact. `FA_MIX_CUE_TRIM_MS` (`CueTrim`, −250..250 ms) is added to the master's: raise it when the headphones sound early against the speakers, lower it when late. It takes effect at once and can't be ramped.
 - **Changes.** A change of alignment (a trim, a mic turned to monitored, other headphones) makes a short gap in the output it delays (5 ms fades on the master); changes under 5 ms in the headphones glide in.
-- **Mode.** The headphones open in the mixer's latency mode (low when it is exclusive, which a second device can't share) and move with `fa_mixer_set_latency_mode`.
+- **Mode.** The headphones open in the mixer's latency mode (low when it is exclusive, which a second device can't share) and move with `fa_mixer_set_latency_mode` (`fa_mixer_get_latency_mode`, `LatencyMode`).
 - **Lost headphones.** Headphones that go away go silent and raise `FA_EVENT_CUE_LOST` (`CueLost`) once; the master plays on untouched, keeping any delay. `fa_mixer_set_cue_device` (`SetCueDevice`) opens the same or other headphones (lined up anew). It is `FA_ERROR_INVALID_ARG` on a mixer made without `FA_CUE_DEVICE`.
 - **Systems.** Windows, macOS, Linux and Android (where the system may route both outputs to one place). iOS is `FA_ERROR_NOT_IMPLEMENTED`: use `FA_CUE_SPLIT`.
 
@@ -127,13 +127,15 @@ mixer.CueLost += (_, _) => Console.WriteLine("headphones gone; call SetCueDevice
 | `FA_MIX_CUE_MIX` / `CueMix` | 0 (cue) .. 1 (master) | 0 |
 | `FA_MIX_CUE_GAIN` / `CueGain` | 0..4, linear | 1 |
 | `FA_MIX_CUE_TRIM_MS` / `CueTrim` | −250..250 ms, [second-device cue](#second-device-cue) only, not rampable | 0 |
-| `fa_mixer_set_crossfader_curve` / `Crossfader.Curve` | constant power (each side −3 dB in the middle, steady loudness) or linear (−6 dB, a slight dip); a change mid-set glides over 5 ms | constant power |
+| `fa_mixer_set_crossfader_curve` / `fa_mixer_get_crossfader_curve`, `Crossfader.Curve` | constant power (each side −3 dB in the middle, steady loudness) or linear (−6 dB, a slight dip); a change mid-set glides over 5 ms | constant power |
 | `FA_DECK_GAIN` / `Gain` | 0..1, the channel fader | 1 |
 | `FA_DECK_TRIM_DB` / `TrimDb` | −12..+12 dB, on top of loudness normalization | 0 |
 | `FA_DECK_EQ_LOW_DB`, `_MID_DB`, `_HIGH_DB` / `Eq.Low`, `Eq.Mid`, `Eq.High` | `FA_DECK_EQ_KILL_DB` (−60, silent) .. +6 dB | 0 |
 | `FA_DECK_XFADER_SIDE` / `Side` | thru (0), A (1), B (2) | deck 1 A, deck 2 B |
 | `FA_DECK_CUE` / `Cue` | off / on | off |
 | `FA_DECK_SYNC_RANGE` / `SyncRange` | 0.01..1: the most [sync](#sync-and-beat-loops) moves the deck's tempo away from 1, not rampable | 0.16 (±16%) |
+
+Every parameter has a getter: `fa_mixer_get_param`, `fa_deck_get_param` and `fa_mic_get_param` return the current value. `fa_mixer_get_output_channels` gives the device's output channel count and the first cue channel (-1 when there are no cue channels; .NET `OutputChannels`, `CueChannel`). `fa_mic_get_index` gives a mic's slot, 0 or 1, as used in `fa_mixer_latency.mic_*` and `fa_mixer_event.index` (.NET `Mic.Index`).
 
 ## Rules
 
@@ -142,8 +144,8 @@ mixer.CueLost += (_, _) => Console.WriteLine("headphones gone; call SetCueDevice
 - `fa_deck_load` attaches the stream to the mixer's device through the deck, from wherever it was, keeping its position. Loading over a stream that is playing and heard (fader up and the crossfader not closed on its side) is `FA_ERROR_BUSY` unless `FA_DECK_LOAD_FORCE` (`force: true`). Loading a stream that isn't playing also shortens its decode-ahead to 60 ms, so tempo and pitch moves are heard quickly.
 - A deck holds one stream. `fa_crossfade` or `fa_stream_set_next` from a deck's stream to a stream that isn't attached yet is `FA_ERROR_INVALID_ARG`: load the next song on the other deck and use the crossfader. A crossfade between the streams of two decks works.
 - A deck's stream may be closed (disposed) from any thread, also while it is loaded: it leaves its deck first, under the mixer's lock, so a deck call on another thread (or the engine's event thread driving [sync](#sync-and-beat-loops) and [auto-mix](#auto-mix)) finishes before it goes.
-- The device mute (`fa_device_set_mute`, `Output.Muted`) silences the headphones too.
-- The cue point (`fa_deck_set_cue_point`, `CuePoint`) defaults to the stream's CUE_IN marker, else 0. `fa_deck_cue` (`ReturnToCuePoint`) pauses the deck and goes back to it.
+- The device mute (`fa_device_set_mute` / `fa_device_get_mute`, `Output.Muted`) silences the headphones too.
+- The cue point (`fa_deck_set_cue_point` / `fa_deck_get_cue_point`, `CuePoint`) defaults to the stream's CUE_IN marker, else 0. `fa_deck_cue` (`ReturnToCuePoint`) pauses the deck and goes back to it.
 - The meter (`fa_deck_get_levels`) shows the deck after trim, EQ and fader, before the crossfader, as heard now.
 - `latency` defaults to `FA_LATENCY_LOW`: on Windows the WASAPI low-latency shared mode at the device's own rate (needs a driver that offers small periods, most do), about 5 ms periods elsewhere. `FA_LATENCY_NORMAL` uses the engine's period. `FA_LATENCY_EXCLUSIVE` (opt-in) is Windows WASAPI exclusive with 3 ms periods for the output and the mics: other apps can't use those devices meanwhile and the Windows volume no longer applies (the mixer's gains and `fa_device_set_volume` still do); `FA_ERROR_NOT_IMPLEMENTED` on other systems, `FA_ERROR_DEVICE` when another app holds the device. `fa_mixer_set_latency_mode` (`LatencyMode`) moves a running mixer to another mode: the devices close and open again (a moment of silence) and playback carries on. When the new mode can't be had the mixer stays in its own and returns that error; a mic input that won't open in the new mode raises `FA_EVENT_INPUT_LOST`.
 - Closing the mixer's device, or the engine, destroys the mixer. In .NET, `DjMixer` keeps its `OutputDevice`, so dispose the mixer, not its `Output`.
@@ -209,7 +211,7 @@ TimeSpan delay = mic.MonitorLatency;            // voice to speaker
 | Gate | `FA_MIC_GATE_DB` | `GateDb` | −100 (off) .. 0 dB | −50 |
 | Low cut | `FA_MIC_LOW_CUT` | `LowCut` | an 80 Hz high-pass, on / off | on |
 | Monitor | `FA_MIC_MONITOR`, `fa_mic_config.monitor` | `Monitor`, `MicOptions.Monitor` | heard through the master, or metered only (a mic that goes through a hardware mixer) | heard |
-| EQ | `fa_mic_set_eq` | `SetEqualizer` | the stream EQ's bands and presets ([equalizer](equalizer.md)); `FA_EQ_PRESET_LIVE_VOCAL` is made for mics | off |
+| EQ | `fa_mic_set_eq` / `fa_mic_get_eq` | `SetEqualizer` / `GetEqualizer` | the stream EQ's bands and presets ([equalizer](equalizer.md)); `FA_EQ_PRESET_LIVE_VOCAL` is made for mics | off |
 | Reverb send | `FA_MIC_REVERB_SEND` | `ReverbSend` | 0..1 into the shared reverb | 0.2 |
 | Echo send | `FA_MIC_ECHO_SEND` | `EchoSend` | 0..1 into the shared echo | 0 |
 
@@ -232,7 +234,7 @@ fa_mic_effects fx;
 fa_mic_effects_init(&fx);              /* the defaults below */
 fx.reverb_size = 0.7f;
 fx.echo_time_ms = 180;
-fa_mixer_set_mic_effects(mixer, &fx);
+fa_mixer_set_mic_effects(mixer, &fx);   /* fa_mixer_get_mic_effects reads them back */
 fa_mic_set_param(mic, FA_MIC_ECHO_SEND, 0.3f);
 ```
 
@@ -253,7 +255,7 @@ The reverb is the one the MIDI synthesizer uses (eight combs and four allpasses 
 
 ### Ducking
 
-While a host mic speaks above the threshold, the music (the decks after the crossfader, and any other stream on the mixer's device) goes down by the depth; it comes back after the hold and the release. It is on with these defaults from the start, so marking a mic `FA_MIC_DUCKS_MUSIC` is enough; `fa_mixer_set_ducking(mixer, NULL)` (`Ducking = null`) turns it off.
+While a host mic speaks above the threshold, the music (the decks after the crossfader, and any other stream on the mixer's device) goes down by the depth; it comes back after the hold and the release. It is on with these defaults from the start, so marking a mic `FA_MIC_DUCKS_MUSIC` is enough; `fa_mixer_set_ducking(mixer, NULL)` (`Ducking = null`) turns it off. `fa_ducking_init` fills a `fa_ducking` with the defaults below; `fa_mixer_get_ducking` reads the setting back.
 
 | Setting | C (`fa_ducking`) | .NET (`Ducking`) | Range | Default |
 |---|---|---|---|---|
