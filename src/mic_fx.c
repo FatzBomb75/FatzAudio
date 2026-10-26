@@ -165,14 +165,6 @@ fa_result fa_mic_bus_make(struct fa_mixer* m)
 
 /* ---- audio thread ---------------------------------------------------------------- */
 
-static int all_zero(const float* x, uint32_t n)
-{
-    uint32_t i;
-    for (i = 0; i < n; i++)
-        if (x[i] != 0.0f) return 0;
-    return 1;
-}
-
 /* The echo: the send through the delay line into vox (both sides alike). */
 static void echo_process(struct fa_mixer* m, fa_mic_bus* b, uint32_t frames)
 {
@@ -182,7 +174,7 @@ static void echo_process(struct fa_mixer* m, fa_mic_bus* b, uint32_t frames)
     float a, fb_step;
     int64_t since;
     uint32_t i;
-    if (b->echo_idle && all_zero(b->esend, frames)) {
+    if (b->echo_idle && fa_all_zero(b->esend, frames)) {
         b->echo_delay = target;   /* nothing to bend: take the new time at once */
         b->echo_fb = fb_to;
         return;
@@ -237,7 +229,7 @@ static void duck_process(struct fa_mixer* m, fa_mic_bus* b, float* out, uint32_t
     uint32_t i, off;
     if (!b->hosts && b->duck_db == 0.0f && b->duck_env == 0.0f) return;
     depth = fa_load_float(&m->duck_depth);
-    thr = powf(10.0f, fa_load_float(&m->duck_threshold) / 20.0f);
+    thr = fa_db_to_lin(fa_load_float(&m->duck_threshold));
     follow = expf(-1.0f / ((float)DUCK_FOLLOW_MS * 0.001f * (float)b->rate));
     att = (float)fa_load64(&m->duck_attack) * 1e-9f * (float)b->rate;
     rel = (float)fa_load64(&m->duck_release) * 1e-9f * (float)b->rate;
@@ -245,7 +237,7 @@ static void duck_process(struct fa_mixer* m, fa_mic_bus* b, float* out, uint32_t
     down = -depth / att;
     up = (depth < 0.0f ? -depth : 12.0f) / rel;
     hold = (int64_t)((double)fa_load64(&m->duck_hold) * 1e-9 * b->rate);
-    g_prev = powf(10.0f, b->duck_db / 20.0f);
+    g_prev = fa_db_to_lin(b->duck_db);
     for (i = 0; i < frames; i++) {
         float x = b->hosts ? b->duck[i] : 0.0f;
         b->duck_env = x > b->duck_env ? x : b->duck_env * follow;
@@ -262,7 +254,7 @@ static void duck_process(struct fa_mixer* m, fa_mic_bus* b, float* out, uint32_t
     if (b->duck_env < 1e-20f) b->duck_env = 0.0f;
     for (off = 0; off < frames; off += MIXER_SUB) {
         uint32_t n = frames - off < MIXER_SUB ? frames - off : MIXER_SUB, j;
-        float g1 = powf(10.0f, b->duck[off + n - 1] / 20.0f), inv = 1.0f / (float)n;
+        float g1 = fa_db_to_lin(b->duck[off + n - 1]), inv = 1.0f / (float)n;
         if (g_prev == 1.0f && g1 == 1.0f) continue;
         for (j = 0; j < n; j++) {
             float g = g_prev + (g1 - g_prev) * (float)(j + 1) * inv;

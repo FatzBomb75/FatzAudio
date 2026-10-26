@@ -154,7 +154,7 @@ static void render_block(fa_device* dev, float* out, uint32_t frames, int64_t no
         float level = dev->mute_level, target = (float)fa_load32(&dev->muted);
         if (level != target) {
             for (i = 0; i < frames; i++) {
-                level = fa_mute_glide(level, target, 1, dev->rate);
+                level = fa_glide(level, target, 1, dev->rate);
                 out[i * FA_DEVICE_CHANNELS] *= 1.0f - level;
                 out[i * FA_DEVICE_CHANNELS + 1] *= 1.0f - level;
             }
@@ -307,7 +307,7 @@ fa_result fa_device_reopen_mode(fa_device* d, fa_latency_mode mode, void (*betwe
     fa_latency_mode old = d->open_mode;
     fa_result r = FA_OK;
     int ok;
-    if (mode == FA_LATENCY_EXCLUSIVE && d->engine->context.backend != ma_backend_wasapi) return FA_ERROR_NOT_IMPLEMENTED;
+    if (!fa_device_mode_supported(d->engine, mode)) return FA_ERROR_NOT_IMPLEMENTED;
     fa_mutex_lock(&d->life_lock);
     if (fa_load32(&d->closing)) {
         fa_mutex_unlock(&d->life_lock);
@@ -517,7 +517,7 @@ fa_result fa_device_open_with(fa_engine* engine, const char* device_id, uint32_t
     pr = fa_device_parse_id(engine, FA_DEVICE_PLAYBACK, device_id, &id, &has_id);
     if (pr != FA_OK) return pr;
     if (has_id) pid = &id;
-    if (mode == FA_LATENCY_EXCLUSIVE && engine->context.backend != ma_backend_wasapi) return FA_ERROR_NOT_IMPLEMENTED;
+    if (!fa_device_mode_supported(engine, mode)) return FA_ERROR_NOT_IMPLEMENTED;
 
     d = (fa_device*)calloc(1, sizeof(*d));
     if (!d) return FA_ERROR_OUT_OF_MEMORY;

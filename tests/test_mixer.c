@@ -423,6 +423,13 @@ static void test_gains(void)
     CHECK_EQ(fa_mixer_get_crossfader_curve(r.m, &curve), FA_OK);
     CHECK_EQ(curve, FA_XFADER_LINEAR);
     CHECK_NEAR(sine_rms(&r, 0, buf, 24576) / k_sine_rms, 0.5, 0.01);
+    /* A curve change glides over 5 ms: the first millisecond stays near linear's 0.5
+     * instead of stepping to constant power's 0.707. */
+    CHECK_EQ(fa_mixer_set_crossfader_curve(r.m, FA_XFADER_CONSTANT_POWER), FA_OK);
+    rig_render(&r, buf, 1024);
+    CHECK(rms_of(buf, r.channels, g_rate / 1000, g_rate / 1000, 0) / k_sine_rms < 0.6);
+    CHECK_NEAR(rms_of(buf, r.channels, 1024, 512, 0) / k_sine_rms, 0.7071, 0.02);
+    CHECK_EQ(fa_mixer_set_crossfader_curve(r.m, FA_XFADER_LINEAR), FA_OK);
     fa_mixer_set_param(r.m, FA_MIX_CROSSFADER, 1.0f);                              /* all the way to B */
     CHECK(sine_rms(&r, 0, buf, 24576) / k_sine_rms < 0.001);
     CHECK_EQ(fa_deck_set_param(r.a, FA_DECK_XFADER_SIDE, 0.0f), FA_OK);             /* thru */

@@ -539,9 +539,6 @@ static void test_input_lost(void)
     /* A callback may remove the mic it is told about. */
     fa_mic_remove(mic);
     CHECK(sim_mic(&s, -1, s.dev->rate, s.dev->rate, 1, &mic));
-    /* Off the real input like the first: on a real system (the Android emulator) the
-     * backend's late "started" would otherwise count as the input coming back. */
-    fa_mic_test_take_over(mic, s.dev->rate, 1);
     r.count = 0;
     r.remove = 1;
     fa_mic_test_lose(mic);

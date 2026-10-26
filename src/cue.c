@@ -387,7 +387,7 @@ void fa_mixer_cue_render(struct fa_mixer* m, fa_device* dev, float* master, uint
         const float* cs = m->cue + (size_t)i * 2;
         const float* mm = master + (size_t)i * 2;
         float audible;
-        if (mute != mute1) mute = fa_mute_glide(mute, mute1, 1, dev->rate);
+        if (mute != mute1) mute = fa_glide(mute, mute1, 1, dev->rate);
         audible = 1.0f - mute;
         q->cue[i * 2] = clip1(cs[0] * audible + m->cue_master[i] * mm[0]);
         q->cue[i * 2 + 1] = clip1(cs[1] * audible + m->cue_master[i] * mm[1]);

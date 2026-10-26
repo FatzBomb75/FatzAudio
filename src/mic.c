@@ -97,8 +97,6 @@ static void capture_pull(fa_capture* c, fa_device* dev, uint32_t frames, int hol
 
 /* ---- the channel strip (master callback) ---------------------------------------- */
 
-static float db_to_lin(float db) { return powf(10.0f, db / 20.0f); }
-
 /* Per sub-block edge (start, end): the gains after the strip. */
 typedef struct strip_out {
     float audible[2], monitor[2], left[2], right[2], reverb[2], echo[2];
@@ -110,7 +108,7 @@ static void mic_process(struct fa_mic* mic, fa_mic_bus* b, fa_device* dev, int64
     uint32_t rate = dev->rate, off, i;
     float thr = fa_load_float(&mic->gate_db);
     int gate_on = thr > GATE_OFF_DB;
-    float open_lin = db_to_lin(thr), close_lin = open_lin * 0.5f;
+    float open_lin = fa_db_to_lin(thr), close_lin = open_lin * 0.5f;
     float follow = expf(-1.0f / ((float)GATE_FOLLOW_MS * 0.001f * (float)rate));
     float att = 1.0f / ((float)GATE_ATTACK_MS * 0.001f * (float)rate);
     float rel = 1.0f / ((float)GATE_RELEASE_MS * 0.001f * (float)rate);
@@ -120,7 +118,7 @@ static void mic_process(struct fa_mic* mic, fa_mic_bus* b, fa_device* dev, int64
     int host = (mic->flags & FA_MIC_DUCKS_MUSIC) != 0;
     fa_tap* tap;
     uint32_t k;
-    take_lanes(mic->lanes, MIC_LANES, rate);
+    fa_lanes_take(mic->lanes, MIC_LANES, rate);
     /* Low cut, gain and gate into buf (the mono voice on both channels, for the EQ and
      * the meter); the output gains (mute, monitor, pan, sends) kept per sub-block. */
     for (off = 0, k = 0; off < frames; off += MIXER_SUB, k++) {
@@ -128,8 +126,8 @@ static void mic_process(struct fa_mic* mic, fa_mic_bus* b, fa_device* dev, int64
         float v0[MIC_LANES], v1[MIC_LANES], g0, g1, inv = 1.0f / (float)n;
         int e;
         lane_span(mic->lanes, MIC_LANES, clock, clock + off, n, v0, v1);
-        g0 = db_to_lin(v0[MIC_GAIN]);
-        g1 = db_to_lin(v1[MIC_GAIN]);
+        g0 = fa_db_to_lin(v0[MIC_GAIN]);
+        g1 = fa_db_to_lin(v1[MIC_GAIN]);
         for (i = 0; i < n; i++) {
             float f = (float)i * inv, x = c->out[(size_t)(off + i) * CAPTURE_LANES + mic->lane];
             float lc = v0[MIC_LOW_CUT] + (v1[MIC_LOW_CUT] - v0[MIC_LOW_CUT]) * f, h;
@@ -202,7 +200,7 @@ static void mic_process(struct fa_mic* mic, fa_mic_bus* b, fa_device* dev, int64
             if (host && fabsf(y) > b->duck[at]) b->duck[at] = fabsf(y);
         }
     }
-    end_lanes(mic->lanes, MIC_LANES, clock, frames);
+    fa_lanes_end(mic->lanes, MIC_LANES, clock, frames);
 }
 
 void fa_mixer_mics_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t frames)
@@ -801,7 +799,11 @@ void fa_mic_test_feed(fa_mic* mic, const float* frames, uint32_t n)
 
 void fa_mic_test_lose(fa_mic* mic)
 {
-    flag_lost(mic->cap);
+    fa_capture* c = mic->cap;
+    /* As a backend does: the input stops, so its start notification (sent after
+     * ma_device_start returns, and clearing a loss) cannot come after the loss. */
+    if (c->device_ok && ma_device_is_started(&c->device)) ma_device_stop(&c->device);
+    flag_lost(c);
 }
 
 void fa_mic_test_back(fa_mic* mic)
