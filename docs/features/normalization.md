@@ -81,7 +81,7 @@ Open it with `FA_OPEN_NO_NORMALIZE` (.NET: `new StreamOptions { NoNormalize = tr
 
 ## True-peak limiter
 
-A boost can push peaks over full scale, and so can two loud streams crossfading. Every output device therefore has a **true-peak limiter**: it detects peaks between samples too (4x oversampling), looks 1.5 ms ahead so it is already at the right gain when a peak arrives, releases smoothly over about 150 ms, and never touches audio below the ceiling.
+A boost can push peaks over full scale, and so can two loud streams crossfading. Every output device therefore has a **true-peak limiter**: it detects peaks between samples too (4x oversampling), looks 1.5 ms ahead so it is already at the right gain when a peak arrives, releases smoothly over about 150 ms back to exactly unity gain, and never touches audio below the ceiling.
 
 ```c
 fa_engine_set_limiter(engine, FA_LIMITER_AUTO, -1.0);  /* the default: on while normalization is on */

@@ -318,27 +318,6 @@ static const uint16_t cp1252[32] = {
     0xFFFD, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0xFFFD, 0x017E, 0x0178
 };
 
-static int valid_utf8(const uint8_t* s, size_t n)
-{
-    size_t i = 0;
-    while (i < n) {
-        uint8_t c = s[i];
-        size_t k, len;
-        if (c < 0x80) { i++; continue; }
-        if (c >= 0xC2 && c <= 0xDF) len = 2;
-        else if (c >= 0xE0 && c <= 0xEF) len = 3;
-        else if (c >= 0xF0 && c <= 0xF4) len = 4;
-        else return 0;
-        if (n - i < len) return 0;
-        for (k = 1; k < len; k++) if ((s[i + k] & 0xC0) != 0x80) return 0;
-        /* No overlong forms, UTF-16 surrogates or code points above U+10FFFF. */
-        if ((c == 0xE0 && s[i + 1] < 0xA0) || (c == 0xED && s[i + 1] > 0x9F) ||
-            (c == 0xF0 && s[i + 1] < 0x90) || (c == 0xF4 && s[i + 1] > 0x8F)) return 0;
-        i += len;
-    }
-    return 1;
-}
-
 /* How a file's text is read (detected once per file, or forced by the app). AUTO
  * keeps each event that is valid UTF-8 and reads the others as Windows-1252, as
  * files of mixed origin need. */
@@ -352,14 +331,6 @@ static uint32_t sjis_char(uint32_t lead, uint32_t trail)
     if (trail >= 0x40 && trail <= 0x7E) return sjis_map[row][trail - 0x40];
     if (trail >= 0x80 && trail <= 0xFC) return sjis_map[row][trail - 0x80 + 63];
     return 0;
-}
-
-static size_t put_utf8(char* out, uint32_t c)
-{
-    if (c < 0x80) { out[0] = (char)c; return 1; }
-    if (c < 0x800) { out[0] = (char)(0xC0 | (c >> 6)); out[1] = (char)(0x80 | (c & 0x3F)); return 2; }
-    out[0] = (char)(0xE0 | (c >> 12)); out[1] = (char)(0x80 | ((c >> 6) & 0x3F)); out[2] = (char)(0x80 | (c & 0x3F));
-    return 3;
 }
 
 /* A lead and trail byte at s[i] that make one Shift-JIS character, mapped or not
@@ -380,7 +351,7 @@ static char* text_utf8_as(const char* in, size_t n, int conv)
     char* out;
     size_t i, k = 0;
     if (n >= 3 && s[0] == 0xEF && s[1] == 0xBB && s[2] == 0xBF) { s += 3; n -= 3; }
-    utf8 = conv == CONV_AUTO && valid_utf8(s, n);
+    utf8 = conv == CONV_AUTO && fa_utf8_valid(s, n);
     out = (char*)malloc(n * 3 + 1);
     if (!out) return NULL;
     for (i = 0; i < n; i++) {
@@ -395,7 +366,7 @@ static char* text_utf8_as(const char* in, size_t n, int conv)
         } else if (c < 0xA0) {
             c = cp1252[c - 0x80];
         }
-        k += put_utf8(out + k, c);
+        k += fa_put_utf8(out + k, c);
     }
     out[k] = '\0';
     return out;
@@ -1255,7 +1226,7 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
             for (i = 0; i < n && t[i] < 0x80; i++) {}
             if (i < n) {
                 any_high = 1;
-                if (!valid_utf8(t, n)) all_utf8 = 0;
+                if (!fa_utf8_valid(t, n)) all_utf8 = 0;
                 sjis_score(t, n, &sj_pairs, &sj_kana, &sj_bad);
             }
         }

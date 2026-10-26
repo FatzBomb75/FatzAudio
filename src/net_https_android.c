@@ -429,12 +429,14 @@ static int append_jstring(JNIEnv* env, jstring s, char** out, size_t* n, size_t*
     return 1;
 }
 
-/* The response headers as "Name: value\r\n" lines (malloc'd). */
-static char* collect_headers(JNIEnv* env, jobject conn)
+/* The response headers as "Name: value\r\n" lines (malloc'd). NULL with *err set
+ * when out of memory or longer than FA_HTTP_HEAD_MAX, as the other backends. */
+static char* collect_headers(JNIEnv* env, jobject conn, fa_result* err)
 {
     size_t cap = 4096, n = 0;
     char* out = (char*)malloc(cap);
     jint i;
+    *err = FA_ERROR_OUT_OF_MEMORY;
     if (!out) return NULL;
     out[0] = 0;
     for (i = 0; i < 1024; i++) {
@@ -451,6 +453,7 @@ static char* collect_headers(JNIEnv* env, jobject conn)
         }
         (*env)->DeleteLocalRef(env, v);
         if (!ok) break;
+        if (n > FA_HTTP_HEAD_MAX) { free(out); *err = FA_ERROR_NETWORK; return NULL; }
     }
     return out;
 }
@@ -462,13 +465,14 @@ static fa_result run_response(JNIEnv* env, const fa_http_request* req, const cha
                               fa_http_head_proc on_head, fa_http_data_proc on_data, void* user, char** out_redirect,
                               int* out_whole)
 {
-    char* headers = collect_headers(env, conn);
+    fa_result head_err = FA_OK;
+    char* headers = collect_headers(env, conn, &head_err);
     fa_http_response resp;
     jobject in;
     jbyteArray buf;
     jbyte* chunk;
     fa_result r = FA_OK;
-    if (!headers) return FA_ERROR_OUT_OF_MEMORY;
+    if (!headers) return head_err;
     if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
         char loc[FA_NET_URL_MAX];
         if (fa_http_header(headers, "Location", loc, sizeof(loc))) {

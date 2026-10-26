@@ -751,6 +751,29 @@ static void test_limiter(void)
     CHECK_EQ(fa_engine_set_limiter(g_engine, FA_LIMITER_AUTO, -1.0), FA_OK);
 }
 
+/* After a reduction the gain releases all the way back to 1: quiet audio a few
+ * seconds later passes unchanged, not about 0.002 dB down (the release step
+ * stops moving short of 1 in float). */
+static void test_limiter_releases_to_unity(void)
+{
+    fa_limiter lim;
+    uint32_t rate = 48000, i, n = rate * 4;
+    float* x = (float*)malloc((size_t)n * 2 * sizeof(float));
+    float* orig = (float*)malloc((size_t)n * 2 * sizeof(float));
+    float ceiling = (float)pow(10.0, -1.0 / 20.0);
+    CHECK_EQ(fa_limiter_init(&lim, rate, 2), FA_OK);
+    for (i = 0; i < n; i++) {
+        float v = (float)((i < rate / 2 ? 2.0 : 0.5) * sin(2.0 * PI * 997.0 * i / rate));
+        x[i * 2] = x[i * 2 + 1] = orig[i * 2] = orig[i * 2 + 1] = v;
+    }
+    fa_limiter_process(&lim, x, n, ceiling, 1);
+    CHECK(lim.gain == 1.0f);
+    for (i = n - rate / 2; i < n; i++) CHECK(x[i * 2] == orig[(i - (uint32_t)lim.delay) * 2]);
+    fa_limiter_free(&lim);
+    free(x);
+    free(orig);
+}
+
 /* The limiter measures true peaks a block at a time: each frame's value must be
  * exactly what pushing frame by frame gives, at every oversampling (4, 2 and 1
  * phases) and channel count, on odd block sizes, and a block skipped as unable to
@@ -888,6 +911,7 @@ int main(void)
     RUN(test_running_estimate_for_io);
     RUN(test_close_during_scan);
     RUN(test_limiter);
+    RUN(test_limiter_releases_to_unity);
     RUN(test_truepeak_block_matches_push);
     RUN(test_limiter_switching_is_smooth);
     RUN(test_scan_release_races);

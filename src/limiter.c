@@ -106,8 +106,14 @@ static float limit_frame(fa_limiter* l, float* frame, float need, float ceiling,
     box_avg = (float)(l->box_sum / (double)l->attack);
     if (box_avg > 1.0f) box_avg = 1.0f;
 
-    /* Instant into reduction, smooth release out of it. */
-    g = box_avg < l->gain ? box_avg : box_avg + (l->gain - box_avg) * l->release;
+    /* Instant into reduction, smooth release out of it. A release step that no
+     * longer moves the gain (float rounding, about 0.002 dB short of 1) lands on
+     * the target, so the gain gets back to exactly 1. */
+    if (box_avg < l->gain) g = box_avg;
+    else {
+        g = box_avg + (l->gain - box_avg) * l->release;
+        if (g == l->gain) g = box_avg;
+    }
     l->gain = g;
 
     /* Fade between bypass and limiting when switched. */
@@ -134,15 +140,11 @@ static float limit_frame(fa_limiter* l, float* frame, float need, float ceiling,
     return ge;
 }
 
-/* 1 when the gain has released as far as it will: the box average is 1 and the
- * release step leaves the gain where it is. That is 1 before the first reduction,
- * and after one a value a little under 1 (about 0.9998), where 1 + (gain - 1) *
- * release rounds back to gain. */
+/* 1 when the gain has released all the way: the box average and the gain are 1. */
 static int released(const fa_limiter* l)
 {
     float box_avg = (float)(l->box_sum / (double)l->attack);
-    if (box_avg > 1.0f) box_avg = 1.0f;
-    return box_avg == 1.0f && box_avg + (l->gain - box_avg) * l->release == l->gain;
+    return box_avg >= 1.0f && l->gain == 1.0f;
 }
 
 /* A block while nothing in the window needs a reduction, the gain has released
@@ -151,7 +153,7 @@ static int released(const fa_limiter* l)
 static void pass_block(fa_limiter* l, float* b, uint32_t n, float ceiling)
 {
     uint32_t i, c, ch = l->channels;
-    float ge = l->mix >= 1.0f ? l->gain : 1.0f + l->mix * (l->gain - 1.0f);
+    float ge = 1.0f;   /* the gain is 1 (released) */
     for (i = 0; i < n; i++) {
         float* slot = l->audio + (size_t)l->apos * ch;
         float* frame = b + (size_t)i * ch;

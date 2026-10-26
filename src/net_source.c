@@ -135,32 +135,15 @@ int fa_net_wait(fa_net* n, uint32_t ms)
 
 /* ---- ICY metadata ---------------------------------------------------------- */
 
-static int valid_utf8(const char* s)
-{
-    const unsigned char* p = (const unsigned char*)s;
-    while (*p) {
-        int k = *p < 0x80 ? 0 : (*p & 0xE0) == 0xC0 ? 1 : (*p & 0xF0) == 0xE0 ? 2 : (*p & 0xF8) == 0xF0 ? 3 : -1;
-        if (k < 0) return 0;
-        p++;
-        while (k-- > 0) { if ((*p & 0xC0) != 0x80) return 0; p++; }
-    }
-    return 1;
-}
-
 /* Stations send UTF-8 or Latin-1; everything leaves FatzAudio as UTF-8. */
 static char* to_utf8(const char* s, size_t len)
 {
-    char* out = (char*)malloc(len * 2 + 1);
+    char* out;
     size_t i, o = 0;
+    if (fa_utf8_valid(s, len)) return fa_strndup(s, len);
+    out = (char*)malloc(len * 2 + 1);
     if (!out) return NULL;
-    memcpy(out, s, len);
-    out[len] = 0;
-    if (valid_utf8(out)) return out;
-    for (i = 0; i < len; i++) {
-        unsigned char c = (unsigned char)s[i];
-        if (c < 0x80) out[o++] = (char)c;
-        else { out[o++] = (char)(0xC0 | (c >> 6)); out[o++] = (char)(0x80 | (c & 0x3F)); }
-    }
+    for (i = 0; i < len; i++) o += fa_put_utf8(out + o, (unsigned char)s[i]);
     out[o] = 0;
     return out;
 }
