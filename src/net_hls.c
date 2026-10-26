@@ -12,13 +12,6 @@
 #define FA_HLS_LIVE_START 3          /* live: start this many segments from the end */
 #define FA_HLS_SEGMENT_RETRIES 3
 
-static char* dup_n(const char* s, size_t n)
-{
-    char* d = (char*)malloc(n + 1);
-    if (d) { memcpy(d, s, n); d[n] = 0; }
-    return d;
-}
-
 /* ---- playlists ------------------------------------------------------------- */
 
 /* Value of `key` in an attribute list (KEY=value,KEY="quoted, value"), into out. */
@@ -140,7 +133,7 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
                 out->is_master = 1;
                 bandwidth = attr(tmp + 18, "BANDWIDTH", v, sizeof(v)) ? (uint32_t)strtoul(v, NULL, 10) : 0;
                 free(codecs);
-                codecs = attr(tmp + 18, "CODECS", v, sizeof(v)) ? dup_n(v, strlen(v)) : NULL;
+                codecs = attr(tmp + 18, "CODECS", v, sizeof(v)) ? fa_strdup(v) : NULL;
             } else if (strncmp(tmp, "#EXT-X-MEDIA:", 13) == 0) {
                 char type[32], uri[FA_NET_URL_MAX], def[8];
                 out->is_master = 1;
@@ -149,7 +142,7 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
                     int is_default = attr(tmp + 13, "DEFAULT", def, sizeof(def)) && strcmp(def, "YES") == 0;
                     if (!out->audio_group_uri || (is_default && !audio_default)) {
                         free(out->audio_group_uri);
-                        out->audio_group_uri = dup_n(resolved, strlen(resolved));
+                        out->audio_group_uri = fa_strdup(resolved);
                         audio_default = is_default;
                     }
                 }
@@ -178,7 +171,7 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
                     else if (strcmp(v, "NONE") != 0) { r = FA_ERROR_PROTECTED_CONTENT; break; }  /* SAMPLE-AES, DRM */
                 }
                 if (key_method && attr(tmp + 11, "URI", v, sizeof(v)) && fa_url_resolve(base, v, resolved, sizeof(resolved)) == FA_OK)
-                    key_uri = dup_n(resolved, strlen(resolved));
+                    key_uri = fa_strdup(resolved);
                 if (key_method && !key_uri) { r = FA_ERROR_UNSUPPORTED_FORMAT; break; }
                 if (attr(tmp + 11, "IV", v, sizeof(v))) has_iv = parse_iv(v, iv);
             } else if (strncmp(tmp, "#EXT-X-MAP:", 11) == 0) {
@@ -186,7 +179,7 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
                 free(map_uri);
                 map_uri = NULL;
                 if (attr(tmp + 11, "URI", v, sizeof(v)) && fa_url_resolve(base, v, resolved, sizeof(resolved)) == FA_OK)
-                    map_uri = dup_n(resolved, strlen(resolved));
+                    map_uri = fa_strdup(resolved);
             }
             continue;
         }
@@ -209,7 +202,7 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
                 out->variant_codecs = c;
                 var_cap = cap;
             }
-            out->variant_uri[out->variant_count] = dup_n(resolved, strlen(resolved));
+            out->variant_uri[out->variant_count] = fa_strdup(resolved);
             out->variant_bandwidth[out->variant_count] = bandwidth;
             out->variant_codecs[out->variant_count] = codecs;
             codecs = NULL;
@@ -228,16 +221,16 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
             }
             s = &out->segments[out->segment_count++];
             memset(s, 0, sizeof(*s));
-            s->uri = dup_n(resolved, strlen(resolved));
+            s->uri = fa_strdup(resolved);
             s->duration = extinf >= 0 ? extinf : out->target_duration;
             s->start = t;
             s->seq = seq++;
             s->discontinuity = discontinuity;
             s->key_method = key_method;
-            s->key_uri = key_uri ? dup_n(key_uri, strlen(key_uri)) : NULL;
+            s->key_uri = fa_strdup(key_uri);
             s->has_iv = has_iv;
             memcpy(s->iv, iv, 16);
-            s->map_uri = map_uri ? dup_n(map_uri, strlen(map_uri)) : NULL;
+            s->map_uri = fa_strdup(map_uri);
             s->byte_offset = br_len >= 0 ? br_off : 0;
             s->byte_length = br_len;
             if (br_len >= 0) next_br_off = br_off + br_len;
@@ -274,13 +267,6 @@ int fa_hls_pick_variant(const fa_hls_playlist* p, uint32_t max_bw)
         if (best < 0 || bw > p->variant_bandwidth[best]) best = i;
     }
     return best >= 0 ? best : lowest;
-}
-
-int fa_hls_detect(const char* ct, const uint8_t* head, size_t n, const char* url)
-{
-    (void)url;
-    if (ct && (fa_strncasecmp_ascii(ct, "application/vnd.apple.mpegurl", 29) == 0)) return 1;
-    return n >= 7 && memcmp(head, "#EXTM3U", 7) == 0;
 }
 
 /* ---- MPEG-TS ------------------------------------------------------------------ */
@@ -740,7 +726,6 @@ static int take_seek(fa_net* n, hls_state* h)
         n->win_start = n->win_end = n->read_pos = 0;
         n->finished = 0;
         n->starving = 1;
-        n->hls_generation++;
         n->hls_seek = 0;
         fa_store32(&n->cancel, 0);
         fa_cond_broadcast(&n->cond);

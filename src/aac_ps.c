@@ -11,10 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 #define SLOTS 32
 #define MAX_ENV 5            /* 4 plus one added to reach the frame's end */
 #define MAX_PAR 34
@@ -30,7 +26,6 @@ typedef struct ps_config {
     int npar;                /* parameter bands */
     int allpass_bands, short_delay_band, decay_cutoff, nipd;
     const int8_t* k_to_i;
-    float f_center[MAX_BANDS];
 } ps_config;
 
 struct fa_aac_ps {
@@ -38,7 +33,7 @@ struct fa_aac_ps {
     int header_seen;
     int enable_iid, iid_mode, enable_icc, icc_mode, enable_ext, enable_ipdopd;
     /* frame */
-    int num_env, num_env_last;
+    int num_env;
     int border[MAX_ENV + 1];
     int8_t iid[MAX_ENV][MAX_PAR], icc[MAX_ENV][MAX_PAR], ipd[MAX_ENV][17], opd[MAX_ENV][17];
     int8_t iid_last[MAX_PAR], icc_last[MAX_PAR], ipd_last[17], opd_last[17];
@@ -96,7 +91,7 @@ static void make_filter(float (*f)[13][2], const float* proto, int bands)
     for (q = 0; q < bands; q++)
         for (n = 0; n < 13; n++) {
             float g = proto[n < 7 ? n : 12 - n];
-            double theta = 2.0 * M_PI * (q + 0.5) * (n - 6) / bands;
+            double theta = 2.0 * FA_PI * (q + 0.5) * (n - 6) / bands;
             f[q][n][0] = (float)(g * cos(theta));
             f[q][n][1] = (float)(g * -sin(theta));
         }
@@ -123,12 +118,11 @@ fa_aac_ps* fa_aac_ps_create(void)
             float f;
             if (k < cf->nhybrid) f = c ? f_center_34[k] / 24.0f : f_center_20[k] / 8.0f;
             else f = (float)(k - cf->nhybrid + cf->qsplit) + 0.5f;
-            cf->f_center[k] = f;
-            p->phi_fract[c][k][0] = (float)cos(-M_PI * 0.39 * f);
-            p->phi_fract[c][k][1] = (float)sin(-M_PI * 0.39 * f);
+            p->phi_fract[c][k][0] = (float)cos(-FA_PI * 0.39 * f);
+            p->phi_fract[c][k][1] = (float)sin(-FA_PI * 0.39 * f);
             for (m = 0; m < AP_LINKS; m++) {
-                p->q_fract[c][k][m][0] = (float)cos(-M_PI * q_link[m] * f);
-                p->q_fract[c][k][m][1] = (float)sin(-M_PI * q_link[m] * f);
+                p->q_fract[c][k][m][0] = (float)cos(-FA_PI * q_link[m] * f);
+                p->q_fract[c][k][m][1] = (float)sin(-FA_PI * q_link[m] * f);
             }
         }
     }
@@ -138,7 +132,7 @@ fa_aac_ps* fa_aac_ps_create(void)
     make_filter(p->f4, fa_aac_ps_p4_13_34, 4);
     for (i = 0; i < 512; i++) {
         /* Phase smoothing: 0.25, 0.5 and 1 times the last three phases. */
-        double a0 = M_PI / 4 * (i >> 6), a1 = M_PI / 4 * ((i >> 3) & 7), a2 = M_PI / 4 * (i & 7);
+        double a0 = FA_PI / 4 * (i >> 6), a1 = FA_PI / 4 * ((i >> 3) & 7), a2 = FA_PI / 4 * (i & 7);
         double re = 0.25 * cos(a0) + 0.5 * cos(a1) + cos(a2), im = 0.25 * sin(a0) + 0.5 * sin(a1) + sin(a2);
         double mag = sqrt(re * re + im * im);
         p->pd_smooth[i][0] = (float)(mag > 0 ? re / mag : 1.0);
@@ -169,7 +163,6 @@ void fa_aac_ps_reset(fa_aac_ps* p)
     memset(p->ipd_last, 0, sizeof(p->ipd_last));
     memset(p->opd_last, 0, sizeof(p->opd_last));
     p->num_env = 0;
-    p->num_env_last = 0;
 }
 
 /* ---- ps_data() ------------------------------------------------------------------------ */
@@ -211,7 +204,6 @@ int fa_aac_ps_parse(fa_aac_ps* p, fa_aac_bits* b, int bits_left)
     }
     if (!p->header_seen) return -1;
     frame_class = (int)fa_aac_get(b, 1);
-    p->num_env_last = p->num_env;
     p->num_env = num_env_tab[frame_class][fa_aac_get(b, 2)];
     p->border[0] = -1;
     if (frame_class) {
@@ -596,12 +588,12 @@ static void mixing_matrix(const fa_aac_ps* p, int iid, int icc, float h[4])
     } else {
         /* procedure R_B */
         float r = rho > 0.05f ? rho : 0.05f, alpha, mu, gamma;
-        if (fabsf(c * c - 1.0f) < 1e-9f) alpha = (float)(M_PI / 4);
+        if (fabsf(c * c - 1.0f) < 1e-9f) alpha = (float)(FA_PI / 4);
         else alpha = 0.5f * atanf(2.0f * c * r / (c * c - 1.0f));
         mu = c + 1.0f / c;
         mu = sqrtf(1.0f + (4.0f * r * r - 4.0f) / (mu * mu));
         gamma = atanf(sqrtf((1.0f - mu) / (1.0f + mu)));
-        if (alpha < 0.0f) alpha += (float)(M_PI / 2);
+        if (alpha < 0.0f) alpha += (float)(FA_PI / 2);
         h[0] = 1.41421356f * cosf(alpha) * cosf(gamma);
         h[1] = 1.41421356f * sinf(alpha) * cosf(gamma);
         h[2] = -1.41421356f * sinf(alpha) * sinf(gamma);

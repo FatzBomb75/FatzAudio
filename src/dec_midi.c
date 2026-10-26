@@ -65,8 +65,6 @@ struct fa_soundfont {
     char name[256];
 };
 
-static uint32_t rd32le(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
-
 /* The bank's name: RIFF sfbk > LIST INFO > INAM. Also the size of the sample data
  * (smpl in LIST sdta), each kept as float. */
 static void sf2_scan(const uint8_t* d, size_t n, char* name, size_t cap, uint64_t* sample_memory)
@@ -76,7 +74,7 @@ static void sf2_scan(const uint8_t* d, size_t n, char* name, size_t cap, uint64_
     *sample_memory = 0;
     if (n < 12) return;
     while (pos + 8 <= n) {
-        uint32_t size = rd32le(d + pos + 4);
+        uint32_t size = fa_le32(d + pos + 4);
         size_t body = pos + 8, end;
         if (size > n - body) size = (uint32_t)(n - body);
         end = body + size;
@@ -84,7 +82,7 @@ static void sf2_scan(const uint8_t* d, size_t n, char* name, size_t cap, uint64_
             size_t sub = body + 4;
             int info = memcmp(d + body, "INFO", 4) == 0, sdta = memcmp(d + body, "sdta", 4) == 0;
             while (sub + 8 <= end) {
-                uint32_t len = rd32le(d + sub + 4);
+                uint32_t len = fa_le32(d + sub + 4);
                 if (len > end - sub - 8) len = (uint32_t)(end - sub - 8);
                 if (info && memcmp(d + sub, "INAM", 4) == 0) {
                     size_t k = 0;
@@ -954,34 +952,7 @@ static void midi_close(fa_decoder* dec)
 /* The whole source, however it is given (its length may be unknown). */
 static fa_result read_source(fa_source* src, uint8_t** out, size_t* out_size)
 {
-    /* One byte of slack: the read that finds the end needs no extra room, and a
-     * file of exactly FA_MIDI_MAX_FILE bytes fits. */
-    size_t cap, n = 0;
-    uint8_t* buf;
-    *out = NULL;
-    *out_size = 0;
-    if (src->length > (int64_t)FA_MIDI_MAX_FILE) return FA_ERROR_UNSUPPORTED_FORMAT;
-    cap = (src->length > 0 ? (size_t)src->length : 65536) + 1;
-    buf = (uint8_t*)malloc(cap);
-    if (!buf) return FA_ERROR_OUT_OF_MEMORY;
-    for (;;) {
-        int64_t got;
-        if (n == cap) {
-            uint8_t* grown;
-            if (cap > FA_MIDI_MAX_FILE) { free(buf); return FA_ERROR_UNSUPPORTED_FORMAT; }
-            cap = cap * 2 > FA_MIDI_MAX_FILE + 1 ? FA_MIDI_MAX_FILE + 1 : cap * 2;
-            grown = (uint8_t*)realloc(buf, cap);
-            if (!grown) { free(buf); return FA_ERROR_OUT_OF_MEMORY; }
-            buf = grown;
-        }
-        got = fa_source_read(src, buf + n, cap - n);
-        if (got < 0) { free(buf); return (fa_result)got; }
-        if (got == 0) break;
-        n += (size_t)got;
-    }
-    *out = buf;
-    *out_size = n;
-    return FA_OK;
+    return fa_source_read_rest(src, FA_MIDI_MAX_FILE, out, out_size);
 }
 
 /* The Standard MIDI File inside `d`: the file itself, or the "data" chunk of a
@@ -992,7 +963,7 @@ static const uint8_t* find_smf(const uint8_t* d, size_t n, size_t* out_n)
     if (n >= 14 && memcmp(d, "MThd", 4) == 0) { *out_n = n; return d; }
     if (n < 12 || memcmp(d, "RIFF", 4) != 0 || memcmp(d + 8, "RMID", 4) != 0) return NULL;
     for (pos = 12; pos + 8 <= n;) {
-        uint32_t size = rd32le(d + pos + 4);
+        uint32_t size = fa_le32(d + pos + 4);
         if (size > n - pos - 8) size = (uint32_t)(n - pos - 8);   /* a truncated file: what is there */
         if (memcmp(d + pos, "data", 4) == 0 && size >= 14 && memcmp(d + pos + 8, "MThd", 4) == 0) {
             *out_n = size;

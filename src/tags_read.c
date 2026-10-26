@@ -20,10 +20,6 @@
 #define MKV_MAX_ELEMENTS 200000       /* top-level elements visited before giving up */
 
 static int read_exact(fa_source* src, void* buf, size_t n) { return fa_source_read(src, buf, n) == (int64_t)n; }
-static uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
-static uint32_t be24(const uint8_t* p) { return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | p[2]; }
-static uint16_t be16(const uint8_t* p) { return (uint16_t)((p[0] << 8) | p[1]); }
-static uint32_t le32(const uint8_t* p) { return ((uint32_t)p[3] << 24) | ((uint32_t)p[2] << 16) | ((uint32_t)p[1] << 8) | p[0]; }
 static uint32_t synchsafe(const uint8_t* p) { return ((uint32_t)(p[0] & 0x7f) << 21) | ((uint32_t)(p[1] & 0x7f) << 14) | ((uint32_t)(p[2] & 0x7f) << 7) | (p[3] & 0x7f); }
 
 /* Reads n bytes at `pos` into a malloc'ed, NUL-terminated block. */
@@ -99,13 +95,13 @@ static char* text_utf16(const uint8_t* p, size_t n, int big)
     char* out = (char*)malloc(n / 2 * 3 + 1);
     if (!out) return NULL;
     while (i + 1 < n) {
-        uint32_t u = big ? be16(p + i) : (uint32_t)(p[i] | (p[i + 1] << 8));
+        uint32_t u = big ? fa_be16(p + i) : fa_le16(p + i);
         i += 2;
         if (u == 0) break;
         if (u == 0xFEFF) continue;
         if (u == 0xFFFE) { big = !big; continue; }
         if (u >= 0xD800 && u < 0xDC00 && i + 1 < n) {
-            uint32_t lo = big ? be16(p + i) : (uint32_t)(p[i] | (p[i + 1] << 8));
+            uint32_t lo = big ? fa_be16(p + i) : fa_le16(p + i);
             if (lo >= 0xDC00 && lo < 0xE000) { u = 0x10000 + ((u - 0xD800) << 10) + (lo - 0xDC00); i += 2; }
             else u = 0xFFFD;
         } else if (u >= 0xD800 && u < 0xE000) {
@@ -273,7 +269,7 @@ static void id3_frames(fa_source* src, int64_t pos, int64_t end, int ver, int un
         if (fh[0] == 0) return;                          /* padding */
         if (ver == 2) {
             size_t i;
-            fsize = be24(fh + 3);
+            fsize = fa_be24(fh + 3);
             memcpy(id, fh, 3);
             id[3] = '\0';
             for (i = 0; i < sizeof(id3v22_ids) / sizeof(id3v22_ids[0]); i++)
@@ -282,10 +278,10 @@ static void id3_frames(fa_source* src, int64_t pos, int64_t end, int ver, int un
             memcpy(id, fh, 4);
             id[4] = '\0';
             /* ID3v2.4 sizes are synchsafe, but some writers store them plain. */
-            fsize = ver == 4 && !((fh[4] | fh[5] | fh[6] | fh[7]) & 0x80) ? synchsafe(fh + 4) : be32(fh + 4);
+            fsize = ver == 4 && !((fh[4] | fh[5] | fh[6] | fh[7]) & 0x80) ? synchsafe(fh + 4) : fa_be32(fh + 4);
             if (ver == 4 && pos + hl + fsize + hl <= end && fsize >= 0x80) {
                 uint8_t nx[4];
-                int64_t plain = be32(fh + 4);
+                int64_t plain = fa_be32(fh + 4);
                 /* If the synchsafe size leads nowhere but the plain one leads to a frame, take that. */
                 if (fa_source_seek(src, pos + hl + fsize) == FA_OK && read_exact(src, nx, 4) &&
                     !((nx[0] >= 'A' && nx[0] <= 'Z') || (nx[0] >= '0' && nx[0] <= '9') || nx[0] == 0) &&
@@ -344,7 +340,7 @@ static int64_t read_id3v2(fa_source* src, int64_t at, fa_tag_sink* sink)
             fa_source mem;
             size_t n = id3_unsync(body, (size_t)size);
             size_t skip = 0;
-            if (ver == 3 && (flags & 0x40) && n >= 4) skip = 4 + be32(body);
+            if (ver == 3 && (flags & 0x40) && n >= 4) skip = 4 + fa_be32(body);
             if (skip < n && fa_source_open_memory_ref(&mem, body + skip, n - skip) == FA_OK) {
                 id3_frames(&mem, 0, (int64_t)(n - skip), ver, 0, sink);
                 fa_source_close(&mem);
@@ -355,7 +351,7 @@ static int64_t read_id3v2(fa_source* src, int64_t at, fa_tag_sink* sink)
         if (ver >= 3 && (flags & 0x40)) {                /* extended header */
             uint8_t e[4];
             if (!read_exact(src, e, 4)) return end - at;
-            pos += ver == 4 ? synchsafe(e) : (int64_t)be32(e) + 4;
+            pos += ver == 4 ? synchsafe(e) : (int64_t)fa_be32(e) + 4;
         }
         id3_frames(src, pos, end, ver, ver == 4 && (flags & 0x80), sink);
     }
@@ -415,9 +411,9 @@ static int64_t read_ape_at(fa_source* src, int64_t footer_pos, fa_tag_sink* sink
     int64_t pos, total;
     if (footer_pos < 0 || fa_source_seek(src, footer_pos) != FA_OK || !read_exact(src, f, 32)) return 0;
     if (memcmp(f, "APETAGEX", 8) != 0) return 0;
-    size = le32(f + 12);                  /* items + footer */
-    count = le32(f + 16);
-    tflags = le32(f + 20);
+    size = fa_le32(f + 12);                  /* items + footer */
+    count = fa_le32(f + 16);
+    tflags = fa_le32(f + 20);
     if (size < 32 || (int64_t)size > footer_pos + 32) return 0;
     total = (int64_t)size + ((tflags & 0x80000000u) ? 32 : 0);
     if (!sink) return total;
@@ -428,8 +424,8 @@ static int64_t read_ape_at(fa_source* src, int64_t footer_pos, fa_tag_sink* sink
         size_t k = 0;
         uint32_t vlen, iflags;
         if (fa_source_seek(src, pos) != FA_OK || !read_exact(src, ih, 8)) break;
-        vlen = le32(ih);
-        iflags = le32(ih + 4);
+        vlen = fa_le32(ih);
+        iflags = fa_le32(ih + 4);
         pos += 8;
         for (;;) {                        /* key, NUL-terminated */
             uint8_t c;
@@ -510,7 +506,7 @@ static int64_t read_flac(fa_source* src, int64_t start, fa_tag_sink* sink, uint3
         if (fa_source_seek(src, pos) != FA_OK || !read_exact(src, h, 4)) return 0;
         last = h[0] & 0x80;
         type = h[0] & 0x7f;
-        len = be24(h + 1);
+        len = fa_be24(h + 1);
         if (type == 0 && len >= 34 && bits) {
             uint8_t si[34];
             if (read_exact(src, si, 34)) *bits = (uint32_t)(((si[12] & 1) << 4) | (si[13] >> 4)) + 1;
@@ -535,19 +531,17 @@ typedef struct mp4_box {
     int64_t pos, data, end;     /* header, body and end offsets */
 } mp4_box;
 
-#define FCC(a, b, c, d) (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
-
 static int mp4_next(fa_source* src, int64_t pos, int64_t end, mp4_box* b)
 {
     uint8_t h[16];
     uint64_t size;
     int64_t hl = 8;
     if (pos + 8 > end || fa_source_seek(src, pos) != FA_OK || !read_exact(src, h, 8)) return 0;
-    size = be32(h);
-    b->type = be32(h + 4);
+    size = fa_be32(h);
+    b->type = fa_be32(h + 4);
     if (size == 1) {
         if (!read_exact(src, h + 8, 8)) return 0;
-        size = ((uint64_t)be32(h + 8) << 32) | be32(h + 12);
+        size = ((uint64_t)fa_be32(h + 8) << 32) | fa_be32(h + 12);
         hl = 16;
     } else if (size == 0) {
         size = (uint64_t)(end - pos);
@@ -588,15 +582,15 @@ static void mp4_item(uint32_t type, const uint8_t* p, size_t n, fa_tag_sink* sin
     size_t pos = 0;
     mp4_key(type, key);
     while (pos + 8 <= n) {
-        uint32_t size = be32(p + pos), atom = be32(p + pos + 4);
+        uint32_t size = fa_be32(p + pos), atom = fa_be32(p + pos + 4);
         const uint8_t* d = p + pos + 8;
         size_t dl;
         if (size < 8 || size > n - pos) return;
         dl = size - 8;
-        if (atom == FCC('n', 'a', 'm', 'e') && dl >= 4) {
+        if (atom == FA_FOURCC('n', 'a', 'm', 'e') && dl >= 4) {
             snprintf(key, sizeof(key), "%.*s", (int)(dl - 4 < 255 ? dl - 4 : 255), (const char*)(d + 4));
-        } else if (atom == FCC('d', 'a', 't', 'a') && dl >= 8) {
-            uint32_t dt = be32(d) & 0xFFFFFF;
+        } else if (atom == FA_FOURCC('d', 'a', 't', 'a') && dl >= 8) {
+            uint32_t dt = fa_be32(d) & 0xFFFFFF;
             const uint8_t* v = d + 8;
             size_t vl = dl - 8;
             char num[32];
@@ -608,11 +602,11 @@ static void mp4_item(uint32_t type, const uint8_t* p, size_t n, fa_tag_sink* sin
                 char* s = text_utf16(v, vl, 1);
                 if (s) sink->text(sink, FA_TAG_FORMAT_MP4, key, s);
                 free(s);
-            } else if ((dt == 13 || dt == 14 || dt == 27 || (dt == 0 && type == FCC('c', 'o', 'v', 'r'))) && sink->picture) {
+            } else if ((dt == 13 || dt == 14 || dt == 27 || (dt == 0 && type == FA_FOURCC('c', 'o', 'v', 'r'))) && sink->picture) {
                 const char* mime = dt == 13 ? "image/jpeg" : dt == 14 ? "image/png" : dt == 27 ? "image/bmp" : fa_tags_image_mime(v, vl);
                 sink->picture(sink, FA_TAG_FORMAT_MP4, FA_PICTURE_FRONT_COVER, mime, "", v, vl);
-            } else if ((dt == 0 || dt == 21) && (type == FCC('t', 'r', 'k', 'n') || type == FCC('d', 'i', 's', 'k')) && vl >= 6) {
-                uint16_t no = be16(v + 2), total = be16(v + 4);
+            } else if ((dt == 0 || dt == 21) && (type == FA_FOURCC('t', 'r', 'k', 'n') || type == FA_FOURCC('d', 'i', 's', 'k')) && vl >= 6) {
+                uint16_t no = fa_be16(v + 2), total = fa_be16(v + 4);
                 if (total) snprintf(num, sizeof(num), "%u/%u", no, total);
                 else snprintf(num, sizeof(num), "%u", no);
                 if (no || total) sink->text(sink, FA_TAG_FORMAT_MP4, key, num);
@@ -641,24 +635,24 @@ static void read_mp4(fa_source* src, fa_tag_sink* sink)
     mp4_box moov, udta, meta, ilst, it;
     int64_t len = src->length, pos;
     int found = 0;
-    if (!mp4_find(src, 0, len, FCC('m', 'o', 'o', 'v'), &moov)) return;
-    if (mp4_find(src, moov.data, moov.end, FCC('u', 'd', 't', 'a'), &udta) &&
-        mp4_find(src, udta.data, udta.end, FCC('m', 'e', 't', 'a'), &meta))
+    if (!mp4_find(src, 0, len, FA_FOURCC('m', 'o', 'o', 'v'), &moov)) return;
+    if (mp4_find(src, moov.data, moov.end, FA_FOURCC('u', 'd', 't', 'a'), &udta) &&
+        mp4_find(src, udta.data, udta.end, FA_FOURCC('m', 'e', 't', 'a'), &meta))
         found = 1;
-    else if (mp4_find(src, moov.data, moov.end, FCC('m', 'e', 't', 'a'), &meta))
+    else if (mp4_find(src, moov.data, moov.end, FA_FOURCC('m', 'e', 't', 'a'), &meta))
         found = 1;
     if (!found) return;
     {
         /* ISO meta is a full box (4 bytes of version and flags); QuickTime's is not. */
         uint8_t h[8];
         int64_t first = meta.data;
-        if (fa_source_seek(src, meta.data) == FA_OK && read_exact(src, h, 8) && be32(h + 4) != FCC('h', 'd', 'l', 'r')) first += 4;
-        if (!mp4_find(src, first, meta.end, FCC('i', 'l', 's', 't'), &ilst)) return;
+        if (fa_source_seek(src, meta.data) == FA_OK && read_exact(src, h, 8) && fa_be32(h + 4) != FA_FOURCC('h', 'd', 'l', 'r')) first += 4;
+        if (!mp4_find(src, first, meta.end, FA_FOURCC('i', 'l', 's', 't'), &ilst)) return;
     }
     pos = ilst.data;
     while (mp4_next(src, pos, ilst.end, &it)) {
         int64_t n = it.end - it.data;
-        int pic = it.type == FCC('c', 'o', 'v', 'r');
+        int pic = it.type == FA_FOURCC('c', 'o', 'v', 'r');
         if (pic ? sink->picture != NULL && n <= (int64_t)TAG_MAX_FRAME : n <= (int64_t)sink->max_text + 64) {
             uint8_t* body = read_block(src, it.data, (size_t)n);
             if (body) mp4_item(it.type, body, (size_t)n, sink);
@@ -697,10 +691,10 @@ static void read_riff(fa_source* src, fa_tag_sink* sink)
         uint8_t c[8];
         int64_t size;
         if (fa_source_seek(src, pos) != FA_OK || !read_exact(src, c, 8)) break;
-        size = le32(c + 4);
+        size = fa_le32(c + 4);
         if (rf64 && memcmp(c, "ds64", 4) == 0 && size >= 16) {
             uint8_t d[16];
-            if (read_exact(src, d, 16)) data64 = (int64_t)(((uint64_t)le32(d + 12) << 32) | le32(d + 8));
+            if (read_exact(src, d, 16)) data64 = (int64_t)(((uint64_t)fa_le32(d + 12) << 32) | fa_le32(d + 8));
         }
         if (memcmp(c, "data", 4) == 0 && size == 0xFFFFFFFF && data64 >= 0) size = data64;
         if (size > end - pos) break;    /* runs past the file (also keeps pos from overflowing) */
@@ -719,7 +713,7 @@ static void read_riff(fa_source* src, fa_tag_sink* sink)
             char key[5];
             uint32_t size;
             if (fa_source_seek(src, p) != FA_OK || !read_exact(src, c, 8)) break;
-            size = le32(c + 4);
+            size = fa_le32(c + 4);
             if (p + 8 + size > e) break;
             memcpy(key, c, 4);
             key[4] = '\0';
@@ -741,7 +735,7 @@ static void read_aiff(fa_source* src, fa_tag_sink* sink)
         uint8_t c[8];
         uint32_t size;
         if (fa_source_seek(src, pos) != FA_OK || !read_exact(src, c, 8)) break;
-        size = be32(c + 4);
+        size = fa_be32(c + 4);
         if (memcmp(c, "ID3 ", 4) == 0 || memcmp(c, "id3 ", 4) == 0) id3 = pos + 8;
         else if ((memcmp(c, "NAME", 4) == 0 || memcmp(c, "AUTH", 4) == 0 || memcmp(c, "(c) ", 4) == 0 ||
                   memcmp(c, "ANNO", 4) == 0) && nt < 64) {

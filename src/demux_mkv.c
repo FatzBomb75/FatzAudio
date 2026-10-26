@@ -385,9 +385,6 @@ static int set_extra(mkv* m, const uint8_t* p, size_t n)
     return 1;
 }
 
-static uint16_t le16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-static uint32_t le32(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
-
 static const char* pcm_name(int is_float, int big, uint64_t bits)
 {
     if (is_float) return bits == 64 ? "pcm_f64le" : bits == 32 ? "pcm_f32le" : NULL;
@@ -477,11 +474,11 @@ static fa_result map_codec(mkv* m, const mkv_entry* t, fa_codec_params* cp)
         const uint8_t* w = t->priv.p;
         uint32_t tag, bits;
         if (!t->has_priv || t->priv.len < 16) return FA_ERROR_UNSUPPORTED_FORMAT;
-        tag = le16(w);
-        channels = le16(w + 2);
-        rate = le32(w + 4);
-        bits = le16(w + 14);
-        if (tag == 0xFFFE && t->priv.len >= 18 + 22) tag = le16(w + 18 + 6);
+        tag = fa_le16(w);
+        channels = fa_le16(w + 2);
+        rate = fa_le32(w + 4);
+        bits = fa_le16(w + 14);
+        if (tag == 0xFFFE && t->priv.len >= 18 + 22) tag = fa_le16(w + 18 + 6);
         if (tag == 1 || tag == 3) {
             name = pcm_name(tag == 3, 0, bits);
             block_align = channels * (bits / 8);

@@ -181,7 +181,7 @@ static void echo_process(struct fa_mixer* m, fa_mic_bus* b, uint32_t frames)
     }
     glide = 1.0 - exp(-1.0 / (ECHO_GLIDE_MS * 0.001 * b->rate));
     hz = fmin(ECHO_TONE_LOW_HZ * pow(ECHO_TONE_SPAN, fa_load_float(&m->fx[MFX_ECHO_TONE])), 0.45 * b->rate);
-    a = (float)exp(-2.0 * k_pi * hz / b->rate);
+    a = (float)exp(-2.0 * FA_PI * hz / b->rate);
     fb_step = (fb_to - b->echo_fb) / (float)frames;
     b->echo_idle = 0;
     since = b->echo_quiet + frames;

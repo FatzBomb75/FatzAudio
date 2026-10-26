@@ -4,7 +4,7 @@ To: FatzBomb.MediaControl and Keith. From: FatzAudio, 2026-10-20. Status: **appr
 Nothing in sections 2 to 9 is built yet. Answers to the three requests in this folder:
 [review](2026-10-20_MediaControl_Review_MidiAndCdg.md),
 [request](2026-10-20_MediaControl_Request_KaraokeSurfaces.md),
-[design reference](2026-10-20_MediaControl_KaraokeDesignReference.md).
+design reference (2026-10-20_MediaControl_KaraokeDesignReference.md, kept with the project files).
 
 Ground rules this plan keeps: one binary per platform with no new runtime libraries, every capability
 implemented once (no per-OS renderers), clean-room code, what the OS already has where it helps, and

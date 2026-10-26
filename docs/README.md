@@ -7,7 +7,7 @@
 | [Building](building.md) | Build for Windows, macOS, Linux, Android and iOS, and run the tests |
 | [Feature guides](features/README.md) | One page per feature: what it does, how to use it, options, pitfalls; for example [MIDI and karaoke files](features/midi.md) |
 | [Migrating from BASS](migration/bass.md) | Every BASS function and add-on mapped to FatzAudio |
-| [Migrating from NAudio](migration/naudio.md) | Planned |
+| Migrating from NAudio | Planned |
 | [Migrating from SoundTouch](migration/soundtouch.md) | SoundTouch calls mapped to the tempo, pitch and rate parameters |
 | [Design](../fatzaudio-design.md) | Architecture and decisions |
 | [Engineering notes](engineering-notes.md) | Known issues and out-of-scope follow-ups |

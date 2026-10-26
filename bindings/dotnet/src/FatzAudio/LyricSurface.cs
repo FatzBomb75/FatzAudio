@@ -231,8 +231,8 @@ public sealed record LyricStyle
     private unsafe LyricStyle(FaLyricStyle style)
     {
         var s = &style;
-        FontFamily = s->FontFamily == 0 ? null : Marshal.PtrToStringUTF8(s->FontFamily);
-        FontPath = s->FontPath == 0 ? null : Marshal.PtrToStringUTF8(s->FontPath);
+        FontFamily = NativeText.ReadOrNull(s->FontFamily);
+        FontPath = NativeText.ReadOrNull(s->FontPath);
         FontData = s->FontData == 0
             ? null
             : (ReadOnlyMemory<byte>?)new ReadOnlySpan<byte>((void*)s->FontData, checked((int)s->FontDataSize)).ToArray();
@@ -285,8 +285,8 @@ public sealed record LyricStyle
         Effects = SurfaceInterop.FromNative(s->Effects);
         IntroPage = s->IntroPage != 0;
         EndingPage = s->EndingPage != 0;
-        FallbackTitle = s->FallbackTitle == 0 ? null : Marshal.PtrToStringUTF8(s->FallbackTitle);
-        Labels = s->Labels == 0 ? null : Marshal.PtrToStringUTF8(s->Labels);
+        FallbackTitle = NativeText.ReadOrNull(s->FallbackTitle);
+        Labels = NativeText.ReadOrNull(s->Labels);
         IntroStart = TimeSpan.FromMilliseconds(s->IntroStartMs);
         IntroFade = TimeSpan.FromMilliseconds(s->IntroFadeMs);
         IntroClear = TimeSpan.FromMilliseconds(s->IntroClearMs);
@@ -370,10 +370,10 @@ public sealed record LyricStyle
         s.TitleColor = SurfaceInterop.Argb(TitleColor);
         s.InfoColor = SurfaceInterop.Argb(InfoColor);
         s.CopyrightColor = SurfaceInterop.Argb(CopyrightColor);
-        nint family = FontFamily is null ? 0 : Marshal.StringToCoTaskMemUTF8(FontFamily);
-        nint path = FontPath is null ? 0 : Marshal.StringToCoTaskMemUTF8(FontPath);
-        nint fallback = FallbackTitle is null ? 0 : Marshal.StringToCoTaskMemUTF8(FallbackTitle);
-        nint labels = Labels is null ? 0 : Marshal.StringToCoTaskMemUTF8(Labels);
+        nint family = NativeText.Alloc(FontFamily);
+        nint path = NativeText.Alloc(FontPath);
+        nint fallback = NativeText.Alloc(FallbackTitle);
+        nint labels = NativeText.Alloc(Labels);
         try
         {
             s.FontFamily = family;

@@ -13,8 +13,6 @@
 #define ISO_SECTIONS 9
 #define DECK_TEMPO_LATENCY_MS 60
 
-static const double k_pi = 3.14159265358979323846;
-
 static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
 static inline float clip1(float v) { return v > 1.0f ? 1.0f : v < -1.0f ? -1.0f : v; }
 

@@ -204,6 +204,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   sizes predictors with SSE2/NEON kernels without storing their residual, picks each Rice parameter in closed form,
   and from level 3 on costs only the most promising LPC candidates in full. The output still decodes bit-exact and
   passes `flac -t`.
+- Internal clean-up from the 2026-10-26 deep audit, no change in behaviour: six internal functions nothing called,
+  nine struct fields that were written but never read, two unused macros and the never-built AC-3 statistics
+  counters are gone; the byte-order readers, string copies, pi and the peak-to-dB conversion that a dozen source files
+  each wrote for themselves are shared (`src/fa_util.h`); MIDI and tracker files share one read-to-end helper.
+  .NET: one internal UTF-8 helper replaces 28 hand-written conversions. The 24 white-box tests link one shared build
+  of the library sources instead of compiling their own copy each.
 - Linux: the library is about 460 KB smaller (4.49 to 4.05 MiB on Linux x64): FatzAudio's own code, miniaudio and
   the Xiph codecs are now built with a section per function, so the linker drops what is never called. Android
   builds were already made this way by the NDK, so their size did not change.

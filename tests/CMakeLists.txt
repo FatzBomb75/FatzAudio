@@ -30,7 +30,7 @@ if(UNIX)
 endif()
 add_test(NAME analysis COMMAND fa_test_analysis WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
-# White-box tests: the library sources compiled straight into the test, so it can
+# White-box tests: the library sources linked straight into the test, so it can
 # drive the mixer by hand and check exact sample values.
 list(TRANSFORM FA_SOURCES PREPEND ${PROJECT_SOURCE_DIR}/)
 set_source_files_properties(${PROJECT_SOURCE_DIR}/src/stretch.cpp PROPERTIES
@@ -39,7 +39,7 @@ set_source_files_properties(${PROJECT_SOURCE_DIR}/src/stretch.cpp PROPERTIES
 # from the sources themselves.
 set_source_files_properties(${PROJECT_SOURCE_DIR}/src/dec_midi.c ${PROJECT_SOURCE_DIR}/src/tinysoundfont_impl.c PROPERTIES
     INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
-add_executable(fa_test_internal test_internal.c ${FA_SOURCES})
+add_executable(fa_test_internal test_internal.c)
 target_include_directories(fa_test_internal PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -65,7 +65,7 @@ if(UNIX)
 endif()
 add_test(NAME internal COMMAND fa_test_internal)
 
-add_executable(fa_test_mixer test_mixer.c ${FA_SOURCES})
+add_executable(fa_test_mixer test_mixer.c)
 target_include_directories(fa_test_mixer PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -77,7 +77,7 @@ if(UNIX)
 endif()
 add_test(NAME mixer COMMAND fa_test_mixer)
 
-add_executable(fa_test_sync test_sync.c ${FA_SOURCES})
+add_executable(fa_test_sync test_sync.c)
 target_include_directories(fa_test_sync PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -90,7 +90,7 @@ endif()
 add_test(NAME sync COMMAND fa_test_sync)
 
 # The system's real audio output and input (skips unless FA_TEST_REAL_SYSTEM=1).
-add_executable(fa_test_device test_device.c ${FA_SOURCES})
+add_executable(fa_test_device test_device.c)
 target_include_directories(fa_test_device PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -102,7 +102,7 @@ if(UNIX)
 endif()
 add_test(NAME device COMMAND fa_test_device)
 
-add_executable(fa_test_mic test_mic.c ${FA_SOURCES})
+add_executable(fa_test_mic test_mic.c)
 target_include_directories(fa_test_mic PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -114,7 +114,7 @@ if(UNIX)
 endif()
 add_test(NAME mic COMMAND fa_test_mic)
 
-add_executable(fa_test_loudness test_loudness.c ${FA_SOURCES})
+add_executable(fa_test_loudness test_loudness.c)
 target_include_directories(fa_test_loudness PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -126,7 +126,7 @@ if(UNIX)
 endif()
 add_test(NAME loudness COMMAND fa_test_loudness WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
-add_executable(fa_test_crossfade test_crossfade.c ${FA_SOURCES})
+add_executable(fa_test_crossfade test_crossfade.c)
 target_include_directories(fa_test_crossfade PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -138,7 +138,7 @@ if(UNIX)
 endif()
 add_test(NAME crossfade COMMAND fa_test_crossfade)
 
-add_executable(fa_test_handoff test_handoff.c ${FA_SOURCES})
+add_executable(fa_test_handoff test_handoff.c)
 target_include_directories(fa_test_handoff PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -150,7 +150,7 @@ if(UNIX)
 endif()
 add_test(NAME handoff COMMAND fa_test_handoff)
 
-add_executable(fa_test_demux test_demux.c ${FA_SOURCES})
+add_executable(fa_test_demux test_demux.c)
 target_include_directories(fa_test_demux PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -162,7 +162,7 @@ if(UNIX)
 endif()
 add_test(NAME demux COMMAND fa_test_demux)
 
-add_executable(fa_test_dolby test_dolby.c ${FA_SOURCES})
+add_executable(fa_test_dolby test_dolby.c)
 target_include_directories(fa_test_dolby PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -174,7 +174,7 @@ if(UNIX)
 endif()
 add_test(NAME dolby COMMAND fa_test_dolby)
 
-add_executable(fa_test_aac test_aac.c ${FA_SOURCES})
+add_executable(fa_test_aac test_aac.c)
 target_include_directories(fa_test_aac PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -203,7 +203,7 @@ if(FA_TEST_AV_FOUND)
     add_test(NAME ffmpeg_helper COMMAND fa_test_ffmpeg_helper)
 endif()
 
-add_executable(fa_test_net test_net.c ${FA_SOURCES})
+add_executable(fa_test_net test_net.c)
 target_include_directories(fa_test_net PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -218,7 +218,7 @@ if(ANDROID)
 endif()
 add_test(NAME net COMMAND fa_test_net)
 
-add_executable(fa_test_cdg test_cdg.c ${FA_SOURCES})
+add_executable(fa_test_cdg test_cdg.c)
 target_include_directories(fa_test_cdg PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -230,7 +230,7 @@ if(UNIX)
 endif()
 add_test(NAME cdg COMMAND fa_test_cdg WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
-add_executable(fa_test_font test_font.c ${FA_SOURCES})
+add_executable(fa_test_font test_font.c)
 target_include_directories(fa_test_font PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -242,7 +242,7 @@ if(UNIX)
 endif()
 add_test(NAME font COMMAND fa_test_font)
 
-add_executable(fa_test_lyric test_lyric.c ${FA_SOURCES})
+add_executable(fa_test_lyric test_lyric.c)
 target_include_directories(fa_test_lyric PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -254,7 +254,7 @@ if(UNIX)
 endif()
 add_test(NAME lyric COMMAND fa_test_lyric)
 
-add_executable(fa_test_disc test_disc.c ${FA_SOURCES})
+add_executable(fa_test_disc test_disc.c)
 target_include_directories(fa_test_disc PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -266,7 +266,7 @@ if(UNIX)
 endif()
 add_test(NAME disc COMMAND fa_test_disc WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
-add_executable(fa_test_tempo test_tempo.c ${FA_SOURCES})
+add_executable(fa_test_tempo test_tempo.c)
 target_include_directories(fa_test_tempo PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -278,7 +278,7 @@ if(UNIX)
 endif()
 add_test(NAME tempo COMMAND fa_test_tempo)
 
-add_executable(fa_test_asf test_asf.c ${FA_SOURCES})
+add_executable(fa_test_asf test_asf.c)
 target_include_directories(fa_test_asf PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
 target_compile_definitions(fa_test_asf PRIVATE FA_STATIC FA_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
@@ -289,7 +289,7 @@ if(UNIX)
 endif()
 add_test(NAME asf COMMAND fa_test_asf)
 
-add_executable(fa_test_tags test_tags.c ${FA_SOURCES})
+add_executable(fa_test_tags test_tags.c)
 target_include_directories(fa_test_tags PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
 target_compile_definitions(fa_test_tags PRIVATE FA_STATIC FA_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
@@ -300,7 +300,7 @@ if(UNIX)
 endif()
 add_test(NAME tags COMMAND fa_test_tags)
 
-add_executable(fa_test_encode test_encode.c ${FA_SOURCES})
+add_executable(fa_test_encode test_encode.c)
 target_include_directories(fa_test_encode PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
 target_compile_definitions(fa_test_encode PRIVATE FA_STATIC)
@@ -311,7 +311,7 @@ if(UNIX)
 endif()
 add_test(NAME encode COMMAND fa_test_encode WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
-add_executable(fa_test_midi test_midi.c ${FA_SOURCES})
+add_executable(fa_test_midi test_midi.c)
 target_include_directories(fa_test_midi PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -324,7 +324,7 @@ endif()
 add_test(NAME midi COMMAND fa_test_midi WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
 # White-box: it plays the audio thread itself for FA_EVENT_TRACKER_ROW.
-add_executable(fa_test_tracker test_tracker.c ${FA_SOURCES})
+add_executable(fa_test_tracker test_tracker.c)
 target_include_directories(fa_test_tracker PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -336,7 +336,7 @@ if(UNIX)
 endif()
 add_test(NAME tracker COMMAND fa_test_tracker)
 
-add_executable(fa_test_ogg test_ogg.c ${FA_SOURCES})
+add_executable(fa_test_ogg test_ogg.c)
 target_include_directories(fa_test_ogg PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
     ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
@@ -348,7 +348,7 @@ if(UNIX)
 endif()
 add_test(NAME ogg COMMAND fa_test_ogg)
 
-add_executable(fa_test_flac test_flac.c ${FA_SOURCES})
+add_executable(fa_test_flac test_flac.c)
 target_include_directories(fa_test_flac PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
 target_compile_definitions(fa_test_flac PRIVATE FA_STATIC FA_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
@@ -359,13 +359,27 @@ if(UNIX)
 endif()
 add_test(NAME flac COMMAND fa_test_flac)
 
-# The white-box tests build the library's sources themselves; the vendored codecs
-# come prebuilt.
+# The white-box tests link the library's sources as objects compiled once for all
+# of them; the vendored codecs come prebuilt.
+add_library(fa_whitebox OBJECT ${FA_SOURCES})
+target_include_directories(fa_whitebox PUBLIC
+    ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
+    ${PROJECT_SOURCE_DIR}/third_party/tinysoundfont)
+target_compile_definitions(fa_whitebox PUBLIC FA_STATIC)
+target_compile_options(fa_whitebox PRIVATE ${FA_WARNINGS})
+target_link_libraries(fa_whitebox PUBLIC fa_opus fa_vorbis fa_openmpt Threads::Threads ${CMAKE_DL_LIBS} ${FA_NET_LIBS})
+if(UNIX)
+    target_link_libraries(fa_whitebox PUBLIC m)
+endif()
+if(MSVC)
+    set_property(TARGET fa_whitebox PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 foreach(t fa_test_internal fa_test_loudness fa_test_crossfade fa_test_handoff fa_test_demux
           fa_test_dolby fa_test_aac fa_test_net fa_test_cdg fa_test_disc fa_test_tempo fa_test_ogg
           fa_test_encode fa_test_midi fa_test_tracker fa_test_flac fa_test_asf fa_test_tags fa_test_font
           fa_test_lyric fa_test_mixer fa_test_sync fa_test_mic fa_test_device)
-    target_link_libraries(${t} PRIVATE fa_opus fa_vorbis fa_openmpt)
+    target_link_libraries(${t} PRIVATE fa_whitebox)
     # The same static C runtime as those libraries: libopenmpt is C++, and MSVC
     # refuses to link C++ objects built for different runtimes.
     if(MSVC)

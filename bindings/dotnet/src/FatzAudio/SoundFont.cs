@@ -95,7 +95,7 @@ public sealed class SoundFont : IDisposable
     {
         FaSoundFontInfo n;
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_soundfont_get_info(Handle, &n));
-        return new SoundFontInfo(Marshal.PtrToStringUTF8((nint)n.Name) ?? "", (int)n.PresetCount, (long)n.SampleMemory);
+        return new SoundFontInfo(NativeText.Read(n.Name), (int)n.PresetCount, (long)n.SampleMemory);
     }
 
     /// <summary>The bank's name, preset count and memory use.</summary>

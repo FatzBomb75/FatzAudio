@@ -4,6 +4,7 @@
 #include "fatzaudio/fatzaudio.h"
 #include "miniaudio.h"
 #include "fa_platform.h"
+#include "fa_util.h"
 #include "tempo.h"
 #include <math.h>
 #include <stdio.h>
@@ -70,6 +71,9 @@ int64_t fa_source_tell(const fa_source* src);
 /* The whole source in one malloc'ed block (archives, .cdg files); needs a known
  * length of at most `max_size`, else FA_ERROR_UNSUPPORTED_FORMAT. */
 fa_result fa_source_read_all(fa_source* src, size_t max_size, uint8_t** out_data, size_t* out_size);
+/* From the current position to the end, when the length is unknown too. Over
+ * `max_size` bytes: FA_ERROR_UNSUPPORTED_FORMAT. */
+fa_result fa_source_read_rest(fa_source* src, size_t max_size, uint8_t** out_data, size_t* out_size);
 void fa_source_close(fa_source* src);
 
 /* ---- Decoder registry (decoder.c) --------------------------------------- */
@@ -318,7 +322,6 @@ void fa_grid_data_free(fa_grid_data* g);
 /* Fills grid.bpm (the tempo that lasts longest up to `length` frames, -1 = unknown)
  * and the CONSTANT flag from the segments. */
 void fa_grid_data_finish(fa_grid_data* g, fa_frames length);
-fa_result fa_grid_data_copy(fa_grid_data* dst, const fa_grid_data* src);
 /* The checks of fa_stream_set_beat_grid (segments may be NULL with count 0). */
 int fa_grid_valid(const fa_beat_grid* g, const fa_tempo_segment* segs, uint32_t count);
 /* Copies a grid out the way the public getters do. */
@@ -648,7 +651,6 @@ typedef struct fa_meter {
 /* ring_subs > 0 keeps only the newest ring_subs sub-blocks (running estimate). */
 fa_result fa_meter_init(fa_meter* m, uint32_t rate, uint32_t channels, int with_peak, int64_t ring_subs);
 void fa_meter_free(fa_meter* m);
-void fa_meter_reset(fa_meter* m);
 fa_result fa_meter_process(fa_meter* m, const float* interleaved, int64_t frames);
 double fa_meter_running_lufs(const fa_meter* m);   /* ring mode; NAN until 400 ms measured */
 double fa_meter_peak_dbtp(const fa_meter* m);
@@ -965,6 +967,8 @@ static inline float fa_glide(float level, float target, int64_t n, uint32_t rate
 
 /* dB to linear gain. */
 static inline float fa_db_to_lin(float db) { return powf(10.0f, db / 20.0f); }
+/* Linear peak to dB (-HUGE_VAL for silence). */
+static inline double fa_lin_to_db(double peak) { return peak > 0.0 ? 20.0 * log10(peak) : -HUGE_VAL; }
 
 /* 1 when all `n` samples are exactly zero, so an idle effect can skip its block. */
 static inline int fa_all_zero(const float* x, uint32_t n)

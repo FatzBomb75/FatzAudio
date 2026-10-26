@@ -303,8 +303,6 @@ int fa_probe_tracker(const uint8_t* data, size_t size, size_t id3_size)
 
 static fa_result read_source(fa_source* src, uint8_t** out, size_t* out_size)
 {
-    size_t cap, n = 0;
-    uint8_t* buf;
     *out = NULL;
     *out_size = 0;
     /* A live or unknown-length source is never a module, and a weak probe
@@ -327,27 +325,7 @@ static fa_result read_source(fa_source* src, uint8_t** out, size_t* out_size)
         if (pr != OPENMPT_PROBE_FILE_HEADER_RESULT_SUCCESS) return FA_ERROR_UNSUPPORTED_FORMAT;
         if (fa_source_seek(src, 0) != FA_OK) return FA_ERROR_NOT_SEEKABLE;
     }
-    cap = (src->length > 0 ? (size_t)src->length : 65536) + 1;
-    buf = (uint8_t*)malloc(cap);
-    if (!buf) return FA_ERROR_OUT_OF_MEMORY;
-    for (;;) {
-        int64_t got;
-        if (n == cap) {
-            uint8_t* grown;
-            if (cap > FA_TRACKER_MAX_FILE) { free(buf); return FA_ERROR_UNSUPPORTED_FORMAT; }
-            cap = cap * 2 > FA_TRACKER_MAX_FILE + 1 ? FA_TRACKER_MAX_FILE + 1 : cap * 2;
-            grown = (uint8_t*)realloc(buf, cap);
-            if (!grown) { free(buf); return FA_ERROR_OUT_OF_MEMORY; }
-            buf = grown;
-        }
-        got = fa_source_read(src, buf + n, cap - n);
-        if (got < 0) { free(buf); return (fa_result)got; }
-        if (got == 0) break;
-        n += (size_t)got;
-    }
-    *out = buf;
-    *out_size = n;
-    return FA_OK;
+    return fa_source_read_rest(src, FA_TRACKER_MAX_FILE, out, out_size);
 }
 
 /* `in` (UTF-8, from libopenmpt) into `out`, cut at a character boundary. */
@@ -375,11 +353,8 @@ static void copy_meta(openmpt_module* mod, const char* key, char* out, size_t ca
 static char* dup_free(const char* s)
 {
     char* d;
-    size_t n;
     if (!s) return NULL;
-    n = strlen(s);
-    d = (char*)malloc(n + 1);
-    if (d) memcpy(d, s, n + 1);
+    d = fa_strdup(s);
     openmpt_free_string(s);
     return d;
 }

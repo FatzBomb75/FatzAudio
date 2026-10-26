@@ -186,14 +186,14 @@ public sealed class Tags
             var fields = new string?[(int)TagField.Count];
             for (int f = 0; f < fields.Length; f++)
             {
-                string s = Marshal.PtrToStringUTF8(NativeMethods.fa_tags_get(native, f)) ?? "";
+                string s = NativeText.Read(NativeMethods.fa_tags_get(native, f));
                 fields[f] = s.Length > 0 ? s : null;
             }
             var items = new TagItem[NativeMethods.fa_tags_get_item_count(native)];
             for (uint i = 0; i < items.Length; i++)
             {
                 FatzAudioException.ThrowIfFailed(NativeMethods.fa_tags_get_item(native, i, out FaTagItem it));
-                items[i] = new TagItem(Marshal.PtrToStringUTF8(it.Key) ?? "", Marshal.PtrToStringUTF8(it.Value) ?? "", (TagFormat)it.Format);
+                items[i] = new TagItem(NativeText.Read(it.Key), NativeText.Read(it.Value), (TagFormat)it.Format);
             }
             var pictures = new TagPicture[NativeMethods.fa_tags_get_picture_count(native)];
             for (uint i = 0; i < pictures.Length; i++)
@@ -201,8 +201,8 @@ public sealed class Tags
                 FatzAudioException.ThrowIfFailed(NativeMethods.fa_tags_get_picture(native, i, out FaTagPicture p));
                 var data = new byte[checked((int)p.Size)];
                 Marshal.Copy(p.Data, data, 0, data.Length);
-                pictures[i] = new TagPicture((PictureType)p.Type, Marshal.PtrToStringUTF8(p.Mime) ?? "",
-                    Marshal.PtrToStringUTF8(p.Description) ?? "", data, (TagFormat)p.Format);
+                pictures[i] = new TagPicture((PictureType)p.Type, NativeText.Read(p.Mime),
+                    NativeText.Read(p.Description), data, (TagFormat)p.Format);
             }
             StreamInfo? info = NativeMethods.fa_tags_get_info(native, out FaStreamInfo n) == 0 ? StreamInfo.FromNative(n) : null;
             return new Tags(fields, items, pictures, info);

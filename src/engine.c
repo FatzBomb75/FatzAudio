@@ -151,14 +151,6 @@ static void worker_main(void* arg)
 
 void fa_event_thread_main(void* arg);
 
-static char* copy_string(const char* s)
-{
-    size_t len = strlen(s) + 1;
-    char* d = (char*)malloc(len);
-    if (d) memcpy(d, s, len);
-    return d;
-}
-
 /* The app's temp directory gets a folder of FatzAudio's own, so the sweep never
  * touches the app's files. One that cannot be made now is tried again when a song
  * needs it (FA_ERROR_IO then). */
@@ -203,11 +195,11 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
     }
     /* Keep our own copies: the caller's strings (marshalled ones, in .NET) may not outlive this call. */
     if (e->config.cache_directory) {
-        e->config.cache_directory = copy_string(e->config.cache_directory);
+        e->config.cache_directory = fa_strdup(e->config.cache_directory);
         if (!e->config.cache_directory) { free(e); return FA_ERROR_OUT_OF_MEMORY; }
     }
     if (e->config.temp_directory && e->config.temp_directory[0]) {
-        e->config.temp_directory = copy_string(e->config.temp_directory);
+        e->config.temp_directory = fa_strdup(e->config.temp_directory);
         if (!e->config.temp_directory || temp_folder_prepare(e) != FA_OK) { free_strings(e); free(e); return FA_ERROR_OUT_OF_MEMORY; }
     } else {
         e->config.temp_directory = NULL;

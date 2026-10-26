@@ -1,4 +1,3 @@
-using System.Collections.ObjectModel;
 using System.Runtime.InteropServices;
 using FatzAudio.Native;
 
@@ -349,7 +348,7 @@ public sealed class MusicalKey : IEquatable<MusicalKey>
         fixed (byte* name = k.Name)
         fixed (byte* camelot = k.Camelot)
             return new MusicalKey(k.Tonic, k.Minor != 0, k.Confidence,
-                Marshal.PtrToStringUTF8((nint)name) ?? "", Marshal.PtrToStringUTF8((nint)camelot) ?? "");
+                NativeText.Read(name), NativeText.Read(camelot));
     }
 
     internal static unsafe MusicalKey? FromAnalysis(nint analysis)

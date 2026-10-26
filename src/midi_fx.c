@@ -324,7 +324,7 @@ static void chorus_process(fa_midi_fx* fx, const float* in, float* out, int fram
      * a silent stretch, a new rate) it starts again from the last such frame. */
     if (fx->lfo_next != song_frame) {
         fa_frames g = song_frame - song_frame % FX_LFO_SEED;
-        double ph = 2.0 * 3.14159265358979323846 * fmod((double)g * step, 1.0);
+        double ph = 2.0 * FA_PI * fmod((double)g * step, 1.0);
         s = sin(ph);
         c = cos(ph);
         for (; g < song_frame; g++) {
@@ -342,7 +342,7 @@ static void chorus_process(fa_midi_fx* fx, const float* in, float* out, int fram
         double lfo[2], s1;
         int loud = 0;
         if (g % FX_LFO_SEED == 0) {
-            double ph = 2.0 * 3.14159265358979323846 * fmod((double)g * step, 1.0);
+            double ph = 2.0 * FA_PI * fmod((double)g * step, 1.0);
             s = sin(ph);
             c = cos(ph);
         }
@@ -449,8 +449,8 @@ static void chorus_update(fa_midi_fx* fx)
     if (fx->depth_ms > 0.9 * fx->delay_ms) fx->depth_ms = 0.9 * fx->delay_ms;
     if (rate != fx->rate_hz || fx->lfo_cos == 0.0) {
         fx->rate_hz = rate;
-        fx->lfo_cos = cos(2.0 * 3.14159265358979323846 * rate / fx->rate);
-        fx->lfo_sin = sin(2.0 * 3.14159265358979323846 * rate / fx->rate);
+        fx->lfo_cos = cos(2.0 * FA_PI * rate / fx->rate);
+        fx->lfo_sin = sin(2.0 * FA_PI * rate / fx->rate);
         fx->lfo_next = -1;
     }
     fx->chorus_fb = (float)fx->cho_feedback / 127.0f * FX_FEEDBACK_MAX;

@@ -147,7 +147,7 @@ static uint8_t* tone_wav(uint32_t rate, uint32_t frames, uint32_t start, double 
     b[32] = 2; b[33] = 0; b[34] = 16; b[35] = 0;
     memcpy(b + 36, "data", 4); v = (uint32_t)data; memcpy(b + 40, &v, 4);
     for (i = 0; i < frames; i++) {
-        int16_t sv = i < start ? 0 : (int16_t)lrint(8192.0 * sin(2.0 * k_pi * hz * (i - start) / rate));
+        int16_t sv = i < start ? 0 : (int16_t)lrint(8192.0 * sin(2.0 * FA_PI * hz * (i - start) / rate));
         memcpy(b + 44 + (size_t)i * 2, &sv, 2);
     }
     *size = n;
@@ -201,7 +201,7 @@ static void sim_step(sim* s, int64_t now_ns)
             for (i = 0; i < s->in_period; i++)
                 for (c = 0; c < s->in_ch; c++) {
                     in[i * s->in_ch + c] = (float)(s->amp[c] * sin(s->phase[c]));
-                    s->phase[c] += 2.0 * k_pi * s->hz[c] / (double)s->in_rate;
+                    s->phase[c] += 2.0 * FA_PI * s->hz[c] / (double)s->in_rate;
                 }
             fa_mic_test_feed(s->mic, in, s->in_period);
             s->owed -= (double)s->in_period;
@@ -964,7 +964,7 @@ static int room_check(sim* s, const room* rm, const fa_latency_check_config* cfg
     float* hist = NULL;
     uint32_t cap = 0, rendered = 0, fed = 0, rate = s->dev->rate, i;
     int64_t deadline;
-    double A = pow(10.0, rm->peak_db / 40.0), w0 = 2.0 * k_pi * 1000.0 / rate, alpha = sin(w0) / 16.0;
+    double A = pow(10.0, rm->peak_db / 40.0), w0 = 2.0 * FA_PI * 1000.0 / rate, alpha = sin(w0) / 16.0;
     double a0 = 1.0 + alpha / A, b0 = (1.0 + alpha * A) / a0, b1 = -2.0 * cos(w0) / a0, b2 = (1.0 - alpha * A) / a0;
     double a1 = -2.0 * cos(w0) / a0, a2 = (1.0 - alpha / A) / a0, z1 = 0.0, z2 = 0.0;
     double noise = pow(10.0, rm->noise_db / 20.0) * 1.7320508;   /* uniform: RMS = amplitude / sqrt(3) */
@@ -1604,7 +1604,7 @@ static tbuf make_sf2(void)
     tchunk(&riff, "LIST", &info);
     tput(&sdta, "sdta", 4);
     c.n = 0;
-    for (i = 0; i < 4410; i++) tput16(&c, (unsigned)(uint16_t)(int16_t)lrint(sin(2.0 * k_pi * 440.0 * i / 44100) * 32000.0));
+    for (i = 0; i < 4410; i++) tput16(&c, (unsigned)(uint16_t)(int16_t)lrint(sin(2.0 * FA_PI * 440.0 * i / 44100) * 32000.0));
     for (i = 0; i < 46; i++) tput16(&c, 0);
     tchunk(&sdta, "smpl", &c);
     tchunk(&riff, "LIST", &sdta);
