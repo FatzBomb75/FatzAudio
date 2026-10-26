@@ -31,7 +31,7 @@ typedef struct alac_state {
     uint32_t frame_length, bit_depth, channels, rate;
     uint32_t pb, mb, kb;            /* Golomb tuning: history multiplier, initial history, k limit */
     int32_t* buf[2];                /* one element's channels */
-    uint32_t* low[2];               /* their low bytes, for shifted (wide) audio */
+    uint32_t* low[2];               /* their low bytes, for shifted (wide) audio only */
 } alac_state;
 
 typedef struct bits {
@@ -248,8 +248,13 @@ static fa_result element(bits* b, alac_state* st, uint32_t nch, uint32_t* n)
             /* The first stored applies to the most recent sample. */
             for (k = 0; k < cp[c].order; k++) cp[c].coefs[k] = (int16_t)get(b, 16);
         }
-        /* The low bytes, stored after the parameters and before the residuals. */
+        /* The low bytes, stored after the parameters and before the residuals
+         * (wide audio: their buffers are made at open, or here for a file that
+         * has them at 16 bits). */
         if (shifted) {
+            for (c = 0; c < nch; c++)
+                if (!st->low[c] && !(st->low[c] = (uint32_t*)malloc((size_t)st->frame_length * sizeof(uint32_t))))
+                    return FA_ERROR_OUT_OF_MEMORY;
             for (i = 0; i < *n; i++)
                 for (c = 0; c < nch; c++) st->low[c][i] = get(b, (int)shifted * 8);
         }
@@ -415,11 +420,13 @@ fa_result fa_alac_codec_open(fa_codec* c, const fa_codec_params* p)
     if (st->kb == 0 || st->kb > 31) st->kb = 14;
     st->buf[0] = (int32_t*)malloc((size_t)st->frame_length * sizeof(int32_t));
     st->buf[1] = (int32_t*)malloc((size_t)st->frame_length * sizeof(int32_t));
-    st->low[0] = (uint32_t*)malloc((size_t)st->frame_length * sizeof(uint32_t));
-    st->low[1] = (uint32_t*)malloc((size_t)st->frame_length * sizeof(uint32_t));
+    if (st->bit_depth > 16) {
+        st->low[0] = (uint32_t*)malloc((size_t)st->frame_length * sizeof(uint32_t));
+        st->low[1] = (uint32_t*)malloc((size_t)st->frame_length * sizeof(uint32_t));
+    }
     c->impl = st;
     c->vt = &alac_vtable;
-    if (!st->buf[0] || !st->buf[1] || !st->low[0] || !st->low[1]) {
+    if (!st->buf[0] || !st->buf[1] || (st->bit_depth > 16 && (!st->low[0] || !st->low[1]))) {
         alac_close(c);
         c->vt = NULL;
         return FA_ERROR_OUT_OF_MEMORY;

@@ -179,6 +179,13 @@ static fa_result build_packets(mp4* m, const box* stbl)
         if (m->frame_bytes) each = pcm_sample_bytes(m, sample_size);
         if (!z2 && sample_size && total > len / each + 1) total = len / each + 1;
     }
+    if (!m->frame_bytes && sample_size == 0 && total > m->pk_cap && (int64_t)total <= m->limit) {
+        /* Listed sizes: one packet each, so the list is made at its size (growing it
+         * by doubling would leave up to half of it unused). Without the memory it
+         * still grows as it goes. */
+        mp4_pkt* p = (mp4_pkt*)realloc(m->pk, (size_t)total * sizeof(mp4_pkt));
+        if (p) { m->pk = p; m->pk_cap = (size_t)total; }
+    }
 
     for (chunk = 0; chunk < n_chunks && sample < total; chunk++) {
         int64_t off = co64 ? (int64_t)fa_be64(stco.p + 8 + chunk * 8) : (int64_t)fa_be32(stco.p + 8 + chunk * 4);
@@ -821,6 +828,15 @@ static fa_result mp4_open(fa_decoder* dec)
 
     r = fa_track_open(&m->track, dec, &mp4_ops, m, &tp);
     if (r != FA_OK) goto fail;
+    /* Only open reads the moov (the codec has its extradata, fragments are read
+     * from the file), and a complete packet list grows no more. */
+    free(m->moov);
+    m->moov = NULL;
+    m->moov_len = 0;
+    if (!m->lazy && m->npk && m->npk < m->pk_cap) {
+        mp4_pkt* p = (mp4_pkt*)realloc(m->pk, m->npk * sizeof(mp4_pkt));
+        if (p) { m->pk = p; m->pk_cap = m->npk; }
+    }
     dec->impl = m;
     dec->seekable = src->seekable && !m->lazy;
     if (!m->lazy) {

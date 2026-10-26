@@ -167,8 +167,7 @@ static int page_rest(ogg* o, uint8_t* h, size_t have, int64_t pos, oggs_page* pg
     pg->body_len = 0;
     for (i = 0; i < pg->nseg; i++) pg->body_len += h[OGG_HEADER + i];
     if (pg->body_len > o->body_cap || !o->body) {   /* never NULL, also for an empty page */
-        size_t cap = o->body_cap ? o->body_cap : 4096;
-        while (cap < pg->body_len) cap *= 2;
+        size_t cap = (pg->body_len + 4096) & ~(size_t)4095;   /* whole 4 KB steps, not doubling; never 0 */
         if (cap > OGG_MAX_BODY) cap = OGG_MAX_BODY;
         free(o->body);                              /* nothing in it is needed any more */
         o->body = (uint8_t*)malloc(cap);
@@ -320,9 +319,9 @@ static fa_result page_packets(ogg* o, const oggs_page* pg)
             oggs_pkt* q;
             if (o->nq == OGG_MAX_QUEUE) return FA_ERROR_UNSUPPORTED_FORMAT;
             if (o->qdata_len + o->pend_len > o->qdata_cap) {
-                size_t cap = o->qdata_cap ? o->qdata_cap : 16384;
+                /* Room for the rest of the page too: one realloc a page at most. */
+                size_t cap = (o->qdata_len + o->pend_len + (pg->body_len - pos) + 4095) & ~(size_t)4095;
                 uint8_t* b;
-                while (cap < o->qdata_len + o->pend_len) cap *= 2;
                 b = (uint8_t*)realloc(o->qdata, cap);
                 if (!b) return FA_ERROR_OUT_OF_MEMORY;
                 o->qdata = b;

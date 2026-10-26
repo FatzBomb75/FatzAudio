@@ -125,11 +125,12 @@ void fa_convert_to_f32(const void* const* planes, int kind, int planar, int big_
 
 fa_result fa_codec_reserve(fa_codec* c, fa_frames frames, uint32_t channels)
 {
-    fa_frames need = c->out_frames + frames;
-    if (need * (fa_frames)channels > c->out_cap) {
-        fa_frames cap = c->out_cap ? c->out_cap : 4096;
+    fa_frames need = (c->out_frames + frames) * (fa_frames)channels;
+    if (need > c->out_cap) {
+        /* The first packet sets the size (most codecs keep theirs); doubling after. */
+        fa_frames cap = c->out_cap ? c->out_cap : (need > 4096 ? need : 4096);
         float* p;
-        while (cap < need * (fa_frames)channels) cap *= 2;
+        while (cap < need) cap *= 2;
         p = (float*)realloc(c->out, (size_t)cap * sizeof(float));
         if (!p) return FA_ERROR_OUT_OF_MEMORY;
         c->out = p;

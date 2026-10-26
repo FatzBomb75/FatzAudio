@@ -203,6 +203,11 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   (a 44.1 kHz file on a 48 kHz device) runs both channels in one SSE register, about 2x; raw PCM in MKV, MOV, CAF and
   push streams converts with one loop per sample format, 3-8x; HE-AAC clears only the bands it reads (4-10% less
   work); the lyric surface draws with SSE on x86, about 2x (a 4K partial frame 8.4 to 4.1 ms).
+- Less memory per stream, same output (deep audit, 2026-10-26): MP4/M4A/MOV frees its movie box after open and makes
+  its packet table at its size (a 10-minute M4A 987 to 723 KB, a 30-second one 173 to 149 KB); HE-AAC elements share
+  one SBR scratch (5.1 738 to 618 KB); 16-bit ALAC no longer makes the low-byte buffers only 24 and 32-bit files use
+  (157 to 107 KB); Ogg page buffers grow in 4 KB steps instead of doubling (Opus 155 to 140 KB); decoders' output
+  buffers start at the first packet's size.
 - FLAC encoding is faster (level 0: 1.2 times, level 5: 2.2 times, level 8: 3.4 times; about 400× real time on one
   x64 core at level 5, 170× at level 8) and level 5 to 8 files are smaller (against `flac` 1.4.3 on 8 music files:
   level 5 went from 6% larger to 0.3%, level 8 from 13% to 1.8%, mostly on 24-bit files; pure tones and sweeps
