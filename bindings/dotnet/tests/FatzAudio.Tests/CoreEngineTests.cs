@@ -178,6 +178,29 @@ public class PlaybackTests
     }
 
     [Fact]
+    public void Reverse_ReadsBackwards()
+    {
+        using var engine = CreateHeadless();
+        using var s = engine.OpenMemory(TestAudio.SineWav(seconds: 1), new StreamOptions { DecodeOnly = true });
+        int channels = s.Info.Format.Channels;
+        var forward = new float[1000 * channels];
+        s.PositionFrames = 1000;
+        Assert.Equal(1000, s.Read(forward));
+        Assert.False(s.Reverse);
+        s.Reverse = true;
+        Assert.True(s.Reverse);
+        Assert.Equal(2000, s.PositionFrames);
+        var back = new float[1000 * channels];
+        Assert.Equal(1000, s.Read(back));
+        Assert.Equal(1000, s.PositionFrames);
+        for (int i = 0; i < 1000; i++)
+            for (int c = 0; c < channels; c++)
+                Assert.Equal(forward[(999 - i) * channels + c], back[i * channels + c]);
+        s.Reverse = false;
+        Assert.False(s.Reverse);
+    }
+
+    [Fact]
     public void Muted_KeepsVolume()
     {
         using var engine = CreateHeadless();

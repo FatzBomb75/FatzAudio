@@ -404,6 +404,7 @@ typedef struct fa_deck_now {
     double grid_bpm;             /* the grid's tempo there */
     double bpm;                  /* heard: grid_bpm x tempo x rate */
     int32_t state;               /* fa_stream_state */
+    int32_t reversed;            /* playing backwards (fa_stream_set_reverse): not pulled into phase */
 } fa_deck_now;
 int64_t fa_mixer_now(struct fa_mixer* m);
 /* The event thread looks at the mixer again at monotonic `at` (the sooner one wins). */

@@ -124,6 +124,7 @@ fa_result fa_deck_look(struct fa_deck* d, int64_t now, fa_deck_now* o)
     fa_mutex_lock(&s->api_lock);
     o->src = (double)fa_stream_clock_at(s, now) * o->sr / 1e9;
     o->state = fa_load32(&s->state);
+    o->reversed = fa_load32(&s->reverse);
     fa_mutex_unlock(&s->api_lock);
     fa_stream_get_param(s, FA_PARAM_TEMPO, &tempo);
     fa_stream_get_param(s, FA_PARAM_RATE, &rate);
@@ -247,7 +248,10 @@ static int sync_tick(struct fa_deck* d, int64_t now)
     }
     if (d->settling && !(playing(&dn) && playing(&ln)))   /* the pull's time starts once both play */
         d->settle_end = now + (int64_t)(8.0 * 60e9 / ln.bpm) + 1000000000;
-    if ((f & FA_SYNC_BEAT) && playing(&dn) && playing(&ln) && now >= d->hold_until) {
+    /* Reversed, no phase jump is made: drop a pending one, so fa_deck_beat_jump isn't
+     * kept busy, and measure anew once both play forward. */
+    if (d->jumping && (dn.reversed || ln.reversed)) d->jumping = 0;
+    if ((f & FA_SYNC_BEAT) && playing(&dn) && playing(&ln) && !dn.reversed && !ln.reversed && now >= d->hold_until) {
         if (d->jumping) {
             fa_result r = fa_stream_jump(dn.s, d->jump_at, d->jump_by);
             if (r == FA_OK || (r == FA_ERROR_BUSY && dn.src > (double)d->jump_at + dn.sr)) {

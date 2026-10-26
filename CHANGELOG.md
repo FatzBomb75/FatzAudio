@@ -18,6 +18,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- Reverse playback: `fa_stream_set_reverse` / `fa_stream_get_reverse` (.NET `AudioStream.Reverse`), bass_fx's
+  `BASS_FX_ReverseCreate` and `BASS_ATTRIB_REVERSE_DIR` on the stream itself, switchable while playing; works with tempo,
+  pitch, rate, loops and deck loops. See [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md#reverse-playback).
+- MIDI: GS and XG reverb and chorus SysEx are followed: reverb type (rooms, halls, plate, GS delay and panning delay,
+  XG stage, tunnel and others), level and time; chorus type (chorus, celeste, flanger, short delay), level and the GS
+  chorus parameters; GS and XG part volume, pan, reverb send and chorus send. A seek with effects on renders the second
+  before the target, so reverb and chorus tails ring on across it. See
+  [docs/features/midi.md](docs/features/midi.md#reverb-and-chorus).
 - Track analysis: songs whose tempo changes or drifts get a tempo map measured from the audio (segments joined end to end;
   on the drifting test songs every beat within 10 ms, where a constant grid was up to 359 ms off), and bars are found
   from chord changes and kicks (`FA_GRID_BARS` with `beats_per_bar` 4 or 3 and `bar_offset`) when they are clear. Steady

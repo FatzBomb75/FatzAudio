@@ -1180,6 +1180,162 @@ static void test_transient_mode(void)
     }
 }
 
+/* ---- reverse playback ---------------------------------------------------------- */
+
+/* Decode-only: frames come out last first, exactly, across the half-second blocks
+ * and whatever the read size; the position counts down; the start ends it; turning
+ * it off plays on forward from there. */
+static void test_reverse_decode(void)
+{
+    const fa_frames len = 2 * RATE, from = RATE + RATE / 2 + 7;
+    fa_stream* s = open_wav((uint32_t)len, ramp_sig, FA_OPEN_DECODE_ONLY);
+    float* buf = (float*)malloc((size_t)len * 2 * sizeof(float));
+    fa_frames got = 0, pos = 0, total = 0, i;
+    int32_t on = -1;
+    fa_result r = FA_OK;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_get_reverse(s, &on), FA_OK);
+    CHECK_EQ(on, 0);
+    CHECK_EQ(fa_stream_seek(s, from), FA_OK);
+    CHECK_EQ(fa_stream_set_reverse(s, 1), FA_OK);
+    CHECK_EQ(fa_stream_get_reverse(s, &on), FA_OK);
+    CHECK_EQ(on, 1);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_EQ(pos, from);
+    while (r == FA_OK && total < len) {
+        r = fa_stream_read(s, buf + total * 2, total < RATE / 3 ? 4093 : 777, &got);
+        total += got;
+        if (total == 1000 && got > 0) {
+            CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+            CHECK_EQ(pos, from - 1000);
+        }
+    }
+    CHECK_EQ(total, from);
+    for (i = 0; i < total; i++)
+        if (buf[i * 2] != ramp_sig((double)(from - 1 - i) / RATE, 0)) break;
+    CHECK_EQ(i, total);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_EQ(pos, 0);
+    /* Back to forward, from a second in. */
+    CHECK_EQ(fa_stream_seek(s, RATE), FA_OK);
+    CHECK_EQ(fa_stream_read(s, buf, 100, &got), FA_OK);
+    CHECK_EQ(buf[0], ramp_sig((double)(RATE - 1) / RATE, 0));
+    CHECK_EQ(fa_stream_set_reverse(s, 0), FA_OK);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_EQ(pos, RATE - 100);
+    CHECK_EQ(fa_stream_read(s, buf, 100, &got), FA_OK);
+    CHECK_EQ(buf[0], ramp_sig((double)(RATE - 100) / RATE, 0));
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_EQ(pos, RATE);
+    fa_stream_close(s);
+    free(buf);
+}
+
+/* With the rate at 2x, the chain runs on the reversed audio: twice as fast,
+ * counting down, and what comes out is the source at that position. */
+static void test_reverse_with_rate(void)
+{
+    fa_stream* s = open_wav(4 * RATE, ramp_sig, FA_OPEN_DECODE_ONLY);
+    float* buf = (float*)malloc((size_t)RATE * 2 * sizeof(float));
+    fa_frames got = 0, pos = 0, total = 0;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_param(s, FA_PARAM_RATE, 2.0f), FA_OK);
+    CHECK_EQ(fa_stream_seek(s, 3 * RATE), FA_OK);
+    CHECK_EQ(fa_stream_set_reverse(s, 1), FA_OK);
+    while (total < RATE / 4) {
+        CHECK_EQ(fa_stream_read(s, buf, RATE / 4 - total, &got), FA_OK);
+        total += got;
+    }
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_NEAR((double)pos, 2.5 * RATE, 2.0);
+    CHECK_NEAR(buf[(got - 1) * 2], (double)pos / RATE * 0.01, 0.00002);
+    fa_stream_close(s);
+    free(buf);
+}
+
+/* Attached: the position counts down and what is heard is the source there; at
+ * the start it ends. Playing from stopped starts at the end, and a loop wraps from
+ * its start to its end. */
+static void test_reverse_attached(void)
+{
+    fa_stream* s = open_attached(4 * RATE, ramp_sig, 0);
+    float* out = (float*)malloc(1024 * 2 * sizeof(float));
+    fa_frames pos = 0, last = 0;
+    fa_stream_state st;
+    int i;
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_seek(s, 3 * RATE), FA_OK);
+    CHECK_EQ(fa_stream_set_reverse(s, 1), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    for (i = 0; i < 20; i++) render(s, out, 1024);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_NEAR((double)pos, 3.0 * RATE - 20.0 * 1024, 8.0);
+    CHECK_NEAR(out[1023 * 2], (double)pos / RATE * 0.01, 0.00005);
+    CHECK(out[1023 * 2] < out[0]);
+    /* The clock counts down too. */
+    CHECK_NEAR((double)fa_stream_clock_at(s, fa_monotonic_ns()) * RATE / 1e9, (double)pos, 2048.0);
+    /* To the start: ended there. */
+    CHECK_EQ(fa_stream_seek(s, RATE / 4), FA_OK);
+    for (i = 0; i < 20; i++) render(s, out, 1024);
+    CHECK_EQ(fa_stream_get_state(s, &st), FA_OK);
+    CHECK_EQ(st, FA_STATE_ENDED);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_EQ(pos, 0);
+    /* Play again: from the end. */
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_EQ(pos, 4 * RATE);
+    render(s, out, 1024);
+    CHECK_NEAR(out[0], 0.04, 0.00005);
+    fa_stream_close(s);
+
+    /* A looping second: wraps from 0 to the end and plays on. */
+    s = open_attached(RATE, ramp_sig, FA_OPEN_LOOP);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_reverse(s, 1), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    for (i = 0; i < 70; i++) {
+        render(s, out, 1024);
+        CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+        if (i > 0 && pos > last) CHECK(last < 1024);   /* only goes up where it wraps */
+        last = pos;
+    }
+    CHECK_NEAR((double)pos, RATE - fmod(70.0 * 1024, RATE), 8.0);
+    CHECK_NEAR(out[1023 * 2], (double)pos / RATE * 0.01, 0.00005);
+    CHECK_EQ(fa_stream_get_state(s, &st), FA_OK);
+    CHECK_EQ(st, FA_STATE_PLAYING);
+    /* A deck loop: wraps at its in point. */
+    CHECK_EQ(fa_stream_set_loop(s, 0), FA_OK);
+    CHECK_EQ(fa_stream_seek(s, RATE / 2), FA_OK);
+    CHECK_EQ(fa_stream_set_loop_region(s, RATE / 4, RATE / 2), FA_OK);
+    for (i = 0; i < 30; i++) render(s, out, 1024);
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_NEAR((double)pos, RATE / 2 - fmod(30.0 * 1024, RATE / 4), 8.0);
+    CHECK_EQ(fa_stream_get_state(s, &st), FA_OK);
+    CHECK_EQ(st, FA_STATE_PLAYING);
+    fa_stream_close(s);
+    free(out);
+}
+
+static void test_reverse_api(void)
+{
+    fa_audio_format f;
+    fa_stream* s = NULL;
+    int32_t on = 1;
+    memset(&f, 0, sizeof(f));
+    f.sample_format = FA_FORMAT_F32;
+    f.sample_rate = RATE;
+    f.channels = 2;
+    CHECK_EQ(fa_stream_set_reverse(NULL, 1), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_get_reverse(NULL, &on), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_open_push(g_engine, &f, NULL, &s), FA_OK);
+    CHECK_EQ(fa_stream_set_reverse(s, 1), FA_ERROR_NOT_SEEKABLE);
+    CHECK_EQ(fa_stream_set_reverse(s, 0), FA_OK);
+    CHECK_EQ(fa_stream_get_reverse(s, &on), FA_OK);
+    CHECK_EQ(on, 0);
+    fa_stream_close(s);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -1213,6 +1369,10 @@ int main(void)
     RUN(test_device_rate_phases_match);
     RUN(test_device_rate_timing_and_end);
     RUN(test_transient_mode);
+    RUN(test_reverse_decode);
+    RUN(test_reverse_with_rate);
+    RUN(test_reverse_attached);
+    RUN(test_reverse_api);
 
     fa_device_close(g_dev);
     fa_engine_destroy(g_engine);

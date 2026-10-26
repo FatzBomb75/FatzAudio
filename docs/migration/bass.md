@@ -440,7 +440,7 @@ bass_fx needs a decode stream wrapped in a separate tempo stream; FatzAudio puts
 | Formant-preserving pitch (not in bass_fx) | `fa_tempo_options.keep_formants = 1` | `TempoOptions.KeepFormants` | ✅ |
 | Keeping the buffer short so tempo changes respond quickly | `fa_tempo_options.latency_ms` (default 150) | `TempoOptions.Latency` | ✅ |
 | Converting positions back with BASS_FX_TempoGetRateRatio | Not needed: positions, markers, the clock and CD+G stay in song time | — | ➖ (by design) |
-| BASS_FX_ReverseCreate / BASS_ATTRIB_REVERSE_DIR | Reverse playback | | 🗓️ |
+| BASS_FX_ReverseCreate / BASS_ATTRIB_REVERSE_DIR | `fa_stream_set_reverse` on the stream itself, switchable while playing; no separate reverse stream or decode block size ([reverse playback](../features/tempo-pitch.md#reverse-playback)) | `AudioStream.Reverse` | ✅ |
 | BASS_FX_BPM_DecodeGet | `fa_analyze_path` with `FA_ANALYZE_BEATS`, then `fa_analysis_get_beat_grid` ([track analysis](../features/analysis.md)) | `AudioEngine.Analyze` / `AnalyzeAsync`, `TrackAnalysis.Beats` | ✅ |
 | BASS_FX_BPM_BeatDecodeGet | Beat times from the grid: `fa_beat_grid.first_beat` plus `bpm`, or the tempo segments for songs that change tempo (measured from the audio, so drifting songs stay on their beats) | `BeatGrid.BeatToFrame` | ✅ |
 | Bars and downbeats (BASS_FX has none) | `fa_beat_grid.beats_per_bar` and `bar_offset` with `FA_GRID_BARS`: from MIDI files, or found in the audio when chord changes and kicks mark them ([bars](../features/analysis.md#bars)) | `BeatGrid.BeatsPerBar`, `BarOffset`, `BeatGridFlags.Bars` | ✅ |
@@ -534,7 +534,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | BASS_MIDI_StreamGetMark BASS_MIDI_MARK_KEYSIG / TIMESIG / TEMPO | `fa_stream_get_midi_marks`: type `FA_MIDI_MARK_KEY_SIGNATURE` / `TIME_SIGNATURE` / `TEMPO`, numbers in `value`/`value2`, text like `"3/4"` ([MIDI](../features/midi.md#tempo-time-and-key-signatures)) | `stream.MidiMarks` | ✅ |
 | BASS_SYNC_MIDI_KEYSIG / TIMESIG / TEMPO | Not raised as events: follow the clock through `fa_stream_get_midi_marks` | — | ➖ |
 | BASS_MIDI_MARK_TICK (positions in ticks) | Not provided: positions are frames and nanoseconds | — | ➖ |
-| GS/XG/GM2 SysEx (resets, drum parts, master volume and tuning), handled by BASSMIDI | Applied the same way ([SysEx](../features/midi.md#sysex)) | automatic | ✅ (effects SysEx ignored) |
+| GS/XG/GM2 SysEx (resets, drum parts, master volume and tuning), handled by BASSMIDI | Applied the same way, GS and XG reverb and chorus settings included ([SysEx](../features/midi.md#sysex)) | automatic | ✅ |
 | BASS_SYNC_MIDI_LYRIC / BASS_SYNC_MIDI_TEXT / BASS_SYNC_MIDI_MARK | `FA_EVENT_MIDI_TEXT` (`value` = text index) | `stream.MidiTextReached` | ✅ |
 | BASS_MIDI_StreamEvent MIDI_EVENT_TRANSPOSE | `fa_stream_set_midi_transpose` | `stream.MidiTranspose` | ✅ |
 | BASS_MIDI_StreamEvent MIDI_EVENT_MUTE | `fa_stream_set_midi_channel_mute` | `stream.SetMidiChannelMuted` | ✅ |
@@ -552,7 +552,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | BASS_MIDI_DECAYSEEK (let the sound before a seek decay) | Not provided: a seek starts from silence, with the held notes restarted | — | ➖ |
 | BASS_MIDI_NOFX (reverb and chorus) | Reverb and chorus are on by default; `fa_stream_set_midi_effects(stream, 0)` turns them off ([MIDI](../features/midi.md#reverb-and-chorus)) | `stream.MidiEffects` | ✅ |
 | BASS_MIDI_StreamEvent MIDI_EVENT_REVERB / MIDI_EVENT_CHORUS (send levels) | Set by the file's CC91 and CC93 controllers, with the soundfont's effect sends; not settable from the app | automatic | ✅ (in the file) |
-| BASS_MIDI_StreamEvent MIDI_EVENT_REVERB_MACRO / MIDI_EVENT_CHORUS_MACRO and other reverb or chorus type and level events | Not provided: one fixed reverb and chorus | — | ➖ |
+| BASS_MIDI_StreamEvent MIDI_EVENT_REVERB_MACRO / MIDI_EVENT_CHORUS_MACRO and other reverb or chorus type and level events | Taken from the file's GS and XG SysEx ([reverb and chorus](../features/midi.md#reverb-and-chorus)); not settable from the app | automatic | ✅ (in the file) |
 | BASS_ATTRIB_MIDI_SRC / BASS_MIDI_SINCINTER | Not configurable: the synthesizer's own interpolation | — | ➖ |
 
 ## 3. Add-on map
@@ -570,7 +570,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | basswma.dll | Built-in ASF demuxer (`.wma`, `.asf`, `.wmv` audio; files, memory, your own reader, HTTP), decoded by Media Foundation on Windows (unsupported elsewhere); ReplayGain attributes for normalization, tags and covers ([WMA](../features/streams.md#wma)) | ✅ playback; ➖ encoding (record to MP3, FLAC or WAV with `fa_encoder_*` instead), MMS, broadcasting and DRM |
 | bassenc.dll, bassenc_mp3.dll, bassenc_flac.dll (if added later) | Built in: `fa_encoder_*` writes WAV and FLAC itself and MP3 through the app's LAME ([recording and encoding](../features/recording-encoding.md)) | ✅ WAV/FLAC/MP3, 🗓️ Opus/AAC/casting |
 | bassmidi.dll | Built-in SoundFont 2 synthesizer for `.mid`, `.kar` and `.rmi`: SF2 or DLS banks, engine-wide or per-stream, the OS's `gm.dls` when the app sets none, SF3 banks, reverb and chorus, lyrics and text events, transpose and channel mute ([MIDI](../features/midi.md)) | ✅ (SFZ and MIDI input 🗓️) |
-| bass_fx.dll | Tempo/pitch/rate params on every stream ([tempo and pitch](../features/tempo-pitch.md)); BPM and beat detection in [track analysis](../features/analysis.md); reverse planned. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | ✅ tempo/pitch/rate, BPM and beats, and level control; 🗓️ reverse |
+| bass_fx.dll | Tempo/pitch/rate params on every stream ([tempo and pitch](../features/tempo-pitch.md)); BPM and beat detection in [track analysis](../features/analysis.md); reverse playback with `fa_stream_set_reverse`. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | ✅ tempo/pitch/rate, reverse, BPM and beats, and level control |
 | basscd.dll | Built-in disc source: drives on Windows, macOS and Linux, `.cue` images, CD-Text, freedb and MusicBrainz ids, CD+G graphics ([disc playback](../features/disc.md)); analog playback not provided | ✅ disc and CD+G discs |
 | Your own CD+G decoder and renderer (MP3+G, ZIP) | Built in: `fa_cdg_surface_*` draws the graphics in sync with the audio ([CD+G](../features/cdg.md)) | ✅ |
 

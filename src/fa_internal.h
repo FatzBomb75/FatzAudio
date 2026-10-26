@@ -270,6 +270,13 @@ void fa_midi_fx_process(fa_midi_fx* fx, const float* reverb_in, const float* cho
  * Call set_reverb on the thread that processes; it takes effect at once. */
 void fa_midi_fx_set_reverb(fa_midi_fx* fx, float room, float damp, float in_gain, float wet);
 void fa_midi_fx_reverb(fa_midi_fx* fx, const float* in, float* out, int frames);
+/* GS and XG effect SysEx (dec_midi.c, on the thread that processes): defaults puts
+ * back the reverb and chorus every reset gives; gs takes Roland's 40 01 `addr`
+ * (reverb 30-35, chorus 38-3E), xg Yamaha's 02 01 `addr` (reverb 00-0C, chorus
+ * 20-2C), one data byte each. Others are ignored. */
+void fa_midi_fx_defaults(fa_midi_fx* fx);
+void fa_midi_fx_gs(fa_midi_fx* fx, int addr, int value);
+void fa_midi_fx_xg(fa_midi_fx* fx, int addr, int value);
 struct fa_soundfont* fa_soundfont_retain(struct fa_soundfont* f);
 void fa_soundfont_release(struct fa_soundfont* f);
 /* A fingerprint of the soundfont's content, for the loudness cache. */
@@ -1259,6 +1266,17 @@ struct fa_stream {
     int64_t rd_count, rd_off;
     double rd_src0, rd_slope;
     const float* chain_buf;      /* attached: the chain's output the converter reads, NULL = in_buf */
+    /* Reverse playback (fa_stream_set_reverse): reverse_want as set, reverse the way
+     * the current timeline runs (taken from reverse_want at each restart). Reversed,
+     * the timeline's linear frames (seek_base + frames since, what `decoded`, the
+     * chain and the tmap count) run up while the source position runs down: linear
+     * frame L is source position 2 * seek_base - L. The source is decoded forward in
+     * blocks into rev_buf and handed out last frame first: rev_n frames are left,
+     * ending at source frame rev_pos (decode side, under decode_lock). */
+    fa_atomic32 reverse_want;
+    fa_atomic32 reverse;
+    float* rev_buf;
+    fa_frames rev_cap, rev_n, rev_pos;
 
     /* CD+G graphics (cdg.c): the packs, the surfaces drawing them, and a generation
      * count that tells surfaces the graphics were replaced. Never touched by the
