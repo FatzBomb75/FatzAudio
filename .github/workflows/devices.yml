@@ -1,0 +1,142 @@
+name: devices
+
+# The test suites on a real Android 14 (an emulator) and a real iOS (the simulator),
+# with the system services build.yml cannot reach: audio output and input (AAudio,
+# Core Audio), the system AAC decoders (MediaCodec, AudioToolbox), and HTTPS through
+# the system's own stack (HttpURLConnection, URLSession). FA_TEST_REAL_SYSTEM=1
+# makes the tests that need them fail instead of skipping.
+#
+# These cost more than build.yml (an emulator boot; macOS minutes bill at 10x), so
+# pull requests run them only when they touch code these systems run differently;
+# every push to main, and a manual run, runs them.
+on:
+  pull_request:
+    paths:
+      - 'src/*android*'
+      - 'src/*apple*'
+      - 'src/codec_at.c'
+      - 'src/codec_mediacodec.c'
+      - 'src/codec.c'
+      - 'src/codec_os.c'
+      - 'src/engine.c'
+      - 'src/device*.c'
+      - 'src/mic.c'
+      - 'src/fa_platform.*'
+      - 'third_party/miniaudio/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'tests/CMakeLists.txt'
+      - 'tests/test_device.c'
+      - 'tests/test_aac.c'
+      - 'tests/test_net.c'
+      - 'tests/net_tls_android.*'
+      - 'tools/android-test/**'
+      - 'tools/ios-sim/**'
+      - 'tools/test-https/**'
+      - '.github/workflows/devices.yml'
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+  workflow_dispatch:
+
+concurrency:
+  group: devices-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CMAKE_C_COMPILER_LAUNCHER: ccache
+  CMAKE_CXX_COMPILER_LAUNCHER: ccache
+  CMAKE_OBJC_COMPILER_LAUNCHER: ccache
+
+jobs:
+  # Every test suite on an Android 14 emulator (x86_64, Google APIs image, KVM),
+  # run over adb by tools/android-test/run-adb.py.
+  android-emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hendrikmuhs/ccache-action@v1.2.14
+        with:
+          key: android-emulator
+          max-size: 500M
+      # The tests find their data by absolute path and the device can only write
+      # under /data/local/tmp, so the source and build live at that path here too.
+      - name: Build for Android x86_64 with tests
+        run: |
+          sudo mkdir -p /data/local/tmp/fa
+          sudo chown "$USER" /data/local/tmp/fa
+          rsync -a --exclude .git "$GITHUB_WORKSPACE/" /data/local/tmp/fa/src/
+          cmake -S /data/local/tmp/fa/src -B /data/local/tmp/fa/build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=x86_64 -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release \
+            -DFA_BUILD_TOOLS=OFF
+          cmake --build /data/local/tmp/fa/build --parallel "$(nproc)"
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # The emulator keeps its virtual sound card (no -no-audio): with no sound
+      # server on the runner it plays into nothing, but AAudio runs for real.
+      - name: Test on an Android 14 emulator
+        uses: reactivecircus/android-emulator-runner@v2.33.0
+        env:
+          FA_TEST_REAL_SYSTEM: '1'
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-boot-anim -camera-back none -camera-front none
+          disable-animations: true
+          script: python3 tools/android-test/run-adb.py /data/local/tmp/fa/build
+
+  # Every test suite in an iOS simulator (arm64), each program started in it by
+  # tools/ios-sim/run.sh. URLSession is checked against a local HTTPS server whose
+  # test certificate authority the simulator is told to trust.
+  ios-simulator:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hendrikmuhs/ccache-action@v1.2.14
+        with:
+          key: ios-simulator
+          max-size: 500M
+      - name: Build for the iOS simulator with tests
+        run: |
+          cmake -S . -B build-iossim -G "Unix Makefiles" \
+            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DCMAKE_BUILD_TYPE=Release \
+            -DFA_BUILD_TESTS=ON -DFA_BUILD_TOOLS=OFF \
+            -DCMAKE_CROSSCOMPILING_EMULATOR="$PWD/tools/ios-sim/run.sh"
+          cmake --build build-iossim --parallel "$(sysctl -n hw.ncpu)"
+      # The runner has no sound device; the simulator plays through the Mac's.
+      - name: Install a virtual sound device (BlackHole)
+        run: |
+          brew install --cask blackhole-2ch
+          sudo killall coreaudiod || true
+      - name: Boot a simulator
+        run: |
+          udid=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)["devices"]
+          print(next(x["udid"] for k in sorted(d, reverse=True) if ".iOS-" in k for x in d[k] if x["name"].startswith("iPhone")))')
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+          echo "FA_IOS_SIM=$udid" >> "$GITHUB_ENV"
+      - name: Start the HTTPS test server
+        run: |
+          python3 tools/test-https/serve.py tests/data "$RUNNER_TEMP/https" > "$RUNNER_TEMP/https.log" 2>&1 &
+          for i in $(seq 100); do nc -z 127.0.0.1 8443 && break; sleep 0.2; done
+          xcrun simctl keychain "$FA_IOS_SIM" add-root-cert "$RUNNER_TEMP/https/ca.crt"
+      - name: Test in the iOS simulator
+        env:
+          FA_TEST_REAL_SYSTEM: '1'
+          FA_NET_HTTPS_URL: https://127.0.0.1:8443/net/tone_cbr.mp3
+        run: ctest --test-dir build-iossim -j 3 --output-on-failure
+      - name: HTTPS test server log
+        if: failure()
+        run: cat "$RUNNER_TEMP/https.log"

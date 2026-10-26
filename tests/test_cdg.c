@@ -13,6 +13,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#  include <unistd.h>
+#endif
 #include <time.h>
 #ifndef _WIN32
 #  include <dirent.h>
@@ -3755,6 +3758,10 @@ static void test_close_while_updating(void)
 int main(void)
 {
     fa_engine_config cfg;
+#if defined(__APPLE__)
+    /* The iOS simulator starts programs elsewhere: tools/ios-sim/run.sh names the folder. */
+    if (getenv("FA_TEST_CWD") && chdir(getenv("FA_TEST_CWD")) != 0) return 1;
+#endif
     fa_engine_config_init(&cfg);
     cfg.flags = FA_ENGINE_NULL_OUTPUT;
     cfg.worker_threads = 2;   /* render-ahead needs two (ra_request) */

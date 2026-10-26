@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#  include <unistd.h>
+#endif
 
 static int g_failures = 0;
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); g_failures++; return; } } while (0)
@@ -2152,6 +2155,10 @@ int main(void)
 {
     fa_engine_config cfg;
     buf sf = make_sf2();
+#if defined(__APPLE__)
+    /* The iOS simulator starts programs elsewhere: tools/ios-sim/run.sh names the folder. */
+    if (getenv("FA_TEST_CWD") && chdir(getenv("FA_TEST_CWD")) != 0) return 1;
+#endif
     fa_engine_config_init(&cfg);
     cfg.flags = FA_ENGINE_NULL_OUTPUT;
     cfg.worker_threads = 2;

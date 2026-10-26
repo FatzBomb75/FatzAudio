@@ -11,6 +11,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#  include <unistd.h>
+#endif
 #include <time.h>
 #if defined(_WIN32)
 #  include <direct.h>
@@ -1405,6 +1408,10 @@ int main(void)
     fa_engine_config cfg;
     buf sf2;
     const char* report = getenv("FA_ANALYSIS_REPORT_SF2");
+#if defined(__APPLE__)
+    /* The iOS simulator starts programs elsewhere: tools/ios-sim/run.sh names the folder. */
+    if (getenv("FA_TEST_CWD") && chdir(getenv("FA_TEST_CWD")) != 0) return 1;
+#endif
     fa_engine_config_init(&cfg);
     cfg.flags |= FA_ENGINE_NULL_OUTPUT;
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) { fprintf(stderr, "engine\n"); return 1; }

@@ -12,6 +12,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#  include <TargetConditionals.h>
+#endif
 
 static int g_failures = 0;
 #define CHECK(cond) do { if (!(cond)) { fprintf(stderr, "  FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); g_failures++; return; } } while (0)
@@ -1856,6 +1859,18 @@ static void test_cue_heard_position(void)
     free(cdg.d);
 }
 
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+static void test_cue_device_not_on_ios(void)
+{
+    fa_mixer_config c;
+    fa_mixer* m = NULL;
+    fa_mixer_config_init(&c);
+    c.cue_mode = FA_CUE_DEVICE;
+    CHECK_EQ(fa_mixer_create(g_engine, &c, &m), FA_ERROR_NOT_IMPLEMENTED);
+    CHECK(m == NULL);
+}
+#endif
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -1902,6 +1917,10 @@ int main(void)
     RUN(test_check_errors);
     RUN(test_check_mic_removed);
     RUN(test_latency_mode);
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    /* Headphones on a second device are not on iOS (FA_ERROR_NOT_IMPLEMENTED). */
+    RUN(test_cue_device_not_on_ios);
+#else
     RUN(test_cue_drift_fast);
     RUN(test_cue_drift_slow);
     RUN(test_cue_other_rate);
@@ -1912,6 +1931,7 @@ int main(void)
     RUN(test_cue_lost);
     RUN(test_cue_latency_mode);
     RUN(test_cue_heard_position);
+#endif
 
     fa_engine_destroy(g_engine);
     free(g_sf2_song.d);

@@ -54,6 +54,16 @@ jobs:
       - name: Install LAME (macOS)
         if: runner.os == 'macOS'
         run: brew install lame
+      # Real audio output (FA_TEST_REAL_SYSTEM: the device test and the system AAC
+      # decoder must run, not skip). The runner has no sound device, so BlackHole's
+      # virtual one. (HTTPS through URLSession is checked in the iOS simulator job,
+      # devices.yml: a hosted Mac refuses to trust a test root without a person.)
+      - name: Virtual sound device (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install --cask blackhole-2ch
+          sudo killall coreaudiod || true
+          echo "FA_TEST_REAL_SYSTEM=1" >> "$GITHUB_ENV"
       # Only the built libmp3lame.dll is cached (a vcpkg install is over a minute);
       # bump the key to refresh it.
       - name: Restore LAME (Windows)
