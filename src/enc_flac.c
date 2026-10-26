@@ -5,13 +5,17 @@
  * autocorrelation, Levinson-Durbin, every order up to the level's maximum), and for
  * stereo the four channel decorrelations (left/right, left/side, side/right,
  * mid/side); the residual's Rice partitions are chosen per order with escapes for
- * noise. Everything is costed exactly (a Rice estimate from partition sums is an
- * upper bound of the real size), and the cheapest wins.
+ * noise. A predictor is costed from per-partition sums of its residual
+ * (enc_flac_dsp.c) without storing it, and the cost of a Rice partition is exact
+ * (closed-form parameter, no search). At levels 3 and up the LPC candidates are
+ * first costed on 8 short pieces of the block and only the best few in full; the
+ * residual is computed once more for the predictor written.
  *
  * STREAMINFO is completed at the end (length, frame sizes, MD5 of the audio) when
  * the output can seek; a forward-only output keeps "unknown" there, which the
  * format allows. */
 #include "encode.h"
+#include "enc_flac_dsp.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,8 +23,6 @@
 #include <intrin.h>
 #endif
 
-#define FLAC_MAX_LPC 12
-#define FLAC_MAX_PART 8
 #define FLAC_PADDING 4096
 
 /* ---- MD5 (RFC 1321) ---------------------------------------------------------------- */
@@ -41,39 +43,83 @@ static void md5_init(md5_ctx* m)
 
 #define ROL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
 
+/* The four rounds written out, so every rotation and word is a constant. */
+#define MD5_F(x, y, z) ((z) ^ ((x) & ((y) ^ (z))))
+#define MD5_G(x, y, z) (((x) & (z)) + ((y) & ~(z)))
+#define MD5_H(x, y, z) ((x) ^ (y) ^ (z))
+#define MD5_I(x, y, z) ((y) ^ ((x) | ~(z)))
+#define MD5_STEP(f, a, b, c, d, x, s, k) (a) += (x) + (k); (a) += f((b), (c), (d)); (a) = ROL((a), (s)) + (b);
+
 static void md5_block(md5_ctx* m, const uint8_t* p)
 {
-    static const uint32_t K[64] = {
-        0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
-        0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be, 0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-        0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa, 0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
-        0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed, 0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-        0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c, 0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-        0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05, 0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-        0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039, 0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-        0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1, 0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391
-    };
-    static const uint8_t R[64] = {
-        7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
-        4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21
-    };
     uint32_t w[16], a = m->a, b = m->b, c = m->c, d = m->d;
     int i;
     for (i = 0; i < 16; i++)
         w[i] = (uint32_t)p[i * 4] | ((uint32_t)p[i * 4 + 1] << 8) | ((uint32_t)p[i * 4 + 2] << 16) | ((uint32_t)p[i * 4 + 3] << 24);
-    for (i = 0; i < 64; i++) {
-        uint32_t f, t;
-        int g;
-        if (i < 16) { f = (b & c) | (~b & d); g = i; }
-        else if (i < 32) { f = (d & b) | (~d & c); g = (5 * i + 1) & 15; }
-        else if (i < 48) { f = b ^ c ^ d; g = (3 * i + 5) & 15; }
-        else { f = c ^ (b | ~d); g = (7 * i) & 15; }
-        t = d;
-        d = c;
-        c = b;
-        b = b + ROL(a + f + K[i] + w[g], R[i]);
-        a = t;
-    }
+    MD5_STEP(MD5_F, a, b, c, d, w[0], 7, 0xd76aa478u)
+    MD5_STEP(MD5_F, d, a, b, c, w[1], 12, 0xe8c7b756u)
+    MD5_STEP(MD5_F, c, d, a, b, w[2], 17, 0x242070dbu)
+    MD5_STEP(MD5_F, b, c, d, a, w[3], 22, 0xc1bdceeeu)
+    MD5_STEP(MD5_F, a, b, c, d, w[4], 7, 0xf57c0fafu)
+    MD5_STEP(MD5_F, d, a, b, c, w[5], 12, 0x4787c62au)
+    MD5_STEP(MD5_F, c, d, a, b, w[6], 17, 0xa8304613u)
+    MD5_STEP(MD5_F, b, c, d, a, w[7], 22, 0xfd469501u)
+    MD5_STEP(MD5_F, a, b, c, d, w[8], 7, 0x698098d8u)
+    MD5_STEP(MD5_F, d, a, b, c, w[9], 12, 0x8b44f7afu)
+    MD5_STEP(MD5_F, c, d, a, b, w[10], 17, 0xffff5bb1u)
+    MD5_STEP(MD5_F, b, c, d, a, w[11], 22, 0x895cd7beu)
+    MD5_STEP(MD5_F, a, b, c, d, w[12], 7, 0x6b901122u)
+    MD5_STEP(MD5_F, d, a, b, c, w[13], 12, 0xfd987193u)
+    MD5_STEP(MD5_F, c, d, a, b, w[14], 17, 0xa679438eu)
+    MD5_STEP(MD5_F, b, c, d, a, w[15], 22, 0x49b40821u)
+    MD5_STEP(MD5_G, a, b, c, d, w[1], 5, 0xf61e2562u)
+    MD5_STEP(MD5_G, d, a, b, c, w[6], 9, 0xc040b340u)
+    MD5_STEP(MD5_G, c, d, a, b, w[11], 14, 0x265e5a51u)
+    MD5_STEP(MD5_G, b, c, d, a, w[0], 20, 0xe9b6c7aau)
+    MD5_STEP(MD5_G, a, b, c, d, w[5], 5, 0xd62f105du)
+    MD5_STEP(MD5_G, d, a, b, c, w[10], 9, 0x02441453u)
+    MD5_STEP(MD5_G, c, d, a, b, w[15], 14, 0xd8a1e681u)
+    MD5_STEP(MD5_G, b, c, d, a, w[4], 20, 0xe7d3fbc8u)
+    MD5_STEP(MD5_G, a, b, c, d, w[9], 5, 0x21e1cde6u)
+    MD5_STEP(MD5_G, d, a, b, c, w[14], 9, 0xc33707d6u)
+    MD5_STEP(MD5_G, c, d, a, b, w[3], 14, 0xf4d50d87u)
+    MD5_STEP(MD5_G, b, c, d, a, w[8], 20, 0x455a14edu)
+    MD5_STEP(MD5_G, a, b, c, d, w[13], 5, 0xa9e3e905u)
+    MD5_STEP(MD5_G, d, a, b, c, w[2], 9, 0xfcefa3f8u)
+    MD5_STEP(MD5_G, c, d, a, b, w[7], 14, 0x676f02d9u)
+    MD5_STEP(MD5_G, b, c, d, a, w[12], 20, 0x8d2a4c8au)
+    MD5_STEP(MD5_H, a, b, c, d, w[5], 4, 0xfffa3942u)
+    MD5_STEP(MD5_H, d, a, b, c, w[8], 11, 0x8771f681u)
+    MD5_STEP(MD5_H, c, d, a, b, w[11], 16, 0x6d9d6122u)
+    MD5_STEP(MD5_H, b, c, d, a, w[14], 23, 0xfde5380cu)
+    MD5_STEP(MD5_H, a, b, c, d, w[1], 4, 0xa4beea44u)
+    MD5_STEP(MD5_H, d, a, b, c, w[4], 11, 0x4bdecfa9u)
+    MD5_STEP(MD5_H, c, d, a, b, w[7], 16, 0xf6bb4b60u)
+    MD5_STEP(MD5_H, b, c, d, a, w[10], 23, 0xbebfbc70u)
+    MD5_STEP(MD5_H, a, b, c, d, w[13], 4, 0x289b7ec6u)
+    MD5_STEP(MD5_H, d, a, b, c, w[0], 11, 0xeaa127fau)
+    MD5_STEP(MD5_H, c, d, a, b, w[3], 16, 0xd4ef3085u)
+    MD5_STEP(MD5_H, b, c, d, a, w[6], 23, 0x04881d05u)
+    MD5_STEP(MD5_H, a, b, c, d, w[9], 4, 0xd9d4d039u)
+    MD5_STEP(MD5_H, d, a, b, c, w[12], 11, 0xe6db99e5u)
+    MD5_STEP(MD5_H, c, d, a, b, w[15], 16, 0x1fa27cf8u)
+    MD5_STEP(MD5_H, b, c, d, a, w[2], 23, 0xc4ac5665u)
+    MD5_STEP(MD5_I, a, b, c, d, w[0], 6, 0xf4292244u)
+    MD5_STEP(MD5_I, d, a, b, c, w[7], 10, 0x432aff97u)
+    MD5_STEP(MD5_I, c, d, a, b, w[14], 15, 0xab9423a7u)
+    MD5_STEP(MD5_I, b, c, d, a, w[5], 21, 0xfc93a039u)
+    MD5_STEP(MD5_I, a, b, c, d, w[12], 6, 0x655b59c3u)
+    MD5_STEP(MD5_I, d, a, b, c, w[3], 10, 0x8f0ccc92u)
+    MD5_STEP(MD5_I, c, d, a, b, w[10], 15, 0xffeff47du)
+    MD5_STEP(MD5_I, b, c, d, a, w[1], 21, 0x85845dd1u)
+    MD5_STEP(MD5_I, a, b, c, d, w[8], 6, 0x6fa87e4fu)
+    MD5_STEP(MD5_I, d, a, b, c, w[15], 10, 0xfe2ce6e0u)
+    MD5_STEP(MD5_I, c, d, a, b, w[6], 15, 0xa3014314u)
+    MD5_STEP(MD5_I, b, c, d, a, w[13], 21, 0x4e0811a1u)
+    MD5_STEP(MD5_I, a, b, c, d, w[4], 6, 0xf7537e82u)
+    MD5_STEP(MD5_I, d, a, b, c, w[11], 10, 0xbd3af235u)
+    MD5_STEP(MD5_I, c, d, a, b, w[2], 15, 0x2ad7d2bbu)
+    MD5_STEP(MD5_I, b, c, d, a, w[9], 21, 0xeb86d391u)
     m->a += a; m->b += b; m->c += c; m->d += d;
 }
 
@@ -116,12 +162,28 @@ typedef struct bitw {
     int nbits;
 } bitw;
 
+/* Up to 32 bits; whole 32-bit words go out to buf, the rest waits in acc
+ * (flush_bytes writes its whole bytes). */
 static void put(bitw* w, uint32_t v, int n)
 {
     if (n <= 0) return;
     if (n < 32) v &= (1u << n) - 1;
     w->acc = (w->acc << n) | v;
     w->nbits += n;
+    if (w->nbits >= 32) {
+        uint32_t o;
+        w->nbits -= 32;
+        o = (uint32_t)(w->acc >> w->nbits);
+        w->buf[w->len] = (uint8_t)(o >> 24);
+        w->buf[w->len + 1] = (uint8_t)(o >> 16);
+        w->buf[w->len + 2] = (uint8_t)(o >> 8);
+        w->buf[w->len + 3] = (uint8_t)o;
+        w->len += 4;
+    }
+}
+
+static void flush_bytes(bitw* w)
+{
     while (w->nbits >= 8) {
         w->nbits -= 8;
         w->buf[w->len++] = (uint8_t)(w->acc >> w->nbits);
@@ -138,7 +200,8 @@ static void put_unary(bitw* w, uint64_t q)
 
 static void align_byte(bitw* w)
 {
-    if (w->nbits) put(w, 0, 8 - w->nbits);
+    if (w->nbits & 7) put(w, 0, 8 - (w->nbits & 7));
+    flush_bytes(w);
 }
 
 static uint8_t crc8(const uint8_t* p, size_t n)
@@ -213,28 +276,25 @@ static int bitlen64(uint64_t u)
 #endif
 }
 
-static uint32_t zigzag(int32_t r) { return ((uint32_t)r << 1) ^ (uint32_t)(r >> 31); }
-
 /* Cheapest coding of one partition of `n` samples whose zigzag values sum to `sum`
- * (largest `umax`): Rice parameter, or an escape with raw bits. *wide is set when
- * a parameter above 14 was in reach (only then can the 5-bit method win). */
-static uint64_t part_cost(uint64_t n, uint64_t sum, uint64_t umax, int method, uint8_t* out_k, uint8_t* out_esc, int* wide)
+ * (OR of them `uor`; `avg` is sum / n): Rice parameter (at most kmax, written in
+ * pbits), or an escape with raw bits. *wide is set when a parameter above 14 was
+ * in reach (only then can the 5-bit method win). */
+static uint64_t part_cost(uint64_t n, uint64_t sum, uint64_t avg, uint32_t uor, int kmax, int pbits, uint8_t* out_k,
+                          uint8_t* out_esc, int* wide)
 {
-    int kmax = method ? 30 : 14, pbits = method ? 5 : 4, k, k0, best_k = 0;
-    uint64_t best = UINT64_MAX, esc;
-    int raw;
+    int k0, best_k, raw;
+    uint64_t best, esc;
     if (n == 0) { *out_k = 0; *out_esc = 0; return (uint64_t)pbits; }
-    k0 = sum > n ? bitlen64((n & (n - 1)) == 0 ? sum >> (bitlen64(n) - 1) : sum / n) - 1 : 0;
+    k0 = sum > n ? bitlen64(avg) - 1 : 0;
     if (k0 + 1 > 14) *wide = 1;
-    for (k = k0 - 1; k <= k0 + 1; k++) {
-        uint64_t c;
-        if (k < 0 || k > kmax) continue;
-        /* sum(u >> k) <= sum >> k: an upper bound of the coded size */
-        c = (uint64_t)pbits + n * (uint64_t)(k + 1) + (sum >> k);
-        if (c < best) { best = c; best_k = k; }
-    }
-    if (best == UINT64_MAX) { best_k = kmax; best = (uint64_t)pbits + n * (uint64_t)(kmax + 1) + (sum >> kmax); }
-    raw = bitlen64(umax);
+    /* Size bound: n * (k + 1) + (sum >> k), since sum(u >> k) <= sum >> k. With
+     * 2^k0 <= sum / n < 2^(k0 + 1), k0 + 1 never costs less than k0, and k0 - 1
+     * costs the same only when sum >> (k0 - 1) == 2n (taken then, as the lower). */
+    best_k = k0 > kmax ? kmax : k0 > 0 && (sum >> (k0 - 1)) == 2 * n ? k0 - 1 : k0;
+    best = n * (uint64_t)(best_k + 1) + (sum >> best_k);
+    best += (uint64_t)pbits;
+    raw = bitlen64(uor);
     if (raw < 1) raw = 1;
     esc = (uint64_t)pbits + 5 + n * (uint64_t)raw;
     if (raw <= 31 && esc < best) { *out_k = 0; *out_esc = (uint8_t)raw; return esc; }
@@ -243,50 +303,52 @@ static uint64_t part_cost(uint64_t n, uint64_t sum, uint64_t umax, int method, u
     return best;
 }
 
-/* Plans the residual r[pred_order .. n) (with r stored from index 0 for the whole
- * block; the first pred_order entries are warm-up and ignored). */
-static void plan_residual(const int32_t* r, int n, int pred_order, int max_part, rice_plan* best)
+/* The highest partition order for n samples, pred_order of them warm-up. */
+static int part_top(int n, int pred_order, int max_part)
 {
-    uint64_t sums[1 << FLAC_MAX_PART], maxs[1 << FLAC_MAX_PART];
-    int top = 0, p, i, method;
+    int top = 0;
     while (top < max_part && (n % (2 << top)) == 0 && (n >> (top + 1)) > pred_order) top++;
-    /* finest partitions */
-    {
-        int parts = 1 << top, psize = n >> top, j;
-        for (j = 0; j < parts; j++) {
-            int start = j == 0 ? pred_order : j * psize, end = (j + 1) * psize;
-            uint64_t s = 0;
-            uint32_t m = 0;
-            for (i = start; i < end; i++) {
-                uint32_t u = zigzag(r[i]);
-                s += u;
-                if (u > m) m = u;
-            }
-            sums[j] = s;
-            maxs[j] = m;
-        }
-    }
+    return top;
+}
+
+/* Plans a residual from its partition sums at partition order `level` (at least
+ * the residual's own highest); merges in place, so `ps` is used up. */
+static void plan_sums(flac_sums* ps, int level, int n, int pred_order, int max_part, rice_plan* best)
+{
+    int top = part_top(n, pred_order, max_part), p, j, method;
     best->bits = UINT64_MAX;
-    for (p = top; p >= 0; p--) {
-        int parts = 1 << p, psize = n >> p, j, wide = 0;
-        if (p < top) {
+    for (p = level; p >= 0; p--) {
+        int parts = 1 << p, psize = n >> p, wide = 0;
+        if (p < level) {
             for (j = 0; j < parts; j++) {
-                sums[j] = sums[2 * j] + sums[2 * j + 1];
-                maxs[j] = maxs[2 * j] > maxs[2 * j + 1] ? maxs[2 * j] : maxs[2 * j + 1];
+                ps->sum[j] = ps->sum[2 * j] + ps->sum[2 * j + 1];
+                ps->bits[j] = ps->bits[2 * j] | ps->bits[2 * j + 1];
             }
         }
+        if (p > top) continue;
         /* Where every partition's parameters stay within 14, the 5-bit method picks
          * the same ones at a bit more each, so it cannot win. */
         for (method = 0; method < 2 && (method == 0 || wide); method++) {
-            rice_plan cand;
-            cand.method = method;
-            cand.order = p;
-            cand.bits = 6;   /* method + partition order */
-            for (j = 0; j < parts; j++) {
-                uint64_t cnt = (uint64_t)(j == 0 ? psize - pred_order : psize);
-                cand.bits += part_cost(cnt, sums[j], maxs[j], method, &cand.param[j], &cand.escape_bits[j], &wide);
+            int kmax = method ? 30 : 14, pbits = method ? 5 : 4, lg = bitlen64((uint64_t)psize) - 1;
+            int pow2 = (psize & (psize - 1)) == 0;
+            uint8_t param[1 << FLAC_MAX_PART], esc[1 << FLAC_MAX_PART];
+            uint64_t bits = 6;   /* method + partition order */
+            {
+                uint64_t cnt = (uint64_t)(psize - pred_order), sum = ps->sum[0];
+                bits += part_cost(cnt, sum, cnt ? sum / cnt : 0, ps->bits[0], kmax, pbits, &param[0], &esc[0], &wide);
             }
-            if (cand.bits < best->bits) *best = cand;
+            for (j = 1; j < parts; j++) {
+                uint64_t sum = ps->sum[j];
+                bits += part_cost((uint64_t)psize, sum, pow2 ? sum >> lg : sum / (uint64_t)psize, ps->bits[j], kmax, pbits,
+                                  &param[j], &esc[j], &wide);
+            }
+            if (bits < best->bits) {
+                best->bits = bits;
+                best->method = method;
+                best->order = p;
+                memcpy(best->param, param, (size_t)parts);
+                memcpy(best->escape_bits, esc, (size_t)parts);
+            }
         }
     }
 }
@@ -305,12 +367,39 @@ static void write_residual(bitw* w, const int32_t* r, int n, int pred_order, con
             for (i = start; i < end; i++) put_signed(w, r[i], b);
         } else {
             int k = pl->param[j];
+            uint32_t mask = (1u << k) - 1;
+            uint64_t acc;
+            int nbits;
+            uint8_t* o;
             put(w, (uint32_t)k, pbits);
+            /* put(), with the writer's state kept in registers */
+            acc = w->acc;
+            nbits = w->nbits;
+            o = w->buf + w->len;
             for (i = start; i < end; i++) {
-                uint64_t u = zigzag(r[i]);
-                put_unary(w, u >> k);
-                if (k) put(w, (uint32_t)(u & ((1ull << k) - 1)), k);
+                uint32_t u = fa_flac_zigzag(r[i]), q = u >> k;
+                if (q + 1 + (uint32_t)k <= 32) {
+                    /* q zeros, a one, then the k low bits: one write */
+                    int len = (int)q + 1 + k;
+                    acc = (acc << len) | ((1u << k) | (u & mask));
+                    nbits += len;
+                    if (nbits >= 32) {
+                        uint32_t v;
+                        nbits -= 32;
+                        v = (uint32_t)(acc >> nbits);
+                        o[0] = (uint8_t)(v >> 24); o[1] = (uint8_t)(v >> 16); o[2] = (uint8_t)(v >> 8); o[3] = (uint8_t)v;
+                        o += 4;
+                    }
+                } else {
+                    w->acc = acc; w->nbits = nbits; w->len = (size_t)(o - w->buf);
+                    put_unary(w, q);
+                    if (k) put(w, u & mask, k);
+                    acc = w->acc; nbits = w->nbits; o = w->buf + w->len;
+                }
             }
+            w->acc = acc;
+            w->nbits = nbits;
+            w->len = (size_t)(o - w->buf);
         }
     }
 }
@@ -327,10 +416,18 @@ typedef struct subframe {
     uint64_t bits;
 } subframe;
 
+/* An LPC candidate of the search */
+typedef struct lpc_cand {
+    int order, precision, shift, use;
+    int32_t coef[FLAC_MAX_LPC];
+    uint64_t est;                /* bits estimated from the probe */
+} lpc_cand;
+
 typedef struct flac_state {
     fa_enc_format f;
     uint32_t bits;               /* sample size: 16 or 24 */
     int level, blocksize, max_lpc, max_part, stereo_search, precision_search;
+    int probe;                   /* LPC candidates costed in full after a probe, 0 = all */
     int64_t frames, frame_number;
     uint32_t min_frame, max_frame;
     int64_t streaminfo_pos;
@@ -339,8 +436,10 @@ typedef struct flac_state {
     int32_t* pcm;                /* blocksize x channels, interleaved: the block being filled */
     int fill;
     int32_t* sig[4];             /* per signal: L, R, M, S (or one per channel) */
-    int32_t* res;                /* residual scratch */
     int32_t* best_res[4];        /* residual of the chosen subframe per signal */
+    flac_signal sg[4];           /* the kernels' view of each signal */
+    int16_t* sgbuf;              /* their buffers */
+    flac_sums fixed[5], sums;
     double* win;                 /* Tukey window */
     double* wbuf;
     subframe sub[8];
@@ -365,48 +464,6 @@ static void residual_fixed(const int32_t* x, int n, int order, int32_t* r)
         for (i = 4; i < n; i++) r[i] = x[i] - 4 * x[i - 1] + 6 * x[i - 2] - 4 * x[i - 3] + x[i - 4];
         break;
     }
-}
-
-/* 1 when the residual fits the 32-bit range decoders use. xmax: the largest
- * |x[i]|; when the coefficients' sizes times it stay below 2^31, every partial
- * sum fits 32 bits and is summed so (the same values, faster). */
-static int residual_lpc(const int32_t* x, int n, int order, const int32_t* q, int shift, int64_t xmax, int32_t* r)
-{
-    int64_t qsum = 0;
-    int i, j;
-    for (i = 0; i < order; i++) {
-        r[i] = 0;
-        qsum += q[i] < 0 ? -(int64_t)q[i] : q[i];
-    }
-    if (qsum * xmax < ((int64_t)1 << 31)) {
-        /* Each order on its own, so the compiler can unroll the sum. */
-#define LPC32(o)                                                         \
-        case o:                                                          \
-            for (i = o; i < n; i++) {                                    \
-                int32_t sum = 0;                                         \
-                int64_t v;                                               \
-                for (j = 0; j < o; j++) sum += q[j] * x[i - j - 1];      \
-                v = (int64_t)x[i] - (sum >> shift);                      \
-                if (v > INT32_MAX || v < INT32_MIN) return 0;            \
-                r[i] = (int32_t)v;                                       \
-            }                                                            \
-            break;
-        switch (order) {
-        LPC32(1) LPC32(2) LPC32(3) LPC32(4) LPC32(5) LPC32(6)
-        LPC32(7) LPC32(8) LPC32(9) LPC32(10) LPC32(11) LPC32(12)
-        default: return 0;
-        }
-#undef LPC32
-        return 1;
-    }
-    for (i = order; i < n; i++) {
-        int64_t sum = 0, v;
-        for (j = 0; j < order; j++) sum += (int64_t)q[j] * x[i - j - 1];
-        v = (int64_t)x[i] - (sum >> shift);
-        if (v > INT32_MAX || v < INT32_MIN) return 0;
-        r[i] = (int32_t)v;
-    }
-    return 1;
 }
 
 /* Quantizes LPC coefficients to `precision` bits; 0 if they cannot be. */
@@ -434,16 +491,13 @@ static int quantize_lpc(const double* lpc, int order, int precision, int32_t* q,
     return 1;
 }
 
-/* Best subframe for signal x (bps bits per sample); its residual ends up in
- * *keep. Each better candidate's buffer trades places with *keep, so nothing is
- * copied. */
-static void choose_subframe(flac_state* st, const int32_t* x, int n, int bps, subframe* best, int32_t** keep)
+/* Best subframe for signal x (bps bits per sample), costed from the candidates'
+ * partition sums; finish_subframe computes its residual. */
+static void choose_subframe(flac_state* st, const int32_t* x, int n, int bps, subframe* best, flac_signal* sg)
 {
     int i, order;
-    int32_t* r = st->res;
     subframe cand;
     int all_same = 1;
-    int64_t xmax = 0;
     for (i = 1; i < n; i++)
         if (x[i] != x[0]) { all_same = 0; break; }
     memset(best, 0, sizeof(*best));
@@ -457,19 +511,18 @@ static void choose_subframe(flac_state* st, const int32_t* x, int n, int bps, su
     /* The 32-bit residuals below need at most 25 bits a sample (24-bit side);
      * flac_check takes only 16 and 24 bits. */
     if (bps > 25) return;
+    fa_flac_signal_prepare(sg, x, n, sg->x16, sg->hi, sg->lo);
 
-    for (order = 0; order <= 4 && order < n; order++) {
-        memset(&cand, 0, sizeof(cand));
-        cand.type = SUB_FIXED;
-        cand.order = order;
-        residual_fixed(x, n, order, r);
-        plan_residual(r, n, order, st->max_part, &cand.plan);
-        cand.bits = 8 + (uint64_t)order * bps + cand.plan.bits;
-        if (cand.bits < best->bits) {
-            *best = cand;
-            st->res = *keep;
-            *keep = r;
-            r = st->res;
+    {
+        int top = part_top(n, 0, st->max_part);
+        fa_flac_fixed_sums(x, n, top, sg->xmax, st->fixed);
+        for (order = 0; order <= 4 && order < n; order++) {
+            memset(&cand, 0, sizeof(cand));
+            cand.type = SUB_FIXED;
+            cand.order = order;
+            plan_sums(&st->fixed[order], top, n, order, st->max_part, &cand.plan);
+            cand.bits = 8 + (uint64_t)order * bps + cand.plan.bits;
+            if (cand.bits < best->bits) *best = cand;
         }
     }
 
@@ -480,11 +533,7 @@ static void choose_subframe(flac_state* st, const int32_t* x, int n, int bps, su
         double* w = st->wbuf;
         const double* win = st->win;
         int whole = n == st->blocksize;
-        for (i = 0; i < n; i++) {
-            int64_t a = x[i] < 0 ? -(int64_t)x[i] : x[i];
-            if (a > xmax) xmax = a;
-            w[i] = (double)x[i] * (whole ? win[i] : 1.0);
-        }
+        for (i = 0; i < n; i++) w[i] = (double)x[i] * (whole ? win[i] : 1.0);
         /* Every lag at once: each sum still adds its terms in order, but the
          * sums no longer wait for one another. */
         for (lag = 0; lag <= maxo; lag++) ac[lag] = 0.0;
@@ -493,37 +542,102 @@ static void choose_subframe(flac_state* st, const int32_t* x, int n, int bps, su
         for (; i < n; i++)
             for (lag = 0; lag <= maxo; lag++) ac[lag] += w[i] * w[i - lag];
         if (ac[0] <= 0.0) return;
-        ac[0] *= 1.0 + 1e-9;   /* a little white noise: keeps the recursion stable */
-        /* Levinson-Durbin: the coefficients of every order */
-        e = ac[0];
-        for (k = 0; k < maxo; k++) {
-            double acc = ac[k + 1], refl;
-            for (i = 0; i < k; i++) acc -= a[i] * ac[k - i];
-            refl = acc / e;
-            for (i = 0; i < k; i++) tmp[i] = a[i] - refl * a[k - 1 - i];
-            for (i = 0; i < k; i++) a[i] = tmp[i];
-            a[k] = refl;
-            e *= 1.0 - refl * refl;
-            for (i = 0; i <= k; i++) lpc[k][i] = a[i];
-            if (e <= 0.0) { maxo = k + 1; break; }
-        }
-        for (order = 1; order <= maxo; order++) {
-            for (p = pmin; p <= pmax; p++) {
+        {
+            lpc_cand list[FLAC_MAX_LPC * 4 * 2];
+            int nc = 0, c, keep = st->probe, pass;
+            /* Levinson-Durbin as measured, and again with a little white noise
+             * (ac[0] * (1 + 1e-9)) when the first reached a very high prediction
+             * gain. The noise keeps the recursion well-conditioned on pure tones
+             * (up to 10% smaller) but caps the gain near 90 dB, which costs 24-bit
+             * music up to 15%; the candidates of both go on. */
+            for (pass = 0; pass < 2; pass++) {
+                int mo = maxo;
+                if (pass && e > ac[0] * 1e-7) break;   /* under 70 dB: the noise changes nothing */
+                e = pass ? ac[0] * (1.0 + 1e-9) : ac[0];
+                for (k = 0; k < mo; k++) {
+                    double acc = ac[k + 1], refl;
+                    for (i = 0; i < k; i++) acc -= a[i] * ac[k - i];
+                    refl = acc / e;
+                    for (i = 0; i < k; i++) tmp[i] = a[i] - refl * a[k - 1 - i];
+                    for (i = 0; i < k; i++) a[i] = tmp[i];
+                    a[k] = refl;
+                    e *= 1.0 - refl * refl;
+                    for (i = 0; i <= k; i++) lpc[k][i] = a[i];
+                    if (e <= 0.0) { mo = k + 1; break; }
+                }
+                for (order = 1; order <= mo; order++)
+                    for (p = pmin; p <= pmax; p++) {
+                        lpc_cand* lc = &list[nc];
+                        if (!quantize_lpc(lpc[order - 1], order, p, lc->coef, &lc->shift)) continue;
+                        for (c = 0; c < nc; c++)   /* the same predictor twice */
+                            if (list[c].order == order && list[c].precision == p && list[c].shift == lc->shift &&
+                                !memcmp(list[c].coef, lc->coef, sizeof(int32_t) * (size_t)order)) break;
+                        if (c < nc) continue;
+                        lc->order = order;
+                        lc->precision = p;
+                        lc->use = 1;
+                        nc++;
+                    }
+            }
+            if (keep > 0 && nc > keep && n >= 512) {
+                /* Probe every candidate on a quarter of the block (8 spread pieces),
+                 * then cost only the `keep` most promising in full. */
+                int pieces = 8, stride = n / pieces, len = stride / 4, j, t;
+                for (c = 0; c < nc; c++) {
+                    lpc_cand* lc = &list[c];
+                    uint64_t est = 0;
+                    int wide = 0;
+                    lc->use = 0;
+                    lc->est = UINT64_MAX;
+                    if (!fa_flac_lpc_sums(sg, lc->order, lc->coef, lc->shift, pieces, stride, len, &st->sums, NULL)) continue;
+                    for (j = 0; j < pieces; j++) {
+                        uint64_t m = (uint64_t)(j == 0 ? len - lc->order : len), sum = st->sums.sum[j];
+                        uint8_t pk, pe;
+                        est += part_cost(m, sum, m ? sum / m : 0, st->sums.bits[j], 30, 5, &pk, &pe, &wide);
+                    }
+                    lc->est = (uint64_t)lc->order * (uint64_t)(bps + lc->precision) +
+                              est * (uint64_t)(n - lc->order) / (uint64_t)(pieces * len - lc->order);
+                }
+                for (t = 0; t < keep; t++) {
+                    int bc = -1;
+                    for (c = 0; c < nc; c++)
+                        if (!list[c].use && list[c].est != UINT64_MAX && (bc < 0 || list[c].est < list[bc].est)) bc = c;
+                    if (bc >= 0) list[bc].use = 1;
+                }
+            }
+            for (c = 0; c < nc; c++) {
+                const lpc_cand* lc = &list[c];
+                int top;
+                if (!lc->use) continue;
+                order = lc->order;
+                top = part_top(n, order, st->max_part);
                 memset(&cand, 0, sizeof(cand));
                 cand.type = SUB_LPC;
                 cand.order = order;
-                cand.precision = p;
-                if (!quantize_lpc(lpc[order - 1], order, p, cand.coef, &cand.shift)) continue;
-                if (!residual_lpc(x, n, order, cand.coef, cand.shift, xmax, r)) continue;
-                plan_residual(r, n, order, st->max_part, &cand.plan);
-                cand.bits = 8 + (uint64_t)order * bps + 4 + 5 + (uint64_t)order * p + cand.plan.bits;
-                if (cand.bits < best->bits) {
-                    *best = cand;
-                    st->res = *keep;
-                    *keep = r;
-                    r = st->res;
-                }
+                cand.precision = lc->precision;
+                cand.shift = lc->shift;
+                memcpy(cand.coef, lc->coef, sizeof(cand.coef));
+                if (!fa_flac_lpc_sums(sg, order, cand.coef, cand.shift, 1 << top, n >> top, n >> top, &st->sums, NULL)) continue;
+                plan_sums(&st->sums, top, n, order, st->max_part, &cand.plan);
+                cand.bits = 8 + (uint64_t)order * bps + 4 + 5 + (uint64_t)order * cand.precision + cand.plan.bits;
+                if (cand.bits < best->bits) *best = cand;
             }
+        }
+    }
+}
+
+/* The chosen subframe's residual (the plan made from its sums stays). */
+static void finish_subframe(flac_state* st, int n, int bps, subframe* sf, int32_t* res, flac_signal* sg)
+{
+    if (sf->type == SUB_FIXED) {
+        residual_fixed(sg->x, n, sf->order, res);
+    } else if (sf->type == SUB_LPC) {
+        int top = part_top(n, sf->order, st->max_part);
+        if (!fa_flac_lpc_sums(sg, sf->order, sf->coef, sf->shift, 1 << top, n >> top, n >> top, &st->sums, res)) {
+            /* not reached: the search computed the same residual */
+            memset(sf, 0, sizeof(*sf));
+            sf->type = SUB_VERBATIM;
+            sf->bits = 8 + (uint64_t)n * bps;
         }
     }
 }
@@ -597,12 +711,18 @@ static fa_result encode_frame(flac_state* st, fa_enc_sink* s)
     /* MD5 of the samples as little-endian signed integers */
     {
         int64_t k, total = (int64_t)n * ch, b = 0;
-        int bytes = bps / 8;
-        for (k = 0; k < total; k++) {
-            int32_t v = st->pcm[k];
-            st->md5buf[b++] = (uint8_t)v;
-            st->md5buf[b++] = (uint8_t)(v >> 8);
-            if (bytes == 3) st->md5buf[b++] = (uint8_t)(v >> 16);
+        uint8_t* o = st->md5buf;
+        if (bps == 16) {
+            for (k = 0; k < total; k++, b += 2) {
+                o[b] = (uint8_t)st->pcm[k];
+                o[b + 1] = (uint8_t)(st->pcm[k] >> 8);
+            }
+        } else {
+            for (k = 0; k < total; k++, b += 3) {
+                o[b] = (uint8_t)st->pcm[k];
+                o[b + 1] = (uint8_t)(st->pcm[k] >> 8);
+                o[b + 2] = (uint8_t)(st->pcm[k] >> 16);
+            }
         }
         md5_update(&st->md5, st->md5buf, (size_t)b);
     }
@@ -618,7 +738,7 @@ static fa_result encode_frame(flac_state* st, fa_enc_sink* s)
             S[i] = l - rr;
         }
         for (c = 0; c < 4; c++) {
-            choose_subframe(st, st->sig[c], n, c == 3 ? bps + 1 : bps, &sub[c], &st->best_res[c]);
+            choose_subframe(st, st->sig[c], n, c == 3 ? bps + 1 : bps, &sub[c], &st->sg[c]);
             cost[c] = sub[c].bits;
         }
         /* 0: L/R, 8: L/S, 9: S/R, 10: M/S */
@@ -631,7 +751,7 @@ static fa_result encode_frame(flac_state* st, fa_enc_sink* s)
          * once channel 0 is written (below). */
         for (c = 0; c < ch && c < 4; c++) {
             for (i = 0; i < n; i++) st->sig[c][i] = st->pcm[i * ch + c];
-            choose_subframe(st, st->sig[c], n, bps, &sub[c], &st->best_res[c]);
+            choose_subframe(st, st->sig[c], n, bps, &sub[c], &st->sg[c]);
         }
     }
 
@@ -654,6 +774,7 @@ static fa_result encode_frame(flac_state* st, fa_enc_sink* s)
     put_utf8_number(&w, (uint64_t)st->frame_number);
     if (bs_bits) put(&w, (uint32_t)(n - 1), bs_bits);
     if (rbits) put(&w, rextra, rbits);
+    flush_bytes(&w);
     hdr_end = w.len;
     put(&w, crc8(w.buf, hdr_end), 8);
 
@@ -661,16 +782,19 @@ static fa_result encode_frame(flac_state* st, fa_enc_sink* s)
         static const int pick[11][2] = { { 0, 1 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 },
                                          { 0, 3 }, { 3, 1 }, { 2, 3 } };
         for (c = 0; c < 2; c++) {
-            int sidx = pick[mode][c];
-            write_subframe(&w, st->sig[sidx], n, sidx == 3 ? bps + 1 : bps, &sub[sidx], st->best_res[sidx]);
+            int sidx = pick[mode][c], sbps = sidx == 3 ? bps + 1 : bps;
+            finish_subframe(st, n, sbps, &sub[sidx], st->best_res[sidx], &st->sg[sidx]);
+            write_subframe(&w, st->sig[sidx], n, sbps, &sub[sidx], st->best_res[sidx]);
         }
     } else {
         for (c = 0; c < ch; c++) {
             if (c >= 4) {
                 for (i = 0; i < n; i++) st->sig[0][i] = st->pcm[i * ch + c];
-                choose_subframe(st, st->sig[0], n, bps, &sub[0], &st->best_res[0]);
+                choose_subframe(st, st->sig[0], n, bps, &sub[0], &st->sg[0]);
+                finish_subframe(st, n, bps, &sub[0], st->best_res[0], &st->sg[0]);
                 write_subframe(&w, st->sig[0], n, bps, &sub[0], st->best_res[0]);
             } else {
+                finish_subframe(st, n, bps, &sub[c], st->best_res[c], &st->sg[c]);
                 write_subframe(&w, st->sig[c], n, bps, &sub[c], st->best_res[c]);
             }
         }
@@ -679,6 +803,7 @@ static fa_result encode_frame(flac_state* st, fa_enc_sink* s)
     crc = crc16(w.buf, w.len);
     put(&w, crc >> 8, 8);
     put(&w, crc & 0xFF, 8);
+    flush_bytes(&w);
 
     r = fa_sink_write(s, w.buf, w.len);
     if (r != FA_OK) return r;
@@ -747,10 +872,10 @@ static void flac_choose(fa_enc_format* f)
 
 static fa_result flac_begin(void** impl, const fa_enc_format* f, const fa_enc_tags* t, fa_enc_sink* s)
 {
-    static const struct { int lpc, part, stereo, block, prec; } levels[9] = {
-        { 0, 3, 0, 1152, 0 }, { 0, 3, 1, 1152, 0 }, { 0, 4, 1, 1152, 0 },
-        { 6, 4, 0, 4096, 0 }, { 8, 4, 1, 4096, 0 }, { 8, 5, 1, 4096, 0 },
-        { 8, 6, 1, 4096, 0 }, { 12, 6, 1, 4096, 0 }, { 12, 8, 1, 4096, 1 }
+    static const struct { int lpc, part, stereo, block, prec, probe; } levels[9] = {
+        { 0, 3, 0, 1152, 0, 0 }, { 0, 3, 1, 1152, 0, 0 }, { 0, 4, 1, 1152, 0, 0 },
+        { 6, 4, 0, 4096, 0, 2 }, { 8, 4, 1, 4096, 0, 2 }, { 8, 5, 1, 4096, 0, 2 },
+        { 8, 6, 1, 4096, 0, 2 }, { 12, 6, 1, 4096, 0, 2 }, { 12, 8, 1, 4096, 1, 4 }
     };
     flac_state* st = (flac_state*)calloc(1, sizeof(*st));
     char track[16];
@@ -770,6 +895,7 @@ static fa_result flac_begin(void** impl, const fa_enc_format* f, const fa_enc_ta
     st->max_part = levels[lv].part;
     st->stereo_search = levels[lv].stereo && f->channels == 2;
     st->precision_search = levels[lv].prec;
+    st->probe = levels[lv].probe;
     st->seed = 0x2545F491u;
     md5_init(&st->md5);
     st->pcm = (int32_t*)malloc((size_t)bs * f->channels * sizeof(int32_t));
@@ -778,14 +904,19 @@ static fa_result flac_begin(void** impl, const fa_enc_format* f, const fa_enc_ta
         st->best_res[i] = (int32_t*)malloc((size_t)bs * sizeof(int32_t));
         if (!st->sig[i] || !st->best_res[i]) return FA_ERROR_OUT_OF_MEMORY;
     }
-    st->res = (int32_t*)malloc((size_t)bs * sizeof(int32_t));
+    st->sgbuf = (int16_t*)malloc((size_t)bs * 12 * sizeof(int16_t));
+    for (i = 0; st->sgbuf && i < 4; i++) {
+        st->sg[i].x16 = st->sgbuf + (size_t)bs * (3 * i);
+        st->sg[i].hi = st->sgbuf + (size_t)bs * (3 * i + 1);
+        st->sg[i].lo = st->sgbuf + (size_t)bs * (3 * i + 2);
+    }
     st->win = (double*)malloc((size_t)bs * sizeof(double));
     st->wbuf = (double*)malloc((size_t)bs * sizeof(double));
     /* the worst case is verbatim (+1 bit for side) plus headers */
     st->frame_cap = (size_t)bs * f->channels * 4 + 64 * f->channels + 64;
     st->frame = (uint8_t*)malloc(st->frame_cap);
     st->md5buf = (uint8_t*)malloc((size_t)bs * f->channels * 3);
-    if (!st->pcm || !st->res || !st->win || !st->wbuf || !st->frame || !st->md5buf) return FA_ERROR_OUT_OF_MEMORY;
+    if (!st->pcm || !st->sgbuf || !st->win || !st->wbuf || !st->frame || !st->md5buf) return FA_ERROR_OUT_OF_MEMORY;
     /* Tukey window, half of it tapered */
     for (i = 0; i < bs; i++) {
         double x = (double)i / (double)(bs - 1), a = 0.5, v = 1.0;
@@ -868,7 +999,7 @@ static void flac_free(void* impl)
     int i;
     for (i = 0; i < 4; i++) { free(st->sig[i]); free(st->best_res[i]); }
     free(st->pcm);
-    free(st->res);
+    free(st->sgbuf);
     free(st->win);
     free(st->wbuf);
     free(st->frame);

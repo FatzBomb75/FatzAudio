@@ -126,6 +126,8 @@ set(FA_SOURCES
     src/encode.c
     src/enc_wav.c
     src/enc_flac.c
+    src/enc_flac_dsp.c
+    src/enc_flac_dsp.h
     src/enc_mp3.c
     src/dynlib.c
     src/cdg.h

@@ -197,7 +197,13 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
 ### Changed
-
+- FLAC encoding is faster (level 0: 1.2 times, level 5: 2.2 times, level 8: 3.4 times; about 400× real time on one
+  x64 core at level 5, 170× at level 8) and level 5 to 8 files are smaller (against `flac` 1.4.3 on 8 music files:
+  level 5 went from 6% larger to 0.3%, level 8 from 13% to 1.8%, mostly on 24-bit files; pure tones and sweeps
+  are up to 10% smaller too). Level 8 is now faster than `flac -8`. The encoder
+  sizes predictors with SSE2/NEON kernels without storing their residual, picks each Rice parameter in closed form,
+  and from level 3 on costs only the most promising LPC candidates in full. The output still decodes bit-exact and
+  passes `flac -t`.
 - Internal clean-up from the 2026-10-26 deep audit, no change in behaviour: six internal functions nothing called,
   nine struct fields that were written but never read, two unused macros and the never-built AC-3 statistics
   counters are gone; the byte-order readers, string copies, pi and the peak-to-dB conversion that a dozen source files
