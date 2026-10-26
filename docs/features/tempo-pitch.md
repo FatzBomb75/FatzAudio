@@ -112,10 +112,35 @@ build\bin\Release\bassfx_render.exe C:\path\to\legacy song.mp3 bassfx.wav --temp
 
 Both take `--tempo` (multiplier), `--pitch` (semitones) and `--rate` (multiplier); `fa_tempo_render` also takes `--formants` and `--fast`. Piano, held vocals and acoustic guitar show the difference most. See [tools/tempo-compare](../../tools/tempo-compare/README.md).
 
+## Reverse playback
+
+`fa_stream_set_reverse` (`AudioStream.Reverse` in .NET) plays a stream backwards, as bass_fx's `BASS_FX_ReverseCreate` with `BASS_ATTRIB_REVERSE_DIR` does, but on the stream itself: there is no second stream to make. It can be switched at any time, also while playing; the stream then restarts at the position heard, the way a seek does.
+
+```c
+fa_stream_set_reverse(deck, 1);                  /* backwards from here */
+fa_stream_set_reverse(deck, 0);                  /* forwards again from where it got to */
+```
+
+```csharp
+deck.Reverse = true;
+deck.Reverse = false;
+```
+
+Reversed:
+
+- The position and the clock count down, so a progress bar, lyrics display or CD+G screen that follows them goes backwards too.
+- The stream ends (`FA_EVENT_ENDED`) at the cue-in marker, or the start. Playing it from stopped or ended starts at the cue-out marker, or the end, so a stream reversed before its first play plays the whole song backwards.
+- A loop, `fa_stream_set_loop` or a deck loop, wraps from its start back to its end.
+- Tempo, pitch, rate, volume, the equalizer, DSPs, normalization and the fade markers work as they do forward. The output is exactly the forward audio, last frame first.
+- Marker, loop, MIDI text and tracker row events are not raised. The cue-out marker doesn't end the stream and a mix point doesn't start the queued stream; a queued stream starts when this one ends, without a crossfade.
+- On a DJ deck, sync doesn't pull the deck into phase (the tempo match still applies), and a beat jump or a deck loop change takes effect at once instead of on the beat, with a short gap as after a seek.
+
+The source is decoded forward in half-second blocks, each after a seek, and handed out last frame first, so reverse needs a seekable source and costs one seek per half second. Decoders that seek to the exact frame join the blocks without a seam (tested with PCM, FLAC in four containers and MP3). AAC seeks are not sample exact yet, HE-AAC most of all (see the engineering notes), so reversed AAC can have a small seam every half second. MIDI files seek by replaying their events, so a note held across a block start is struck again there; with effects on that happens a second before it is heard. Push, packet and forward-only streams return `FA_ERROR_NOT_SEEKABLE`, and web streams `FA_ERROR_NOT_IMPLEMENTED`, since each block would be a new range request.
+
 ## Pitfalls
 
 - `RATE` changes the key. For a speed change that keeps the key use `TEMPO`; for a key change that keeps the speed use `PITCH`.
 - `fa_stream_get_param` returns the value being applied now. A value you just set reads back at once, but is heard after the latency above.
 - A forward-only stream (an HTTP download without range requests) can't re-render from the position being heard, so the first change on it is heard after the whole decode-ahead buffer.
 - Extreme settings (tempo below 0.25 or above 4, pitch beyond an octave) work but sound processed with any stretcher; keep_formants helps voices most within about ±5 semitones.
-- Reverse playback from bass_fx is not available yet. BPM and beat detection is [track analysis](analysis.md).
+- BPM and beat detection is [track analysis](analysis.md).
