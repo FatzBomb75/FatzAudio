@@ -127,38 +127,33 @@ int fa_net_system_proxy(const char* scheme, const char* host, char* out, size_t 
     return found;
 }
 
-/* The app's extra headers plus ours, one CRLF-terminated line each. */
-static wchar_t* build_headers(const fa_http_request* req)
+/* fa_http_each_header's sink: CRLF-terminated lines for WinHttpSendRequest, except
+ * the User-Agent, which WinHTTP takes from the session (one given in the block
+ * would be sent twice). */
+typedef struct header_block {
+    char* text;
+    size_t n, cap;
+    char* agent;              /* the User-Agent value, NULL = none */
+} header_block;
+
+static int add_block_line(void* user, const char* name, const char* value)
 {
-    size_t cap = 1024 + (req->headers ? strlen(req->headers) * 2 : 0);
-    char* h = (char*)malloc(cap);
-    size_t n = 0;
-    wchar_t* w;
-    if (!h) return NULL;
-    h[0] = 0;
-    if (req->icy) n += (size_t)snprintf(h + n, cap - n, "Icy-MetaData: 1\r\n");
-    if (req->range_start >= 0) n += (size_t)snprintf(h + n, cap - n, "Range: bytes=%lld-\r\n", (long long)req->range_start);
-    {
-        /* WinHTTP ignores credentials in the URL: send them as the socket client does. */
-        fa_url u;
-        if (fa_url_parse(req->url, &u) == FA_OK && u.userinfo[0]) {
-            char auth[512];
-            fa_http_basic_auth(u.userinfo, auth, sizeof(auth));
-            n += (size_t)snprintf(h + n, cap - n, "Authorization: %s\r\n", auth);
-        }
+    header_block* b = (header_block*)user;
+    size_t ln = strlen(name), lv = strlen(value);
+    if (_stricmp(name, "User-Agent") == 0) {
+        free(b->agent);
+        b->agent = _strdup(value);
+        return b->agent == NULL;
     }
-    if (req->headers) {
-        const char* p = req->headers;
-        while (*p) {
-            size_t len = strcspn(p, "\r\n");
-            if (len > 0 && n + len + 3 < cap) { memcpy(h + n, p, len); n += len; h[n++] = '\r'; h[n++] = '\n'; h[n] = 0; }
-            p += len;
-            while (*p == '\r' || *p == '\n') p++;
-        }
+    if (b->n + ln + lv + 5 > b->cap) {
+        size_t cap = (b->n + ln + lv + 5) * 2;
+        char* p = (char*)realloc(b->text, cap);
+        if (!p) return 1;
+        b->text = p;
+        b->cap = cap;
     }
-    w = widen(h);
-    free(h);
-    return w;
+    b->n += (size_t)snprintf(b->text + b->n, b->cap - b->n, "%s: %s\r\n", name, value);
+    return 0;
 }
 
 fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user)
@@ -172,10 +167,19 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
     uint8_t* buf = NULL;
     char* headers = NULL;
     char* final_url = NULL;
+    header_block block;
+    fa_url u;
 
+    memset(&block, 0, sizeof(block));
+    /* WinHTTP ignores credentials in the URL: the walk sends them. */
+    if (fa_http_each_header(req, fa_url_parse(req->url, &u) == FA_OK ? &u : NULL, add_block_line, &block) != FA_OK) {
+        r = FA_ERROR_OUT_OF_MEMORY;
+        goto done;
+    }
     wurl = widen(req->url);
-    wua = widen(req->user_agent ? req->user_agent : "FatzAudio");
-    if (!wurl || !wua) { r = FA_ERROR_OUT_OF_MEMORY; goto done; }
+    wua = widen(block.agent ? block.agent : "FatzAudio");
+    wheaders = block.text ? widen(block.text) : NULL;
+    if (!wurl || !wua || (block.text && !wheaders)) { r = FA_ERROR_OUT_OF_MEMORY; goto done; }
     memset(&uc, 0, sizeof(uc));
     uc.dwStructSize = sizeof(uc);
     uc.dwHostNameLength = (DWORD)-1;
@@ -216,7 +220,6 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
     if (!request) goto done;
     slot = slot_add(req->cancel, request);
     if (req->cancel && fa_load32(req->cancel)) { r = FA_ERROR_BUSY; goto done; }
-    wheaders = build_headers(req);
     if (!WinHttpSendRequest(request, wheaders && wheaders[0] ? wheaders : WINHTTP_NO_ADDITIONAL_HEADERS,
                             wheaders && wheaders[0] ? (DWORD)-1L : 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(request, NULL))
@@ -273,7 +276,7 @@ done:
     if (request && !slot_remove(slot)) WinHttpCloseHandle(request);
     if (connect) WinHttpCloseHandle(connect);
     if (session) WinHttpCloseHandle(session);
-    free(buf); free(headers); free(final_url);
+    free(buf); free(headers); free(final_url); free(block.text); free(block.agent);
     free(wurl); free(wua); free(whost); free(wpath); free(wheaders); free(wproxy);
     return r;
 }

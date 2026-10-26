@@ -84,8 +84,22 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
  * stack (WinHTTP), so the download thread notices at once. */
 void fa_http_abort(fa_atomic32* cancel);
 
-/* "Basic <base64>" for a URL's percent-encoded "user:password". */
-void fa_http_basic_auth(const char* userinfo, char* out, size_t cap);
+/* One request header for a transport to send; `name` and `value` are NUL-terminated
+ * and valid (a token name, a trimmed value of printable ASCII and tabs). Return
+ * nonzero when out of memory. */
+typedef int (*fa_http_header_proc)(void* user, const char* name, const char* value);
+
+/* Every request header a GET of `url` (NULL = no credentials) sends, once each, in
+ * the same order on every transport: User-Agent, Accept, Accept-Encoding: identity,
+ * Icy-MetaData, Range, Authorization (Basic, from the URL's user info), then the
+ * app's lines from req->headers. An app line replaces the header of ours with the
+ * same name. Dropped: app lines without a colon, with an invalid name or a value
+ * that is not printable ASCII, or
+ * longer than FA_HTTP_LINE_MAX, and Host, Connection, Content-Length and
+ * Transfer-Encoding (the transport's own). The transport adds Host and connection
+ * handling itself. FA_ERROR_OUT_OF_MEMORY if `add` failed. */
+#define FA_HTTP_LINE_MAX 8192
+fa_result fa_http_each_header(const fa_http_request* req, const fa_url* url, fa_http_header_proc add, void* user);
 
 /* Shared by the transports: parses a header block (status line excluded) into resp. */
 void fa_http_fill_lengths(fa_http_response* resp);

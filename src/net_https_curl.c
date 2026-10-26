@@ -23,7 +23,7 @@ typedef struct curl_slist* (*curl_slist_append_fn)(struct curl_slist* list, cons
 typedef void (*curl_slist_free_all_fn)(struct curl_slist* list);
 
 enum {
-    C_WRITEDATA = 10001, C_URL = 10002, C_PROXY = 10004, C_RANGE = 10007, C_WRITEFUNCTION = 20011,
+    C_WRITEDATA = 10001, C_URL = 10002, C_PROXY = 10004, C_WRITEFUNCTION = 20011,
     C_USERAGENT = 10018, C_LOW_SPEED_LIMIT = 19, C_LOW_SPEED_TIME = 20, C_HTTPHEADER = 10023,
     C_HEADERDATA = 10029, C_NOPROGRESS = 43, C_FOLLOWLOCATION = 52, C_XFERINFODATA = 10057,
     C_MAXREDIRS = 68, C_HEADERFUNCTION = 20079, C_NOSIGNAL = 99, C_CONNECTTIMEOUT_MS = 156,
@@ -158,11 +158,36 @@ static int on_progress(void* user, long long dltotal, long long dlnow, long long
     return c->req->cancel && fa_load32(c->req->cancel) ? 1 : 0;
 }
 
+/* fa_http_each_header's sink: one "Name: value" list entry ("Name;" sends an empty
+ * value: "Name:" would remove the header). The User-Agent also goes to
+ * CURLOPT_USERAGENT, for a proxy's CONNECT, which does not get the list. */
+typedef struct curl_headers {
+    CURL* curl;
+    struct curl_slist* list;
+} curl_headers;
+
+static int add_list_line(void* user, const char* name, const char* value)
+{
+    curl_headers* h = (curl_headers*)user;
+    struct curl_slist* grown;
+    size_t ln = strlen(name), lv = strlen(value);
+    char* line = (char*)malloc(ln + lv + 3);
+    if (!line) return 1;
+    if (lv) snprintf(line, ln + lv + 3, "%s: %s", name, value);
+    else snprintf(line, ln + 2, "%s;", name);
+    grown = g_curl.slist_append(h->list, line);
+    free(line);
+    if (!grown) return 1;
+    h->list = grown;
+    if (fa_strncasecmp_ascii(name, "User-Agent", 11) == 0) g_curl.setopt(h->curl, C_USERAGENT, value);   /* curl copies it */
+    return 0;
+}
+
 fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user)
 {
     curl_ctx c;
-    struct curl_slist* list = NULL;
-    char range[48];
+    curl_headers headers;
+    fa_url u;
     int code;
     fa_result r;
     long secs;
@@ -179,7 +204,6 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
     g_curl.setopt(c.curl, C_NOSIGNAL, 1L);
     g_curl.setopt(c.curl, C_FOLLOWLOCATION, 1L);
     g_curl.setopt(c.curl, C_MAXREDIRS, (long)FA_NET_MAX_REDIRECTS);
-    g_curl.setopt(c.curl, C_USERAGENT, req->user_agent);
     g_curl.setopt(c.curl, C_CONNECTTIMEOUT_MS, (long)req->timeout_ms);
     secs = (long)((req->timeout_ms + 999) / 1000);
     g_curl.setopt(c.curl, C_LOW_SPEED_LIMIT, 1L);           /* the server went quiet */
@@ -192,37 +216,24 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
     g_curl.setopt(c.curl, C_XFERINFOFUNCTION, on_progress);
     g_curl.setopt(c.curl, C_XFERINFODATA, &c);
     if (req->proxy) g_curl.setopt(c.curl, C_PROXY, req->proxy);    /* "" = no proxy, even from the environment */
-    if (req->range_start >= 0) {
-        snprintf(range, sizeof(range), "%lld-", (long long)req->range_start);
-        g_curl.setopt(c.curl, C_RANGE, range);
-    }
-    if (req->icy) list = g_curl.slist_append(list, "Icy-MetaData: 1");
-    if (req->headers) {
-        const char* h = req->headers;
-        while (*h) {
-            size_t len = strcspn(h, "\r\n");
-            if (len > 0 && len < 1024) {
-                char line[1024];
-                memcpy(line, h, len);
-                line[len] = 0;
-                list = g_curl.slist_append(list, line);
-            }
-            h += len;
-            while (*h == '\r' || *h == '\n') h++;
-        }
-    }
-    if (list) g_curl.setopt(c.curl, C_HTTPHEADER, list);
+    /* Every header goes in the list (User-Agent and Range too), so curl's own give way. */
+    headers.curl = c.curl;
+    headers.list = NULL;
+    r = fa_http_each_header(req, fa_url_parse(req->url, &u) == FA_OK ? &u : NULL, add_list_line, &headers);
+    if (headers.list) g_curl.setopt(c.curl, C_HTTPHEADER, headers.list);
 
-    code = g_curl.perform(c.curl);
-    if (code == CE_OK && !c.head_done) deliver_head(&c);   /* an empty body */
-    if (req->cancel && fa_load32(req->cancel)) r = FA_ERROR_BUSY;
-    else if (c.failed_status) r = FA_ERROR_NOT_FOUND;
-    else if (c.stopped) r = FA_OK;
-    else if (code == CE_OK) r = FA_OK;
-    else r = FA_ERROR_NETWORK;
+    if (r == FA_OK) {
+        code = g_curl.perform(c.curl);
+        if (code == CE_OK && !c.head_done) deliver_head(&c);   /* an empty body */
+        if (req->cancel && fa_load32(req->cancel)) r = FA_ERROR_BUSY;
+        else if (c.failed_status) r = FA_ERROR_NOT_FOUND;
+        else if (c.stopped) r = FA_OK;
+        else if (code == CE_OK) r = FA_OK;
+        else r = FA_ERROR_NETWORK;
+    }
     (void)CE_WRITE_ERROR; (void)CE_ABORTED_BY_CALLBACK;
     g_curl.cleanup(c.curl);
-    if (list) g_curl.slist_free(list);
+    if (headers.list) g_curl.slist_free(headers.list);
     free(c.headers);
     return r;
 }

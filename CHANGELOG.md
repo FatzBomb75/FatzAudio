@@ -198,6 +198,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Web streams: one request-header walk for every transport (plain HTTP, curl, WinHTTP, URLSession,
+  HttpURLConnection), so all of them send the same headers: `Accept: */*` and `Accept-Encoding: identity` everywhere
+  now, an app header replaces the built-in one of the same name instead of being sent twice, and invalid app lines
+  (no colon, a bad name, a value that isn't printable ASCII, over 8192 bytes, or `Host`/`Connection`/`Content-Length`/
+  `Transfer-Encoding`) are dropped on every platform. Lines up to 8192 bytes now reach the server through curl too
+  (the limit was 1024). See [docs/features/web-streams.md](docs/features/web-streams.md#request-headers).
 - Faster and smaller, with the same output (deep audit, small items, 2026-10-26): the DJ deck isolator runs both
   channels and four filter sections per SSE step (a mixer callback takes about 38% fewer instructions, output identical
   to the bit); the running loudness estimate (about 7% of decoding) runs only with normalization on or once the app asks

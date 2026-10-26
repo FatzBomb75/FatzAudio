@@ -493,7 +493,7 @@ static void handle(void* arg)
 
 static void handle_request(sock_t s)
 {
-    char req[4096], path[512];
+    char req[16384], path[512];
     size_t got = 0;
     while (got < sizeof(req) - 1) {
         int k = (int)recv(s, req + got, (int)(sizeof(req) - 1 - got), 0);
@@ -508,7 +508,15 @@ static void handle_request(sock_t s)
         const char* ua = strstr(req, "\r\nUser-Agent: ");
         if (ua) { ua += 14; snprintf(g_last_agent, sizeof(g_last_agent), "%.*s", (int)strcspn(ua, "\r\n"), ua); }
     }
-    if (strcmp(path, "/tone.wav") == 0) serve_bytes(s, req, g_wav, g_wav_n, "audio/wav", 1, 0);
+    if (strcmp(path, "/echo-headers") == 0) {
+        /* The request's header lines as the body (as tools/test-https/serve.py does). */
+        char head[256];
+        const char* lines = strstr(req, "\r\n") + 2;
+        size_t n = (size_t)(strstr(req, "\r\n\r\n") + 2 - lines);
+        snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", n);
+        if (!send_str(s, head)) send_all(s, lines, n);
+    }
+    else if (strcmp(path, "/tone.wav") == 0) serve_bytes(s, req, g_wav, g_wav_n, "audio/wav", 1, 0);
     else if (strcmp(path, "/tone.mp3") == 0) serve_bytes(s, req, g_mp3, g_mp3_n, "audio/mpeg", 1, 0);
     else if (strcmp(path, "/xing.mp3") == 0) serve_bytes(s, req, g_mp3x, g_mp3x_n, "audio/mpeg", 1, 0);
     else if (strcmp(path, "/noranges.wav") == 0) serve_bytes(s, req, g_wav, g_wav_n, "audio/wav", 0, 0);
@@ -859,6 +867,169 @@ static fa_result fetch(const char* path, fetch_result* f)
     req.proxy = "";
     req.timeout_ms = 3000;
     return fa_http_fetch(&req, fr_head, fr_data, f);
+}
+
+/* ---- request headers ------------------------------------------------------------ */
+
+/* Collects fa_http_each_header's output as "name=value|". */
+typedef struct walk_text { char text[1024]; int fail_at, calls; } walk_text;
+static int walk_add(void* user, const char* name, const char* value)
+{
+    walk_text* w = (walk_text*)user;
+    size_t n = strlen(w->text);
+    if (++w->calls == w->fail_at) return 1;
+    snprintf(w->text + n, sizeof(w->text) - n, "%s=%s|", name, value);
+    return 0;
+}
+
+/* The header walk on odd app input: bare LF, blank lines, a colon in the value,
+ * lines without a name or colon, control characters, a line over the limit, and
+ * app headers that replace ours or that belong to the transport. */
+static void test_request_header_walk(void)
+{
+    static char headers[FA_HTTP_LINE_MAX + 512];
+    fa_http_request req;
+    fa_url u;
+    walk_text w;
+    size_t n;
+    memset(&req, 0, sizeof(req));
+    req.url = "https://user:p%20w@example.com/a";
+    req.range_start = -1;
+    req.user_agent = "fa-test/1";
+    CHECK_EQ(fa_url_parse(req.url, &u), FA_OK);
+
+    /* Ours only. */
+    memset(&w, 0, sizeof(w));
+    CHECK_EQ(fa_http_each_header(&req, NULL, walk_add, &w), FA_OK);
+    CHECK_STR(w.text, "User-Agent=fa-test/1|Accept=*/*|Accept-Encoding=identity|");
+    req.icy = 1;
+    req.range_start = 1234567890123LL;
+    memset(&w, 0, sizeof(w));
+    CHECK_EQ(fa_http_each_header(&req, &u, walk_add, &w), FA_OK);
+    CHECK_STR(w.text, "User-Agent=fa-test/1|Accept=*/*|Accept-Encoding=identity|Icy-MetaData=1|"
+                      "Range=bytes=1234567890123-|Authorization=Basic dXNlcjpwIHc=|");
+
+    /* The app's lines. */
+    n = (size_t)snprintf(headers, sizeof(headers),
+                         "X-One: a\n\nX-Two: \t b c \t\r\n\r\n no colon\n: no name\nBad Name: x\nX-Colon:a:b\n"
+                         "accept: audio/*\nHost: evil\nconnection: keep-alive\nContent-Length: 5\nTransfer-Encoding: chunked\n"
+                         "X-Ctl: a\x01" "b\nX-Del: a\x7f\nX-Empty:\nX-Latin: caf\xe9\nX-Utf8: caf\xc3\xa9\nX-Name : v\n"
+                         "X-Long: ");
+    memset(headers + n, 'x', FA_HTTP_LINE_MAX - 7);   /* "X-Long: " + this = one byte over */
+    snprintf(headers + n + FA_HTTP_LINE_MAX - 7, sizeof(headers) - n - FA_HTTP_LINE_MAX + 7, "\r\nX-Last: z");
+    req.headers = headers;
+    memset(&w, 0, sizeof(w));
+    CHECK_EQ(fa_http_each_header(&req, &u, walk_add, &w), FA_OK);
+    CHECK_STR(w.text, "User-Agent=fa-test/1|Accept-Encoding=identity|Icy-MetaData=1|Range=bytes=1234567890123-|"
+                      "Authorization=Basic dXNlcjpwIHc=|X-One=a|X-Two=b c|X-Colon=a:b|accept=audio/*|X-Empty=|"
+                      "X-Name=v|X-Last=z|");
+    /* A line exactly at the limit is kept. */
+    headers[n + FA_HTTP_LINE_MAX - 8] = '\r';
+    memset(&w, 0, sizeof(w));
+    CHECK_EQ(fa_http_each_header(&req, NULL, walk_add, &w), FA_OK);
+    CHECK(strstr(w.text, "X-Long=xxx") != NULL);
+
+    /* A user agent with a line break is not sent; the sink failing stops the walk. */
+    req.headers = NULL;
+    req.user_agent = "evil\r\nX-Injected: 1";
+    memset(&w, 0, sizeof(w));
+    CHECK_EQ(fa_http_each_header(&req, NULL, walk_add, &w), FA_OK);
+    CHECK(strstr(w.text, "evil") == NULL);
+    memset(&w, 0, sizeof(w));
+    w.fail_at = 2;
+    CHECK_EQ(fa_http_each_header(&req, NULL, walk_add, &w), FA_ERROR_OUT_OF_MEMORY);
+    CHECK_EQ(w.calls, 2);
+}
+
+/* The body of a GET, NUL-terminated (malloc'd). */
+typedef struct body_text { char* p; size_t n; } body_text;
+static int body_add(void* user, const uint8_t* p, size_t n)
+{
+    body_text* b = (body_text*)user;
+    char* grown = (char*)realloc(b->p, b->n + n + 1);
+    if (!grown) return 1;
+    memcpy(grown + b->n, p, n);
+    b->p = grown;
+    b->n += n;
+    b->p[b->n] = 0;
+    return 0;
+}
+
+/* How often header `name` is in `lines` ("Name: value\r\n"); its last value into out. */
+static int count_header(const char* lines, const char* name, char* out, size_t cap)
+{
+    size_t ln = strlen(name);
+    int count = 0;
+    if (out && cap) out[0] = 0;
+    while (*lines) {
+        size_t len = strcspn(lines, "\r\n");
+        if (len > ln && lines[ln] == ':' && fa_strncasecmp_ascii(lines, name, ln) == 0) {
+            const char* v = lines + ln + 1;
+            while (*v == ' ') v++;
+            count++;
+            if (out) snprintf(out, cap, "%.*s", (int)(lines + len - v), v);
+        }
+        lines += len;
+        while (*lines == '\r' || *lines == '\n') lines++;
+    }
+    return count;
+}
+
+/* Fetches `url` (a server answering with the request's header lines) with every
+ * kind of header, and checks what the server got: each header once, the app's
+ * lines trimmed, the invalid ones dropped. The same on every transport. */
+static void check_request_headers(const char* url)
+{
+    static char headers[6000];
+    fa_http_request req;
+    body_text body = { NULL, 0 };
+    char v[4100];
+    size_t n;
+    memset(&req, 0, sizeof(req));
+    req.url = url;
+    req.range_start = 5;
+    req.icy = 1;
+    req.user_agent = "fa-test/1";
+    req.timeout_ms = 5000;
+    req.proxy = "";
+    n = (size_t)snprintf(headers, sizeof(headers), "X-One: a\nX-Two: \t b c \t\r\n\r\nno colon\nBad Name: x\nX-Colon: a:b\n"
+                                                   "Accept: audio/*\nHost: evil\nX-Ctl: a\x01" "b\nX-Latin: caf\xe9\nX-Empty:\nX-Big: ");
+    memset(headers + n, 'y', 4000);
+    snprintf(headers + n + 4000, sizeof(headers) - n - 4000, "\r\n");
+    req.headers = headers;
+    CHECK_EQ(fa_http_fetch(&req, NULL, body_add, &body), FA_OK);
+    CHECK(body.p != NULL);
+    if (!body.p) return;
+    printf("  %zu bytes of request headers\n", body.n);
+#define EXPECT_ONE(name, value) do { CHECK_EQ(count_header(body.p, name, v, sizeof(v)), 1); CHECK_STR(v, value); } while (0)
+    EXPECT_ONE("User-Agent", "fa-test/1");
+    EXPECT_ONE("Accept", "audio/*");
+    EXPECT_ONE("Accept-Encoding", "identity");
+    EXPECT_ONE("Icy-MetaData", "1");
+    EXPECT_ONE("Range", "bytes=5-");
+    EXPECT_ONE("Authorization", "Basic dXNlcjpwIHc=");
+    EXPECT_ONE("X-One", "a");
+    EXPECT_ONE("X-Two", "b c");
+    EXPECT_ONE("X-Colon", "a:b");
+#undef EXPECT_ONE
+    CHECK_EQ(count_header(body.p, "Host", v, sizeof(v)), 1);
+    CHECK(strcmp(v, "evil") != 0);
+    CHECK_EQ(count_header(body.p, "X-Big", v, sizeof(v)), 1);
+    CHECK_EQ(strlen(v), 4000);
+    CHECK(count_header(body.p, "X-Empty", v, sizeof(v)) <= 1);   /* some stacks drop an empty header */
+    CHECK_STR(v, "");
+    CHECK_EQ(count_header(body.p, "X-Ctl", NULL, 0), 0);
+    CHECK_EQ(count_header(body.p, "X-Latin", NULL, 0), 0);
+    CHECK_EQ(count_header(body.p, "Bad Name", NULL, 0), 0);
+    CHECK(strstr(body.p, "no colon") == NULL);
+    free(body.p);
+}
+
+static void test_request_headers_sent(void)
+{
+    char url[256];
+    snprintf(url, sizeof(url), "%s://user:p%%20w@127.0.0.1:%d/echo-headers", g_scheme, g_url_port);
+    check_request_headers(url);
 }
 
 static void test_http_fetch(void)
@@ -1671,6 +1842,19 @@ static void test_https_optional(void)
     fa_stream_close(s);
 }
 
+/* The request headers through the system's TLS stack, when FA_NET_HTTPS_ECHO_URL
+ * names tools/test-https/serve.py's /echo-headers (with credentials in the URL:
+ * https://user:p%20w@127.0.0.1:8443/echo-headers). */
+static void test_https_headers_optional(void)
+{
+    const char* url = getenv("FA_NET_HTTPS_ECHO_URL");
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    CHECK(url != NULL || !real_system());
+#endif
+    if (!url) { printf("  skipped (set FA_NET_HTTPS_ECHO_URL)\n"); return; }
+    check_request_headers(url);
+}
+
 /* A segment whose download breaks off is fetched again, and the audio already
  * delivered is not repeated; byte-range segments work on a server ignoring Range. */
 static void test_hls_retry_and_byteranges(void)
@@ -1800,6 +1984,7 @@ static void test_android_https(void)
     CHECK_EQ(fa_android_set_java_vm(vm), FA_OK);
     before = g_failures;
     test_http_fetch();
+    test_request_headers_sent();
     test_wav_over_http();
     test_mp3_over_http();
     test_no_ranges_and_chunked();
@@ -1858,10 +2043,12 @@ int main(void)
     RUN(test_url_parse);
     RUN(test_url_resolve);
     RUN(test_http_header_lookup);
+    RUN(test_request_header_walk);
     RUN(test_hls_parse);
     RUN(test_aes_vectors);
     RUN(test_ts_demux);
     RUN(test_http_fetch);
+    RUN(test_request_headers_sent);
     RUN(test_wav_over_http);
     RUN(test_mp3_over_http);
     RUN(test_no_ranges_and_chunked);
@@ -1883,6 +2070,7 @@ int main(void)
     RUN(test_long_user_agent);
     RUN(test_close_while_streaming);
     RUN(test_https_optional);
+    RUN(test_https_headers_optional);
 #if defined(__ANDROID__)
     RUN(test_android_https);
 #endif
