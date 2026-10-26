@@ -557,7 +557,7 @@ typedef struct disc_dec {
  * within a fraction of a dB of the analog one. */
 static void deemph_init(disc_dec* x, double rate)
 {
-    const double pi = 3.14159265358979323846, t1 = 50e-6, t2 = 15e-6;
+    const double pi = FA_PI, t1 = 50e-6, t2 = 15e-6;
     double w = pi * rate;
     double target = sqrt((1.0 + w * w * t2 * t2) / (1.0 + w * w * t1 * t1));
     double p = exp(-1.0 / (t1 * rate));

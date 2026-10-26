@@ -18,9 +18,6 @@
 #define ZIP64_LOCATOR_SIZE 20
 #define ZIP_MAX_DIRECTORY ((uint64_t)16 << 20)
 
-static uint32_t rd16(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8); }
-static uint32_t rd32(const uint8_t* p) { return rd16(p) | (rd16(p + 2) << 16); }
-
 /* ---- CRC-32 (IEEE 802.3, reflected) ---------------------------------------- */
 
 /* `crc` is the CRC of the bytes before `data` (0 to start). */
@@ -320,7 +317,7 @@ fa_result fa_inflate(const uint8_t* in, size_t in_size, uint8_t* out, size_t out
 
 int fa_zip_probe(const uint8_t* data, size_t size)
 {
-    return size >= 4 && rd32(data) == ZIP_LOCAL_SIG;
+    return size >= 4 && fa_le32(data) == ZIP_LOCAL_SIG;
 }
 
 /* Exactly n bytes at `offset`; a short read is a damaged (cut) archive. */
@@ -340,7 +337,6 @@ static fa_result read_at(fa_source* src, int64_t offset, void* buf, size_t n)
 /* ZIP64 (APPNOTE 4.3.14 to 4.3.15 and 4.5.3): the end record holds 0xFFFF or
  * 0xFFFFFFFF where a value does not fit, and the real ones follow in a ZIP64 end
  * record, found through a locator right before the end record. */
-static uint64_t rd64(const uint8_t* p) { return (uint64_t)rd32(p) | ((uint64_t)rd32(p + 4) << 32); }
 
 /* The directory's place, from the end record at tail[end] (tail starts at `tail_at`). */
 static fa_result find_directory(fa_source* src, const uint8_t* tail, size_t end, int64_t tail_at,
@@ -349,25 +345,25 @@ static fa_result find_directory(fa_source* src, const uint8_t* tail, size_t end,
     uint8_t z[ZIP64_END_SIZE];
     uint64_t z_at, limit = (uint64_t)tail_at + end;
     fa_result r;
-    *total = rd16(tail + end + 10);
-    *cd_size = rd32(tail + end + 12);
-    *cd_at = rd32(tail + end + 16);
-    if (rd16(tail + end + 4) != 0 || rd16(tail + end + 6) != 0) return FA_ERROR_UNSUPPORTED_FORMAT; /* multi-disk */
+    *total = fa_le16(tail + end + 10);
+    *cd_size = fa_le32(tail + end + 12);
+    *cd_at = fa_le32(tail + end + 16);
+    if (fa_le16(tail + end + 4) != 0 || fa_le16(tail + end + 6) != 0) return FA_ERROR_UNSUPPORTED_FORMAT; /* multi-disk */
     /* Without a locator the values are real ones (an archive of exactly 65,535 entries). */
     if ((*total == 0xFFFF || *cd_size == 0xFFFFFFFFu || *cd_at == 0xFFFFFFFFu) && end >= ZIP64_LOCATOR_SIZE &&
-        rd32(tail + end - ZIP64_LOCATOR_SIZE) == ZIP64_LOCATOR_SIG) {
+        fa_le32(tail + end - ZIP64_LOCATOR_SIZE) == ZIP64_LOCATOR_SIG) {
         const uint8_t* loc = tail + end - ZIP64_LOCATOR_SIZE;
-        if (rd32(loc + 4) != 0 || rd32(loc + 16) != 1) return FA_ERROR_UNSUPPORTED_FORMAT;
-        z_at = rd64(loc + 8);
+        if (fa_le32(loc + 4) != 0 || fa_le32(loc + 16) != 1) return FA_ERROR_UNSUPPORTED_FORMAT;
+        z_at = fa_le64(loc + 8);
         if (z_at > limit - ZIP64_LOCATOR_SIZE || limit - ZIP64_LOCATOR_SIZE - z_at < ZIP64_END_SIZE)
             return FA_ERROR_UNSUPPORTED_FORMAT;
         r = read_at(src, (int64_t)z_at, z, sizeof(z));
         if (r != FA_OK) return r;
-        if (rd32(z) != ZIP64_END_SIG || rd32(z + 16) != 0 || rd32(z + 20) != 0 || rd64(z + 24) != rd64(z + 32))
+        if (fa_le32(z) != ZIP64_END_SIG || fa_le32(z + 16) != 0 || fa_le32(z + 20) != 0 || fa_le64(z + 24) != fa_le64(z + 32))
             return FA_ERROR_UNSUPPORTED_FORMAT;
-        *total = rd64(z + 32);
-        *cd_size = rd64(z + 40);
-        *cd_at = rd64(z + 48);
+        *total = fa_le64(z + 32);
+        *cd_size = fa_le64(z + 40);
+        *cd_at = fa_le64(z + 48);
         limit = z_at;
     }
     if (*cd_at > limit || *cd_size > limit - *cd_at) return FA_ERROR_UNSUPPORTED_FORMAT;
@@ -382,14 +378,14 @@ static int apply_zip64_extra(fa_zip_entry* e, const uint8_t* extra, size_t extra
 {
     if (!need_size && !need_comp && !need_offset) return 0;
     while (extra_len >= 4) {
-        uint32_t id = rd16(extra), len = rd16(extra + 2);
+        uint32_t id = fa_le16(extra), len = fa_le16(extra + 2);
         if (len > extra_len - 4) return -1;
         if (id == 0x0001) {
             const uint8_t* f = extra + 4;
             uint32_t left = len;
-            if (need_size) { if (left < 8) return -1; e->size = rd64(f); f += 8; left -= 8; }
-            if (need_comp) { if (left < 8) return -1; e->compressed_size = rd64(f); f += 8; left -= 8; }
-            if (need_offset) { if (left < 8) return -1; e->header_offset = rd64(f); }
+            if (need_size) { if (left < 8) return -1; e->size = fa_le64(f); f += 8; left -= 8; }
+            if (need_comp) { if (left < 8) return -1; e->compressed_size = fa_le64(f); f += 8; left -= 8; }
+            if (need_offset) { if (left < 8) return -1; e->header_offset = fa_le64(f); }
             return 0;
         }
         extra += 4 + len;
@@ -425,7 +421,7 @@ fa_result fa_zip_list(fa_source* src, fa_zip_entry** out_entries, uint32_t* out_
     end = tail_len - ZIP_END_SIZE;
     scan_from = 0;
     for (;;) {
-        if (rd32(tail + end) == ZIP_END_SIG && end + ZIP_END_SIZE + rd16(tail + end + 20) == tail_len) break;
+        if (fa_le32(tail + end) == ZIP_END_SIG && end + ZIP_END_SIZE + fa_le16(tail + end + 20) == tail_len) break;
         if (end == scan_from) goto done;
         end--;
     }
@@ -444,11 +440,11 @@ fa_result fa_zip_list(fa_source* src, fa_zip_entry** out_entries, uint32_t* out_
         const uint8_t* h = cd + pos;
         uint32_t flags, name_len, extra_len, skip, comp32, size32, off32;
         fa_zip_entry* e;
-        if (cd_size - pos < ZIP_CENTRAL_SIZE || rd32(h) != ZIP_CENTRAL_SIG) goto done;
-        flags = rd16(h + 8);
-        name_len = rd16(h + 28);
-        extra_len = rd16(h + 30);
-        skip = ZIP_CENTRAL_SIZE + name_len + extra_len + rd16(h + 32);
+        if (cd_size - pos < ZIP_CENTRAL_SIZE || fa_le32(h) != ZIP_CENTRAL_SIG) goto done;
+        flags = fa_le16(h + 8);
+        name_len = fa_le16(h + 28);
+        extra_len = fa_le16(h + 30);
+        skip = ZIP_CENTRAL_SIZE + name_len + extra_len + fa_le16(h + 32);
         if (cd_size - pos < skip) goto done;
         /* Directories and encrypted entries are left out. */
         if (name_len == 0 || h[ZIP_CENTRAL_SIZE + name_len - 1] == '/' || (flags & 1)) { pos += skip; continue; }
@@ -462,11 +458,11 @@ fa_result fa_zip_list(fa_source* src, fa_zip_entry** out_entries, uint32_t* out_
         }
         e = &entries[n];
         memset(e, 0, sizeof(*e));
-        e->method = rd16(h + 10);
-        e->crc32 = rd32(h + 16);
-        comp32 = rd32(h + 20);
-        size32 = rd32(h + 24);
-        off32 = rd32(h + 42);
+        e->method = fa_le16(h + 10);
+        e->crc32 = fa_le32(h + 16);
+        comp32 = fa_le32(h + 20);
+        size32 = fa_le32(h + 24);
+        off32 = fa_le32(h + 42);
         e->compressed_size = comp32;
         e->size = size32;
         e->header_offset = off32;
@@ -499,8 +495,8 @@ fa_result fa_zip_entry_offset(fa_source* src, const fa_zip_entry* e, int64_t* ou
     if (src->length < 0 || e->header_offset > len || len - e->header_offset < ZIP_LOCAL_SIZE) return FA_ERROR_UNSUPPORTED_FORMAT;
     r = read_at(src, (int64_t)e->header_offset, h, sizeof(h));
     if (r != FA_OK) return r;
-    if (rd32(h) != ZIP_LOCAL_SIG) return FA_ERROR_UNSUPPORTED_FORMAT;
-    data_pos = e->header_offset + ZIP_LOCAL_SIZE + rd16(h + 26) + rd16(h + 28);
+    if (fa_le32(h) != ZIP_LOCAL_SIG) return FA_ERROR_UNSUPPORTED_FORMAT;
+    data_pos = e->header_offset + ZIP_LOCAL_SIZE + fa_le16(h + 26) + fa_le16(h + 28);
     if (data_pos > len || len - data_pos < e->compressed_size) return FA_ERROR_UNSUPPORTED_FORMAT;
     if (e->method != 0 && e->method != 8) return FA_ERROR_UNSUPPORTED_FORMAT;
     if (e->method == 0 && e->compressed_size != e->size) return FA_ERROR_UNSUPPORTED_FORMAT;

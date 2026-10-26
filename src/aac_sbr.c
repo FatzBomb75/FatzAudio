@@ -155,11 +155,6 @@ void fa_aac_sbr_reset(fa_aac_sbr* s)
     if (s->ps) fa_aac_ps_reset(s->ps);
 }
 
-int fa_aac_sbr_has_ps(const fa_aac_sbr* s)
-{
-    return s && s->ps_seen;
-}
-
 /* ---- frequency band tables (4.6.18.3) ---------------------------------------------------- */
 
 static int cmp_int(const void* a, const void* b)

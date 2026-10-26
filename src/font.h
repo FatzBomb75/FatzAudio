@@ -21,7 +21,6 @@ typedef struct fa_font_info {
     int width;                         /* 1..9, OS/2 usWidthClass: 5 normal, 3 condensed (5 without) */
     int italic, bold;                  /* OS/2 fsSelection, else head macStyle */
     int cff;                           /* outlines are CFF (cubic) */
-    int monospace;
     uint32_t glyph_count;
     char family[128];                  /* UTF-8: typographic family (name 16), else name 1 */
     char style[64];                    /* typographic subfamily (17), else 2 */

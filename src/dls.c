@@ -26,9 +26,6 @@
 #define SF2_MAX_RECORDS 0xFFFF        /* SF2 indexes zones, generators and samples in 16 bits */
 #define HDR_HASH_SIZE 131072u         /* power of two, over twice SF2_MAX_RECORDS */
 
-static uint16_t rd16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-static uint32_t rd32(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
-
 /* ---- RIFF walking ------------------------------------------------------------ */
 
 typedef struct chunk {
@@ -44,7 +41,7 @@ static int next_chunk(const uint8_t** p, const uint8_t* end, chunk* c)
     uint32_t size;
     if (end - *p < 8) return 0;
     memcpy(c->id, *p, 4);
-    size = rd32(*p + 4);
+    size = fa_le32(*p + 4);
     if (size > (size_t)(end - *p - 8)) size = (uint32_t)(end - *p - 8);   /* truncated: what is there */
     c->data = *p + 8;
     c->size = size;
@@ -128,19 +125,19 @@ static void parse_wsmp(const uint8_t* p, uint32_t n, dls_wsmp* w)
     memset(w, 0, sizeof(*w));
     w->loop_type = -1;
     if (n < 20) return;
-    cb = rd32(p);
+    cb = fa_le32(p);
     if (cb < 20 || cb > n) cb = 20;
     w->present = 1;
-    w->unity = rd16(p + 4) & 0x7F;
-    w->fine = (int16_t)rd16(p + 6);
-    w->gain_cb = (double)(int32_t)rd32(p + 8) / 65536.0;
-    loops = rd32(p + 16);
+    w->unity = fa_le16(p + 4) & 0x7F;
+    w->fine = (int16_t)fa_le16(p + 6);
+    w->gain_cb = (double)(int32_t)fa_le32(p + 8) / 65536.0;
+    loops = fa_le32(p + 16);
     if (loops >= 1 && cb + 16 <= n) {
         const uint8_t* l = p + cb;
-        uint32_t type = rd32(l + 4);
+        uint32_t type = fa_le32(l + 4);
         w->loop_type = type == 1 ? 1 : 0;
-        w->loop_start = rd32(l + 8);
-        w->loop_len = rd32(l + 12);
+        w->loop_start = fa_le32(l + 8);
+        w->loop_len = fa_le32(l + 12);
     }
 }
 
@@ -155,11 +152,11 @@ static int parse_wave(const uint8_t* p, uint32_t n, dls_wave* w)
     w->wsmp.loop_type = -1;
     while (next_chunk(&p, end, &c)) {
         if (is_id(&c, "fmt ") && c.size >= 16) {
-            uint16_t tag = rd16(c.data);
-            w->channels = rd16(c.data + 2);
-            w->rate = rd32(c.data + 4);
-            w->bits = rd16(c.data + 14);
-            if (tag == 0xFFFE && c.size >= 26) tag = rd16(c.data + 24);   /* WAVE_FORMAT_EXTENSIBLE: the subformat */
+            uint16_t tag = fa_le16(c.data);
+            w->channels = fa_le16(c.data + 2);
+            w->rate = fa_le32(c.data + 4);
+            w->bits = fa_le16(c.data + 14);
+            if (tag == 0xFFFE && c.size >= 26) tag = fa_le16(c.data + 24);   /* WAVE_FORMAT_EXTENSIBLE: the subformat */
             have_fmt = tag == 1;
         } else if (is_id(&c, "data")) {
             w->data = c.data;
@@ -185,7 +182,7 @@ static int16_t wave_sample(const dls_wave* w, uint32_t frame, int ch)
         const uint8_t* s = w->data + ((size_t)frame * w->channels + (size_t)c) * (size_t)bytes;
         long v;
         if (bytes == 1) v = ((long)s[0] - 128) * 256;
-        else v = (int16_t)rd16(s + bytes - 2);       /* the top 16 bits */
+        else v = (int16_t)fa_le16(s + bytes - 2);       /* the top 16 bits */
         sum += v;
     }
     return (int16_t)(sum / (to - from));
@@ -321,12 +318,12 @@ static void parse_articulation(const uint8_t* p, uint32_t n, gens* g)
         uint32_t cb, count, i;
         if (!is_id(&c, "art1") && !is_id(&c, "art2")) continue;
         if (c.size < 8) continue;
-        cb = rd32(c.data);
-        count = rd32(c.data + 4);
+        cb = fa_le32(c.data);
+        count = fa_le32(c.data + 4);
         if (cb < 8 || cb > c.size) continue;
         for (i = 0; i < count && cb + (size_t)(i + 1) * 12 <= c.size; i++) {
             const uint8_t* b = c.data + cb + (size_t)i * 12;
-            apply_connection(g, rd16(b), rd16(b + 2), rd16(b + 4), (int32_t)rd32(b + 8));
+            apply_connection(g, fa_le16(b), fa_le16(b + 2), fa_le16(b + 4), (int32_t)fa_le32(b + 8));
         }
     }
 }
@@ -433,15 +430,15 @@ static void parse_region(conv* cv, const uint8_t* p, uint32_t n, const gens* ins
     wsmp.present = 0;
     while (next_chunk(&p, end, &c)) {
         if (is_id(&c, "rgnh") && c.size >= 12) {
-            klo = rd16(c.data); khi = rd16(c.data + 2);
-            vlo = rd16(c.data + 4); vhi = rd16(c.data + 6);
-            group = rd16(c.data + 10);
+            klo = fa_le16(c.data); khi = fa_le16(c.data + 2);
+            vlo = fa_le16(c.data + 4); vhi = fa_le16(c.data + 6);
+            group = fa_le16(c.data + 10);
             have_rgnh = 1;
         } else if (is_id(&c, "wsmp")) {
             parse_wsmp(c.data, c.size, &wsmp);
         } else if (is_id(&c, "wlnk") && c.size >= 12) {
-            channel_mask = rd32(c.data + 4);
-            cue = rd32(c.data + 8);
+            channel_mask = fa_le32(c.data + 4);
+            cue = fa_le32(c.data + 8);
             have_wlnk = 1;
         } else if (is_list(&c, "lart") || is_list(&c, "lar2")) {
             /* The region's own articulation replaces the instrument's. */
@@ -508,8 +505,8 @@ static void parse_instrument(conv* cv, const uint8_t* p, uint32_t n)
     memset(&art, 0, sizeof(art));
     while (next_chunk(&p, end, &c)) {
         if (is_id(&c, "insh") && c.size >= 12) {
-            bank = rd32(c.data + 4);
-            program = rd32(c.data + 8);
+            bank = fa_le32(c.data + 4);
+            program = fa_le32(c.data + 8);
             have_insh = 1;
         } else if (is_list(&c, "lrgn")) {
             lrgn = c.data;
@@ -736,7 +733,7 @@ fa_result fa_dls_to_sf2(const uint8_t* d, size_t n, uint8_t** out, size_t* out_n
     memset(&cv, 0, sizeof(cv));
     end = d + n;
     {
-        uint32_t riff = rd32(d + 4);
+        uint32_t riff = fa_le32(d + 4);
         if (riff >= 4 && riff - 4 < n - 12) end = d + 12 + (riff - 4);
     }
     p = d + 12;
@@ -771,8 +768,8 @@ fa_result fa_dls_to_sf2(const uint8_t* d, size_t n, uint8_t** out, size_t* out_n
      * 'wvpl' type in front, so both are accepted. Without a table, cues are the
      * waves in order. */
     if (ptbl && ptbl_n >= 8) {
-        uint32_t count = rd32(ptbl + 4);
-        cues_at = rd32(ptbl);
+        uint32_t count = fa_le32(ptbl + 4);
+        cues_at = fa_le32(ptbl);
         if (cues_at < 8 || cues_at > ptbl_n) cues_at = 8;
         if (count > (ptbl_n - cues_at) / 4) count = (ptbl_n - cues_at) / 4;
         if (count > SF2_MAX_RECORDS) count = SF2_MAX_RECORDS;
@@ -787,7 +784,7 @@ fa_result fa_dls_to_sf2(const uint8_t* d, size_t n, uint8_t** out, size_t* out_n
         uint32_t want;
         cv.cues[i] = UINT32_MAX;
         if (!(ptbl && ptbl_n >= 8)) { if (cv.waves[i].data) cv.cues[i] = i; continue; }
-        want = rd32(ptbl + cues_at + (size_t)i * 4);
+        want = fa_le32(ptbl + cues_at + (size_t)i * 4);
         cv.cues[i] = find_wave(&cv, want);
         if (cv.cues[i] == UINT32_MAX && want >= 4) cv.cues[i] = find_wave(&cv, want - 4);
     }

@@ -26,7 +26,6 @@
 #define ALIGN_MAX_MS 500         /* the most either output is delayed */
 #define ALIGN_STEP_MS 1.0        /* the outputs count as lined up within this; smaller changes wait */
 #define DELAY_FADE_MS 5.0        /* the master's delay changes through a fade out and in */
-#define TRIM_MAX_MS 250.0f
 
 /* ---- the headphones' callback ----------------------------------------------------- */
 

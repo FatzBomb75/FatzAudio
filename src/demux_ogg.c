@@ -153,9 +153,6 @@ static uint32_t crc_update(uint32_t crc, const uint8_t* p, size_t n)
     return crc;
 }
 
-static uint32_t le32(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
-static uint64_t le64(const uint8_t* p) { return (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32); }
-
 /* Reads the page at `pos`, whose first `have` header bytes are already in h, into
  * pg and o->body. 1 = a valid page, 0 = not one (the reader is left wherever
  * reading stopped), -1 = the data ends first, -2 = out of memory. */
@@ -179,15 +176,15 @@ static int page_rest(ogg* o, uint8_t* h, size_t have, int64_t pos, oggs_page* pg
         if (!o->body) { o->oom = 1; return -2; }
     }
     if (fa_br_read(&o->br, o->body, pg->body_len) < pg->body_len) return -1;
-    crc = le32(h + 22);
+    crc = fa_le32(h + 22);
     memset(h + 22, 0, 4);
     if (crc_update(crc_update(0, h, OGG_HEADER + pg->nseg), o->body, pg->body_len) != crc) return 0;
     pg->pos = pos;
     pg->size = OGG_HEADER + pg->nseg + pg->body_len;
     pg->flags = h[5];
-    pg->granule = (int64_t)le64(h + 6);
-    pg->serial = le32(h + 14);
-    pg->seq = le32(h + 18);
+    pg->granule = (int64_t)fa_le64(h + 6);
+    pg->serial = fa_le32(h + 14);
+    pg->seq = fa_le32(h + 18);
     memcpy(pg->lace, h + OGG_HEADER, pg->nseg);
     return 1;
 }
@@ -500,12 +497,12 @@ static void comment_title(const uint8_t* p, size_t n, char* out, size_t cap)
     uint32_t count, i;
     out[0] = '\0';
     if (n < 8) return;
-    pos = 4 + (size_t)le32(p);
+    pos = 4 + (size_t)fa_le32(p);
     if (pos < 4 || pos + 4 > n) return;
-    count = le32(p + pos);
+    count = fa_le32(p + pos);
     pos += 4;
     for (i = 0; i < count && pos + 4 <= n; i++) {
-        uint32_t len = le32(p + pos);
+        uint32_t len = fa_le32(p + pos);
         const char* f = (const char*)p + pos + 4;
         pos += 4;
         if (len > n - pos) return;

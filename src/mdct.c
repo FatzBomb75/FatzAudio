@@ -14,10 +14,6 @@
 #  define FA_FFT_NEON 1
 #endif
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 /* One set of tables per size 2^bits of m (m up to 2^20). */
 typedef struct mdct_tables {
     fa_atomic32 state;     /* 0 not built, 1 being built, 2 built */
@@ -48,12 +44,12 @@ static int build_tables(mdct_tables* s, int m)
         return 0;
     }
     for (i = 0; i < q; i++) {
-        double a = M_PI * (4.0 * i + 1.0) / (4.0 * m);
+        double a = FA_PI * (4.0 * i + 1.0) / (4.0 * m);
         int r = 0, b;
         s->twiddle[i] = (float)cos(a);
         s->twiddle[q + i] = (float)-sin(a);
-        s->post[i] = (float)cos(M_PI * i / m);
-        s->post[q + i] = (float)-sin(M_PI * i / m);
+        s->post[i] = (float)cos(FA_PI * i / m);
+        s->post[q + i] = (float)-sin(FA_PI * i / m);
         for (b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b);
         s->rev[i] = r;
     }
@@ -70,7 +66,7 @@ static int build_tables(mdct_tables* s, int m)
                 for (r = 1; r <= 3; r++, w += 8) {
                     int j;
                     for (j = 0; j < 2; j++) {
-                        double a = -2.0 * M_PI * r * (k + j) / (4.0 * h);
+                        double a = -2.0 * FA_PI * r * (k + j) / (4.0 * h);
                         w[2 * j] = w[2 * j + 1] = (float)cos(a);
                         w[4 + 2 * j] = (float)-sin(a);
                         w[4 + 2 * j + 1] = (float)sin(a);

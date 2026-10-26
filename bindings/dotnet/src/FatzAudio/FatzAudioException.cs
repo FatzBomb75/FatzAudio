@@ -90,7 +90,7 @@ public class FatzAudioException : Exception
         {
             NativeLoader.EnsureLoaded();
             var p = NativeMethods.fa_result_string((int)code);
-            var s = p == 0 ? null : Marshal.PtrToStringUTF8(p);
+            var s = NativeText.ReadOrNull(p);
             if (!string.IsNullOrEmpty(s)) return $"{s} ({code})";
         }
         catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException or BadImageFormatException)

@@ -23,8 +23,6 @@
 #define SF3_VORBIS 0x10
 #define SF3_MAX_SMPL_BYTES ((size_t)1 << 30)  /* decoded samples, like the largest SF2 accepted */
 
-static uint16_t rd16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
-static uint32_t rd32(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
 static void wr16(uint8_t* p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void wr32(uint8_t* p, uint32_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24); }
 
@@ -83,7 +81,7 @@ static int riff_next(riff_it* it, const uint8_t** id, const uint8_t** data, uint
     uint32_t sz;
     if (it->pos + 8 > it->n) return 0;
     *id = it->p + it->pos;
-    sz = rd32(it->p + it->pos + 4);
+    sz = fa_le32(it->p + it->pos + 4);
     if (sz > it->n - it->pos - 8) sz = (uint32_t)(it->n - it->pos - 8);
     *data = it->p + it->pos + 8;
     *size = sz;
@@ -107,7 +105,7 @@ static int find_parts(const uint8_t* d, size_t n, sf3_parts* p)
     if (n < 12 || memcmp(d, "RIFF", 4) != 0 || memcmp(d + 8, "sfbk", 4) != 0) return 0;
     top.p = d + 12;
     top.n = n - 12;
-    if (rd32(d + 4) >= 4 && (size_t)rd32(d + 4) - 4 < top.n) top.n = (size_t)rd32(d + 4) - 4;
+    if (fa_le32(d + 4) >= 4 && (size_t)fa_le32(d + 4) - 4 < top.n) top.n = (size_t)fa_le32(d + 4) - 4;
     top.pos = 0;
     while (riff_next(&top, &id, &data, &size)) {
         if (memcmp(id, "LIST", 4) != 0 || size < 4) continue;
@@ -135,7 +133,7 @@ int fa_sf3_probe(const uint8_t* d, size_t n)
     if (!find_parts(d, n, &p)) return 0;
     count = p.shdr_size / SHDR_SIZE;
     for (i = 0; i + 1 < count; i++)   /* the last record is the terminal EOS */
-        if (rd16(p.shdr + (size_t)i * SHDR_SIZE + 44) & SF3_CODEC_MASK) return 1;
+        if (fa_le16(p.shdr + (size_t)i * SHDR_SIZE + 44) & SF3_CODEC_MASK) return 1;
     return 0;
 }
 
@@ -189,8 +187,8 @@ fa_result fa_sf3_to_sf2(const uint8_t* d, size_t n, uint8_t** out, size_t* out_n
         uint32_t start, end, sl, el, type, at = (uint32_t)(smpl.n / 2), frames = 0;
         memcpy(rec, p.shdr + (size_t)i * SHDR_SIZE, SHDR_SIZE);
         if (i + 1 == count) { ob_put(&shdr, rec, SHDR_SIZE); break; }   /* EOS */
-        start = rd32(rec + 20); end = rd32(rec + 24); sl = rd32(rec + 28); el = rd32(rec + 32);
-        type = rd16(rec + 44);
+        start = fa_le32(rec + 20); end = fa_le32(rec + 24); sl = fa_le32(rec + 28); el = fa_le32(rec + 32);
+        type = fa_le16(rec + 44);
         if (type & SF3_ROM) {
             /* ROM samples (of a sound card) have no data in the file. */
         } else if (type & SF3_CODEC_MASK) {

@@ -81,6 +81,6 @@ public static class Equalizer
     {
         byte* p = NativeMethods.fa_eq_preset_name((int)preset);
         if (p == null) throw new ArgumentOutOfRangeException(nameof(preset));
-        return System.Runtime.InteropServices.Marshal.PtrToStringUTF8((nint)p) ?? "";
+        return NativeText.Read(p);
     }
 }

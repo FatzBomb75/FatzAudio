@@ -24,8 +24,6 @@
 #  define FA_TP_NEON 1
 #endif
 
-#define FA_PI 3.14159265358979323846
-
 /* ---- True peak ------------------------------------------------------------- */
 
 static double bessel_i0(double x)
@@ -430,14 +428,6 @@ void fa_meter_free(fa_meter* m)
     memset(m, 0, sizeof(*m));
 }
 
-void fa_meter_reset(fa_meter* m)
-{
-    memset(m->z, 0, (size_t)m->channels * 4 * sizeof(double));
-    m->subfill = 0;
-    m->subacc = 0.0;
-    m->nsubs = 0;
-}
-
 static int push_sub(fa_meter* m, double energy)
 {
     if (m->ring) {
@@ -601,5 +591,5 @@ double fa_meter_running_lufs(const fa_meter* m)
 double fa_meter_peak_dbtp(const fa_meter* m)
 {
     if (!m->with_peak) return NAN;
-    return m->tp->peak > 0.0f ? 20.0 * log10((double)m->tp->peak) : -HUGE_VAL;
+    return fa_lin_to_db(m->tp->peak);
 }

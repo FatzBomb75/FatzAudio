@@ -22,7 +22,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define FOURCC(a, b, c, d) (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
 #define CAF_MAX_KUKI (1u << 20)
 #define CAF_MAX_PAKT (1u << 28)
 #define CAF_MAX_PACKETS (1 << 25)
@@ -105,7 +104,7 @@ static fa_result codec_for(caf* c, const caf_desc* d, fa_codec_params* cp, int* 
     rate = (uint32_t)(d->rate + 0.5);
     *constant = 0;
     switch (d->format) {
-    case FOURCC('l', 'p', 'c', 'm'): {
+    case FA_FOURCC('l', 'p', 'c', 'm'): {
         int fl = (d->flags & 1) != 0, le = (d->flags & 2) != 0;
         uint32_t bits = d->bits;
         if (bits == 0 || bits % 8 || d->bytes_per_packet != d->channels * (bits / 8) || d->frames_per_packet != 1)
@@ -116,23 +115,23 @@ static fa_result codec_for(caf* c, const caf_desc* d, fa_codec_params* cp, int* 
         *constant = 1;
         break;
     }
-    case FOURCC('a', 'l', 'a', 'c'):
+    case FA_FOURCC('a', 'l', 'a', 'c'):
         if (!c->kuki) return FA_ERROR_UNSUPPORTED_FORMAT;
         name = "alac";
         break;
-    case FOURCC('.', 'm', 'p', '3'):
+    case FA_FOURCC('.', 'm', 'p', '3'):
         name = "mp3";
         break;
-    case FOURCC('a', 'a', 'c', ' '):     /* AAC-LC (also Main and LTP) */
-    case FOURCC('a', 'a', 'c', 'h'):     /* HE-AAC: the rate and frames per packet are after SBR */
-    case FOURCC('a', 'a', 'c', 'p'): {   /* HE-AAC v2 */
+    case FA_FOURCC('a', 'a', 'c', ' '):     /* AAC-LC (also Main and LTP) */
+    case FA_FOURCC('a', 'a', 'c', 'h'):     /* HE-AAC: the rate and frames per packet are after SBR */
+    case FA_FOURCC('a', 'a', 'c', 'p'): {   /* HE-AAC v2 */
         uint8_t oti = 0x40;     /* no cookie: MPEG-4 AAC, the config from 'desc' */
         if (c->kuki && (!aac_cookie(c->kuki, c->kuki_len, &oti, &asc, &asc_len) || !(oti == 0x40 || (oti >= 0x66 && oti <= 0x68))))
             return FA_ERROR_UNSUPPORTED_FORMAT;
         if (!asc || asc_len == 0) {
             /* MPEG-2 AAC says its profile in the object type: Main, LC, SSR. */
             int aot = oti == 0x66 ? 1 : oti == 0x68 ? 3 : 2;
-            if (d->format != FOURCC('a', 'a', 'c', ' ')) return FA_ERROR_UNSUPPORTED_FORMAT;
+            if (d->format != FA_FOURCC('a', 'a', 'c', ' ')) return FA_ERROR_UNSUPPORTED_FORMAT;
             asc_len = fa_aac_build_asc(c->asc, aot, rate, d->channels, 0);
             asc = c->asc;
         }
@@ -146,7 +145,7 @@ static fa_result codec_for(caf* c, const caf_desc* d, fa_codec_params* cp, int* 
     cp->codec = name;
     cp->sample_rate = rate;
     cp->channels = d->channels;
-    if (d->format == FOURCC('a', 'l', 'a', 'c')) {
+    if (d->format == FA_FOURCC('a', 'l', 'a', 'c')) {
         cp->extradata = c->kuki;
         cp->extradata_size = c->kuki_len;
     } else if (asc) {
@@ -284,7 +283,7 @@ static fa_result caf_open(fa_decoder* dec)
         if (fa_br_seek(&c->br, pos) != FA_OK || fa_br_read(&c->br, h, 12) != 12) break;
         type = fa_be32(h);
         size = (int64_t)fa_be64(h + 4);
-        if (type == FOURCC('d', 'e', 's', 'c') && size >= 32 && !have_desc) {
+        if (type == FA_FOURCC('d', 'e', 's', 'c') && size >= 32 && !have_desc) {
             uint64_t bits;
             if (fa_br_read(&c->br, desc, 32) != 32) break;
             bits = fa_be64(desc);
@@ -296,11 +295,11 @@ static fa_result caf_open(fa_decoder* dec)
             d.channels = fa_be32(desc + 24);
             d.bits = fa_be32(desc + 28);
             have_desc = 1;
-        } else if (type == FOURCC('k', 'u', 'k', 'i') && size > 0 && size <= (int64_t)CAF_MAX_KUKI && !c->kuki) {
+        } else if (type == FA_FOURCC('k', 'u', 'k', 'i') && size > 0 && size <= (int64_t)CAF_MAX_KUKI && !c->kuki) {
             c->kuki = (uint8_t*)malloc((size_t)size);
             if (!c->kuki) { r = FA_ERROR_OUT_OF_MEMORY; goto fail; }
             c->kuki_len = fa_br_read(&c->br, c->kuki, (size_t)size);
-        } else if (type == FOURCC('p', 'a', 'k', 't') && size >= 24 && size <= (int64_t)CAF_MAX_PAKT && !pakt) {
+        } else if (type == FA_FOURCC('p', 'a', 'k', 't') && size >= 24 && size <= (int64_t)CAF_MAX_PAKT && !pakt) {
             int64_t want = size;    /* never more than the source holds: a lying size must not allocate 256 MB */
             size_t cap = 0;
             if (src->length > 0 && want > src->length - pos - 12) want = src->length - pos - 12;
@@ -323,7 +322,7 @@ static fa_result caf_open(fa_decoder* dec)
                 if (got < step) break;
             }
             if (pakt_len < 24) { free(pakt); pakt = NULL; pakt_len = 0; }
-        } else if (type == FOURCC('d', 'a', 't', 'a') && !have_data) {
+        } else if (type == FA_FOURCC('d', 'a', 't', 'a') && !have_data) {
             if (!have_desc) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
             have_data = 1;
             c->data_off = pos + 12 + 4;    /* after the edit count */

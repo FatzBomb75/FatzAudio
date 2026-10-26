@@ -6,7 +6,6 @@
 #include "fa_internal.h"
 
 #define FA_AAC_FRAME 1024          /* core samples per raw data block */
-#define FA_AAC_MAX_OUT 8           /* output channels (7.1) */
 
 typedef struct fa_aac fa_aac;
 
@@ -41,7 +40,7 @@ typedef struct fa_aac_bits {
 static inline uint32_t fa_aac_peek(const fa_aac_bits* b, int n)   /* n <= 25 */
 {
     const uint8_t* q = b->p + (b->pos >> 3);
-    uint32_t v = ((uint32_t)q[0] << 24) | ((uint32_t)q[1] << 16) | ((uint32_t)q[2] << 8) | q[3];
+    uint32_t v = fa_be32(q);
     return n ? (v << (b->pos & 7)) >> (32 - n) : 0;
 }
 
@@ -161,8 +160,6 @@ void fa_aac_sbr_parse(fa_aac_sbr* s, fa_aac_bits* b, int bits, int crc);
  * high band is left empty (plain upsampling). With parametric stereo in a mono
  * element, out[1] gets the second channel and 1 is returned. */
 int fa_aac_sbr_apply(fa_aac_sbr* s, const float* const in[2], float* out[2]);
-/* 1 once the element has carried parametric stereo data. */
-int fa_aac_sbr_has_ps(const fa_aac_sbr* s);
 
 /* ---- parametric stereo (aac_ps.c) --------------------------------------------------- */
 

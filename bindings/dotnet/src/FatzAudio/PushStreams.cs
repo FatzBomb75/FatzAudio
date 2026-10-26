@@ -75,7 +75,7 @@ public abstract class FeedAudioStream : AudioStream
     public const long NoTimestamp = long.MinValue;
 
     private protected FeedAudioStream(AudioEngine engine, StreamHandle handle, AudioFormat? format)
-        : base(engine, handle, null, null, format)
+        : base(engine, handle, null, format)
     {
     }
 
