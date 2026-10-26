@@ -73,17 +73,39 @@ struct fa_aac_sbr {
     int f_master[65], f_high[65], f_low[65], f_noise[MAX_NQ + 1], f_lim[MAX_LIM + 1];
     int num_patches, patch_n[MAX_PATCH], patch_start[MAX_PATCH];
     int kx_last, M_last;
-    float x[2][XSLOTS][64][2];          /* the QMF matrix of each output channel */
-    float syn[2][1280];                 /* synthesis delay lines v of each output channel, from syn_pos (rings) */
+    /* The QMF matrix and synthesis delay line v (a ring from syn_pos) of each output
+     * channel. The second channel's are made with the element for a CPE, and for an
+     * SCE only once parametric stereo shows up (25 KB a mono stream never uses). */
+    float (*x[2])[64][2];
+    float* syn[2];
     int syn_pos[2];
+    float x0[XSLOTS][64][2];
+    float syn0[1280];
     fa_aac_qmf* qmf;                    /* transform tables and scratch, shared by the decoder's elements */
     fa_aac_ps* ps;
+    struct sbr_out1* out1;              /* the second output channel's x and syn */
     int ps_seen;
     int ps_data;                        /* PS data came with this frame */
     sbr_chan ch[2];                     /* last: a mono element has only ch[0] */
 };
 
 /* ---- setup ------------------------------------------------------------------------------- */
+
+struct sbr_out1 {
+    float x[XSLOTS][64][2];
+    float syn[1280];
+};
+
+/* The second output channel (zeroed, as after a reset). 0 without the memory. */
+static int make_out1(fa_aac_sbr* s)
+{
+    if (s->out1) return 1;
+    s->out1 = (struct sbr_out1*)calloc(1, sizeof(*s->out1));
+    if (!s->out1) return 0;
+    s->x[1] = s->out1->x;
+    s->syn[1] = s->out1->syn;
+    return 1;
+}
 
 struct fa_aac_qmf {
     fa_mdct dct4;                       /* 64 points, for the analysis and the synthesis */
@@ -118,6 +140,12 @@ fa_aac_sbr* fa_aac_sbr_create(uint32_t rate, int channels, fa_aac_qmf* qmf)
     s->rate = rate * 2;
     s->nch = channels;
     s->qmf = qmf;
+    s->x[0] = s->x0;
+    s->syn[0] = s->syn0;
+    if (channels > 1 && !make_out1(s)) {
+        free(s);
+        return NULL;
+    }
     fa_aac_sbr_reset(s);
     return s;
 }
@@ -126,13 +154,15 @@ void fa_aac_sbr_destroy(fa_aac_sbr* s)
 {
     if (!s) return;
     fa_aac_ps_destroy(s->ps);
+    free(s->out1);
     free(s);
 }
 
 void fa_aac_sbr_reset(fa_aac_sbr* s)
 {
     int c;
-    memset(s->syn, 0, sizeof(s->syn));
+    memset(s->syn0, 0, sizeof(s->syn0));
+    if (s->out1) memset(s->out1->syn, 0, sizeof(s->out1->syn));
     s->syn_pos[0] = s->syn_pos[1] = 0;
     for (c = 0; c < s->nch; c++) {
         sbr_chan* ch = &s->ch[c];
@@ -658,7 +688,7 @@ static void read_extensions(fa_aac_sbr* s, fa_aac_bits* b)
         left -= 2;
         if (id == 2 && s->nch == 1 && left > 0) {
             int used;
-            if (!s->ps) s->ps = fa_aac_ps_create();
+            if (!s->ps && make_out1(s)) s->ps = fa_aac_ps_create();
             used = s->ps ? fa_aac_ps_parse(s->ps, b, left) : -1;
             if (used >= 0) {
                 s->ps_seen = 1;

@@ -37,25 +37,37 @@ typedef struct alac_state {
 typedef struct bits {
     const uint8_t* p;
     size_t n, pos;                  /* in bits */
+    uint64_t cache;                 /* 64 bits from bit cache_pos on (a whole byte) */
+    size_t cache_pos;               /* above pos when nothing is cached */
 } bits;
 
-static uint32_t peek(const bits* b, int k)
+/* Near the end: up to 32 bits from whatever bytes are left, zeros past them. */
+static uint32_t peek_tail(const bits* b, int k)
 {
     uint64_t v = 0;
     size_t byte = b->pos >> 3;
-    int i, have;
-    if (k == 0) return 0;
-    if (byte + 8 <= (b->n >> 3)) {
-        /* Away from the end: eight bytes in one go. */
-        const uint8_t* q = b->p + byte;
-        v = ((uint64_t)q[0] << 56) | ((uint64_t)q[1] << 48) | ((uint64_t)q[2] << 40) | ((uint64_t)q[3] << 32) |
-            ((uint64_t)q[4] << 24) | ((uint64_t)q[5] << 16) | ((uint64_t)q[6] << 8) | (uint64_t)q[7];
-        have = 64 - (int)(b->pos & 7);
-    } else {
-        for (i = 0; i < 5; i++) v = (v << 8) | (byte + i < (b->n >> 3) ? b->p[byte + i] : 0);
-        have = 40 - (int)(b->pos & 7);
-    }
+    int i, have = 40 - (int)(b->pos & 7);
+    for (i = 0; i < 5; i++) v = (v << 8) | (byte + i < (b->n >> 3) ? b->p[byte + i] : 0);
     return (uint32_t)((v >> (have - k)) & ((k == 32) ? 0xFFFFFFFFu : ((1u << k) - 1)));
+}
+
+/* The next k bits (0 to 32), from a 64-bit window loaded only when they run past
+ * it: about every 7 bytes instead of 8 byte loads a call. */
+static uint32_t peek(bits* b, int k)
+{
+    size_t off = b->pos - b->cache_pos;   /* huge when pos is before the window */
+    if (k == 0) return 0;
+    if (off > (size_t)(64 - k)) {
+        size_t byte = b->pos >> 3;
+        const uint8_t* q;
+        if (byte + 8 > (b->n >> 3)) return peek_tail(b, k);
+        q = b->p + byte;
+        b->cache = ((uint64_t)q[0] << 56) | ((uint64_t)q[1] << 48) | ((uint64_t)q[2] << 40) | ((uint64_t)q[3] << 32) |
+                   ((uint64_t)q[4] << 24) | ((uint64_t)q[5] << 16) | ((uint64_t)q[6] << 8) | (uint64_t)q[7];
+        b->cache_pos = byte * 8;
+        off = b->pos & 7;
+    }
+    return (uint32_t)((b->cache << off) >> (64 - k));
 }
 
 static uint32_t get(bits* b, int k)
@@ -313,6 +325,8 @@ static fa_result alac_decode(fa_codec* c, const uint8_t* data, size_t size)
     b.p = data;
     b.n = size * 8;
     b.pos = 0;
+    b.cache = 0;
+    b.cache_pos = 1;                                /* nothing cached */
     r = fa_codec_reserve(c, st->frame_length, st->channels);
     if (r != FA_OK) return r;
     for (;;) {

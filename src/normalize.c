@@ -37,6 +37,7 @@ float fa_stream_norm_target_db(struct fa_stream* s)
 /* Starts tags/cache/scan for the stream once. */
 void fa_stream_start_analysis(struct fa_stream* s)
 {
+    fa_store32(&s->est_wanted, 1);
     fa_mutex_lock(&s->norm_lock);
     if (!s->scan_job && !s->loud.is_final && !s->analysis_tried) {
         s->analysis_tried = 1;

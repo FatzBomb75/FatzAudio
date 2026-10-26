@@ -9,6 +9,7 @@
  * files (moof/traf/trun) are indexed up front when the source can seek, and read
  * fragment by fragment from forward-only sources. */
 #include "demux.h"
+#include "pkt_index.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -16,20 +17,13 @@
 #define MP4_MAX_PACKET (64u << 20)
 #define MP4_PCM_FRAMES 4096
 
-typedef struct mp4_pkt {
-    int64_t off;
-    int64_t pts;
-    uint32_t size;
-    uint32_t dur;
-} mp4_pkt;
-
 typedef struct mp4 {
     fa_br br;
     fa_track track;
     uint8_t* moov;
     size_t moov_len;
-    mp4_pkt* pk;
-    size_t npk, pk_cap, cur;
+    fa_pkt_index pk;
+    size_t cur;
     int64_t end_pts;              /* after the last packet listed */
     int64_t limit;                /* bound for counts read from the file */
     uint32_t track_id, timescale, movie_timescale;
@@ -97,31 +91,54 @@ static int find_path(const box* in, const uint32_t* path, int depth, box* out)
 
 static fa_result add_packet(mp4* m, int64_t off, uint32_t size, int64_t pts, uint32_t dur)
 {
-    if (m->frame_bytes && m->npk > 0) {
-        mp4_pkt* last = &m->pk[m->npk - 1];
+    fa_pkt_index* x = &m->pk;
+    /* A size no packet can have (a damaged table) is kept unreadable rather than
+     * failing the open: reading stops at that packet, as before the compact list. */
+    if (size > MP4_MAX_PACKET) size = MP4_MAX_PACKET + 1;
+    if (m->frame_bytes && x->n > 0) {
+        uint32_t last_size = fa_pkt_size(x, x->n - 1), last_dur = fa_pkt_dur(x, x->n - 1);
         /* PCM: one packet for neighbouring frames. */
-        if (last->off + last->size == off && last->pts + last->dur == pts &&
-            last->size + (uint64_t)size <= (uint64_t)MP4_PCM_FRAMES * m->frame_bytes &&
-            (uint64_t)last->dur + dur < 0xFFFFFFFFu) {
-            last->size += size;
-            last->dur += dur;
-            return FA_OK;
+        if (x->end_off == off && x->end_pts == pts &&
+            last_size + (uint64_t)size <= (uint64_t)MP4_PCM_FRAMES * m->frame_bytes &&
+            (uint64_t)last_dur + dur < 0xFFFFFFFFu)
+            return fa_pkt_extend_last(x, size, dur);
+    }
+    if ((int64_t)x->n >= m->limit && x->n == x->cap) return FA_ERROR_UNSUPPORTED_FORMAT;
+    return fa_pkt_add(x, off, size, pts, dur);
+}
+
+/* `count` PCM samples of `size` bytes and `dur` each, back to back from `off`: what
+ * add_packet does for each, a whole packet's worth at a time. */
+static fa_result add_pcm_run(mp4* m, int64_t off, uint32_t size, int64_t pts, uint32_t dur, uint64_t count)
+{
+    fa_pkt_index* x = &m->pk;
+    fa_result r;
+    while (count > 0) {
+        if (x->n > 0 && x->end_off == off && x->end_pts == pts) {
+            uint64_t last_size = fa_pkt_size(x, x->n - 1), last_dur = fa_pkt_dur(x, x->n - 1);
+            uint64_t cap = (uint64_t)MP4_PCM_FRAMES * m->frame_bytes;
+            uint64_t k = count;
+            if (last_size > cap) k = 0;
+            else if (k > (cap - last_size) / size) k = (cap - last_size) / size;
+            if (dur > 0) {
+                if (last_dur > 0xFFFFFFFEu) k = 0;
+                else if (k > (0xFFFFFFFEu - last_dur) / dur) k = (0xFFFFFFFEu - last_dur) / dur;
+            }
+            if (k > 0) {
+                r = fa_pkt_extend_last(x, (uint32_t)(k * size), (uint32_t)(k * dur));
+                if (r != FA_OK) return r;
+                off += (int64_t)(k * size);
+                pts += (int64_t)(k * dur);
+                count -= k;
+                continue;
+            }
         }
+        r = add_packet(m, off, size, pts, dur);
+        if (r != FA_OK) return r;
+        off += size;
+        pts += dur;
+        count--;
     }
-    if (m->npk == m->pk_cap) {
-        size_t cap = m->pk_cap ? m->pk_cap * 2 : 1024;
-        mp4_pkt* p;
-        if ((int64_t)m->npk >= m->limit) return FA_ERROR_UNSUPPORTED_FORMAT;
-        p = (mp4_pkt*)realloc(m->pk, cap * sizeof(mp4_pkt));
-        if (!p) return FA_ERROR_OUT_OF_MEMORY;
-        m->pk = p;
-        m->pk_cap = cap;
-    }
-    m->pk[m->npk].off = off;
-    m->pk[m->npk].size = size;
-    m->pk[m->npk].pts = pts;
-    m->pk[m->npk].dur = dur;
-    m->npk++;
     return FA_OK;
 }
 
@@ -179,12 +196,11 @@ static fa_result build_packets(mp4* m, const box* stbl)
         if (m->frame_bytes) each = pcm_sample_bytes(m, sample_size);
         if (!z2 && sample_size && total > len / each + 1) total = len / each + 1;
     }
-    if (!m->frame_bytes && sample_size == 0 && total > m->pk_cap && (int64_t)total <= m->limit) {
+    if (!m->frame_bytes && sample_size == 0 && total > m->pk.cap && (int64_t)total <= m->limit) {
         /* Listed sizes: one packet each, so the list is made at its size (growing it
          * by doubling would leave up to half of it unused). Without the memory it
          * still grows as it goes. */
-        mp4_pkt* p = (mp4_pkt*)realloc(m->pk, (size_t)total * sizeof(mp4_pkt));
-        if (p) { m->pk = p; m->pk_cap = (size_t)total; }
+        (void)fa_pkt_reserve(&m->pk, (size_t)total);
     }
 
     for (chunk = 0; chunk < n_chunks && sample < total; chunk++) {
@@ -193,6 +209,32 @@ static fa_result build_packets(mp4* m, const box* stbl)
         while (stsc_i + 1 < n_stsc && (uint64_t)fa_be32(stsc.p + 8 + (stsc_i + 1) * 12) <= chunk + 1) stsc_i++;
         spc = fa_be32(stsc.p + 8 + stsc_i * 12 + 4);
         if (off < 0) return FA_ERROR_UNSUPPORTED_FORMAT;
+        if (m->frame_bytes && sample_size) {
+            /* Constant-size PCM: a run of samples at a time (a QuickTime file lists
+             * every frame, millions of them), as the loop below would add them. */
+            uint32_t size = pcm_sample_bytes(m, sample_size);
+            uint64_t left = total - sample < spc ? total - sample : spc;
+            while (left > 0) {
+                uint64_t k = left;
+                while (stts_left == 0 && stts_i < n_stts) {
+                    stts_left = fa_be32(stts.p + 8 + stts_i * 8);
+                    delta = fa_be32(stts.p + 8 + stts_i * 8 + 4);
+                    stts_i++;
+                }
+                if (stts_left > 0) {   /* past the table: keep the last duration */
+                    if (k > stts_left) k = stts_left;
+                    stts_left -= k;
+                }
+                if (k * delta > (uint64_t)(INT64_MAX / 4 - pts)) return FA_ERROR_UNSUPPORTED_FORMAT;
+                r = add_pcm_run(m, off, size, pts, delta, k);
+                if (r != FA_OK) return r;
+                off += (int64_t)(k * size);
+                pts += (int64_t)(k * delta);
+                left -= k;
+                sample += k;
+            }
+            continue;
+        }
         for (s = 0; s < spc && sample < total; s++, sample++) {
             uint32_t size;
             if (sample_size) size = sample_size;
@@ -314,7 +356,7 @@ static int load_fragment(mp4* m, fa_result* err)
         uint32_t type;
         int64_t size, pos = m->next_box;
         int hdr;
-        size_t before = m->npk;
+        size_t before = m->pk.n;
         if (!read_box_header(m, pos, &type, &size, &hdr)) break;
         m->next_box = size < 0 ? -1 : pos + size;
         if (type != FA_FOURCC('m', 'o', 'o', 'f')) continue;
@@ -324,7 +366,7 @@ static int load_fragment(mp4* m, fa_result* err)
             if (*err != FA_ERROR_OUT_OF_MEMORY) *err = FA_OK;   /* a cut file: it ends here */
             break;
         }
-        if (m->lazy) m->npk = m->cur = before = 0;       /* forward-only: the past is gone anyway */
+        if (m->lazy) { fa_pkt_clear(&m->pk); m->cur = before = 0; }       /* forward-only: the past is gone anyway */
         *err = parse_moof(m, buf, (size_t)(size - hdr), pos);
         if (*err != FA_OK) break;
         if (m->lazy && m->next_box >= 0) {
@@ -335,7 +377,7 @@ static int load_fragment(mp4* m, fa_result* err)
             if (read_box_header(m, m->next_box, &t2, &s2, &h2) && t2 == FA_FOURCC('m', 'd', 'a', 't'))
                 m->next_box = s2 < 0 ? -1 : m->next_box + s2;
         }
-        if (m->npk > before) { free(buf); return 1; }
+        if (m->pk.n > before) { free(buf); return 1; }
     }
     free(buf);
     return 0;
@@ -648,7 +690,7 @@ static void mp4_free(mp4* m)
 {
     fa_br_free(&m->br);
     free(m->moov);
-    free(m->pk);
+    fa_pkt_free(&m->pk);
     free(m->data);
     free(m->extra);
     free(m);
@@ -657,22 +699,22 @@ static void mp4_free(mp4* m)
 static fa_result mp4_next(void* ctx, fa_demux_packet* out)
 {
     mp4* m = (mp4*)ctx;
-    const mp4_pkt* p;
+    fa_pkt p;
     fa_result r;
-    if (m->cur >= m->npk) {
+    if (m->cur >= m->pk.n) {
         if (!m->lazy) return FA_ERROR_END_OF_STREAM;
         if (!load_fragment(m, &r)) return r != FA_OK ? r : FA_ERROR_END_OF_STREAM;
     }
-    p = &m->pk[m->cur];
-    r = fa_br_seek(&m->br, p->off);
+    fa_pkt_get(&m->pk, m->cur, &p);
+    r = fa_br_seek(&m->br, p.off);
     if (r == FA_ERROR_NOT_SEEKABLE) return r;          /* samples out of file order */
     if (r != FA_OK) return FA_ERROR_END_OF_STREAM;    /* past the end of a cut file */
-    r = fa_br_read_alloc(&m->br, p->size, MP4_MAX_PACKET, &m->data, &m->data_cap);
+    r = fa_br_read_alloc(&m->br, p.size, MP4_MAX_PACKET, &m->data, &m->data_cap);
     if (r != FA_OK) return r == FA_ERROR_OUT_OF_MEMORY ? r : FA_ERROR_END_OF_STREAM;
     out->data = m->data;
-    out->size = p->size;
-    out->pts = p->pts;
-    out->duration = p->dur;
+    out->size = p.size;
+    out->pts = p.pts;
+    out->duration = p.dur;
     m->cur++;
     return FA_OK;
 }
@@ -680,23 +722,8 @@ static fa_result mp4_next(void* ctx, fa_demux_packet* out)
 static fa_result mp4_seek_packets(void* ctx, int64_t t, int packets_back, size_t bytes_back)
 {
     mp4* m = (mp4*)ctx;
-    size_t lo = 0, hi = m->npk, j;
-    int n = 0;
-    size_t bytes = 0;
     if (m->lazy) return FA_ERROR_NOT_SEEKABLE;
-    /* Last packet starting at or before t. */
-    while (hi - lo > 1) {
-        size_t mid = lo + (hi - lo) / 2;
-        if (m->pk[mid].pts <= t) lo = mid;
-        else hi = mid;
-    }
-    j = lo;
-    while (j > 0 && n < 64 && (n < packets_back || bytes < bytes_back)) {
-        j--;
-        n++;
-        bytes += m->pk[j].size;
-    }
-    m->cur = j;
+    m->cur = fa_pkt_seek_back(&m->pk, t, packets_back, bytes_back);
     return FA_OK;
 }
 
@@ -833,18 +860,12 @@ static fa_result mp4_open(fa_decoder* dec)
     free(m->moov);
     m->moov = NULL;
     m->moov_len = 0;
-    if (!m->lazy && m->npk && m->npk < m->pk_cap) {
-        mp4_pkt* p = (mp4_pkt*)realloc(m->pk, m->npk * sizeof(mp4_pkt));
-        if (p) { m->pk = p; m->pk_cap = m->npk; }
-    }
+    if (!m->lazy) fa_pkt_trim(&m->pk);
     dec->impl = m;
     dec->seekable = src->seekable && !m->lazy;
     if (!m->lazy) {
         /* The track's own samples: exact even with video and other tracks in the file. */
-        size_t i;
-        int64_t total = 0;
-        for (i = 0; i < m->npk; i++) total += m->pk[i].size;
-        dec->audio_bytes = total;
+        dec->audio_bytes = fa_pkt_total_bytes(&m->pk);
     }
     snprintf(dec->container, sizeof(dec->container), "%s", qt ? "mov" : "mp4");
     return FA_OK;

@@ -19,7 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MP3_WINDOW 8192          /* bytes read at a time; a frame is at most 2881 */
+#define MP3_WINDOW 4096          /* bytes read at a time; a frame and the next header are at most 2885 */
 #define MP3_INDEX_STEP 16        /* frames per index entry */
 #define MP3_RESYNC 65536         /* junk bytes skipped looking for the next frame */
 #define MP3_DECODER_DELAY 529    /* samples the synthesis filter bank delays the audio by */

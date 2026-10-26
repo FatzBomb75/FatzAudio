@@ -1658,7 +1658,8 @@ fa_result fa_aac_decode(fa_aac* d, const uint8_t* data, size_t size, float** pcm
         nch = c;
         need = (size_t)(total + n) * (size_t)c;
         if (need > *cap) {
-            size_t nc = *cap ? *cap : 4096;
+            /* The first frame sets the size (one frame's audio, exactly); doubling after. */
+            size_t nc = *cap ? *cap : need;
             float* p;
             while (nc < need) nc *= 2;
             p = (float*)realloc(*pcm, nc * sizeof(float));

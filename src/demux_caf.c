@@ -19,6 +19,7 @@
  * WAVE's order. Packets of constant size (PCM) are found by arithmetic; the others
  * from a table built from 'pakt'. */
 #include "demux.h"
+#include "pkt_index.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -28,13 +29,6 @@
 #define CAF_MAX_PACKET (64u << 20)
 #define CAF_PCM_FRAMES 4096     /* frames per packet when PCM is read in groups */
 
-typedef struct caf_pkt {
-    int64_t off;
-    int64_t pts;
-    uint32_t size;
-    uint32_t dur;
-} caf_pkt;
-
 typedef struct caf {
     fa_br br;
     fa_track track;
@@ -43,8 +37,9 @@ typedef struct caf {
     uint8_t asc[FA_AAC_ASC_MAX];  /* AAC with no config in a cookie: built from 'desc' */
     uint8_t* data;
     size_t data_cap;
-    caf_pkt* pk;              /* packets from 'pakt' (NULL: constant size) */
-    size_t npk, cur;
+    fa_pkt_index pk;          /* packets from 'pakt' */
+    int has_pk;               /* else constant size */
+    size_t cur;
     uint32_t frame_bytes;     /* constant size: bytes per frame */
     int64_t data_off, data_len;   /* the audio; data_len -1 = to the end of the source */
 } caf;
@@ -54,7 +49,7 @@ static void caf_free(caf* c)
     fa_br_free(&c->br);
     free(c->kuki);
     free(c->data);
-    free(c->pk);
+    fa_pkt_free(&c->pk);
     free(c);
 }
 
@@ -160,19 +155,19 @@ static fa_result caf_next(void* ctx, fa_demux_packet* out)
 {
     caf* c = (caf*)ctx;
     fa_result r;
-    if (c->pk) {
-        const caf_pkt* p;
-        if (c->cur >= c->npk) return FA_ERROR_END_OF_STREAM;
-        p = &c->pk[c->cur];
-        r = fa_br_seek(&c->br, p->off);
+    if (c->has_pk) {
+        fa_pkt p;
+        if (c->cur >= c->pk.n) return FA_ERROR_END_OF_STREAM;
+        fa_pkt_get(&c->pk, c->cur, &p);
+        r = fa_br_seek(&c->br, p.off);
         if (r == FA_ERROR_NOT_SEEKABLE) return r;
         if (r != FA_OK) return FA_ERROR_END_OF_STREAM;
-        r = fa_br_read_alloc(&c->br, p->size, CAF_MAX_PACKET, &c->data, &c->data_cap);
+        r = fa_br_read_alloc(&c->br, p.size, CAF_MAX_PACKET, &c->data, &c->data_cap);
         if (r != FA_OK) return r == FA_ERROR_OUT_OF_MEMORY ? r : FA_ERROR_END_OF_STREAM;
         out->data = c->data;
-        out->size = p->size;
-        out->pts = p->pts;
-        out->duration = p->dur;
+        out->size = p.size;
+        out->pts = p.pts;
+        out->duration = p.dur;
         c->cur++;
         return FA_OK;
     } else {
@@ -199,23 +194,8 @@ static fa_result caf_next(void* ctx, fa_demux_packet* out)
 static fa_result caf_seek_packets(void* ctx, int64_t t, int packets_back, size_t bytes_back)
 {
     caf* c = (caf*)ctx;
-    if (c->pk) {
-        size_t lo = 0, hi = c->npk, j;
-        int n = 0;
-        size_t bytes = 0;
-        if (c->npk == 0) { c->cur = 0; return FA_OK; }
-        while (hi - lo > 1) {
-            size_t mid = lo + (hi - lo) / 2;
-            if (c->pk[mid].pts <= t) lo = mid;
-            else hi = mid;
-        }
-        j = lo;
-        while (j > 0 && n < 64 && (n < packets_back || bytes < bytes_back)) {
-            j--;
-            n++;
-            bytes += c->pk[j].size;
-        }
-        c->cur = j;
+    if (c->has_pk) {
+        c->cur = fa_pkt_seek_back(&c->pk, t, packets_back, bytes_back);
     } else {
         int64_t j = t / CAF_PCM_FRAMES - packets_back;
         c->cur = j > 0 ? (size_t)j : 0;
@@ -238,22 +218,19 @@ static fa_result build_table(caf* c, const caf_desc* d, const uint8_t* pakt, siz
     if (n < 0 || (uint64_t)n > most) n = (int64_t)most;
     if (n > CAF_MAX_PACKETS) n = CAF_MAX_PACKETS;
     cap = (size_t)n;
-    c->pk = (caf_pkt*)malloc((cap ? cap : 1) * sizeof(caf_pkt));
-    if (!c->pk) return FA_ERROR_OUT_OF_MEMORY;
+    c->has_pk = 1;
+    if (fa_pkt_reserve(&c->pk, cap) != FA_OK) return FA_ERROR_OUT_OF_MEMORY;
     for (i = 0; i < cap; i++) {
         uint64_t size = d->bytes_per_packet, dur = d->frames_per_packet;
         if (size == 0 && !read_vlq(pakt, pakt_len, &pos, &size)) break;
         if (dur == 0 && !read_vlq(pakt, pakt_len, &pos, &dur)) break;
         if (size > CAF_MAX_PACKET || dur > (1u << 24)) return FA_ERROR_UNSUPPORTED_FORMAT;
         if (c->data_len >= 0 && off + (int64_t)size > c->data_off + c->data_len) break;   /* a cut file */
-        c->pk[i].off = off;
-        c->pk[i].pts = pts;
-        c->pk[i].size = (uint32_t)size;
-        c->pk[i].dur = (uint32_t)dur;
+        if (fa_pkt_add(&c->pk, off, (uint32_t)size, pts, (uint32_t)dur) != FA_OK) return FA_ERROR_OUT_OF_MEMORY;
         off += (int64_t)size;
         pts += (int64_t)dur;
     }
-    c->npk = i;
+    fa_pkt_trim(&c->pk);   /* a cut file lists fewer */
     *total = pts;
     return FA_OK;
 }
