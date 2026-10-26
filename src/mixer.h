@@ -119,8 +119,9 @@ struct fa_mixer {
     biquad lp1, hp1, lp2, hp2, ap2;
     /* audio thread */
     float master[FA_MIXER_BLOCK * FA_DEVICE_CHANNELS];
-    float cue[FA_MIXER_BLOCK * FA_DEVICE_CHANNELS];   /* the cue sends, scaled by (1 - mix) x gain */
-    float cue_master[FA_MIXER_BLOCK];                 /* mix x gain: the master's share of the cue */
+    float* cue;                  /* FA_MIXER_BLOCK stereo frames: the cue sends, scaled by (1 - mix) x gain */
+    float* cue_master;           /* FA_MIXER_BLOCK: mix x gain, the master's share of the cue.
+                                    Both made only with a cue (cue_mode not FA_CUE_NONE) */
     /* Mics (mic.c): slots published to the audio thread, which runs them each block. */
     fa_atomic_ptr mics[FA_MIC_MAX];                   /* struct fa_mic*; changed under the lock */
     struct fa_mic* removed[FA_MIC_MAX];               /* fa_mixer_destroy's mics, freed with the mixer

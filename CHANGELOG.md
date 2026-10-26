@@ -198,6 +198,16 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Faster and smaller, with the same output (deep audit, small items, 2026-10-26): the DJ deck isolator runs both
+  channels and four filter sections per SSE step (a mixer callback takes about 38% fewer instructions, output identical
+  to the bit); the running loudness estimate (about 7% of decoding) runs only with normalization on or once the app asks
+  `fa_stream_get_loudness`; the ALAC bit reader keeps a 64-bit window (about 8% faster); a QuickTime PCM `.mov` opens in
+  well under 1 ms instead of about 40 ms for 5 minutes; the MP4/MOV/CAF packet list takes about 6.5 bytes a packet
+  instead of 24 (a 10-minute M4A stream 682 to 226 KB); a mono HE-AAC stream makes its second output channel only when
+  parametric stereo shows up (about 20 KB); a DJ mixer without a cue skips its 24 KB cue buffers; the MP3 reader's window
+  is 4 KB; the AAC output buffer is one frame exactly. Decoded audio and seeks were compared old against new on 39 files
+  (MP4, MOV, CAF, fragmented, with video, ALAC, HE-AAC, MP3): identical.
+
 - Faster, with output identical to the bit (deep audit, 2026-10-26): the output limiter skips its gain tracking
   while nothing comes near the ceiling (about half the cost of a quiet callback); the device resampler's stereo path
   (a 44.1 kHz file on a 48 kHz device) runs both channels in one SSE register, about 2x; raw PCM in MKV, MOV, CAF and

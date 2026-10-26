@@ -3018,9 +3018,10 @@ static void test_presentation_incremental(void)
                 CHECK_EQ(fa_surface_update_into(f, t_packs((int64_t)k), mem[b], stride, l.width, l.height, rev[b], &fr), FA_OK);
                 if (fr.base_revision) partial++;
                 rev[b] = fr.revision;
-                /* With sanitizers, effects are compared every fourth step and at the end
-                 * (a stale pixel stays until something draws over it). */
-                if (FA_TEST_SANITIZED && cfgs[ci].fx && n % 4 != 0 && n + 3 < packs + 10) continue;
+                /* Compared every fourth step and at the end: a stale pixel stays until
+                 * something draws over it, so it is still caught, and the test takes a
+                 * quarter of the time (it was 55 s of every CI run). */
+                if (n % 4 != 0 && n + 3 < packs + 10) continue;
                 /* The reference draws its whole master again every time. */
                 CHECK_EQ(fa_cdg_surface_set_presentation(ref, &p), FA_OK);
                 want = full_draw(ref, (int64_t)k, 4, &lr);

@@ -1186,12 +1186,16 @@ static void net_decoded(struct fa_stream* s, fa_frames got, fa_frames cursor, fa
     }
 }
 
-/* Feeds the running loudness estimate until the final value is known. */
+/* Feeds the running loudness estimate until the final value is known, once
+ * anything wants it (normalization on, or the app asked for the loudness): with
+ * normalization off, the default, the meter would cost about 7% of decoding for
+ * nothing. */
 static void update_estimate(struct fa_stream* s, const float* frames, fa_frames count)
 {
     int64_t before;
     float track = fa_load_float(&s->norm_track);
     if (!s->run_meter_ready || track == track) return;
+    if (!fa_load32(&s->est_wanted) && fa_load32(&s->engine->norm_mode) == FA_NORMALIZE_OFF) return;
     before = s->run_meter.nsubs;
     fa_meter_process(&s->run_meter, frames, count);
     if (s->run_meter.nsubs != before) {

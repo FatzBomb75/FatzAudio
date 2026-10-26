@@ -1261,6 +1261,7 @@ struct fa_stream {
     fa_atomic32 norm_track;      /* float LUFS used for gain, NAN = unknown */
     fa_atomic32 norm_album;      /* float LUFS from album tags, NAN = unknown */
     fa_atomic32 norm_est;        /* float LUFS running estimate, NAN = none yet */
+    fa_atomic32 est_wanted;      /* 1 once normalization or the app wants loudness: run run_meter */
     fa_meter run_meter;          /* running estimate; worker-owned under decode_lock */
     int run_meter_ready;
     float norm_db;               /* audio thread: gain being applied, dB */

@@ -140,7 +140,7 @@ Values that aren't known are `NAN` (.NET: `double.NaN`), for example the range a
 ## Threads
 
 - Scans run on their own scan threads, never on the decode workers or the audio thread. `fa_scan_loudness_path` also uses the calling thread.
-- The running estimate is computed by the decode worker that fills the stream, on audio it decodes anyway.
+- The running estimate is computed by the decode worker that fills the stream, on audio it decodes anyway, and only once something wants it: normalization on, or the app asking with `fa_stream_get_loudness`. With normalization off (the default) and no one asking, it costs nothing; the first `fa_stream_get_loudness` starts it, so its estimate covers the audio decoded from then on.
 - The audio thread only reads the gain (atomics) and moves it a little per block.
 - `FA_EVENT_LOUDNESS_FINAL` is delivered on the event thread like every other event.
 - Closing a stream stops its scan at once; it never waits for a scan to finish.

@@ -7,6 +7,7 @@
 #endif
 #include "fa_internal.h"
 #include "mdct.h"
+#include "pkt_index.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -117,6 +118,55 @@ static void rec_init(recorder* r) { memset(r, 0, sizeof(*r)); fa_mutex_init(&r->
 static void rec_free(recorder* r) { fa_mutex_destroy(&r->lock); }
 
 /* ---- unit tests -------------------------------------------------------------- */
+
+/* The compact packet list gives back exactly what was added: offsets and times
+ * across group edges, breaks (gaps, jumps in time), joined PCM packets and
+ * durations past 16 bits; and finds packets by time as a binary search would. */
+static void test_pkt_index(void)
+{
+    enum { N = 5000 };
+    static fa_pkt ref[N];
+    fa_pkt_index x;
+    fa_pkt p;
+    uint32_t seed = 12345;
+    int64_t off = 100, pts = 0;
+    size_t i, n = 0;
+    memset(&x, 0, sizeof(x));
+    for (i = 0; i < N + 600; i++) {
+        uint32_t r, size, dur;
+        seed = seed * 1103515245u + 12345u;
+        r = seed >> 8;
+        size = 1 + r % 900;
+        dur = (r % 97 == 0) ? 70000 + r % 1000 : 1024;
+        if (r % 13 == 0) off += 5000 + r % 70000;      /* a gap (interleaved video) */
+        if (r % 211 == 0) pts += 33;                   /* a jump in time */
+        if (n > 0 && r % 7 == 0) {                     /* joined to the last packet */
+            CHECK_EQ(fa_pkt_extend_last(&x, size, dur), FA_OK);
+            ref[n - 1].size += size;
+            ref[n - 1].dur += dur;
+        } else {
+            if (n == N) break;
+            CHECK_EQ(fa_pkt_add(&x, off, size, pts, dur), FA_OK);
+            ref[n].off = off; ref[n].pts = pts; ref[n].size = size; ref[n].dur = dur;
+            n++;
+        }
+        off += size;
+        pts += dur;
+    }
+    fa_pkt_trim(&x);
+    CHECK_EQ(x.n, n);
+    for (i = 0; i < n; i++) {
+        fa_pkt_get(&x, i, &p);
+        if (p.off != ref[i].off || p.pts != ref[i].pts || p.size != ref[i].size || p.dur != ref[i].dur) { CHECK_EQ((long long)i, -1); }
+    }
+    for (i = 0; i < 2000; i++) {
+        int64_t t = (int64_t)((uint64_t)i * (uint64_t)(ref[n - 1].pts + 5000) / 2000) - 100;
+        size_t lo = 0, hi = n;
+        while (hi - lo > 1) { size_t mid = lo + (hi - lo) / 2; if (ref[mid].pts <= t) lo = mid; else hi = mid; }
+        if (fa_pkt_find(&x, t) != lo) { CHECK_EQ((long long)t, -1); }
+    }
+    fa_pkt_free(&x);
+}
 
 /* The one UTF-8 check that tags, stream titles, HTTP headers and MIDI text share:
  * well-formed RFC 3629 only. */
@@ -1810,6 +1860,7 @@ int main(void)
     RUN(test_levels_tap_fits_latency);
     RUN(test_dsp_order_and_remove);
     RUN(test_dsp_on_decode_only);
+    RUN(test_pkt_index);
     RUN(test_utf8_valid);
 
     fa_device_close(g_dev);

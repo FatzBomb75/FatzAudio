@@ -13,6 +13,10 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#  include <emmintrin.h>
+#  define FA_ISO_SSE 1
+#endif
 
 
 /* ---- the isolator ------------------------------------------------------------- */
@@ -37,6 +41,7 @@ biquad fa_mixer_design(int type, double hz, double rate)
 }
 
 
+#ifndef FA_ISO_SSE
 /* One sample of one channel: the three bands, weighted. */
 static inline float isolate(const struct fa_mixer* m, float (*z)[2][2], int c, float x, float gl, float gm, float gh)
 {
@@ -47,6 +52,80 @@ static inline float isolate(const struct fa_mixer* m, float (*z)[2][2], int c, f
     lo = fa_biquad_run(&m->ap2, z[8][c], lo);
     return gl * lo + gm * mid + gh * hi;
 }
+#endif
+
+#ifdef FA_ISO_SSE
+/* The isolator four sections at a time: both channels of two sections per vector,
+ * so its 9 sections x 2 channels take 5 vector steps a frame instead of 18. Each lane
+ * does the scalar section's arithmetic in the same order, so the output is the
+ * same to the bit. Stages (lanes L, R, L, R):
+ *   0: lp1 (section 0), hp1 (2) on the input     1: lp1 (1), hp1 (3) -> lo, up
+ *   2: lp2 (4), hp2 (6) on up                    3: lp2 (5), hp2 (7) -> mid, hi
+ *   4: ap2 (8) on lo (lanes 2 and 3 unused, kept at 0) */
+typedef struct iso_sse {
+    __m128 b0[5], b1[5], b2[5], a1[5], a2[5], z0[5], z1[5];
+} iso_sse;
+
+static const int8_t iso_lane_sec[5][4] = { { 0, 0, 2, 2 }, { 1, 1, 3, 3 }, { 4, 4, 6, 6 }, { 5, 5, 7, 7 }, { 8, 8, -1, -1 } };
+
+static void iso_sse_load(iso_sse* v, const struct fa_mixer* m, float (*z)[2][2])
+{
+    const biquad* q[9] = { &m->lp1, &m->lp1, &m->hp1, &m->hp1, &m->lp2, &m->lp2, &m->hp2, &m->hp2, &m->ap2 };
+    int s, l;
+    for (s = 0; s < 5; s++) {
+        float b0[4], b1[4], b2[4], a1[4], a2[4], z0[4], z1[4];
+        for (l = 0; l < 4; l++) {
+            int sec = iso_lane_sec[s][l];
+            if (sec < 0) { b0[l] = b1[l] = b2[l] = a1[l] = a2[l] = z0[l] = z1[l] = 0.0f; continue; }
+            b0[l] = q[sec]->b0; b1[l] = q[sec]->b1; b2[l] = q[sec]->b2; a1[l] = q[sec]->a1; a2[l] = q[sec]->a2;
+            z0[l] = z[sec][l & 1][0];
+            z1[l] = z[sec][l & 1][1];
+        }
+        v->b0[s] = _mm_loadu_ps(b0); v->b1[s] = _mm_loadu_ps(b1); v->b2[s] = _mm_loadu_ps(b2);
+        v->a1[s] = _mm_loadu_ps(a1); v->a2[s] = _mm_loadu_ps(a2);
+        v->z0[s] = _mm_loadu_ps(z0); v->z1[s] = _mm_loadu_ps(z1);
+    }
+}
+
+static void iso_sse_store(const iso_sse* v, float (*z)[2][2])
+{
+    int s, l;
+    for (s = 0; s < 5; s++) {
+        float z0[4], z1[4];
+        _mm_storeu_ps(z0, v->z0[s]);
+        _mm_storeu_ps(z1, v->z1[s]);
+        for (l = 0; l < 4; l++) {
+            int sec = iso_lane_sec[s][l];
+            if (sec < 0) continue;
+            z[sec][l & 1][0] = z0[l];
+            z[sec][l & 1][1] = z1[l];
+        }
+    }
+}
+
+static inline __m128 iso_sse_step(iso_sse* v, int s, __m128 x)
+{
+    __m128 y = _mm_add_ps(_mm_mul_ps(v->b0[s], x), v->z0[s]);
+    v->z0[s] = _mm_add_ps(_mm_sub_ps(_mm_mul_ps(v->b1[s], x), _mm_mul_ps(v->a1[s], y)), v->z1[s]);
+    v->z1[s] = _mm_sub_ps(_mm_mul_ps(v->b2[s], x), _mm_mul_ps(v->a2[s], y));
+    return y;
+}
+
+/* One frame (left, right) through the isolator, as isolate() on each channel. */
+static inline void iso_sse_frame(iso_sse* v, float xl, float xr, float gl, float gm, float gh, float* y)
+{
+    float o[4];
+    __m128 in = _mm_setr_ps(xl, xr, xl, xr);
+    __m128 lu = iso_sse_step(v, 1, iso_sse_step(v, 0, in));                       /* lo, lo, up, up */
+    __m128 mh = iso_sse_step(v, 3, iso_sse_step(v, 2, _mm_movehl_ps(lu, lu)));    /* mid, mid, hi, hi */
+    __m128 lo = iso_sse_step(v, 4, _mm_movelh_ps(lu, _mm_setzero_ps()));
+    __m128 r = _mm_add_ps(_mm_add_ps(_mm_mul_ps(_mm_set1_ps(gl), lo), _mm_mul_ps(_mm_set1_ps(gm), mh)),
+                          _mm_mul_ps(_mm_set1_ps(gh), _mm_movehl_ps(mh, mh)));
+    _mm_storeu_ps(o, r);
+    y[0] = o[0];
+    y[1] = o[1];
+}
+#endif
 
 /* dB to linear for trim and EQ: the kill setting is silence. */
 static float band_gain(float db)
@@ -92,6 +171,9 @@ static void deck_process(struct fa_mixer* m, struct fa_deck* d, const mix_edges*
     int side = fa_load32(&d->side), cue_on = m->cue_mode != FA_CUE_NONE;
     uint32_t off, k;
     fa_tap* tap;
+#ifdef FA_ISO_SSE
+    iso_sse iv;
+#endif
     for (off = 0, k = 0; off < frames; off += MIXER_SUB, k++) {
         uint32_t n = frames - off < MIXER_SUB ? frames - off : MIXER_SUB, i, j;
         float v0[DECK_LANES], v1[DECK_LANES], w0[3], w1[3];
@@ -113,6 +195,9 @@ static void deck_process(struct fa_mixer* m, struct fa_deck* d, const mix_edges*
         xfader_gains(me->lin[k + 1], me->e[ML_XF][k + 1], &ga1, &gb1);
         x0 = w0[0] + w0[1] * ga0 + w0[2] * gb0;
         x1 = w1[0] + w1[1] * ga1 + w1[2] * gb1;
+#ifdef FA_ISO_SSE
+        iso_sse_load(&iv, m, d->z);
+#endif
         for (i = 0; i < n; i++) {
             float f = (float)i * inv;
             float tr = t0 + (t1 - t0) * f, gl = l0 + (l1 - l0) * f, gm = mi0 + (mi1 - mi0) * f, gh = h0 + (h1 - h0) * f;
@@ -120,14 +205,25 @@ static void deck_process(struct fa_mixer* m, struct fa_deck* d, const mix_edges*
             float* p = buf + (size_t)(off + i) * 2;
             float* o = out + (size_t)(off + i) * 2;
             int c;
+#ifdef FA_ISO_SSE
+            float ys[2];
+            iso_sse_frame(&iv, p[0] * tr, p[1] * tr, gl, gm, gh, ys);
+#endif
             for (c = 0; c < 2; c++) {
+#ifdef FA_ISO_SSE
+                float y = ys[c];
+#else
                 float y = isolate(m, d->z, c, p[c] * tr, gl, gm, gh);
+#endif
                 if (cue_on) m->cue[(size_t)(off + i) * 2 + c] += y * cs;
                 y *= fd;
                 p[c] = y;          /* for the meter */
                 o[c] += y * xf;
             }
         }
+#ifdef FA_ISO_SSE
+        iso_sse_store(&iv, d->z);
+#endif
         /* Flush denormals so a deck left silent stays cheap: every sub-block, since the
          * upper sections decay from 1e-20 into the denormal range in about 180 frames. */
         {
@@ -271,6 +367,8 @@ static void free_mixer(struct fa_mixer* m)
     fa_mic_bus_free((fa_mic_bus*)fa_load_ptr(&m->bus));
     fa_mutex_destroy(&m->cb_lock);
     fa_mutex_destroy(&m->lock);
+    free(m->cue);
+    free(m->cue_master);
     free(m);
 }
 
@@ -352,6 +450,15 @@ FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_confi
     m->cue_mode = c.cue_mode;
     m->cue_channel = c.cue_channel;
     m->flags = c.flags;
+    if (c.cue_mode != FA_CUE_NONE) {
+        m->cue = (float*)calloc((size_t)FA_MIXER_BLOCK * FA_DEVICE_CHANNELS, sizeof(float));
+        m->cue_master = (float*)calloc(FA_MIXER_BLOCK, sizeof(float));
+        if (!m->cue || !m->cue_master) {
+            fa_device_close(dev);
+            free_mixer(m);
+            return FA_ERROR_OUT_OF_MEMORY;
+        }
+    }
     fa_store32(&m->curve, FA_XFADER_CONSTANT_POWER);
     fa_lane_init(&m->lanes[ML_XF], 0.5f);
     fa_lane_init(&m->lanes[ML_MASTER], 1.0f);
