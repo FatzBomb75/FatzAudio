@@ -9,6 +9,7 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include "encode.h"
+#include "enc_flac_dsp.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -331,6 +332,123 @@ static void test_16bit_source_is_lossless(void)
     remove("enc_16.bin");
 }
 
+/* The FLAC encoder's kernels (SSE2, NEON or plain C, whichever this build has)
+ * against the formulas: per-range sums and ORs of the zigzag residuals, the stored
+ * residual and the refusal of residuals beyond 32 bits, for random coefficients,
+ * shifts and orders on 16- to 25-bit signals (every kernel path: 16-bit, split,
+ * checked, 32- and 64-bit sums). */
+static uint32_t kz(int64_t r) { return (uint32_t)(((uint64_t)r << 1) ^ (uint64_t)(r >> 63)); }
+
+static uint32_t krand(uint32_t* s)
+{
+    *s = *s * 1664525u + 1013904223u;
+    return *s >> 8;
+}
+
+static void test_flac_kernels(void)
+{
+    static int32_t x[4096], res[4096];
+    static int16_t buf[3][4096];
+    static flac_sums out, fx[5];
+    static const int sizes[3] = { 4096, 1152, 777 };
+    uint32_t seed = 12345u;
+    int round;
+    for (round = 0; round < 600; round++) {
+        int n = sizes[round % 3], bits = 16 + (int)(krand(&seed) % 10), order = 1 + round % 12;
+        int p = 12 + (int)(krand(&seed) % 4), shift = (int)(krand(&seed) % 16), top = 0, kind = (int)(krand(&seed) % 3);
+        int64_t amp = ((int64_t)1 << (bits - 1)) - 1;
+        int32_t q[12];
+        int i, j, k, ok, ref_ok = 1, mode;
+        flac_signal sg;
+        for (i = 0; i < n; i++) {
+            double v = kind == 0 ? sin(i * 0.01) * 0.6 + sin(i * 0.37) * 0.3 : kind == 1 ? (krand(&seed) / 8388608.0 - 1.0) : (i / 50 % 2 ? 1.0 : -1.0);
+            x[i] = (int32_t)(v * (double)amp);
+            if (x[i] > amp) x[i] = (int32_t)amp;
+            if (x[i] < -amp - 1) x[i] = (int32_t)(-amp - 1);
+        }
+        for (j = 0; j < order; j++) q[j] = (int32_t)(krand(&seed) % (1u << p)) - (1 << (p - 1));
+        while (top < 8 && n % (2 << top) == 0 && (n >> (top + 1)) > order) top++;
+        top = (int)(krand(&seed) % (uint32_t)(top + 1));
+        fa_flac_signal_prepare(&sg, x, n, buf[0], buf[1], buf[2]);
+        for (i = order; i < n; i++) {
+            int64_t sum = 0, v;
+            for (j = 0; j < order; j++) sum += (int64_t)q[j] * x[i - 1 - j];
+            v = x[i] - (sum >> shift);
+            if (v > INT32_MAX || v < INT32_MIN) ref_ok = 0;
+        }
+        /* mode 0: partitions with the residual stored, 1: the search's probe pieces */
+        for (mode = 0; mode < 2; mode++) {
+            int count = mode ? 8 : 1 << top, stride = mode ? n / 8 : n >> top, len = mode ? n / 32 : n >> top;
+            int piece_ok = 1;
+            if (mode && len <= order) continue;
+            for (k = 0; k < count; k++)
+                for (i = k ? k * stride : order; i < k * stride + len; i++) {
+                    int64_t sum = 0, v;
+                    for (j = 0; j < order; j++) sum += (int64_t)q[j] * x[i - 1 - j];
+                    v = x[i] - (sum >> shift);
+                    if (v > INT32_MAX || v < INT32_MIN) piece_ok = 0;
+                }
+            ok = fa_flac_lpc_sums(&sg, order, q, shift, count, stride, len, &out, mode ? NULL : res);
+            if (ok != (mode ? piece_ok : ref_ok)) {
+                fprintf(stderr, "  round %d (order %d, shift %d, %d bits): kernel %d, formula %d\n", round, order, shift, bits, ok, mode ? piece_ok : ref_ok);
+                CHECK(0);
+            }
+            if (!ok) continue;
+            for (k = 0; k < count; k++) {
+                uint64_t s = 0;
+                uint32_t b = 0;
+                for (i = k ? k * stride : order; i < k * stride + len; i++) {
+                    int64_t sum = 0, v;
+                    for (j = 0; j < order; j++) sum += (int64_t)q[j] * x[i - 1 - j];
+                    v = x[i] - (sum >> shift);
+                    s += kz(v);
+                    b |= kz(v);
+                    if (!mode && res[i] != v) {
+                        fprintf(stderr, "  round %d sample %d: residual %d vs %lld\n", round, i, res[i], (long long)v);
+                        CHECK(0);
+                    }
+                }
+                if (out.sum[k] != s || out.bits[k] != b) {
+                    fprintf(stderr, "  round %d (order %d, shift %d, %d bits, mode %d) range %d: %llu/%x vs %llu/%x\n", round, order,
+                            shift, bits, mode, k, (unsigned long long)out.sum[k], out.bits[k], (unsigned long long)s, b);
+                    CHECK(0);
+                }
+            }
+            if (!mode)
+                for (i = 0; i < order; i++) CHECK_EQ(res[i], 0);
+        }
+        /* the fixed predictors, at the finest partitions order 0 allows */
+        top = 0;
+        while (top < 8 && n % (2 << top) == 0 && (n >> (top + 1)) > 0) top++;
+        fa_flac_fixed_sums(x, n, top, sg.xmax, fx);
+        for (k = 0; k <= 4; k++) {
+            int psize = n >> top;
+            for (j = 0; j < 1 << top; j++) {
+                uint64_t s = 0;
+                uint32_t b = 0;
+                for (i = j * psize; i < (j + 1) * psize; i++) {
+                    int64_t r;
+                    if (i < k) continue;
+                    switch (k) {
+                    case 0: r = x[i]; break;
+                    case 1: r = (int64_t)x[i] - x[i - 1]; break;
+                    case 2: r = (int64_t)x[i] - 2 * (int64_t)x[i - 1] + x[i - 2]; break;
+                    case 3: r = (int64_t)x[i] - 3 * (int64_t)x[i - 1] + 3 * (int64_t)x[i - 2] - x[i - 3]; break;
+                    default: r = (int64_t)x[i] - 4 * (int64_t)x[i - 1] + 6 * (int64_t)x[i - 2] - 4 * (int64_t)x[i - 3] + x[i - 4]; break;
+                    }
+                    s += kz(r);
+                    b |= kz(r);
+                }
+                if (fx[k].sum[j] != s || fx[k].bits[j] != b) {
+                    fprintf(stderr, "  round %d: fixed order %d partition %d: %llu vs %llu\n", round, k, j,
+                            (unsigned long long)fx[k].sum[j], (unsigned long long)s);
+                    CHECK(0);
+                }
+            }
+        }
+    }
+}
+
 static void test_flac_compresses(void)
 {
     const uint32_t rate = 44100, ch = 2;
@@ -350,6 +468,7 @@ static void test_flac_compresses(void)
            (long long)best);
     CHECK(best < fast);
     CHECK(best < n * 4 / 3);
+    CHECK(best < 89000);   /* 88060; 90170 when Levinson runs without its white-noise pass */
     free(x);
     remove("enc_c0.flac");
     remove("enc_c8.flac");
@@ -792,6 +911,7 @@ int main(void)
     RUN(test_flac_lossless);
     RUN(test_16bit_source_is_lossless);
     RUN(test_flac_compresses);
+    RUN(test_flac_kernels);
     RUN(test_resample_and_mix);
     RUN(test_encode_stream_offline);
     RUN(test_record_device_and_stream);
