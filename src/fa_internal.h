@@ -766,6 +766,7 @@ void fa_limiter_process(fa_limiter* l, float* frames, uint32_t count, float ceil
  * markers are best effort and dropped when the device queue is full. So the spill
  * slots always hold everything that must arrive, even with the device queue full. */
 #define FA_EVENT_SPILL 10
+#define FA_POSITION_EVENT_SLOTS 64 /* fa_stream_add_position_event: frames armed at once per stream */
 
 /* An event plus its engine-wide sequence number. Events from the audio thread and
  * from API threads travel different paths; the event thread sorts each round by
@@ -1164,6 +1165,10 @@ struct fa_stream {
     fa_atomic32 state;           /* fa_stream_state */
     fa_atomic64 position;        /* source frames, when not attached */
     fa_atomic64 markers[FA_MARKER_COUNT];  /* read by the worker and the audio thread */
+    fa_atomic64 pos_events[FA_POSITION_EVENT_SLOTS]; /* frames armed by fa_stream_add_position_event;
+                                    FA_FRAMES_UNSET = free. The mixer frees a slot (CAS) as it raises it */
+    fa_atomic32 pos_armed;       /* at least the number armed: raised before a slot is armed,
+                                    so the mixer can skip the scan at 0 */
     fa_shape_atomic fade_shape[2];         /* FA_FADE_IN, FA_FADE_OUT */
     fa_atomic32 loop;            /* 1 = loops (FA_OPEN_LOOP, fa_stream_set_loop); changed
                                     under decode_lock, or while the mixer skips the stream */

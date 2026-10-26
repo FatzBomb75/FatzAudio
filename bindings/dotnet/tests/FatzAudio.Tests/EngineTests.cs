@@ -266,13 +266,13 @@ public class EngineTests
     }
 
     [Fact]
-    public void NotImplementedCall_ThrowsWithErrorCode()
+    public void FailedCall_ThrowsWithErrorCode()
     {
         using var engine = AudioEngine.Create();
         using var s = engine.OpenMemory(TestAudio.SineWav(), DecodeOnly);
-        var ex = Assert.Throws<FatzAudioException>(() => s.AddPositionEvent(TimeSpan.FromSeconds(1)));   // still a stub
-        Assert.Equal(ErrorCode.NotImplemented, ex.ErrorCode);
-        Assert.Contains("mplemented", ex.Message, StringComparison.OrdinalIgnoreCase);
+        var ex = Assert.Throws<FatzAudioException>(() => s.AddPositionEvent(TimeSpan.FromSeconds(5)));   // past the end
+        Assert.Equal(ErrorCode.InvalidArgument, ex.ErrorCode);
+        Assert.Contains("invalid", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

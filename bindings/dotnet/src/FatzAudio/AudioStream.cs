@@ -1638,11 +1638,27 @@ public unsafe class AudioStream : IDisposable
         }
     }
 
-    /// <summary>Requests a <see cref="PositionReached"/> event when playback reaches a position.</summary>
+    /// <summary>
+    /// Raises <see cref="PositionReached"/> once, the first time playback passes <paramref name="position"/>; the
+    /// request is then gone. Add it again from the handler to hear about the next pass (a loop's next turn, or after
+    /// seeking back). Frame-exact like markers: it follows tempo, rate and loops, and is raised as that audio is
+    /// mixed, about one device latency before it is heard. Unlike markers it is raised playing in
+    /// <see cref="Reverse"/> too. A seek over the position doesn't raise it: it stays armed. Streams playing on a
+    /// device only. Up to 64 positions are armed at once; adding one that is already armed does nothing.
+    /// </summary>
     /// <param name="position">The position to watch.</param>
-    /// <exception cref="FatzAudioException">Not supported by the native build yet (<see cref="ErrorCode.NotImplemented"/>).</exception>
-    public void AddPositionEvent(TimeSpan position) =>
-        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_add_position_event(Handle, TimeToFrames(position)));
+    /// <exception cref="FatzAudioException">The position is negative or past the stream's length
+    /// (<see cref="ErrorCode.InvalidArgument"/>), or 64 are armed already (<see cref="ErrorCode.Busy"/>).</exception>
+    public void AddPositionEvent(TimeSpan position)
+    {
+        long frame = TimeToFrames(position);
+        // -1 would be FA_FRAMES_UNSET (remove all); any negative position is an invalid argument.
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_add_position_event(Handle, frame < 0 ? -2 : frame));
+    }
+
+    /// <summary>Removes every position armed with <see cref="AddPositionEvent"/> that has not been reached.</summary>
+    public void ClearPositionEvents() =>
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_add_position_event(Handle, -1));
 
     /// <summary>
     /// Adds a user DSP processor that changes the audio in place, after rate, tempo and pitch and before the
@@ -1715,7 +1731,7 @@ public unsafe class AudioStream : IDisposable
     public event EventHandler? DecodeError;
     /// <summary>Raised when the stream's final loudness is known (from tags, the cache or a scan); <see cref="GetLoudness"/> then returns it. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? LoudnessFinal;
-    /// <summary>Raised when a position requested with <see cref="AddPositionEvent"/> is reached. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
+    /// <summary>Raised when a position requested with <see cref="AddPositionEvent"/> is reached (<see cref="StreamEventArgs.Frame"/> is that position, in frames). Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler<StreamEventArgs>? PositionReached;
     /// <summary>Raised when a scheduled, crossfaded or queued start happened (<see cref="PlayAt"/>, <see cref="CrossfadeTo"/>, <see cref="QueueNext"/>). Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? Started;

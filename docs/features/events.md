@@ -8,7 +8,7 @@ Each stream has one event callback. The audio thread queues events without locki
 |---|---|---|---|
 | `FA_EVENT_ENDED` | position at the end | 0 | ✅ |
 | `FA_EVENT_RAMP_DONE` | position | the ramp's `tag` | ✅ |
-| `FA_EVENT_POSITION` | the requested frame | 0 | 🧩 |
+| `FA_EVENT_POSITION` | the requested frame | 0 | ✅ streams on a device, once per `fa_stream_add_position_event` ([position events](#position-events)) |
 | `FA_EVENT_MARKER` | the marker's frame | the `fa_marker` | ✅ ([markers](crossfade.md#markers)) |
 | `FA_EVENT_STARTED` | position at the start | 0 | ✅ after `play_at`, a crossfade or a queue ([crossfade](crossfade.md)) |
 | `FA_EVENT_METADATA` | position where the new title starts | `fa_metadata.seq` of the title | ✅ radio song titles ([web streams](web-streams.md#song-titles-icy-metadata)) |
@@ -20,8 +20,6 @@ Each stream has one event callback. The audio thread queues events without locki
 | `FA_EVENT_LOOPED` | the loop end it left (cue-out or the length) | the frame it went to (cue-in or 0) | ✅ looping streams on a device, once per jump; raised as the audio is mixed, like markers ([playback](playback.md#loop-and-mute-while-playing)) |
 | `FA_EVENT_TRACKER_ROW` | the row's first frame | `order << 16 \| row` | ✅ tracker modules with `FA_TRACKER_ROW_EVENTS` on; raised as the audio is mixed, like markers ([trackers](trackers.md#row-events)) |
 | `FA_EVENT_SEEK_FAILED` | the target of `fa_stream_seek_async` that was not reached | the `fa_result` | ✅ a worker could not seek there (a web server refusing the range); playback goes on where it was ([seek cost](playback.md#what-a-seek-costs)) |
-
-`FA_EVENT_POSITION` is for `fa_stream_add_position_event(stream, frame)` (.NET `AddPositionEvent`, `PositionReached`), a one-shot event at a frame of your choice, as BASS's `BASS_SYNC_POS`. It is declared but not built yet: the call returns `FA_ERROR_NOT_IMPLEMENTED`. Use a marker ([markers](crossfade.md#markers)) for a point inside a track you set before playing, or poll `fa_stream_get_position`.
 
 ## C
 
@@ -52,10 +50,40 @@ song.MarkerReached += (_, e) => Console.WriteLine($"{e.Marker} reached");
 song.MidiTextReached += (_, e) => Console.WriteLine($"lyric: {e.Text.Text}");
 ```
 
+## Position events
+
+`fa_stream_add_position_event(stream, frame)` asks for one `FA_EVENT_POSITION` the first time playback passes a source frame. It is the counterpart of a marker for any frame you like:
+
+- **Once.** The request is used up when it fires. To hear about every pass (each turn of a loop, or after seeking back), add it again from the callback.
+- **Frame-exact.** It is raised in the mix callback that plays that frame, about one device latency before it is heard, and follows tempo, rate, loops and deck loops. A loop that wraps over the frame raises it on the wrap.
+- **Seeks.** Seeking over the frame doesn't raise it; it stays armed until playback passes it.
+- **Reverse.** Unlike markers, it is raised in [reverse playback](tempo-pitch.md#reverse-playback) too, when the position counts down past the frame (and where a reversed loop wraps from its start to its end).
+- **Limits.** Up to 64 frames can be armed per stream (`FA_ERROR_BUSY` after that); adding one that is already armed does nothing. A frame past a known length is `FA_ERROR_INVALID_ARG`; the length itself is reached as the stream ends (reversed, as playback starts there). `FA_FRAMES_UNSET` removes every armed frame. Only streams played on a device raise it; decode-only streams don't.
+- **Best effort**, like markers (see below).
+
+```c
+static void FA_CALL on_event(const fa_event* ev, void* user)
+{
+    if (ev->type == FA_EVENT_POSITION) {
+        show_chorus_banner();
+        fa_stream_add_position_event(ev->stream, ev->frame);   /* again on the next turn of the loop */
+    }
+}
+
+fa_stream_set_event_callback(s, on_event, NULL);
+fa_stream_add_position_event(s, 30 * 44100);                 /* 0:30 of a 44.1 kHz song */
+```
+
+```csharp
+song.PositionReached += (_, e) => Console.WriteLine($"reached {e.Position}");
+song.AddPositionEvent(TimeSpan.FromSeconds(30));
+song.ClearPositionEvents();   // drops the ones not reached yet
+```
+
 ## Lifetime guarantees
 
 - When `fa_stream_set_event_callback` (replacing a callback) or `fa_stream_close` returns, the previous callback isn't running and won't be called again, so you can free its `user` data. The one exception is calling them from inside that callback itself.
 - Events queued for a stream that has since been closed are dropped, not delivered.
 - Events for a stream arrive in the order they happened, whether the audio thread raised them (a ramp finishing) or an API call did (a ramp replaced before it started).
-- `ENDED`, `RAMP_DONE` and `STARTED` aren't lost, so a `RampAsync` or `CrossfadeTo` always completes. `MARKER`, `MIDI_TEXT` and `TRACKER_ROW` are best effort: they can be dropped in the rare case that the device's event queue (1024 events) fills before the engine empties it. A slow callback only delays later events: the decode workers keep moving events off the audio thread's queue every few milliseconds while your callback runs.
+- `ENDED`, `RAMP_DONE` and `STARTED` aren't lost, so a `RampAsync` or `CrossfadeTo` always completes. `MARKER`, `POSITION`, `MIDI_TEXT` and `TRACKER_ROW` are best effort: they can be dropped in the rare case that the device's event queue (1024 events) fills before the engine empties it. A slow callback only delays later events: the decode workers keep moving events off the audio thread's queue every few milliseconds while your callback runs.
 - Closing a device delivers what it had queued. A callback may also call `fa_engine_destroy` after closing the engine's streams; the teardown finishes once the callback returns.
