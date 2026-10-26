@@ -197,6 +197,7 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
                     for (NSString* key in resp.allHeaderFields)
                         [lines appendFormat:@"%@: %@\r\n", key, resp.allHeaderFields[key]];
                     headers = strdup(lines.UTF8String ? lines.UTF8String : "");
+                    if (headers && strlen(headers) > FA_HTTP_HEAD_MAX) { free(headers); r = FA_ERROR_NETWORK; break; }   /* as the other backends */
                     snprintf(final_url, sizeof(final_url), "%s", resp.URL.absoluteString.UTF8String ? resp.URL.absoluteString.UTF8String : req->url);
                     memset(&fr, 0, sizeof(fr));
                     fr.status = (int)resp.statusCode;

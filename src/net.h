@@ -11,6 +11,7 @@
 #define FA_NET_DEFAULT_RECONNECT_MS 30000
 #define FA_NET_MAX_REDIRECTS 8
 #define FA_NET_URL_MAX 2048
+#define FA_HTTP_HEAD_MAX 65536   /* a response's headers, in every backend (plain HTTP and WinHTTP count the status line too) */
 
 /* ---- URLs (net_url.c) ------------------------------------------------------ */
 

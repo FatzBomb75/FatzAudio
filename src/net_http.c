@@ -65,7 +65,6 @@ static int net_startup(void) { return 0; }
 #  endif
 #endif
 
-#define FA_HTTP_HEAD_MAX 65536
 #define FA_HTTP_SLICE_MS 100
 
 static int cancelled(const fa_http_request* req) { return req->cancel && fa_load32(req->cancel); }

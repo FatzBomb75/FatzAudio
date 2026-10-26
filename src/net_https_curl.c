@@ -107,6 +107,7 @@ static size_t on_header(char* data, size_t size, size_t nitems, void* user)
         c->status = sp ? atoi(sp + 1) : 0;
         return n;
     }
+    if (!c->head_done && c->hlen + n > FA_HTTP_HEAD_MAX) return 0;   /* curl stops: a network error (trailers after the head don't count) */
     if (c->hlen + n + 1 > c->hcap) {
         size_t cap = (c->hlen + n + 1) * 2;
         char* p = (char*)realloc(c->headers, cap);

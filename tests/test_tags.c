@@ -231,6 +231,11 @@ static void test_id3v24(void)
     while (body.n < 200) put_str(&body, "z");
     put_str(&frames, "TALB"); put_be32(&frames, (uint32_t)body.n); put_be16(&frames, 0); put_buf(&frames, &body);
     buf_free(&body);
+    /* TPE2 in "UTF-8" holding a UTF-16 surrogate (ED A0 80): not well-formed, so
+     * read as Latin-1, as other text that is not UTF-8. */
+    put_u8(&body, 3); put_u8(&body, 0xED); put_u8(&body, 0xA0); put_u8(&body, 0x80);
+    put_str(&frames, "TPE2"); put_synchsafe(&frames, (uint32_t)body.n); put_be16(&frames, 0); put_buf(&frames, &body);
+    buf_free(&body);
     put_u8(&body, 3); put_str(&body, "Next");
     put_str(&frames, "TCOM"); put_synchsafe(&frames, (uint32_t)body.n); put_be16(&frames, 0); put_buf(&frames, &body);
     buf_free(&body);
@@ -242,6 +247,7 @@ static void test_id3v24(void)
     CHECK_STR(fa_tags_get(t, FA_TAG_TITLE), "x\xc3\xbfy");
     CHECK_EQ(strlen(fa_tags_get(t, FA_TAG_ALBUM)), 199);
     CHECK_STR(fa_tags_get(t, FA_TAG_COMPOSER), "Next");
+    CHECK_STR(fa_tags_get(t, FA_TAG_ALBUM_ARTIST), "\xc3\xad\xc2\xa0\xc2\x80");
     fa_tags_close(t);
     buf_free(&frames);
     buf_free(&file);
