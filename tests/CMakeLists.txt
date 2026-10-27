@@ -50,6 +50,8 @@ if(MSVC)
         PROPERTIES COMPILE_OPTIONS "/W0")
 else()
     set_source_files_properties(${PROJECT_SOURCE_DIR}/src/miniaudio_impl.c PROPERTIES COMPILE_OPTIONS "-w;-fwrapv")
+    set_source_files_properties(${PROJECT_SOURCE_DIR}/src/surface_fx.c ${PROJECT_SOURCE_DIR}/src/cdg_scale.c
+        ${PROJECT_SOURCE_DIR}/src/cdg_contour.c PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 endif()
 if(APPLE)
     set_source_files_properties(${PROJECT_SOURCE_DIR}/src/net_https_apple.m PROPERTIES COMPILE_OPTIONS "-fobjc-arc")

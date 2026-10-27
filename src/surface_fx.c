@@ -22,11 +22,20 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+/* SSE2 or NEON (64-bit ARM: it has vsqrtq), with plain C for the rest and other
+ * machines: the same operations in the same order everywhere, so the same results
+ * (the build turns off fused multiply-adds for this file). */
 #if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #  include <emmintrin.h>
 #  define FX_SSE 1
 #else
 #  define FX_SSE 0
+#endif
+#if !FX_SSE && (defined(__aarch64__) || defined(_M_ARM64))
+#  include <arm_neon.h>
+#  define FX_NEON 1
+#else
+#  define FX_NEON 0
 #endif
 
 #define FX_TILE FA_FX_TILE
@@ -254,6 +263,32 @@ static void field(const uint8_t* a, size_t stride, int step, int wn, int hn, int
             }
             any = _mm_movemask_epi8(seen);
         }
+#elif FX_NEON
+        {
+            const int16x8_t vcap = vdupq_n_s16((int16_t)cap), none = vdupq_n_s16(FX_NONE), one = vdupq_n_s16(1);
+            uint16x8_t seen = vdupq_n_u16(0);
+            for (; x + 8 <= wn; x += 8) {
+                uint16x8_t c, site, cn, cu;
+                int16x8_t gn;
+                if (step == 4) c = vmovl_u8(vld4_u8(ar - 3 + (size_t)x * 4).val[3]);
+                else c = vmovl_u8(vld1_u8(ar + x));
+                site = inside ? vcltq_u16(c, vdupq_n_u16(255)) : vcgtq_u16(c, vdupq_n_u16(0));
+                seen = vorrq_u16(seen, site);
+                if (gu) {
+                    int16x8_t up = vld1q_s16(gu + x);
+                    cu = vmovl_u8(vld1_u8(cvu + x));
+                    gn = vbslq_s16(vcltq_s16(up, vcap), vaddq_s16(up, one), none);
+                } else {
+                    cu = c;
+                    gn = none;
+                }
+                gn = vbicq_s16(gn, vreinterpretq_s16_u16(site));
+                cn = vbslq_u16(site, c, cu);
+                vst1q_s16(g + x, gn);
+                vst1_u8(cv + x, vmovn_u16(cn));
+            }
+            any = vmaxvq_u16(seen) != 0;
+        }
 #endif
         for (; x < wn; x++) {
             uint8_t c = ar[(size_t)x * (size_t)step];
@@ -291,6 +326,16 @@ static void field(const uint8_t* a, size_t stride, int step, int wn, int hn, int
                 _mm_storel_epi64((__m128i*)(void*)(cv + x), _mm_packus_epi16(cc, cc));
             }
         }
+#elif FX_NEON
+        {
+            const int16x8_t vcap = vdupq_n_s16((int16_t)cap), one = vdupq_n_s16(1);
+            for (; x + 8 <= wn; x += 8) {
+                int16x8_t d = vld1q_s16(gd + x), gv = vld1q_s16(g + x), d1 = vaddq_s16(d, one);
+                uint16x8_t take = vandq_u16(vcltq_s16(d, vcap), vcltq_s16(d1, gv));
+                vst1q_s16(g + x, vbslq_s16(take, d1, gv));
+                vst1_u8(cv + x, vbsl_u8(vmovn_u16(take), vld1_u8(cvd + x), vld1_u8(cv + x)));
+            }
+        }
 #endif
         for (; x < wn; x++)
             if (gd[x] < cap && gd[x] + 1 < g[x]) {
@@ -325,6 +370,25 @@ static void field(const uint8_t* a, size_t stride, int step, int wn, int hn, int
             }
             any = _mm_movemask_epi8(seen) != 0;
         }
+#elif FX_NEON
+        {
+            const uint16x8_t none = vdupq_n_u16(FX_NONE);
+            const float32x4_t far = vdupq_n_f32(FX_FAR);
+            uint16x8_t seen = vdupq_n_u16(0);
+            for (; x + 8 <= wn; x += 8) {
+                uint16x8_t gv = vreinterpretq_u16_s16(vld1q_s16(g + x)), no = vceqq_u16(gv, none);
+                /* The masks widened with their sign: all ones stay all ones. */
+                uint32x4_t nlo = vreinterpretq_u32_s32(vmovl_s16(vreinterpret_s16_u16(vget_low_u16(no))));
+                uint32x4_t nhi = vreinterpretq_u32_s32(vmovl_s16(vreinterpret_s16_u16(vget_high_u16(no))));
+                float32x4_t lo = vcvtq_f32_u32(vmovl_u16(vget_low_u16(gv))), hi = vcvtq_f32_u32(vmovl_u16(vget_high_u16(gv)));
+                lo = vmulq_f32(lo, lo);
+                hi = vmulq_f32(hi, hi);
+                vst1q_f32(s->f + x, vbslq_f32(nlo, far, lo));
+                vst1q_f32(s->f + x + 4, vbslq_f32(nhi, far, hi));
+                seen = vorrq_u16(seen, vmvnq_u16(no));
+            }
+            any = vmaxvq_u16(seen) != 0;
+        }
 #endif
         for (; x < wn; x++) {
             if (g[x] == FX_NONE) {
@@ -348,6 +412,21 @@ static void field(const uint8_t* a, size_t stride, int step, int wn, int hn, int
                                                                        cv[s->arg[x + 3]])), k);
                 __m128 corr = inside ? _mm_sub_ps(cov, h) : _mm_sub_ps(h, cov);
                 _mm_storeu_ps(o + x, _mm_add_ps(_mm_sqrt_ps(_mm_loadu_ps(s->dd + x)), corr));
+            }
+        }
+#elif FX_NEON
+        {
+            const float32x4_t k = vdupq_n_f32(1.0f / 255.0f), h = vdupq_n_f32(0.5f);
+            for (; x + 4 <= wn; x += 4) {
+                int32_t c4[4];
+                float32x4_t cov, corr;
+                c4[0] = cv[s->arg[x]];
+                c4[1] = cv[s->arg[x + 1]];
+                c4[2] = cv[s->arg[x + 2]];
+                c4[3] = cv[s->arg[x + 3]];
+                cov = vmulq_f32(vcvtq_f32_s32(vld1q_s32(c4)), k);
+                corr = inside ? vsubq_f32(cov, h) : vsubq_f32(h, cov);
+                vst1q_f32(o + x, vaddq_f32(vsqrtq_f32(vld1q_f32(s->dd + x)), corr));
             }
         }
 #endif
@@ -394,11 +473,14 @@ static float sample(const float* d, int wn, int hn, int x, int y, float fx, floa
     return (v[0] * (1.0f - fx) + v[1] * fx) * (1.0f - fy) + (v[2] * (1.0f - fx) + v[3] * fx) * fy;
 }
 
-/* A pixel being drawn, premultiplied, 0..1: with SSE2 the four channels at once (the
- * same operations, and no fused multiply-add, so the same results). */
+/* A pixel being drawn, premultiplied, 0..1: with SSE2 or NEON the four channels at
+ * once (the same operations, and no fused multiply-add, so the same results). */
 #if FX_SSE
 typedef __m128 fx_px;
 static fx_px px_zero(void) { return _mm_setzero_ps(); }
+#elif FX_NEON
+typedef float32x4_t fx_px;
+static fx_px px_zero(void) { return vdupq_n_f32(0.0f); }
 #else
 typedef struct fx_px { float c[4]; } fx_px;
 static fx_px px_zero(void) { fx_px v = { { 0.0f, 0.0f, 0.0f, 0.0f } }; return v; }
@@ -410,6 +492,8 @@ static fx_px over(fx_px acc, const float layer[4], float k)
     float keep = 1.0f - layer[3] * k;
 #if FX_SSE
     return _mm_add_ps(_mm_mul_ps(_mm_loadu_ps(layer), _mm_set1_ps(k)), _mm_mul_ps(acc, _mm_set1_ps(keep)));
+#elif FX_NEON
+    return vaddq_f32(vmulq_f32(vld1q_f32(layer), vdupq_n_f32(k)), vmulq_f32(acc, vdupq_n_f32(keep)));
 #else
     int i;
     for (i = 0; i < 4; i++) acc.c[i] = layer[i] * k + acc.c[i] * keep;
@@ -417,12 +501,23 @@ static fx_px over(fx_px acc, const float layer[4], float k)
 #endif
 }
 
+#if FX_NEON
+/* Four of o[i] = a[i] > b[i] ? a[i] : b[i], as _mm_max_ps (vmaxq_f32 differs at -0). */
+static void o_max(float* o, const float* a, const float* b)
+{
+    float32x4_t va = vld1q_f32(a), vb = vld1q_f32(b);
+    vst1q_f32(o, vbslq_f32(vcgtq_f32(va, vb), va, vb));
+}
+#endif
+
 /* o[i] = the larger of a[i] and b[i]. */
 static void max_of(float* o, const float* a, const float* b, int n)
 {
     int i = 0;
 #if FX_SSE
     for (; i + 4 <= n; i += 4) _mm_storeu_ps(o + i, _mm_max_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i)));
+#elif FX_NEON
+    for (; i + 4 <= n; i += 4) o_max(o + i, a + i, b + i);
 #endif
     for (; i < n; i++) o[i] = a[i] > b[i] ? a[i] : b[i];
 }
@@ -440,6 +535,8 @@ static void max_row(float* row, int n, int r, float* e)
         j = 0;
 #if FX_SSE
         for (; j + p + 4 <= len; j += 4) _mm_storeu_ps(e + j, _mm_max_ps(_mm_loadu_ps(e + j), _mm_loadu_ps(e + j + p)));
+#elif FX_NEON
+        for (; j + p + 4 <= len; j += 4) o_max(e + j, e + j, e + j + p);
 #endif
         for (; j + p < len; j++) e[j] = e[j] > e[j + p] ? e[j] : e[j + p];
     }
@@ -522,6 +619,15 @@ static int keep_alpha(const uint8_t* sp, uint8_t* ka, int n)
         memcpy(ka + x, &four, 4);
     }
     mixed = _mm_movemask_epi8(bad) != 0;
+#elif FX_NEON
+    uint8x16_t bad = vdupq_n_u8(0);
+    for (; x + 16 <= n; x += 16) {
+        uint8x16x4_t v = vld4q_u8(sp + (size_t)x * 4);
+        uint8x16_t rgb = vorrq_u8(vorrq_u8(v.val[0], v.val[1]), v.val[2]);
+        bad = vorrq_u8(bad, vandq_u8(vtstq_u8(rgb, rgb), vceqq_u8(v.val[3], vdupq_n_u8(0))));
+        vst1q_u8(ka + x, v.val[3]);
+    }
+    mixed = vmaxvq_u8(bad) != 0;
 #endif
     for (; x < n; x++) {
         ka[x] = sp[(size_t)x * 4 + 3];
@@ -544,6 +650,13 @@ static int same_alpha(const uint8_t* sp, const uint8_t* ka, int n)
         if (_mm_movemask_epi8(_mm_cmpeq_epi32(a, k)) != 0xFFFF ||
             _mm_movemask_epi8(_mm_andnot_si128(_mm_cmpeq_epi32(_mm_and_si128(v, rgb), z), _mm_cmpeq_epi32(a, z))))
             return 0;
+    }
+#elif FX_NEON
+    for (; x + 16 <= n; x += 16) {
+        uint8x16x4_t v = vld4q_u8(sp + (size_t)x * 4);
+        uint8x16_t rgb = vorrq_u8(vorrq_u8(v.val[0], v.val[1]), v.val[2]);
+        uint8x16_t bad = vandq_u8(vtstq_u8(rgb, rgb), vceqq_u8(v.val[3], vdupq_n_u8(0)));
+        if (vmaxvq_u8(vorrq_u8(bad, vmvnq_u8(vceqq_u8(v.val[3], vld1q_u8(ka + x)))))) return 0;
     }
 #endif
     for (; x < n; x++)
@@ -570,6 +683,15 @@ static void finish(const fa_fx_plan* p, fx_px acc, const uint8_t* sp, float bk, 
         x = _mm_cvttps_epi32(_mm_min_ps(_mm_max_ps(acc, _mm_setzero_ps()), _mm_set1_ps(255.0f)));
         x = _mm_packs_epi32(x, x);
         px = _mm_cvtsi128_si32(_mm_packus_epi16(x, x));
+        memcpy(dp, &px, 4);
+    }
+#elif FX_NEON
+    {
+        uint32_t px;
+        uint16x4_t w;
+        acc = vaddq_f32(vmulq_f32(acc, vdupq_n_f32(255.0f)), vdupq_n_f32(0.5f));
+        w = vmovn_u32(vreinterpretq_u32_s32(vcvtq_s32_f32(vminq_f32(vmaxq_f32(acc, vdupq_n_f32(0.0f)), vdupq_n_f32(255.0f)))));
+        px = vget_lane_u32(vreinterpret_u32_u8(vmovn_u16(vcombine_u16(w, w))), 0);
         memcpy(dp, &px, 4);
     }
 #else

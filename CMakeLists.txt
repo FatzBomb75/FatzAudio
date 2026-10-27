@@ -299,6 +299,10 @@ else()
     # -fwrapv: dr_flac's predictors overflow int on damaged files; wrapping is what
     # they expect, and it keeps that defined behaviour.
     set_source_files_properties(src/miniaudio_impl.c PROPERTIES COMPILE_OPTIONS "-w;-fwrapv")
+    # No fused multiply-adds where pixels are worked out in floating point (ARM and
+    # x86 with FMA would fuse them): the same pixels on every machine (tests/ too).
+    set_source_files_properties(src/surface_fx.c src/cdg_scale.c src/cdg_contour.c PROPERTIES
+        COMPILE_OPTIONS "-ffp-contract=off")
     set(FA_WARNINGS -Wall -Wextra)
 endif()
 
