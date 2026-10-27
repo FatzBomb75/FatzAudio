@@ -198,6 +198,10 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Lyric surfaces: a sweeping wipe recolours and redraws only the columns its edge crossed since the last frame instead of
+  the whole syllable, and a cross-fade only the syllable's own columns (no longer padded by the effects' reach). Frames
+  are identical; a wipe-only frame costs about a tenth of before (test song: 0.15 to 0.016 ms at 1080p, 0.67 to
+  0.07 ms at 2160p).
 - Lyrics: surfaces that use the same font file (a main screen and an operator preview) share one copy of it in memory
   instead of reading it once each; a CJK font is 20-40 MB. The copy is freed when the last surface using it closes, and a
   file changed on disk is read again.

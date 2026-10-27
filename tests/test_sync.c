@@ -956,12 +956,13 @@ static void test_module_grid_background(void)
     fa_beat_grid g;
     uint32_t count = 0;
     fa_result res = FA_ERROR_BUSY;
-    int i;
+    int64_t t0;
     CHECK(rig_open(&r));
     s = open_mod(100);
     CHECK(s != NULL);
     CHECK_EQ(fa_deck_load(r.a, s, 0), FA_OK);
-    for (i = 0; i < 10000 && res != FA_OK; i++) {
+    /* Up to a minute: the render is slow under the sanitizers with other tests running. */
+    for (t0 = fa_monotonic_ns(); res != FA_OK && fa_monotonic_ns() - t0 < 60000000000LL;) {
         memset(&info, 0, sizeof(info));
         info.struct_size = sizeof(info);
         res = fa_deck_get_beat_info(r.a, &info);
