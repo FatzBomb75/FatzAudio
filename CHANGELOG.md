@@ -198,6 +198,10 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Chained Ogg files (several songs one after another) find where each song ends by bisection on the serial numbers,
+  as vorbisfile does, instead of reading every page: an hour of 20 songs opens in about 6 ms instead of 41 ms. Links,
+  lengths, decoded audio and seeks are the same as before. A file whose songs reuse a serial number (against the Ogg
+  spec) is read through as before ([chained files](docs/features/streams.md#ogg-opus-and-ogg-vorbis)).
 - Lyric surfaces: a sweeping wipe recolours and redraws only the columns its edge crossed since the last frame instead of
   the whole syllable, and a cross-fade only the syllable's own columns (no longer padded by the effects' reach). Frames
   are identical; a wipe-only frame costs about a tenth of before (test song: 0.15 to 0.016 ms at 1080p, 0.67 to
@@ -377,6 +381,13 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   call takes. The encoder now reads the stream only once enough is downloaded, as playback does.
 - Bitrate and `audio_bytes` of an MP3 with a Xing/LAME header frame (VBR files, and LAME's CBR ones) no longer count
   that frame as audio.
+- AAC seeks: HE-AAC and HE-AAC v2 (SBR and PS) came out up to 0.35-0.86 off a straight decode for the first frames
+  after a seek, because only one packet before the target was decoded. Now 12 packets are decoded and thrown away
+  first, and on the test streams a seek gives exactly a straight decode's audio; a seek costs 0.1-0.5 ms more for
+  stereo, about 1 ms for 5.1 HE-AAC. The noise generator for noise-filled bands now starts again on a seek to the
+  start, so that is exact for every AAC stream. Deeper into a stream, noise-filled bands and SBR's noise are a
+  different stretch of noise than a straight decode's (the generators run through the whole stream), and AAC Main
+  and LTP still settle more slowly ([AAC](docs/features/streams.md#aac)).
 - Web streams: credentials from the URL (`https://user:password@host/...`) were still sent after a redirect to
   another server on Windows (WinHTTP) and Apple (URLSession). Now they go only to the URL's own scheme, host and port,
   and the app's `Authorization` and `Cookie` header lines likewise, on every transport
