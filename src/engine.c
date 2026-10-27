@@ -93,6 +93,62 @@ static uint32_t poll_ms_locked(fa_engine* e)
  * finds more streams wanting decoding than the one it takes wakes one more, which
  * does the same, so busy moments still get every worker. Workers with no decoding to
  * do render ahead for drawing surfaces that asked for it (cdg.c). */
+static int decode_wanted_locked(fa_engine* e)
+{
+    struct fa_stream* s;
+    for (s = e->streams; s; s = s->next)
+        if (fa_stream_needs_work(s)) return 1;
+    return 0;
+}
+
+/* Takes part in the first job with items left and room for a helper, until it is
+ * done or a stream wants decoding (the others finish it). Caller holds list_lock,
+ * which is released while working. */
+static int par_help(fa_engine* e)
+{
+    fa_par_job* j;
+    int slot, i, stop = 0;
+    for (j = e->par; j; j = j->next_job)
+        if (j->joined < j->slots && fa_load32(&j->next) < j->count) break;
+    if (!j) return 0;
+    slot = ++j->joined;
+    j->helpers++;
+    while (!stop && (i = fa_fetch_add32(&j->next, 1)) < j->count) {
+        fa_mutex_unlock(&e->list_lock);
+        j->run(j->ctx, i, slot);
+        fa_mutex_lock(&e->list_lock);
+        stop = decode_wanted_locked(e);
+    }
+    if (--j->helpers == 0) fa_cond_broadcast(&j->done);
+    return 1;
+}
+
+void fa_engine_parallel(fa_engine* e, fa_par_job* job)
+{
+    int i, shared = e && e->worker_count && job->slots > 0 && job->count > 1 && fa_cond_init(&job->done) == 0;
+    fa_store32(&job->next, 0);
+    job->joined = job->helpers = 0;
+    if (shared) {
+        fa_mutex_lock(&e->list_lock);
+        job->next_job = e->par;
+        e->par = job;
+        fa_cond_broadcast(&e->work_cond);
+        fa_mutex_unlock(&e->list_lock);
+    }
+    while ((i = fa_fetch_add32(&job->next, 1)) < job->count) job->run(job->ctx, i, 0);
+    if (!shared) return;
+    /* No one joins from here on; those who did finish the items they took. */
+    fa_mutex_lock(&e->list_lock);
+    {
+        fa_par_job** pp;
+        for (pp = &e->par; *pp; pp = &(*pp)->next_job)
+            if (*pp == job) { *pp = job->next_job; break; }
+    }
+    while (job->helpers) fa_cond_wait_ms(&job->done, &e->list_lock, UINT32_MAX);
+    fa_mutex_unlock(&e->list_lock);
+    fa_cond_destroy(&job->done);
+}
+
 static void worker_main(void* arg)
 {
     fa_engine* e = (fa_engine*)arg;
@@ -129,7 +185,9 @@ static void worker_main(void* arg)
             if (busy) fa_cond_wait_ms(&e->work_cond, &e->list_lock, 1);
             continue;
         }
-        /* No stream wants decoding: a surface rendering ahead may (cdg.c). */
+        /* No stream wants decoding: help with work being shared out, which someone
+         * waits for, then a surface rendering ahead may want a frame (cdg.c). */
+        if (par_help(e)) continue;
         if (fa_load32(&e->cdg_render_count)) {
             fa_mutex_unlock(&e->list_lock);
             fa_cdg_render_one(e);

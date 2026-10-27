@@ -816,6 +816,23 @@ void fa_event_rescue_stream(fa_engine* e, struct fa_stream* s);
 #define FA_STREAM_LANES 3
 #define FA_START_QUEUED INT64_MAX /* start_frame of a queued stream: set by its predecessor */
 
+/* Work split into items that run at once on the calling thread and idle workers
+ * (fa_engine_parallel). */
+typedef struct fa_par_job {
+    void (*run)(void* ctx, int item, int slot);   /* slot 0: the caller, 1..slots: helpers */
+    void* ctx;
+    int count;                   /* items */
+    int slots;                   /* most helpers */
+    fa_atomic32 next;            /* the next item to take */
+    int joined, helpers;         /* list_lock: helpers that took part, and still do */
+    fa_cond done;                /* the last helper finished */
+    struct fa_par_job* next_job; /* list_lock: engine->par */
+} fa_par_job;
+
+/* Runs job->run for every item, here and on the workers with nothing to decode,
+ * and returns when all are done. */
+void fa_engine_parallel(fa_engine* e, fa_par_job* job);
+
 struct fa_engine {
     fa_engine_config config;
     char* temp_folder;           /* config.temp_directory + "/fatzaudio-tmp", NULL = none */
@@ -831,6 +848,7 @@ struct fa_engine {
     struct fa_stream* cdg_watched; /* streams with CD+G change events (cdg.c), via cdg_watch_link */
     struct fa_cdg_surface* cdg_render; /* surfaces waiting for a worker to render ahead (cdg.c) */
     fa_atomic32 cdg_render_count; /* how many: read by idle workers without a lock */
+    fa_par_job* par;             /* list_lock: work being shared out (fa_engine_parallel) */
     fa_qevent* pending;          /* events posted by API/worker threads */
     uint32_t pending_count, pending_cap;
 

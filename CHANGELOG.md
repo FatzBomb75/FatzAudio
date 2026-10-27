@@ -201,6 +201,13 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Lyrics: surfaces that use the same font file (a main screen and an operator preview) share one copy of it in memory
   instead of reading it once each; a CJK font is 20-40 MB. The copy is freed when the last surface using it closes, and a
   file changed on disk is read again.
+- CD+G effects are faster, with the same pixels: a frame whose colours change but not its shapes (a colour fade, a
+  lyric being coloured in) blends the new colours with what the effects kept instead of working the effects out again;
+  the distance field, the stroke widths and the blend use SSE2; and a large redraw is shared with the engine's idle
+  worker threads (up to three). A dense 2160p song with every effect at maximum draws in about a third of the time,
+  its worst frame 530 to 120 ms (four cores); a colour change at 2160p costs the picture's redraw plus a blend instead
+  of 115-280 ms. What is kept costs memory with effects on: 5 bytes per output pixel with outline and shadow, 9 with
+  the bevel (about 32 or 58 MB at 2160p). See [CD+G presentation options](docs/features/cdg.md#presentation-options-fa_cdg_surface_set_presentation).
 - Web streams: the requests of one stream share their connections (curl, WinHTTP, URLSession; Android's
   `HttpURLConnection` pools by itself), so an `https://` HLS start makes one TLS handshake instead of one per playlist,
   key and segment: with a 100 ms round trip the first audio comes about 0.5 s sooner. HLS byte-range segments ask for

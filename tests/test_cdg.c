@@ -2708,6 +2708,112 @@ static void test_bevel_half_stroke(void)
     free(dst);
 }
 
+/* Lyrics coloured in while the colours fade, with a scroll, new transparency and a new
+ * background on the way. */
+static buf fade_cdg(void)
+{
+    uint8_t pal[8][3];
+    buf c = { 0 };
+    int row, col, k, j;
+    memcpy(pal, k_low, sizeof(pal));
+    colors(&c, 0, k_low);
+    colors(&c, 1, k_low);
+    preset(&c, 0, 0);
+    for (row = 2; row < 16; row += 2)
+        for (col = 2; col < 48; col += 3) tile(&c, 0, 0, 1 + (row + col) % 7, row, col, (uint8_t)(0x15 ^ (col * 7 + row)));
+    for (k = 0; k < 60; k++) {
+        tile(&c, k & 1, 0, 9 + k % 6, 2 + 2 * ((k / 15) % 7), 2 + 3 * (k % 15), (uint8_t)(0x2A ^ k));
+        if (k % 3 == 0) {
+            for (j = 1; j < 8; j++) pal[j][(k / 3) % 3] = (uint8_t)((pal[j][(k / 3) % 3] + 5) & 15);
+            colors(&c, (k / 3) & 1, (const uint8_t(*)[3])pal);
+        }
+        if (k == 20) scroll(&c, 1, 0, 1, 0, 0, 0);
+        if (k == 30) transparent(&c, 4, 30);
+        if (k == 45) preset(&c, 5, 0);
+    }
+    return c;
+}
+
+/* With effects, a frame whose colours changed but not its shapes blends the new
+ * colours with what the effects kept: the same pixels as drawing them all again. */
+static void test_effects_recolor(void)
+{
+    static const struct { uint32_t w, h; int smooth, blend, rgba, fx; } cfgs[] = {
+        { 600, 432, 2, 1, 0, 1 },     /* the 2N pass */
+        { 900, 648, 4, 1, 1, 2 },
+        { 1200, 864, 4, 0, 0, 4 },    /* everything at maximum */
+        { 1200, 864, 10, 0, 0, 3 },
+    };
+    buf c = fade_cdg();
+    size_t packs = c.n / FA_CDG_PACK_BYTES;
+    unsigned ci;
+    int32_t blends = fa_cdg_test_blends();
+    for (ci = 0; ci < sizeof(cfgs) / sizeof(cfgs[0]); ci++) {
+        fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+        fa_cdg_surface *ref = NULL, *f = NULL;
+        fa_cdg_surface_config cfg;
+        fa_cdg_presentation p;
+        fa_surface_effects fx;
+        fa_surface_layout l;
+        fa_surface_frame fr;
+        uint8_t* mem[2];
+        uint64_t rev[2] = { 0, 0 };
+        size_t n, size;
+        uint32_t b, y;
+        fa_cdg_surface_config_init(&cfg);
+        if (cfgs[ci].rgba) cfg.pixel_format = FA_CDG_PIXELS_RGBA32;
+        CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+        CHECK_EQ(fa_cdg_surface_create(s, &cfg, &ref), FA_OK);
+        CHECK_EQ(fa_cdg_surface_create(s, &cfg, &f), FA_OK);
+        p = pres(1, FA_SAFETY_SHOW);
+        p.smoothness = cfgs[ci].smooth;
+        p.edge_blend = cfgs[ci].blend;
+        CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+        CHECK_EQ(fa_surface_set_presentation_size(f, cfgs[ci].w, cfgs[ci].h), FA_OK);
+        CHECK_EQ(fa_surface_set_presentation_size(ref, cfgs[ci].w, cfgs[ci].h), FA_OK);
+        if (cfgs[ci].fx == 4) {
+            fa_surface_effects_init(&fx);
+            fx.outline.on = fx.shadow.on = fx.bevel.on = 1;
+            fx.outline.size = fx.shadow.size = fx.shadow.distance = fx.bevel.size = fx.bevel.strength = 1.0f;
+            fx.shadow.fade = 1.0f;
+        } else {
+            fx = fx_set(cfgs[ci].fx);
+        }
+        CHECK_EQ(fa_surface_set_effects(f, &fx), FA_OK);
+        CHECK_EQ(fa_surface_set_effects(ref, &fx), FA_OK);
+        l = layout_of(f);
+        size = (size_t)l.width * 4 * l.height;
+        for (b = 0; b < 2; b++) mem[b] = (uint8_t*)calloc(1, size);
+        for (n = 0; n < packs; n++) {
+            fa_surface_layout lr;
+            uint8_t* want;
+            b = (uint32_t)(n % 2);
+            memset(&fr, 0, sizeof(fr));
+            fr.struct_size = sizeof(fr);
+            CHECK_EQ(fa_surface_update_into(f, t_packs((int64_t)n + 1), mem[b], (int32_t)(l.width * 4), l.width, l.height,
+                                            rev[b], &fr), FA_OK);
+            rev[b] = fr.revision;
+            if (n < packs - 70 && n % 5 != 0) continue;   /* the fades: every frame */
+            CHECK_EQ(fa_cdg_surface_set_presentation(ref, &p), FA_OK);
+            want = full_draw(ref, (int64_t)n + 1, 4, &lr);
+            CHECK(want);
+            for (y = 0; y < l.height; y++)
+                if (memcmp(mem[b] + (size_t)y * l.width * 4, want + (size_t)y * l.width * 4, l.width * 4) != 0) {
+                    printf("    config %u, pack %u, row %u\n", ci, (unsigned)n + 1, y);
+                    free(want);
+                    CHECK(!"blending new colours differs from drawing all");
+                }
+            free(want);
+        }
+        for (b = 0; b < 2; b++) free(mem[b]);
+        fa_surface_destroy(ref);
+        fa_surface_destroy(f);
+        fa_stream_close(s);
+    }
+    CHECK(fa_cdg_test_blends() > blends);
+    free(c.p);
+}
+
 /* At 1x the effects are worked out at 2x and box-filtered down: a bar 2 CD+G pixels
  * wide gets a bevel (at 1x itself half its width is under a pixel and there would be
  * none), a 1-pixel bar keeps its colour, and a 0.45-pixel outline covers about half
@@ -3809,6 +3915,7 @@ int main(void)
     RUN(test_effects);
     RUN(test_bevel_half_stroke);
     RUN(test_effects_small_sizes);
+    RUN(test_effects_recolor);
     RUN(test_presentation_incremental);
     RUN(test_render_ahead);
     RUN(test_presentation_costs);
