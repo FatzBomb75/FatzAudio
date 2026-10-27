@@ -59,7 +59,9 @@ typedef struct fa_http_request {
     uint32_t timeout_ms;     /* connect, and the longest wait for data */
     fa_atomic32* cancel;     /* nonzero = stop as soon as possible */
     fa_http_session* session;   /* NULL = connections of this request only */
-    int other_origin;        /* set by fa_http_fetch: a redirect left the first URL's origin */
+    const char* app_origin;  /* the app's Authorization and Cookie lines go only to this URL's
+                              * origin (the stream's URL); NULL = url's */
+    int other_origin;        /* set by fa_http_fetch: this hop is not on app_origin's origin */
 } fa_http_request;
 
 typedef struct fa_http_response {
@@ -78,7 +80,8 @@ typedef int (*fa_http_data_proc)(void* user, const uint8_t* data, size_t n);
 /* Blocking GET that streams the body to `on_data` on the calling thread, following
  * redirects (for every transport, so they all treat credentials alike: the URL's
  * user info goes along only to the first URL's scheme, host and port, and the app's
- * Authorization and Cookie lines are not sent anywhere else). FA_OK when the body ended cleanly or a callback stopped it;
+ * Authorization and Cookie lines only to app_origin's: a playlist entry or HLS
+ * segment on another server gets neither, like a redirect there). FA_OK when the body ended cleanly or a callback stopped it;
  * FA_ERROR_NETWORK for connection failures, timeouts and bodies cut short;
  * FA_ERROR_NOT_FOUND for HTTP 4xx/5xx (after on_head saw the status);
  * FA_ERROR_PROVIDER_MISSING when https has no transport on this system;
@@ -221,7 +224,9 @@ int fa_net_write(fa_net* n, const uint8_t* data, size_t size);
 int fa_net_wait(fa_net* n, uint32_t ms);
 /* Fills a request with the stream's settings. */
 void fa_net_request(fa_net* n, fa_http_request* req, const char* url);
-/* Downloads a small resource (a playlist, a key) into memory (NUL-terminated). */
+/* Downloads a small resource (a playlist, a key, an init section) into memory
+ * (NUL-terminated): `length` bytes from `offset`, or all of it when length is -1.
+ * A range the response doesn't hold in full is FA_ERROR_UNSUPPORTED_FORMAT. */
 fa_result fa_net_get_small(fa_net* n, const char* url, int64_t offset, int64_t length, char** out, size_t* out_len,
                            char* final_url, size_t final_cap);
 /* HLS seek: restarts the producer at the segment holding `seconds`; waits until it
@@ -295,6 +300,7 @@ typedef struct fa_hls_segment {
     uint8_t iv[16];
     int has_iv;
     char* map_uri;           /* EXT-X-MAP init section, NULL = none */
+    int64_t map_offset, map_length;     /* its BYTERANGE, length -1 = whole */
     int64_t byte_offset, byte_length;   /* EXT-X-BYTERANGE, length -1 = whole */
 } fa_hls_segment;
 

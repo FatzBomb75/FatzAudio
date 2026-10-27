@@ -7,7 +7,6 @@
 #import <CFNetwork/CFNetwork.h>
 #include "net.h"
 #include <pthread.h>
-#include <sys/time.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -184,13 +183,10 @@ int fa_net_system_proxy(const char* scheme, const char* host, char* out, size_t 
 
 static void timed_wait(FAFetchDelegate* d, int ms)
 {
-    struct timespec ts;
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    ts.tv_sec = tv.tv_sec + ms / 1000;
-    ts.tv_nsec = (long)tv.tv_usec * 1000 + (long)(ms % 1000) * 1000000L;
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-    pthread_cond_timedwait(&d->cond, &d->mutex, &ts);
+    struct timespec ts;   /* relative: a wall-clock step doesn't stretch the wait */
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    pthread_cond_timedwait_relative_np(&d->cond, &d->mutex, &ts);
 }
 
 /* fa_http_each_header's sink (ASCII only). addValue sets a header not set yet,

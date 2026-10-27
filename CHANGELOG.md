@@ -392,6 +392,18 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   - A WAVE disc image whose data chunk claims more than the file holds (a cut-off file, or one written as a stream with
     length 0xFFFFFFFF) gets its length from the file instead of hours of missing sectors.
   - ZIP: an entry claiming more than 4 GB unpacked returns `FA_ERROR_TOO_LARGE` instead of filling the temp directory.
+- Web streams (audit of 2026-10-27):
+  - Single-file fMP4 HLS (`#EXT-X-MAP:URI="main.mp4",BYTERANGE="720@0"`) plays. The init section's byte range was
+    ignored, so the whole file was fetched as the init section: over 2 MB the stream failed as unsupported, below it
+    the audio was garbled. A malformed `BYTERANGE` now refuses the playlist.
+  - Your `Authorization` and `Cookie` header lines are sent only to the stream URL's own server. A playlist (`.pls`,
+    `.m3u`, HLS) naming entries, segments or keys on another server used to send them there too, although a redirect
+    there already dropped them.
+  - Timed waits inside the library (download, encoder and queue polls) no longer stretch when the wall clock is set
+    back (NTP, the user changing the time): on Linux and Android they run on the monotonic clock, on Apple systems
+    they are relative. Windows already was.
+  - A seekable web file smaller than 4 MB gets a download buffer of its own size plus 64 KB instead of 4 MB
+    (16 short jingles: about 7 MB instead of 64 MB).
 - Looping a source whose length isn't known (a container without one, such as a FLAC written to an output that can't seek): the
   position now wraps and `FA_EVENT_LOOPED` is raised at each jump. Before, it looped where the decoder ended but the
   position ran on past the end and no event came. The end is taken as the length from the first jump on.

@@ -364,7 +364,8 @@ public sealed record NetworkOptions
 {
     /// <summary>The User-Agent header; null sends <c>FatzAudio/&lt;version&gt;</c>.</summary>
     public string? UserAgent { get; init; }
-    /// <summary>Extra request headers (cookies, authorization, ...), sent with every request including HLS segments.</summary>
+    /// <summary>Extra request headers (cookies, authorization, ...), sent with every request including HLS segments;
+    /// <c>Authorization</c> and <c>Cookie</c> only to the stream URL's own server (scheme, host and port).</summary>
     public IReadOnlyDictionary<string, string>? Headers { get; init; }
     /// <summary>
     /// Null uses the system's proxy setting (the http_proxy / https_proxy environment variables, and the

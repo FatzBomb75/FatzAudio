@@ -300,17 +300,17 @@ static int same_origin(const fa_url* a, const fa_url* b)
 /* The next hop of a redirect from the request for `first`: `target` (malloc'd,
  * absolute) with the user info of `first` when it goes back to that origin without
  * credentials of its own (an absolute Location on the same server). *out_other: the
- * hop leaves the first origin. Returns the URL to fetch (target, or a new string
+ * hop is not on `app`'s origin (where the app's Authorization and Cookie may go). Returns the URL to fetch (target, or a new string
  * replacing it), NULL when out of memory. */
-static char* next_hop(const fa_url* first, char* target, int* out_other)
+static char* next_hop(const fa_url* first, const fa_url* app, char* target, int* out_other)
 {
     fa_url t;
     char* with;
     const char* rest;
     size_t ln, lr;
     if (fa_url_parse(target, &t) != FA_OK) { *out_other = 1; return target; }   /* the transport rejects it */
-    *out_other = !same_origin(first, &t);
-    if (*out_other || t.userinfo[0] || !first->userinfo[0]) return target;
+    *out_other = !same_origin(app, &t);
+    if (!same_origin(first, &t) || t.userinfo[0] || !first->userinfo[0]) return target;
     rest = strstr(target, "://") + 3;
     ln = strlen(first->userinfo);
     lr = strlen(rest);
@@ -644,11 +644,13 @@ fa_result fa_http_fetch(const fa_http_request* req, fa_http_head_proc on_head, f
 {
     fa_http_request cur = *req;
     char* owned = NULL;
-    fa_url first;
+    fa_url first, app;
     int hops;
     fa_result r = FA_ERROR_NETWORK;
     if (fa_url_parse(req->url, &first) != FA_OK) return FA_ERROR_INVALID_ARG;
-    cur.other_origin = 0;
+    if (!req->app_origin) app = first;
+    else if (fa_url_parse(req->app_origin, &app) != FA_OK) memset(&app, 0, sizeof(app));   /* matches nothing */
+    cur.other_origin = !same_origin(&app, &first);
     for (hops = 0; hops <= FA_NET_MAX_REDIRECTS; hops++) {
         fa_url u;
         char* next = NULL;
@@ -657,7 +659,7 @@ fa_result fa_http_fetch(const fa_http_request* req, fa_http_head_proc on_head, f
         else r = fa_http_fetch_socket(&cur, on_head, on_data, user, &next);
         if (r != FA_OK || !next) { free(next); break; }
         if (cur.cancel && fa_load32(cur.cancel)) { free(next); r = FA_ERROR_BUSY; break; }
-        next = next_hop(&first, next, &cur.other_origin);
+        next = next_hop(&first, &app, next, &cur.other_origin);
         if (!next) { r = FA_ERROR_OUT_OF_MEMORY; break; }
         free(owned);
         owned = next;

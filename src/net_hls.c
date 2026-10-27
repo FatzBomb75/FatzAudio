@@ -4,6 +4,7 @@
  * file: it opens the format found in the segments (MP3, AAC, AC-3, fMP4, ...)
  * through the normal registry, and seeks on-demand playlists by segment. */
 #include "net.h"
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,6 +70,24 @@ static int parse_iv(const char* s, uint8_t iv[16])
     return 1;
 }
 
+/* "<n>[@<o>]" of an EXT-X-MAP BYTERANGE (o defaults to 0). 0 when malformed. */
+static int parse_range(const char* s, int64_t* len, int64_t* off)
+{
+    char* end;
+    long long n, o = 0;
+    if (*s < '0' || *s > '9') return 0;
+    n = strtoll(s, &end, 10);
+    if (*end == '@') {
+        const char* at = end + 1;
+        if (*at < '0' || *at > '9') return 0;
+        o = strtoll(at, &end, 10);
+    }
+    if (*end || n <= 0 || n == LLONG_MAX || o == LLONG_MAX || o > LLONG_MAX - n) return 0;
+    *len = n;
+    *off = o;
+    return 1;
+}
+
 void fa_hls_playlist_free(fa_hls_playlist* p)
 {
     int i;
@@ -99,6 +118,7 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
     char* codecs = NULL;
     char* key_uri = NULL;
     char* map_uri = NULL;
+    int64_t map_off = 0, map_len = -1;
     uint8_t iv[16];
     int64_t br_len = -1, br_off = 0, next_br_off = 0;
     int64_t seq;
@@ -178,8 +198,14 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
                 char v[FA_NET_URL_MAX];
                 free(map_uri);
                 map_uri = NULL;
+                map_off = 0;
+                map_len = -1;
                 if (attr(tmp + 11, "URI", v, sizeof(v)) && fa_url_resolve(base, v, resolved, sizeof(resolved)) == FA_OK)
                     map_uri = fa_strdup(resolved);
+                if (attr(tmp + 11, "BYTERANGE", v, sizeof(v)) && !parse_range(v, &map_len, &map_off)) {
+                    r = FA_ERROR_UNSUPPORTED_FORMAT;   /* the wrong bytes would garble every segment */
+                    break;
+                }
             }
             continue;
         }
@@ -231,6 +257,8 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
             s->has_iv = has_iv;
             memcpy(s->iv, iv, 16);
             s->map_uri = fa_strdup(map_uri);
+            s->map_offset = map_off;
+            s->map_length = map_len;
             s->byte_offset = br_len >= 0 ? br_off : 0;
             s->byte_length = br_len;
             if (br_len >= 0) next_br_off = br_off + br_len;
@@ -668,7 +696,8 @@ typedef struct hls_state {
     char key_uri[FA_NET_URL_MAX];
     uint8_t key[16];
     int have_key;
-    char map_uri[FA_NET_URL_MAX];
+    char map_uri[FA_NET_URL_MAX];   /* the init section in the window, "" = none */
+    int64_t map_offset, map_length;
     int64_t next_seq;
     int ts_continuity;        /* keep the TS demuxer across segments of one timeline */
     fa_ts_demux ts;
@@ -720,15 +749,18 @@ static fa_result fetch_segment(fa_net* n, hls_state* h, const fa_hls_segment* se
         if (seg->has_iv) memcpy(sink.iv, seg->iv, 16);
         else { int i; for (i = 0; i < 8; i++) sink.iv[15 - i] = (uint8_t)((uint64_t)seg->seq >> (8 * i)); }
     }
-    if (seg->map_uri && strcmp(h->map_uri, seg->map_uri) != 0) {
+    if (seg->map_uri && (strcmp(h->map_uri, seg->map_uri) != 0 || h->map_offset != seg->map_offset ||
+                         h->map_length != seg->map_length)) {
         /* fMP4: the init section goes in front of the first media segment that uses it. */
         char* init = NULL;
         size_t ilen = 0;
-        r = fa_net_get_small(n, seg->map_uri, 0, -1, &init, &ilen, NULL, 0);
+        r = fa_net_get_small(n, seg->map_uri, seg->map_offset, seg->map_length, &init, &ilen, NULL, 0);
         if (r != FA_OK) return r;
         if (fa_net_write(n, (const uint8_t*)init, ilen)) { free(init); return FA_ERROR_BUSY; }
         free(init);
         snprintf(h->map_uri, sizeof(h->map_uri), "%s", seg->map_uri);
+        h->map_offset = seg->map_offset;
+        h->map_length = seg->map_length;
     }
     fa_net_request(n, &req, seg->uri);
     if (seg->byte_length >= 0) {

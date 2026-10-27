@@ -278,6 +278,36 @@ static void make_hls_ac3(void)
 
 /* ---- the HTTP server ---------------------------------------------------------- */
 
+/* Single-file HLS with an init section (EXT-X-MAP BYTERANGE): tone_cbr.mp3 behind
+ * MAP_PAD bytes of zeros. The map is its first frames, the segments the rest, all
+ * byte ranges of the one file. */
+#define MAP_PAD 4096
+#define MAP_SEGS 3
+static uint8_t* g_pad;
+static size_t g_pad_n;
+static size_t g_map_cut[MAP_SEGS + 2];   /* frame boundaries in g_mp3: map, segments, end */
+
+static void make_hls_map(void)
+{
+    size_t at = 0, frames = 0, total = 0, i, k = 1;
+    while (at + 4 <= g_mp3_n && mp3_frame_size(g_mp3 + at)) { at += mp3_frame_size(g_mp3 + at); total++; }
+    g_map_cut[0] = 0;
+    at = 0;
+    while (k <= MAP_SEGS && at + 4 <= g_mp3_n && mp3_frame_size(g_mp3 + at)) {
+        at += mp3_frame_size(g_mp3 + at);
+        frames++;
+        if (frames == (k == 1 ? 8 : 8 + (total - 8) * (k - 1) / MAP_SEGS)) g_map_cut[k++] = at;
+    }
+    for (i = k; i <= MAP_SEGS + 1; i++) g_map_cut[i] = g_mp3_n;
+    g_pad_n = MAP_PAD + g_mp3_n;
+    g_pad = (uint8_t*)calloc(1, g_pad_n);
+    memcpy(g_pad + MAP_PAD, g_mp3, g_mp3_n);
+}
+
+static char g_cred_playlist[2048];   /* /hls/cred.m3u8: segments on another origin (set by the test) */
+static fa_atomic32 g_cred_home;      /* requests to 127.0.0.1 with a Cookie or Authorization */
+static fa_atomic32 g_cred_foreign;   /* ... and to "localhost" */
+
 static sock_t g_listen = BAD_SOCK;
 static int g_port;
 static fa_thread g_accept_thread;
@@ -407,6 +437,28 @@ static void serve_hls(sock_t s, const char* req, const char* path)
         if (!send_str(s, head)) send_str(s, text);
         return;
     }
+    if (strcmp(path, "/hls/map.m3u8") == 0 || strcmp(path, "/hls/map-nr.m3u8") == 0) {
+        /* nr: on a server that ignores Range. */
+        const char* file = path[9] == '-' ? "padded-nr.mp3" : "padded.mp3";
+        int n = snprintf(text, sizeof(text), "#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:2\n"
+                         "#EXT-X-MAP:URI=\"%s\",BYTERANGE=\"%zu@%d\"\n", file, g_map_cut[1], MAP_PAD);
+        for (i = 1; i <= MAP_SEGS; i++)
+            n += snprintf(text + n, sizeof(text) - (size_t)n, "#EXT-X-BYTERANGE:%zu@%zu\n#EXTINF:1.0,\n%s\n",
+                          g_map_cut[i + 1] - g_map_cut[i], MAP_PAD + g_map_cut[i], file);
+        snprintf(text + n, sizeof(text) - (size_t)n, "#EXT-X-ENDLIST\n");
+        snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(text));
+        if (!send_str(s, head)) send_str(s, text);
+        return;
+    }
+    if (strcmp(path, "/hls/padded.mp3") == 0 || strcmp(path, "/hls/padded-nr.mp3") == 0) {
+        serve_bytes(s, req, g_pad, g_pad_n, "audio/mpeg", path[11] != '-', 0);
+        return;
+    }
+    if (strcmp(path, "/hls/cred.m3u8") == 0) {
+        snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(g_cred_playlist));
+        if (!send_str(s, head)) send_str(s, g_cred_playlist);
+        return;
+    }
     if (strcmp(path, "/hls/all0.ts") == 0) {
         size_t total = 0;
         for (i = 0; i < HLS_SEGS; i++) total += g_seg[i].n;
@@ -510,6 +562,8 @@ static int handle_request(sock_t s, int id)
     {
         const char* ua = strstr(req, "\r\nUser-Agent: ");
         if (ua) { ua += 14; snprintf(g_last_agent, sizeof(g_last_agent), "%.*s", (int)strcspn(ua, "\r\n"), ua); }
+        if (strstr(req, "\r\nCookie:") || strstr(req, "\r\nAuthorization:"))
+            fa_fetch_add32(strstr(req, "\r\nHost: localhost") ? &g_cred_foreign : &g_cred_home, 1);
     }
     if (strcmp(path, "/echo-headers") == 0 || strcmp(path, "/keep-echo") == 0) {
         /* The request's header lines as the body (as tools/test-https/serve.py does).
@@ -802,6 +856,25 @@ static void test_hls_parse(void)
     CHECK_EQ(p.segments[2].key_method, 0);
     CHECK(fabs(p.segments[1].duration - 5.5) < 1e-9);
     fa_hls_playlist_free(&p);
+    /* EXT-X-MAP with a BYTERANGE (offset 0 when left out); a malformed one is refused. */
+    {
+        const char* fmp4 = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXT-X-MAP:URI=\"main.mp4\",BYTERANGE=\"720@16\"\n"
+                           "#EXT-X-BYTERANGE:5000@736\n#EXTINF:6.0,\nmain.mp4\n"
+                           "#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"64\"\n#EXTINF:6.0,\nb.m4s\n"
+                           "#EXT-X-MAP:URI=\"whole.mp4\"\n#EXTINF:6.0,\nc.m4s\n#EXT-X-ENDLIST\n";
+        const char* bad = "#EXTM3U\n#EXT-X-MAP:URI=\"main.mp4\",BYTERANGE=\"720@x\"\n#EXTINF:6.0,\nmain.mp4\n#EXT-X-ENDLIST\n";
+        CHECK_EQ(fa_hls_parse(fmp4, strlen(fmp4), "http://h.com/m/a.m3u8", &p), FA_OK);
+        CHECK_EQ(p.segment_count, 3);
+        CHECK_STR(p.segments[0].map_uri, "http://h.com/m/main.mp4");
+        CHECK_EQ(p.segments[0].map_offset, 16);
+        CHECK_EQ(p.segments[0].map_length, 720);
+        CHECK_EQ(p.segments[0].byte_offset, 736);
+        CHECK_EQ(p.segments[1].map_offset, 0);
+        CHECK_EQ(p.segments[1].map_length, 64);
+        CHECK_EQ(p.segments[2].map_length, -1);
+        fa_hls_playlist_free(&p);
+        CHECK_EQ(fa_hls_parse(bad, strlen(bad), "http://h.com/m/a.m3u8", &p), FA_ERROR_UNSUPPORTED_FORMAT);
+    }
     /* SAMPLE-AES and DRM key formats are protected content. */
     {
         const char* drm = "#EXTM3U\n#EXT-X-TARGETDURATION:6\n"
@@ -2302,6 +2375,148 @@ static void test_hls_retry_and_byteranges(void)
     free(ref);
 }
 
+/* Single-file fMP4-style HLS: the EXT-X-MAP init section is a byte range of the
+ * file the segments are ranges of. Only that range goes in front of the first
+ * segment (it used to be the whole file), also from a server that ignores Range. */
+static void test_hls_map_byterange(void)
+{
+    static const char* const paths[] = { "/hls/map.m3u8", "/hls/map-nr.m3u8" };
+    fa_frames ref_n = 0;
+    float* ref = read_all_memory(g_mp3, g_mp3_n, &ref_n);
+    size_t p;
+    CHECK(ref != NULL);
+    for (p = 0; p < 2; p++) {
+        fa_result r;
+        fa_stream* s = open_url(paths[p], FA_OPEN_DECODE_ONLY, &r);
+        fa_frames n = 0, i;
+        float* got;
+        double err = 0;
+        CHECK_EQ(r, FA_OK);
+        if (!s) continue;
+        got = read_all(s, &n);
+        printf("  %s: %lld frames (file %lld)\n", paths[p], (long long)n, (long long)ref_n);
+        CHECK(llabs((long long)n - (long long)ref_n) <= 1152);
+        for (i = 0; i < n * 2 && i < ref_n * 2; i++) err += fabs(got[i] - ref[i]);
+        CHECK(err / (double)(n * 2 + 1) < 1e-6);
+        free(got);
+        fa_stream_close(s);
+    }
+    free(ref);
+}
+
+/* The parts of the download buffer a playlist and an init section use: a byte
+ * range from either kind of server, and a window no bigger than a small file. */
+static void test_net_small_range_and_window(void)
+{
+    char url[256];
+    fa_net_config cfg;
+    fa_net* n = NULL;
+    char* data = NULL;
+    size_t len = 0;
+    memset(&cfg, 0, sizeof(cfg));
+    url_of(url, sizeof(url), "/tone.wav");
+    cfg.url = fa_strdup(url);
+    cfg.proxy = fa_strdup("");
+    cfg.timeout_ms = 3000;
+    cfg.prebuffer_ms = 100;
+    cfg.reconnect_ms = 1000;
+    CHECK_EQ(fa_net_open(&cfg, &n), FA_OK);
+    if (!n) return;
+    fa_mutex_lock(&n->lock);
+    CHECK_EQ(n->cap, (int64_t)g_wav_n + 65536);   /* not 4 MiB for a 345 KB file */
+    fa_mutex_unlock(&n->lock);
+    {
+        fa_io_callbacks io;
+        uint8_t* all = (uint8_t*)malloc(g_wav_n + 16);
+        size_t got = 0;
+        int64_t k;
+        fa_net_io(n, &io);
+        while ((k = io.read(n, all + got, g_wav_n + 16 - got)) > 0) got += (size_t)k;
+        CHECK_EQ(got, g_wav_n);
+        CHECK(memcmp(all, g_wav, g_wav_n) == 0);
+        free(all);
+    }
+    url_of(url, sizeof(url), "/hls/padded.mp3");
+    CHECK_EQ(fa_net_get_small(n, url, MAP_PAD + 100, 720, &data, &len, NULL, 0), FA_OK);
+    CHECK_EQ(len, 720);
+    CHECK(data && memcmp(data, g_mp3 + 100, 720) == 0);
+    free(data);
+    url_of(url, sizeof(url), "/hls/padded-nr.mp3");
+    CHECK_EQ(fa_net_get_small(n, url, MAP_PAD + 100, 720, &data, &len, NULL, 0), FA_OK);
+    CHECK_EQ(len, 720);
+    CHECK(data && memcmp(data, g_mp3 + 100, 720) == 0);
+    free(data);
+    /* A range past the end is never handed on short. */
+    CHECK_EQ(fa_net_get_small(n, url, (int64_t)g_pad_n - 10, 720, &data, &len, NULL, 0), FA_ERROR_UNSUPPORTED_FORMAT);
+    CHECK(data == NULL);
+    fa_net_close(n);
+}
+
+/* The app's Cookie and Authorization go to the stream's own server only: segments
+ * a playlist names on another origin don't get them (as after a redirect there). */
+static void test_playlist_credentials(void)
+{
+    char url[256];
+    fa_open_options o;
+    fa_net_options net;
+    fa_stream* s = NULL;
+    fa_result r;
+    int i, n;
+    n = snprintf(g_cred_playlist, sizeof(g_cred_playlist), "#EXTM3U\n#EXT-X-TARGETDURATION:2\n");
+    for (i = 0; i < HLS_SEGS; i++)
+        n += snprintf(g_cred_playlist + n, sizeof(g_cred_playlist) - (size_t)n, "#EXTINF:%.5f,\n%s://localhost:%d/hls/seg%d.ts\n",
+                      g_seg_dur[i], g_scheme, g_url_port, i);
+    snprintf(g_cred_playlist + n, sizeof(g_cred_playlist) - (size_t)n, "#EXT-X-ENDLIST\n");
+    fa_store32(&g_cred_home, 0);
+    fa_store32(&g_cred_foreign, 0);
+    url_of(url, sizeof(url), "/hls/cred.m3u8");
+    fa_open_options_init(&o);
+    fa_net_options_init(&net);
+    net.timeout_ms = 3000;
+    net.proxy = "";
+    net.headers = "Cookie: a=b\r\nAuthorization: Bearer t";
+    o.flags = FA_OPEN_DECODE_ONLY;
+    o.net = &net;
+    r = fa_stream_open_url(g_engine, url, &o, &s);
+    CHECK_EQ(r, FA_OK);
+    if (s) {
+        fa_frames got = 0;
+        float* buf = read_all(s, &got);
+        CHECK(got > 44100);
+        free(buf);
+        fa_stream_close(s);
+    }
+    CHECK(fa_load32(&g_cred_home) >= 1);   /* the playlist itself */
+    CHECK_EQ(fa_load32(&g_cred_foreign), 0);
+
+    /* The same rule one level down: app_origin names the origin they may go to. */
+    {
+        fa_http_request req;
+        conn_fetch c;
+        memset(&c, 0, sizeof(c));
+        memset(&req, 0, sizeof(req));
+        snprintf(url, sizeof(url), "%s://localhost:%d/echo-headers", g_scheme, g_url_port);
+        req.url = url;
+        req.range_start = -1;
+        req.proxy = "";
+        req.timeout_ms = 3000;
+        req.headers = "Cookie: a=b\r\nX-Keep: 1";
+        req.cancel = &c.cancel;
+        req.app_origin = "http://127.0.0.1:1/stream.m3u8";
+        CHECK_EQ(fa_http_fetch(&req, cf_head, cf_data, &c), FA_OK);
+        CHECK(c.body.p != NULL);
+        CHECK_EQ(count_header(c.body.p, "Cookie", NULL, 0), 0);
+        CHECK_EQ(count_header(c.body.p, "X-Keep", NULL, 0), 1);
+        free(c.body.p);
+        memset(&c, 0, sizeof(c));
+        req.app_origin = url;
+        CHECK_EQ(fa_http_fetch(&req, cf_head, cf_data, &c), FA_OK);
+        CHECK(c.body.p != NULL);
+        CHECK_EQ(count_header(c.body.p, "Cookie", NULL, 0), 1);
+        free(c.body.p);
+    }
+}
+
 /* A file whose connection dropped with reconnecting off: what arrived plays and
  * the stream ends; a later seek past it connects again. */
 static void test_seek_after_giving_up(void)
@@ -2444,6 +2659,7 @@ int main(void)
     make_hls();
     make_hls_aac();
     make_hls_ac3();
+    make_hls_map();
     g_aac_tagged_n = 30000 + g_aac_n;
     g_aac_tagged = (uint8_t*)calloc(1, g_aac_tagged_n);
     memcpy(g_aac_tagged, "ID3\x04\x00\x00", 6);   /* size 29990 (syncsafe), all padding */
@@ -2484,6 +2700,9 @@ int main(void)
     RUN(test_hls_vod);
     RUN(test_hls_ac3);
     RUN(test_hls_retry_and_byteranges);
+    RUN(test_hls_map_byterange);
+    RUN(test_net_small_range_and_window);
+    RUN(test_playlist_credentials);
     RUN(test_aac_over_http);
     RUN(test_aac_radio);
     RUN(test_asf_over_http);
@@ -2511,6 +2730,7 @@ int main(void)
     free(g_oggradio);
     free(g_mp3);
     free(g_mp3x);
+    free(g_pad);
     free(g_aac);
     free(g_aac_tagged);
     free(g_wma);

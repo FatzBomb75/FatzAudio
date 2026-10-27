@@ -246,8 +246,21 @@ void fa_mutex_unlock(fa_mutex* m) { pthread_mutex_unlock((pthread_mutex_t*)m->im
 int fa_cond_init(fa_cond* c)
 {
     pthread_cond_t* cv = (pthread_cond_t*)malloc(sizeof(pthread_cond_t));
+    int ok;
     if (!cv) return -1;
-    if (pthread_cond_init(cv, NULL) != 0) { free(cv); return -1; }
+#  if defined(__APPLE__)
+    ok = pthread_cond_init(cv, NULL) == 0;   /* timed waits are relative there */
+#  else
+    {
+        /* Timed waits run on the monotonic clock: a wall-clock step (NTP, the user
+         * setting the time) must not stretch a 5 ms poll into seconds. */
+        pthread_condattr_t a;
+        if (pthread_condattr_init(&a) != 0) { free(cv); return -1; }
+        ok = pthread_condattr_setclock(&a, CLOCK_MONOTONIC) == 0 && pthread_cond_init(cv, &a) == 0;
+        pthread_condattr_destroy(&a);
+    }
+#  endif
+    if (!ok) { free(cv); return -1; }
     c->impl = cv;
     return 0;
 }
@@ -260,18 +273,23 @@ void fa_cond_destroy(fa_cond* c)
 }
 void fa_cond_wait_ms(fa_cond* c, fa_mutex* m, uint32_t timeout_ms)
 {
-    /* Wall-clock deadline: a clock jump only causes an early or late wakeup,
-     * which every caller tolerates (they all re-check state in a loop). */
+    /* Never on the wall clock (see fa_cond_init); callers re-check state in a loop. */
     struct timespec ts;
     if (timeout_ms == UINT32_MAX) {   /* until woken, as INFINITE on Windows */
         pthread_cond_wait((pthread_cond_t*)c->impl, (pthread_mutex_t*)m->impl);
         return;
     }
-    clock_gettime(CLOCK_REALTIME, &ts);
+#  if defined(__APPLE__)
+    ts.tv_sec = timeout_ms / 1000;
+    ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
+    pthread_cond_timedwait_relative_np((pthread_cond_t*)c->impl, (pthread_mutex_t*)m->impl, &ts);
+#  else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     ts.tv_sec += timeout_ms / 1000;
     ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
     pthread_cond_timedwait((pthread_cond_t*)c->impl, (pthread_mutex_t*)m->impl, &ts);
+#  endif
 }
 void fa_cond_broadcast(fa_cond* c) { pthread_cond_broadcast((pthread_cond_t*)c->impl); }
 void fa_cond_signal(fa_cond* c) { pthread_cond_signal((pthread_cond_t*)c->impl); }

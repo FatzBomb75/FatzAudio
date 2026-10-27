@@ -143,7 +143,7 @@ A URL that isn't an absolute http or https URL throws `ArgumentException`. Other
 
 ## Buffering, stalls and reconnects
 
-- The download thread keeps up to 4 MB per stream, at most 2 MB ahead of playback. A stream that can't seek (radio, HLS, a server without byte ranges) keeps only the part ahead, about 2 MB. Radio that states its bitrate (`icy-br`) keeps less: twice `prebuffer_ms` plus 5 s of audio, at least 256 KB (a 128 kbps station with the default prebuffer: 256 KB). A station whose `icy-br` is too low gets a shorter prebuffer than asked, at most 3/4 of that window. Decoding only starts on data that's already downloaded, so neither the audio thread nor the decode workers ever wait for the network.
+- The download thread keeps up to 4 MB per stream, at most 2 MB ahead of playback; a seekable file smaller than that gets a buffer of its size plus 64 KB. A stream that can't seek (radio, HLS, a server without byte ranges) keeps only the part ahead, about 2 MB. Radio that states its bitrate (`icy-br`) keeps less: twice `prebuffer_ms` plus 5 s of audio, at least 256 KB (a 128 kbps station with the default prebuffer: 256 KB). A station whose `icy-br` is too low gets a shorter prebuffer than asked, at most 3/4 of that window. Decoding only starts on data that's already downloaded, so neither the audio thread nor the decode workers ever wait for the network.
 - After `fa_stream_play` the stream stays silent, in `FA_STATE_BUFFERING`, until `prebuffer_ms` of audio are in, then plays. No event is raised for that first fill.
 - When the network can't keep up and the buffer runs dry, the stream goes to `FA_STATE_BUFFERING` and raises `FA_EVENT_STALLED`. Once `prebuffer_ms` are buffered again it plays on from where it stopped and raises `FA_EVENT_RESUMED`. Pause, stop and seek work in either state.
 - A dropped connection is re-established by itself, with waits growing from 250 ms to 4 s, for up to `reconnect_ms`. A file continues at the byte where it stopped (with a Range request; if the server ignores ranges, the bytes already played are skipped). Radio picks up the live stream. If reconnecting fails for that long, the stream plays what it has and ends with `FA_EVENT_ENDED`.
@@ -173,7 +173,7 @@ Ogg radio (Opus or Vorbis) has no ICY titles: every song starts a new Ogg link w
 
 - **Variant choice:** the highest bandwidth up to `hls_max_bandwidth`, audio-only variants first. A playlist with a separate audio rendition (`EXT-X-MEDIA TYPE=AUDIO`) plays that rendition, the default one first.
 - **Live:** starts three segments from the end, as players usually do, and reloads the playlist every half target duration.
-- **Segments:** MPEG-TS (the audio track is taken out of the transport stream), fMP4 with `EXT-X-MAP`, and packed audio (ID3 timestamps skipped). `EXT-X-BYTERANGE` and `EXT-X-KEY METHOD=AES-128` (keys fetched once and cached) are supported; SAMPLE-AES (DRM) isn't and returns `FA_ERROR_PROTECTED_CONTENT`.
+- **Segments:** MPEG-TS (the audio track is taken out of the transport stream), fMP4 with `EXT-X-MAP` (also a `BYTERANGE` of it, as single-file fMP4 playlists use; only that range is fetched), and packed audio (ID3 timestamps skipped). `EXT-X-BYTERANGE` and `EXT-X-KEY METHOD=AES-128` (keys fetched once and cached) are supported; SAMPLE-AES (DRM) isn't and returns `FA_ERROR_PROTECTED_CONTENT`.
 - `fa_stream_get_info` reports container `hls` and the codec of the segments. On-demand playlists have an exact length from the `EXTINF` durations.
 
 ## With the rest of the engine
@@ -212,8 +212,10 @@ FatzAudio follows redirects itself, up to 8, the same way on every platform and 
 
 - The URL's own credentials (`https://user:password@host/...`) are sent to the URL's own origin (scheme, host and
   port) only. A redirect to the same server keeps them; a redirect to another one doesn't send them.
-- Your `Authorization` and `Cookie` header lines are likewise sent to the first URL's origin only. Every other line
-  of yours goes to every hop.
+- Your `Authorization` and `Cookie` header lines are likewise sent to the stream URL's origin only: not after a
+  redirect to another server, and not to entries, HLS playlists, segments or keys a playlist names on another
+  server. Every other line of yours goes to every request. If a CDN host behind your playlist needs a token, put it
+  in the segment URLs (as signed URLs do) or in a header line of another name.
 - Cookies a server sets are not kept, on any platform: if a server needs one back, send it in `headers`.
 
 ### Request headers
