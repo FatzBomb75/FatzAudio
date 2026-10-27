@@ -224,6 +224,15 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   its worst frame 530 to 120 ms (four cores); a colour change at 2160p costs the picture's redraw plus a blend instead
   of 115-280 ms. What is kept costs memory with effects on: 5 bytes per output pixel with outline and shadow, 9 with
   the bevel (about 32 or 58 MB at 2160p). See [CD+G presentation options](docs/features/cdg.md#presentation-options-fa_cdg_surface_set_presentation).
+- CD+G presentation scaling: a change of colours (a new colour table, a fade over several frames) redraws only what is
+  drawn in the colours that changed, as far as smoothing and edge blend reach (the background is transparent whatever
+  its colour, so a fade leaves it alone), and a large redraw of the picture is shared with the engine's idle workers in
+  bands of rows. The same pixels. A fade frame of six lines of lyrics at 2160p with smoothness 4 and edge blend: 11.7 to
+  5.4 ms, with every effect 21.9 to 9.7 ms; a full 2160p redraw at smoothness 4 with edge blend 10.4 to 5.8 ms. On
+  64-bit ARM the effects' distance field, stroke widths and blend use NEON, with the same pixels as SSE2 on x86 and the
+  plain C build; `surface_fx.c`, `cdg_scale.c` and `cdg_contour.c` are built without fused multiply-adds
+  (`-ffp-contract=off`), so ARM and x86 with FMA give the same pixels too. See
+  [CD+G presentation options](docs/features/cdg.md#presentation-options-fa_cdg_surface_set_presentation).
 - Web streams: the requests of one stream share their connections (curl, WinHTTP, URLSession; Android's
   `HttpURLConnection` pools by itself), so an `https://` HLS start makes one TLS handshake instead of one per playlist,
   key and segment: with a 100 ms round trip the first audio comes about 0.5 s sooner. HLS byte-range segments ask for

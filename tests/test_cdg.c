@@ -2814,6 +2814,72 @@ static void test_effects_recolor(void)
     free(c.p);
 }
 
+/* With presentation scaling a colour change redraws only what is drawn in the colours
+ * that changed (and what they reach), and one not on the screen redraws nothing; the
+ * pixels stay those of a full draw. */
+static void test_colour_change_partial(void)
+{
+    uint8_t pal[8][3];
+    buf c = { 0 };
+    fa_stream* s = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface *f = NULL, *ref = NULL;
+    fa_cdg_presentation p = pres(1, FA_SAFETY_SHOW);
+    fa_surface_layout l, lr;
+    fa_surface_frame fr;
+    uint8_t *mem, *want;
+    int32_t stride;
+    int k;
+    memcpy(pal, k_low, sizeof(pal));
+    colors(&c, 0, k_low);
+    preset(&c, 0, 0);
+    tile(&c, 0, 0, 1, 4, 5, 0x1E);    /* red, on the left */
+    tile(&c, 0, 0, 2, 12, 40, 0x33);  /* green, on the right */
+    pal[1][1] = 9;                    /* pack 5: red becomes orange */
+    colors(&c, 0, (const uint8_t(*)[3])pal);
+    pal[7][2] = 15;                   /* pack 6: a colour nothing is drawn in */
+    colors(&c, 0, (const uint8_t(*)[3])pal);
+    CHECK_EQ(fa_stream_load_cdg_memory(s, c.p, c.n), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
+    CHECK_EQ(fa_cdg_surface_create(s, NULL, &ref), FA_OK);
+    p.smoothness = 4;
+    p.edge_blend = 1;
+    CHECK_EQ(fa_cdg_surface_set_presentation(f, &p), FA_OK);
+    CHECK_EQ(fa_cdg_surface_set_presentation(ref, &p), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(f, 600, 432), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(ref, 600, 432), FA_OK);
+    l = layout_of(f);
+    stride = (int32_t)(l.width * 4);
+    mem = (uint8_t*)calloc((size_t)stride, l.height);
+    CHECK(mem);
+    memset(&fr, 0, sizeof(fr));
+    fr.struct_size = sizeof(fr);
+    CHECK_EQ(fa_surface_update_into(f, t_packs(4), mem, stride, l.width, l.height, 0, &fr), FA_OK);
+    for (k = 5; k <= 6; k++) {
+        uint64_t rev = fr.revision;
+        memset(&fr, 0, sizeof(fr));
+        fr.struct_size = sizeof(fr);
+        CHECK_EQ(fa_surface_update_into(f, t_packs(k), mem, stride, l.width, l.height, rev, &fr), FA_OK);
+        if (k == 5) {
+            /* Around the red tile (screen x 30..36, y 48..60, at 2x), not the green one. */
+            CHECK(fr.dirty_count > 0);
+            CHECK(fr.dirty_bounds.x + fr.dirty_bounds.width <= l.content_x + 2 * 60);
+            CHECK(fr.dirty_bounds.y + fr.dirty_bounds.height <= l.content_y + 2 * 80);
+        } else {
+            CHECK_EQ(fr.dirty_count, 0);
+            CHECK_EQ(fr.revision, rev);
+        }
+        want = full_draw(ref, k, 4, &lr);
+        CHECK(want);
+        CHECK(memcmp(mem, want, (size_t)stride * l.height) == 0);
+        free(want);
+    }
+    free(mem);
+    fa_surface_destroy(ref);
+    fa_surface_destroy(f);
+    fa_stream_close(s);
+    free(c.p);
+}
+
 /* At 1x the effects are worked out at 2x and box-filtered down: a bar 2 CD+G pixels
  * wide gets a bevel (at 1x itself half its width is under a pixel and there would be
  * none), a 1-pixel bar keeps its colour, and a 0.45-pixel outline covers about half
@@ -3916,6 +3982,7 @@ int main(void)
     RUN(test_bevel_half_stroke);
     RUN(test_effects_small_sizes);
     RUN(test_effects_recolor);
+    RUN(test_colour_change_partial);
     RUN(test_presentation_incremental);
     RUN(test_render_ahead);
     RUN(test_presentation_costs);

@@ -204,6 +204,8 @@ struct fa_cdg_surface {
     fa_engine* eng;               /* the stream's, set by sync_state */
     void* fx_help[CDG_FX_HELPERS];
     size_t fx_help_size[CDG_FX_HELPERS];
+    uint16_t* rows_help[CDG_FX_HELPERS]; /* ... and to draw the master (scale_draw) */
+    size_t rows_help_size[CDG_FX_HELPERS];
     /* At N 1-3 the effects are worked out at 2N and box-filtered down (plan 3.3): m2
      * is the master drawn at 2N (by sc2), f2 its effects. */
     int x2;
@@ -1298,6 +1300,112 @@ static void fx_recolor(fa_cdg_surface* f, const fa_fx_plan* plan, const fa_rects
     fx_blend_all(&j, count, px, rc, done, e);
 }
 
+/* The colours changed from those the master was drawn with: the master pixels drawn
+ * from a screen pixel whose colour changed, a band of tile rows at a time, its
+ * columns that have one in runs (gaps of up to a tile joined). The background is
+ * transparent whatever its colour, so a fade redraws only what is on it. */
+static void recolor_mark(const fa_cdg_surface* f, const uint8_t pm[CDG_SCALE_COLORS][4], int tb, fa_rects* m)
+{
+    uint8_t changed[CDG_SCALE_COLORS];
+    int i, x, y, y0, xa = tb ? CDG_BORDER_X : 0, xb = tb ? FA_CDG_WIDTH - CDG_BORDER_X : FA_CDG_WIDTH;
+    for (i = 0; i < CDG_SCALE_COLORS; i++) changed[i] = (uint8_t)(memcmp(pm[i], f->master_pm[i], 4) != 0);
+    for (y0 = 0; y0 < FA_CDG_HEIGHT; y0 += CDG_TILE_H) {
+        uint8_t col[FA_CDG_WIDTH];
+        int ya = FA_CDG_HEIGHT, yb = 0, start = -1, last = 0;
+        memset(col, 0, sizeof(col));
+        for (y = y0; y < y0 + CDG_TILE_H; y++) {
+            const uint8_t* row = f->st.screen[y];
+            int any = 0;
+            /* A transparent border is drawn as 16, which never changes. */
+            if (tb && (y < CDG_BORDER_Y || y >= FA_CDG_HEIGHT - CDG_BORDER_Y)) continue;
+            for (x = xa; x < xb; x++)
+                if (changed[row[x]]) col[x] = any = 1;
+            if (any && y < ya) ya = y;
+            if (any) yb = y + 1;
+        }
+        if (ya >= yb) continue;
+        for (x = xa; x < xb; x++) {
+            if (!col[x]) continue;
+            if (start >= 0 && x - last > CDG_TILE_W) {
+                master_mark(f, m, start, ya, last + 1, yb);
+                start = -1;
+            }
+            if (start < 0) start = x;
+            last = x;
+        }
+        if (start >= 0) master_mark(f, m, start, ya, last + 1, yb);
+    }
+}
+
+/* Drawing master rectangles with `sc`, on this thread and idle engine workers at
+ * once (fa_engine_parallel) when there is enough: in bands of screen rows, each with
+ * scratch rows of its own. A band writes only its own pixels and draws them as the
+ * whole rectangle would (cdg_scale_rect reads its neighbours from the screen). */
+typedef struct scale_job {
+    fa_cdg_surface* f;
+    const cdg_scaler* sc;
+    const uint8_t (*pm)[4];
+    uint8_t* out;
+    size_t stride;
+    int (*piece)[4];
+    uint16_t* rows[1 + CDG_FX_HELPERS];
+} scale_job;
+
+static void scale_piece(void* ctx, int item, int slot)
+{
+    scale_job* j = (scale_job*)ctx;
+    const int* r = j->piece[item];
+    cdg_scale_rect(j->sc, (const uint8_t(*)[CDG_SCALE_W])j->f->eidx, j->pm, j->out, j->stride, j->f->mx0, j->f->my0, r[0],
+                   r[1], r[2], r[3], j->rows[slot]);
+}
+
+static void scale_draw(fa_cdg_surface* f, const cdg_scaler* sc, const uint8_t pm[CDG_SCALE_COLORS][4], uint8_t* out,
+                       size_t stride, uint16_t* rows, const fa_rects* m)
+{
+    int piece[CDG_FX_PIECES][4], i, y, count = 0, slots = 0, n = (int)sc->n, band = FA_CDG_HEIGHT;
+    int64_t px = 0;
+    size_t need = CDG_SCALE_ROWS_BYTES(sc->n);
+    scale_job j;
+    fa_par_job pj;
+    memset(&j, 0, sizeof(j));
+    memset(&pj, 0, sizeof(pj));
+    for (i = 0; i < m->n; i++) px += (int64_t)(m->r[i][2] - m->r[i][0]) * (m->r[i][3] - m->r[i][1]) * n * n;
+    if (f->eng && f->eng->worker_count && px >= CDG_FX_SHARE) {
+        int want = (int)f->eng->worker_count < CDG_FX_HELPERS ? (int)f->eng->worker_count : CDG_FX_HELPERS;
+        for (; slots < want; slots++) {
+            if (f->rows_help_size[slots] < need) {
+                free(f->rows_help[slots]);
+                f->rows_help[slots] = (uint16_t*)malloc(need);
+                f->rows_help_size[slots] = f->rows_help[slots] ? need : 0;
+                if (!f->rows_help[slots]) break;
+            }
+            j.rows[1 + slots] = f->rows_help[slots];
+        }
+        if (slots) band = CDG_TILE_H;
+    }
+    j.f = f;
+    j.sc = sc;
+    j.pm = pm;
+    j.out = out;
+    j.stride = stride;
+    j.piece = piece;
+    j.rows[0] = rows;
+    pj.run = scale_piece;
+    pj.ctx = &j;
+    pj.slots = slots;
+    /* At most FA_SURFACE_MAX_DIRTY rectangles of FA_CDG_HEIGHT / CDG_TILE_H bands. */
+    for (i = 0; i < m->n; i++)
+        for (y = m->r[i][1]; y < m->r[i][3] && count < CDG_FX_PIECES; y += band) {
+            piece[count][0] = m->r[i][0];
+            piece[count][1] = y;
+            piece[count][2] = m->r[i][2];
+            piece[count][3] = y + band < m->r[i][3] ? y + band : m->r[i][3];
+            count++;
+        }
+    pj.count = count;
+    fa_engine_parallel(f->eng, &pj);
+}
+
 /* advance() with presentation scaling: the master is brought up to the decoder state
  * (moved for scrolls, the changed areas and what they reach drawn again) and `area`
  * gets the buffer pixels that changed. */
@@ -1312,10 +1420,10 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
     /* The effects see the crop, or with smooth-scroll offsets everything they can show. */
     int wide = st->hoff || st->voff;
     scaled_palette(f, pal, pm);
-    full = !f->drawn || memcmp(pm, f->master_pm, sizeof(pm)) != 0 || abs(st->shift_x) >= f->mw ||
-           abs(st->shift_y) >= f->mh || fx != f->fx_on || (fx && wide != f->fx_wide);
+    full = !f->drawn || abs(st->shift_x) >= f->mw || abs(st->shift_y) >= f->mh || fx != f->fx_on ||
+           (fx && wide != f->fx_wide);
     /* What the effects kept still holds unless they or the master were drawn afresh;
-     * a new palette alone (a full redraw) keeps it. */
+     * new colours alone keep it. */
     keep = fx && f->keep_ok && f->drawn && f->fx_on && wide == f->fx_wide && abs(st->shift_x) < f->mw &&
            abs(st->shift_y) < f->mh && memcmp(&plan, &f->keep_plan, sizeof(plan)) == 0;
     if (!keep) f->keep_ok = 0;
@@ -1331,6 +1439,8 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
          * the transparent pixels the move carried into the picture are drawn again. */
         if (tb != f->master_tb || (tb && moved)) mark_border(f, &m, 0, 0);
         if (f->master_tb && moved) mark_border(f, &m, st->shift_x, st->shift_y);
+        /* New colours: what is drawn from them. */
+        if (memcmp(pm, f->master_pm, sizeof(pm)) != 0) recolor_mark(f, pm, tb, &m);
     }
     if (m.n) {
         memcpy(f->eidx, st->screen, sizeof(f->eidx));
@@ -1350,10 +1460,8 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
             fa_rects_clear(&m);
             fa_rects_add(&m, f->mx0, f->my0, f->mx0 + f->mw, f->my0 + f->mh);
         }
-        for (i = 0; i < m.n; i++)
-            cdg_scale_rect(sc, (const uint8_t(*)[CDG_SCALE_W])f->eidx, (const uint8_t(*)[4])pm,
-                           sc == &f->sc2 ? f->m2 : f->master, sc == &f->sc2 ? f->m2_stride : f->master_stride, f->mx0,
-                           f->my0, m.r[i][0], m.r[i][1], m.r[i][2], m.r[i][3], sc == &f->sc2 ? f->rows2 : f->rows);
+        scale_draw(f, sc, (const uint8_t(*)[4])pm, sc == &f->sc2 ? f->m2 : f->master,
+                   sc == &f->sc2 ? f->m2_stride : f->master_stride, sc == &f->sc2 ? f->rows2 : f->rows, &m);
     }
     f->master_tb = tb;
     memcpy(f->master_pm, pm, sizeof(pm));
@@ -1714,6 +1822,7 @@ static void ra_free(fa_cdg_surface* f)
 
 static void free_maps(fa_cdg_surface* f)
 {
+    int i;
     ra_free(f);
     free(f->xmap);
     free(f->ymap);
@@ -1741,6 +1850,11 @@ static void free_maps(fa_cdg_surface* f)
     f->xlerp = f->ylerp = NULL;
     f->master = NULL;
     f->rows = NULL;
+    for (i = 0; i < CDG_FX_HELPERS; i++) {
+        free(f->rows_help[i]);
+        f->rows_help[i] = NULL;
+        f->rows_help_size[i] = 0;
+    }
 }
 
 /* Puts layout `l` in place when it differs from the one in use: new maps or master, a
