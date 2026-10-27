@@ -18,6 +18,9 @@ typedef struct fa_zip_entry {
 /* Compressed entries are unpacked into memory up to this size unless the engine
  * says otherwise (fa_engine_config.zip_memory_limit_mb). */
 #define FA_ZIP_DEFAULT_MEMORY_LIMIT ((uint64_t)256 << 20)
+/* The most unpacked into a temp file: a bigger entry (only a hostile archive
+ * claims one) returns FA_ERROR_TOO_LARGE before anything is written. */
+#define FA_ZIP_TEMP_LIMIT ((uint64_t)4 << 30)
 
 /* 1 when `data` starts like a ZIP archive. */
 int fa_zip_probe(const uint8_t* data, size_t size);
@@ -32,7 +35,8 @@ fa_result fa_zip_entry_offset(fa_source* src, const fa_zip_entry* e, int64_t* ou
  * it is bigger than max_size. */
 fa_result fa_zip_extract(fa_source* src, const fa_zip_entry* e, uint64_t max_size, uint8_t** out_data);
 /* Unpacks one entry into `f` (written from its current position), CRC checked;
- * memory use stays at about 1 MB whatever the size. */
+ * memory use stays at about 1 MB whatever the size. FA_ERROR_TOO_LARGE past
+ * FA_ZIP_TEMP_LIMIT. */
 fa_result fa_zip_extract_file(fa_source* src, const fa_zip_entry* e, FILE* f);
 /* Raw DEFLATE (RFC 1951). FA_OK only when the stream ends exactly at out_size bytes. */
 fa_result fa_inflate(const uint8_t* in, size_t in_size, uint8_t* out, size_t out_size);

@@ -373,6 +373,25 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- Damaged and hostile files (audit of 2026-10-27):
+  - HE-AAC with a 64, 88.2 or 96 kHz core (which the standard doesn't allow with SBR) could hang the decoder forever
+    building its SBR tables. SBR data with a core above 48 kHz is now ignored and the core plays alone.
+  - A damaged HE-AAC frame whose SBR envelope or noise levels step past the standard's range gave infinite, then NaN,
+    samples that reached the output and stuck in the EQ and resampler. Such a frame now counts as damaged.
+  - HE-AAC v2: a damaged parametric stereo header could leave a mode past the tables for the next frames (an
+    out-of-bounds read), and a fine-mode level held over a switch to coarse steps read past its table.
+  - MP3 in a packet stream (MPEG-TS, pushed streams) changing between mono and stereo or between rates: the first frame
+    after the change was decoded twice and came out wrong.
+  - Tags: at most 65,536 items, 1,024 pictures and 64 KB for a field joined from a repeated key are kept (a file with a million repeated
+    `ARTIST` comments took minutes to read); an empty ID3v2 frame no longer ends the tag (the frames after it were
+    lost); an APEv2 item's key is read in one go instead of byte by byte; a huge `WM/Track` number no longer overflows.
+  - Matroska: Cues times and block durations so large they overflow once scaled are clamped, and a second Tracks
+    element no longer leaks the first one's header-stripping bytes.
+  - MP4: a chunk or fragment offset near the largest 64-bit value (a damaged `co64` or `tfhd`) is refused instead of
+    overflowing.
+  - A WAVE disc image whose data chunk claims more than the file holds (a cut-off file, or one written as a stream with
+    length 0xFFFFFFFF) gets its length from the file instead of hours of missing sectors.
+  - ZIP: an entry claiming more than 4 GB unpacked returns `FA_ERROR_TOO_LARGE` instead of filling the temp directory.
 - Looping a source whose length isn't known (a container without one, such as a FLAC written to an output that can't seek): the
   position now wraps and `FA_EVENT_LOOPED` is raised at each jump. Before, it looped where the decoder ended but the
   position ran on past the end and no event came. The end is taken as the length from the first jump on.

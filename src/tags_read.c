@@ -253,7 +253,11 @@ static void id3_frames(fa_source* src, int64_t pos, int64_t end, int ver, int un
             }
             flags = fh[9];
         }
-        if (fsize <= 0 || pos + hl + fsize > end) return;
+        if (fsize < 0 || pos + hl + fsize > end) return;
+        if (fsize == 0) {                                /* empty frames exist: skipped */
+            pos += hl;
+            continue;
+        }
         is_pic = strcmp(id, "APIC") == 0;
         wanted = is_pic ? sink->picture != NULL && fsize <= (int64_t)TAG_MAX_FRAME
                         : (id[0] == 'T' || id[0] == 'W' || !strcmp(id, "COMM") || !strcmp(id, "USLT")) &&
@@ -381,22 +385,19 @@ static int64_t read_ape_at(fa_source* src, int64_t footer_pos, fa_tag_sink* sink
     if (!sink) return total;
     pos = footer_pos + 32 - (int64_t)size;
     for (i = 0; i < count && pos < footer_pos; i++) {
-        uint8_t ih[8];
+        /* The item's header and key (at most 255 bytes and a NUL) in one read. */
+        uint8_t ih[8 + 256];
         char key[256];
-        size_t k = 0;
+        size_t k = 0, n = footer_pos - pos < (int64_t)sizeof(ih) ? (size_t)(footer_pos - pos) : sizeof(ih);
         uint32_t vlen, iflags;
-        if (fa_source_seek(src, pos) != FA_OK || !read_exact(src, ih, 8)) break;
+        if (n < 9 || fa_source_seek(src, pos) != FA_OK || !read_exact(src, ih, n)) break;
         vlen = fa_le32(ih);
         iflags = fa_le32(ih + 4);
-        pos += 8;
-        for (;;) {                        /* key, NUL-terminated */
-            uint8_t c;
-            if (!read_exact(src, &c, 1)) return total;
-            pos++;
-            if (c == 0) break;
-            if (k + 1 < sizeof(key)) key[k++] = (char)c;
-        }
+        while (8 + k < n && ih[8 + k]) k++;
+        if (8 + k >= n) break;            /* no NUL: not a valid key */
+        memcpy(key, ih + 8, k);
         key[k] = '\0';
+        pos += 8 + (int64_t)k + 1;
         if (pos + vlen > footer_pos) break;
         if (((iflags >> 1) & 3) == 0 && vlen <= sink->max_text) {
             uint8_t* v = read_block(src, pos, vlen);

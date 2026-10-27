@@ -399,6 +399,40 @@ static void test_image_formats(void)
     remove("disc_test.wav"); remove("disc_test_wav.cue"); remove("disc_test_be.bin"); remove("disc_test_be.cue");
 }
 
+/* A WAVE image written as a stream (data length 0xFFFFFFFF) or cut short: the
+ * file's size decides the track's length, not the chunk header (which claimed
+ * hours, each missing sector read three times). */
+static void test_image_wav_length(void)
+{
+    FILE* f;
+    uint8_t sec[FA_CD_SECTOR_BYTES], hdr[44];
+    uint32_t data = 0xFFFFFFFFu, v;
+    fa_disc* d = NULL;
+    fa_disc_toc toc;
+    int64_t sct;
+    f = fopen("disc_test_stream.wav", "wb");
+    CHECK(f);
+    memcpy(hdr, "RIFF", 4); v = 0xFFFFFFFFu; memcpy(hdr + 4, &v, 4); memcpy(hdr + 8, "WAVEfmt ", 8);
+    v = 16; memcpy(hdr + 16, &v, 4);
+    hdr[20] = 1; hdr[21] = 0; hdr[22] = 2; hdr[23] = 0;
+    v = 44100; memcpy(hdr + 24, &v, 4); v = 44100 * 4; memcpy(hdr + 28, &v, 4);
+    hdr[32] = 4; hdr[33] = 0; hdr[34] = 16; hdr[35] = 0;
+    memcpy(hdr + 36, "data", 4); memcpy(hdr + 40, &data, 4);
+    fwrite(hdr, 1, 44, f);
+    for (sct = 0; sct < 20; sct++) { put_sector(sec, sct); fwrite(sec, 1, sizeof(sec), f); }
+    fwrite(sec, 1, 100, f);                       /* and part of a sector */
+    fclose(f);
+    f = fopen("disc_test_stream.cue", "wb");
+    CHECK(f);
+    fputs("FILE disc_test_stream.wav WAVE\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n", f);
+    fclose(f);
+    CHECK_EQ(fa_disc_open("disc_test_stream.cue", NULL, &d), FA_OK);
+    CHECK_EQ(fa_disc_get_toc(d, &toc), FA_OK);
+    CHECK_EQ(toc.tracks[0].sectors, 20);
+    fa_disc_close(d);
+    remove("disc_test_stream.wav"); remove("disc_test_stream.cue");
+}
+
 /* A disc track plays through a (silent) device like any stream. */
 /* A later disc of a set (tracks 14 and 15) with a 2048-byte data session in its
  * own file: CD-Text goes to the right track numbers, the data file's length counts
@@ -1471,6 +1505,7 @@ int main(void)
     RUN(test_image_deemphasis);
     RUN(test_image_errors);
     RUN(test_image_formats);
+    RUN(test_image_wav_length);
     RUN(test_image_later_disc);
     RUN(test_image_playback);
     RUN(test_mmc_ids);

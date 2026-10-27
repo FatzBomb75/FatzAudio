@@ -1975,7 +1975,6 @@ static void test_encoder_close_during_stall(void)
     fa_encoder* e = NULL;
     fa_encoder_status st;
     int64_t t0;
-    int i;
     CHECK_EQ(r, FA_OK);
     if (!s) return;
     memset(&out, 0, sizeof(out));
@@ -1983,9 +1982,12 @@ static void test_encoder_close_during_stall(void)
     out.write = discard_write;
     CHECK_EQ(fa_encoder_create_output(&out, NULL, NULL, &e), FA_OK);
     CHECK_EQ(fa_encoder_encode_stream(e, s), FA_OK);
-    for (i = 0; i < 400; i++) {                  /* the first second is encoded, then it waits */
+    /* The first second is encoded, then it waits. Timed by the clock, not by
+     * sleeps: a slow emulator takes longer than 400 short ones. */
+    t0 = fa_monotonic_ns() + 20000000000LL;
+    for (;;) {
         CHECK_EQ(fa_encoder_get_status(e, &st), FA_OK);
-        if (st.frames >= 30000) break;
+        if (st.frames >= 30000 || fa_monotonic_ns() > t0) break;
         fa_sleep_ms(5);
     }
     CHECK(st.frames >= 30000);

@@ -214,17 +214,18 @@ int fa_aac_ps_parse(fa_aac_ps* p, fa_aac_bits* b, int bits_left)
     size_t start = b->pos;
     int frame_class, e, nr_iid = 0, nr_icc = 0, nr_ipd = 0, fine;
     if (fa_aac_get(b, 1)) {
+        /* Kept only when valid: a damaged header must not leave a mode past the
+         * tables for the frames after it. */
+        int iid = (int)fa_aac_get(b, 1), iid_mode = p->iid_mode, icc, icc_mode = p->icc_mode;
+        if (iid) iid_mode = (int)fa_aac_get(b, 3);
+        icc = (int)fa_aac_get(b, 1);
+        if (icc) icc_mode = (int)fa_aac_get(b, 3);
+        if (iid_mode > 5 || icc_mode > 5) return -1;
         p->header_seen = 1;
-        p->enable_iid = (int)fa_aac_get(b, 1);
-        if (p->enable_iid) {
-            p->iid_mode = (int)fa_aac_get(b, 3);
-            if (p->iid_mode > 5) return -1;
-        }
-        p->enable_icc = (int)fa_aac_get(b, 1);
-        if (p->enable_icc) {
-            p->icc_mode = (int)fa_aac_get(b, 3);
-            if (p->icc_mode > 5) return -1;
-        }
+        p->enable_iid = iid;
+        p->iid_mode = iid_mode;
+        p->enable_icc = icc;
+        p->icc_mode = icc_mode;
         p->enable_ext = (int)fa_aac_get(b, 1);
     }
     if (!p->header_seen) return -1;
@@ -599,8 +600,13 @@ static void decorrelate(fa_aac_ps* p, int top)
 
 static void mixing_matrix(const fa_aac_ps* p, int iid, int icc, float h[4])
 {
-    int fine = p->iid_mode > 2;
-    float db = fine ? iid_fine_db[iid + 15] : iid_default_db[iid + 7];
+    int fine = p->iid_mode > 2, lim = fine ? 15 : 7;
+    float db;
+    /* A fine value held over a switch to coarse steps (a frame without new IID
+     * data) can lie outside the coarse table. */
+    if (iid > lim) iid = lim;
+    if (iid < -lim) iid = -lim;
+    db = fine ? iid_fine_db[iid + 15] : iid_default_db[iid + 7];
     float c = powf(10.0f, db / 20.0f), rho = icc_rho[icc];
     if (p->icc_mode < 3) {
         /* procedure R_A */

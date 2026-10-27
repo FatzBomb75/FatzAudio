@@ -140,6 +140,10 @@ extern const uint32_t fa_aac_rates[13];        /* sampling frequency index -> Hz
 
 /* ---- SBR (aac_sbr.c) --------------------------------------------------------------- */
 
+/* The highest core rate SBR runs on (a 96 kHz output). SBR data with a faster core
+ * is ignored: the core plays alone. */
+#define FA_AAC_SBR_MAX_CORE 48000u
+
 typedef struct fa_aac_sbr fa_aac_sbr;
 typedef struct fa_aac_qmf fa_aac_qmf;
 

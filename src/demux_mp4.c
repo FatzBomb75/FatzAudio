@@ -15,6 +15,10 @@
 
 #define MP4_MAX_BOX (1u << 30)        /* moov / moof read into memory */
 #define MP4_MAX_PACKET (64u << 20)
+/* Packet offsets above this come only from damaged or hostile tables (co64, tfhd):
+ * refused, so adding sample sizes to an offset cannot overflow. Offsets past the
+ * end of a cut-off file are kept: reading stops there. */
+#define MP4_MAX_OFFSET (INT64_MAX / 2)
 #define MP4_PCM_FRAMES 4096
 
 typedef struct mp4 {
@@ -92,6 +96,7 @@ static int find_path(const box* in, const uint32_t* path, int depth, box* out)
 static fa_result add_packet(mp4* m, int64_t off, uint32_t size, int64_t pts, uint32_t dur)
 {
     fa_pkt_index* x = &m->pk;
+    if (off > MP4_MAX_OFFSET) return FA_ERROR_UNSUPPORTED_FORMAT;
     /* A size no packet can have (a damaged table) is kept unreadable rather than
      * failing the open: reading stops at that packet, as before the compact list. */
     if (size > MP4_MAX_PACKET) size = MP4_MAX_PACKET + 1;
@@ -113,6 +118,7 @@ static fa_result add_pcm_run(mp4* m, int64_t off, uint32_t size, int64_t pts, ui
 {
     fa_pkt_index* x = &m->pk;
     fa_result r;
+    if (off > MP4_MAX_OFFSET) return FA_ERROR_UNSUPPORTED_FORMAT;
     while (count > 0) {
         if (x->n > 0 && x->end_off == off && x->end_pts == pts) {
             uint64_t last_size = fa_pkt_size(x, x->n - 1), last_dur = fa_pkt_dur(x, x->n - 1);
@@ -279,6 +285,7 @@ static fa_result parse_moof(mp4* m, const uint8_t* p, size_t len, int64_t moof_o
         if (fa_be32(tfhd.p + 4) != m->track_id) continue;
         o = 8;
         if ((flags & 0x1) && o + 8 <= tfhd.len) { base = (int64_t)fa_be64(tfhd.p + o); o += 8; }
+        if (base < 0 || base > MP4_MAX_OFFSET) return FA_ERROR_UNSUPPORTED_FORMAT;
         if (flags & 0x2) o += 4;
         if ((flags & 0x8) && o + 4 <= tfhd.len) { def_dur = fa_be32(tfhd.p + o); o += 4; }
         if ((flags & 0x10) && o + 4 <= tfhd.len) { def_size = fa_be32(tfhd.p + o); }

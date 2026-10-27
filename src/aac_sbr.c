@@ -316,7 +316,7 @@ static int is_patch_border(const fa_aac_sbr* s, int v)
 
 static int build_patches(fa_aac_sbr* s)
 {
-    int msb = s->k0, usb = s->kx, goal = nint(2.048e6 / s->rate), k, i, sb = 0;
+    int msb = s->k0, usb = s->kx, goal = nint(2.048e6 / s->rate), k, i, sb = 0, empty = 0;
     s->num_patches = 0;
     if (goal < s->kx + s->M) {
         for (i = 0, k = 0; s->f_master[i] < goal; i++) k = i + 1;
@@ -337,7 +337,11 @@ static int build_patches(fa_aac_sbr* s)
             usb = sb;
             msb = sb;
             s->num_patches++;
+            empty = 0;
         } else {
+            /* Three passes in a row without a patch repeat the same state forever
+             * (possible with a core above 48 kHz, which the standard rules out). */
+            if (++empty > 2) return 0;
             msb = s->kx;
         }
         if (s->f_master[k] - sb < 3) k = s->N_master;
@@ -702,6 +706,28 @@ static void read_extensions(fa_aac_sbr* s, fa_aac_bits* b)
     fa_aac_skip(b, (size_t)(left > 0 ? left : 0));
 }
 
+/* The standard's ranges for the decoded envelope and noise levels. Delta coding
+ * lets a damaged frame step outside them, and exp2f() of that gives inf, then
+ * NaN in the HF adjuster. A balance channel (coupling) only pans, which stays
+ * finite, so it is not checked. */
+static int data_in_range(const fa_aac_sbr* s)
+{
+    int c, l, k, nch = s->nch == 2 && s->coupling ? 1 : s->nch;
+    for (c = 0; c < nch; c++) {
+        const sbr_chan* ch = &s->ch[c];
+        unsigned e_max = ch->amp_res ? 63 : 127;
+        for (l = 0; l < ch->L_E; l++) {
+            int n = ch->freq_res[l] ? s->N_high : s->N_low;
+            for (k = 0; k < n; k++)
+                if ((unsigned)ch->E[l][k] > e_max) return 0;
+        }
+        for (l = 0; l < ch->L_Q; l++)
+            for (k = 0; k < s->N_Q; k++)
+                if ((unsigned)ch->Q[l][k] > 30u) return 0;
+    }
+    return 1;
+}
+
 /* Dequantizes the envelope and noise data (4.6.18.3.5). */
 static void dequantize(fa_aac_sbr* s)
 {
@@ -808,7 +834,7 @@ void fa_aac_sbr_parse(fa_aac_sbr* s, fa_aac_bits* b, int bits, int crc)
         }
     }
     if (ok) read_extensions(s, b);
-    if (!ok || b->pos > end) {
+    if (!ok || b->pos > end || !data_in_range(s)) {
         for (c = 0; c < s->nch; c++) s->ch[c].have_last = 0;
         s->ps_data = 0;
         b->pos = end;

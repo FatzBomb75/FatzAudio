@@ -42,7 +42,7 @@ static void put(buf* b, const void* d, size_t n)
         b->cap = (b->n + n) * 2 + 64;
         b->p = (uint8_t*)realloc(b->p, b->cap);
     }
-    memcpy(b->p + b->n, d, n);
+    if (n) memcpy(b->p + b->n, d, n);
     b->n += n;
 }
 static void put_str(buf* b, const char* s) { put(b, s, strlen(s)); }
@@ -961,6 +961,64 @@ static void test_errors_and_empty(void)
     fa_tags_close(t);
 }
 
+/* Hostile tags: a Vorbis comment block with 70,000 ARTIST values keeps 65,536
+ * items and a joined field of at most 64 KB, and reads in moments (joining them
+ * all took minutes). */
+static void test_hostile_tag_counts(void)
+{
+    buf file = { 0 }, vc = { 0 };
+    fa_tags* t;
+    uint8_t si[34];
+    uint32_t i, n = 70000;
+    memset(si, 0, sizeof(si));
+    si[12] = 0x01; si[13] = 0x70;
+    put_str(&file, "fLaC");
+    put_u8(&file, 0); put_u8(&file, 0); put_u8(&file, 0); put_u8(&file, 34); put(&file, si, 34);
+    put_le32(&vc, 6); put_str(&vc, "vendor");
+    put_le32(&vc, n);
+    for (i = 0; i < n; i++) {
+        char item[32];
+        snprintf(item, sizeof(item), "ARTIST=Artist %u", (unsigned)i);
+        vc_item(&vc, item);
+    }
+    put_u8(&file, 0x84); put_u8(&file, (unsigned)(vc.n >> 16)); put_be16(&file, (unsigned)vc.n & 0xFFFF); put_buf(&file, &vc);
+    put_str(&file, "\xFF\xF8 frames");
+    t = read_mem(&file, 0);
+    CHECK(t != NULL);
+    if (t) {
+        const char* artist = fa_tags_get(t, FA_TAG_ARTIST);
+        CHECK_EQ(fa_tags_get_item_count(t), 65536);
+        CHECK(strlen(artist) <= 65536 && strlen(artist) > 60000);
+        CHECK(strncmp(artist, "Artist 0; Artist 1; ", 20) == 0);
+        fa_tags_close(t);
+    }
+    buf_free(&vc);
+    buf_free(&file);
+}
+
+/* An empty ID3v2 frame (some writers make them) is skipped: the frames after it
+ * are still read. */
+static void test_id3_empty_frame(void)
+{
+    buf file = { 0 }, frames = { 0 }, body = { 0 };
+    fa_tags* t;
+    id3_frame23(&frames, "TPE1", &body, 0);
+    text_body(&body, 0, "After");
+    id3_frame23(&frames, "TIT2", &body, 0);
+    id3_header(&file, 3, 0, (uint32_t)frames.n);
+    put_buf(&file, &frames);
+    put_str(&file, "\xFF\xFB\x90\x00");
+    t = read_mem(&file, 0);
+    CHECK(t != NULL);
+    if (t) {
+        CHECK_STR(fa_tags_get(t, FA_TAG_TITLE), "After");
+        fa_tags_close(t);
+    }
+    buf_free(&body);
+    buf_free(&frames);
+    buf_free(&file);
+}
+
 /* Damaged tags never read outside the data: prefixes of each tagged file, and
  * every byte flipped in the first and the last 400 (where the tags are). */
 static void test_damaged(void)
@@ -1019,6 +1077,8 @@ int main(void)
     RUN(test_ffmpeg_files);
     RUN(test_errors_and_empty);
     RUN(test_damaged);
+    RUN(test_hostile_tag_counts);
+    RUN(test_id3_empty_frame);
 
     fa_engine_destroy(g_engine);
     if (g_failures) { printf("%d failure(s)\n", g_failures); return 1; }

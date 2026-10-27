@@ -723,8 +723,10 @@ fa_result fa_zip_extract(fa_source* src, const fa_zip_entry* e, uint64_t max_siz
 
 fa_result fa_zip_extract_file(fa_source* src, const fa_zip_entry* e, FILE* f)
 {
-    uint8_t* out = (uint8_t*)malloc(INF_OUT_CHUNK);
+    uint8_t* out;
     fa_result r;
+    if (e->size > FA_ZIP_TEMP_LIMIT) return FA_ERROR_TOO_LARGE;
+    out = (uint8_t*)malloc(INF_OUT_CHUNK);
     if (!out) return FA_ERROR_OUT_OF_MEMORY;
     r = unpack(src, e, out, INF_OUT_CHUNK, f);
     free(out);

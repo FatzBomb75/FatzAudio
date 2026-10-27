@@ -376,7 +376,7 @@ Only what is needed is read: the archive's directory at the end of the file, the
 |---|---|---|
 | Stored (uncompressed, the usual case) | Straight from the archive, like a plain file | None beyond a plain file's |
 | Compressed, up to the memory limit (256 MB unless `fa_engine_config.zip_memory_limit_mb` says otherwise) | Unpacked into memory at open, CRC checked | The song's unpacked size |
-| Compressed, bigger than the limit (or memory ran out), with `fa_engine_config.temp_directory` set | Unpacked into a temp file at open, CRC checked, then played from it | About 1 MB while unpacking |
+| Compressed, bigger than the limit (or memory ran out), with `fa_engine_config.temp_directory` set | Unpacked into a temp file at open, CRC checked, then played from it. Entries over 4 GB unpacked return `FA_ERROR_TOO_LARGE` (only a damaged or hostile archive claims that much audio) | About 1 MB while unpacking |
 | Compressed, bigger than the limit, no temp directory | Not opened: `FA_ERROR_TOO_LARGE` (.NET `ErrorCode.TooLarge`). Tell the user to extract the archive, or set a temp directory | None |
 
 The `.cdg` is always unpacked into memory (a song's graphics are a few MB).

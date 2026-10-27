@@ -38,7 +38,7 @@ A ZIP (MP3+G) is read through the audio file inside it: the one named like the `
 | `FA_TAG_ENCODER` | `Encoder` | The software that made the file |
 | `FA_TAG_BPM` | `Bpm` | |
 
-When a file has several tag formats, the richest wins for each field: ID3v2 before APEv2 before ID3v1; in FLAC, the Vorbis comments before a leading ID3v2; in WAV and AIFF, ID3v2 before the native chunks. A field the winning format lacks is filled from the next one. A key that appears more than once in one format (two `ARTIST` comments) is joined with "; ".
+When a file has several tag formats, the richest wins for each field: ID3v2 before APEv2 before ID3v1; in FLAC, the Vorbis comments before a leading ID3v2; in WAV and AIFF, ID3v2 before the native chunks. A field the winning format lacks is filled from the next one. A key that appears more than once in one format (two `ARTIST` comments) is joined with "; ". A joined field stops growing at 64 KB, and a file keeps at most 65,536 items and 1,024 pictures: only damaged or hostile files reach either limit.
 
 Everything else, ReplayGain values and MusicBrainz IDs included, is in the item list exactly as the file stores it: `fa_tags_get_item` (.NET: `tags.Items`, or the indexer `tags["REPLAYGAIN_TRACK_GAIN"]`, which ignores case). The key is the format's own name: an ID3v2 frame ID (`TIT2`; a `TXXX` uses its description, a `COMM` with a description is `COMM:desc`), a Vorbis or APE key, an MP4 atom (`©nam` in UTF-8; freeform atoms by their name), an ASF attribute, a RIFF or AIFF chunk ID, or a Matroska tag name (`ALBUM/TITLE` for album-level tags when the file has track-level ones too).
 

@@ -140,8 +140,13 @@ static fa_result open_wave(img_file* f)
                      ((uint32_t)fmt[4] | ((uint32_t)fmt[5] << 8) | ((uint32_t)fmt[6] << 16)) == 44100 && fmt[14] == 16;
         } else if (memcmp(ck, "data", 4) == 0) {
             if (!fmt_ok) return FA_ERROR_UNSUPPORTED_FORMAT;
+            int64_t size = file_size(f->f), have;
             f->data_offset = pos + 8;
-            f->sectors = (int64_t)len / FA_CD_SECTOR_BYTES;
+            /* A cut-off file, or one written as a stream (length 0xFFFFFFFF), holds
+             * less than the chunk claims: the file's size decides. */
+            have = size >= f->data_offset ? size - f->data_offset : 0;
+            if (size < 0 || have > (int64_t)len) have = (int64_t)len;
+            f->sectors = have / FA_CD_SECTOR_BYTES;
             return FA_OK;
         }
         pos += 8 + (int64_t)len + (len & 1);

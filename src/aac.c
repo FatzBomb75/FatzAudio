@@ -340,6 +340,7 @@ static fa_result read_config(fa_aac* d, fa_aac_bits* b)
     }
     if (rate == 0 || ri > 12 || config > 12 || (config > 7 && config < 11)) return FA_ERROR_UNSUPPORTED_FORMAT;
     (void)ext_ri;
+    if (rate > FA_AAC_SBR_MAX_CORE) sbr = 0;   /* the standard has no SBR above it: the core plays alone */
     d->configured = 1;
     d->from_asc = 1;
     d->object_type = aot;
@@ -1193,7 +1194,7 @@ static int read_fil(fa_aac* d, fa_aac_bits* b, aac_elem* prev)
     {
         int type = (int)fa_aac_get(b, 4);
         if ((type == EXT_SBR_DATA || type == EXT_SBR_DATA_CRC) && prev && prev->type != ID_LFE) {
-            if (d->sbr_signalled != 0) {
+            if (d->sbr_signalled != 0 && d->rate <= FA_AAC_SBR_MAX_CORE) {
                 if (!prev->sbr) prev->sbr = sbr_create(d, prev->nch);
                 if (prev->sbr) {
                     fa_aac_sbr_parse(prev->sbr, b, count * 8 - 4, type == EXT_SBR_DATA_CRC);

@@ -227,6 +227,7 @@ struct fa_tags {
     char* fields[FA_TAG_FIELD_COUNT];
     int field_format[FA_TAG_FIELD_COUNT];
     char* field_key[FA_TAG_FIELD_COUNT];
+    size_t field_len[FA_TAG_FIELD_COUNT], field_cap[FA_TAG_FIELD_COUNT];
     int have_info;
     fa_stream_info info;
 };
@@ -376,8 +377,14 @@ static const field_map field_maps[] = {
     { FA_TAG_FORMAT_TRACKER, "COMMENT", FA_TAG_COMMENT }
 };
 
+/* Limits for hostile tags: items and pictures kept, and the length of a field
+ * joined from repeated keys. Real files stay far below all three. */
+#define MAX_TAG_ITEMS 65536u
+#define MAX_JOINED 65536u
+#define MAX_TAG_PICTURES 1024u
+
 /* The first format to give a field owns it; more values of the same key from that
- * format (repeated Vorbis comments) are joined with "; ". */
+ * format (repeated Vorbis comments) are joined with "; ", up to MAX_JOINED bytes. */
 static void set_field(fa_tags* t, int field, int format, const char* key, const char* value)
 {
     if (!value[0]) return;
@@ -385,14 +392,24 @@ static void set_field(fa_tags* t, int field, int format, const char* key, const 
         t->fields[field] = fa_strdup(value);
         t->field_key[field] = fa_strdup(key);
         t->field_format[field] = format;
+        t->field_len[field] = t->field_cap[field] = t->fields[field] ? strlen(value) : 0;
     } else if (t->field_format[field] == format && t->field_key[field] && ieq(t->field_key[field], key) &&
                strcmp(t->fields[field], value) != 0) {
-        size_t a = strlen(t->fields[field]), b = strlen(value);
-        char* j = (char*)realloc(t->fields[field], a + b + 3);
-        if (!j) return;
-        memcpy(j + a, "; ", 2);
-        memcpy(j + a + 2, value, b + 1);
-        t->fields[field] = j;
+        size_t a = t->field_len[field], b = strlen(value);
+        if (b > MAX_JOINED || a + 2 + b > MAX_JOINED) return;
+        if (a + 2 + b > t->field_cap[field]) {
+            /* Grown in steps, so many joins do not copy the field each time. */
+            size_t cap = 2 * (a + 2 + b);
+            char* j;
+            if (cap > MAX_JOINED) cap = MAX_JOINED;
+            j = (char*)realloc(t->fields[field], cap + 1);
+            if (!j) return;
+            t->fields[field] = j;
+            t->field_cap[field] = cap;
+        }
+        memcpy(t->fields[field] + a, "; ", 2);
+        memcpy(t->fields[field] + a + 2, value, b + 1);
+        t->field_len[field] = a + 2 + b;
     }
 }
 
@@ -421,8 +438,11 @@ static void map_item(fa_tags* t, int format, const char* key, const char* value)
             set_field(t, field, format, key, g);
         } else if (m->field & MAP_PLUS1) {
             char num[24];
+            const char* d = value;
             if (!all_digits(value, strlen(value))) return;
-            snprintf(num, sizeof(num), "%d", atoi(value) + 1);
+            while (d[0] == '0' && d[1]) d++;              /* zero padding does not count */
+            if (strlen(d) > 9) return;                    /* atoi() + 1 must not overflow */
+            snprintf(num, sizeof(num), "%d", atoi(d) + 1);
             set_field(t, field, format, key, num);
         } else {
             set_field(t, field, format, key, value);
@@ -436,6 +456,10 @@ static void collect_text(fa_tag_sink* sink, int format, const char* key, const c
     fa_tags* t = (fa_tags*)sink;
     tag_item_store* it;
     if (!value[0]) return;
+    if (t->nitems >= MAX_TAG_ITEMS) {
+        map_item(t, format, key, value);   /* not kept as an item, but a field may still need it */
+        return;
+    }
     if (t->nitems == t->cap_items) {
         uint32_t cap = t->cap_items ? t->cap_items * 2 : 16;
         tag_item_store* p = (tag_item_store*)realloc(t->items, sizeof(*p) * cap);
@@ -457,7 +481,7 @@ static void collect_picture(fa_tag_sink* sink, int format, int type, const char*
 {
     fa_tags* t = (fa_tags*)sink;
     tag_picture_store* p;
-    if (size == 0) return;
+    if (size == 0 || t->npics >= MAX_TAG_PICTURES) return;
     if (t->npics == t->cap_pics) {
         uint32_t cap = t->cap_pics ? t->cap_pics * 2 : 4;
         tag_picture_store* q = (tag_picture_store*)realloc(t->pics, sizeof(*q) * cap);
