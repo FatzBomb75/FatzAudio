@@ -147,5 +147,5 @@ Reading is synchronous and does file I/O on the calling thread, so a media libra
 - Fields are text as written. A date may be a year or a full date, a track may have leading zeros, and a genre may be any text. .NET's `Year`, `Track`, `Disc` and `Bpm` give `null` when the text isn't a number.
 - MP4 atom keys start with the copyright sign, which is two bytes in UTF-8 (`"\xC2\xA9nam"`). Use `fa_tags_get` for the common fields instead of matching keys.
 - ID3v2 frames stored compressed (the rare zlib flag) are skipped. Lyrics3 tags are not read. Matroska tags aimed at one track or chapter are left out; global and album tags are read.
-- Bitrate and `audio_bytes` for MP3, AAC, AC-3 and FLAC are measured between the tags, so a VBR MP3 includes its small Xing header frame (a fraction of a percent). MP4, WAV, AIFF and CD are exact.
+- Bitrate and `audio_bytes` for MP3, AAC, AC-3 and FLAC are measured between the tags (an MP3's Xing/LAME header frame is left out). MP4, WAV, AIFF and CD are exact.
 - The BASS `TAGS_Read` format strings (`%ARTI - %TITL`) have no equivalent: build the text from the fields.

@@ -202,6 +202,10 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   the whole syllable, and a cross-fade only the syllable's own columns (no longer padded by the effects' reach). Frames
   are identical; a wipe-only frame costs about a tenth of before (test song: 0.15 to 0.016 ms at 1080p, 0.67 to
   0.07 ms at 2160p).
+- FLAC encoder: a file written to a seekable output now has a SEEKTABLE, a point every 10 s as `flac` makes (fewer,
+  further apart, past about 42 minutes), so players that rely on one seek at once. The audio frames are the same bytes as
+  before; the file is 4,612 bytes larger (the table's room, what is left of it joins the padding). Forward-only outputs
+  are unchanged. See [docs/features/recording-encoding.md](docs/features/recording-encoding.md#how-it-behaves).
 - Lyrics: surfaces that use the same font file (a main screen and an operator preview) share one copy of it in memory
   instead of reading it once each; a CJK font is 20-40 MB. The copy is freed when the last surface using it closes, and a
   file changed on disk is read again.
@@ -348,6 +352,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- Looping a source whose length isn't known (a container without one, such as a FLAC written to an output that can't seek): the
+  position now wraps and `FA_EVENT_LOOPED` is raised at each jump. Before, it looped where the decoder ended but the
+  position ran on past the end and no event came. The end is taken as the length from the first jump on.
+- `fa_encoder_close` on an encoder converting a web stream (`fa_encoder_encode_stream`) returns at once while the
+  download stalls. It used to wait in the network read for data or the network timeout, holding the lock every encoder
+  call takes. The encoder now reads the stream only once enough is downloaded, as playback does.
+- Bitrate and `audio_bytes` of an MP3 with a Xing/LAME header frame (VBR files, and LAME's CBR ones) no longer count
+  that frame as audio.
 - Web streams: credentials from the URL (`https://user:password@host/...`) were still sent after a redirect to
   another server on Windows (WinHTTP) and Apple (URLSession). Now they go only to the URL's own scheme, host and port,
   and the app's `Authorization` and `Cookie` header lines likewise, on every transport

@@ -305,6 +305,70 @@ static void test_flac_lossless(void)
     remove("enc_test.flac");
 }
 
+static uint64_t be_n(const uint8_t* p, int n)
+{
+    uint64_t v = 0;
+    int i;
+    for (i = 0; i < n; i++) v = (v << 8) | p[i];
+    return v;
+}
+
+/* A seekable FLAC output gets a SEEKTABLE: a point on the first frame at or after
+ * every 10 s, each pointing at a frame header; the reserved room left over is in
+ * the last (padding) block; seeks land on the same samples as a full decode. */
+static void test_flac_seektable(void)
+{
+    const uint32_t rate = 44100, ch = 2;
+    const int64_t n = 25 * 44100;
+    float* x = make_signal(4, n, rate, ch);
+    fa_encoder_options o;
+    fa_stream_info info;
+    fa_stream* s = NULL;
+    uint8_t* b;
+    size_t len = 0, pos = 4, table = 0, first = 0;
+    int64_t got;
+    float *y, part[1000 * 2];
+    int i, points = 0, last = 0;
+    fa_encoder_options_init(&o);
+    o.format = FA_ENCODE_FLAC;
+    CHECK_EQ(encode_pcm("enc_seek.flac", &o, x, n, rate, ch), FA_OK);
+    b = read_file("enc_seek.flac", &len);
+    CHECK(b != NULL && len > 64 && memcmp(b, "fLaC", 4) == 0);
+    while (b && pos + 4 <= len && !last) {         /* the metadata blocks */
+        uint32_t size = (uint32_t)be_n(b + pos + 1, 3);
+        last = b[pos] >> 7;
+        if ((b[pos] & 0x7F) == 3) { table = pos + 4; points = (int)(size / 18); }
+        if (last) CHECK_EQ(b[pos] & 0x7F, 1);       /* padding last */
+        pos += 4 + size;
+    }
+    first = pos;
+    CHECK_EQ(points, 3);
+    for (i = 0; b && table && i < points; i++) {
+        const uint8_t* q = b + table + (size_t)i * 18;
+        uint64_t sample = be_n(q, 8), off = be_n(q + 8, 8);
+        CHECK(sample % 4096 == 0 && sample >= (uint64_t)i * 10 * rate && sample < (uint64_t)i * 10 * rate + 4096);
+        CHECK_EQ(be_n(q + 16, 2), 4096);
+        CHECK(first + off + 2 <= len && b[first + off] == 0xFF && b[first + off + 1] == 0xF8);
+    }
+    free(b);
+    CHECK(flac_cli_ok("enc_seek.flac"));
+    y = decode_file("enc_seek.flac", &info, &got);
+    CHECK(y != NULL && got == n);
+    CHECK_EQ(fa_stream_open_path(g_engine, "enc_seek.flac", NULL, &s), FA_OK);
+    for (i = 0; s && y && i < 4; i++) {
+        static const int64_t at[4] = { 900000, 12345, 441000 + 4095, 1000000 };
+        fa_frames k = 0;
+        CHECK_EQ(fa_stream_seek(s, at[i]), FA_OK);
+        CHECK_EQ(fa_stream_read(s, part, 1000, &k), FA_OK);
+        CHECK_EQ(k, 1000);
+        CHECK(memcmp(part, y + (size_t)at[i] * ch, sizeof(part)) == 0);
+    }
+    fa_stream_close(s);
+    free(y);
+    free(x);
+    remove("enc_seek.flac");
+}
+
 /* A 16-bit source (samples on the 16-bit grid) stays bit exact: no dither is added. */
 static void test_16bit_source_is_lossless(void)
 {
@@ -468,7 +532,8 @@ static void test_flac_compresses(void)
            (long long)best);
     CHECK(best < fast);
     CHECK(best < n * 4 / 3);
-    CHECK(best < 89000);   /* 88060; 90170 when Levinson runs without its white-noise pass */
+    /* 92672 (4612 of it the SEEKTABLE's room); 94782 when Levinson runs without its white-noise pass */
+    CHECK(best < 93612);
     free(x);
     remove("enc_c0.flac");
     remove("enc_c8.flac");
@@ -909,6 +974,7 @@ int main(void)
     RUN(test_wav_formats);
     RUN(test_wav_multichannel_and_tags);
     RUN(test_flac_lossless);
+    RUN(test_flac_seektable);
     RUN(test_16bit_source_is_lossless);
     RUN(test_flac_compresses);
     RUN(test_flac_kernels);

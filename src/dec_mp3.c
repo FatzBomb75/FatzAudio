@@ -381,7 +381,10 @@ static fa_result mp3_open(fa_decoder* dec)
     m->spf = h.mpeg1 ? 1152 : 576;
     m->channels = (uint32_t)h.channels;
     p = window(m, off, (size_t)h.size, &avail);
-    if (avail >= (size_t)h.size && xing(p, &h, &xframes, &delay, &padding)) off += h.size;
+    if (avail >= (size_t)h.size && xing(p, &h, &xframes, &delay, &padding)) {
+        off += h.size;
+        dec->lead_bytes = h.size;   /* not audio: left out of the bitrate */
+    }
     m->known_off = off;
     m->next_off = off;
 

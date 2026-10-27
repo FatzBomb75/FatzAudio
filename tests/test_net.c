@@ -553,6 +553,17 @@ static int handle_request(sock_t s, int id)
             send_all(s, g_wav + first, g_wav_n - first);
         }
     }
+    else if (strcmp(path, "/hang.wav") == 0) {
+        /* 1 s of audio, then nothing for 5 s (every connection), then the rest. */
+        char head[256];
+        size_t first = 44 + 44100 * 4;
+        snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", g_wav_n);
+        if (!send_str(s, head) && !send_all(s, g_wav, first)) {
+            int64_t until = fa_monotonic_ns() + 5000000000LL;
+            while (fa_monotonic_ns() < until && !fa_load32(&g_stop)) fa_sleep_ms(10);
+            send_all(s, g_wav + first, g_wav_n - first);
+        }
+    }
     else if (strcmp(path, "/redirect") == 0)
         send_str(s, "HTTP/1.1 302 Found\r\nLocation: /tone.wav\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
     else if (strcmp(path, "/station.pls") == 0) {
@@ -1948,6 +1959,45 @@ static void test_stall_and_resume(void)
     fa_mutex_destroy(&log.lock);
 }
 
+static fa_result FA_CALL discard_write(void* user, const void* data, size_t size)
+{
+    (void)user; (void)data; (void)size;
+    return FA_OK;
+}
+
+/* An encoder converting a web stream whose download stalls closes at once: it
+ * doesn't wait in a network read for the data (or the timeout). */
+static void test_encoder_close_during_stall(void)
+{
+    fa_result r;
+    fa_stream* s = open_url("/hang.wav", FA_OPEN_DECODE_ONLY, &r);
+    fa_encoder_output out;
+    fa_encoder* e = NULL;
+    fa_encoder_status st;
+    int64_t t0;
+    int i;
+    CHECK_EQ(r, FA_OK);
+    if (!s) return;
+    memset(&out, 0, sizeof(out));
+    memset(&st, 0, sizeof(st));
+    out.write = discard_write;
+    CHECK_EQ(fa_encoder_create_output(&out, NULL, NULL, &e), FA_OK);
+    CHECK_EQ(fa_encoder_encode_stream(e, s), FA_OK);
+    for (i = 0; i < 400; i++) {                  /* the first second is encoded, then it waits */
+        CHECK_EQ(fa_encoder_get_status(e, &st), FA_OK);
+        if (st.frames >= 30000) break;
+        fa_sleep_ms(5);
+    }
+    CHECK(st.frames >= 30000);
+    fa_sleep_ms(300);
+    t0 = fa_monotonic_ns();
+    CHECK_EQ(fa_encoder_close(e), FA_OK);
+    t0 = fa_monotonic_ns() - t0;
+    printf("  close took %.0f ms\n", (double)t0 / 1e6);
+    CHECK(t0 < 1000000000LL);
+    fa_stream_close(s);
+}
+
 /* ---- HLS ------------------------------------------------------------------------- */
 
 static void test_hls_vod(void)
@@ -2428,6 +2478,7 @@ int main(void)
     RUN(test_playlist_file_is_followed);
     RUN(test_icy_radio_attached);
     RUN(test_stall_and_resume);
+    RUN(test_encoder_close_during_stall);
     RUN(test_hls_vod);
     RUN(test_hls_ac3);
     RUN(test_hls_retry_and_byteranges);

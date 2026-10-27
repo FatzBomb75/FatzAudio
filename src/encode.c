@@ -16,6 +16,7 @@
 #endif
 #include "encode.h"
 #include "mixer.h"
+#include "net.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -445,6 +446,9 @@ static int read_chunk(fa_encoder* e)
     fa_result r;
     fa_mutex_lock(&e->read_lock);
     if (!e->stream) { fa_mutex_unlock(&e->read_lock); return 0; }   /* the stream was closed */
+    /* A web stream is read only once enough is downloaded (as playback does), so a
+     * stalled download never holds read_lock and fa_encoder_close returns at once. */
+    if (e->stream->net && !fa_net_can_decode(e->stream->net, NULL)) { fa_mutex_unlock(&e->read_lock); return -1; }
     r = fa_stream_read(e->stream, e->chunk, ENC_CHUNK, &got);
     fa_mutex_unlock(&e->read_lock);
     if (got > 0) {

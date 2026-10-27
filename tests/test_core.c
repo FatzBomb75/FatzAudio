@@ -432,7 +432,7 @@ static void test_open_io_seekable(void)
     free(media.p);
 }
 
-/* A .flac without a SEEKTABLE (FatzAudio's and FFmpeg's encoders write none) seeks
+/* A .flac without a SEEKTABLE (FFmpeg's encoder writes none) seeks
  * by searching the file for the frame, and one with a coarse SEEKTABLE searches
  * between its points: every seek lands on exactly the right sample, in a few
  * probes (one file seek each), also where silence makes the bytes per frame jump. */

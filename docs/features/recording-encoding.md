@@ -5,7 +5,7 @@ An encoder writes audio to a file, or to your own output (a network upload, a pi
 | Format | `fa_encode_format` | .NET `EncodeFormat` | What you get |
 |---|---|---|---|
 | WAV | `FA_ENCODE_WAV` | `Wav` | 16 or 24-bit PCM, or 32-bit float. More than two channels use `WAVE_FORMAT_EXTENSIBLE` with the standard speaker layout; files past 4 GB become RF64 automatically |
-| FLAC | `FA_ENCODE_FLAC` | `Flac` | Lossless, 16 or 24 bit, up to 8 channels, with the MD5 of the audio. Built into the library (no libFLAC) |
+| FLAC | `FA_ENCODE_FLAC` | `Flac` | Lossless, 16 or 24 bit, up to 8 channels, with the MD5 of the audio and a SEEKTABLE. Built into the library (no libFLAC) |
 | MP3 | `FA_ENCODE_MP3` | `Mp3` | Through LAME, which your app ships and FatzAudio loads at runtime (see [MP3 and LAME](#mp3-and-lame)). VBR or CBR, with a LAME header for exact length and gapless playback |
 
 Each encoder takes its audio from one source:
@@ -141,7 +141,7 @@ Invalid values (FLAC at 32 bits, MP3 at 96 kHz, an unknown format) fail at creat
 | `FA_ENCODER_FINISHED` | `fa_encoder_encode_stream` reached the end of the stream |
 | `FA_ENCODER_FAILED` | Stopped by an error (`status.error`): the output failed (disk full, network gone) or the stream could not be decoded |
 
-`fa_encoder_wait(enc, timeout)` (.NET `Wait`) returns when the encoder is finished or failed, or `FA_ERROR_BUSY` after the timeout. `fa_encoder_close` stops the source, encodes what is still queued, completes the header (WAV sizes, FLAC length, frame sizes and MD5, the MP3's LAME/Xing frame) and closes the file. It returns the first error the encoder hit; `FA_OK` means the file is complete. An encoder closed before it got any audio still leaves a valid, empty file.
+`fa_encoder_wait(enc, timeout)` (.NET `Wait`) returns when the encoder is finished or failed, or `FA_ERROR_BUSY` after the timeout. `fa_encoder_close` stops the source, encodes what is still queued, completes the header (WAV sizes, FLAC length, frame sizes, MD5 and SEEKTABLE, the MP3's LAME/Xing frame) and closes the file. Closing an encoder that converts a web stream doesn't wait for the download: it reads the stream only once enough is downloaded, as playback does. It returns the first error the encoder hit; `FA_OK` means the file is complete. An encoder closed before it got any audio still leaves a valid, empty file.
 
 ## How it behaves
 
@@ -149,8 +149,9 @@ Invalid values (FLAC at 32 bits, MP3 at 96 kHz, an unknown format) fail at creat
 - **Pausing.** `fa_encoder_set_paused` (.NET `IsPaused`) skips the device's or stream's audio until resumed: the file just continues where it stopped, with no gap of silence.
 - **When the source goes away.** Closing the device or stream being recorded (or encoded) ends the input; the encoder stays open and its file is completed when you close it. A recorded stream moved to a device of another sample rate is not recorded while it plays there (the input format is fixed when the source is attached).
 - **Exact lengths.** Resampled output has exactly `input × out_rate / in_rate` frames (rounded), with the resampler's look-ahead flushed at the end. FLAC and WAV keep every frame; MP3 files carry LAME's delay and padding in the LAME header, so decoders that read it (FatzAudio, FFmpeg, most players) give back exactly the frames encoded.
+- **FLAC seek table.** A FLAC file written to a seekable output has a SEEKTABLE with a point every 10 s (as `flac` makes by default); a file longer than about 42 minutes (256 points) gets one every 20 s, 30 s and so on, whatever fits. Room for the points is kept before the audio and filled in at the end; what is left over joins the padding block (4 KB plus 18 bytes per unused point) that tag editors use.
 - **Dither.** 16-bit output (WAV or FLAC) gets TPDF dither, except for samples that already are exact 16-bit values. So a 16-bit source played or converted at unity gain stays bit exact: WAV to FLAC is lossless, and so is FLAC to WAV. 24-bit output is rounded without dither.
-- **Outputs that cannot seek.** When `fa_encoder_output.seek` is NULL (or the .NET stream can't seek), the header can't be completed at the end. WAV keeps "length unknown" sizes and FLAC an unknown length and no MD5 (both decode fine, including with FatzAudio); MP3 is written without the LAME header.
+- **Outputs that cannot seek.** When `fa_encoder_output.seek` is NULL (or the .NET stream can't seek), the header can't be completed at the end. WAV keeps "length unknown" sizes and FLAC an unknown length, no MD5 and no SEEKTABLE (both decode fine, including with FatzAudio); MP3 is written without the LAME header.
 - **Threads.** One thread per encoder does the conversion, encoding and writing; your output callbacks run there. FLAC level 5 encodes 44.1 kHz stereo at about 400× real time on one x64 core (level 8: about 170×, level 0: about 650×), so recording costs almost nothing. The calls are thread-safe; `fa_encoder_write` calls must not overlap each other.
 
 ## FLAC compression

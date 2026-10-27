@@ -52,9 +52,9 @@ static const char* extension_of(const char* path)
     return dot + 1;
 }
 
-/* Elementary-stream files (MP3, AAC, AC-3, FLAC) are all audio but their tags
- * and FLAC's metadata blocks. Read on a local source only, with the source put
- * back where the decoder left it. */
+/* Elementary-stream files (MP3, AAC, AC-3, FLAC) are all audio but their tags,
+ * FLAC's metadata blocks and an MP3's Xing/LAME frame (lead_bytes). Read on a
+ * local source only, with the source put back where the decoder left it. */
 static void whole_file_size(fa_decoder* dec)
 {
     fa_source* src = dec->src;
@@ -68,7 +68,7 @@ static void whole_file_size(fa_decoder* dec)
     at = fa_source_tell(src);
     fa_tags_audio_span(src, &start, &end, &bits);
     fa_source_seek(src, at);
-    dec->audio_bytes = end - start;
+    dec->audio_bytes = end - start > dec->lead_bytes ? end - start - dec->lead_bytes : end - start;
     if (bits && !dec->bits_per_sample) dec->bits_per_sample = bits;
 }
 

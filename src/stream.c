@@ -164,6 +164,7 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
     fa_store32(&s->loop, (s->flags & FA_OPEN_LOOP) ? 1 : 0);
     s->mute_next = -1;               /* nothing mixed yet: the mute starts as set */
     fa_store64(&s->seek_pending, -1);
+    fa_store64(&s->found_end, -1);
     s->buffer_ms = FA_DEFAULT_BUFFER_MS;
     if (options && options->struct_size >= offsetof(fa_open_options, buffer_ms) + sizeof(options->buffer_ms) &&
         options->buffer_ms) {
@@ -1223,12 +1224,13 @@ static int loops(struct fa_stream* s)
     return (fa_load32(&s->loop) || region_of(s)[1] > 0) && s->decoder.seekable;
 }
 
-/* Where the song ends: CUE_OUT, else the length; -1 = unknown. */
+/* Where the song ends: CUE_OUT, else the length (for a source without one, where
+ * it ended when it first looped); -1 = unknown. */
 static fa_frames song_end(struct fa_stream* s)
 {
-    fa_frames out = marker(s, FA_MARKER_CUE_OUT);
-    if (out != FA_FRAMES_UNSET && (s->decoder.length < 0 || out < s->decoder.length)) return out;
-    return s->decoder.length;
+    fa_frames out = marker(s, FA_MARKER_CUE_OUT), len = s->decoder.length >= 0 ? s->decoder.length : fa_load64(&s->found_end);
+    if (out != FA_FRAMES_UNSET && (len < 0 || out < len)) return out;
+    return len;
 }
 
 /* Where playback ends or loops back from (a deck loop's out point, else the song's
@@ -1439,6 +1441,9 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 /* Reversed, the loop goes from its start back to its end. */
                 if (loops(s) && !just_looped && (reversed(s) ? back > loop_start(s) && (s->rev_pos = back, s->rev_n = 0, 1)
                                                              : fa_decoder_seek(&s->decoder, back) == FA_OK)) {
+                    /* No length known: the end is here, so the position wraps and
+                     * LOOPED is raised from now on. */
+                    if (end < 0 && !reversed(s) && s->src_pos > back) fa_store64(&s->found_end, s->src_pos);
                     just_looped = 1; /* a second empty read right after looping = empty source */
                     s->jumped_back = 1;
                     s->src_pos = back;
