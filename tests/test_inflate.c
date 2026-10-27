@@ -172,6 +172,17 @@ static void test_zip_paths(void)
             CHECK(got && fread(got, 1, n, f) == n && memcmp(got, data, n) == 0);
             free(got);
             fclose(f);
+            /* An entry claiming more than the temp-file limit (a hostile archive) is
+             * refused before anything is written. */
+            {
+                fa_zip_entry big = *e;
+                big.size = FA_ZIP_TEMP_LIMIT + 1;
+                f = tmpfile();
+                CHECK(f);
+                CHECK_EQ(fa_zip_extract_file(&src, &big, f), FA_ERROR_TOO_LARGE);
+                CHECK_EQ(ftell(f), 0);
+                fclose(f);
+            }
             /* A wrong CRC is caught on both paths. */
             e->crc32 ^= 1;
             got = NULL;

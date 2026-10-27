@@ -366,6 +366,9 @@ typedef struct mp3_state {
     size_t len, cap;
 } mp3_state;
 
+/* MPEG-1 sampling rates by header index (halved for MPEG-2, quartered for 2.5). */
+static const uint32_t mpa_rates[3] = { 44100, 48000, 32000 };
+
 /* Length of the MPEG audio frame whose header is at h (4 bytes): 0 if h is not
  * a valid header, -1 for free-format frames (length not in the header). */
 static long mpa_frame_len(const uint8_t* h)
@@ -377,7 +380,6 @@ static long mpa_frame_len(const uint8_t* h)
         { { 0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256 },        /* MPEG-2/2.5 layer I */
           { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160 },
           { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160 } } };
-    static const uint32_t sr[3] = { 44100, 48000, 32000 };
     int ver, layer, bri, sri, pad, v2;
     uint32_t rate, kbps;
     if (h[0] != 0xFF || (h[1] & 0xE0) != 0xE0) return 0;
@@ -389,11 +391,19 @@ static long mpa_frame_len(const uint8_t* h)
     if (ver == 1 || layer == 4 || bri == 15 || sri == 3) return 0;
     if (bri == 0) return -1;
     v2 = ver != 3;
-    rate = sr[sri] >> (ver == 3 ? 0 : ver == 2 ? 1 : 2);
+    rate = mpa_rates[sri] >> (ver == 3 ? 0 : ver == 2 ? 1 : 2);
     kbps = br[v2][layer - 1][bri];
     if (layer == 1) return (long)((12 * kbps * 1000 / rate + pad) * 4);
     if (layer == 3 && v2) return (long)(72 * kbps * 1000 / rate + pad);
     return (long)(144 * kbps * 1000 / rate + pad);
+}
+
+/* Channels and rate of the frame whose (valid) header is at h. */
+static void mpa_format(const uint8_t* h, uint32_t* channels, uint32_t* rate)
+{
+    int ver = (h[1] >> 3) & 3;
+    *channels = (h[3] >> 6) == 3 ? 1u : 2u;
+    *rate = mpa_rates[(h[2] >> 2) & 3] >> (ver == 3 ? 0 : ver == 2 ? 1 : 2);
 }
 
 /* A tag after the last frame (ID3v1, ID3v2, APE, Lyrics3). */
@@ -447,6 +457,13 @@ static fa_result mp3_decode(fa_codec* c, const uint8_t* data, size_t size)
             if (ending) pos = st->len;                  /* a cut-off last frame */
             break;                                      /* the rest comes with the next packet */
         }
+        if (c->out_frames > 0) {
+            /* A format change: hand out what we have first. Checked before decoding,
+             * as the decoder's bit reservoir takes in the frame's tail when it runs. */
+            uint32_t fch, frate;
+            mpa_format(st->buf + pos, &fch, &frate);
+            if (fch != c->channels || frate != c->rate) break;
+        }
         /* Free format: the decoder finds the length itself from the next header. */
         used = fa_mp3dec_decode(st->dec, st->buf + pos, flen > 0 ? (int)flen : (int)avail, pcm, &frames, &ch, &rate);
         if (used <= 0) {
@@ -458,8 +475,10 @@ static fa_result mp3_decode(fa_codec* c, const uint8_t* data, size_t size)
             pos += flen > 0 ? (size_t)flen : (size_t)used;
             continue;
         }
-        if (c->out_frames > 0 && ((uint32_t)ch != c->channels || (uint32_t)rate != c->rate))
-            break;                                      /* format change: hand out what we have first */
+        if (c->out_frames > 0 && ((uint32_t)ch != c->channels || (uint32_t)rate != c->rate)) {
+            pos += flen > 0 ? (size_t)flen : (size_t)used;  /* disagrees with its header: dropped */
+            continue;
+        }
         if (fa_codec_reserve(c, frames, (uint32_t)ch) != FA_OK) return FA_ERROR_OUT_OF_MEMORY;
         c->channels = (uint32_t)ch;
         c->rate = (uint32_t)rate;

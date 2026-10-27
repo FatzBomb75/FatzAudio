@@ -276,6 +276,13 @@ static void index_add(mkv* m, int64_t pos, int64_t ts)
     m->nindex++;
 }
 
+/* `t` timestamp units in ns, clamped so hostile values cannot overflow. */
+static int64_t ticks_ns(const mkv* m, int64_t t)
+{
+    int64_t lim = INT64_MAX / (int64_t)m->scale;
+    return (t > lim ? lim : t < -lim ? -lim : t) * (int64_t)m->scale;
+}
+
 static void parse_cues(mkv* m, const uint8_t* p, size_t len)
 {
     const uint8_t* cur = p;
@@ -292,7 +299,7 @@ static void parse_cues(mkv* m, const uint8_t* p, size_t len)
                 ebml_el f;
                 while (mem_next(&c3, e.p + e.len, &f))
                     if (f.id == ID_CUECLUSTERPOSITION && el_uint(&f) < (uint64_t)INT64_MAX / 4)
-                        index_add(m, m->seg_start + (int64_t)el_uint(&f), ts * (int64_t)m->scale);
+                        index_add(m, m->seg_start + (int64_t)el_uint(&f), ticks_ns(m, ts));
             }
         }
     }
@@ -530,6 +537,9 @@ static fa_result parse_tracks(mkv* m, const uint8_t* p, size_t len, int32_t want
     m->track_num = chosen.number;
     m->codec_delay = chosen.codec_delay;
     m->seek_preroll = chosen.seek_preroll;
+    free(m->strip);                       /* from an earlier Tracks element */
+    m->strip = NULL;
+    m->strip_len = 0;
     if (chosen.has_strip && chosen.strip.len > 0) {
         m->strip = (uint8_t*)malloc(chosen.strip.len);
         if (!m->strip) return FA_ERROR_OUT_OF_MEMORY;
@@ -623,7 +633,7 @@ static int take_block(mkv* m, int64_t elem, int64_t size, int full, mkv_ref* ref
     for (k = 1; k < l; k++) track = (track << 8) | h[k];
     if (track != m->track_num) { fa_br_seek(&m->br, end); return 0; }
     hl = (size_t)l + 3;
-    pts = (m->cluster_ts + (int16_t)fa_be16(h + l)) * (int64_t)m->scale;
+    pts = ticks_ns(m, m->cluster_ts + (int16_t)fa_be16(h + l));
     if (!full) {
         ref->elem = elem;
         ref->cluster = m->cluster_pos;
@@ -687,7 +697,7 @@ static fa_result step(mkv* m, int full, mkv_ref* ref)
             for (i = 0; i < n; i++) v = (v << 8) | b[i];
             if (v > (uint64_t)INT64_MAX / (m->scale + 1)) return FA_ERROR_END_OF_STREAM;
             m->cluster_ts = (int64_t)v;
-            index_add(m, m->cluster_pos, m->cluster_ts * (int64_t)m->scale);
+            index_add(m, m->cluster_pos, ticks_ns(m, m->cluster_ts));
             fa_br_seek(&m->br, data + size);
             continue;
         }
@@ -724,7 +734,7 @@ static fa_result step(mkv* m, int full, mkv_ref* ref)
                     if (fa_br_read(&m->br, b, n) < n) return FA_ERROR_END_OF_STREAM;
                     e.p = b;
                     e.len = n;
-                    if (cid == ID_BLOCKDURATION) dur = (int64_t)(el_uint(&e) & 0xFFFFFFFFFFFFull) * (int64_t)m->scale;
+                    if (cid == ID_BLOCKDURATION) dur = ticks_ns(m, (int64_t)(el_uint(&e) & 0xFFFFFFFFFFFFull));
                     else discard = el_sint(&e);
                     fa_br_seek(&m->br, cd + cs);
                 } else {

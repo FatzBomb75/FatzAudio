@@ -906,6 +906,68 @@ static void test_mkv_lacing_and_live_layout(void)
     free(f.p);
 }
 
+/* Hostile Matroska values: a Cues time and a BlockDuration that overflow once
+ * scaled to ns (undefined behaviour, caught by the sanitizer build), and two
+ * Tracks elements with header stripping (the first one's bytes leaked). */
+static void test_mkv_hostile_values(void)
+{
+    ebuf f = { 0 }, hdr = { 0 }, info = { 0 }, audio = { 0 }, cues = { 0 }, cp = { 0 }, ctp = { 0 }, bg = { 0 };
+    static const int eight[1] = { 8 };
+    union { double d; uint64_t u; } rate;
+    int64_t k = 0;
+    int t;
+    fa_open_options o;
+    fa_stream* s = NULL;
+    put_el(&hdr, 0x4282, "matroska", 8);
+    put_el(&f, 0x1A45DFA3, hdr.p, (int64_t)hdr.n);
+    put_el(&f, 0x18538067, NULL, -1);
+    put_uint(&info, 0x2AD7B1, 1000000);
+    put_el(&f, 0x1549A966, info.p, (int64_t)info.n);
+    rate.d = 8000.0;
+    put_uint(&audio, 0xB5, rate.u);
+    put_uint(&audio, 0x9F, 1);
+    put_uint(&audio, 0x6264, 16);
+    for (t = 0; t < 2; t++) {
+        ebuf tracks = { 0 }, te = { 0 }, encs = { 0 }, enc = { 0 }, comp = { 0 };
+        put_uint(&comp, 0x4254, 3);                           /* header stripping */
+        put_el(&comp, 0x4255, "\0\0", 2);
+        put_el(&enc, 0x5034, comp.p, (int64_t)comp.n);
+        put_el(&encs, 0x6240, enc.p, (int64_t)enc.n);
+        put_uint(&te, 0xD7, 1);
+        put_uint(&te, 0x83, 2);
+        put_el(&te, 0x86, "A_PCM/INT/LIT", 13);
+        put_el(&te, 0xE1, audio.p, (int64_t)audio.n);
+        put_el(&te, 0x6D80, encs.p, (int64_t)encs.n);
+        put_el(&tracks, 0xAE, te.p, (int64_t)te.n);
+        put_el(&f, 0x1654AE6B, tracks.p, (int64_t)tracks.n);
+        free(tracks.p); free(te.p); free(encs.p); free(enc.p); free(comp.p);
+    }
+    put_uint(&ctp, 0xF7, 1);
+    put_uint(&ctp, 0xF1, 0);
+    put_uint(&cp, 0xB3, 0x7FFFFFFFFFFFFFFFull);               /* CueTime */
+    put_el(&cp, 0xB7, ctp.p, (int64_t)ctp.n);
+    put_el(&cues, 0xBB, cp.p, (int64_t)cp.n);
+    put_el(&f, 0x1C53BB6B, cues.p, (int64_t)cues.n);
+    put_el(&f, 0x1F43B675, NULL, -1);
+    put_uint(&f, 0xE7, 0);
+    put_block(&f, 0xA3, 1, 0, 0, eight, 1, &k);
+    put_block(&bg, 0xA1, 1, 2, 0, eight, 1, &k);
+    put_uint(&bg, 0x9B, 0xFFFFFFFFFFFFull);                  /* BlockDuration: 48 bits */
+    put_el(&f, 0xA0, bg.p, (int64_t)bg.n);
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    CHECK_EQ(fa_stream_open_memory(g_engine, f.p, f.n, &o, &s), FA_OK);
+    if (s) {
+        int64_t n;
+        float* all = read_all(s, 1, &n);
+        CHECK(n >= 9);                                        /* the stripped zero sample in front of each */
+        if (n >= 9) CHECK_NEAR(all[0], 0.0, 1e-9);
+        free(all);
+        fa_stream_close(s);
+    }
+    free(f.p); free(hdr.p); free(info.p); free(audio.p); free(cues.p); free(cp.p); free(ctp.p); free(bg.p);
+}
+
 /* ---- damaged files ------------------------------------------------------------------- */
 
 static void exercise_memory(const uint8_t* data, size_t size, int32_t track)
@@ -1179,6 +1241,92 @@ static void test_os_codec_helpers(void)
 }
 
 /* ALAC is lossless: the 16-bit sines come back exactly. */
+/* The file with its 'stco' rewritten as 'co64', the first chunk at `first` (the
+ * rest where they were); the boxes around it grow to match. Malloc'ed. */
+static uint8_t* with_co64(const uint8_t* d, size_t n, int64_t first, size_t* out_n)
+{
+    size_t at = 0, bs, i, count, grow, pos, end;
+    uint8_t* o;
+    while (at + 4 <= n && memcmp(d + at, "stco", 4) != 0) at++;
+    if (at + 12 > n || at < 4) return NULL;
+    bs = at - 4;
+    count = ((size_t)d[at + 8] << 24) | ((size_t)d[at + 9] << 16) | ((size_t)d[at + 10] << 8) | d[at + 11];
+    grow = 4 * count;
+    o = (uint8_t*)malloc(n + grow);
+    memcpy(o, d, bs);
+    /* The box itself. */
+    {
+        size_t sz = 16 + 8 * count;
+        uint8_t* b = o + bs;
+        b[0] = (uint8_t)(sz >> 24); b[1] = (uint8_t)(sz >> 16); b[2] = (uint8_t)(sz >> 8); b[3] = (uint8_t)sz;
+        memcpy(b + 4, "co64", 4);
+        memcpy(b + 8, d + at + 4, 8);                       /* version, flags, count */
+        for (i = 0; i < count; i++) {
+            const uint8_t* e = d + at + 12 + 4 * i;
+            uint64_t v = i == 0 ? (uint64_t)first : ((uint64_t)e[0] << 24) | ((uint64_t)e[1] << 16) | ((uint64_t)e[2] << 8) | e[3];
+            int k;
+            for (k = 0; k < 8; k++) b[16 + 8 * i + k] = (uint8_t)(v >> (56 - 8 * k));
+        }
+    }
+    memcpy(o + bs + 16 + 8 * count, d + at + 12 + 4 * count, n - (at + 12 + 4 * count));
+    /* Every box around it: 4 bytes more per entry. */
+    pos = 0;
+    end = n;
+    while (pos + 8 <= end) {
+        size_t sz = ((size_t)d[pos] << 24) | ((size_t)d[pos + 1] << 16) | ((size_t)d[pos + 2] << 8) | d[pos + 3];
+        if (sz < 8) break;
+        if (pos < bs && bs < pos + sz) {
+            size_t nsz = sz + grow;
+            o[pos] = (uint8_t)(nsz >> 24); o[pos + 1] = (uint8_t)(nsz >> 16); o[pos + 2] = (uint8_t)(nsz >> 8); o[pos + 3] = (uint8_t)nsz;
+            end = pos + sz;
+            pos += 8;                                         /* into it */
+            continue;
+        }
+        pos += sz;
+    }
+    *out_n = n + grow;
+    return o;
+}
+
+/* A co64 chunk offset near INT64_MAX: adding the sample sizes to it overflowed
+ * (undefined behaviour, caught by the sanitizer build). Now the open fails; the
+ * same file with the real offsets as co64 still plays. */
+static void test_mp4_co64_offset_overflow(void)
+{
+    size_t size = 0, n = 0;
+    uint8_t* d = load_file("alac.m4a", &size);
+    uint8_t* x;
+    fa_open_options o;
+    fa_stream* s = NULL;
+    CHECK(d != NULL);
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    {
+        size_t at = 0;
+        int64_t first;
+        while (at + 16 <= size && memcmp(d + at, "stco", 4) != 0) at++;
+        first = ((int64_t)d[at + 12] << 24) | ((int64_t)d[at + 13] << 16) | ((int64_t)d[at + 14] << 8) | d[at + 15];
+        x = with_co64(d, size, first, &n);
+        CHECK(x != NULL);
+        CHECK_EQ(fa_stream_open_memory(g_engine, x, n, &o, &s), FA_OK);
+        if (s) {
+            int64_t got;
+            float* all = read_all(s, 2, &got);
+            CHECK_EQ(got, 11025);
+            free(all);
+            fa_stream_close(s);
+            s = NULL;
+        }
+        free(x);
+    }
+    x = with_co64(d, size, INT64_MAX - 100, &n);
+    CHECK(x != NULL);
+    CHECK(fa_stream_open_memory(g_engine, x, n, &o, &s) != FA_OK);
+    if (s) fa_stream_close(s);
+    free(x);
+    free(d);
+}
+
 static void test_m4a_alac(void)
 {
     static const int64_t targets[] = { 0, 1, 4095, 4096, 4097, 9000, 3 };
@@ -1568,6 +1716,102 @@ static void test_caf_unsupported(void)
 
 /* ---- MP3 files (dec_mp3.c) ---------------------------------------------------------- */
 
+/* `max` whole frames of an MP3 file from its first frame header (past any ID3v2
+ * tag): the bytes, their count in *n. */
+static const uint8_t* mp3_frames(const uint8_t* d, size_t size, int max, size_t* n)
+{
+    static const int kbps1[16] = { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0 };
+    static const int kbps2[16] = { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0 };
+    static const int rates[3] = { 44100, 48000, 32000 };
+    size_t at = 0, end;
+    int k;
+    if (size >= 10 && memcmp(d, "ID3", 3) == 0)
+        at = 10 + (((size_t)d[6] << 21) | ((size_t)d[7] << 14) | ((size_t)d[8] << 7) | d[9]);
+    end = at;
+    for (k = 0; k < max && end + 4 <= size; k++) {
+        const uint8_t* h = d + end;
+        int v1 = (h[1] >> 3) & 1, rate = rates[(h[2] >> 2) & 3] >> (v1 ? 0 : 1);
+        int kb = (v1 ? kbps1 : kbps2)[h[2] >> 4];
+        if (h[0] != 0xFF || (h[1] & 0xE6) != 0xE2 || kb == 0) break;   /* layer III only */
+        end += (size_t)((v1 ? 144 : 72) * kb * 1000 / rate + ((h[2] >> 1) & 1));
+    }
+    *n = end - at;
+    return d + at;
+}
+
+static void mp3_collect(fa_codec* c, const uint8_t* p, size_t n, float** out, size_t* len, int* changes, uint32_t* last_ch)
+{
+    int round;
+    for (round = 0; round < 64; round++) {
+        if (c->vt->decode(c, p, n) != FA_OK) break;
+        if (c->out_frames > 0) {
+            size_t add = (size_t)c->out_frames * c->channels;
+            if (c->channels != *last_ch) (*changes)++;
+            *last_ch = c->channels;
+            *out = (float*)realloc(*out, (*len + add) * sizeof(float));
+            memcpy(*out + *len, c->out, add * sizeof(float));
+            *len += add;
+        } else if (!p) {
+            break;
+        }
+        if (p) break;                                 /* a packet goes in once */
+    }
+}
+
+/* Stereo 44.1 kHz frames, then mono 22.05 kHz ones, in one packet (as in MPEG-TS
+ * or a pushed stream): the first frame of the new format was decoded twice, the
+ * second time against a bit reservoir that already held its own tail. The output
+ * must match the same frames fed as two packets. */
+static void test_mp3_format_change_in_packet(void)
+{
+    size_t na = 0, nb = 0, an = 0, bn = 0, len1 = 0, len2 = 0;
+    uint8_t* a = load_file("mp3/cbr.mp3", &na);
+    uint8_t* b = load_file("mp3/mpeg2.mp3", &nb);
+    const uint8_t *fa, *fb;
+    uint8_t* both;
+    float *one = NULL, *two = NULL;
+    int pass;
+    size_t skip = 0;
+    CHECK(a && b);
+    fa = mp3_frames(a, na, 20, &an);
+    fb = mp3_frames(b, nb, 1, &skip);                /* past its LAME header frame (silent, no reservoir) */
+    fb = mp3_frames(b, nb, 21, &bn);
+    fb += skip;
+    bn -= skip;
+    CHECK(an > 0 && bn > 0);
+    both = (uint8_t*)malloc(an + bn);
+    memcpy(both, fa, an);
+    memcpy(both + an, fb, bn);
+    for (pass = 0; pass < 2; pass++) {
+        fa_codec c;
+        fa_codec_params p;
+        int changes = 0;
+        uint32_t last = 0;
+        fa_codec_params_init(&p);
+        p.codec = "mp3";
+        p.sample_rate = 44100;
+        p.channels = 2;
+        memset(&c, 0, sizeof(c));
+        CHECK_EQ(fa_codec_open(&c, &p), FA_OK);
+        if (pass == 0) {
+            mp3_collect(&c, both, an + bn, &one, &len1, &changes, &last);
+        } else {
+            mp3_collect(&c, fa, an, &two, &len2, &changes, &last);
+            mp3_collect(&c, fb, bn, &two, &len2, &changes, &last);
+        }
+        mp3_collect(&c, NULL, 0, pass == 0 ? &one : &two, pass == 0 ? &len1 : &len2, &changes, &last);
+        CHECK_EQ(changes, 2);
+        fa_codec_close(&c);
+    }
+    CHECK_EQ(len1, len2);
+    CHECK(len1 == len2 && memcmp(one, two, len1 * sizeof(float)) == 0);
+    free(one);
+    free(two);
+    free(both);
+    free(a);
+    free(b);
+}
+
 /* Where a 440 Hz sine of phase 0 at sample 0 sits in channel 0 of p: its lag
  * in samples, modulo one period (0 .. rate / 440). */
 static double sine_lag(const float* p, int64_t from, int64_t to, uint32_t ch, uint32_t rate)
@@ -1740,6 +1984,8 @@ int main(void)
     RUN(test_adts_junk_and_tags);
     RUN(test_adts_junk_and_format_change);
     RUN(test_mkv_lacing_and_live_layout);
+    RUN(test_mkv_hostile_values);
+    RUN(test_mp4_co64_offset_overflow);
     RUN(test_protected_content);
     RUN(test_damaged_files_do_not_crash);
     RUN(test_scan_video_file);
@@ -1748,6 +1994,7 @@ int main(void)
     RUN(test_mp3_mpeg2);
     RUN(test_mp3_no_header);
     RUN(test_mp3_junk);
+    RUN(test_mp3_format_change_in_packet);
 
     fa_engine_destroy(g_engine);
     if (g_failures) { printf("%d failure(s)\n", g_failures); return 1; }

@@ -289,7 +289,7 @@ static fa_result unpack_to_temp(struct fa_stream* s, fa_source* arc, const fa_zi
     fa_engine* engine = s->engine;
     FILE* f;
     fa_result r;
-    if (!engine->temp_folder) return FA_ERROR_TOO_LARGE;
+    if (!engine->temp_folder || e->size > FA_ZIP_TEMP_LIMIT) return FA_ERROR_TOO_LARGE;
     /* Made again here: the app may have created the directory after the engine. */
     fa_mkdir_utf8(engine->config.temp_directory);
     fa_mkdir_utf8(engine->temp_folder);

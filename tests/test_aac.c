@@ -564,6 +564,179 @@ static void test_damaged_frames(void)
     }
 }
 
+/* SBR on its own: a payload of an SBR header (then whatever follows) for a mono
+ * element. Bits go MSB first; `buf` must have 12 bytes of padding past `bits`. */
+typedef struct sbr_bits {
+    uint8_t buf[256 + 12];
+    size_t n;
+} sbr_bits;
+
+static void sbr_put(sbr_bits* w, uint32_t v, int n)
+{
+    while (n-- > 0) {
+        if ((v >> n) & 1) w->buf[w->n >> 3] |= (uint8_t)(0x80 >> (w->n & 7));
+        w->n++;
+    }
+}
+
+static void sbr_feed(fa_aac_sbr* s, const sbr_bits* w)
+{
+    fa_aac_bits b;
+    b.p = w->buf;
+    b.pos = 0;
+    b.end = w->n;
+    fa_aac_sbr_parse(s, &b, (int)w->n, 0);
+}
+
+/* The standard has SBR only up to a 48 kHz core, but a stream can claim it with a
+ * faster one. Building the patches for some headers there used to loop forever
+ * (the test then hangs): every header value at 64, 88.2 and 96 kHz. */
+static void test_sbr_fast_core(void)
+{
+    static const uint32_t rates[3] = { 64000, 88200, 96000 };
+    fa_aac_qmf* q = fa_aac_qmf_create();
+    int r;
+    CHECK(q != NULL);
+    for (r = 0; r < 3 && q; r++) {
+        fa_aac_sbr* s = fa_aac_sbr_create(rates[r], 1, q);
+        int start, stop, xover, scale, alter, noise;
+        CHECK(s != NULL);
+        if (!s) continue;
+        for (start = 0; start < 16; start++)
+            for (stop = 0; stop < 16; stop++)
+                for (xover = 0; xover < 8; xover++)
+                    for (scale = 0; scale < 4; scale++)
+                        for (alter = 0; alter < 2; alter++)
+                            for (noise = 0; noise < 4; noise++) {
+                                sbr_bits w;
+                                memset(&w, 0, sizeof(w));
+                                sbr_put(&w, 1, 1);                  /* header follows */
+                                sbr_put(&w, 0, 1);                  /* amp_res */
+                                sbr_put(&w, (uint32_t)start, 4);
+                                sbr_put(&w, (uint32_t)stop, 4);
+                                sbr_put(&w, (uint32_t)xover, 3);
+                                sbr_put(&w, 0, 2);
+                                sbr_put(&w, 1, 1);                  /* extra 1 */
+                                sbr_put(&w, 0, 1);
+                                sbr_put(&w, (uint32_t)scale, 2);
+                                sbr_put(&w, (uint32_t)alter, 1);
+                                sbr_put(&w, (uint32_t)noise, 2);
+                                w.n += 64;                          /* zero data */
+                                sbr_feed(s, &w);
+                            }
+        fa_aac_sbr_destroy(s);
+    }
+    fa_aac_qmf_destroy(q);
+}
+
+/* The shortest code of `table` for the value `v`: its bits in *code, its length
+ * returned (0 if there is none up to 20 bits). */
+static int sbr_code_for(const uint16_t* table, int v, uint32_t* code)
+{
+    int len;
+    for (len = 1; len <= 20; len++) {
+        uint32_t c;
+        for (c = 0; c < (1u << len); c++) {
+            uint8_t buf[16] = { 0 };
+            fa_aac_bits b;
+            uint32_t x = c << (32 - len);
+            buf[0] = (uint8_t)(x >> 24);
+            buf[1] = (uint8_t)(x >> 16);
+            buf[2] = (uint8_t)(x >> 8);
+            buf[3] = (uint8_t)x;
+            b.p = buf;
+            b.pos = 0;
+            b.end = 32;
+            if (fa_aac_vlc(&b, table, FA_AAC_VLC_ROOT) == v + 128 && b.pos == (size_t)len) {
+                *code = c;
+                return len;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Damaged SBR data whose delta-coded envelope levels climb past the standard's
+ * range (here by the largest step every band) used to give inf, then NaN, in the
+ * output. Now the frame counts as damaged: plain upsampling, finite output. The
+ * band and noise band counts are tried rather than worked out, so one of the
+ * payloads lines up with the tables. */
+static void test_sbr_levels_out_of_range(void)
+{
+    static float in[1024], out0[2048];
+    uint32_t up = 0, zero = 0;
+    int up_len = 0, zero_len, step, n, nq, i;
+    fa_aac_qmf* q = fa_aac_qmf_create();
+    CHECK(q != NULL);
+    if (!q) return;
+    for (step = 60; step > 0 && !up_len; step--) up_len = sbr_code_for(fa_aac_sbr_f_huffman_env_1_5db, step, &up);
+    zero_len = sbr_code_for(fa_aac_sbr_f_huffman_env_3_0db, 0, &zero);
+    CHECK(up_len > 0 && zero_len > 0);
+    for (i = 0; i < 1024; i++) in[i] = 0.5f * sinf((float)i * 0.3f);
+    for (n = 2; n <= 24; n++)
+        for (nq = 1; nq <= 5; nq++) {
+            fa_aac_sbr* s = fa_aac_sbr_create(22050, 1, q);
+            const float* ins[2] = { in, NULL };
+            float* outs[2] = { out0, NULL };
+            sbr_bits w;
+            int k, frame, bad = 0;
+            CHECK(s != NULL);
+            if (!s) continue;
+            memset(&w, 0, sizeof(w));
+            sbr_put(&w, 1, 1);
+            sbr_put(&w, 0, 1);       /* amp_res */
+            sbr_put(&w, 5, 4);       /* start */
+            sbr_put(&w, 9, 4);       /* stop */
+            sbr_put(&w, 0, 3);       /* xover */
+            sbr_put(&w, 0, 2);
+            sbr_put(&w, 0, 2);       /* default extras */
+            sbr_put(&w, 0, 1);       /* no data extra */
+            sbr_put(&w, 0, 2);       /* FIXFIX */
+            sbr_put(&w, 0, 2);       /* one envelope */
+            sbr_put(&w, 1, 1);       /* high resolution */
+            sbr_put(&w, 0, 2);       /* frequency-coded envelope and noise */
+            sbr_put(&w, 0, 2 * nq);  /* invf */
+            sbr_put(&w, 127, 7);     /* the top of the range, then up each band */
+            for (k = 1; k < n; k++) sbr_put(&w, up, up_len);
+            sbr_put(&w, 0, 5);
+            for (k = 1; k < nq; k++) sbr_put(&w, zero, zero_len);
+            sbr_put(&w, 0, 2);       /* no harmonics, no extensions */
+            for (frame = 0; frame < 3; frame++) {
+                sbr_feed(s, &w);
+                fa_aac_sbr_apply(s, ins, outs);
+                for (i = 0; i < 2048; i++)
+                    if (!isfinite(out0[i])) bad = 1;
+            }
+            CHECK(!bad);
+            fa_aac_sbr_destroy(s);
+        }
+    fa_aac_qmf_destroy(q);
+}
+
+/* A parametric stereo header with a reserved IID mode is refused, and must not
+ * leave that mode for the next frame (which then read past the band tables). */
+static void test_ps_bad_header_not_kept(void)
+{
+    fa_aac_ps* p = fa_aac_ps_create();
+    sbr_bits w;
+    fa_aac_bits b;
+    CHECK(p != NULL);
+    if (!p) return;
+    memset(&w, 0, sizeof(w));
+    sbr_put(&w, 1, 1);           /* header */
+    sbr_put(&w, 1, 1);           /* IID on */
+    sbr_put(&w, 6, 3);           /* mode 6: reserved */
+    w.n += 64;
+    b.p = w.buf; b.pos = 0; b.end = w.n;
+    CHECK_EQ(fa_aac_ps_parse(p, &b, (int)w.n), -1);
+    memset(&w, 0, sizeof(w));
+    sbr_put(&w, 0, 1);           /* no header: the last one's modes */
+    w.n += 64;
+    b.p = w.buf; b.pos = 0; b.end = w.n;
+    CHECK_EQ(fa_aac_ps_parse(p, &b, (int)w.n), -1);
+    fa_aac_ps_destroy(p);
+}
+
 /* What the built-in decoder turns down goes on to the system's decoders. */
 static void test_unsupported_configs(void)
 {
@@ -758,6 +931,9 @@ int main(void)
     RUN(test_several_blocks_and_crc);
     RUN(test_damaged_frames);
     RUN(test_unsupported_configs);
+    RUN(test_sbr_fast_core);
+    RUN(test_sbr_levels_out_of_range);
+    RUN(test_ps_bad_header_not_kept);
 #if defined(_WIN32) || defined(__APPLE__) || defined(__ANDROID__)
     RUN(test_os_decoder);
 #endif
