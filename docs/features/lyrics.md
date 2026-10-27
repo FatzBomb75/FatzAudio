@@ -306,6 +306,8 @@ Measured in a Release build on one core of a desktop x64 CPU, with a song that h
 
 The columns without render-ahead are the time on your thread with the setting off; with it on, the frames over 8 ms on your thread were the very first frame and the start. At 1080p, 114 of the 2063 frames took over 4 ms without render-ahead.
 
+A wipe-only frame redraws just the columns whose colour changed; for a sweep, only those its edge crossed since the last frame (a few pixels wide).
+
 Turning the effects off changes little: at 2160p the average goes from 4.2 ms to 3.7 ms. Lines are laid out once; a frame colours and places them, so only what changed is redrawn.
 
 ### Render-ahead

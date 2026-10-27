@@ -10,8 +10,9 @@
  * Lines shown smaller (the lines around the active one), growing or shrinking (page
  * fades) or between pixels (scrolls) are resampled from the masks with a tent
  * filter as wide as the step, which at smaller sizes is an area average. A frame
- * redraws only what changed from the last: the columns of syllables being wiped, a
- * countdown's arrows, or the lines that moved or faded. */
+ * redraws only what changed from the last: the columns a wipe changed (for a sweep,
+ * only those its edge crossed), a countdown's arrows, or the lines that moved or
+ * faded. */
 #include "lyric.h"
 #include "lyric_time.h"
 #include "fa_platform.h"
@@ -1029,9 +1030,45 @@ static void color_columns(const fa_lyric* l, ly_layer* L, const ly_line* line, c
     }
 }
 
-/* Brings a line's picture to a wipe: only the syllables whose colour changed. */
+/* The layer columns [*c0, *c1) whose colour differs between wipes a and b: 0 when none.
+ * A sweep whose edge only moved inside the current syllable: column x is sung by
+ * edge - x clamped to 0..1, so only those between the two edges change. Otherwise the
+ * syllables whose colour changed (exactly: a sweep's last columns turn when mix
+ * reaches 1, and the gap before a syllable when it becomes the current one). */
+static int changed_columns(const fa_lyric* l, const ly_layer* L, const ly_line* line, const ly_wipe* a,
+                           const ly_wipe* b, int* c0, int* c1)
+{
+    if (l->st.wipe == FA_WIPE_SWEEP && a->current >= 0 && a->current == b->current && a->full == b->full &&
+        a->mix < 1.0f && b->mix < 1.0f) {
+        float x0 = L->gx[2 * a->current], x1 = L->gx[2 * a->current + 1];
+        float e0 = x0 + (x1 - x0) * a->mix, e1 = x0 + (x1 - x0) * b->mix;
+        if (same(a->mix, b->mix)) return 0;
+        *c0 = (int)floorf(e0 < e1 ? e0 : e1) - 1;
+        *c1 = (int)ceilf(e0 < e1 ? e1 : e0) + 1;
+    } else {
+        int first = -1, last = -1;
+        uint32_t j;
+        float u0, u1;
+        for (j = 0; j < line->nseg; j++)
+            if (seg_mix(a, j) != seg_mix(b, j) || (a->current == (int)j) != (b->current == (int)j)) {
+                if (first < 0) first = (int)j;
+                last = (int)j;
+            }
+        if (first < 0) return 0;
+        u0 = first ? L->bnd[first] : 0.0f;
+        u1 = (uint32_t)last + 1 < line->nseg ? L->bnd[last + 1] : (float)L->w;
+        *c0 = (int)floorf(u0 - 0.5f);
+        *c1 = (int)ceilf(u1 + 0.5f);
+    }
+    if (*c0 < 0) *c0 = 0;
+    if (*c1 > L->w) *c1 = L->w;
+    return *c0 < *c1;
+}
+
+/* Brings a line's picture to a wipe: only the columns whose colour changed. */
 static int color_line(const fa_lyric* l, ly_layer* L, const ly_line* line, const ly_wipe* w)
 {
+    int c0, c1;
     if (!L->px) {
         L->px = (uint8_t*)malloc((size_t)L->w * (size_t)L->h * 4);
         if (!L->px) return 0;
@@ -1039,18 +1076,8 @@ static int color_line(const fa_lyric* l, ly_layer* L, const ly_line* line, const
     }
     if (!L->pw_valid) {
         color_columns(l, L, line, w, 0, 0, L->w);
-    } else {
-        int first = -1, last = -1;
-        uint32_t j;
-        for (j = 0; j < line->nseg; j++)
-            if (seg_mix(&L->pw, j) != seg_mix(w, j) || (L->pw.current == (int)j) != (w->current == (int)j)) {
-                if (first < 0) first = (int)j;
-                last = (int)j;
-            }
-        if (first >= 0) {
-            float u0 = first ? L->bnd[first] : 0.0f, u1 = (uint32_t)last + 1 < line->nseg ? L->bnd[last + 1] : (float)L->w;
-            color_columns(l, L, line, w, 0, (int)floorf(u0 - 0.5f), (int)ceilf(u1 + 0.5f));
-        }
+    } else if (changed_columns(l, L, line, &L->pw, w, &c0, &c1)) {
+        color_columns(l, L, line, w, 0, c0, c1);
     }
     L->pw = *w;
     L->pw_valid = 1;
@@ -1919,26 +1946,17 @@ static void diff(const fa_lyric* l, const ly_inst* a, int na, const ly_inst* b, 
         /* In place: the syllables whose colour changed, and the arrows. */
         {
             const ly_line* line = &l->tl.line[o->line];
-            int first = -1, last = -1;
-            uint32_t s;
-            /* Exactly, as color_line: a sweep's last columns turn when mix reaches 1,
-             * and the gap before a syllable when it becomes the current one. */
-            for (s = 0; s < line->nseg; s++)
-                if (seg_mix(&o->wipe, s) != seg_mix(&n->wipe, s) ||
-                    (o->wipe.current == (int)s) != (n->wipe.current == (int)s)) {
-                    if (first < 0) first = (int)s;
-                    last = (int)s;
-                }
-            if (first >= 0) {
+            int c0, c1;
+            if (changed_columns(l, n->layer, line, &o->wipe, &n->wipe, &c0, &c1)) {
+                /* The columns whose colour changed, and the output pixels whose filter
+                 * taps reach them (rad source columns either side). */
                 const ly_layer* L = n->layer;
-                float u0 = first ? L->bnd[first] : 0.0f, u1 = (uint32_t)last + 1 < line->nseg ? L->bnd[last + 1] : (float)L->w;
-                /* The colour boundary moves inside a syllable's columns and the
-                 * effects reach past its ends: the whole syllable span plus reach. */
-                float pad = (float)l->pad;
-                int x0 = (int)floorf(n->cx + (u0 - pad - L->cx) * n->sc) - 2, x1 = (int)ceilf(n->cx + (u1 + pad - L->cx) * n->sc) + 2;
+                float rad = n->sc < 1.0f ? 1.0f / n->sc : 1.0f;
+                int x0 = (int)floorf(n->cx + ((float)c0 - rad - L->cx) * n->sc) - 2;
+                int x1 = (int)ceilf(n->cx + ((float)c1 + rad - L->cx) * n->sc) + 2;
                 if (x0 < n->box[0]) x0 = n->box[0];
                 if (x1 > n->box[2]) x1 = n->box[2];
-                fa_rects_add(out, x0, n->box[1], x1, n->box[3]);
+                if (x0 < x1) fa_rects_add(out, x0, n->box[1], x1, n->box[3]);
             }
             if (o->cd.shown != n->cd.shown || o->cd.done != n->cd.done || !same(o->cd.progress, n->cd.progress) ||
                 !same(o->cd.opacity, n->cd.opacity)) {

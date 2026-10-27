@@ -634,6 +634,62 @@ static void test_stateless(void)
     fa_stream_close(s);
 }
 
+/* A wipe recolours and redraws only the columns whose colour changed (a sweep: those
+ * its edge crossed): walked forward and back in small steps, every frame equals a new
+ * surface drawn there at once (at several sizes and scales, effects on and off, with a
+ * panel, sweeps and cross-fades). */
+static void test_wipe_exact(void)
+{
+    /* A new surface at 2160p costs tens of ms: those are checked at fewer frames. */
+    static const struct { fa_lyric_preset preset; int fx; uint32_t w, h; int every; } cfg[] = {
+        { FA_LYRIC_MODERN, 1, 1920, 1080, 7 }, { FA_LYRIC_MODERN, 0, 1920, 1080, 7 }, { FA_LYRIC_NEON, 1, 3840, 2160, 23 },
+        { FA_LYRIC_MODERN, 0, 3840, 2160, 23 }, { FA_LYRIC_SUBTITLE, 1, 1280, 720, 7 }, { FA_LYRIC_NEON, 1, 1366, 768, 7 },
+        { FA_LYRIC_CLASSIC, 1, 1920, 1080, 7 }, { FA_LYRIC_CLASSIC, 1, 1280, 720, 7 },
+    };
+    static const int from[] = { 950, 9950, 2100 }, to[] = { 2200, 10700, 1000 };
+    fa_stream* s = open_song();
+    size_t c;
+    CHECK(s != NULL);
+    for (c = 0; c < sizeof(cfg) / sizeof(cfg[0]); c++) {
+        fa_lyric_style st;
+        fa_surface *a = NULL, *b = NULL;
+        fa_surface_frame fr;
+        target ta, tb;
+        int w, k = 0;
+        style(&st, cfg[c].preset);
+        st.intro_page = st.ending_page = 0;
+        if (cfg[c].fx) {
+            /* Every part of a column changes colour as it is sung. */
+            st.effects.bevel.on = 1;
+            st.effects.outline.sung_color = 0xFF2BF0FFu;
+            st.effects.shadow.sung_color = 0x9000FF00u;
+        } else st.effects.outline.on = st.effects.shadow.on = st.effects.bevel.on = 0;
+        CHECK_EQ(fa_lyric_surface_create(s, &st, &a), FA_OK);
+        CHECK_EQ(fa_surface_set_presentation_size(a, cfg[c].w, cfg[c].h), FA_OK);
+        CHECK(target_make(a, &ta));
+        for (w = 0; w < 3; w++) {
+            int ms, step = from[w] < to[w] ? 3 : -3;
+            for (ms = from[w]; step > 0 ? ms <= to[w] : ms >= to[w]; ms += step, k++) {
+                CHECK_EQ(draw_at(a, &ta, (fa_time)ms * MS, &fr), FA_OK);
+                if (k % cfg[c].every) continue;
+                CHECK_EQ(fa_lyric_surface_create(s, &st, &b), FA_OK);
+                CHECK_EQ(fa_surface_set_presentation_size(b, cfg[c].w, cfg[c].h), FA_OK);
+                CHECK(target_make(b, &tb));
+                CHECK_EQ(draw_at(b, &tb, (fa_time)ms * MS, &fr), FA_OK);
+                if (memcmp(ta.px, tb.px, (size_t)ta.stride * ta.lay.height) != 0) {
+                    fprintf(stderr, "  config %d differs at %d ms\n", (int)c, ms);
+                    CHECK(0);
+                }
+                fa_surface_destroy(b);
+                free(tb.px);
+            }
+        }
+        fa_surface_destroy(a);
+        free(ta.px);
+    }
+    fa_stream_close(s);
+}
+
 /* Three buffers in rotation: each catches up from the frame it holds. */
 static void test_rotation(void)
 {
@@ -1297,6 +1353,7 @@ int main(void)
     RUN(test_wipe_area);
     RUN(test_stateless);
     RUN(test_rotation);
+    RUN(test_wipe_exact);
     RUN(test_countdown_drawn);
     RUN(test_presets);
     RUN(test_sizes);
