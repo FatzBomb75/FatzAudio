@@ -463,7 +463,7 @@ FA_API fa_result FA_CALL fa_deck_beat_jump(fa_deck* deck, double beats)
 {
     struct fa_mixer* m;
     fa_deck_now dn;
-    fa_frames in = 0, out = 0, oin, oout, last;
+    fa_frames in = 0, out = 0, last;
     double delta;
     fa_result r;
     if (!deck || !(fabs(beats) >= 1.0 / 16.0 - 1e-9 && fabs(beats) <= 1024.0)) return FA_ERROR_INVALID_ARG;
@@ -476,8 +476,6 @@ FA_API fa_result FA_CALL fa_deck_beat_jump(fa_deck* deck, double beats)
     delta = floor(src_of_beat(&dn.v, dn.beat + beats) - src_of_beat(&dn.v, dn.beat) + 0.5);
     last = dn.s->decoder.length > 0 ? dn.s->decoder.length : -1;
     fa_stream_get_loop_region(dn.s, &in, &out);
-    oin = in;
-    oout = out;
     if (out > in) {   /* the loop moves along: within the song, its length kept */
         fa_frames len = out - in, nin = in + (fa_frames)delta;
         if (nin < 0) nin = 0;
@@ -498,17 +496,8 @@ FA_API fa_result FA_CALL fa_deck_beat_jump(fa_deck* deck, double beats)
         if (r == FA_OK && out > in) r = fa_stream_set_loop_region(dn.s, in, out);
         goto done;
     }
-    if (out > in) {
-        /* Off, the jump (into the moved loop), on again there: each join is seamless. */
-        if ((r = fa_stream_set_loop_region(dn.s, 0, 0)) != FA_OK) goto done;
-        if ((r = fa_stream_jump(dn.s, -1, (fa_frames)delta)) != FA_OK) {
-            fa_stream_set_loop_region(dn.s, oin, oout);
-            goto done;
-        }
-        r = fa_stream_set_loop_region(dn.s, in, out);
-        goto done;
-    }
-    r = fa_stream_jump(dn.s, -1, (fa_frames)delta);
+    /* The jump, and a loop moved with it at the same seamless join. */
+    r = out > in ? fa_stream_jump_loop(dn.s, (fa_frames)delta, in, out) : fa_stream_jump(dn.s, -1, (fa_frames)delta);
 done:
     fa_mutex_unlock(&m->lock);
     return r;
