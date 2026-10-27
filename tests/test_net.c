@@ -2097,14 +2097,14 @@ static int https_origin(char* out, size_t cap, int* out_port)
 }
 
 /* How many connections serve.py has opened (this request's included). */
-static int https_connections(const char* origin)
+static int https_connections(fa_http_session* session, const char* origin)
 {
     char url[300];
     conn_fetch c;
     int n;
     memset(&c, 0, sizeof(c));
     snprintf(url, sizeof(url), "%s/connections", origin);
-    n = fetch_with(NULL, url, NULL, &c) == FA_OK && c.body.p ? atoi(c.body.p) : -1;
+    n = fetch_with(session, url, NULL, &c) == FA_OK && c.body.p ? atoi(c.body.p) : -1;
     free(c.body.p);
     return n;
 }
@@ -2178,8 +2178,10 @@ static void test_https_session_optional(void)
 }
 
 /* An HLS stream from serve.py (a master playlist, a media playlist, three
- * byte-range segments of one file) plays over a single connection. Prints the time
- * to the first audio. */
+ * byte-range segments of one file) plays over a single connection: the stream
+ * opens at most one (none when the system pools connections across sessions, as
+ * WinHTTP does). The two counts go over a session of their own, so they add none.
+ * Prints the time to the first audio. */
 static void test_https_hls_optional(void)
 {
     char origin[300], url[400];
@@ -2190,8 +2192,10 @@ static void test_https_hls_optional(void)
     fa_frames got = 0, total = 0;
     int port, before, after;
     int64_t t0, t_first = 0;
+    fa_http_session* counts;
     if (!https_origin(origin, sizeof(origin), &port)) { printf("  skipped (set FA_NET_HTTPS_ECHO_URL)\n"); return; }
-    before = https_connections(origin);
+    counts = fa_http_session_create();
+    before = https_connections(counts, origin);
     CHECK(before > 0);
     snprintf(url, sizeof(url), "%s/hls/master.m3u8", origin);
     fa_open_options_init(&o);
@@ -2207,11 +2211,12 @@ static void test_https_hls_optional(void)
         total += got;
     }
     fa_stream_close(s);
-    after = https_connections(origin);
-    printf("  %lld frames, first audio after %.0f ms, %d connection(s)\n", (long long)total,
-           (double)(t_first - t0) / 1e6, after - before - 1);
+    after = https_connections(counts, origin);
+    fa_http_session_destroy(counts);
+    printf("  %lld frames, first audio after %.0f ms, %d new connection(s)\n", (long long)total,
+           (double)(t_first - t0) / 1e6, after - before);
     CHECK(total > 44100 * 2);
-    CHECK_EQ(after - before - 1, 1);
+    CHECK(after - before <= 1);
 }
 
 /* A segment whose download breaks off is fetched again, and the audio already

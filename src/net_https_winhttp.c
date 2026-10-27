@@ -220,7 +220,7 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
     URL_COMPONENTS uc;
     fa_result r = FA_ERROR_NETWORK;
     DWORD status = 0, size, features = WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES;
-    int slot = -1;
+    int slot = -1, attempt;
     uint8_t* buf = NULL;
     char* headers = NULL;
     header_block block;
@@ -270,21 +270,34 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
         whost = NULL;
         s->port = uc.nPort;
     }
-    request = WinHttpOpenRequest(s->connect, L"GET", wpath, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                 uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
-    if (!request) goto done;
-    WinHttpSetTimeouts(request, (int)req->timeout_ms, (int)req->timeout_ms, (int)req->timeout_ms, (int)req->timeout_ms);
-    /* Redirects come back to fa_http_fetch, which follows them for every transport
-     * (WinHTTP's own would keep the Authorization header on another server). No
-     * cookie store either, as on the other transports: a kept session would replay
-     * a server's cookies on the stream's later requests. */
-    WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &features, sizeof(features));
-    slot = slot_add(req->cancel, request);
-    if (req->cancel && fa_load32(req->cancel)) { r = FA_ERROR_BUSY; goto done; }
-    if (!WinHttpSendRequest(request, wheaders && wheaders[0] ? wheaders : WINHTTP_NO_ADDITIONAL_HEADERS,
-                            wheaders && wheaders[0] ? (DWORD)-1L : 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
-        !WinHttpReceiveResponse(request, NULL))
-        goto done;
+    for (attempt = 0;; attempt++) {
+        DWORD err;
+        request = WinHttpOpenRequest(s->connect, L"GET", wpath, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                     uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+        if (!request) goto done;
+        WinHttpSetTimeouts(request, (int)req->timeout_ms, (int)req->timeout_ms, (int)req->timeout_ms, (int)req->timeout_ms);
+        /* Redirects come back to fa_http_fetch, which follows them for every transport
+         * (WinHTTP's own would keep the Authorization header on another server). No
+         * cookie store either, as on the other transports: a kept session would replay
+         * a server's cookies on the stream's later requests. */
+        WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &features, sizeof(features));
+        slot = slot_add(req->cancel, request);
+        if (req->cancel && fa_load32(req->cancel)) { r = FA_ERROR_BUSY; goto done; }
+        if (WinHttpSendRequest(request, wheaders && wheaders[0] ? wheaders : WINHTTP_NO_ADDITIONAL_HEADERS,
+                               wheaders && wheaders[0] ? (DWORD)-1L : 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+            WinHttpReceiveResponse(request, NULL))
+            break;
+        /* A pooled connection that the server closed in the meantime fails before any
+         * response, and WinHTTP doesn't try again by itself (curl, URLSession and
+         * HttpURLConnection do). A GET is safe to repeat: once, on a new connection. */
+        err = GetLastError();
+        if (attempt > 0 || (err != ERROR_WINHTTP_CONNECTION_ERROR && err != ERROR_WINHTTP_INVALID_SERVER_RESPONSE) ||
+            (req->cancel && fa_load32(req->cancel)))
+            goto done;
+        if (!slot_remove(slot)) WinHttpCloseHandle(request);
+        request = NULL;
+        slot = -1;
+    }
 
     size = sizeof(status);
     WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX,
