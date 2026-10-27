@@ -198,6 +198,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Web streams: the requests of one stream share their connections (curl, WinHTTP, URLSession; Android's
+  `HttpURLConnection` pools by itself), so an `https://` HLS start makes one TLS handshake instead of one per playlist,
+  key and segment: with a 100 ms round trip the first audio comes about 0.5 s sooner. HLS byte-range segments ask for
+  their exact range (`Range: bytes=N-M`) instead of everything from N on. See
+  [web streams](docs/features/web-streams.md#connections).
+- Web streams: FatzAudio follows redirects itself on every transport. WinHTTP and URLSession now follow an `https://`
+  to `http://` redirect too, as curl and Android did, and like them keep no cookie store: a cookie a server sets
+  during a redirect is not sent to the next hop any more (the app's own `Cookie` line still is).
 - Web streams: one request-header walk for every transport (plain HTTP, curl, WinHTTP, URLSession,
   HttpURLConnection), so all of them send the same headers: `Accept: */*` and `Accept-Encoding: identity` everywhere
   now, an app header replaces the built-in one of the same name instead of being sent twice, and invalid app lines
@@ -326,6 +334,10 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- Web streams: credentials from the URL (`https://user:password@host/...`) were still sent after a redirect to
+  another server on Windows (WinHTTP) and Apple (URLSession). Now they go only to the URL's own scheme, host and port,
+  and the app's `Authorization` and `Cookie` header lines likewise, on every transport
+  ([redirects](docs/features/web-streams.md#redirects)).
 - Output limiter: after a reduction the gain now releases all the way back to 1. It used to stop about 0.002 dB short
   (float rounding in the release step), so everything after the first loud peak played that much quieter until the
   device was reset. Output after a reduction changes by that amount; audio that never reached the ceiling is unchanged.

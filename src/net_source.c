@@ -45,6 +45,7 @@ void fa_net_request(fa_net* n, fa_http_request* req, const char* url)
     req->proxy = n->cfg.proxy;
     req->timeout_ms = n->cfg.timeout_ms;
     req->cancel = &n->cancel;
+    req->session = n->http;
 }
 
 /* ---- the window ------------------------------------------------------------ */
@@ -411,6 +412,7 @@ static void download_main(void* arg)
     int hops = 0;
     uint32_t backoff = 250;
     int64_t fail_start = 0;
+    n->http = fa_http_session_create();   /* only this thread uses it */
     fa_mutex_lock(&n->lock);
     while (!n->quit && url) {
         fa_http_request req;
@@ -503,6 +505,8 @@ static void download_main(void* arg)
     n->thread_done = 1;
     fa_cond_broadcast(&n->cond);
     fa_mutex_unlock(&n->lock);
+    fa_http_session_destroy(n->http);    /* fa_net_close frees n only after joining this thread */
+    n->http = NULL;
     free(url);
 }
 

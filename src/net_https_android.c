@@ -375,7 +375,7 @@ static jobject open_connection(JNIEnv* env, const fa_http_request* req, const ch
     (*env)->CallVoidMethod(env, conn, J.set_connect_timeout, timeout);
     (*env)->CallVoidMethod(env, conn, J.set_read_timeout, timeout);
     (*env)->CallVoidMethod(env, conn, J.set_use_caches, JNI_FALSE);
-    (*env)->CallVoidMethod(env, conn, J.set_follow, JNI_FALSE);   /* followed here, also to http:// */
+    (*env)->CallVoidMethod(env, conn, J.set_follow, JNI_FALSE);   /* fa_http_fetch follows them */
     clear_exception(env);
     {
         /* HttpURLConnection ignores credentials in the URL: the walk sends them. */
@@ -464,17 +464,10 @@ static fa_result run_response(JNIEnv* env, const fa_http_request* req, const cha
     jbyte* chunk;
     fa_result r = FA_OK;
     if (!headers) return head_err;
-    if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
-        char loc[FA_NET_URL_MAX];
-        if (fa_http_header(headers, "Location", loc, sizeof(loc))) {
-            char* target = (char*)malloc(FA_NET_URL_MAX);
-            if (target && fa_url_resolve(url, loc, target, FA_NET_URL_MAX) == FA_OK) {
-                free(headers);
-                *out_redirect = target;
-                return FA_OK;
-            }
-            free(target);
-        }
+    switch (fa_http_redirect_target(url, status, headers, out_redirect)) {
+    case 1: free(headers); return FA_OK;     /* its body is left unread: the connection closes */
+    case -1: free(headers); return FA_ERROR_NETWORK;
+    default: break;
     }
     memset(&resp, 0, sizeof(resp));
     resp.status = status;
@@ -507,46 +500,39 @@ done:
     return r;
 }
 
-fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user)
+/* HttpURLConnection keeps finished connections in the system's pool by itself (a
+ * body read to its end, then closed, without disconnect()), so a stream needs no
+ * state of its own. */
+struct fa_http_session {
+    int unused;
+};
+
+fa_http_session* fa_http_session_create(void) { return (fa_http_session*)calloc(1, sizeof(fa_http_session)); }
+void fa_http_session_destroy(fa_http_session* s) { free(s); }
+
+fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user,
+                            char** out_redirect)
 {
     JNIEnv* env = java_ready();
-    fa_http_request cur = *req;
-    char* owned = NULL;
     fa_result r = FA_ERROR_NETWORK;
-    int hops;
+    int status = 0, slot = -1, whole = 0;
+    jobject conn = NULL;
+    *out_redirect = NULL;
     if (!env) return FA_ERROR_PROVIDER_MISSING;
-    for (hops = 0; hops <= FA_NET_MAX_REDIRECTS; hops++) {
-        char* next = NULL;
-        fa_url u;
-        if (fa_url_parse(cur.url, &u) != FA_OK) { r = FA_ERROR_INVALID_ARG; break; }
-        if (strcmp(u.scheme, "https") != 0) {
-            r = fa_http_fetch_socket(&cur, on_head, on_data, user, &next);
-        } else if ((*env)->PushLocalFrame(env, 32) != JNI_OK) {
+    if ((*env)->PushLocalFrame(env, 32) != JNI_OK) { clear_exception(env); return FA_ERROR_OUT_OF_MEMORY; }
+    if (req->cancel && fa_load32(req->cancel)) r = FA_ERROR_BUSY;
+    else conn = open_connection(env, req, req->url, &status, &r, &slot);
+    if (conn) {
+        r = run_response(env, req, req->url, conn, status, on_head, on_data, user, out_redirect, &whole);
+        if (!whole) {   /* a body left unread (a redirect, an error, a stop) closes the socket */
+            (*env)->CallVoidMethod(env, conn, J.disconnect);
             clear_exception(env);
-            r = FA_ERROR_OUT_OF_MEMORY;
-        } else {
-            int status = 0, slot = -1, whole = 0;
-            jobject conn = NULL;
-            if (req->cancel && fa_load32(req->cancel)) r = FA_ERROR_BUSY;
-            else conn = open_connection(env, &cur, cur.url, &status, &r, &slot);
-            if (conn) {
-                r = run_response(env, &cur, cur.url, conn, status, on_head, on_data, user, &next, &whole);
-                if (!whole) {   /* a body left unread (a redirect, an error, a stop) closes the socket */
-                    (*env)->CallVoidMethod(env, conn, J.disconnect);
-                    clear_exception(env);
-                }
-            }
-            slot_remove(env, slot);
-            (*env)->PopLocalFrame(env, NULL);
         }
-        if (req->cancel && fa_load32(req->cancel)) { free(next); r = FA_ERROR_BUSY; break; }
-        if (r != FA_OK || !next) { free(next); break; }
-        free(owned);
-        owned = next;
-        cur.url = owned;
-        r = FA_ERROR_NETWORK;    /* too many redirects, unless a later hop answers */
     }
-    free(owned);
+    slot_remove(env, slot);
+    (*env)->PopLocalFrame(env, NULL);
+    if (req->cancel && fa_load32(req->cancel)) r = FA_ERROR_BUSY;
+    if (r != FA_OK) { free(*out_redirect); *out_redirect = NULL; }
     return r;
 }
 
