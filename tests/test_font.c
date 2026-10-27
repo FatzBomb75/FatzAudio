@@ -527,12 +527,76 @@ static void test_font_dir(void)
 #endif
 }
 
+/* Faces opened from one unchanged file share a buffer, freed when the last closes;
+ * a file changed on disk gets a new one. */
+static void test_shared_buffers(void)
+{
+    char a[1024], b[1024];
+    const char* tmp = "font_share_test.ttf";
+    fa_font *f1 = NULL, *f2 = NULL, *f3 = NULL, *f4 = NULL;
+    blob x, y;
+    FILE* fp;
+    CHECK_EQ(fa_font_shared_buffers(), 0);
+    snprintf(a, sizeof(a), "%s/fonts/pair.ttc", FA_TEST_DATA_DIR);
+    snprintf(b, sizeof(b), "%s/fonts/tt.ttf", FA_TEST_DATA_DIR);
+    CHECK_EQ(fa_font_open_file(a, 0, &f1), FA_OK);
+    CHECK_EQ(fa_font_open_file(a, 1, &f2), FA_OK);
+    CHECK_EQ(fa_font_shared_buffers(), 1);
+    CHECK_EQ(fa_font_open_file(b, 0, &f3), FA_OK);
+    CHECK_EQ(fa_font_shared_buffers(), 2);
+    fa_font_close(f1);
+    CHECK_EQ(fa_font_shared_buffers(), 2);
+    CHECK(fa_font_get_info(f2)->glyph_count > 0);   /* still readable */
+    fa_font_close(f3);
+    CHECK_EQ(fa_font_shared_buffers(), 1);
+    fa_font_close(f2);
+    CHECK_EQ(fa_font_shared_buffers(), 0);
+    /* The same path with other contents is a new buffer; the old face keeps its own. */
+    x = load("tt.ttf");
+    y = load("cff.otf");
+    CHECK(x.n && y.n);
+    fp = fopen(tmp, "wb");
+    CHECK(fp);
+    fwrite(x.p, 1, x.n, fp);
+    fclose(fp);
+    CHECK_EQ(fa_font_open_file(tmp, 0, &f1), FA_OK);
+    fp = fopen(tmp, "wb");
+    CHECK(fp);
+    fwrite(y.p, 1, y.n, fp);
+    fclose(fp);
+    CHECK_EQ(fa_font_open_file(tmp, 0, &f4), FA_OK);
+    CHECK_EQ(fa_font_shared_buffers(), 2);
+    CHECK(!fa_font_get_info(f1)->cff && fa_font_get_info(f4)->cff);
+    fa_font_close(f4);
+    fa_font_close(f1);
+    CHECK_EQ(fa_font_shared_buffers(), 0);
+    /* Same size, one byte different (the last byte of a table nothing reads): still a new buffer. */
+    CHECK_EQ(fa_font_open_file(tmp, 0, &f1), FA_OK);
+    y.p[y.n - 1] ^= 0x55;
+    fp = fopen(tmp, "wb");
+    CHECK(fp);
+    fwrite(y.p, 1, y.n, fp);
+    fclose(fp);
+    CHECK_EQ(fa_font_open_file(tmp, 0, &f4), FA_OK);
+    CHECK_EQ(fa_font_shared_buffers(), 2);
+    fa_font_close(f4);
+    fa_font_close(f1);
+    CHECK_EQ(fa_font_shared_buffers(), 0);
+    remove(tmp);
+    free(x.p);
+    free(y.p);
+    /* A file that is no font leaves nothing behind. */
+    CHECK(fa_font_open_file(tmp, 0, &f1) != FA_OK);
+    CHECK_EQ(fa_font_shared_buffers(), 0);
+}
+
 int main(void)
 {
     RUN(test_info_and_maps);
     RUN(test_kerning);
     RUN(test_outlines);
     RUN(test_collection);
+    RUN(test_shared_buffers);
     RUN(test_composite_bomb);
     RUN(test_bad_metrics);
     RUN(test_damage);
