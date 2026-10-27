@@ -1327,6 +1327,7 @@ struct fa_stream {
     int tempo_drained;           /* the chain gave back its tail at the end of the source */
     int jumped_back;             /* a loop jumped back since the last restart (decode side) */
     fa_atomic64 found_end;       /* a source without a length: where it ended when it first looped, -1 = not yet */
+    int mix_end_unknown;         /* mix side: the last marker_events had no end yet (audio thread only) */
     int64_t tempo_frames;        /* chain output frames since the last restart */
     fa_atomic_ptr tmap;          /* fa_tmap*, made with the first chain (NULL = no segments);
                                     kept until the stream is freed */

@@ -3254,8 +3254,13 @@ static void marker_events(struct fa_stream* s, fa_device* dev, const mix_markers
     fa_frames p1 = (fa_frames)(linear_position(s, played1) + 0.5);
     fa_frames end = end_frame(s), back = loop_start(s), w0, w1;
     int looping = loops(s) && end > 0 && end > back;
+    /* A source without a length learns its end when the decoder first reaches it,
+     * which can be after the block that ended exactly there was mixed: that jump
+     * is then counted with the next block. */
+    int late_end = s->mix_end_unknown && p0 == end;
     int i;
     if ((p1 <= p0 && !ended) || reversed(s)) return;
+    s->mix_end_unknown = end <= 0;
     w0 = wrap_position(s, p0);
     w1 = wrap_position(s, p1);
     for (i = 0; i < FA_MARKER_COUNT; i++) {
@@ -3270,7 +3275,7 @@ static void marker_events(struct fa_stream* s, fa_device* dev, const mix_markers
     }
     if (looping && p1 >= end) {
         /* Every jump between p0 and p1: at end, end + len, ... in linear frames. */
-        fa_frames len = end - back, k0 = p0 < end ? 0 : (p0 - end) / len + 1, k;
+        fa_frames len = end - back, k0 = p0 < end || late_end ? 0 : (p0 - end) / len + 1, k;
         for (k = k0; k <= (p1 - end) / len; k++) fa_audio_post_event(dev, s, FA_EVENT_LOOPED, end, back);
     }
 }
