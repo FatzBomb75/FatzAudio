@@ -206,6 +206,13 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   further apart, past about 42 minutes), so players that rely on one seek at once. The audio frames are the same bytes as
   before; the file is 4,612 bytes larger (the table's room, what is left of it joins the padding). Forward-only outputs
   are unchanged. See [docs/features/recording-encoding.md](docs/features/recording-encoding.md#how-it-behaves).
+- DJ mixer, with output identical to the bit: each deck converts its trim and EQ settings to gains (`powf`), and the
+  crossfader its position to the two sides' gains (sin/cos, once for both decks), only when they change, instead of
+  at both ends of every 16-frame piece of every deck: a two-deck mixer block runs about 7% fewer instructions with
+  steady settings (6% while the crossfader and EQ move). A mixer made with `FA_MIXER_CUE_LOWEST_LATENCY` no
+  longer allocates the master's alignment delay line (256 KB at 48 kHz), which it never uses, and its meters keep no
+  room for that delay. A beat jump with a deck loop on moves the loop and the position in one join instead of three
+  (loop off, jump, loop on), each of which waited for the audio thread and restarted the stretcher.
 - Lyrics: surfaces that use the same font file (a main screen and an operator preview) share one copy of it in memory
   instead of reading it once each; a CJK font is 20-40 MB. The copy is freed when the last surface using it closes, and a
   file changed on disk is read again.
@@ -374,6 +381,13 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   `FA_ERROR_NETWORK`, as plain HTTP already did. Before, only plain HTTP had a limit and the others took any size.
 - MIDI: a GS, XG or universal SysEx message cut short (its F7 where the value goes) is ignored. It used to read the
   F7 as the value, so a broken GS master volume message nearly doubled the level.
+- DJ mixer: a beat jump with a deck loop on can no longer leave the deck jumped with its loop off when a step fails:
+  the loop and the position move in one join, or not at all. `fa_deck_load` of a stream on a deck of another mixer
+  now takes it off that deck under that mixer's lock too (both locks in a fixed order, so two mixers loading each
+  other's streams at once cannot deadlock); before, a load on the other mixer at the same moment could detach the
+  stream just loaded, leaving a deck holding a stream that played nowhere. The audio thread reads a deck loop once
+  per helper and once per stream mix, so a loop changed while playing no longer mixes the old out point with the new
+  in point for a block.
 - DJ mixer: changing the crossfader curve with the crossfader away from the ends glides over 5 ms instead of
   stepping the decks by up to 3 dB. `fa_stream_get_loop_region` no longer returns the in point of one change with the
   out point of another.

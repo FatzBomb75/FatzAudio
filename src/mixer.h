@@ -61,6 +61,8 @@ struct fa_deck {
     uint32_t segs_cap;
     /* audio thread */
     float side_w[3];             /* thru, A, B: glide between sides over 5 ms */
+    float gain_in[DECK_LANES];   /* lane_gain's last dB per lane (trim, EQ), and its gain */
+    float gain_out[DECK_LANES];
     float z[ISO_SECTIONS][2][2]; /* isolator filter memory, per section and channel */
 };
 
@@ -104,6 +106,7 @@ struct fa_mixer {
     fa_lane lanes[MIX_LANES];
     fa_atomic32 curve;           /* fa_xfader_curve */
     float curve_w;               /* audio thread: blend toward the linear curve (0..1), glides 5 ms */
+    float xf_in[2], xf_out[2];   /* audio thread: the last crossfader gains (curve blend, position -> A, B) */
     fa_cue_mode cue_mode;
     uint32_t cue_channel;
     uint32_t flags;              /* FA_MIXER_* */

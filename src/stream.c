@@ -1241,15 +1241,33 @@ static fa_frames end_frame(struct fa_stream* s)
     return r[1] > 0 ? r[1] : song_end(s);
 }
 
-static fa_frames loop_start(struct fa_stream* s)
+/* One reading of the loop: where playback ends or turns (end_frame), where it turns
+ * back to (loop_start) and whether it loops. A helper that needs more than one of
+ * them takes them from one reading, so it never mixes an old deck loop's out point
+ * with a new one's in point (the audio thread reads the region without a lock). */
+typedef struct loop_view {
+    fa_frames end, back;
+    int loops;
+} loop_view;
+
+static loop_view loop_view_of(struct fa_stream* s)
 {
     const fa_frames* r = region_of(s);
-    fa_frames in, end;
-    if (r[1] > 0) return r[0];
-    in = marker(s, FA_MARKER_CUE_IN);
-    end = end_frame(s);
-    return (in != FA_FRAMES_UNSET && (end < 0 || in < end)) ? in : 0;
+    fa_frames in = r[0], out = r[1];
+    loop_view v;
+    v.loops = (fa_load32(&s->loop) || out > 0) && s->decoder.seekable;
+    if (out > 0) {
+        v.end = out;
+        v.back = in;
+    } else {
+        v.end = song_end(s);
+        in = marker(s, FA_MARKER_CUE_IN);
+        v.back = (in != FA_FRAMES_UNSET && (v.end < 0 || in < v.end)) ? in : 0;
+    }
+    return v;
 }
+
+static fa_frames loop_start(struct fa_stream* s) { return loop_view_of(s).back; }
 
 /* ---- reverse ------------------------------------------------------------------ */
 
@@ -1527,20 +1545,22 @@ static int64_t frames_until(struct fa_stream* s, int64_t played, double target)
 /* Wraps a linear position into the loop (CUE_IN..CUE_OUT) of looping streams, and
  * clamps it to the end of other streams. Reversed, the loop wraps at its start and
  * other streams stop at theirs. */
-static fa_frames wrap_position(struct fa_stream* s, fa_frames pos)
+static fa_frames wrap_in(struct fa_stream* s, const loop_view* v, fa_frames pos)
 {
-    fa_frames end = end_frame(s);
+    fa_frames end = v->end, back = v->back, len = end - back;
     if (reversed(s)) {
-        fa_frames back = loop_start(s), len = end - back;
-        if (loops(s) && len > 0 && pos < back) return end - 1 - (back - 1 - pos) % len;
+        if (v->loops && len > 0 && pos < back) return end - 1 - (back - 1 - pos) % len;
         return pos < back ? back : pos;
     }
-    if (loops(s) && end > 0 && pos >= end) {
-        fa_frames back = loop_start(s), len = end - back;
-        return len > 0 ? back + (pos - end) % len : back;
-    }
+    if (v->loops && end > 0 && pos >= end) return len > 0 ? back + (pos - end) % len : back;
     if (end >= 0 && pos > end) pos = end;
     return pos;
+}
+
+static fa_frames wrap_position(struct fa_stream* s, fa_frames pos)
+{
+    loop_view v = loop_view_of(s);
+    return wrap_in(s, &v, pos);
 }
 
 /* Source position from the frames the device has consumed. Exact for a fixed
@@ -2303,19 +2323,32 @@ static int64_t jump_point(struct fa_stream* s, fa_frames at, int64_t played, int
  * that is decoded ahead and at least FA_LOOP_MARGIN_MS ahead of the mix; `at` < 0 or
  * already that close joins a margin ahead of the mix. FA_ERROR_BUSY while `at` (or
  * the margin) is not decoded yet, or the stream is not playing from its ring: try
- * again later. */
-fa_result fa_stream_jump(struct fa_stream* s, fa_frames at, fa_frames delta)
+ * again later. `region` (in, out) also sets the deck loop at the join, so a loop
+ * moves with the jump in one step; NULL keeps it. */
+static fa_result jump(struct fa_stream* s, fa_frames at, fa_frames delta, const fa_frames* region)
 {
     fa_result r = FA_ERROR_BUSY;
-    if (!s) return FA_ERROR_INVALID_ARG;
     if (s->push || !s->decoder.seekable) return FA_ERROR_NOT_SEEKABLE;
     fa_mutex_lock(&s->api_lock);
     if (reversed(s) && is_attached(s) && fa_load32(&s->state) == FA_STATE_PLAYING) {
         /* Reversed: at once, as a seek (the join is made for forward playback). */
         fa_frames x = target_position(s) + delta, last = s->decoder.length > 0 ? s->decoder.length - 1 : -1;
+        fa_frames old[2];
         if (x < 0) x = 0;
         if (last >= 0 && x > last) x = last;
+        old[0] = region_of(s)[0];
+        old[1] = region_of(s)[1];
+        if (region) {
+            fa_mutex_lock(&s->decode_lock);
+            region_store(s, region[0], region[1]);
+            fa_mutex_unlock(&s->decode_lock);
+        }
         r = seek_locked(s, x);
+        if (r != FA_OK && region) {   /* not moved: the loop stays where it was */
+            fa_mutex_lock(&s->decode_lock);
+            region_store(s, old[0], old[1]);
+            fa_mutex_unlock(&s->decode_lock);
+        }
         fa_mutex_unlock(&s->api_lock);
         return r;
     }
@@ -2355,6 +2388,7 @@ fa_result fa_stream_jump(struct fa_stream* s, fa_frames at, fa_frames delta)
             if (x < 0) x = 0;
             if (last >= 0 && x > last) x = last;
             lin = (double)x + (lj - floor(lj + 0.5));      /* keeps the fraction of a frame */
+            if (region) region_store(s, region[0], region[1]);
             fa_store64(&s->ring.write, j);
             fa_tmap_truncate(m, j);
             fa_tmap_add(m, j, lin, sr / dr * speed_now(s, (int64_t)((double)j * sr / dr + 0.5), s->tempo && fa_tempo_engaged(s->tempo)));
@@ -2365,6 +2399,22 @@ fa_result fa_stream_jump(struct fa_stream* s, fa_frames at, fa_frames delta)
     fa_mutex_unlock(&s->decode_lock);
     fa_mutex_unlock(&s->api_lock);
     return r;
+}
+
+fa_result fa_stream_jump(struct fa_stream* s, fa_frames at, fa_frames delta)
+{
+    if (!s) return FA_ERROR_INVALID_ARG;
+    return jump(s, at, delta, NULL);
+}
+
+fa_result fa_stream_jump_loop(struct fa_stream* s, fa_frames delta, fa_frames in, fa_frames out)
+{
+    fa_frames region[2];
+    if (!s || in < 0 || out <= in) return FA_ERROR_INVALID_ARG;
+    if (s->decoder.length >= 0 && out > s->decoder.length) return FA_ERROR_INVALID_ARG;
+    region[0] = in;
+    region[1] = out;
+    return jump(s, -1, delta, region);
 }
 
 FA_API fa_result FA_CALL fa_stream_set_mute(fa_stream* stream, int32_t muted)
@@ -3230,20 +3280,16 @@ static float marker_gain(const mix_markers* mk, double pos)
     return g;
 }
 
-/* Source position for the fades: wrapped into the loop, not clamped. */
-static double fade_position(struct fa_stream* s, int64_t played)
+/* Source position for the fades: wrapped into the loop `v`, not clamped. */
+static double fade_position(struct fa_stream* s, const loop_view* v, int64_t played)
 {
     double lin = linear_position(s, played);
-    fa_frames end = end_frame(s);
+    fa_frames end = v->end, back = v->back, len = end - back;
     if (reversed(s)) {
-        fa_frames back = loop_start(s), len = end - back;
-        if (loops(s) && len > 0 && lin < (double)back) return (double)end - fmod((double)back - lin, (double)len);
+        if (v->loops && len > 0 && lin < (double)back) return (double)end - fmod((double)back - lin, (double)len);
         return lin;
     }
-    if (loops(s) && end > 0 && lin >= (double)end) {
-        fa_frames back = loop_start(s), len = end - back;
-        if (len > 0) return (double)back + fmod(lin - (double)end, (double)len);
-    }
+    if (v->loops && end > 0 && lin >= (double)end && len > 0) return (double)back + fmod(lin - (double)end, (double)len);
     return lin;
 }
 
@@ -3252,8 +3298,9 @@ static void marker_events(struct fa_stream* s, fa_device* dev, const mix_markers
 {
     fa_frames p0 = (fa_frames)(linear_position(s, played0) + 0.5);
     fa_frames p1 = (fa_frames)(linear_position(s, played1) + 0.5);
-    fa_frames end = end_frame(s), back = loop_start(s), w0, w1;
-    int looping = loops(s) && end > 0 && end > back;
+    loop_view v = loop_view_of(s);
+    fa_frames end = v.end, back = v.back, w0, w1;
+    int looping = v.loops && end > 0 && end > back;
     /* A source without a length learns its end when the decoder first reaches it,
      * which can be after the block that ended exactly there was mixed: that jump
      * is then counted with the next block. */
@@ -3261,8 +3308,8 @@ static void marker_events(struct fa_stream* s, fa_device* dev, const mix_markers
     int i;
     if ((p1 <= p0 && !ended) || reversed(s)) return;
     s->mix_end_unknown = end <= 0;
-    w0 = wrap_position(s, p0);
-    w1 = wrap_position(s, p1);
+    w0 = wrap_in(s, &v, p0);
+    w1 = wrap_in(s, &v, p1);
     for (i = 0; i < FA_MARKER_COUNT; i++) {
         fa_frames m = mk->m[i];
         int hit;
@@ -3322,16 +3369,18 @@ static void frame_events(struct fa_stream* s, fa_device* dev, int64_t played0, i
                          void (*post)(struct fa_stream*, fa_device*, fa_frames, fa_frames))
 {
     fa_frames p0, p1, end, back, w0, w1;
+    loop_view v;
     p0 = (fa_frames)(linear_position(s, played0) + 0.5);
     p1 = (fa_frames)(linear_position(s, played1) + 0.5);
     if (p1 <= p0 && !ended) return;
-    end = end_frame(s);
-    back = loop_start(s);
-    w0 = wrap_position(s, p0);
-    w1 = wrap_position(s, p1);
-    if (loops(s) && end > back && p1 - p0 >= end - back) {
+    v = loop_view_of(s);
+    end = v.end;
+    back = v.back;
+    w0 = wrap_in(s, &v, p0);
+    w1 = wrap_in(s, &v, p1);
+    if (v.loops && end > back && p1 - p0 >= end - back) {
         post(s, dev, back, end);
-    } else if (loops(s) && end > back && w1 < w0) {
+    } else if (v.loops && end > back && w1 < w0) {
         post(s, dev, w0, end);
         post(s, dev, back, w1);
     } else {
@@ -3348,6 +3397,7 @@ static void frame_events(struct fa_stream* s, fa_device* dev, int64_t played0, i
 static void position_events(struct fa_stream* s, fa_device* dev, int64_t played0, int64_t played1, int ended)
 {
     fa_frames p0, p1, end, back, len, w0, w1, at[FA_POSITION_EVENT_SLOTS];
+    loop_view v;
     int64_t dist[FA_POSITION_EVENT_SLOTS];
     int rev, looping, whole, i, j, n = 0;
     if (fa_load32(&s->pos_armed) <= 0) return;
@@ -3355,13 +3405,14 @@ static void position_events(struct fa_stream* s, fa_device* dev, int64_t played0
     p0 = (fa_frames)(linear_position(s, played0) + 0.5);
     p1 = (fa_frames)(linear_position(s, played1) + 0.5);
     if (rev ? p1 >= p0 : (p1 <= p0 && !ended)) return;
-    end = end_frame(s);
-    back = loop_start(s);
+    v = loop_view_of(s);
+    end = v.end;
+    back = v.back;
     len = end - back;
-    looping = loops(s) && end > 0 && len > 0;
+    looping = v.loops && end > 0 && len > 0;
     whole = looping && (rev ? p0 - p1 : p1 - p0) >= len;   /* a whole turn or more: every frame */
-    w0 = wrap_position(s, p0);
-    w1 = wrap_position(s, p1);
+    w0 = wrap_in(s, &v, p0);
+    w1 = wrap_in(s, &v, p1);
     for (i = 0; i < FA_POSITION_EVENT_SLOTS; i++) {
         fa_frames m = fa_load64(&s->pos_events[i]);
         int64_t d;
@@ -3445,26 +3496,23 @@ static int64_t frames_to_mix_point(struct fa_stream* s, int64_t frames)
     fa_frames mix = reversed(s) ? FA_FRAMES_UNSET : marker(s, FA_MARKER_MIX_POINT);
     int64_t xf_ns = fa_load64(&s->xfade_ns);
     double sr = (double)s->decoder.format.sample_rate;
+    loop_view v = loop_view_of(s);
     /* A loop has no end to count back from: it hands over at its MIX_POINT only. */
-    if (mix == FA_FRAMES_UNSET && xf_ns > 0 && !loops(s) && !reversed(s)) {
-        fa_frames end = end_frame(s);
-        if (end >= 0) {
-            mix = end - (fa_frames)((double)xf_ns * sr / 1e9 + 0.5);
+    if (mix == FA_FRAMES_UNSET && xf_ns > 0 && !v.loops && !reversed(s)) {
+        if (v.end >= 0) {
+            mix = v.end - (fa_frames)((double)xf_ns * sr / 1e9 + 0.5);
             if (mix < 0) mix = 0;
         }
     }
     if (mix != FA_FRAMES_UNSET) {
         int64_t played = fa_load64(&s->played), k;
-        double dist = (double)mix - fade_position(s, played);
-        if (dist < 0.0 && loops(s)) {
-            fa_frames end = end_frame(s), back = loop_start(s);
-            if (end > back) dist += (double)(end - back);
-        }
+        double dist = (double)mix - fade_position(s, &v, played);
+        if (dist < 0.0 && v.loops && v.end > v.back) dist += (double)(v.end - v.back);
         k = dist <= 0.0 ? 0 : frames_until(s, played, linear_position(s, played) + dist);
         if (k < frames) return k;
     }
     /* At the end: gapless (or the fallback when the end was not known in advance). */
-    if (!loops(s)) {
+    if (!v.loops) {
         int64_t avail = fa_ring_readable(&s->ring), left = -1;
         int64_t cut = frames_to_cue_out(s, fa_load64(&s->played));
         if (fa_load32(&s->eof)) left = avail;
@@ -3536,7 +3584,8 @@ static int64_t pts_at_played(struct fa_stream* s, int64_t played, int64_t* out_n
 {
     double sr = (double)s->decoder.format.sample_rate, dr = (double)s->dev_rate;
     double pos, lin, slope;
-    fa_frames end;
+    fa_frames end, back;
+    loop_view v;
     if (s->push) {
         /* The app's timestamp at the last timeline restart, plus the source audio
          * heard since then (tempo and rate included, from the position map). */
@@ -3554,17 +3603,18 @@ static int64_t pts_at_played(struct fa_stream* s, int64_t played, int64_t* out_n
     }
     lin = mirror(s, fa_tmap_pos(tmap_of(s), played, (double)fa_load64(&s->seek_base), sr / dr, &slope, out_next));
     *out_ns = (reversed(s) ? -slope : slope) * 1e9 / sr;
-    pos = fade_position(s, played);
-    end = end_frame(s);
+    v = loop_view_of(s);
+    pos = fade_position(s, &v, played);
+    end = v.end;
+    back = v.back;
     if (reversed(s)) {
-        fa_frames back = loop_start(s);
-        if (loops(s) && end > back && pos > (double)back) {   /* device frames until the loop wraps */
+        if (v.loops && end > back && pos > (double)back) {   /* device frames until the loop wraps */
             int64_t wrap = played + frames_until(s, played, lin - (pos - (double)back));
             if (wrap > played && wrap < *out_next) *out_next = wrap;
         } else if (pos < (double)back) {
             pos = (double)back;                            /* the resampler's tail after the start */
         }
-    } else if (end > 0 && loops(s)) {
+    } else if (end > 0 && v.loops) {
         if ((double)end > pos) {                           /* device frames until the loop wraps */
             int64_t wrap = played + frames_until(s, played, lin + ((double)end - pos));
             if (wrap > played && wrap < *out_next) *out_next = wrap;
@@ -3580,12 +3630,12 @@ static void record_clock(struct fa_stream* s, int64_t dev0, int64_t played0, int
 {
     double ns_per_frame;
     int64_t p = played0, stop = played0 + n;
-    fa_frames end = end_frame(s);
+    loop_view v = loop_view_of(s);
     int rev = reversed(s);
-    int64_t end_pts = (!s->push && end >= 0 && !loops(s) && !rev)
-        ? (int64_t)((double)end * 1e9 / (double)s->decoder.format.sample_rate + 0.5) : INT64_MAX;
-    int64_t start_pts = rev && !loops(s)   /* reversed, the clock stops at the start */
-        ? (int64_t)((double)loop_start(s) * 1e9 / (double)s->decoder.format.sample_rate + 0.5) : INT64_MIN;
+    int64_t end_pts = (!s->push && v.end >= 0 && !v.loops && !rev)
+        ? (int64_t)((double)v.end * 1e9 / (double)s->decoder.format.sample_rate + 0.5) : INT64_MAX;
+    int64_t start_pts = rev && !v.loops   /* reversed, the clock stops at the start */
+        ? (int64_t)((double)v.back * 1e9 / (double)s->decoder.format.sample_rate + 0.5) : INT64_MIN;
     while (p < stop) {
         int64_t next, seg, pts0, pts1;
         pts0 = pts_at_played(s, p, &next, &ns_per_frame);
@@ -3621,17 +3671,17 @@ static void net_title_heard(struct fa_stream* s, fa_device* dev)
  * out of reach. A looping stream must not wrap in them either, as blocks end at the
  * loop end (where the fades jump, and where the equalizer's blocks restart). */
 static int steady_gain(struct fa_stream* s, const mix_markers* mk, struct fa_bus* bus, int64_t played, int64_t n,
-                       int looping, fa_frames loop_end)
+                       int looping, const loop_view* lv)
 {
     double pos0, lin0, pos1;
     int p;
     for (p = 0; p < FA_STREAM_LANES; p++) if (s->lanes[p].v.active) return 0;
     if (bus) for (p = 0; p < FA_MIX_PARAMS; p++) if (bus->lanes[p].v.active) return 0;
     if (!looping && mk->fade_in_to < 0 && mk->fade_out_to < 0) return 1;
-    pos0 = fade_position(s, played);
+    pos0 = fade_position(s, lv, played);
     lin0 = linear_position(s, played);
     if (looping) {
-        int64_t to_end = frames_until(s, played, lin0 + ((double)loop_end - pos0));
+        int64_t to_end = frames_until(s, played, lin0 + ((double)lv->end - pos0));
         if (to_end <= n) return 0;
     }
     /* Positions only grow until the wrap; a frame of margin covers the rounding of
@@ -3647,12 +3697,13 @@ static int steady_gain(struct fa_stream* s, const mix_markers* mk, struct fa_bus
  * still runs in blocks of FA_RAMP_BLOCK, as its glides and state go by block (eq is
  * NULL when it is off). */
 static void mix_steady(struct fa_stream* s, fa_device* dev, float* out, int64_t now, int64_t off, int64_t played, int64_t n,
-                       float norm_lin, float mute, const mix_markers* mk, struct fa_bus* bus, fa_stream_eq* eq, fa_tap* tap)
+                       float norm_lin, float mute, const mix_markers* mk, const loop_view* lv, struct fa_bus* bus,
+                       fa_stream_eq* eq, fa_tap* tap)
 {
     float g, l, r, bl = 1.0f, br = 1.0f;
     const float *p1, *p2;
     int64_t n1, n2, done;
-    g = s->lanes[FA_PARAM_VOLUME].v.value * s->lanes[FA_LANE_FADE].v.value * marker_gain(mk, fade_position(s, played));
+    g = s->lanes[FA_PARAM_VOLUME].v.value * s->lanes[FA_LANE_FADE].v.value * marker_gain(mk, fade_position(s, lv, played));
     g *= 1.0f - mute;
     stereo_gains(g * norm_lin, s->lanes[FA_PARAM_PAN].v.value, &l, &r);
     if (bus) {
@@ -3697,6 +3748,7 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
     int64_t avail, n, done = 0, clock, off = 0, played0, hold;
     int p, playing, audible, ended = 0, at_cue_out = 0, looping;
     fa_frames loop_end, loop_back;
+    loop_view lv;                /* the loop as read once for this mix */
     int32_t state;
     float norm_target, norm_lin, mute_target, mute0, mute1;
     mix_markers mk;
@@ -3758,9 +3810,10 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
         int64_t cut = frames_to_cue_out(s, played0);
         if (cut >= 0 && cut <= n) { n = cut; at_cue_out = 1; }
     }
-    loop_end = end_frame(s);
-    loop_back = loop_start(s);
-    looping = loops(s) && loop_end > 0 && loop_end > loop_back;
+    lv = loop_view_of(s);
+    loop_end = lv.end;
+    loop_back = lv.back;
+    looping = lv.loops && loop_end > 0 && loop_end > loop_back;
     mute_target = (float)fa_load32(&s->muted);
     /* Glides only while audio flows: a stream (re)starting starts at the setting, so
      * one muted before it plays never sounds. */
@@ -3772,8 +3825,8 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
                               (fa_load32(&s->eq_restart) && fa_exchange32(&s->eq_restart, 0)) | (s->mute_next != clock + off));
 
     if (n > 0 && !fa_load32(&dev->mix_blockwise) && mute0 == mute_target && s->norm_db == norm_target &&
-        steady_gain(s, &mk, bus, played0, n, looping, loop_end)) {
-        mix_steady(s, dev, out + off * 2, clock + off, off, played0, n, norm_lin, mute0, &mk, bus, eq_on ? eq : NULL, tap);
+        steady_gain(s, &mk, bus, played0, n, looping, &lv)) {
+        mix_steady(s, dev, out + off * 2, clock + off, off, played0, n, norm_lin, mute0, &mk, &lv, bus, eq_on ? eq : NULL, tap);
         done = n;
     }
     while (done < n && !ended) {
@@ -3803,7 +3856,7 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
             else if (v->total - v->done > 0 && v->total - v->done < blk) blk = v->total - v->done;
         }
         if (bus) blk = bus_block(bus, clock, now, blk);
-        pos0 = fade_position(s, pl);
+        pos0 = fade_position(s, &lv, pl);
         lin0 = linear_position(s, pl);
         if (looping) {
             /* Blocks end at the loop end, so the fades are not interpolated toward

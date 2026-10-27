@@ -161,7 +161,37 @@ typedef struct mix_edges {
     float v[MIX_LANES][MIXER_EDGES];     /* the value from that edge on */
     float e[MIX_LANES][MIXER_EDGES];     /* the value up to that edge (differs where a jump starts) */
     float lin[MIXER_EDGES];              /* the crossfader curve blend (fa_mixer.curve_w) */
+    float ga[MIXER_EDGES], gb[MIXER_EDGES];     /* the crossfader's side gains from v[ML_XF] */
+    float gae[MIXER_EDGES], gbe[MIXER_EDGES];   /* and from e[ML_XF] */
 } mix_edges;
+
+/* Bit-equal floats (a function of them gives the same result). */
+static int same_bits(float a, float b) { return memcmp(&a, &b, sizeof(a)) == 0; }
+
+/* xfader_gains, kept from the last call while its inputs stay the same: outside a
+ * crossfader move or a curve glide, every sub-block edge. */
+static void xfader_gains_memo(struct fa_mixer* m, float lin, float x, float* ga, float* gb)
+{
+    if (!same_bits(lin, m->xf_in[0]) || !same_bits(x, m->xf_in[1])) {
+        m->xf_in[0] = lin;
+        m->xf_in[1] = x;
+        xfader_gains(lin, x, &m->xf_out[0], &m->xf_out[1]);
+    }
+    *ga = m->xf_out[0];
+    *gb = m->xf_out[1];
+}
+
+/* A deck lane's dB as a linear gain (trim; the EQ bands, where the kill is silence),
+ * kept from the last time while the lane holds the same value: a sub-block's start
+ * is the last one's end except where a ramp starts. */
+static float lane_gain(struct fa_deck* d, int lane, float db)
+{
+    if (!same_bits(db, d->gain_in[lane])) {
+        d->gain_in[lane] = db;
+        d->gain_out[lane] = lane == DL_TRIM ? fa_db_to_lin(db) : band_gain(db);
+    }
+    return d->gain_out[lane];
+}
 
 /* One deck channel over the block: trim, isolator, cue send, fader, meter, crossfader. */
 static void deck_process(struct fa_mixer* m, struct fa_deck* d, const mix_edges* me, int64_t clock, uint32_t rate,
@@ -177,24 +207,22 @@ static void deck_process(struct fa_mixer* m, struct fa_deck* d, const mix_edges*
     for (off = 0, k = 0; off < frames; off += MIXER_SUB, k++) {
         uint32_t n = frames - off < MIXER_SUB ? frames - off : MIXER_SUB, i, j;
         float v0[DECK_LANES], v1[DECK_LANES], w0[3], w1[3];
-        float t0, t1, l0, l1, mi0, mi1, h0, h1, g0, g1, c0, c1, x0, x1, ga0, gb0, ga1, gb1, inv = 1.0f / (float)n;
+        float t0, t1, l0, l1, mi0, mi1, h0, h1, g0, g1, c0, c1, x0, x1, inv = 1.0f / (float)n;
         lane_span(d->lanes, DECK_LANES, clock, clock + off, n, v0, v1);
         for (j = 0; j < 3; j++) {
             w0[j] = d->side_w[j];
             d->side_w[j] = fa_glide(d->side_w[j], (int)j == side ? 1.0f : 0.0f, n, rate);
             w1[j] = d->side_w[j];
         }
-        t0 = fa_db_to_lin(v0[DL_TRIM]); t1 = fa_db_to_lin(v1[DL_TRIM]);
-        l0 = band_gain(v0[DL_LOW]); l1 = band_gain(v1[DL_LOW]);
-        mi0 = band_gain(v0[DL_MID]); mi1 = band_gain(v1[DL_MID]);
-        h0 = band_gain(v0[DL_HIGH]); h1 = band_gain(v1[DL_HIGH]);
+        t0 = lane_gain(d, DL_TRIM, v0[DL_TRIM]); t1 = lane_gain(d, DL_TRIM, v1[DL_TRIM]);
+        l0 = lane_gain(d, DL_LOW, v0[DL_LOW]); l1 = lane_gain(d, DL_LOW, v1[DL_LOW]);
+        mi0 = lane_gain(d, DL_MID, v0[DL_MID]); mi1 = lane_gain(d, DL_MID, v1[DL_MID]);
+        h0 = lane_gain(d, DL_HIGH, v0[DL_HIGH]); h1 = lane_gain(d, DL_HIGH, v1[DL_HIGH]);
         g0 = v0[DL_GAIN]; g1 = v1[DL_GAIN];
         c0 = v0[DL_CUE]; c1 = v1[DL_CUE];
         /* This deck's crossfader gain (its side mix) at both ends of the sub-block. */
-        xfader_gains(me->lin[k], me->v[ML_XF][k], &ga0, &gb0);
-        xfader_gains(me->lin[k + 1], me->e[ML_XF][k + 1], &ga1, &gb1);
-        x0 = w0[0] + w0[1] * ga0 + w0[2] * gb0;
-        x1 = w1[0] + w1[1] * ga1 + w1[2] * gb1;
+        x0 = w0[0] + w0[1] * me->ga[k] + w0[2] * me->gb[k];
+        x1 = w1[0] + w1[1] * me->gae[k + 1] + w1[2] * me->gbe[k + 1];
 #ifdef FA_ISO_SSE
         iso_sse_load(&iv, m, d->z);
 #endif
@@ -253,6 +281,8 @@ void fa_mixer_process(struct fa_mixer* m, fa_device* dev, float* out, uint32_t f
             me.e[p][k] = fa_lane_value_at_frame(&m->lanes[p].v, clock, clock + at, 0);
         }
         me.lin[k] = m->curve_w;
+        xfader_gains_memo(m, me.lin[k], me.e[ML_XF][k], &me.gae[k], &me.gbe[k]);
+        xfader_gains_memo(m, me.lin[k], me.v[ML_XF][k], &me.ga[k], &me.gb[k]);
         if (off >= frames) break;
         m->curve_w = fa_glide(m->curve_w, lin, frames - off < MIXER_SUB ? frames - off : MIXER_SUB, dev->rate);
     }
@@ -407,6 +437,7 @@ FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_confi
     fa_device* dev = NULL;
     fa_result r;
     uint32_t i, channels;
+    int l;
     if (!engine || !out_mixer) return FA_ERROR_INVALID_ARG;
     *out_mixer = NULL;
     fa_mixer_config_init(&c);
@@ -460,6 +491,7 @@ FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_confi
         }
     }
     fa_store32(&m->curve, FA_XFADER_CONSTANT_POWER);
+    xfader_gains(0.0f, 0.0f, &m->xf_out[0], &m->xf_out[1]);   /* the memos start at 0 (xf_in, gain_in) */
     fa_lane_init(&m->lanes[ML_XF], 0.5f);
     fa_lane_init(&m->lanes[ML_MASTER], 1.0f);
     fa_lane_init(&m->lanes[ML_CUE_MIX], 0.0f);
@@ -485,6 +517,7 @@ FA_API fa_result FA_CALL fa_mixer_create(fa_engine* engine, const fa_mixer_confi
         fa_store32(&d->side, side);
         fa_store_float(&d->sync_range, 0.16f);
         d->side_w[side] = 1.0f;
+        for (l = 0; l < DECK_LANES; l++) d->gain_out[l] = l == DL_TRIM ? fa_db_to_lin(0.0f) : band_gain(0.0f);
         r = fa_bus_create(dev, &d->bus);
         if (r == FA_OK) {
             d->bus->deck = d;
@@ -746,18 +779,71 @@ static int deck_heard(struct fa_deck* d)
     return g > 0.001f;   /* -60 dB */
 }
 
+/* The deck of a mixer other than `m` that `s` is on, its mixer kept by `refs` as in
+ * fa_mixer_stream_leaving; NULL when there is none. */
+static struct fa_deck* foreign_deck(struct fa_stream* s, struct fa_mixer* m)
+{
+    struct fa_deck* d = NULL;
+    fa_bus* bus;
+    fa_mutex_lock(&s->api_lock);
+    bus = (fa_bus*)fa_load_ptr(&s->bus);
+    if (bus && bus->deck && bus->deck->mixer != m) d = bus->deck;
+    if (d) fa_fetch_add32(&d->mixer->refs, 1);
+    fa_mutex_unlock(&s->api_lock);
+    return d;
+}
+
+/* The locks of `m` and of `o` (another mixer, or NULL), in address order so that two
+ * mixers loading each other's streams cannot deadlock. */
+static void lock_mixers(struct fa_mixer* m, struct fa_mixer* o)
+{
+    if (o && o < m) fa_mutex_lock(&o->lock);
+    fa_mutex_lock(&m->lock);
+    if (o && o > m) fa_mutex_lock(&o->lock);
+}
+
+static void unlock_foreign(struct fa_deck* od)
+{
+    if (!od) return;
+    fa_mutex_unlock(&od->mixer->lock);
+    fa_fetch_add32(&od->mixer->refs, -1);
+}
+
 FA_API fa_result FA_CALL fa_deck_load(fa_deck* deck, fa_stream* stream, uint32_t flags)
 {
     struct fa_mixer* m;
+    struct fa_deck* od;
     fa_stream* old;
     fa_result r = FA_OK;
+    int od_had = 0;
     if (!deck || (flags & ~FA_DECK_LOAD_FORCE)) return FA_ERROR_INVALID_ARG;
     m = deck->mixer;
     if (stream && stream->engine != m->engine) return FA_ERROR_INVALID_ARG;
-    fa_mutex_lock(&m->lock);
+    /* A stream on a deck of another mixer leaves it under that mixer's lock too, held
+     * with ours, so it stays there if the load fails; looked up again under the locks
+     * in case it moved meanwhile. */
+    for (;;) {
+        struct fa_deck* now;
+        od = stream ? foreign_deck(stream, m) : NULL;
+        lock_mixers(m, od ? od->mixer : NULL);
+        now = stream ? foreign_deck(stream, m) : NULL;
+        if (now) fa_fetch_add32(&now->mixer->refs, -1);   /* when it is `od`, od's own ref keeps it */
+        if (now == od) break;
+        fa_mutex_unlock(&m->lock);
+        unlock_foreign(od);
+    }
+    if (od) od_had = deck_stream(od) == stream;
     old = deck_stream(deck);
-    if (stream == old) { fa_mutex_unlock(&m->lock); return FA_OK; }
-    if (old && !(flags & FA_DECK_LOAD_FORCE) && deck_heard(deck)) { fa_mutex_unlock(&m->lock); return FA_ERROR_BUSY; }
+    if (stream == old) {
+        fa_mutex_unlock(&m->lock);
+        unlock_foreign(od);
+        return FA_OK;
+    }
+    if (old && !(flags & FA_DECK_LOAD_FORCE) && deck_heard(deck)) {
+        fa_mutex_unlock(&m->lock);
+        unlock_foreign(od);
+        return FA_ERROR_BUSY;
+    }
     if (stream) {
         fa_stream_state st = FA_STATE_STOPPED;
         fa_tempo_options o;
@@ -780,8 +866,11 @@ FA_API fa_result FA_CALL fa_deck_load(fa_deck* deck, fa_stream* stream, uint32_t
                 fa_stream_set_tempo_options(stream, &o);
             }
             fa_mutex_unlock(&m->lock);
+            unlock_foreign(od);
             return r;
         }
+        if (od_had) fa_deck_sync_loaded(od);   /* the other mixer's deck is empty now */
+        unlock_foreign(od);
     }
     fa_exchange_ptr(&deck->stream, stream);
     if (stream) fa_stream_beat_grid_now(stream, NULL, NULL, 0, NULL);   /* a module's grid starts rendering now */

@@ -6,7 +6,7 @@
 #if !defined(_WIN32)
 #  define _POSIX_C_SOURCE 200809L
 #endif
-#include "fa_internal.h"
+#include "mixer.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -264,6 +264,43 @@ static void test_seek_past_loop_leaves_it(void)
     CHECK_EQ(idx[0], 50000 % 4096);
     CHECK_EQ(first_jump(idx, n, 0), -1);
     fa_stream_close(s);
+}
+
+/* Moving a playing loop (a beat jump with a loop on) is one join: the jump and the
+ * moved loop start together, a margin ahead of the mix, and the loop turns there. A
+ * call that cannot join leaves both the position and the loop alone. */
+static void test_jump_moves_loop(void)
+{
+    fa_stream* s = playing_saw(400000);
+    int* idx = (int*)malloc(sizeof(int) * 80000);
+    int n = 0, n0, j, j2, margin = (int)(g_rate * 15 / 1000);
+    fa_frames in = -1, out = -1, a;
+    CHECK(s && idx);
+    CHECK_EQ(fa_stream_set_loop_region(s, 20000, 30000), FA_OK);
+    render_saw(s, 35000, idx, &n);                     /* turned once: at 25000 now */
+    CHECK_EQ(first_jump(idx, n, 0), 30000);
+    CHECK_EQ(fa_stream_jump_loop(s, 50000, 70000, 80000), FA_OK);
+    fa_stream_get_loop_region(s, &in, &out);
+    CHECK_EQ(in, 70000);
+    CHECK_EQ(out, 80000);
+    n0 = n;
+    render_saw(s, 30000, idx, &n);
+    j = first_jump(idx, n, n0 - 1);
+    CHECK(j >= n0 && j <= n0 + margin + 1);
+    a = 20000 + (j - 30000) % 10000;                   /* where the old loop played at the join */
+    CHECK_EQ(idx[j], (a + 50000) % 4096);
+    j2 = first_jump(idx, n, j);                        /* then the moved loop turns */
+    CHECK_EQ(j2, j + (80000 - (a + 50000)));
+    CHECK_EQ(idx[j2], 70000 % 4096);
+    CHECK_EQ(fa_stream_jump_loop(s, 1000, 90000, 90000), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_jump_loop(s, 1000, 390000, 400001), FA_ERROR_INVALID_ARG);   /* past the end */
+    CHECK_EQ(fa_stream_detach(s), FA_OK);
+    CHECK_EQ(fa_stream_jump_loop(s, 1000, 1000, 2000), FA_ERROR_BUSY);   /* not playing: nothing moves */
+    fa_stream_get_loop_region(s, &in, &out);
+    CHECK_EQ(in, 70000);
+    CHECK_EQ(out, 80000);
+    fa_stream_close(s);
+    free(idx);
 }
 
 /* Loops follow tempo: with the stretcher engaged the position stays in the loop. */
@@ -633,6 +670,109 @@ static void test_decks_and_lifetime(void)
     free(buf);
 }
 
+/* Two mixers loading each other's streams at once: every load takes the stream off the
+ * other mixer's deck under that mixer's lock, so a deck never ends up holding a stream
+ * another load detached, and the two locks cannot deadlock. After each load the test
+ * looks at both decks under both locks (in the mixer's own order). */
+typedef struct swapper {
+    struct rig* mine;
+    struct rig* other;
+    fa_stream* first;
+    fa_stream* second;
+    int rounds;
+    int errors, broken;
+} swapper;
+
+/* A deck's stream plays through that deck; a stream on a deck's bus is that deck's. */
+static int deck_consistent(fa_deck* d)
+{
+    fa_stream* s = (fa_stream*)fa_load_ptr(&d->stream);
+    return !s || ((fa_bus*)fa_load_ptr(&s->bus) == d->bus && s->device == d->mixer->device);
+}
+
+static int stream_consistent(fa_stream* s)
+{
+    fa_bus* bus = (fa_bus*)fa_load_ptr(&s->bus);
+    return !bus || !bus->deck || fa_load_ptr(&bus->deck->stream) == s;
+}
+
+static int both_consistent(swapper* w)
+{
+    fa_mixer* lo = w->mine->m < w->other->m ? w->mine->m : w->other->m;
+    fa_mixer* hi = lo == w->mine->m ? w->other->m : w->mine->m;
+    int ok;
+    fa_mutex_lock(&lo->lock);
+    fa_mutex_lock(&hi->lock);
+    ok = deck_consistent(w->mine->a) && deck_consistent(w->other->a) && stream_consistent(w->first) &&
+         stream_consistent(w->second);
+    fa_mutex_unlock(&hi->lock);
+    fa_mutex_unlock(&lo->lock);
+    return ok;
+}
+
+static void swap_proc(void* arg)
+{
+    swapper* w = (swapper*)arg;
+    int i;
+    for (i = 0; i < w->rounds; i++) {
+        if (fa_deck_load(w->mine->a, w->first, FA_DECK_LOAD_FORCE) != FA_OK) w->errors++;
+        if (!both_consistent(w)) w->broken++;
+        if (fa_deck_load(w->mine->a, w->second, FA_DECK_LOAD_FORCE) != FA_OK) w->errors++;
+        if (!both_consistent(w)) w->broken++;
+    }
+}
+
+static void test_load_across_mixers(void)
+{
+    rig r1, r2;
+    fa_stream* s1 = open_wav(g_rate * 4, 1, 1000.0);
+    fa_stream* s2 = open_wav(g_rate * 4, 1, 500.0);
+    swapper w1, w2;
+    fa_thread t1, t2;
+    CHECK(s1 && s2 && rig_open(&r1, FA_CUE_NONE) && rig_open(&r2, FA_CUE_NONE));
+    CHECK_EQ(fa_deck_load(r1.a, s1, 0), FA_OK);
+    CHECK_EQ(fa_deck_load(r2.a, s2, 0), FA_OK);
+    memset(&w1, 0, sizeof(w1));
+    memset(&w2, 0, sizeof(w2));
+    w1.mine = &r1; w1.other = &r2; w1.first = s2; w1.second = s1;
+    w2.mine = &r2; w2.other = &r1; w2.first = s1; w2.second = s2;
+    w1.rounds = w2.rounds = 2000;
+    CHECK_EQ(fa_thread_create(&t1, swap_proc, &w1), 0);
+    CHECK_EQ(fa_thread_create(&t2, swap_proc, &w2), 0);
+    fa_thread_join(&t1);
+    fa_thread_join(&t2);
+    CHECK_EQ(w1.errors + w2.errors, 0);
+    CHECK_EQ(w1.broken + w2.broken, 0);
+    CHECK(fa_load_ptr(&r1.a->stream) || fa_load_ptr(&r2.a->stream));   /* the last loads left a stream on a deck */
+    fa_mixer_destroy(r1.m);
+    fa_mixer_destroy(r2.m);
+    fa_stream_close(s1);
+    fa_stream_close(s2);
+}
+
+/* The second-device cue at its lowest latency never delays the master, so the master
+ * has no delay line (taps keep no room for one either). */
+static void test_lowest_latency_no_delay_line(void)
+{
+#if !(defined(__APPLE__) && TARGET_OS_IPHONE)
+    fa_mixer_config c;
+    fa_mixer* m = NULL;
+    fa_device* dev = NULL;
+    int lowest;
+    for (lowest = 0; lowest < 2; lowest++) {
+        fa_mixer_config_init(&c);
+        c.cue_mode = FA_CUE_DEVICE;
+        c.latency = FA_LATENCY_NORMAL;
+        c.flags = lowest ? FA_MIXER_CUE_LOWEST_LATENCY : 0;
+        CHECK_EQ(fa_mixer_create(g_engine, &c, &m), FA_OK);
+        fa_mixer_get_device(m, &dev);
+        CHECK_EQ(m->mdelay.buf == NULL, lowest);
+        CHECK_EQ(dev->align_max == 0, lowest);
+        fa_mixer_destroy(m);
+    }
+#endif
+}
+
 static void test_config_errors(void)
 {
     fa_mixer_config c;
@@ -673,6 +813,7 @@ int main(void)
     RUN(test_loop_far_behind_goes_to_in);
     RUN(test_loop_off_carries_on);
     RUN(test_seek_past_loop_leaves_it);
+    RUN(test_jump_moves_loop);
     RUN(test_loop_with_tempo);
     RUN(test_isolator_flat);
     RUN(test_isolator_kills);
@@ -682,6 +823,8 @@ int main(void)
     RUN(test_cue_split);
     RUN(test_deck_meter);
     RUN(test_decks_and_lifetime);
+    RUN(test_load_across_mixers);
+    RUN(test_lowest_latency_no_delay_line);
     RUN(test_config_errors);
 
     fa_device_close(g_dev);

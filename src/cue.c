@@ -174,13 +174,16 @@ fa_result fa_mixer_cue_create(struct fa_mixer* m, const char* id)
     r = fa_bridge_init(&q->br, CUE_MAX_ADJUST);
     if (r == FA_OK) r = set_id(q, id);
     if (r == FA_OK) r = fa_bridge_size(&q->br, dev->rate, dev->rate, CUE_RING_SECONDS);
-    /* The master's delay line: the most alignment, and a block. */
-    dev->align_max = (uint32_t)((uint64_t)dev->rate * ALIGN_MAX_MS / 1000);
-    for (len = 1024; len < dev->align_max + FA_MIXER_BLOCK; len *= 2) {}
-    m->mdelay.len = len;
-    m->mdelay.gain = 1.0f;
-    m->mdelay.buf = r == FA_OK ? (float*)calloc((size_t)len * FA_DEVICE_CHANNELS, sizeof(float)) : NULL;
-    if (r == FA_OK && !m->mdelay.buf) r = FA_ERROR_OUT_OF_MEMORY;
+    /* The master's delay line: the most alignment, and a block. None for the lowest
+     * latency, where the master is never delayed. */
+    if (!(m->flags & FA_MIXER_CUE_LOWEST_LATENCY)) {
+        dev->align_max = (uint32_t)((uint64_t)dev->rate * ALIGN_MAX_MS / 1000);
+        for (len = 1024; len < dev->align_max + FA_MIXER_BLOCK; len *= 2) {}
+        m->mdelay.len = len;
+        m->mdelay.gain = 1.0f;
+        m->mdelay.buf = r == FA_OK ? (float*)calloc((size_t)len * FA_DEVICE_CHANNELS, sizeof(float)) : NULL;
+        if (r == FA_OK && !m->mdelay.buf) r = FA_ERROR_OUT_OF_MEMORY;
+    }
     if (r == FA_OK) r = cue_open(q, cue_mode_for(dev->open_mode));
     if (r != FA_OK) {
         fa_bridge_free(&q->br);
@@ -393,7 +396,7 @@ void fa_mixer_cue_render(struct fa_mixer* m, fa_device* dev, float* master, uint
     }
     fa_bridge_write(&q->br, q->cue, frames);
     align(m, dev);
-    delay_run(&m->mdelay, dev, master, frames);
+    if (m->mdelay.buf) delay_run(&m->mdelay, dev, master, frames);
 }
 
 /* ---- tests -------------------------------------------------------------------------- */
