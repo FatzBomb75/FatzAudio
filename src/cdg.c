@@ -157,7 +157,7 @@ struct fa_cdg_surface {
     int pixels_drawn;
     fa_surface_history history;   /* the output area each recent revision changed */
     uint32_t present_w, present_h; /* fa_surface_set_presentation_size */
-    int render_ahead;
+    fa_atomic32 render_ahead;     /* changed under work_lock; update_into peeks without it */
     uint32_t ra_w, ra_h;          /* lyric render-ahead: the slots' size and layout */
     uint64_t ra_layout;
     uint32_t gen;                 /* stream->cdg_gen the state belongs to */
@@ -2367,7 +2367,7 @@ static fa_result surface_update(fa_cdg_surface* f, struct fa_stream* s, fa_time 
 /* A frame this many packs older than wanted (1/60 s) is still on time. */
 #define RA_ON_TIME_PACKS 5
 
-static int ra_on(const fa_cdg_surface* f) { return f->render_ahead && f->lay.scaled; }
+static int ra_on(fa_cdg_surface* f) { return fa_load32(&f->render_ahead) && f->lay.scaled; }
 
 /* 1 when packs [a, b) may change the picture (anything but tiles, scrolls, presets
  * and colours does not). Caller holds cdg_lock. */
@@ -2831,7 +2831,7 @@ FA_API fa_result FA_CALL fa_surface_set_render_ahead(fa_surface* surface, int32_
     if (!surface || (enabled != 0 && enabled != 1)) return FA_ERROR_INVALID_ARG;
     fa_mutex_lock(&surface->work_lock);
     if (!enabled) ra_free(surface);
-    surface->render_ahead = enabled;
+    fa_store32(&surface->render_ahead, enabled);
     fa_mutex_unlock(&surface->work_lock);
     return FA_OK;
 }
@@ -2984,7 +2984,7 @@ static void lyric_ra_job(fa_cdg_surface* f, struct fa_stream* s)
     float tempo = stream_tempo(s);
     int k = -1;
     fa_mutex_lock(&f->work_lock);
-    if (f->render_ahead && f->slot[0].px && fa_lyric_ready_for(f->lyric, f->present_w, f->present_h) &&
+    if (fa_load32(&f->render_ahead) && f->slot[0].px && fa_lyric_ready_for(f->lyric, f->present_w, f->present_h) &&
         fa_lyric_layout_revision(f->lyric) == f->ra_layout) {
         fa_mutex_lock(&f->pub_lock);
         if (f->front >= 0 && f->ready < 0) k = 1 - f->front;
@@ -3130,7 +3130,7 @@ static fa_result update_held(fa_cdg_surface* f, struct fa_stream* s, fa_time tim
     int64_t drawing;
     int b[4], i, partial;
     fa_result r;
-    if (f->render_ahead) {
+    if (fa_load32(&f->render_ahead)) {
         r = layout_refresh(f, s);
         if (r != FA_OK) return r;
         if (f->lay.scaled) {
@@ -3175,26 +3175,31 @@ FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* surface, fa_time tim
     if (!s) return FA_ERROR_INVALID_ARG; /* its stream was closed */
     memset(&fr, 0, sizeof(fr));
     if (time == FA_SURFACE_NOW) r = fa_stream_get_clock(s, &time);
-    if (r == FA_OK && surface->lyric && surface->render_ahead) {
-        if (fa_mutex_trylock(&surface->work_lock)) {
-            r = lyric_ra_update(surface, s, time, (uint8_t*)dst, dst_stride, dst_width, dst_height, dst_revision, 1, &fr);
-            fa_mutex_unlock(&surface->work_lock);
-        } else {
-            /* A worker is rendering ahead: what it finished; else wait for it. */
-            r = lyric_ra_update(surface, s, time, (uint8_t*)dst, dst_stride, dst_width, dst_height, dst_revision, 0, &fr);
-            if (r == FA_ERROR_BUSY) {
-                fa_mutex_lock(&surface->work_lock);
-                r = lyric_ra_update(surface, s, time, (uint8_t*)dst, dst_stride, dst_width, dst_height, dst_revision, 1, &fr);
-                fa_mutex_unlock(&surface->work_lock);
+    if (r == FA_OK && surface->lyric) {
+        int pending = 1, locked = 0;
+        if (fa_load32(&surface->render_ahead)) {
+            if (fa_mutex_trylock(&surface->work_lock)) {
+                locked = 1;
+            } else {
+                /* A worker is rendering ahead: what it finished; else wait for it. */
+                r = lyric_ra_update(surface, s, time, (uint8_t*)dst, dst_stride, dst_width, dst_height, dst_revision, 0, &fr);
+                if (r == FA_ERROR_BUSY) r = FA_OK;
+                else pending = 0;
             }
         }
-    } else if (r == FA_OK && surface->lyric) {
-        float tempo = stream_tempo(s);
-        fa_mutex_lock(&surface->work_lock);
-        r = fa_lyric_update(surface->lyric, surface->present_w, surface->present_h, (double)tempo, time, (uint8_t*)dst,
-                            dst_stride, dst_width, dst_height, dst_revision, &fr);
-        fa_store64(&surface->layout_revision, (int64_t)fa_lyric_layout_revision(surface->lyric));
-        fa_mutex_unlock(&surface->work_lock);
+        if (pending) {
+            if (!locked) fa_mutex_lock(&surface->work_lock);
+            /* Checked again under the lock: a set_render_ahead(0) meanwhile freed the
+             * slots, and rendering ahead now would make them again. */
+            if (fa_load32(&surface->render_ahead)) {
+                r = lyric_ra_update(surface, s, time, (uint8_t*)dst, dst_stride, dst_width, dst_height, dst_revision, 1, &fr);
+            } else {
+                r = fa_lyric_update(surface->lyric, surface->present_w, surface->present_h, (double)stream_tempo(s), time,
+                                    (uint8_t*)dst, dst_stride, dst_width, dst_height, dst_revision, &fr);
+                fa_store64(&surface->layout_revision, (int64_t)fa_lyric_layout_revision(surface->lyric));
+            }
+            fa_mutex_unlock(&surface->work_lock);
+        }
     } else if (r == FA_OK) {
         if (fa_mutex_trylock(&surface->work_lock)) {
             r = update_held(surface, s, time, (uint8_t*)dst, dst_stride, dst_width, dst_height, dst_revision, &fr);

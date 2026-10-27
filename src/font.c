@@ -1156,11 +1156,17 @@ typedef struct font_blob {
 enum { BLOB_PENDING, BLOB_READY, BLOB_FAILED };
 
 static font_blob* g_blobs;
-static fa_atomic32 g_blob_lock;   /* held only for list edits, never while reading a file */
+static fa_lazy_mutex g_blob_lock; /* held only for list edits, never while reading a file */
+static fa_cond g_blob_done;       /* a pending entry became ready or failed */
+static int g_blob_cond;           /* g_blob_done made; under the lock */
 static fa_atomic32 g_blob_reads;  /* whole-file reads, for the tests */
 
-static void blob_lock(void) { while (!fa_cas32(&g_blob_lock, 0, 1)) fa_sleep_ms(1); }
-static void blob_unlock(void) { fa_store32(&g_blob_lock, 0); }
+static void blob_lock(void)
+{
+    fa_lazy_mutex_lock(&g_blob_lock);
+    if (!g_blob_cond) g_blob_cond = fa_cond_init(&g_blob_done) == 0;   /* tried again on the next lock */
+}
+static void blob_unlock(void) { fa_lazy_mutex_unlock(&g_blob_lock); }
 
 /* Takes `b` off the list if it is on it; lock held. */
 static void blob_unlink(font_blob* b)
@@ -1219,13 +1225,17 @@ size_t fa_font_file_reads(void) { return (size_t)fa_load32(&g_blob_reads); }
 static int blob_wait(font_blob* b)
 {
     int st;
-    for (;;) {
-        blob_lock();
-        st = b->state;
-        blob_unlock();
-        if (st != BLOB_PENDING) break;
-        fa_sleep_ms(1);
+    blob_lock();
+    while ((st = b->state) == BLOB_PENDING) {
+        if (g_blob_cond) {
+            fa_cond_wait_ms(&g_blob_done, &g_blob_lock.m, UINT32_MAX);
+        } else {   /* no condition variable (out of resources): look again shortly */
+            blob_unlock();
+            fa_sleep_ms(1);
+            blob_lock();
+        }
     }
+    blob_unlock();
     if (st == BLOB_READY) return 1;
     blob_release(b);
     return 0;
@@ -1293,6 +1303,7 @@ fa_result fa_font_open_file(const char* path, uint32_t index, fa_font** out)
                 pending->state = BLOB_FAILED;   /* its waiters look again */
                 blob_unlink(pending);
             }
+            if (g_blob_cond) fa_cond_broadcast(&g_blob_done);
             blob_unlock();
             if (same) b = pending;
             else blob_release(pending);

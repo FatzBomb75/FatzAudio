@@ -1198,9 +1198,10 @@ struct fa_stream {
                                     under decode_lock, or while the mixer skips the stream */
     /* A loop between two source frames (fa_deck_set_loop), over the CUE_IN..CUE_OUT one:
      * region[region_idx] = { in, out }, out 0 = none. Written under api_lock + decode_lock
-     * into the other slot, then region_idx (a change count; slot = idx & 1) moves on, so
-     * readers never see half a change. */
-    fa_frames region[2][2];
+     * into the other slot, then region_idx (a change count; slot = idx & 1) moves on.
+     * Readers copy a slot and retry while region_idx moved meanwhile (a second change
+     * rewrites the slot being read), so they never see half a change. */
+    fa_atomic64 region[2][2];
     fa_atomic32 region_idx;
     fa_atomic32 muted;           /* fa_stream_set_mute */
     float mute_level;            /* audio thread: 0 = audible .. 1 = silent, glides to `muted` */

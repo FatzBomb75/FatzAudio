@@ -158,6 +158,7 @@ Every parameter has a getter: `fa_mixer_get_param`, `fa_deck_get_param` and `fa_
 - `out <= in` turns the loop off; playback carries on from where it is. A seek past the out point also leaves the loop; a seek inside it keeps it.
 - While on, the deck loop replaces the CUE_IN..CUE_OUT loop of `fa_stream_set_loop`. Unloading the deck clears it.
 - Only seekable streams loop (`FA_ERROR_NOT_SEEKABLE`): files, memory and discs, not web radio.
+- If the source fails to seek while a loop is set or moved (an I/O error), the call returns that error and `fa_deck_get_loop` still reports the old loop. As after any failed seek, the deck stops once it has played what it already decoded.
 
 ## Microphones
 

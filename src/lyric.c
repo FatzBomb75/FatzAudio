@@ -306,6 +306,8 @@ struct fa_lyric {
     fa_raster ras;
     float* tmp;
     size_t tmp_cap;
+    struct taps* cols;            /* draw_place's taps per output column, grown like tmp */
+    size_t cols_cap;
 };
 
 static void layer_clear(ly_layer* L)
@@ -1143,6 +1145,18 @@ static int ensure_tmp(fa_lyric* l, size_t floats)
     return 1;
 }
 
+/* draw_place's column taps for `n` output columns; 0 = out of memory. */
+static int ensure_cols(fa_lyric* l, size_t n)
+{
+    taps* c;
+    if (n <= l->cols_cap) return 1;
+    c = (taps*)realloc(l->cols, n * sizeof(taps));
+    if (!c) return 0;
+    l->cols = c;
+    l->cols_cap = n;
+    return 1;
+}
+
 #if LY_SSE
 /* One RGBA pixel to four floats and back (clamped at 255, truncated): the SSE
  * paths below do the scalar arithmetic in the same order, so the result is the
@@ -1219,8 +1233,8 @@ static void draw_place(fa_lyric* l, const ly_layer* L, float cx, float cy, float
         }
         return;
     }
-    cols = (taps*)malloc((size_t)(x1 - x0) * sizeof(taps));
-    if (!cols) return;
+    if (!ensure_cols(l, (size_t)(x1 - x0))) return;
+    cols = l->cols;
     /* Per output column its taps; the source columns they read: [ua, ub). */
     ua = INT32_MAX;
     ub = INT32_MIN;
@@ -1230,10 +1244,7 @@ static void draw_place(fa_lyric* l, const ly_layer* L, float cx, float cy, float
         if (t->n && t->first < ua) ua = t->first;
         if (t->n && t->first + t->n > ub) ub = t->first + t->n;
     }
-    if (ub <= ua || !ensure_tmp(l, (size_t)(ub - ua) * 4)) {
-        free(cols);
-        return;
-    }
+    if (ub <= ua || !ensure_tmp(l, (size_t)(ub - ua) * 4)) return;
     /* tmp is all 0 between rows: each row clears what it used. */
     memset(l->tmp, 0, (size_t)(ub - ua) * 4 * sizeof(float));
     for (y = y0; y < y1; y++) {
@@ -1312,7 +1323,6 @@ static void draw_place(fa_lyric* l, const ly_layer* L, float cx, float cy, float
 #endif
         memset(l->tmp + (size_t)(sa - ua) * 4, 0, (size_t)(sb - sa) * 4 * sizeof(float));
     }
-    free(cols);
 }
 
 /* ---- the intro and ending pages ------------------------------------------------- */
@@ -2196,6 +2206,7 @@ void fa_lyric_free(fa_lyric* l)
     free(l->scratch);
     free(l->master);
     free(l->tmp);
+    free(l->cols);
     fa_path_free(&l->gpath);
     fa_raster_free(&l->ras);
     free(l);
