@@ -839,6 +839,50 @@ static void test_sizes(void)
     fa_stream_close(s);
 }
 
+/* update_into on one thread while another asks for the layout (which records its
+ * revision): every frame reports the layout's revision. Meant for ThreadSanitizer. */
+typedef struct layout_race {
+    fa_surface* f;
+    target t;
+    int bad;
+} layout_race;
+
+static void layout_race_draw(void* p)
+{
+    layout_race* a = (layout_race*)p;
+    fa_surface_frame fr;
+    int i;
+    for (i = 0; i < 40; i++)
+        if (draw_at(a->f, &a->t, (1000 + 25 * i) * MS, &fr) != FA_OK || fr.layout_revision != a->t.lay.layout_revision) a->bad++;
+}
+
+static void test_layout_race(void)
+{
+    fa_stream* s = open_song();
+    fa_lyric_style st;
+    fa_surface_layout l;
+    fa_thread th;
+    layout_race a;
+    int i;
+    CHECK(s != NULL);
+    style(&st, FA_LYRIC_CLASSIC);
+    memset(&a, 0, sizeof(a));
+    CHECK_EQ(fa_lyric_surface_create(s, &st, &a.f), FA_OK);
+    CHECK_EQ(fa_surface_set_presentation_size(a.f, 640, 360), FA_OK);
+    CHECK(target_make(a.f, &a.t));
+    CHECK_EQ(fa_thread_create(&th, layout_race_draw, &a), 0);
+    for (i = 0; i < 200; i++) {
+        memset(&l, 0, sizeof(l));
+        l.struct_size = (uint32_t)sizeof(l);
+        fa_surface_get_layout(a.f, &l);
+    }
+    fa_thread_join(&th);
+    CHECK_EQ(a.bad, 0);
+    fa_surface_destroy(a.f);
+    free(a.t.px);
+    fa_stream_close(s);
+}
+
 static void test_styles(void)
 {
     fa_stream* s = open_song();
@@ -1357,6 +1401,7 @@ int main(void)
     RUN(test_countdown_drawn);
     RUN(test_presets);
     RUN(test_sizes);
+    RUN(test_layout_race);
     RUN(test_styles);
     RUN(test_no_lyrics);
     RUN(test_intro_time);

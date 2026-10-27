@@ -147,7 +147,7 @@ struct fa_cdg_surface {
     fa_cdg_presentation pres;
     int tb;                       /* FA_CDG_TRANSPARENT_BORDER */
     cdg_layout lay;               /* in use; lay.buf_w 0 before the first */
-    uint64_t layout_revision;
+    fa_atomic64 layout_revision;  /* written under work_lock; update_into reads it without */
     uint32_t width, height;       /* the picture's output size (= lay.pic_w, pic_h) */
     uint32_t win_x, win_y, win_w, win_h; /* the part of the screen shown (= lay.crop) */
     uint8_t* pixels;              /* fa_cdg_surface_update's picture; made by its first call */
@@ -1773,7 +1773,7 @@ static fa_result layout_apply(fa_cdg_surface* f, const cdg_layout* l)
     f->width = l->pic_w;
     f->height = l->pic_h;
     f->drawn = 0;
-    f->layout_revision++;
+    fa_store64(&f->layout_revision, fa_load64(&f->layout_revision) + 1);
     if (l->scaled) {
         int x1 = (int)(l->crop[0] + l->crop[2]) + CDG_TILE_W - 1, y1 = (int)(l->crop[1] + l->crop[3]) + CDG_TILE_H - 1;
         f->mx0 = (int)l->crop[0];
@@ -2752,7 +2752,7 @@ FA_API fa_result FA_CALL fa_surface_get_layout(fa_surface* surface, fa_surface_l
         fa_mutex_lock(&surface->work_lock);
         r = fa_lyric_get_layout(surface->lyric, surface->present_w, surface->present_h, &l);
         if (r == FA_OK && l.layout_revision != surface->ra_layout) ra_forget(surface);
-        surface->layout_revision = l.layout_revision;
+        fa_store64(&surface->layout_revision, (int64_t)l.layout_revision);
         fa_mutex_unlock(&surface->work_lock);
         if (r != FA_OK) return r;
         l.struct_size = out_layout->struct_size < sizeof(l) ? out_layout->struct_size : (uint32_t)sizeof(l);
@@ -2789,7 +2789,7 @@ FA_API fa_result FA_CALL fa_surface_get_layout(fa_surface* surface, fa_surface_l
     l.safety_zone_resolved = c->resolved;
     l.margin = c->scaled ? c->n : 0;
     l.padding = c->pad;
-    l.layout_revision = surface->layout_revision;
+    l.layout_revision = (uint64_t)fa_load64(&surface->layout_revision);
     fa_mutex_unlock(&surface->work_lock);
     memcpy(out_layout, &l, l.struct_size);
     return FA_OK;
@@ -2901,7 +2901,7 @@ static fa_result lyric_ra_update(fa_cdg_surface* f, struct fa_stream* s, fa_time
         memset(&lay, 0, sizeof(lay));
         r = fa_lyric_get_layout(f->lyric, f->present_w, f->present_h, &lay);
         if (r != FA_OK) return r;
-        f->layout_revision = lay.layout_revision;
+        fa_store64(&f->layout_revision, (int64_t)lay.layout_revision);
         if (lay.layout_revision != f->ra_layout || !f->slot[0].px) {
             size_t size = (size_t)lay.width * (size_t)lay.height * 4;
             uint8_t *p0, *p1;
@@ -3079,7 +3079,7 @@ FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* surface, fa_time tim
         fa_mutex_lock(&surface->work_lock);
         r = fa_lyric_update(surface->lyric, surface->present_w, surface->present_h, (double)tempo, time, (uint8_t*)dst,
                             dst_stride, dst_width, dst_height, dst_revision, &fr);
-        surface->layout_revision = fa_lyric_layout_revision(surface->lyric);
+        fa_store64(&surface->layout_revision, (int64_t)fa_lyric_layout_revision(surface->lyric));
         fa_mutex_unlock(&surface->work_lock);
     } else if (r == FA_OK) {
         if (fa_mutex_trylock(&surface->work_lock)) {
@@ -3099,7 +3099,7 @@ FA_API fa_result FA_CALL fa_surface_update_into(fa_surface* surface, fa_time tim
     stream_release(s);
     if (r != FA_OK) return r;
     fr.struct_size = out_frame->struct_size < sizeof(fr) ? out_frame->struct_size : (uint32_t)sizeof(fr);
-    fr.layout_revision = surface->layout_revision;
+    fr.layout_revision = (uint64_t)fa_load64(&surface->layout_revision);
     fr.draw_ns = fa_monotonic_ns() - start;
     memcpy(out_frame, &fr, fr.struct_size);
     return FA_OK;
