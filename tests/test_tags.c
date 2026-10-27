@@ -885,7 +885,8 @@ static void test_ffmpeg_files(void)
         fa_tags_close(t);
     }
     {
-        /* Known values: the MP3 (128 kbps CBR, its Info frame counts in) and the AIFF. */
+        /* Known values: the MP3 (128 kbps CBR) and the AIFF. The MP3's 9406 bytes are a
+         * 212-byte ID3v2 tag, a 417-byte LAME Info frame (not audio) and 8777 of audio. */
         char path[512];
         fa_tags* t = NULL;
         fa_stream_info info;
@@ -893,6 +894,8 @@ static void test_ffmpeg_files(void)
         CHECK_EQ(fa_tags_read_path(path, FA_TAGS_NO_PICTURES, &t), FA_OK);
         CHECK_EQ(fa_tags_get_info(t, &info), FA_OK);
         CHECK_NEAR(info.bitrate, 128000, 128000 * 0.2);
+        CHECK_EQ(info.audio_bytes, 8777);
+        CHECK_EQ(info.file_size, 9406);
         CHECK_EQ(info.bits_per_sample, 0);
         fa_tags_close(t);
         data_path(path, sizeof(path), "tags.aiff");

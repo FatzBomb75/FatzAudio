@@ -168,7 +168,7 @@ using var fromStream = engine.OpenStream(File.OpenRead("track.wav"));
 | `has_cdg` | A CD+G graphics stream is present (a `.cdg` next to the file, in its ZIP, or on the disc) |
 | `file_size` | Bytes of the file (of the ZIP for an MP3+G archive), -1 if unknown (live web streams, custom I/O without a `length` callback). .NET: `Info.FileSize` (null if unknown) |
 | `audio_bytes` | Bytes of this audio stream's coded data, without tags, headers or other tracks; -1 if unknown. Exact for WAV, AIFF, CD and MP4; close for MP3, AAC, AC-3, E-AC-3, FLAC, Ogg and single-track Matroska/WebM. .NET: `Info.AudioBytes` |
-| `bitrate` | Average bits per second: `audio_bytes` over the duration, else the codec's nominal rate; 0 if unknown. For a VBR MP3 it includes the small Xing/LAME header frame |
+| `bitrate` | Average bits per second: `audio_bytes` over the duration, else the codec's nominal rate; 0 if unknown. An MP3's Xing/LAME header frame is not counted |
 | `bits_per_sample` | 16, 24, ... for PCM and lossless sources (WAV, AIFF, FLAC, ALAC, WMA Lossless, CD); 0 for lossy codecs |
 
 The same properties come without opening a stream, together with the tags, from `fa_tags_read_path` (see [tags.md](tags.md)).
@@ -193,7 +193,7 @@ In .NET, `stream.PlayOn(device)` attaches (or moves) and plays, and `stream.Deta
 
 ## FLAC
 
-- Seeks are sample exact, with or without a SEEKTABLE. A file without one (FatzAudio's own FLAC encoder writes none, nor does FFmpeg's) is searched: each probe reads one frame header near where the target should be and narrows the range, two to four probes usually find it, and only the frame the search ends on is decoded. A seek takes well under a millisecond. A SEEKTABLE narrows the search to the stretch between two of its points.
+- Seeks are sample exact, with or without a SEEKTABLE. A file without one (FFmpeg's FLAC encoder writes none; FatzAudio's writes one when its output can seek) is searched: each probe reads one frame header near where the target should be and narrows the range, two to four probes usually find it, and only the frame the search ends on is decoded. A seek takes well under a millisecond. A SEEKTABLE narrows the search to the stretch between two of its points.
 - Audio whose compression changes sharply, such as long digital silence followed by music, can take more probes (about a dozen) but still lands exactly.
 
 ## MP3

@@ -136,6 +136,8 @@ struct fa_decoder {
     /* Properties (fa_stream_info), set by the decoder when it knows them;
      * fa_decoder_open fills the rest in for whole-file formats. */
     int64_t audio_bytes;              /* coded audio data, -1 = unknown */
+    int64_t lead_bytes;               /* whole-file formats: bytes before the audio that are not
+                                         audio (an MP3's Xing/LAME frame), left out of audio_bytes */
     uint32_t bitrate;                 /* nominal bits per second, 0 = unknown */
     uint32_t bits_per_sample;         /* PCM and lossless, 0 = lossy or unknown */
     int64_t file_size;                /* -1 = unknown */
@@ -1324,6 +1326,8 @@ struct fa_stream {
     int hist_chain;              /* decode side: `hist` also covers what the chain holds */
     int tempo_drained;           /* the chain gave back its tail at the end of the source */
     int jumped_back;             /* a loop jumped back since the last restart (decode side) */
+    fa_atomic64 found_end;       /* a source without a length: where it ended when it first looped, -1 = not yet */
+    int mix_end_unknown;         /* mix side: the last marker_events had no end yet (audio thread only) */
     int64_t tempo_frames;        /* chain output frames since the last restart */
     fa_atomic_ptr tmap;          /* fa_tmap*, made with the first chain (NULL = no segments);
                                     kept until the stream is freed */

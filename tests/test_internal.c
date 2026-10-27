@@ -1401,6 +1401,73 @@ static void test_short_loop_counts_every_jump(void)
     rec_free(&rec);
 }
 
+typedef struct mem_out { uint8_t* p; size_t n, cap; } mem_out;
+
+static fa_result FA_CALL mem_write(void* user, const void* data, size_t size)
+{
+    mem_out* m = (mem_out*)user;
+    if (m->n + size > m->cap) {
+        size_t cap = (m->n + size) * 2;
+        uint8_t* p = (uint8_t*)realloc(m->p, cap);
+        if (!p) return FA_ERROR_OUT_OF_MEMORY;
+        m->p = p;
+        m->cap = cap;
+    }
+    memcpy(m->p + m->n, data, size);
+    m->n += size;
+    return FA_OK;
+}
+
+/* A looping source without a length (a FLAC written forward only, which leaves its
+ * length unknown): the end is found when the decoder first reaches it, and from
+ * then on the position wraps and LOOPED is raised. */
+static void test_loop_without_length(void)
+{
+    uint32_t len = 5000, i, done = 0;
+    mem_out flac = { NULL, 0, 0 };
+    fa_encoder_output eo = { mem_write, NULL, NULL };
+    fa_encoder_options eopt;
+    fa_encoder* e = NULL;
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_stream_info info;
+    fa_frames pos = -1;
+    float out[2 * 1000], pcm[5000];
+    recorder rec;
+    for (i = 0; i < len; i++) pcm[i] = expected(1, i);   /* on the 16-bit grid: lossless */
+    fa_encoder_options_init(&eopt);
+    eopt.format = FA_ENCODE_FLAC;
+    CHECK_EQ(fa_encoder_create_output(&eo, &flac, &eopt, &e), FA_OK);
+    CHECK_EQ(fa_encoder_write(e, pcm, len, g_dev->rate, 1), FA_OK);
+    CHECK_EQ(fa_encoder_close(e), FA_OK);
+    rec_init(&rec);
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_LOOP;
+    CHECK_EQ(fa_stream_open_memory(g_engine, flac.p, flac.n, &o, &s), FA_OK);
+    if (!s) { free(flac.p); rec_free(&rec); return; }
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK_EQ(info.length_frames, -1);
+    CHECK(info.seekable);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    while (done < 2 * len + 2000) {
+        render(s, out, 1000);
+        for (i = 0; i < 1000; i++) CHECK(out[i * 2] == expected(1, (done + i) % len));
+        done += 1000;
+    }
+    CHECK_EQ(fa_stream_get_position(s, &pos), FA_OK);
+    CHECK_EQ(pos, (fa_frames)(done % len));
+    CHECK_EQ(count_events(&rec, FA_EVENT_LOOPED, 2), 2);
+    fa_mutex_lock(&rec.lock);
+    for (i = 0; i < (uint32_t)rec.count && i < 64; i++)
+        if (rec.ev[i].type == FA_EVENT_LOOPED) CHECK_EQ(rec.ev[i].frame, len);
+    fa_mutex_unlock(&rec.lock);
+    fa_stream_close(s);
+    free(flac.p);
+    rec_free(&rec);
+}
+
 static void test_loop_needs_seekable(void)
 {
     fa_stream* s = NULL;
@@ -1846,6 +1913,7 @@ int main(void)
     RUN(test_source_prefix_dropped);
     RUN(test_loop_toggle_while_playing);
     RUN(test_short_loop_counts_every_jump);
+    RUN(test_loop_without_length);
     RUN(test_loop_needs_seekable);
     RUN(test_mute_glides_and_keeps_volume);
     RUN(test_device_mute);

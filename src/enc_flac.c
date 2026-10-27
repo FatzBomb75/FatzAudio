@@ -13,7 +13,10 @@
  *
  * STREAMINFO is completed at the end (length, frame sizes, MD5 of the audio) when
  * the output can seek; a forward-only output keeps "unknown" there, which the
- * format allows. */
+ * format allows. A seekable output also gets a SEEKTABLE: FLAC_SEEKPOINTS
+ * placeholder points are reserved up front and filled at the end with a point
+ * every 10 s (as `flac` does), or spread evenly over a longer file; the room left
+ * over joins the padding after it. */
 #include "encode.h"
 #include "enc_flac_dsp.h"
 #include <math.h>
@@ -24,6 +27,9 @@
 #endif
 
 #define FLAC_PADDING 4096
+#define FLAC_SEEKPOINTS 256          /* a point every 10 s up to 42 minutes */
+#define FLAC_SEEKPOINT_SIZE 18
+#define FLAC_SEEK_SPACING_S 10
 
 /* ---- MD5 (RFC 1321) ---------------------------------------------------------------- */
 
@@ -431,6 +437,11 @@ typedef struct flac_state {
     int64_t frames, frame_number;
     uint32_t min_frame, max_frame;
     int64_t streaminfo_pos;
+    int64_t seektable_pos;       /* the SEEKTABLE's block header, 0 = none (forward-only output) */
+    int64_t first_frame_pos;     /* where the first frame starts: seek points count from here */
+    /* The first frame at or after each 10 s: sample, byte offset, samples in it */
+    struct { int64_t sample, offset; uint32_t n; } *points;
+    int point_count, point_cap;
     uint32_t seed;
     md5_ctx md5;
     int32_t* pcm;                /* blocksize x channels, interleaved: the block being filled */
@@ -805,6 +816,19 @@ static fa_result encode_frame(flac_state* st, fa_enc_sink* s)
     put(&w, crc & 0xFF, 8);
     flush_bytes(&w);
 
+    if (st->seektable_pos && st->frames >= (int64_t)st->point_count * FLAC_SEEK_SPACING_S * st->f.rate) {
+        if (st->point_count == st->point_cap) {
+            int cap = st->point_cap ? st->point_cap * 2 : 64;
+            void* p = realloc(st->points, (size_t)cap * sizeof(*st->points));
+            if (!p) return FA_ERROR_OUT_OF_MEMORY;
+            st->points = p;
+            st->point_cap = cap;
+        }
+        st->points[st->point_count].sample = st->frames;
+        st->points[st->point_count].offset = s->pos - st->first_frame_pos;
+        st->points[st->point_count].n = (uint32_t)n;
+        st->point_count++;
+    }
     r = fa_sink_write(s, w.buf, w.len);
     if (r != FA_OK) return r;
     if (st->min_frame == 0 || w.len < st->min_frame) st->min_frame = (uint32_t)w.len;
@@ -839,6 +863,45 @@ static fa_result block_header(fa_enc_sink* s, int last, int type, uint32_t size)
 {
     uint8_t h[4] = { (uint8_t)((last ? 0x80 : 0) | type), (uint8_t)(size >> 16), (uint8_t)(size >> 8), (uint8_t)size };
     return fa_sink_write(s, h, 4);
+}
+
+static void be64(uint8_t* b, uint64_t v)
+{
+    int i;
+    for (i = 0; i < 8; i++) b[i] = (uint8_t)(v >> (56 - 8 * i));
+}
+
+/* The SEEKTABLE at the end: every k-th of the points kept, so they fit. The room
+ * left over joins the padding block after it (its old header is zeroed), so tag
+ * editors get it; no points (no audio) leaves all of it to the padding. */
+static fa_result write_seektable(flac_state* st, fa_enc_sink* s)
+{
+    static const uint8_t z[FLAC_SEEKPOINT_SIZE] = { 0 };
+    int k = (st->point_count + FLAC_SEEKPOINTS - 1) / FLAC_SEEKPOINTS, i, used;
+    fa_result r = fa_sink_seek(s, st->seektable_pos);
+    if (k < 1) k = 1;
+    used = (st->point_count + k - 1) / k;
+    if (r == FA_OK && used > 0) r = block_header(s, 0, 3, (uint32_t)used * FLAC_SEEKPOINT_SIZE);
+    for (i = 0; r == FA_OK && i < st->point_count; i += k) {
+        uint8_t b[FLAC_SEEKPOINT_SIZE];
+        be64(b, (uint64_t)st->points[i].sample);
+        be64(b + 8, (uint64_t)st->points[i].offset);
+        b[16] = (uint8_t)(st->points[i].n >> 8);
+        b[17] = (uint8_t)st->points[i].n;
+        r = fa_sink_write(s, b, sizeof(b));
+    }
+    if (r == FA_OK && used < FLAC_SEEKPOINTS) {
+        /* Bytes from here up to the padding: the points not used (and the
+         * SEEKTABLE's header without any), less the new header, plus the old one. */
+        uint32_t left = (uint32_t)(FLAC_SEEKPOINTS - used) * FLAC_SEEKPOINT_SIZE + (used > 0 ? 0 : 4);
+        r = block_header(s, 1, 1, left + FLAC_PADDING);
+        while (r == FA_OK && left > 0) {
+            uint32_t m = left < FLAC_SEEKPOINT_SIZE ? left : FLAC_SEEKPOINT_SIZE;
+            r = fa_sink_write(s, z, m);
+            left -= m;
+        }
+    }
+    return r;
 }
 
 static uint32_t comment_size(const char* key, const char* v) { return v ? (uint32_t)(4 + strlen(key) + 1 + strlen(v)) : 0; }
@@ -948,12 +1011,20 @@ static fa_result flac_begin(void** impl, const fa_enc_format* f, const fa_enc_ta
         if (r == FA_OK) r = write_comment(s, "DATE", t->date);
         if (r == FA_OK) r = write_comment(s, "COMMENT", t->comment);
         if (r == FA_OK) r = write_comment(s, "TRACKNUMBER", trk);
+        /* placeholder seek points, filled in at the end */
+        if (r == FA_OK && s->seekable) {
+            uint8_t ph[FLAC_SEEKPOINT_SIZE] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+            st->seektable_pos = s->pos;
+            r = block_header(s, 0, 3, FLAC_SEEKPOINTS * FLAC_SEEKPOINT_SIZE);
+            for (i = 0; r == FA_OK && i < FLAC_SEEKPOINTS; i++) r = fa_sink_write(s, ph, sizeof(ph));
+        }
         /* padding, so tag editors can add to the tags without rewriting the file */
         if (r == FA_OK) r = block_header(s, 1, 1, FLAC_PADDING);
         for (i = 0; r == FA_OK && i < FLAC_PADDING / 512; i++) {
             static const uint8_t z[512] = { 0 };
             r = fa_sink_write(s, z, sizeof(z));
         }
+        st->first_frame_pos = s->pos;
     }
     return r;
 }
@@ -989,6 +1060,7 @@ static fa_result flac_finish(void* impl, fa_enc_sink* s)
     end = s->pos;
     r = fa_sink_seek(s, st->streaminfo_pos);
     if (r == FA_OK) r = write_streaminfo(st, s, digest);
+    if (r == FA_OK && st->seektable_pos) r = write_seektable(st, s);
     if (r == FA_OK) r = fa_sink_seek(s, end);
     return r;
 }
@@ -1004,6 +1076,7 @@ static void flac_free(void* impl)
     free(st->wbuf);
     free(st->frame);
     free(st->md5buf);
+    free(st->points);
     free(st);
 }
 
