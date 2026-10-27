@@ -46,7 +46,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_SetConfig / GetConfig (+Ptr) | `fa_engine_config` fields at creation; per-stream options | `AudioEngineOptions` | ✅ partially (rate, period, threads, cache dir) |
 | BASS_CONFIG_BUFFER | `fa_open_options.buffer_ms` per stream, default 500 ms ([playback](../features/playback.md#buffer-length)) | `StreamOptions.BufferLength` | ✅ |
 | BASS_CONFIG_NET_TIMEOUT / NET_READTIMEOUT | `fa_net_options.timeout_ms` per stream: connecting, and the longest the server may stay silent ([web streams](../features/web-streams.md#connection-settings)) | `NetworkOptions.Timeout` | ✅ |
-| BASS_CONFIG_NET_BUFFER | Not needed: each web stream keeps up to 4 MB, at most 2 MB ahead of playback | — | ➖ (by design) |
+| BASS_CONFIG_NET_BUFFER | Not needed: each web stream keeps up to 4 MB (a smaller file: its size plus 64 KB), at most 2 MB ahead of playback | — | ➖ (by design) |
 | BASS_CONFIG_NET_PREBUF / NET_PREBUF_WAIT | `fa_net_options.prebuffer_ms` (default 1 s), used at the start and after every stall; opening never waits for it | `NetworkOptions.Prebuffer` | ✅ |
 | BASS_CONFIG_NET_AGENT | `fa_net_options.user_agent` | `NetworkOptions.UserAgent` | ✅ |
 | BASS_CONFIG_NET_PROXY | `fa_net_options.proxy`: `NULL` = system settings (Windows, macOS, Android) and environment, `""` = direct, or `"user:pass@host:port"` | `NetworkOptions.Proxy` | ✅ |
@@ -70,7 +70,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_StreamCreateFile (memory) | `fa_stream_open_memory` | `engine.OpenMemory(bytes)` | ✅ |
 | BASS_StreamCreateFileUser | `fa_stream_open_io`; `close` is called once by `fa_stream_close`, never on a failed open ([custom I/O](../features/streams.md#custom-io-your-own-reader)) | `engine.OpenStream(System.IO.Stream)` | ✅ |
 | BASS_StreamCreateURL | `fa_stream_open_url`: HTTP/HTTPS files with range seeking, Icecast/Shoutcast radio, HLS, `.pls`/`.m3u`; reconnects by itself ([web streams](../features/web-streams.md)) | `engine.OpenUrl(url)` | ✅ WAV/FLAC/MP3/OGG/Opus/AAC/AC-3 built in |
-| BASS_StreamCreateURL with request headers after the URL (`"url\r\nHeader: value\r\n"`) | `fa_net_options.headers`, the same `Name: value` lines; sent with every request, the same way on every platform ([request headers](../features/web-streams.md#request-headers)) | `NetworkOptions.Headers` | ✅ |
+| BASS_StreamCreateURL with request headers after the URL (`"url\r\nHeader: value\r\n"`) | `fa_net_options.headers`, the same `Name: value` lines; sent with every request, the same way on every platform, except `Authorization` and `Cookie`, which only go to the URL's own server (not to other hosts a redirect or playlist leads to) ([request headers](../features/web-streams.md#request-headers)) | `NetworkOptions.Headers` | ✅ |
 | BASS_StreamCreateURL with `https://` on Android | The system's HTTPS (`HttpURLConnection` on the app's Java VM): no SSL library to ship. Android 12+ and .NET for Android need nothing; Java/Kotlin apps on Android 7 to 11 call `fa_android_set_java_vm` once ([web streams](../features/web-streams.md#android)) | automatic (`AudioEngine.SetAndroidJavaVM` if needed) | ✅ |
 | BASS_StreamCreateURL `DOWNLOADPROC` (raw bytes to save a station) | Planned | | 🗓️ |
 | BASS_StreamCreateURL `BASS_STREAM_BLOCK` | Not needed: memory per web stream is bounded (4 MB) and seeking still works | — | ➖ (by design) |

@@ -469,7 +469,9 @@ struct fa_net_options {
     uint32_t struct_size;          /* sizeof(fa_net_options) */
     const char* user_agent;        /* NULL = "FatzAudio/<version>" */
     const char* headers;           /* extra request headers, "Name: value" lines separated
-                                      by "\r\n" or "\n" (cookies, authorization, ...); NULL = none */
+                                      by "\r\n" or "\n" (cookies, authorization, ...); NULL = none.
+                                      Authorization and Cookie go only to the URL's own origin
+                                      (not to other servers a redirect or playlist leads to) */
     const char* proxy;             /* NULL = the system's setting (environment http_proxy /
                                       https_proxy, Windows and macOS proxy settings);
                                       "" = connect directly; "host:port" or

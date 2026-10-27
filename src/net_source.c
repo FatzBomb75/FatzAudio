@@ -1,9 +1,10 @@
 /* The download buffer behind every URL stream.
  *
  * One download thread per stream fetches the resource into a sliding window of
- * bytes (FA_NET_WINDOW, of which at most half is read ahead; a stream that can't
- * seek keeps only the part ahead, FA_NET_AHEAD plus one write, or less for radio
- * with a stated bitrate, see radio_ahead_locked). The decoder reads
+ * bytes (FA_NET_WINDOW, or a smaller file plus one piece, of which at most half is
+ * read ahead; a stream that can't seek keeps only the part ahead, FA_NET_AHEAD
+ * plus one write, or less for radio with a stated bitrate, see radio_ahead_locked).
+ * The decoder reads
  * the window through ordinary fa_io_callbacks. A seek inside the window costs
  * nothing; outside it, the thread reconnects with a Range request at the new
  * position. A connection that drops is re-established for reconnect_ms: files
@@ -46,6 +47,7 @@ void fa_net_request(fa_net* n, fa_http_request* req, const char* url)
     req->timeout_ms = n->cfg.timeout_ms;
     req->cancel = &n->cancel;
     req->session = n->http;
+    req->app_origin = n->cfg.url;   /* entries of a playlist on other servers get no app credentials */
 }
 
 /* ---- the window ------------------------------------------------------------ */
@@ -81,6 +83,12 @@ static int window_write(fa_net* n, const uint8_t* data, size_t size)
         int64_t cap;
         if (!seekable_locked(n) && !n->hls && n->icy_br) n->ahead_limit = radio_ahead_locked(n);
         cap = seekable_locked(n) ? FA_NET_WINDOW : n->ahead_limit + FA_NET_PIECE;
+        if (seekable_locked(n) && n->length + FA_NET_PIECE < cap) {
+            /* A file smaller than the window gets room for all of it plus one piece
+             * (a short jingle needn't hold 4 MiB); nothing is ever read ahead too far. */
+            cap = n->length + FA_NET_PIECE;
+            n->ahead_limit = n->length + 1;
+        }
         n->buf = (uint8_t*)malloc((size_t)cap);
         if (!n->buf) {
             if (n->error == FA_OK) n->error = FA_ERROR_OUT_OF_MEMORY;
@@ -852,7 +860,11 @@ typedef struct small_ctx {
     int status;
     char* final_url;
     size_t final_cap;
+    int64_t offset;          /* the first byte wanted */
+    int64_t skip;            /* bytes before it in this response (a server that ignored Range) */
+    int64_t left;            /* bytes still wanted, -1 = to the end */
     int cut;                 /* stopped early: too large, or out of memory */
+    int bad;                 /* the response does not hold the range */
 } small_ctx;
 
 static int small_head(void* user, const fa_http_response* resp)
@@ -860,6 +872,10 @@ static int small_head(void* user, const fa_http_response* resp)
     small_ctx* c = (small_ctx*)user;
     c->status = resp->status;
     if (c->final_url) snprintf(c->final_url, c->final_cap, "%s", resp->final_url);
+    if (resp->status >= 400) return 0;                    /* fa_http_fetch reports it */
+    if (resp->status == 206 && resp->range_start <= c->offset) c->skip = c->offset - resp->range_start;
+    else if (resp->status == 200 || (resp->status != 206 && c->offset == 0 && c->left < 0)) c->skip = c->offset;
+    else { c->bad = 1; return 1; }        /* a range was asked: only 200 or a 206 holding it will do */
     return 0;
 }
 
@@ -867,6 +883,16 @@ static int small_data(void* user, const uint8_t* data, size_t size)
 {
     small_ctx* c = (small_ctx*)user;
     char* p;
+    int done = 0;
+    if (c->skip > 0) {
+        size_t k = c->skip < (int64_t)size ? (size_t)c->skip : size;
+        c->skip -= (int64_t)k;
+        data += k;
+        size -= k;
+        if (size == 0) return 0;
+    }
+    if (c->left == 0) return 1;              /* more than the range (its end was ignored) */
+    if (c->left > 0 && (int64_t)size >= c->left) { size = (size_t)c->left; done = 1; }
     if (c->len + size > FA_NET_PLAYLIST_MAX) { c->cut = 1; return 1; }
     p = (char*)realloc(c->data, c->len + size + 1);
     if (!p) { c->cut = 1; return 1; }
@@ -874,7 +900,8 @@ static int small_data(void* user, const uint8_t* data, size_t size)
     memcpy(p + c->len, data, size);
     c->len += size;
     p[c->len] = 0;
-    return 0;
+    if (c->left > 0) c->left -= (int64_t)size;
+    return done;
 }
 
 fa_result fa_net_get_small(fa_net* n, const char* url, int64_t offset, int64_t length, char** out, size_t* out_len,
@@ -886,15 +913,20 @@ fa_result fa_net_get_small(fa_net* n, const char* url, int64_t offset, int64_t l
     memset(&c, 0, sizeof(c));
     c.final_url = final_url;
     c.final_cap = final_cap;
+    c.offset = offset > 0 ? offset : 0;
+    c.left = length >= 0 ? length : -1;
     fa_net_request(n, &req, url);
-    if (offset > 0) req.range_start = offset;
+    if (c.offset > 0 || length > 0) {
+        req.range_start = c.offset;
+        req.range_length = length > 0 ? length : 0;
+    }
     r = fa_http_fetch(&req, small_head, small_data, &c);
-    if (r == FA_OK && c.cut) r = FA_ERROR_UNSUPPORTED_FORMAT;   /* never hand on a truncated playlist or key */
+    /* Never hand on a truncated playlist, key or init section. */
+    if (r == FA_OK && (c.cut || c.bad || c.left > 0)) r = FA_ERROR_UNSUPPORTED_FORMAT;
     if (r == FA_OK && !c.data) {
         c.data = (char*)calloc(1, 1);
         if (!c.data) r = FA_ERROR_OUT_OF_MEMORY;
     }
-    if (r == FA_OK && length >= 0 && (int64_t)c.len > length) { c.len = (size_t)length; c.data[c.len] = 0; }
     if (r != FA_OK) { free(c.data); c.data = NULL; c.len = 0; }
     *out = c.data;
     *out_len = c.len;
