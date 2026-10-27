@@ -303,6 +303,19 @@ static void add_property(JNIEnv* env, jobject conn, const char* name, const char
     if (v) (*env)->DeleteLocalRef(env, v);
 }
 
+/* fa_http_each_header's sink: addRequestProperty, which sets a header not set yet. */
+typedef struct property_sink {
+    JNIEnv* env;
+    jobject conn;
+} property_sink;
+
+static int add_header(void* user, const char* name, const char* value)
+{
+    property_sink* p = (property_sink*)user;
+    add_property(p->env, p->conn, name, value, strlen(value));
+    return 0;
+}
+
 /* A proxy from the request's setting: NULL = the system's (ProxySelector). */
 static jobject make_proxy(JNIEnv* env, const char* setting)
 {
@@ -354,7 +367,6 @@ static jobject open_connection(JNIEnv* env, const fa_http_request* req, const ch
     jobject u = jurl ? (*env)->NewObject(env, J.url, J.url_init, jurl) : NULL;
     jobject proxy, conn;
     fa_url parsed;
-    char line[64];
     if (!u || clear_exception(env)) { clear_exception(env); *out_r = FA_ERROR_INVALID_ARG; return NULL; }
     proxy = make_proxy(env, req->proxy);
     conn = proxy ? (*env)->CallObjectMethod(env, u, J.url_open_proxy, proxy) : (*env)->CallObjectMethod(env, u, J.url_open);
@@ -365,37 +377,16 @@ static jobject open_connection(JNIEnv* env, const fa_http_request* req, const ch
     (*env)->CallVoidMethod(env, conn, J.set_use_caches, JNI_FALSE);
     (*env)->CallVoidMethod(env, conn, J.set_follow, JNI_FALSE);   /* followed here, also to http:// */
     clear_exception(env);
-    if (req->user_agent) add_property(env, conn, "User-Agent", req->user_agent, strlen(req->user_agent));
-    /* The bytes as the server stores them: byte ranges and offsets must match. */
-    add_property(env, conn, "Accept-Encoding", "identity", 8);
-    if (req->icy) add_property(env, conn, "Icy-MetaData", "1", 1);
-    if (req->range_start >= 0) {
-        snprintf(line, sizeof(line), "bytes=%lld-", (long long)req->range_start);
-        add_property(env, conn, "Range", line, strlen(line));
-    }
-    if (fa_url_parse(url, &parsed) == FA_OK && parsed.userinfo[0]) {
-        /* HttpURLConnection ignores credentials in the URL: send them as the socket client does. */
-        char auth[512];
-        fa_http_basic_auth(parsed.userinfo, auth, sizeof(auth));
-        add_property(env, conn, "Authorization", auth, strlen(auth));
-    }
-    if (req->headers) {
-        const char* h = req->headers;
-        while (*h) {
-            size_t len = strcspn(h, "\r\n");
-            const char* colon = (const char*)memchr(h, ':', len);
-            if (colon && colon > h && (size_t)(colon - h) < 256) {
-                char name[256];
-                const char* v = colon + 1;
-                size_t nlen = (size_t)(colon - h);
-                while (nlen > 0 && h[nlen - 1] == ' ') nlen--;
-                memcpy(name, h, nlen);
-                name[nlen] = 0;
-                while (v < h + len && (*v == ' ' || *v == '\t')) v++;
-                if (nlen > 0) add_property(env, conn, name, v, (size_t)(h + len - v));
-            }
-            h += len;
-            while (*h == '\r' || *h == '\n') h++;
+    {
+        /* HttpURLConnection ignores credentials in the URL: the walk sends them. */
+        property_sink sink;
+        sink.env = env;
+        sink.conn = conn;
+        if (fa_http_each_header(req, fa_url_parse(url, &parsed) == FA_OK ? &parsed : NULL, add_header, &sink) != FA_OK) {
+            (*env)->CallVoidMethod(env, conn, J.disconnect);
+            clear_exception(env);
+            *out_r = FA_ERROR_OUT_OF_MEMORY;
+            return NULL;
         }
     }
     *out_status = (*env)->CallIntMethod(env, conn, J.response_code);

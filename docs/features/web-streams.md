@@ -62,7 +62,7 @@ fa_stream_open_url(engine, "https://cdn.example.com/show/master.m3u8", &opts, &s
 | `fa_net_options` field | Default | Meaning |
 |---|---|---|
 | `user_agent` | `FatzAudio/<version>` | The User-Agent header |
-| `headers` | none | Extra request headers, `Name: value` lines separated by `\r\n` or `\n`. Sent with every request, HLS segments and keys included |
+| `headers` | none | Extra request headers, `Name: value` lines separated by `\r\n` or `\n`. Sent with every request, HLS segments and keys included ([rules](#request-headers)) |
 | `proxy` | the system's | `NULL` uses the `http_proxy`/`https_proxy`/`no_proxy` environment variables and the Windows, macOS and Android proxy settings. `""` connects directly. Or `"host:port"`, `"http://user:password@host:port"` |
 | `timeout_ms` | 10000 | How long connecting may take, and the longest the server may stay silent before the connection counts as dropped |
 | `prebuffer_ms` | 1000 | Audio buffered before playback starts, and again before it resumes after a stall |
@@ -194,6 +194,27 @@ FatzAudio never bundles a TLS library. HTTPS goes through the system's stack, so
 | Android | `HttpURLConnection` (Conscrypt), called through JNI on the app's Java VM. The app's network security config applies |
 
 Plain `http://` uses FatzAudio's own small HTTP/1.1 client on every platform. It understands Shoutcast's `ICY 200 OK` answers, which some HTTP stacks reject.
+
+### Request headers
+
+Every request sends the same headers on every platform and stack, in this order:
+
+| Header | When |
+|---|---|
+| `User-Agent` | `fa_net_options.user_agent`, or `FatzAudio/<version>` |
+| `Accept: */*` | always |
+| `Accept-Encoding: identity` | always: the bytes as the server stores them, so byte ranges match |
+| `Icy-MetaData: 1` | radio song titles, unless `FA_NET_NO_ICY` |
+| `Range: bytes=N-` | seeks and resumed downloads |
+| `Authorization: Basic ...` | the URL has credentials (`https://user:password@host/...`); sent up front, without waiting for a challenge |
+| your `headers` lines | as given, after the ones above |
+
+A line of yours replaces the header above with the same name (any case), so `"User-Agent: MyApp"` or
+`"Accept: audio/*"` works. Spaces and tabs around the name and the value are trimmed. Lines are dropped when they
+have no `:`, a name that isn't a valid header name, a value with anything but printable ASCII and tabs (encode
+other text, as RFC 8187 or percent-encoding does), or more than 8192 bytes, and
+so are `Host`, `Connection`, `Content-Length` and `Transfer-Encoding`, which the stack sets itself. A user agent
+that breaks the same rules is not sent.
 
 ### Android
 

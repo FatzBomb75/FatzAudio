@@ -108,6 +108,18 @@ static void timed_wait(FAFetchDelegate* d, int ms)
     pthread_cond_timedwait(&d->cond, &d->mutex, &ts);
 }
 
+/* fa_http_each_header's sink (ASCII only). addValue sets a header not set yet,
+ * and joins a repeated app header with a comma. */
+static int add_request_header(void* user, const char* name, const char* value)
+{
+    NSMutableURLRequest* request = (__bridge NSMutableURLRequest*)user;
+    NSString* n = [NSString stringWithUTF8String:name];
+    NSString* v = [NSString stringWithUTF8String:value];
+    if (!n || !v) return 1;
+    [request addValue:v forHTTPHeaderField:n];
+    return 0;
+}
+
 fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user)
 {
     fa_result r = FA_ERROR_NETWORK;
@@ -141,37 +153,14 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
         }
         request = [NSMutableURLRequest requestWithURL:url];
         request.HTTPMethod = @"GET";
-        [request setValue:[NSString stringWithUTF8String:req->user_agent ? req->user_agent : "FatzAudio"] forHTTPHeaderField:@"User-Agent"];
-        /* Raw bytes: no transparent decompression of audio. */
-        [request setValue:@"identity" forHTTPHeaderField:@"Accept-Encoding"];
-        if (req->icy) [request setValue:@"1" forHTTPHeaderField:@"Icy-MetaData"];
         {
-            /* URLSession only answers auth challenges through a delegate: send URL
-             * credentials up front, as the socket client does. */
+            /* URLSession ignores credentials in the URL (it answers challenges only
+             * through a delegate): the walk sends them. It adds Host and the
+             * connection headers itself. */
             fa_url u;
-            if (fa_url_parse(req->url, &u) == FA_OK && u.userinfo[0]) {
-                char auth[512];
-                fa_http_basic_auth(u.userinfo, auth, sizeof(auth));
-                [request setValue:[NSString stringWithUTF8String:auth] forHTTPHeaderField:@"Authorization"];
-            }
-        }
-        if (req->range_start >= 0)
-            [request setValue:[NSString stringWithFormat:@"bytes=%lld-", (long long)req->range_start] forHTTPHeaderField:@"Range"];
-        if (req->headers) {
-            const char* h = req->headers;
-            while (*h) {
-                size_t len = strcspn(h, "\r\n");
-                const char* colon = memchr(h, ':', len);
-                if (colon) {
-                    NSString* name = [[NSString alloc] initWithBytes:h length:(NSUInteger)(colon - h) encoding:NSUTF8StringEncoding];
-                    const char* v = colon + 1;
-                    while (v < h + len && (*v == ' ' || *v == '\t')) v++;
-                    NSString* value = [[NSString alloc] initWithBytes:v length:(NSUInteger)(h + len - v) encoding:NSUTF8StringEncoding];
-                    if (name && value) [request setValue:value forHTTPHeaderField:name];
-                }
-                h += len;
-                while (*h == '\r' || *h == '\n') h++;
-            }
+            if (fa_http_each_header(req, fa_url_parse(req->url, &u) == FA_OK ? &u : NULL, add_request_header,
+                                    (__bridge void*)request) != FA_OK)
+                return FA_ERROR_OUT_OF_MEMORY;
         }
 
         d = [[FAFetchDelegate alloc] init];

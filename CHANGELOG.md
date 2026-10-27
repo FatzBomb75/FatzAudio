@@ -198,6 +198,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Web streams: one request-header walk for every transport (plain HTTP, curl, WinHTTP, URLSession,
+  HttpURLConnection), so all of them send the same headers: `Accept: */*` and `Accept-Encoding: identity` everywhere
+  now, an app header replaces the built-in one of the same name instead of being sent twice, and invalid app lines
+  (no colon, a bad name, a value that isn't printable ASCII, over 8192 bytes, or `Host`/`Connection`/`Content-Length`/
+  `Transfer-Encoding`) are dropped on every platform. Lines up to 8192 bytes now reach the server through curl too
+  (the limit was 1024). See [docs/features/web-streams.md](docs/features/web-streams.md#request-headers).
 - Faster ZIP and HLS, with the same output (2026-10-26): DEFLATE in ZIP karaoke archives decodes through lookup tables
   with a 64-bit bit buffer and word-wide match copies, about 3.3 times as fast (roughly 400 MB/s on one core, on a
   par with zlib); the CRC-32 check works on 8 bytes at a time, about 4.5 times as fast; AES-128 for encrypted HLS

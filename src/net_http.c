@@ -146,12 +146,131 @@ static void percent_decode(const char* in, char* out, size_t cap)
     out[o] = 0;
 }
 
-void fa_http_basic_auth(const char* userinfo, char* out, size_t cap)
+/* "Basic <base64>" for a URL's percent-encoded "user:password". */
+static void basic_auth(const char* userinfo, char* out, size_t cap)
 {
     char plain[256], enc[400];
     percent_decode(userinfo, plain, sizeof(plain));
     fa_base64((const uint8_t*)plain, strlen(plain), enc);
     snprintf(out, cap, "Basic %s", enc);
+}
+
+/* ---- request headers ---------------------------------------------------------- */
+
+/* A header name is an RFC 9110 token. */
+static int valid_name(const char* s)
+{
+    if (!*s) return 0;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || strchr("!#$%&'*+-.^_`|~", c)))
+            return 0;
+    }
+    return 1;
+}
+
+/* A value is printable ASCII and tabs. Other bytes (RFC 9110's obs-text) are
+ * refused: WinHTTP takes headers as UTF-16 and HttpURLConnection throws on them,
+ * so they could not be sent the same way everywhere. */
+static int valid_value(const char* s)
+{
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if ((c < 0x20 && c != '\t') || c >= 0x7F) return 0;
+    }
+    return 1;
+}
+
+static int is_space(char c) { return c == ' ' || c == '\t'; }
+
+static int same_name(const char* a, const char* b) { return fa_strncasecmp_ascii(a, b, strlen(a) + 1) == 0; }
+
+/* The app's header text as "name\0value\0" pairs in `out` (room for strlen(text) + 2),
+ * the valid lines only. Returns the number of pairs. */
+static size_t parse_app_headers(const char* text, char* out)
+{
+    static const char* const owned[] = { "Host", "Connection", "Content-Length", "Transfer-Encoding" };
+    size_t count = 0, i;
+    char* o = out;
+    while (*text) {
+        size_t len = strcspn(text, "\r\n");
+        const char* colon = (const char*)memchr(text, ':', len);
+        if (colon && len <= FA_HTTP_LINE_MAX) {
+            const char* name_end = colon;
+            const char* v = colon + 1;
+            const char* v_end = text + len;
+            char *name = o, *value;
+            int keep;
+            while (name_end > text && is_space(name_end[-1])) name_end--;
+            while (v < v_end && is_space(*v)) v++;
+            while (v_end > v && is_space(v_end[-1])) v_end--;
+            memcpy(o, text, (size_t)(name_end - text));
+            o += name_end - text;
+            *o++ = 0;
+            value = o;
+            memcpy(o, v, (size_t)(v_end - v));
+            o += v_end - v;
+            *o++ = 0;
+            keep = valid_name(name) && valid_value(value);
+            for (i = 0; keep && i < sizeof(owned) / sizeof(owned[0]); i++)
+                if (same_name(name, owned[i])) keep = 0;
+            if (keep) count++;
+            else o = name;
+        }
+        text += len;
+        while (*text == '\r' || *text == '\n') text++;
+    }
+    return count;
+}
+
+fa_result fa_http_each_header(const fa_http_request* req, const fa_url* url, fa_http_header_proc add, void* user)
+{
+    const char* own[6][2];
+    char range[40], auth[512];
+    char* app = NULL;
+    size_t napp = 0, nown = 0, i, j;
+    fa_result r = FA_OK;
+    if (req->headers && req->headers[0]) {
+        app = (char*)malloc(strlen(req->headers) + 2);
+        if (!app) return FA_ERROR_OUT_OF_MEMORY;
+        napp = parse_app_headers(req->headers, app);
+    }
+    if (req->user_agent) { own[nown][0] = "User-Agent"; own[nown++][1] = req->user_agent; }
+    own[nown][0] = "Accept"; own[nown++][1] = "*/*";
+    /* The bytes as the server stores them: byte ranges and offsets must match. */
+    own[nown][0] = "Accept-Encoding"; own[nown++][1] = "identity";
+    if (req->icy) { own[nown][0] = "Icy-MetaData"; own[nown++][1] = "1"; }
+    if (req->range_start >= 0) {
+        snprintf(range, sizeof(range), "bytes=%lld-", (long long)req->range_start);
+        own[nown][0] = "Range"; own[nown++][1] = range;
+    }
+    if (url && url->userinfo[0]) {
+        /* Sent up front by every transport: WinHTTP, URLSession and HttpURLConnection
+         * ignore credentials in the URL or answer challenges only through callbacks. */
+        basic_auth(url->userinfo, auth, sizeof(auth));
+        own[nown][0] = "Authorization"; own[nown++][1] = auth;
+    }
+    for (i = 0; i < nown && r == FA_OK; i++) {
+        const char* p = app;
+        int replaced = 0;
+        for (j = 0; j < napp && !replaced; j++) {
+            replaced = same_name(p, own[i][0]);
+            p += strlen(p) + 1;
+            p += strlen(p) + 1;
+        }
+        if (!replaced && valid_value(own[i][1]) && add(user, own[i][0], own[i][1])) r = FA_ERROR_OUT_OF_MEMORY;
+    }
+    {
+        const char* p = app;
+        for (j = 0; j < napp && r == FA_OK; j++) {
+            const char* name = p;
+            const char* value = p + strlen(p) + 1;
+            p = value + strlen(value) + 1;
+            if (add(user, name, value)) r = FA_ERROR_OUT_OF_MEMORY;
+        }
+    }
+    free(app);
+    return r;
 }
 
 /* ---- sockets ------------------------------------------------------------------ */
@@ -322,6 +441,25 @@ static int body_feed(body_state* b, const uint8_t* p, size_t n, fa_http_data_pro
     return b->chunk_state == 4 ? 2 : 0;
 }
 
+/* The socket client's sink for fa_http_each_header: "Name: value\r\n" lines. */
+typedef struct text_sink {
+    char* buf;
+    size_t n, cap;
+} text_sink;
+
+static int add_text_line(void* user, const char* name, const char* value)
+{
+    text_sink* t = (text_sink*)user;
+    size_t ln = strlen(name), lv = strlen(value);
+    if (t->n + ln + lv + 7 > t->cap) return 1;   /* + ": ", CRLF, and the blank line's CRLF and NUL */
+    memcpy(t->buf + t->n, name, ln);
+    memcpy(t->buf + t->n + ln, ": ", 2);
+    memcpy(t->buf + t->n + ln + 2, value, lv);
+    memcpy(t->buf + t->n + ln + 2 + lv, "\r\n", 2);
+    t->n += ln + lv + 4;
+    return 0;
+}
+
 fa_result fa_http_fetch_socket(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data,
                                void* user, char** out_redirect)
 {
@@ -342,8 +480,9 @@ fa_result fa_http_fetch_socket(const fa_http_request* req, fa_http_head_proc on_
     if (r != FA_OK) return r;
 
     /* Room for every line below: URL (path) twice through a proxy, the app's
-     * headers, the user agent, two auth lines (512 each) and the fixed text. */
-    req_cap = 2 * strlen(req->url) + (req->headers ? strlen(req->headers) : 0) +
+     * headers (each line can grow by its ": " and CRLF), the user agent, two auth
+     * lines (512 each) and the fixed text. */
+    req_cap = 2 * strlen(req->url) + (req->headers ? 2 * strlen(req->headers) : 0) +
               (req->user_agent ? strlen(req->user_agent) : 0) + 2048;
     request = (char*)malloc(req_cap);
     head = (uint8_t*)malloc(FA_HTTP_HEAD_MAX + 1);
@@ -354,33 +493,21 @@ fa_result fa_http_fetch_socket(const fa_http_request* req, fa_http_head_proc on_
         if (url.default_port) snprintf(hostport, sizeof(hostport), "%s%s%s", v6 ? "[" : "", url.host, v6 ? "]" : "");
         else snprintf(hostport, sizeof(hostport), "%s%s%s:%u", v6 ? "[" : "", url.host, v6 ? "]" : "", (unsigned)url.port);
         /* Through a proxy the request line carries the whole URL (without credentials). */
-        n = snprintf(request, req_cap, "GET %s%s%s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\nConnection: close\r\n",
-                     use_proxy ? "http://" : "", use_proxy ? hostport : "", url.path, hostport, req->user_agent);
-    }
-    if (req->icy) n += snprintf(request + n, req_cap - (size_t)n, "Icy-MetaData: 1\r\n");
-    if (req->range_start >= 0) n += snprintf(request + n, req_cap - (size_t)n, "Range: bytes=%lld-\r\n", (long long)req->range_start);
-    if (url.userinfo[0]) {
-        fa_http_basic_auth(url.userinfo, auth, sizeof(auth));
-        n += snprintf(request + n, req_cap - (size_t)n, "Authorization: %s\r\n", auth);
+        n = snprintf(request, req_cap, "GET %s%s%s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n",
+                     use_proxy ? "http://" : "", use_proxy ? hostport : "", url.path, hostport);
     }
     if (use_proxy && proxy.userinfo[0]) {
-        fa_http_basic_auth(proxy.userinfo, auth, sizeof(auth));
+        basic_auth(proxy.userinfo, auth, sizeof(auth));
         n += snprintf(request + n, req_cap - (size_t)n, "Proxy-Authorization: %s\r\n", auth);
     }
-    if (req->headers) {
-        /* The app's lines, normalised to CRLF; empty lines dropped. */
-        const char* h = req->headers;
-        while (*h) {
-            size_t len = strcspn(h, "\r\n");
-            if (len > 0 && (size_t)n + len + 3 < req_cap) {
-                memcpy(request + n, h, len);
-                n += (int)len;
-                request[n++] = '\r';
-                request[n++] = '\n';
-            }
-            h += len;
-            while (*h == '\r' || *h == '\n') h++;
-        }
+    {
+        text_sink sink;
+        sink.buf = request;
+        sink.n = (size_t)n;
+        sink.cap = req_cap;
+        r = fa_http_each_header(req, &url, add_text_line, &sink);
+        if (r != FA_OK) goto done;
+        n = (int)sink.n;
     }
     n += snprintf(request + n, req_cap - (size_t)n, "\r\n");
     r = send_all(req, s, request, (size_t)n);

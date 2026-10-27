@@ -8,6 +8,9 @@ stopped. Trust OUT/ca.crt first:
   iOS simulator: xcrun simctl keychain booted add-root-cert OUT/ca.crt
 
 Usage: serve.py DIR OUT [PORT]   (default port 8443)
+GET /echo-headers answers with the request's header lines as text, which the test
+for request headers (FA_NET_HTTPS_ECHO_URL) checks. Every request's headers are also
+logged to stderr.
 Apple accepts a server certificate valid for at most 825 days, with the
 serverAuth usage and the names in subjectAltName, so this one is made that way.
 """
@@ -34,6 +37,21 @@ def make_certs(out):
         "-sha256", "-extfile", "server.ext", "-out", "server.crt")
 
 
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        lines = "".join("%s: %s\r\n" % (k, v) for k, v in self.headers.items())
+        sys.stderr.write("%s\n%s\n" % (self.requestline, "".join(
+            "%s: %s\n" % (k, v if len(v) <= 200 else v[:200] + "... (%d bytes)" % len(v)) for k, v in self.headers.items())))
+        if self.path != "/echo-headers":
+            return super().do_GET()
+        body = lines.encode("latin-1", "replace")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
@@ -42,7 +60,7 @@ def main():
     make_certs(out)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(os.path.join(out, "server.crt"), os.path.join(out, "server.key"))
-    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=root)
+    handler = functools.partial(Handler, directory=root)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
     # The handshake happens in each request's thread, not in accept(): a client that
     # connects and stalls (a port probe) cannot hold up the next one.

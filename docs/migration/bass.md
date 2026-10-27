@@ -70,6 +70,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_StreamCreateFile (memory) | `fa_stream_open_memory` | `engine.OpenMemory(bytes)` | ✅ |
 | BASS_StreamCreateFileUser | `fa_stream_open_io`; `close` is called once by `fa_stream_close`, never on a failed open ([custom I/O](../features/streams.md#custom-io-your-own-reader)) | `engine.OpenStream(System.IO.Stream)` | ✅ |
 | BASS_StreamCreateURL | `fa_stream_open_url`: HTTP/HTTPS files with range seeking, Icecast/Shoutcast radio, HLS, `.pls`/`.m3u`; reconnects by itself ([web streams](../features/web-streams.md)) | `engine.OpenUrl(url)` | ✅ WAV/FLAC/MP3/OGG/Opus/AAC/AC-3 built in |
+| BASS_StreamCreateURL with request headers after the URL (`"url\r\nHeader: value\r\n"`) | `fa_net_options.headers`, the same `Name: value` lines; sent with every request, the same way on every platform ([request headers](../features/web-streams.md#request-headers)) | `NetworkOptions.Headers` | ✅ |
 | BASS_StreamCreateURL with `https://` on Android | The system's HTTPS (`HttpURLConnection` on the app's Java VM): no SSL library to ship. Android 12+ and .NET for Android need nothing; Java/Kotlin apps on Android 7 to 11 call `fa_android_set_java_vm` once ([web streams](../features/web-streams.md#android)) | automatic (`AudioEngine.SetAndroidJavaVM` if needed) | ✅ |
 | BASS_StreamCreateURL `DOWNLOADPROC` (raw bytes to save a station) | Planned | | 🗓️ |
 | BASS_StreamCreateURL `BASS_STREAM_BLOCK` | Not needed: memory per web stream is bounded (4 MB) and seeking still works | — | ➖ (by design) |

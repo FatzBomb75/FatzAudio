@@ -109,11 +109,35 @@ jobs:
             macOS) tools/lib-size.sh "macOS" build/bin/libfatzaudio.dylib ;;
             *) tools/lib-size.sh "Linux x64" build/bin/libfatzaudio.so ;;
           esac
+      # libcurl (Linux) and WinHTTP (Windows) get the end-to-end HTTPS tests the iOS
+      # simulator has: a local server with a test certificate the system trusts.
+      - name: Start the HTTPS test server (Linux, Windows)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          py=python3; [ "$RUNNER_OS" = "Windows" ] && py=python
+          $py tools/test-https/serve.py tests/data "$RUNNER_TEMP/https" > "$RUNNER_TEMP/https.log" 2>&1 &
+          for i in $(seq 150); do
+            $py -c "import socket; socket.create_connection(('127.0.0.1', 8443), 1)" 2>/dev/null && break
+            sleep 0.2
+          done
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            certutil -addstore -f Root "$RUNNER_TEMP/https/ca.crt"
+          else
+            sudo cp "$RUNNER_TEMP/https/ca.crt" /usr/local/share/ca-certificates/fatzaudio-test.crt
+            sudo update-ca-certificates
+          fi
+          echo "FA_NET_HTTPS_URL=https://127.0.0.1:8443/net/tone_cbr.mp3" >> "$GITHUB_ENV"
+          echo "FA_NET_HTTPS_ECHO_URL=https://user:p%20w@127.0.0.1:8443/echo-headers" >> "$GITHUB_ENV"
       - name: Test
         shell: bash
         env:
           FA_TEST_REQUIRE_LAME: '1'
         run: ctest --test-dir build -C Release -j "$JOBS" --output-on-failure
+      - name: HTTPS test server log
+        if: failure() && runner.os != 'macOS'
+        shell: bash
+        run: cat "$RUNNER_TEMP/https.log"
       # The win-x64 and linux-x64 libraries go into the NuGet package (job "package");
       # the .NET tests below run against these staged copies.
       - name: Stage the native library for the NuGet package
