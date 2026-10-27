@@ -326,6 +326,158 @@ static void test_chained_file(void)
     fa_stream_close(s);
 }
 
+/* A chained file of many links, built from the test files with serial numbers
+ * of their own (as RFC 3533 asks): the links are found by bisection, and the
+ * length and seeks come out as reading the file through gives them. Three long
+ * Opus links (tone.opus's audio pages repeated) make the search jump. Junk
+ * between two links is skipped; a link with the serial of the one before is
+ * found by reading the file through. */
+static uint32_t ogg_crc(const uint8_t* p, size_t n)
+{
+    uint32_t crc = 0;
+    size_t i;
+    int b;
+    for (i = 0; i < n; i++) {
+        crc ^= (uint32_t)p[i] << 24;
+        for (b = 0; b < 8; b++) crc = (crc & 0x80000000u) ? (crc << 1) ^ 0x04C11DB7u : crc << 1;
+    }
+    return crc;
+}
+
+static void put_le32(uint8_t* p, uint32_t v)
+{
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static size_t page_size(const uint8_t* d)
+{
+    size_t n = 27 + d[26], i;
+    for (i = 0; i < d[26]; i++) n += d[27 + i];
+    return n;
+}
+
+/* Appends `name` to out with serial numbers from `serial` on (one per stream in
+ * it), its audio pages (all but the last) `repeat` times; returns its length at
+ * its own rate, or -1. */
+static int64_t append_link(uint8_t* out, size_t* n, const char* name, uint32_t serial, int repeat, uint32_t* rate)
+{
+    size_t size = 0, pos, first = 0, last = 0;
+    uint8_t* d = load_file(name, &size);
+    fa_stream* s;
+    fa_stream_info info;
+    int64_t span = 0, len;
+    uint32_t orig[16], seq[16];
+    int r, nser = 0, j;
+    if (!d || open_file(name, -1, &s, &info) != FA_OK) { free(d); return -1; }
+    fa_stream_close(s);
+    *rate = info.format.sample_rate;
+    len = info.length_frames;
+    for (pos = 0; pos < size; pos += page_size(d + pos)) {
+        if (!first && (int64_t)fa_le64(d + pos + 6) > 0) first = pos;   /* the first audio page */
+        last = pos;
+    }
+    if (repeat > 1) {
+        /* The repeated pages start and end on whole packets; their audio is `span`. */
+        size_t before = last - 1, p;
+        for (p = first; p < last; p += page_size(d + p)) before = p;
+        if (!first || (d[first + 5] & 1) || d[before + 27 + d[before + 26] - 1] == 255) { free(d); return -1; }
+        span = (int64_t)fa_le64(d + before + 6);
+        len += span * (repeat - 1);
+    }
+    for (r = 0; r < repeat; r++) {
+        for (pos = 0; pos < size; pos += page_size(d + pos)) {
+            uint8_t* pg = out + *n;
+            size_t ps = page_size(d + pos);
+            int64_t g = (int64_t)fa_le64(d + pos + 6);
+            if ((pos < first && r > 0) || (pos >= last && r < repeat - 1)) continue;   /* headers first, the last page last */
+            memcpy(pg, d + pos, ps);
+            for (j = 0; j < nser && orig[j] != fa_le32(pg + 14); j++) {}
+            if (j == nser) {
+                if (nser == 16) { free(d); return -1; }
+                orig[nser] = fa_le32(pg + 14);
+                seq[nser++] = 0;
+            }
+            if (g > 0) g += span * r;
+            put_le32(pg + 6, (uint32_t)g);
+            put_le32(pg + 10, (uint32_t)((uint64_t)g >> 32));
+            put_le32(pg + 14, serial + (uint32_t)j);
+            put_le32(pg + 18, seq[j]++);
+            put_le32(pg + 22, 0);
+            put_le32(pg + 22, ogg_crc(pg, ps));
+            *n += ps;
+        }
+    }
+    free(d);
+    return len;
+}
+
+typedef enum { CHAIN_PLAIN, CHAIN_JUNK, CHAIN_SAME_SERIAL } chain_kind;
+
+static void check_long_chain(chain_kind kind)
+{
+    static const char* names[] = { "tone.opus", "tone.opus", "pages.opus", "twotracks.ogg", "tone.opus", "pages.opus",
+                                   "tone.opus", "pages.opus", "radio.opus", "pages.opus", "tone.opus", "tone.opus" };
+    static const int repeat[] = { 1, 20, 1, 1, 1, 1, 16, 1, 1, 1, 24, 1 };
+    size_t cap = 8u << 20, n = 0;
+    uint8_t* data = (uint8_t*)malloc(cap);
+    int64_t expect = 0, full_n, at[16];
+    uint32_t rate0 = 0, serial = 1000;
+    size_t i;
+    int k = 0;
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_stream_info info;
+    float* full;
+    double worst;
+    CHECK(data != NULL);
+    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        uint32_t rate = 0;
+        int64_t len;
+        if (kind == CHAIN_JUNK && i == 5) {
+            memset(data + n, 0x5A, 3000);             /* between two links: skipped */
+            n += 3000;
+        }
+        /* Against the RFC: link 4 reuses the serial of link 3 (cat of two files
+         * that got the same serial). The file is then read through. */
+        if (!(kind == CHAIN_SAME_SERIAL && i == 4)) serial += 16;
+        len = append_link(data, &n, names[i], serial, repeat[i], &rate);
+        CHECK(len > 0 && n < cap / 2);
+        if (i == 0) rate0 = rate;
+        if (i < sizeof(at) / sizeof(at[0])) at[k++] = expect + 7;
+        expect += (int64_t)llround((double)len * rate0 / rate);
+    }
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    CHECK_EQ(fa_stream_open_memory(g_engine, data, n, &o, &s), FA_OK);
+    fa_stream_get_info(s, &info);
+    CHECK(info.seekable);
+    CHECK_EQ(info.length_frames, expect);
+    if (kind == CHAIN_PLAIN) {
+        full = read_all(s, 2, &full_n);
+        CHECK_EQ(full_n, expect);
+        at[k++] = expect / 3;
+        at[k++] = expect - 5000;
+        CHECK(seek_matches(s, full, full_n, 2, at, k, 1e-3, &worst));
+        printf("  %d links, %.0f s: seek vs sequential: max difference %.2g\n", (int)(sizeof(names) / sizeof(names[0])),
+               (double)expect / rate0, worst);
+        free(full);
+    }
+    fa_stream_close(s);
+    free(data);
+}
+
+static void test_long_chain(void)
+{
+    check_long_chain(CHAIN_PLAIN);
+    if (g_failures) return;
+    check_long_chain(CHAIN_JUNK);
+    if (g_failures) return;
+    check_long_chain(CHAIN_SAME_SERIAL);
+}
+
 /* ---- forward-only sources ------------------------------------------------------------ */
 
 typedef struct mem_io {
@@ -613,6 +765,7 @@ int main(void)
     RUN(test_surround_order);
     RUN(test_two_audio_streams);
     RUN(test_chained_file);
+    RUN(test_long_chain);
     RUN(test_forward_only_sources);
     RUN(test_opus_packets_pushed);
     RUN(test_loudness_tags);

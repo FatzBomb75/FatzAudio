@@ -741,6 +741,7 @@ static int read_ics(fa_aac* d, fa_aac_bits* b, aac_chan* ch, int common, int lfe
 
 /* ---- spectral reconstruction ------------------------------------------------------------- */
 
+#define PNS_SEED 0x1F2E3D4Cu   /* FFmpeg's, so PNS bands come out as its decoder's */
 
 static float noise_value(fa_aac* d)
 {
@@ -1543,7 +1544,7 @@ fa_aac* fa_aac_create(void)
         return NULL;
     }
     build_shared();
-    d->seed = 0x1F2E3D4C;
+    d->seed = PNS_SEED;
     d->sbr_signalled = -1;
     d->ps_signalled = -1;
     return d;
@@ -1710,7 +1711,11 @@ static fa_result aacc_decode(fa_codec* c, const uint8_t* data, size_t size)
 
 static void aacc_flush(fa_codec* c)
 {
-    fa_aac_reset((fa_aac*)c->impl);
+    fa_aac* d = (fa_aac*)c->impl;
+    fa_aac_reset(d);
+    /* The noise generator starts again too, so a seek to the start gives exactly
+     * a straight decode's audio. */
+    d->seed = PNS_SEED;
 }
 
 static void aacc_close(fa_codec* c)

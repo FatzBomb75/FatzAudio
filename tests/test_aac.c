@@ -191,6 +191,70 @@ static void test_matches_ffmpeg(void)
     for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) compare(&cases[i]);
 }
 
+/* Seeks give a straight decode's samples: the SBR and PS state is settled by
+ * the packets decoded before the target, and a seek to the start restarts the
+ * PNS noise too. The noise generators run through the whole stream, so further
+ * in they can differ: tone.aac (PNS) is checked only where the seek decodes
+ * from its first packet; in the short HE-AAC streams they line up. */
+static void test_seek_matches_straight_decode(void)
+{
+    static const char* files[] = { "aac/he_stereo.aac", "aac/he_v2.aac", "aac/he_mono.aac", "aac/he_51.aac",
+                                   "aac/ps34.aac", "aac/ps_ipd.aac", "caf/aac_he.caf", "caf/aac_hev2.caf",
+                                   "tone.aac" };
+    static const int64_t targets[] = { 0, 1, 1023, 1024, 2047, 5000, 9000, 10000, 12523, 13000 };
+    size_t f, k;
+    for (f = 0; f < sizeof(files) / sizeof(files[0]); f++) {
+        char path[512];
+        fa_open_options o;
+        fa_stream* s = NULL;
+        fa_stream_info info;
+        float* full;
+        float* p;
+        int64_t n = 0, cap = 1 << 15, i;
+        uint32_t ch;
+        double worst = 0;
+        fa_open_options_init(&o);
+        o.flags = FA_OPEN_DECODE_ONLY;
+        snprintf(path, sizeof(path), "%s/%s", FA_TEST_DATA_DIR, files[f]);
+        CHECK_EQ(fa_stream_open_path(g_engine, path, &o, &s), FA_OK);
+        fa_stream_get_info(s, &info);
+        ch = info.format.channels;
+        full = (float*)malloc((size_t)cap * ch * sizeof(float));
+        for (;;) {
+            fa_frames got = 0;
+            fa_result r;
+            if (n + 1000 > cap) {
+                cap *= 2;
+                full = (float*)realloc(full, (size_t)cap * ch * sizeof(float));
+            }
+            r = fa_stream_read(s, full + (size_t)n * ch, 1000, &got);
+            n += got;
+            if (r != FA_OK || got == 0) break;
+        }
+        p = (float*)malloc((size_t)3000 * ch * sizeof(float));
+        for (k = 0; k < sizeof(targets) / sizeof(targets[0]); k++) {
+            int64_t at = targets[k], len = n - at < 3000 ? n - at : 3000, m = 0;
+            if (len <= 0 || (strstr(files[f], "tone") && at > 10000)) continue;
+            CHECK_EQ(fa_stream_seek(s, at), FA_OK);
+            while (m < len) {
+                fa_frames got = 0;
+                fa_frames want = len - m < 777 ? len - m : 777;
+                if (fa_stream_read(s, p + (size_t)m * ch, want, &got) != FA_OK || got == 0) break;
+                m += got;
+            }
+            CHECK_EQ(m, len);
+            for (i = 0; i < len * (int64_t)ch; i++)
+                if (fabs((double)p[i] - full[(size_t)at * ch + (size_t)i]) > worst)
+                    worst = fabs((double)p[i] - full[(size_t)at * ch + (size_t)i]);
+        }
+        printf("  %s: %lld frames, seek vs straight decode %g\n", files[f], (long long)n, worst);
+        CHECK(worst == 0.0);
+        free(p);
+        free(full);
+        fa_stream_close(s);
+    }
+}
+
 /* ---- the decoder itself ------------------------------------------------------------------ */
 
 typedef struct adts_frame {
@@ -689,6 +753,7 @@ int main(void)
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) { fprintf(stderr, "engine create failed\n"); return 1; }
 
     RUN(test_matches_ffmpeg);
+    RUN(test_seek_matches_straight_decode);
     RUN(test_raw_access_units);
     RUN(test_several_blocks_and_crc);
     RUN(test_damaged_frames);
