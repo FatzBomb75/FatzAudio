@@ -387,6 +387,18 @@ foreach(t fa_test_internal fa_test_loudness fa_test_crossfade fa_test_handoff fa
     endif()
 endforeach()
 
+# DEFLATE and ZIP against zlib, where CMake finds it (test only).
+find_package(ZLIB QUIET)
+if(ZLIB_FOUND)
+    add_executable(fa_test_inflate test_inflate.c)
+    target_compile_options(fa_test_inflate PRIVATE ${FA_WARNINGS})
+    target_link_libraries(fa_test_inflate PRIVATE fa_whitebox ZLIB::ZLIB)
+    if(MSVC)
+        set_property(TARGET fa_test_inflate PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME inflate COMMAND fa_test_inflate WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+endif()
+
 # These tests write scratch files with fixed names into the shared working
 # directory, so ctest -j must not run two of them at once. Everything else runs
 # in parallel.

@@ -20,19 +20,40 @@
 
 /* ---- CRC-32 (IEEE 802.3, reflected) ---------------------------------------- */
 
-/* `crc` is the CRC of the bytes before `data` (0 to start). */
-static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t size)
+/* Slice-by-8: crc_tab[k][n] is the CRC of byte n followed by k zero bytes, so
+ * eight bytes are folded in with eight lookups. Built once per process. */
+static uint32_t crc_tab[8][256];
+static fa_atomic32 crc_state;   /* 0 not done, 1 in progress, 2 done */
+
+static void crc_init(void)
 {
-    uint32_t table[256], n, k, c;
-    size_t i;
-    /* Built per call: a few calls per extracted file, and no shared state. */
+    uint32_t n, k, c;
+    if (fa_load32(&crc_state) == 2) return;
+    if (!fa_cas32(&crc_state, 0, 1)) {
+        while (fa_load32(&crc_state) != 2) fa_sleep_ms(1);
+        return;
+    }
     for (n = 0; n < 256; n++) {
         c = n;
         for (k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-        table[n] = c;
+        crc_tab[0][n] = c;
     }
+    for (n = 0; n < 256; n++)
+        for (k = 1; k < 8; k++) crc_tab[k][n] = (crc_tab[k - 1][n] >> 8) ^ crc_tab[0][crc_tab[k - 1][n] & 0xFF];
+    fa_store32(&crc_state, 2);
+}
+
+/* `crc` is the CRC of the bytes before `data` (0 to start). */
+static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t size)
+{
+    crc_init();
     crc ^= 0xFFFFFFFFu;
-    for (i = 0; i < size; i++) crc = table[(crc ^ data[i]) & 0xFF] ^ (crc >> 8);
+    for (; size >= 8; data += 8, size -= 8) {
+        uint32_t a = crc ^ fa_le32(data), b = fa_le32(data + 4);
+        crc = crc_tab[7][a & 0xFF] ^ crc_tab[6][(a >> 8) & 0xFF] ^ crc_tab[5][(a >> 16) & 0xFF] ^ crc_tab[4][a >> 24] ^
+              crc_tab[3][b & 0xFF] ^ crc_tab[2][(b >> 8) & 0xFF] ^ crc_tab[1][(b >> 16) & 0xFF] ^ crc_tab[0][b >> 24];
+    }
+    while (size--) crc = crc_tab[0][(crc ^ *data++) & 0xFF] ^ (crc >> 8);
     return crc ^ 0xFFFFFFFFu;
 }
 
@@ -49,9 +70,30 @@ typedef struct inf_huff {
     uint16_t symbol[INF_MAX_LITLEN];    /* symbols ordered by code */
 } inf_huff;
 
+/* Lookup tables indexed by the next `root` input bits. An entry holds the code's
+ * length in bits 0-7 (0: no code of at most `root` bits starts so; the canonical
+ * walk in inf_slow finds longer codes, which are rare), the extra bits in 8-12,
+ * the flags below and the value (literal, length or distance base, or symbol) in
+ * 16-31. */
+#define INF_LIT_ROOT 10
+#define INF_DIST_ROOT 8
+#define INF_LEN_ROOT 7
+#define INF_E_LIT 0x2000u
+#define INF_E_END 0x4000u
+#define INF_E_BAD 0x8000u                /* a symbol the format does not use */
+
+enum { INF_KIND_LEN, INF_KIND_LITLEN, INF_KIND_DIST };
+
+typedef struct inf_codes_t {
+    inf_huff lit, dist;
+    uint32_t lit_tab[1u << INF_LIT_ROOT];
+    uint32_t dist_tab[1u << INF_DIST_ROOT];
+} inf_codes_t;
+
 #define INF_WINDOW 32768                 /* the farthest a match reaches back */
 #define INF_IN_CHUNK 65536               /* input read from a source at a time */
 #define INF_OUT_CHUNK (1u << 20)         /* output kept before writing to a file */
+#define INF_FAST_OUT (258 + 8)           /* the longest match, plus a word copy's overshoot */
 
 /* Input comes from memory or is pulled from a source; output goes to one buffer
  * of the whole size, or through a 1 MB buffer into a file, keeping the last 32 KB
@@ -62,7 +104,10 @@ typedef struct inf_state {
     fa_source* src;                     /* NULL: `in` is all of it */
     uint64_t src_left;                  /* compressed bytes not read from src yet */
     uint8_t* in_buf;
-    uint32_t bitbuf;
+    /* Bits not used yet, first in the lowest bit. Above bitcnt it may hold the
+     * bits of the input bytes at in_pos, in their places: loading those bytes
+     * again ORs in the same bits. */
+    uint64_t bitbuf;
     int bitcnt;
     uint8_t* out;
     size_t out_cap, out_pos;
@@ -107,15 +152,24 @@ static int inf_room(inf_state* s)
 
 static uint64_t inf_left(const inf_state* s) { return s->total - s->flushed - s->out_pos; }
 
+/* Tops the bit buffer up to at least 56 bits, a byte at a time, or to the end of the input. */
+static void inf_fill(inf_state* s)
+{
+    while (s->bitcnt < 56) {
+        if (s->in_pos >= s->in_size && !inf_refill(s)) return;
+        s->bitbuf |= (uint64_t)s->in[s->in_pos++] << s->bitcnt;
+        s->bitcnt += 8;
+    }
+}
+
 static uint32_t inf_bits(inf_state* s, int need)
 {
     uint32_t v;
-    while (s->bitcnt < need) {
-        if (s->in_pos >= s->in_size && !inf_refill(s)) { s->error = 1; return 0; }
-        s->bitbuf |= (uint32_t)s->in[s->in_pos++] << s->bitcnt;
-        s->bitcnt += 8;
+    if (s->bitcnt < need) {
+        inf_fill(s);
+        if (s->bitcnt < need) { s->error = 1; return 0; }
     }
-    v = s->bitbuf & ((1u << need) - 1u);
+    v = (uint32_t)s->bitbuf & ((1u << need) - 1u);
     s->bitbuf >>= need;
     s->bitcnt -= need;
     return v;
@@ -142,25 +196,6 @@ static int inf_build(inf_huff* h, const uint8_t* lengths, int n)
     return 0;
 }
 
-/* Huffman codes are packed most significant bit first: build the code bit by bit
- * and compare it with the first code of each length. */
-static int inf_decode(inf_state* s, const inf_huff* h)
-{
-    int code = 0, first = 0, index = 0, len;
-    for (len = 1; len <= INF_MAX_BITS; len++) {
-        int count;
-        code |= (int)inf_bits(s, 1);
-        if (s->error) return -1;
-        count = h->count[len];
-        if (code - first < count) return h->symbol[index + (code - first)];
-        index += count;
-        first += count;
-        first <<= 1;
-        code <<= 1;
-    }
-    return -1; /* a code the table does not have */
-}
-
 static const uint16_t len_base[29] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
                                        35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
 static const uint8_t len_extra[29] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
@@ -171,25 +206,127 @@ static const uint16_t dist_base[30] = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49,
 static const uint8_t dist_extra[30] = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6,
                                         7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
 
-static int inf_codes(inf_state* s, const inf_huff* lit, const inf_huff* dist)
+static uint32_t inf_entry(int kind, int sym, int len)
+{
+    if (kind == INF_KIND_LITLEN) {
+        if (sym < 256) return (uint32_t)sym << 16 | INF_E_LIT | (uint32_t)len;
+        if (sym == 256) return INF_E_END | (uint32_t)len;
+        sym -= 257;
+        if (sym >= 29) return INF_E_BAD | (uint32_t)len;
+        return (uint32_t)len_base[sym] << 16 | (uint32_t)len_extra[sym] << 8 | (uint32_t)len;
+    }
+    if (kind == INF_KIND_DIST) {
+        if (sym >= 30) return INF_E_BAD | (uint32_t)len;
+        return (uint32_t)dist_base[sym] << 16 | (uint32_t)dist_extra[sym] << 8 | (uint32_t)len;
+    }
+    return (uint32_t)sym << 16 | (uint32_t)len;
+}
+
+/* Fills the table for the codes of at most `root` bits. Huffman codes are packed
+ * most significant bit first, so a code sits at its bit-reversed index, repeated
+ * for every value of the bits after it. */
+static void inf_table(uint32_t* t, int root, const inf_huff* h, int kind)
+{
+    uint32_t code = 0, size = 1u << root;
+    int len, index = 0, i;
+    memset(t, 0, size * sizeof(*t));
+    for (len = 1; len <= root; len++) {
+        for (i = 0; i < h->count[len]; i++, index++, code++) {
+            uint32_t rev = 0, c = code, at, e = inf_entry(kind, h->symbol[index], len);
+            int b;
+            for (b = 0; b < len; b++) { rev = (rev << 1) | (c & 1); c >>= 1; }
+            for (at = rev; at < size; at += 1u << len) t[at] = e;
+        }
+        code <<= 1;
+    }
+}
+
+/* The canonical walk for a code longer than the table's root, from at most
+ * `avail` bits: build the code bit by bit and compare it with the first code of
+ * each length. -1 for a code the table does not have or input that ran out. */
+static int inf_slow(const inf_huff* h, uint64_t bits, int avail, int* used)
+{
+    int code = 0, first = 0, index = 0, len;
+    for (len = 1; len <= INF_MAX_BITS && len <= avail; len++) {
+        int count = h->count[len];
+        code |= (int)(bits >> (len - 1)) & 1;
+        if (code - first < count) { *used = len; return h->symbol[index + (code - first)]; }
+        index += count;
+        first += count;
+        first <<= 1;
+        code <<= 1;
+    }
+    return -1;
+}
+
+/* Reads one code: its entry, or 0 when invalid or past the input. The fast path
+ * calls it with at least 15 bits at hand. */
+static uint32_t inf_decode(inf_state* s, const uint32_t* t, int root, const inf_huff* h, int kind)
+{
+    uint32_t e, len;
+    if (s->bitcnt < INF_MAX_BITS) inf_fill(s);
+    e = t[s->bitbuf & ((1u << root) - 1u)];
+    if (!(e & 0xFF)) {
+        int used, sym = inf_slow(h, s->bitbuf, s->bitcnt, &used);
+        if (sym < 0) return 0;
+        e = inf_entry(kind, sym, used);
+    }
+    len = e & 0xFF;
+    if ((int)len > s->bitcnt) return 0;
+    s->bitbuf >>= len;
+    s->bitcnt -= (int)len;
+    return e;
+}
+
+static int inf_codes(inf_state* s, const inf_codes_t* c)
 {
     for (;;) {
-        int sym = inf_decode(s, lit);
-        if (sym < 0) return -1;
-        if (sym < 256) {
+        uint32_t e;
+        size_t length, distance;
+        uint8_t* out;
+        /* With 8 input bytes, room for a whole match and that much output to go,
+         * one word load gives the bits for a whole symbol and nothing needs a
+         * bounds check but the match distance. */
+        if (s->in_size - s->in_pos >= 8 && s->out_cap - s->out_pos >= INF_FAST_OUT && inf_left(s) >= 258) {
+            s->bitbuf |= fa_le64(s->in + s->in_pos) << s->bitcnt;
+            s->in_pos += (size_t)(63 - s->bitcnt) >> 3;
+            s->bitcnt |= 56;
+            e = inf_decode(s, c->lit_tab, INF_LIT_ROOT, &c->lit, INF_KIND_LITLEN);
+            if (e & INF_E_LIT) { s->out[s->out_pos++] = (uint8_t)(e >> 16); continue; }
+            if (e & (INF_E_END | INF_E_BAD) || !e) return e & INF_E_END ? 0 : -1;
+            length = (e >> 16) + inf_bits(s, (int)((e >> 8) & 0x1F));   /* the bits are at hand */
+            e = inf_decode(s, c->dist_tab, INF_DIST_ROOT, &c->dist, INF_KIND_DIST);
+            if (!e || (e & INF_E_BAD)) return -1;
+            distance = (e >> 16) + inf_bits(s, (int)((e >> 8) & 0x1F));
+            if (distance > s->out_pos) return -1;
+            out = s->out + s->out_pos;
+            s->out_pos += length;
+            if (distance >= 8) {
+                /* Words, overshooting by up to 7 bytes that later output overwrites. */
+                const uint8_t* from = out - distance;
+                uint8_t* end = out + length;
+                do { memcpy(out, from, 8); out += 8; from += 8; } while (out < end);
+            } else if (distance == 1) {
+                memset(out, out[-1], length);
+            } else {
+                /* Byte by byte: the copy overlaps what it writes (runs). */
+                while (length--) { *out = out[-(ptrdiff_t)distance]; out++; }
+            }
+            continue;
+        }
+        e = inf_decode(s, c->lit_tab, INF_LIT_ROOT, &c->lit, INF_KIND_LITLEN);
+        if (!e) return -1;
+        if (e & INF_E_LIT) {
             if (inf_left(s) == 0 || inf_room(s)) return -1;
-            s->out[s->out_pos++] = (uint8_t)sym;
-        } else if (sym == 256) {
+            s->out[s->out_pos++] = (uint8_t)(e >> 16);
+        } else if (e & INF_E_END) {
             return 0;
         } else {
-            size_t length, distance;
-            int d;
-            sym -= 257;
-            if (sym >= 29) return -1;
-            length = len_base[sym] + inf_bits(s, len_extra[sym]);
-            d = inf_decode(s, dist);
-            if (d < 0 || d >= 30) return -1;
-            distance = dist_base[d] + inf_bits(s, dist_extra[d]);
+            if (e & INF_E_BAD) return -1;
+            length = (e >> 16) + inf_bits(s, (int)((e >> 8) & 0x1F));
+            e = inf_decode(s, c->dist_tab, INF_DIST_ROOT, &c->dist, INF_KIND_DIST);
+            if (!e || (e & INF_E_BAD)) return -1;
+            distance = (e >> 16) + inf_bits(s, (int)((e >> 8) & 0x1F));
             /* After a flush out_pos is at least INF_WINDOW, as far as a match reaches. */
             if (s->error || distance > s->out_pos || length > inf_left(s)) return -1;
             while (length) {
@@ -226,34 +363,57 @@ static int inf_copy(inf_state* s, uint64_t len)
 static int inf_stored(inf_state* s)
 {
     uint32_t len, nlen;
-    s->bitbuf = 0;   /* skip to the byte boundary (fewer than 8 bits are held) */
-    s->bitcnt = 0;
+    /* Skip to the byte boundary; whole bytes already in the bit buffer come first. */
+    s->bitbuf >>= s->bitcnt & 7;
+    s->bitcnt &= ~7;
     len = inf_bits(s, 16);
     nlen = inf_bits(s, 16);
     if (s->error || len != (~nlen & 0xFFFFu) || len > inf_left(s)) return -1;
+    for (; len && s->bitcnt >= 8; len--) {
+        if (inf_room(s)) return -1;
+        s->out[s->out_pos++] = (uint8_t)s->bitbuf;
+        s->bitbuf >>= 8;
+        s->bitcnt -= 8;
+    }
+    if (!len) return 0;
+    s->bitbuf = 0;   /* the bits above are of the bytes inf_copy takes */
     return inf_copy(s, len);
 }
 
+/* The fixed codes (RFC 1951 3.2.6), built once per process. */
+static inf_codes_t inf_fixed_codes;
+static fa_atomic32 inf_fixed_state;   /* 0 not done, 1 in progress, 2 done */
+
 static int inf_fixed(inf_state* s)
 {
-    inf_huff lit, dist;
+    inf_codes_t* c = &inf_fixed_codes;
     uint8_t lengths[INF_MAX_LITLEN];
     int i;
+    if (fa_load32(&inf_fixed_state) == 2) return inf_codes(s, c);
+    if (!fa_cas32(&inf_fixed_state, 0, 1)) {
+        while (fa_load32(&inf_fixed_state) != 2) fa_sleep_ms(1);
+        return inf_codes(s, c);
+    }
     for (i = 0; i < 144; i++) lengths[i] = 8;
     for (; i < 256; i++) lengths[i] = 9;
     for (; i < 280; i++) lengths[i] = 7;
     for (; i < INF_MAX_LITLEN; i++) lengths[i] = 8;
-    inf_build(&lit, lengths, INF_MAX_LITLEN);
+    inf_build(&c->lit, lengths, INF_MAX_LITLEN);
     for (i = 0; i < INF_MAX_DIST; i++) lengths[i] = 5;
-    inf_build(&dist, lengths, INF_MAX_DIST);
-    return inf_codes(s, &lit, &dist);
+    inf_build(&c->dist, lengths, INF_MAX_DIST);
+    inf_table(c->lit_tab, INF_LIT_ROOT, &c->lit, INF_KIND_LITLEN);
+    inf_table(c->dist_tab, INF_DIST_ROOT, &c->dist, INF_KIND_DIST);
+    fa_store32(&inf_fixed_state, 2);
+    return inf_codes(s, c);
 }
 
 static int inf_dynamic(inf_state* s)
 {
     static const uint8_t order[19] = { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
     uint8_t lengths[INF_MAX_LITLEN + INF_MAX_DIST];
-    inf_huff lencode, lit, dist;
+    uint32_t len_tab[1u << INF_LEN_ROOT];
+    inf_huff lencode;
+    inf_codes_t c;
     int nlen, ndist, ncode, i;
     nlen = (int)inf_bits(s, 5) + 257;
     ndist = (int)inf_bits(s, 5) + 1;
@@ -262,11 +422,13 @@ static int inf_dynamic(inf_state* s)
     memset(lengths, 0, sizeof(lengths));
     for (i = 0; i < ncode; i++) lengths[order[i]] = (uint8_t)inf_bits(s, 3);
     if (s->error || inf_build(&lencode, lengths, 19) != 0) return -1;
+    inf_table(len_tab, INF_LEN_ROOT, &lencode, INF_KIND_LEN);
     i = 0;
     while (i < nlen + ndist) {
-        int sym = inf_decode(s, &lencode), repeat;
+        uint32_t e = inf_decode(s, len_tab, INF_LEN_ROOT, &lencode, INF_KIND_LEN);
+        int sym = (int)(e >> 16), repeat;
         uint8_t value = 0;
-        if (sym < 0) return -1;
+        if (!e) return -1;
         if (sym < 16) { lengths[i++] = (uint8_t)sym; continue; }
         if (sym == 16) {
             if (i == 0) return -1;
@@ -281,8 +443,10 @@ static int inf_dynamic(inf_state* s)
         while (repeat--) lengths[i++] = value;
     }
     if (lengths[256] == 0) return -1; /* no end-of-block code */
-    if (inf_build(&lit, lengths, nlen) != 0 || inf_build(&dist, lengths + nlen, ndist) != 0) return -1;
-    return inf_codes(s, &lit, &dist);
+    if (inf_build(&c.lit, lengths, nlen) != 0 || inf_build(&c.dist, lengths + nlen, ndist) != 0) return -1;
+    inf_table(c.lit_tab, INF_LIT_ROOT, &c.lit, INF_KIND_LITLEN);
+    inf_table(c.dist_tab, INF_DIST_ROOT, &c.dist, INF_KIND_DIST);
+    return inf_codes(s, &c);
 }
 
 static fa_result inf_run(inf_state* s)

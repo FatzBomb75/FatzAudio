@@ -198,7 +198,15 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Faster ZIP and HLS, with the same output (2026-10-26): DEFLATE in ZIP karaoke archives decodes through lookup tables
+  with a 64-bit bit buffer and word-wide match copies, about 3.3 times as fast (roughly 400 MB/s on one core, on a
+  par with zlib); the CRC-32 check works on 8 bytes at a time, about 4.5 times as fast; AES-128 for encrypted HLS
+  segments uses 32-bit decryption tables, about 7 times as fast (roughly 320 MB/s). Checked old against new on
+  114,000 streams (about 100,000 of them damaged, which must fail the same way) and against zlib in a new test
+  (`fa_test_inflate`, built where CMake finds zlib; zlib is never linked into the library).
+
 - HE-AAC v2 streams share the parametric-stereo constant tables (14 KB) built once per process instead of one copy per stream. Output is unchanged.
+
 - Faster and smaller, with the same output (deep audit, small items, 2026-10-26): the DJ deck isolator runs both
   channels and four filter sections per SSE step (a mixer callback takes about 38% fewer instructions, output identical
   to the bit); the running loudness estimate (about 7% of decoding) runs only with normalization on or once the app asks

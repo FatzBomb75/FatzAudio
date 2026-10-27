@@ -805,6 +805,89 @@ static void test_aes_vectors(void)
     CHECK(memcmp(data, pt2, 64) == 0);
 }
 
+/* The byte-wise AES that the table version replaced (FIPS-197 5.3 as written),
+ * kept as a reference: random keys, IVs and lengths must decrypt the same. */
+static uint8_t ref_xtime(uint8_t x) { return (uint8_t)((x << 1) ^ ((x & 0x80) ? 0x1B : 0)); }
+static uint8_t ref_gmul(uint8_t a, uint8_t b)
+{
+    uint8_t r = 0;
+    while (b) { if (b & 1) r ^= a; a = ref_xtime(a); b >>= 1; }
+    return r;
+}
+
+static uint8_t ref_sbox_at(uint8_t x)
+{
+    /* The S-box from its definition: the inverse in GF(2^8), then the affine map. */
+    uint8_t inv = 0, r;
+    int i;
+    if (x) for (i = 1; i < 256; i++) if (ref_gmul(x, (uint8_t)i) == 1) { inv = (uint8_t)i; break; }
+    r = inv;
+    for (i = 1; i < 5; i++) r ^= (uint8_t)((inv << i) | (inv >> (8 - i)));
+    return (uint8_t)(r ^ 0x63);
+}
+
+static void ref_aes_cbc(const uint8_t key[16], uint8_t iv[16], uint8_t* data, size_t n)
+{
+    uint8_t sbox[256], inv[256], rk[176], rcon = 1;
+    size_t b;
+    int i;
+    for (i = 0; i < 256; i++) { sbox[i] = ref_sbox_at((uint8_t)i); inv[sbox[i]] = (uint8_t)i; }
+    memcpy(rk, key, 16);
+    for (i = 16; i < 176; i += 4) {
+        uint8_t t[4];
+        memcpy(t, rk + i - 4, 4);
+        if (i % 16 == 0) {
+            uint8_t x = t[0];
+            t[0] = (uint8_t)(sbox[t[1]] ^ rcon); t[1] = sbox[t[2]]; t[2] = sbox[t[3]]; t[3] = sbox[x];
+            rcon = ref_xtime(rcon);
+        }
+        rk[i] = rk[i - 16] ^ t[0]; rk[i + 1] = rk[i - 15] ^ t[1]; rk[i + 2] = rk[i - 14] ^ t[2]; rk[i + 3] = rk[i - 13] ^ t[3];
+    }
+    for (b = 0; b + 16 <= n; b += 16) {
+        uint8_t* s = data + b;
+        uint8_t prev[16];
+        int round;
+        memcpy(prev, s, 16);
+        for (i = 0; i < 16; i++) s[i] ^= rk[160 + i];
+        for (round = 9; round >= 0; round--) {
+            uint8_t t[16];
+            for (i = 0; i < 16; i++) t[(((i / 4) + (i % 4)) % 4) * 4 + i % 4] = inv[s[i]];
+            for (i = 0; i < 16; i++) s[i] = t[i] ^ rk[round * 16 + i];
+            if (round == 0) break;
+            for (i = 0; i < 4; i++) {
+                uint8_t a = s[i * 4], c1 = s[i * 4 + 1], c2 = s[i * 4 + 2], d = s[i * 4 + 3];
+                s[i * 4]     = ref_gmul(a, 14) ^ ref_gmul(c1, 11) ^ ref_gmul(c2, 13) ^ ref_gmul(d, 9);
+                s[i * 4 + 1] = ref_gmul(a, 9) ^ ref_gmul(c1, 14) ^ ref_gmul(c2, 11) ^ ref_gmul(d, 13);
+                s[i * 4 + 2] = ref_gmul(a, 13) ^ ref_gmul(c1, 9) ^ ref_gmul(c2, 14) ^ ref_gmul(d, 11);
+                s[i * 4 + 3] = ref_gmul(a, 11) ^ ref_gmul(c1, 13) ^ ref_gmul(c2, 9) ^ ref_gmul(d, 14);
+            }
+        }
+        for (i = 0; i < 16; i++) s[i] ^= iv[i];
+        memcpy(iv, prev, 16);
+    }
+}
+
+static void test_aes_reference(void)
+{
+    uint32_t rng = 0x2545F491u;
+    int run;
+    for (run = 0; run < 300; run++) {
+        uint8_t key[16], iv_a[16], iv_b[16], a[200], b[200];
+        size_t n, i;
+        for (i = 0; i < 16; i++) {
+            rng = rng * 1664525u + 1013904223u; key[i] = (uint8_t)(rng >> 24);
+            rng = rng * 1664525u + 1013904223u; iv_a[i] = iv_b[i] = (uint8_t)(rng >> 24);
+        }
+        rng = rng * 1664525u + 1013904223u;
+        n = (rng >> 16) % sizeof(a);   /* a partial last block stays as it is */
+        for (i = 0; i < n; i++) { rng = rng * 1664525u + 1013904223u; a[i] = b[i] = (uint8_t)(rng >> 24); }
+        fa_aes128_cbc_decrypt(key, iv_a, a, n);
+        ref_aes_cbc(key, iv_b, b, n);
+        CHECK(memcmp(a, b, n) == 0);
+        CHECK(memcmp(iv_a, iv_b, 16) == 0);
+    }
+}
+
 typedef struct collect { uint8_t* p; size_t n, cap; } collect;
 static int collect_out(void* user, const uint8_t* p, size_t n)
 {
@@ -1860,6 +1943,7 @@ int main(void)
     RUN(test_http_header_lookup);
     RUN(test_hls_parse);
     RUN(test_aes_vectors);
+    RUN(test_aes_reference);
     RUN(test_ts_demux);
     RUN(test_http_fetch);
     RUN(test_wav_over_http);

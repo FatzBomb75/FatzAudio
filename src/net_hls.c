@@ -408,6 +408,31 @@ static uint8_t gmul(uint8_t a, uint8_t b)
     return r;
 }
 
+/* Decryption tables (FIPS-197 5.3, as 32-bit words): td[0][x] is the InvMixColumns
+ * column of InvSubBytes(x) in the first row, td[1..3] the same rotated a row at a
+ * time. Built once per process. Words are big-endian: a column's row 0 is the top
+ * byte. */
+static uint32_t td[4][256];
+static uint8_t inv_sbox[256];
+static fa_atomic32 aes_tables_state;   /* 0 not done, 1 in progress, 2 done */
+
+static void aes_init_tables(void)
+{
+    int i, k;
+    if (fa_load32(&aes_tables_state) == 2) return;
+    if (!fa_cas32(&aes_tables_state, 0, 1)) {
+        while (fa_load32(&aes_tables_state) != 2) fa_sleep_ms(1);
+        return;
+    }
+    for (i = 0; i < 256; i++) inv_sbox[sbox[i]] = (uint8_t)i;
+    for (i = 0; i < 256; i++) {
+        uint8_t x = inv_sbox[i];
+        td[0][i] = (uint32_t)gmul(x, 14) << 24 | (uint32_t)gmul(x, 9) << 16 | (uint32_t)gmul(x, 13) << 8 | gmul(x, 11);
+        for (k = 1; k < 4; k++) td[k][i] = td[k - 1][i] >> 8 | td[k - 1][i] << 24;
+    }
+    fa_store32(&aes_tables_state, 2);
+}
+
 static void aes_expand(const uint8_t key[16], uint8_t rk[176])
 {
     uint8_t rcon = 1;
@@ -425,37 +450,58 @@ static void aes_expand(const uint8_t key[16], uint8_t rk[176])
     }
 }
 
-static void aes_decrypt_block(const uint8_t rk[176], const uint8_t inv[256], uint8_t s[16])
+/* The round keys of the equivalent inverse cipher (FIPS-197 5.3.5), made once per
+ * segment: the encryption keys in reverse order, InvMixColumns applied to all but
+ * the first and last. */
+typedef struct aes_ctx { uint32_t dk[44]; } aes_ctx;
+
+static void aes_init(aes_ctx* c, const uint8_t key[16])
 {
+    uint8_t rk[176];
     int round, i;
-    for (i = 0; i < 16; i++) s[i] ^= rk[160 + i];
-    for (round = 9; round >= 0; round--) {
-        uint8_t t[16];
-        /* InvShiftRows (state is column-major: s[col * 4 + row]) and InvSubBytes. */
-        for (i = 0; i < 16; i++) {
-            int row = i % 4, col = i / 4;
-            t[((col + row) % 4) * 4 + row] = inv[s[i]];
-        }
-        for (i = 0; i < 16; i++) s[i] = t[i] ^ rk[round * 16 + i];
-        if (round == 0) break;
-        for (i = 0; i < 4; i++) {   /* InvMixColumns */
-            uint8_t a = s[i * 4], b = s[i * 4 + 1], c = s[i * 4 + 2], d = s[i * 4 + 3];
-            s[i * 4]     = gmul(a, 14) ^ gmul(b, 11) ^ gmul(c, 13) ^ gmul(d, 9);
-            s[i * 4 + 1] = gmul(a, 9) ^ gmul(b, 14) ^ gmul(c, 11) ^ gmul(d, 13);
-            s[i * 4 + 2] = gmul(a, 13) ^ gmul(b, 9) ^ gmul(c, 14) ^ gmul(d, 11);
-            s[i * 4 + 3] = gmul(a, 11) ^ gmul(b, 13) ^ gmul(c, 9) ^ gmul(d, 14);
+    aes_init_tables();
+    aes_expand(key, rk);
+    for (round = 0; round <= 10; round++) {
+        for (i = 0; i < 4; i++) {
+            const uint8_t* w = rk + (10 - round) * 16 + i * 4;
+            uint32_t v = fa_be32(w);
+            if (round > 0 && round < 10)
+                v = td[0][sbox[w[0]]] ^ td[1][sbox[w[1]]] ^ td[2][sbox[w[2]]] ^ td[3][sbox[w[3]]];
+            c->dk[round * 4 + i] = v;
         }
     }
 }
 
-/* The expanded key, made once per segment. */
-typedef struct aes_ctx { uint8_t rk[176], inv[256]; } aes_ctx;
-
-static void aes_init(aes_ctx* c, const uint8_t key[16])
+static void aes_put_be32(uint8_t* p, uint32_t v)
 {
-    int i;
-    aes_expand(key, c->rk);
-    for (i = 0; i < 256; i++) c->inv[sbox[i]] = (uint8_t)i;
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v;
+}
+
+/* One block in place. InvShiftRows moves row r of column c to column c + r, so
+ * column c takes row r from column c - r. */
+static void aes_decrypt_block(const aes_ctx* c, uint8_t b[16])
+{
+    const uint32_t* k = c->dk;
+    uint32_t s0 = fa_be32(b) ^ k[0], s1 = fa_be32(b + 4) ^ k[1], s2 = fa_be32(b + 8) ^ k[2], s3 = fa_be32(b + 12) ^ k[3];
+    uint32_t t0, t1, t2, t3;
+    int round;
+    for (round = 1; round < 10; round++) {
+        k += 4;
+        t0 = td[0][s0 >> 24] ^ td[1][(s3 >> 16) & 0xFF] ^ td[2][(s2 >> 8) & 0xFF] ^ td[3][s1 & 0xFF] ^ k[0];
+        t1 = td[0][s1 >> 24] ^ td[1][(s0 >> 16) & 0xFF] ^ td[2][(s3 >> 8) & 0xFF] ^ td[3][s2 & 0xFF] ^ k[1];
+        t2 = td[0][s2 >> 24] ^ td[1][(s1 >> 16) & 0xFF] ^ td[2][(s0 >> 8) & 0xFF] ^ td[3][s3 & 0xFF] ^ k[2];
+        t3 = td[0][s3 >> 24] ^ td[1][(s2 >> 16) & 0xFF] ^ td[2][(s1 >> 8) & 0xFF] ^ td[3][s0 & 0xFF] ^ k[3];
+        s0 = t0; s1 = t1; s2 = t2; s3 = t3;
+    }
+    k += 4;
+#define AES_LAST(a, b2, c2, d) \
+    ((uint32_t)inv_sbox[(a) >> 24] << 24 | (uint32_t)inv_sbox[((b2) >> 16) & 0xFF] << 16 | \
+     (uint32_t)inv_sbox[((c2) >> 8) & 0xFF] << 8 | inv_sbox[(d) & 0xFF])
+    aes_put_be32(b, AES_LAST(s0, s3, s2, s1) ^ k[0]);
+    aes_put_be32(b + 4, AES_LAST(s1, s0, s3, s2) ^ k[1]);
+    aes_put_be32(b + 8, AES_LAST(s2, s1, s0, s3) ^ k[2]);
+    aes_put_be32(b + 12, AES_LAST(s3, s2, s1, s0) ^ k[3]);
+#undef AES_LAST
 }
 
 static void aes_cbc_decrypt(const aes_ctx* c, uint8_t iv[16], uint8_t* data, size_t n)
@@ -464,7 +510,7 @@ static void aes_cbc_decrypt(const aes_ctx* c, uint8_t iv[16], uint8_t* data, siz
     size_t i, b;
     for (b = 0; b + 16 <= n; b += 16) {
         memcpy(prev, data + b, 16);
-        aes_decrypt_block(c->rk, c->inv, data + b);
+        aes_decrypt_block(c, data + b);
         for (i = 0; i < 16; i++) data[b + i] ^= iv[i];
         memcpy(iv, prev, 16);
     }
