@@ -2,6 +2,7 @@
  * tests/data/fonts (make_fonts.py says what each glyph is), plus random damage.
  * With FA_TEST_FONT_DIR set, every font in that folder is also opened and drawn
  * in full (a local check on real fonts; nothing is compared). */
+#include "fa_platform.h"
 #include "font.h"
 #include "font_find.h"
 #include "raster.h"
@@ -573,6 +574,7 @@ static void test_shared_buffers(void)
     /* Same size, one byte different (the last byte of a table nothing reads): still a new buffer. */
     CHECK_EQ(fa_font_open_file(tmp, 0, &f1), FA_OK);
     y.p[y.n - 1] ^= 0x55;
+    fa_sleep_ms(60);   /* file times tick every few ms (a coarse kernel clock) */
     fp = fopen(tmp, "wb");
     CHECK(fp);
     fwrite(y.p, 1, y.n, fp);
