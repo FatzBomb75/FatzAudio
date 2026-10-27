@@ -48,9 +48,12 @@ uint32_t fa_font_face_count(const uint8_t* data, size_t size);
  * `owned` the font frees it (free()) when closed, also when the open fails.
  * FA_ERROR_UNSUPPORTED_FORMAT for anything else (CFF2, bitmap-only fonts). */
 fa_result fa_font_open(const uint8_t* data, size_t size, uint32_t index, int owned, fa_font** out);
-/* Reads the whole file (UTF-8 path) and opens face `index`. */
+/* Reads the whole file (UTF-8 path) and opens face `index`. Faces opened from the same
+ * unchanged file share one buffer, freed when the last of them closes. */
 fa_result fa_font_open_file(const char* path, uint32_t index, fa_font** out);
 void fa_font_close(fa_font* font);
+/* White-box: file buffers shared by faces opened with fa_font_open_file right now. */
+size_t fa_font_shared_buffers(void);
 /* Reads only face `index`'s names, weight and style from an open file (for
  * finding fonts without loading them): units, metrics and glyph_count are not
  * filled in. Sets *face_count (may be NULL) when the file could be read. */

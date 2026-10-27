@@ -112,6 +112,17 @@ FILE* fa_fopen_utf8(const char* path, const char* mode)
     free(wp); free(wm);
     return f;
 }
+int fa_file_identity(FILE* fp, uint64_t id[4])
+{
+    BY_HANDLE_FILE_INFORMATION bi;
+    HANDLE h = (HANDLE)_get_osfhandle(_fileno(fp));
+    if (h == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(h, &bi)) return 0;
+    id[0] = bi.dwVolumeSerialNumber;
+    id[1] = ((uint64_t)bi.nFileIndexHigh << 32) | bi.nFileIndexLow;
+    id[2] = ((uint64_t)bi.ftLastWriteTime.dwHighDateTime << 32) | bi.ftLastWriteTime.dwLowDateTime;   /* 100 ns units */
+    id[3] = 0;
+    return 1;
+}
 int fa_mkdir_utf8(const char* path)
 {
     wchar_t* wp = widen(path);
@@ -323,7 +334,24 @@ int64_t fa_monotonic_ns(void)
 #endif
 
 #if !defined(_WIN32)
+#  include <sys/stat.h>
 FILE* fa_fopen_utf8(const char* path, const char* mode) { return fopen(path, mode); }
+int fa_file_identity(FILE* fp, uint64_t id[4])
+{
+    struct stat st;
+    if (fstat(fileno(fp), &st) != 0) return 0;
+    id[0] = (uint64_t)st.st_dev;
+    id[1] = (uint64_t)st.st_ino;
+    id[2] = (uint64_t)st.st_mtime;
+#  if defined(__APPLE__)
+    id[3] = (uint64_t)st.st_mtimespec.tv_nsec;
+#  elif defined(__linux__) || defined(__ANDROID__)
+    id[3] = (uint64_t)st.st_mtim.tv_nsec;
+#  else
+    return 0;   /* no sub-second time: a quick rewrite could not be told apart */
+#  endif
+    return 1;
+}
 int fa_mkdir_utf8(const char* path) { return (mkdir(path, 0777) == 0 || errno == EEXIST) ? 0 : -1; }
 int fa_replace_file(const char* from, const char* to) { return rename(from, to) == 0 ? 0 : -1; }
 int fa_system_soundfont_path(int index, char* out, size_t cap)

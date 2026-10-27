@@ -152,6 +152,10 @@ void fa_sleep_ms(uint32_t ms);
 
 /* Files with UTF-8 paths (wide-character APIs on Windows). */
 FILE* fa_fopen_utf8(const char* path, const char* mode);
+/* An open file's identity and last-write time (device, file id, seconds, nanoseconds; Windows: volume, index,
+ * FILETIME, 0). Two reads with the same identity saw the same bytes unless it changed within the clock's step.
+ * 0 when the OS gives none. */
+int fa_file_identity(FILE* fp, uint64_t id[4]);
 int fa_mkdir_utf8(const char* path);                     /* 0 if created or already there */
 int fa_replace_file(const char* from, const char* to);   /* rename over an existing file; 0 on success */
 /* Where the OS keeps its MIDI instruments (gm.dls, gs_instruments.dls, a GM .sf2),
