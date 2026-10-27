@@ -214,6 +214,7 @@ FatzAudio follows redirects itself, up to 8, the same way on every platform and 
   port) only. A redirect to the same server keeps them; a redirect to another one doesn't send them.
 - Your `Authorization` and `Cookie` header lines are likewise sent to the first URL's origin only. Every other line
   of yours goes to every hop.
+- Cookies a server sets are not kept, on any platform: if a server needs one back, send it in `headers`.
 
 ### Request headers
 

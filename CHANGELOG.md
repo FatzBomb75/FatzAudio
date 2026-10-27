@@ -204,7 +204,8 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   their exact range (`Range: bytes=N-M`) instead of everything from N on. See
   [web streams](docs/features/web-streams.md#connections).
 - Web streams: FatzAudio follows redirects itself on every transport. WinHTTP and URLSession now follow an `https://`
-  to `http://` redirect too, as curl and Android did.
+  to `http://` redirect too, as curl and Android did, and like them keep no cookie store: a cookie a server sets
+  during a redirect is not sent to the next hop any more (the app's own `Cookie` line still is).
 - Web streams: one request-header walk for every transport (plain HTTP, curl, WinHTTP, URLSession,
   HttpURLConnection), so all of them send the same headers: `Accept: */*` and `Accept-Encoding: identity` everywhere
   now, an app header replaces the built-in one of the same name instead of being sent twice, and invalid app lines

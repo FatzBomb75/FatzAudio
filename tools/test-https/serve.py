@@ -13,6 +13,7 @@ byte Range, and every response says which connection carried it (X-Connection: N
 counted from 1 over both ports). Besides the files of DIR:
   /echo-headers            the request's header lines as text (FA_NET_HTTPS_ECHO_URL)
   /echo-headers?close      the same, then the connection is closed without notice
+  /echo-headers?cookie     the same, with a Set-Cookie
   /redirect?to=URL         302 to URL
   /connections             how many connections have been opened so far
   /hls/master.m3u8         an HLS stream: a master playlist, a media playlist and
@@ -108,7 +109,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         sys.stderr.write("%s (connection %d)\n%s\n" % (self.requestline, self.connection_id, "".join(
             "%s: %s\n" % (k, v if len(v) <= 200 else v[:200] + "... (%d bytes)" % len(v)) for k, v in self.headers.items())))
         if url.path == "/echo-headers":
-            self.send_text(200, "".join("%s: %s\r\n" % (k, v) for k, v in self.headers.items()))
+            self.send_text(200, "".join("%s: %s\r\n" % (k, v) for k, v in self.headers.items()),
+                           extra=[("Set-Cookie", "fa=1; Path=/")] if url.query == "cookie" else ())
             if url.query == "close":
                 self.close_connection = True   # no "Connection: close": the client finds out later
         elif url.path == "/redirect":

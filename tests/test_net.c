@@ -2111,8 +2111,8 @@ static int https_connections(const char* origin)
 
 /* Connection reuse through the system's TLS stack, against serve.py
  * (FA_NET_HTTPS_ECHO_URL): requests of one session share a connection, one the
- * server closed without notice is replaced, a cancelled transfer leaves the session
- * usable, and redirects to another origin (serve.py's second port) drop the
+ * server closed without notice is replaced, cookies are not kept, a cancelled
+ * transfer leaves the session usable, and redirects to another origin (serve.py's second port) drop the
  * credentials. */
 static void test_https_session_optional(void)
 {
@@ -2147,6 +2147,13 @@ static void test_https_session_optional(void)
         CHECK_EQ(fetch_with(session, url, NULL, &c), FA_OK);
         CHECK_EQ(c.conn, first);
     }
+    /* A server's cookie is not sent back: no transport keeps a cookie store. */
+    snprintf(url, sizeof(url), "%s/echo-headers?cookie", origin);
+    CHECK_EQ(fetch_with(session, url, NULL, &c), FA_OK);
+    snprintf(url, sizeof(url), "%s/echo-headers", origin);
+    CHECK_EQ(fetch_with(session, url, NULL, &c), FA_OK);
+    CHECK(c.body.p != NULL);
+    CHECK_EQ(count_header(c.body.p, "Cookie", NULL, 0), 0);
     /* Cancelled in the middle of a body, then the next request. */
     snprintf(url, sizeof(url), "%s/net/tone_cbr.mp3", origin);
     c.cancel_on_data = 1;

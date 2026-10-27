@@ -126,6 +126,11 @@ static int session_open(fa_http_session* s, const fa_http_request* req)
     NSURLSession* session;
     cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
     cfg.URLCache = nil;
+    /* No cookie store, as on the other transports: the kept session would replay a
+     * server's cookies on the stream's later requests. The app's Cookie line still goes. */
+    cfg.HTTPCookieStorage = nil;
+    cfg.HTTPShouldSetCookies = NO;
+    cfg.HTTPCookieAcceptPolicy = NSHTTPCookieAcceptPolicyNever;
     cfg.timeoutIntervalForRequest = req->timeout_ms / 1000.0;
     if (req->proxy && !req->proxy[0]) {
         cfg.connectionProxyDictionary = @{};

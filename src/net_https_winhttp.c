@@ -219,7 +219,7 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
     wchar_t *wurl = NULL, *wua = NULL, *whost = NULL, *wpath = NULL, *wheaders = NULL;
     URL_COMPONENTS uc;
     fa_result r = FA_ERROR_NETWORK;
-    DWORD status = 0, size, feature = WINHTTP_DISABLE_REDIRECTS;
+    DWORD status = 0, size, features = WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES;
     int slot = -1;
     uint8_t* buf = NULL;
     char* headers = NULL;
@@ -275,8 +275,10 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
     if (!request) goto done;
     WinHttpSetTimeouts(request, (int)req->timeout_ms, (int)req->timeout_ms, (int)req->timeout_ms, (int)req->timeout_ms);
     /* Redirects come back to fa_http_fetch, which follows them for every transport
-     * (WinHTTP's own would keep the Authorization header on another server). */
-    WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &feature, sizeof(feature));
+     * (WinHTTP's own would keep the Authorization header on another server). No
+     * cookie store either, as on the other transports: a kept session would replay
+     * a server's cookies on the stream's later requests. */
+    WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &features, sizeof(features));
     slot = slot_add(req->cancel, request);
     if (req->cancel && fa_load32(req->cancel)) { r = FA_ERROR_BUSY; goto done; }
     if (!WinHttpSendRequest(request, wheaders && wheaders[0] ? wheaders : WINHTTP_NO_ADDITIONAL_HEADERS,
