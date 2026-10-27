@@ -647,6 +647,7 @@ static int limited_head(void* user, const fa_http_response* resp)
 static int limited_data(void* user, const uint8_t* p, size_t n)
 {
     range_limit* lim = (range_limit*)user;
+    int more = 0;
     if (lim->skip > 0) {
         size_t k = lim->skip < (int64_t)n ? (size_t)lim->skip : n;
         lim->skip -= (int64_t)k;
@@ -654,11 +655,11 @@ static int limited_data(void* user, const uint8_t* p, size_t n)
         n -= k;
         if (n == 0) return 0;
     }
-    if (lim->left <= 0) return 1;
-    if ((int64_t)n > lim->left) n = (size_t)lim->left;
+    if (lim->left <= 0) return 1;             /* more than the segment (the range end was ignored) */
+    if ((int64_t)n > lim->left) { n = (size_t)lim->left; more = 1; }
     lim->left -= (int64_t)n;
     if (sink_data(lim->sink, p, n)) return 1;
-    return lim->left <= 0;
+    return more;   /* a body of just the segment is read to its end: the connection can be kept */
 }
 
 typedef struct hls_state {
@@ -737,6 +738,7 @@ static fa_result fetch_segment(fa_net* n, hls_state* h, const fa_hls_segment* se
         lim.offset = seg->byte_offset;
         lim.left = seg->byte_length;
         req.range_start = seg->byte_offset;
+        req.range_length = seg->byte_length;
         r = fa_http_fetch(&req, limited_head, limited_data, &lim);
         if (r == FA_OK && (lim.bad || lim.left > 0)) r = FA_ERROR_NETWORK;   /* not the whole segment */
     } else {

@@ -40,15 +40,26 @@ const char* fa_http_header(const char* headers, const char* name, char* out, siz
 
 /* ---- HTTP transports (net_http.c, net_https_*.c) ---------------------------- */
 
+/* Kept by one stream's download thread between its requests, so they share
+ * connections: one TLS handshake per server instead of one per request (an HLS
+ * start fetches a master playlist, a media playlist, a key and segments). Only
+ * that thread uses it. Plain http:// keeps one connection per request. */
+typedef struct fa_http_session fa_http_session;
+fa_http_session* fa_http_session_create(void);       /* NULL when out of memory */
+void fa_http_session_destroy(fa_http_session* s);    /* closes its connections; NULL ok */
+
 typedef struct fa_http_request {
     const char* url;
     int64_t range_start;     /* -1 = no Range header */
+    int64_t range_length;    /* bytes wanted from range_start, 0 = to the end */
     int icy;                 /* ask for inline ICY metadata (Icy-MetaData: 1) */
     const char* user_agent;
     const char* headers;     /* extra request header lines, NULL = none */
     const char* proxy;       /* NULL = system / environment, "" = direct */
     uint32_t timeout_ms;     /* connect, and the longest wait for data */
     fa_atomic32* cancel;     /* nonzero = stop as soon as possible */
+    fa_http_session* session;   /* NULL = connections of this request only */
+    int other_origin;        /* set by fa_http_fetch: a redirect left the first URL's origin */
 } fa_http_request;
 
 typedef struct fa_http_response {
@@ -65,20 +76,32 @@ typedef int (*fa_http_head_proc)(void* user, const fa_http_response* resp);
 typedef int (*fa_http_data_proc)(void* user, const uint8_t* data, size_t n);
 
 /* Blocking GET that streams the body to `on_data` on the calling thread, following
- * redirects. FA_OK when the body ended cleanly or a callback stopped it;
+ * redirects (for every transport, so they all treat credentials alike: the URL's
+ * user info goes along only to the first URL's scheme, host and port, and the app's
+ * Authorization and Cookie lines are not sent anywhere else). FA_OK when the body ended cleanly or a callback stopped it;
  * FA_ERROR_NETWORK for connection failures, timeouts and bodies cut short;
  * FA_ERROR_NOT_FOUND for HTTP 4xx/5xx (after on_head saw the status);
  * FA_ERROR_PROVIDER_MISSING when https has no transport on this system;
  * FA_ERROR_BUSY when `cancel` was raised. */
 fa_result fa_http_fetch(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user);
 
-/* The built-in HTTP/1.1 client on plain sockets, for http:// URLs. Sets
- * *out_redirect (malloc'd absolute URL) instead of calling on_head for a redirect. */
+/* One request, no redirects: both set *out_redirect (malloc'd absolute URL)
+ * instead of calling on_head for a redirect. The built-in HTTP/1.1 client on plain
+ * sockets, for http:// URLs: */
 fa_result fa_http_fetch_socket(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data,
                                void* user, char** out_redirect);
-/* The platform's HTTPS stack (WinHTTP, URLSession, libcurl loaded at runtime). It
- * follows redirects itself. */
-fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user);
+/* ... and the platform's HTTPS stack (WinHTTP, URLSession, HttpURLConnection,
+ * libcurl loaded at runtime). */
+fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user,
+                            char** out_redirect);
+
+/* For the transports: 1 when a response with `status` and `headers` is a redirect
+ * (*out = the target, malloc'd, absolute), 0 when it is not (or has no Location),
+ * -1 when its Location can't be resolved or memory ran out. */
+int fa_http_redirect_target(const char* url, int status, const char* headers, char** out);
+/* A redirect's body is read to its end (up to this much) rather than cut off, so a
+ * kept connection stays usable. */
+#define FA_HTTP_DRAIN_MAX 65536
 
 /* Called after raising `cancel`: interrupts a TLS transfer blocked in the system
  * stack (WinHTTP), so the download thread notices at once. */
@@ -93,10 +116,10 @@ typedef int (*fa_http_header_proc)(void* user, const char* name, const char* val
  * the same order on every transport: User-Agent, Accept, Accept-Encoding: identity,
  * Icy-MetaData, Range, Authorization (Basic, from the URL's user info), then the
  * app's lines from req->headers. An app line replaces the header of ours with the
- * same name. Dropped: app lines without a colon, with an invalid name or a value
- * that is not printable ASCII, or
- * longer than FA_HTTP_LINE_MAX, and Host, Connection, Content-Length and
- * Transfer-Encoding (the transport's own). The transport adds Host and connection
+ * same name. Dropped: the app's Authorization and Cookie lines when
+ * req->other_origin is set, app lines without a colon, with an invalid name or a
+ * value that is not printable ASCII, or longer than FA_HTTP_LINE_MAX, and Host,
+ * Connection, Content-Length and Transfer-Encoding (the transport's own). The transport adds Host and connection
  * handling itself. FA_ERROR_OUT_OF_MEMORY if `add` failed. */
 #define FA_HTTP_LINE_MAX 8192
 fa_result fa_http_each_header(const fa_http_request* req, const fa_url* url, fa_http_header_proc add, void* user);
@@ -176,6 +199,7 @@ struct fa_net {
     int64_t downloaded;
     uint32_t reconnects;
     char* headers;           /* of the last response */
+    fa_http_session* http;   /* the download thread's connections (NULL: one per request) */
     char final_url[FA_NET_URL_MAX];
     char content_type[128];
     uint32_t icy_br;

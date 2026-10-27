@@ -187,10 +187,11 @@ static int same_name(const char* a, const char* b) { return fa_strncasecmp_ascii
 
 /* The app's header text as "name\0value\0" pairs in `out` (room for strlen(text) + 2),
  * the valid lines only. Returns the number of pairs. */
-static size_t parse_app_headers(const char* text, char* out)
+static size_t parse_app_headers(const char* text, char* out, int other_origin)
 {
-    static const char* const owned[] = { "Host", "Connection", "Content-Length", "Transfer-Encoding" };
-    size_t count = 0, i;
+    static const char* const owned[] = { "Host", "Connection", "Content-Length", "Transfer-Encoding",
+                                         "Authorization", "Cookie" };   /* the last two: for the first origin only */
+    size_t count = 0, i, nowned = sizeof(owned) / sizeof(owned[0]) - (other_origin ? 0 : 2);
     char* o = out;
     while (*text) {
         size_t len = strcspn(text, "\r\n");
@@ -212,7 +213,7 @@ static size_t parse_app_headers(const char* text, char* out)
             o += v_end - v;
             *o++ = 0;
             keep = valid_name(name) && valid_value(value);
-            for (i = 0; keep && i < sizeof(owned) / sizeof(owned[0]); i++)
+            for (i = 0; keep && i < nowned; i++)
                 if (same_name(name, owned[i])) keep = 0;
             if (keep) count++;
             else o = name;
@@ -226,14 +227,14 @@ static size_t parse_app_headers(const char* text, char* out)
 fa_result fa_http_each_header(const fa_http_request* req, const fa_url* url, fa_http_header_proc add, void* user)
 {
     const char* own[6][2];
-    char range[40], auth[512];
+    char range[48], auth[512];
     char* app = NULL;
     size_t napp = 0, nown = 0, i, j;
     fa_result r = FA_OK;
     if (req->headers && req->headers[0]) {
         app = (char*)malloc(strlen(req->headers) + 2);
         if (!app) return FA_ERROR_OUT_OF_MEMORY;
-        napp = parse_app_headers(req->headers, app);
+        napp = parse_app_headers(req->headers, app, req->other_origin);
     }
     if (req->user_agent) { own[nown][0] = "User-Agent"; own[nown++][1] = req->user_agent; }
     own[nown][0] = "Accept"; own[nown++][1] = "*/*";
@@ -241,7 +242,11 @@ fa_result fa_http_each_header(const fa_http_request* req, const fa_url* url, fa_
     own[nown][0] = "Accept-Encoding"; own[nown++][1] = "identity";
     if (req->icy) { own[nown][0] = "Icy-MetaData"; own[nown++][1] = "1"; }
     if (req->range_start >= 0) {
-        snprintf(range, sizeof(range), "bytes=%lld-", (long long)req->range_start);
+        if (req->range_length > 0)
+            snprintf(range, sizeof(range), "bytes=%lld-%lld", (long long)req->range_start,
+                     (long long)(req->range_start + req->range_length - 1));
+        else
+            snprintf(range, sizeof(range), "bytes=%lld-", (long long)req->range_start);
         own[nown][0] = "Range"; own[nown++][1] = range;
     }
     if (url && url->userinfo[0]) {
@@ -271,6 +276,53 @@ fa_result fa_http_each_header(const fa_http_request* req, const fa_url* url, fa_
     }
     free(app);
     return r;
+}
+
+/* ---- redirects ------------------------------------------------------------------- */
+
+int fa_http_redirect_target(const char* url, int status, const char* headers, char** out)
+{
+    char loc[FA_NET_URL_MAX];
+    *out = NULL;
+    if (status != 301 && status != 302 && status != 303 && status != 307 && status != 308) return 0;
+    if (!fa_http_header(headers, "Location", loc, sizeof(loc))) return 0;   /* delivered as it is */
+    *out = (char*)malloc(FA_NET_URL_MAX);
+    if (!*out) return -1;
+    if (fa_url_resolve(url, loc, *out, FA_NET_URL_MAX) != FA_OK) { free(*out); *out = NULL; return -1; }
+    return 1;
+}
+
+static int same_origin(const fa_url* a, const fa_url* b)
+{
+    return strcmp(a->scheme, b->scheme) == 0 && a->port == b->port && fa_strncasecmp_ascii(a->host, b->host, sizeof(a->host)) == 0;
+}
+
+/* The next hop of a redirect from the request for `first`: `target` (malloc'd,
+ * absolute) with the user info of `first` when it goes back to that origin without
+ * credentials of its own (an absolute Location on the same server). *out_other: the
+ * hop leaves the first origin. Returns the URL to fetch (target, or a new string
+ * replacing it), NULL when out of memory. */
+static char* next_hop(const fa_url* first, char* target, int* out_other)
+{
+    fa_url t;
+    char* with;
+    const char* rest;
+    size_t ln, lr;
+    if (fa_url_parse(target, &t) != FA_OK) { *out_other = 1; return target; }   /* the transport rejects it */
+    *out_other = !same_origin(first, &t);
+    if (*out_other || t.userinfo[0] || !first->userinfo[0]) return target;
+    rest = strstr(target, "://") + 3;
+    ln = strlen(first->userinfo);
+    lr = strlen(rest);
+    if ((size_t)(rest - target) + ln + 1 + lr >= FA_NET_URL_MAX) return target;   /* too long: without them */
+    with = (char*)malloc(FA_NET_URL_MAX);
+    if (!with) { free(target); return NULL; }
+    memcpy(with, target, (size_t)(rest - target));
+    memcpy(with + (rest - target), first->userinfo, ln);
+    with[(rest - target) + ln] = '@';
+    memcpy(with + (rest - target) + ln + 1, rest, lr + 1);
+    free(target);
+    return with;
 }
 
 /* ---- sockets ------------------------------------------------------------------ */
@@ -547,14 +599,10 @@ fa_result fa_http_fetch_socket(const fa_http_request* req, fa_http_head_proc on_
             resp.final_url = req->url;
             fa_http_fill_lengths(&resp);
 
-            if ((status == 301 || status == 302 || status == 303 || status == 307 || status == 308) &&
-                fa_http_header(lines, "Location", v, sizeof(v))) {
-                char* target = (char*)malloc(FA_NET_URL_MAX);
-                if (!target) { r = FA_ERROR_OUT_OF_MEMORY; goto done; }
-                if (fa_url_resolve(req->url, v, target, FA_NET_URL_MAX) != FA_OK) { free(target); r = FA_ERROR_NETWORK; goto done; }
-                *out_redirect = target;
-                r = FA_OK;
-                goto done;
+            switch (fa_http_redirect_target(req->url, status, lines, out_redirect)) {
+            case 1: r = FA_OK; goto done;          /* the connection closes: its body doesn't matter */
+            case -1: r = FA_ERROR_NETWORK; goto done;
+            default: break;
             }
             if (on_head && on_head(user, &resp)) { r = FA_OK; goto done; }
             if (status >= 400) { r = FA_ERROR_NOT_FOUND; goto done; }
@@ -596,18 +644,21 @@ fa_result fa_http_fetch(const fa_http_request* req, fa_http_head_proc on_head, f
 {
     fa_http_request cur = *req;
     char* owned = NULL;
+    fa_url first;
     int hops;
     fa_result r = FA_ERROR_NETWORK;
+    if (fa_url_parse(req->url, &first) != FA_OK) return FA_ERROR_INVALID_ARG;
+    cur.other_origin = 0;
     for (hops = 0; hops <= FA_NET_MAX_REDIRECTS; hops++) {
         fa_url u;
         char* next = NULL;
         if (fa_url_parse(cur.url, &u) != FA_OK) { r = FA_ERROR_INVALID_ARG; break; }
-        if (strcmp(u.scheme, "https") == 0) {
-            r = fa_http_fetch_tls(&cur, on_head, on_data, user);   /* follows its own redirects */
-            break;
-        }
-        r = fa_http_fetch_socket(&cur, on_head, on_data, user, &next);
-        if (r != FA_OK || !next) break;
+        if (strcmp(u.scheme, "https") == 0) r = fa_http_fetch_tls(&cur, on_head, on_data, user, &next);
+        else r = fa_http_fetch_socket(&cur, on_head, on_data, user, &next);
+        if (r != FA_OK || !next) { free(next); break; }
+        if (cur.cancel && fa_load32(cur.cancel)) { free(next); r = FA_ERROR_BUSY; break; }
+        next = next_hop(&first, next, &cur.other_origin);
+        if (!next) { r = FA_ERROR_OUT_OF_MEMORY; break; }
         free(owned);
         owned = next;
         cur.url = owned;

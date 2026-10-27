@@ -156,20 +156,77 @@ static int add_block_line(void* user, const char* name, const char* value)
     return 0;
 }
 
-fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user)
+/* One session per stream (per user agent and proxy setting: WinHTTP takes both at
+ * WinHttpOpen), and a connection handle for the last server. WinHTTP pools the
+ * session's connections, so later requests skip the TCP and TLS handshakes. */
+struct fa_http_session {
+    HINTERNET session, connect;
+    wchar_t* agent;
+    char* proxy;              /* the request's proxy setting (a copy), NULL = the system's */
+    wchar_t* host;            /* connect's server */
+    INTERNET_PORT port;
+};
+
+fa_http_session* fa_http_session_create(void) { return (fa_http_session*)calloc(1, sizeof(fa_http_session)); }
+
+static void session_close(fa_http_session* s)
 {
-    HINTERNET session = NULL, connect = NULL, request = NULL;
-    wchar_t *wurl = NULL, *wua = NULL, *whost = NULL, *wpath = NULL, *wheaders = NULL, *wproxy = NULL;
+    if (s->connect) WinHttpCloseHandle(s->connect);
+    if (s->session) WinHttpCloseHandle(s->session);
+    free(s->agent); free(s->proxy); free(s->host);
+    memset(s, 0, sizeof(*s));
+}
+
+void fa_http_session_destroy(fa_http_session* s)
+{
+    if (!s) return;
+    session_close(s);
+    free(s);
+}
+
+static HINTERNET open_session(const wchar_t* wua, const char* proxy)
+{
+    HINTERNET session;
+    if (proxy && !proxy[0]) {
+        session = WinHttpOpen(wua, WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    } else if (proxy) {
+        /* "http://user:pass@host:port" -> "host:port" (credentials are not passed on). */
+        const char* p = strstr(proxy, "://");
+        const char* at;
+        wchar_t* wproxy;
+        p = p ? p + 3 : proxy;
+        at = strchr(p, '@');
+        if (at) p = at + 1;
+        wproxy = widen(p);
+        if (!wproxy) return NULL;
+        { size_t l = wcslen(wproxy); if (l > 0 && wproxy[l - 1] == L'/') wproxy[l - 1] = 0; }
+        session = WinHttpOpen(wua, WINHTTP_ACCESS_TYPE_NAMED_PROXY, wproxy, WINHTTP_NO_PROXY_BYPASS, 0);
+        free(wproxy);
+    } else {
+        session = WinHttpOpen(wua, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!session)   /* before Windows 8.1 */
+            session = WinHttpOpen(wua, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    }
+    return session;
+}
+
+fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user,
+                            char** out_redirect)
+{
+    fa_http_session one = { 0 };
+    fa_http_session* s = req->session ? req->session : &one;
+    HINTERNET request = NULL;
+    wchar_t *wurl = NULL, *wua = NULL, *whost = NULL, *wpath = NULL, *wheaders = NULL;
     URL_COMPONENTS uc;
     fa_result r = FA_ERROR_NETWORK;
-    DWORD status = 0, size;
+    DWORD status = 0, size, feature = WINHTTP_DISABLE_REDIRECTS;
     int slot = -1;
     uint8_t* buf = NULL;
     char* headers = NULL;
-    char* final_url = NULL;
     header_block block;
     fa_url u;
 
+    *out_redirect = NULL;
     memset(&block, 0, sizeof(block));
     /* WinHTTP ignores credentials in the URL: the walk sends them. */
     if (fa_http_each_header(req, fa_url_parse(req->url, &u) == FA_OK ? &u : NULL, add_block_line, &block) != FA_OK) {
@@ -194,30 +251,32 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
     memcpy(wpath + uc.dwUrlPathLength, uc.lpszExtraInfo, uc.dwExtraInfoLength * sizeof(wchar_t));
     if (!wpath[0]) wpath[0] = L'/';
 
-    if (req->proxy && !req->proxy[0]) {
-        session = WinHttpOpen(wua, WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    } else if (req->proxy) {
-        /* "http://user:pass@host:port" -> "host:port" (credentials are not passed on). */
-        const char* p = strstr(req->proxy, "://");
-        const char* at;
-        p = p ? p + 3 : req->proxy;
-        at = strchr(p, '@');
-        if (at) p = at + 1;
-        wproxy = widen(p);
-        if (wproxy) { size_t l = wcslen(wproxy); if (l > 0 && wproxy[l - 1] == L'/') wproxy[l - 1] = 0; }
-        session = WinHttpOpen(wua, WINHTTP_ACCESS_TYPE_NAMED_PROXY, wproxy, WINHTTP_NO_PROXY_BYPASS, 0);
-    } else {
-        session = WinHttpOpen(wua, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!session)   /* before Windows 8.1 */
-            session = WinHttpOpen(wua, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!s->session || wcscmp(s->agent, wua) != 0 ||
+        !(req->proxy ? s->proxy && strcmp(s->proxy, req->proxy) == 0 : !s->proxy)) {
+        session_close(s);
+        if (req->proxy && !(s->proxy = _strdup(req->proxy))) { r = FA_ERROR_OUT_OF_MEMORY; goto done; }
+        s->session = open_session(wua, req->proxy);
+        if (!s->session) goto done;
+        s->agent = wua;
+        wua = NULL;
     }
-    if (!session) goto done;
-    WinHttpSetTimeouts(session, (int)req->timeout_ms, (int)req->timeout_ms, (int)req->timeout_ms, (int)req->timeout_ms);
-    connect = WinHttpConnect(session, whost, uc.nPort, 0);
-    if (!connect) goto done;
-    request = WinHttpOpenRequest(connect, L"GET", wpath, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+    if (!s->connect || _wcsicmp(s->host, whost) != 0 || s->port != uc.nPort) {
+        if (s->connect) WinHttpCloseHandle(s->connect);
+        free(s->host);
+        s->host = NULL;
+        s->connect = WinHttpConnect(s->session, whost, uc.nPort, 0);
+        if (!s->connect) goto done;
+        s->host = whost;
+        whost = NULL;
+        s->port = uc.nPort;
+    }
+    request = WinHttpOpenRequest(s->connect, L"GET", wpath, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                  uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
     if (!request) goto done;
+    WinHttpSetTimeouts(request, (int)req->timeout_ms, (int)req->timeout_ms, (int)req->timeout_ms, (int)req->timeout_ms);
+    /* Redirects come back to fa_http_fetch, which follows them for every transport
+     * (WinHTTP's own would keep the Authorization header on another server). */
+    WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &feature, sizeof(feature));
     slot = slot_add(req->cancel, request);
     if (req->cancel && fa_load32(req->cancel)) { r = FA_ERROR_BUSY; goto done; }
     if (!WinHttpSendRequest(request, wheaders && wheaders[0] ? wheaders : WINHTTP_NO_ADDITIONAL_HEADERS,
@@ -240,16 +299,8 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
         }
         free(wh);
     }
-    size = 0;
-    WinHttpQueryOption(request, WINHTTP_OPTION_URL, NULL, &size);
-    if (size > 0) {
-        wchar_t* wu = (wchar_t*)malloc(size + sizeof(wchar_t));
-        if (wu && WinHttpQueryOption(request, WINHTTP_OPTION_URL, wu, &size)) {
-            wu[size / sizeof(wchar_t)] = 0;
-            final_url = narrow(wu);
-        }
-        free(wu);
-    }
+    buf = (uint8_t*)malloc(65536);
+    if (!buf) { r = FA_ERROR_OUT_OF_MEMORY; goto done; }
     {
         fa_http_response resp;
         char* lines = headers ? headers + strcspn(headers, "\n") : NULL;   /* skip the status line */
@@ -257,13 +308,22 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
         memset(&resp, 0, sizeof(resp));
         resp.status = (int)status;
         resp.headers = lines ? lines : (char*)"";
-        resp.final_url = final_url ? final_url : req->url;
+        resp.final_url = req->url;
+        switch (fa_http_redirect_target(req->url, (int)status, resp.headers, out_redirect)) {
+        case 1: {
+            /* Its body is read to the end, so the connection goes back to the pool. */
+            DWORD got = 0, total = 0;
+            while (total <= FA_HTTP_DRAIN_MAX && WinHttpReadData(request, buf, 65536, &got) && got > 0) total += got;
+            r = FA_OK;
+            goto done;
+        }
+        case -1: r = FA_ERROR_NETWORK; goto done;
+        default: break;
+        }
         fa_http_fill_lengths(&resp);
         if (on_head && on_head(user, &resp)) { r = FA_OK; goto done; }
         if (status >= 400) { r = FA_ERROR_NOT_FOUND; goto done; }
     }
-    buf = (uint8_t*)malloc(65536);
-    if (!buf) { r = FA_ERROR_OUT_OF_MEMORY; goto done; }
     for (;;) {
         DWORD got = 0;
         if (req->cancel && fa_load32(req->cancel)) { r = FA_ERROR_BUSY; goto done; }
@@ -272,12 +332,11 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
         if (on_data(user, buf, got)) { r = FA_OK; break; }
     }
 done:
-    if (req->cancel && fa_load32(req->cancel)) r = FA_ERROR_BUSY;
+    if (req->cancel && fa_load32(req->cancel)) { r = FA_ERROR_BUSY; free(*out_redirect); *out_redirect = NULL; }
     if (request && !slot_remove(slot)) WinHttpCloseHandle(request);
-    if (connect) WinHttpCloseHandle(connect);
-    if (session) WinHttpCloseHandle(session);
-    free(buf); free(headers); free(final_url); free(block.text); free(block.agent);
-    free(wurl); free(wua); free(whost); free(wpath); free(wheaders); free(wproxy);
+    if (s == &one) session_close(&one);
+    free(buf); free(headers); free(block.text); free(block.agent);
+    free(wurl); free(wua); free(whost); free(wpath); free(wheaders);
     return r;
 }
 

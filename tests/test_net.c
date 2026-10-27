@@ -479,42 +479,55 @@ static void serve_hls(sock_t s, const char* req, const char* path)
     if (!send_str(s, head)) send_str(s, text);
 }
 
-static void handle_request(sock_t s);
+typedef struct conn_arg { sock_t s; int id; } conn_arg;
+static int handle_request(sock_t s, int id);
 
 /* One connection: one request, then the server closes its side (the socket itself
- * is closed by server_stop, so the descriptor is never reused while listed). */
+ * is closed by server_stop, so the descriptor is never reused while listed). Only
+ * /keep-echo keeps the connection for another request. */
 static void handle(void* arg)
 {
-    sock_t s = *(sock_t*)arg;
+    conn_arg c = *(conn_arg*)arg;
     free(arg);
-    handle_request(s);
-    shutdown(s, SHUT_BOTH);
+    while (handle_request(c.s, c.id)) {}
+    shutdown(c.s, SHUT_BOTH);
 }
 
-static void handle_request(sock_t s)
+/* Serves one request; returns 1 to wait for another on the same connection. */
+static int handle_request(sock_t s, int id)
 {
     char req[16384], path[512];
     size_t got = 0;
     while (got < sizeof(req) - 1) {
         int k = (int)recv(s, req + got, (int)(sizeof(req) - 1 - got), 0);
-        if (k <= 0) return;
+        if (k <= 0) return 0;
         got += (size_t)k;
         req[got] = 0;
         if (strstr(req, "\r\n\r\n")) break;
     }
-    if (sscanf(req, "GET %511s", path) != 1) return;
+    if (sscanf(req, "GET %511s", path) != 1) return 0;
     fa_fetch_add32(&g_requests, 1);
     {
         const char* ua = strstr(req, "\r\nUser-Agent: ");
         if (ua) { ua += 14; snprintf(g_last_agent, sizeof(g_last_agent), "%.*s", (int)strcspn(ua, "\r\n"), ua); }
     }
-    if (strcmp(path, "/echo-headers") == 0) {
-        /* The request's header lines as the body (as tools/test-https/serve.py does). */
+    if (strcmp(path, "/echo-headers") == 0 || strcmp(path, "/keep-echo") == 0) {
+        /* The request's header lines as the body (as tools/test-https/serve.py does).
+         * /keep-echo keeps the connection open unless the client closes it, and
+         * says which connection it is (X-Connection). */
         char head[256];
         const char* lines = strstr(req, "\r\n") + 2;
         size_t n = (size_t)(strstr(req, "\r\n\r\n") + 2 - lines);
-        snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", n);
-        if (!send_str(s, head)) send_all(s, lines, n);
+        int keep = path[1] == 'k' && !strstr(req, "\r\nConnection: close\r\n");
+        snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %zu\r\nX-Connection: %d\r\n%s\r\n",
+                 n, id, keep ? "" : "Connection: close\r\n");
+        if (send_str(s, head) || send_all(s, lines, n)) return 0;
+        return keep;
+    }
+    else if (strncmp(path, "/redirect?to=", 13) == 0) {
+        char head[700];
+        snprintf(head, sizeof(head), "HTTP/1.1 302 Found\r\nLocation: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", path + 13);
+        send_str(s, head);
     }
     else if (strcmp(path, "/tone.wav") == 0) serve_bytes(s, req, g_wav, g_wav_n, "audio/wav", 1, 0);
     else if (strcmp(path, "/tone.mp3") == 0) serve_bytes(s, req, g_mp3, g_mp3_n, "audio/mpeg", 1, 0);
@@ -559,6 +572,7 @@ static void handle_request(sock_t s)
     else if (strcmp(path, "/chunked.asf") == 0) serve_chunked(s, g_asf_pcm, g_asf_pcm_n);
     else if (strncmp(path, "/hls/", 5) == 0) serve_hls(s, req, path);
     else send_str(s, "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found");
+    return 0;
 }
 
 static void accept_main(void* arg)
@@ -566,12 +580,13 @@ static void accept_main(void* arg)
     (void)arg;
     while (!fa_load32(&g_stop)) {
         sock_t c = accept(g_listen, NULL, NULL);
-        sock_t* p;
+        conn_arg* p;
         if (c == BAD_SOCK) continue;
         if (fa_load32(&g_stop)) { close_sock(c); break; }
-        p = (sock_t*)malloc(sizeof(*p));
-        *p = c;
+        p = (conn_arg*)malloc(sizeof(*p));
+        p->s = c;
         fa_mutex_lock(&g_conn_lock);
+        p->id = g_conn_count + 1;
         if (g_conn_count < MAX_CONNS && fa_thread_create(&g_conn_threads[g_conn_count], handle, p) == 0)
             g_conns[g_conn_count++] = c;
         else { close_sock(c); free(p); }
@@ -1012,6 +1027,22 @@ static void test_request_header_walk(void)
     CHECK_EQ(fa_http_each_header(&req, NULL, walk_add, &w), FA_OK);
     CHECK(strstr(w.text, "X-Long=xxx") != NULL);
 
+    /* After a redirect to another origin: no Authorization or Cookie of the app. A
+     * Range with a length. */
+    req.headers = "Authorization: Bearer t\nCookie: a=b\nX-Keep: 1";
+    req.range_start = 100;
+    req.range_length = 50;
+    req.icy = 0;
+    memset(&w, 0, sizeof(w));
+    CHECK_EQ(fa_http_each_header(&req, NULL, walk_add, &w), FA_OK);
+    CHECK_STR(w.text, "User-Agent=fa-test/1|Accept=*/*|Accept-Encoding=identity|Range=bytes=100-149|"
+                      "Authorization=Bearer t|Cookie=a=b|X-Keep=1|");
+    req.other_origin = 1;
+    memset(&w, 0, sizeof(w));
+    CHECK_EQ(fa_http_each_header(&req, NULL, walk_add, &w), FA_OK);
+    CHECK_STR(w.text, "User-Agent=fa-test/1|Accept=*/*|Accept-Encoding=identity|Range=bytes=100-149|X-Keep=1|");
+    req.other_origin = 0;
+
     /* A user agent with a line break is not sent; the sink failing stops the walk. */
     req.headers = NULL;
     req.user_agent = "evil\r\nX-Injected: 1";
@@ -1113,6 +1144,121 @@ static void test_request_headers_sent(void)
     char url[256];
     snprintf(url, sizeof(url), "%s://user:p%%20w@127.0.0.1:%d/echo-headers", g_scheme, g_url_port);
     check_request_headers(url);
+}
+
+/* A GET through `session`: the status, the body, and which connection of the test
+ * server carried it (X-Connection). With `cancel_on_data`, the first body bytes
+ * raise the cancel flag instead. */
+typedef struct conn_fetch {
+    int status, conn;
+    body_text body;
+    int cancel_on_data;
+    fa_atomic32 cancel;
+} conn_fetch;
+
+static int cf_head(void* user, const fa_http_response* r)
+{
+    conn_fetch* c = (conn_fetch*)user;
+    char v[32];
+    c->status = r->status;
+    c->conn = fa_http_header(r->headers, "X-Connection", v, sizeof(v)) ? atoi(v) : 0;
+    return 0;
+}
+
+static int cf_data(void* user, const uint8_t* p, size_t n)
+{
+    conn_fetch* c = (conn_fetch*)user;
+    if (c->cancel_on_data) {
+        fa_store32(&c->cancel, 1);
+        fa_http_abort(&c->cancel);   /* as a seek or close on another thread would */
+        return 0;
+    }
+    return body_add(&c->body, p, n);
+}
+
+static fa_result fetch_with(fa_http_session* session, const char* url, const char* headers, conn_fetch* c)
+{
+    fa_http_request req;
+    int cancel_on_data = c->cancel_on_data;
+    free(c->body.p);
+    memset(c, 0, sizeof(*c));
+    c->cancel_on_data = cancel_on_data;
+    memset(&req, 0, sizeof(req));
+    req.url = url;
+    req.range_start = -1;
+    req.user_agent = "fa-test/1";
+    req.headers = headers;
+    req.proxy = "";
+    req.timeout_ms = 5000;
+    req.cancel = &c->cancel;
+    req.session = session;
+    return fa_http_fetch(&req, cf_head, cf_data, c);
+}
+
+/* Redirects take the URL's credentials only back to the URL's own origin, and the
+ * app's Authorization and Cookie lines only to it too. "localhost" is another
+ * origin than "127.0.0.1" (the same server). */
+static void test_redirect_credentials(void)
+{
+    char url[512];
+    conn_fetch c;
+    const char* sc = g_scheme;
+    int port = g_url_port;
+    memset(&c, 0, sizeof(c));
+    /* The same origin, by an absolute Location without credentials: they stay. */
+    snprintf(url, sizeof(url), "%s://user:p%%20w@127.0.0.1:%d/redirect?to=%s://127.0.0.1:%d/echo-headers", sc, port, sc, port);
+    CHECK_EQ(fetch_with(NULL, url, "Cookie: a=b", &c), FA_OK);
+    CHECK(c.body.p != NULL);
+    CHECK_EQ(count_header(c.body.p, "Authorization", NULL, 0), 1);
+    CHECK_EQ(count_header(c.body.p, "Cookie", NULL, 0), 1);
+    /* Another origin: neither the URL's nor the app's. */
+    snprintf(url, sizeof(url), "%s://user:p%%20w@127.0.0.1:%d/redirect?to=%s://localhost:%d/echo-headers", sc, port, sc, port);
+    CHECK_EQ(fetch_with(NULL, url, "Cookie: a=b\r\nX-Keep: 1", &c), FA_OK);
+    CHECK(c.body.p != NULL);
+    CHECK_EQ(count_header(c.body.p, "Authorization", NULL, 0), 0);
+    CHECK_EQ(count_header(c.body.p, "Cookie", NULL, 0), 0);
+    CHECK_EQ(count_header(c.body.p, "X-Keep", NULL, 0), 1);
+    snprintf(url, sizeof(url), "%s://127.0.0.1:%d/redirect?to=%s://localhost:%d/echo-headers", sc, port, sc, port);
+    CHECK_EQ(fetch_with(NULL, url, "Authorization: Bearer t", &c), FA_OK);
+    CHECK_EQ(count_header(c.body.p, "Authorization", NULL, 0), 0);
+    /* Away and back again: the first origin gets them again. */
+    snprintf(url, sizeof(url), "%s://user:p%%20w@127.0.0.1:%d/redirect?to=%s://localhost:%d/redirect?to=%s://127.0.0.1:%d/echo-headers",
+             sc, port, sc, port, sc, port);
+    CHECK_EQ(fetch_with(NULL, url, "Cookie: a=b", &c), FA_OK);
+    CHECK_EQ(count_header(c.body.p, "Authorization", NULL, 0), 1);
+    CHECK_EQ(count_header(c.body.p, "Cookie", NULL, 0), 1);
+    free(c.body.p);
+}
+
+/* Requests through one session: over https they share a connection, plain http
+ * opens one per request. A cancelled transfer leaves the session usable. */
+static void test_session_reuse(void)
+{
+    char url[256];
+    conn_fetch c;
+    fa_http_session* session = fa_http_session_create();
+    int first, i;
+    CHECK(session != NULL);
+    memset(&c, 0, sizeof(c));
+    url_of(url, sizeof(url), "/keep-echo");
+    CHECK_EQ(fetch_with(session, url, NULL, &c), FA_OK);
+    first = c.conn;
+    CHECK(first > 0);
+    for (i = 0; i < 2; i++) {
+        CHECK_EQ(fetch_with(session, url, NULL, &c), FA_OK);
+        CHECK_EQ(c.status, 200);
+        if (strcmp(g_scheme, "https") == 0) CHECK_EQ(c.conn, first);
+        else CHECK(c.conn != first);
+    }
+    url_of(url, sizeof(url), "/tone.wav");
+    c.cancel_on_data = 1;
+    CHECK_EQ(fetch_with(session, url, NULL, &c), FA_ERROR_BUSY);
+    c.cancel_on_data = 0;
+    url_of(url, sizeof(url), "/keep-echo");
+    CHECK_EQ(fetch_with(session, url, NULL, &c), FA_OK);
+    CHECK_EQ(c.status, 200);
+    free(c.body.p);
+    fa_http_session_destroy(session);
 }
 
 static void test_http_fetch(void)
@@ -1938,6 +2084,129 @@ static void test_https_headers_optional(void)
     check_request_headers(url);
 }
 
+/* The origin of FA_NET_HTTPS_ECHO_URL (tools/test-https/serve.py) as
+ * "https://127.0.0.1:8443", and its port. 0 when it is not set. */
+static int https_origin(char* out, size_t cap, int* out_port)
+{
+    const char* url = getenv("FA_NET_HTTPS_ECHO_URL");
+    fa_url u;
+    if (!url || fa_url_parse(url, &u) != FA_OK) return 0;
+    snprintf(out, cap, "https://%s:%u", u.host, (unsigned)u.port);
+    *out_port = u.port;
+    return 1;
+}
+
+/* How many connections serve.py has opened (this request's included). */
+static int https_connections(const char* origin)
+{
+    char url[300];
+    conn_fetch c;
+    int n;
+    memset(&c, 0, sizeof(c));
+    snprintf(url, sizeof(url), "%s/connections", origin);
+    n = fetch_with(NULL, url, NULL, &c) == FA_OK && c.body.p ? atoi(c.body.p) : -1;
+    free(c.body.p);
+    return n;
+}
+
+/* Connection reuse through the system's TLS stack, against serve.py
+ * (FA_NET_HTTPS_ECHO_URL): requests of one session share a connection, one the
+ * server closed without notice is replaced, a cancelled transfer leaves the session
+ * usable, and redirects to another origin (serve.py's second port) drop the
+ * credentials. */
+static void test_https_session_optional(void)
+{
+    char origin[300], url[700];
+    conn_fetch c;
+    fa_http_session* session;
+    int port, first, i;
+    if (!https_origin(origin, sizeof(origin), &port)) { printf("  skipped (set FA_NET_HTTPS_ECHO_URL)\n"); return; }
+    session = fa_http_session_create();
+    CHECK(session != NULL);
+    memset(&c, 0, sizeof(c));
+    snprintf(url, sizeof(url), "%s/echo-headers", origin);
+    CHECK_EQ(fetch_with(session, url, NULL, &c), FA_OK);
+    first = c.conn;
+    CHECK(first > 0);
+    for (i = 0; i < 2; i++) {
+        CHECK_EQ(fetch_with(session, url, NULL, &c), FA_OK);
+        CHECK_EQ(c.conn, first);
+    }
+    /* The server closes the kept connection: the next request gets a new one, once,
+     * right away and after the close has arrived. */
+    for (i = 0; i < 2; i++) {
+        snprintf(url, sizeof(url), "%s/echo-headers?close", origin);
+        CHECK_EQ(fetch_with(session, url, NULL, &c), FA_OK);
+        first = c.conn;
+        if (i == 1) fa_sleep_ms(200);
+        snprintf(url, sizeof(url), "%s/echo-headers", origin);
+        CHECK_EQ(fetch_with(session, url, NULL, &c), FA_OK);
+        CHECK_EQ(c.status, 200);
+        CHECK(c.conn != first);
+        first = c.conn;
+        CHECK_EQ(fetch_with(session, url, NULL, &c), FA_OK);
+        CHECK_EQ(c.conn, first);
+    }
+    /* Cancelled in the middle of a body, then the next request. */
+    snprintf(url, sizeof(url), "%s/net/tone_cbr.mp3", origin);
+    c.cancel_on_data = 1;
+    CHECK_EQ(fetch_with(session, url, NULL, &c), FA_ERROR_BUSY);
+    c.cancel_on_data = 0;
+    snprintf(url, sizeof(url), "%s/echo-headers", origin);
+    CHECK_EQ(fetch_with(session, url, NULL, &c), FA_OK);
+    CHECK_EQ(c.status, 200);
+    /* Redirects: another origin gets no credentials, the same one does. */
+    snprintf(url, sizeof(url), "https://user:p%%20w@127.0.0.1:%d/redirect?to=https://127.0.0.1:%d/echo-headers", port, port + 1);
+    CHECK_EQ(fetch_with(session, url, "Cookie: a=b\r\nX-Keep: 1", &c), FA_OK);
+    CHECK(c.body.p != NULL);
+    CHECK_EQ(count_header(c.body.p, "Authorization", NULL, 0), 0);
+    CHECK_EQ(count_header(c.body.p, "Cookie", NULL, 0), 0);
+    CHECK_EQ(count_header(c.body.p, "X-Keep", NULL, 0), 1);
+    snprintf(url, sizeof(url), "https://user:p%%20w@127.0.0.1:%d/redirect?to=https://127.0.0.1:%d/echo-headers", port, port);
+    CHECK_EQ(fetch_with(session, url, "Cookie: a=b", &c), FA_OK);
+    CHECK_EQ(count_header(c.body.p, "Authorization", NULL, 0), 1);
+    CHECK_EQ(count_header(c.body.p, "Cookie", NULL, 0), 1);
+    free(c.body.p);
+    fa_http_session_destroy(session);
+}
+
+/* An HLS stream from serve.py (a master playlist, a media playlist, three
+ * byte-range segments of one file) plays over a single connection. Prints the time
+ * to the first audio. */
+static void test_https_hls_optional(void)
+{
+    char origin[300], url[400];
+    fa_open_options o;
+    fa_net_options net;
+    fa_stream* s = NULL;
+    float buf[1152 * 2];
+    fa_frames got = 0, total = 0;
+    int port, before, after;
+    int64_t t0, t_first = 0;
+    if (!https_origin(origin, sizeof(origin), &port)) { printf("  skipped (set FA_NET_HTTPS_ECHO_URL)\n"); return; }
+    before = https_connections(origin);
+    CHECK(before > 0);
+    snprintf(url, sizeof(url), "%s/hls/master.m3u8", origin);
+    fa_open_options_init(&o);
+    fa_net_options_init(&net);
+    net.proxy = "";
+    net.timeout_ms = 5000;
+    o.flags = FA_OPEN_DECODE_ONLY;
+    o.net = &net;
+    t0 = fa_monotonic_ns();
+    CHECK_EQ(fa_stream_open_url(g_engine, url, &o, &s), FA_OK);
+    while (fa_stream_read(s, buf, 1152, &got) == FA_OK && got > 0) {
+        if (!t_first) t_first = fa_monotonic_ns();
+        total += got;
+    }
+    fa_stream_close(s);
+    after = https_connections(origin);
+    printf("  %lld frames, first audio after %.0f ms, %d connection(s)\n", (long long)total,
+           (double)(t_first - t0) / 1e6, after - before - 1);
+    CHECK(total > 44100 * 2);
+    CHECK_EQ(after - before - 1, 1);
+}
+
 /* A segment whose download breaks off is fetched again, and the audio already
  * delivered is not repeated; byte-range segments work on a server ignoring Range. */
 static void test_hls_retry_and_byteranges(void)
@@ -2068,6 +2337,8 @@ static void test_android_https(void)
     before = g_failures;
     test_http_fetch();
     test_request_headers_sent();
+    test_redirect_credentials();
+    test_session_reuse();
     test_wav_over_http();
     test_mp3_over_http();
     test_no_ranges_and_chunked();
@@ -2133,6 +2404,8 @@ int main(void)
     RUN(test_ts_demux);
     RUN(test_http_fetch);
     RUN(test_request_headers_sent);
+    RUN(test_redirect_credentials);
+    RUN(test_session_reuse);
     RUN(test_wav_over_http);
     RUN(test_mp3_over_http);
     RUN(test_no_ranges_and_chunked);
@@ -2155,6 +2428,8 @@ int main(void)
     RUN(test_close_while_streaming);
     RUN(test_https_optional);
     RUN(test_https_headers_optional);
+    RUN(test_https_session_optional);
+    RUN(test_https_hls_optional);
 #if defined(__ANDROID__)
     RUN(test_android_https);
 #endif

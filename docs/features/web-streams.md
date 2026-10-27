@@ -195,6 +195,26 @@ FatzAudio never bundles a TLS library. HTTPS goes through the system's stack, so
 
 Plain `http://` uses FatzAudio's own small HTTP/1.1 client on every platform. It understands Shoutcast's `ICY 200 OK` answers, which some HTTP stacks reject.
 
+### Connections
+
+The requests of one stream share their connections. An HLS stream fetches a master playlist, a media playlist,
+maybe a key, and then a segment every few seconds; over `https://` all of them go over one connection per server,
+so only the first pays for the TCP and TLS handshakes. With a 100 ms round trip that makes an HLS start about half
+a second faster (measured on Linux: 1.2 s to 0.7 s to the first audio, five connections down to one). A server that
+closed the kept connection in the meantime gets a new one, without an error. A seek in the middle of a download
+closes that connection (the rest of the old body isn't read), so the request after it connects again. Plain
+`http://` opens a connection per request. Streams never share connections with each other.
+
+### Redirects
+
+FatzAudio follows redirects itself, up to 8, the same way on every platform and stack, also from `https://` to
+`http://`. Credentials go along only to where they belong:
+
+- The URL's own credentials (`https://user:password@host/...`) are sent to the URL's own origin (scheme, host and
+  port) only. A redirect to the same server keeps them; a redirect to another one doesn't send them.
+- Your `Authorization` and `Cookie` header lines are likewise sent to the first URL's origin only. Every other line
+  of yours goes to every hop.
+
 ### Request headers
 
 Every request sends the same headers on every platform and stack, in this order:
@@ -205,8 +225,8 @@ Every request sends the same headers on every platform and stack, in this order:
 | `Accept: */*` | always |
 | `Accept-Encoding: identity` | always: the bytes as the server stores them, so byte ranges match |
 | `Icy-MetaData: 1` | radio song titles, unless `FA_NET_NO_ICY` |
-| `Range: bytes=N-` | seeks and resumed downloads |
-| `Authorization: Basic ...` | the URL has credentials (`https://user:password@host/...`); sent up front, without waiting for a challenge |
+| `Range: bytes=N-` | seeks and resumed downloads; `bytes=N-M` for an HLS segment that is a byte range |
+| `Authorization: Basic ...` | the URL has credentials (`https://user:password@host/...`); sent up front, without waiting for a challenge, and only to that URL's origin ([redirects](#redirects)) |
 | your `headers` lines | as given, after the ones above |
 
 A line of yours replaces the header above with the same name (any case), so `"User-Agent: MyApp"` or
