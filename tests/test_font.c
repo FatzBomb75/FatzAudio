@@ -296,6 +296,45 @@ static void test_composite_bomb(void)
     fa_font_close(f);
 }
 
+/* A crafted outline of 400k lines across a whole 2160p layer, then a square: the
+ * path's cell budget runs out long before the square (which is left out), so the
+ * draw takes milliseconds instead of seconds. A real glyph is drawn in full. */
+static void test_raster_budget(void)
+{
+    enum { W = 3840, H = 2160, LINES = 400000 };
+    fa_raster r = { 0 };
+    fa_path p = { 0 };
+    uint8_t* img = (uint8_t*)malloc((size_t)W * H);
+    int64_t t0;
+    size_t i, n;
+    int pass;
+    CHECK(img);
+    p.cmd = (fa_path_cmd*)calloc(LINES + 8, sizeof(fa_path_cmd));
+    CHECK(p.cmd);
+    for (pass = 0; pass < 2; pass++) {
+        /* Pass 0: 1000 tall lines (as many rows as a big CJK glyph), pass 1: 400k. */
+        size_t lines = pass ? LINES : 1000;
+        n = 0;
+        p.cmd[n].op = FA_PATH_MOVE; p.cmd[n].x = 10; p.cmd[n].y = -10; n++;
+        for (i = 0; i < lines; i++) { p.cmd[n].op = FA_PATH_LINE; p.cmd[n].x = 10; p.cmd[n].y = (i & 1) ? -10.0f : H + 10.0f; n++; }
+        p.cmd[n].op = FA_PATH_MOVE; p.cmd[n].x = 100; p.cmd[n].y = 100; n++;
+        p.cmd[n].op = FA_PATH_LINE; p.cmd[n].x = 200; p.cmd[n].y = 100; n++;
+        p.cmd[n].op = FA_PATH_LINE; p.cmd[n].x = 200; p.cmd[n].y = 200; n++;
+        p.cmd[n].op = FA_PATH_LINE; p.cmd[n].x = 100; p.cmd[n].y = 200; n++;
+        p.count = n;
+        CHECK(fa_raster_begin(&r, W, H));
+        t0 = fa_monotonic_ns();
+        fa_raster_path(&r, &p, 1.0f, 1.0f, 0.0f, 0.0f);
+        fa_raster_end(&r, img, W);
+        printf("  %zu lines: %.1f ms\n", lines, (double)(fa_monotonic_ns() - t0) / 1e6);
+        CHECK_EQ(img[150 * W + 150], pass ? 0 : 255);
+        CHECK_EQ(img[150 * W + 300], 0);
+    }
+    free(p.cmd);
+    fa_raster_free(&r);
+    free(img);
+}
+
 static uint32_t be32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
 static void put16(uint8_t* p, int v) { p[0] = (uint8_t)((unsigned)v >> 8); p[1] = (uint8_t)v; }
 
@@ -592,6 +631,69 @@ static void test_shared_buffers(void)
     CHECK_EQ(fa_font_shared_buffers(), 0);
 }
 
+/* Threads opening one uncached file at the same moment: one of them reads it, the
+ * others wait for that read and share its buffer. */
+enum { RACE_THREADS = 6 };
+typedef struct race_arg {
+    const char* path;
+    fa_atomic32* go;
+    fa_font* font;
+    fa_result r;
+} race_arg;
+
+static void race_open(void* p)
+{
+    race_arg* a = (race_arg*)p;
+    fa_fetch_add32(a->go, 1);
+    while (fa_load32(a->go) < RACE_THREADS) { }   /* start together */
+    a->r = fa_font_open_file(a->path, 0, &a->font);
+}
+
+static void test_shared_race(void)
+{
+    const char* tmp = "font_race_test.ttf";
+    fa_thread th[RACE_THREADS];
+    race_arg args[RACE_THREADS];
+    fa_atomic32 go;
+    blob x = load("tt.ttf");
+    uint8_t* pad;
+    size_t reads;
+    FILE* fp;
+    int round, i;
+    CHECK(x.n);
+    /* 16 MB of padding after the font makes each read take long enough to overlap. */
+    pad = (uint8_t*)calloc(16u << 20, 1);
+    CHECK(pad);
+    fp = fopen(tmp, "wb");
+    CHECK(fp);
+    fwrite(x.p, 1, x.n, fp);
+    fwrite(pad, 1, 16u << 20, fp);
+    fclose(fp);
+    free(pad);
+    free(x.p);
+    for (round = 0; round < 4; round++) {
+        reads = fa_font_file_reads();
+        fa_store32(&go, 0);
+        for (i = 0; i < RACE_THREADS; i++) {
+            args[i].path = tmp;
+            args[i].go = &go;
+            args[i].font = NULL;
+            args[i].r = FA_ERROR_IO;
+            CHECK(fa_thread_create(&th[i], race_open, &args[i]) == 0);
+        }
+        for (i = 0; i < RACE_THREADS; i++) fa_thread_join(&th[i]);
+        for (i = 0; i < RACE_THREADS; i++) CHECK_EQ(args[i].r, FA_OK);
+        CHECK_EQ(fa_font_shared_buffers(), 1);
+        CHECK_EQ(fa_font_file_reads() - reads, 1);
+        for (i = 0; i < RACE_THREADS; i++) {
+            CHECK(fa_font_get_info(args[i].font)->glyph_count > 0);
+            fa_font_close(args[i].font);
+        }
+        CHECK_EQ(fa_font_shared_buffers(), 0);
+    }
+    remove(tmp);
+}
+
 int main(void)
 {
     RUN(test_info_and_maps);
@@ -599,7 +701,9 @@ int main(void)
     RUN(test_outlines);
     RUN(test_collection);
     RUN(test_shared_buffers);
+    RUN(test_shared_race);
     RUN(test_composite_bomb);
+    RUN(test_raster_budget);
     RUN(test_bad_metrics);
     RUN(test_damage);
     RUN(test_find);

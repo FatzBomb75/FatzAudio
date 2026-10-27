@@ -17,6 +17,12 @@
  * pieces each would cost a crafted glyph seconds. Past it, curves are drawn as single
  * lines (the outline stays closed, only coarser). */
 #define RASTER_MAX_SEGMENTS (1 << 20)
+/* Pixel cells (rows crossed plus columns spanned, per edge) of one path, about one
+ * step of row_edge each. The busiest glyph of a CJK font needs 12k at a 480-pixel em
+ * (the largest lyric size at 2160p); a crafted glyph of 400k lines across a 2160p
+ * layer would need 10^9 (9 s). Past it, the rest of the path is left out: such a
+ * glyph draws wrong, but in milliseconds. */
+#define RASTER_MAX_CELLS (1L << 22)
 
 int fa_raster_begin(fa_raster* r, int w, int h)
 {
@@ -93,6 +99,28 @@ void fa_raster_line(fa_raster* r, float x0, float y0, float x1, float y1)
     }
 }
 
+/* The cells fa_raster_line steps through for this edge (the same clipping). */
+static long line_cells(const fa_raster* r, float x0, float y0, float x1, float y1)
+{
+    float lo = x0 < x1 ? x0 : x1, hi = x0 < x1 ? x1 : x0, ya = y0 < y1 ? y0 : y1, yb = y0 < y1 ? y1 : y0;
+    if (!(lo < (float)r->w) || !(hi > 0.0f)) lo = hi = 0.0f;   /* off the side, or NaN */
+    if (lo < 0.0f) lo = 0.0f;
+    if (hi > (float)r->w) hi = (float)r->w;
+    if (!(ya < (float)r->h) || !(yb > 0.0f)) return 1;
+    if (ya < 0.0f) ya = 0.0f;
+    if (yb > (float)r->h) yb = (float)r->h;
+    return (long)(yb - ya) + (long)(hi - lo) + 2;
+}
+
+/* Adds an edge of a path while its cell budget lasts; 0 once it is spent. */
+static int path_line(fa_raster* r, long* cells, float x0, float y0, float x1, float y1)
+{
+    *cells -= line_cells(r, x0, y0, x1, y1);
+    if (*cells < 0) return 0;
+    fa_raster_line(r, x0, y0, x1, y1);
+    return 1;
+}
+
 static int steps_for(float dev, long* budget)
 {
     float f;
@@ -111,20 +139,20 @@ void fa_raster_path(fa_raster* r, const fa_path* p, float sx, float sy, float dx
 {
     float cx = 0, cy = 0, mx = 0, my = 0;
     int open = 0;
-    long budget = RASTER_MAX_SEGMENTS;
+    long budget = RASTER_MAX_SEGMENTS, cells = RASTER_MAX_CELLS;
     size_t i;
     for (i = 0; i < p->count; i++) {
         const fa_path_cmd* c = &p->cmd[i];
         float x = c->x * sx + dx, y = c->y * sy + dy;
         switch (c->op) {
         case FA_PATH_MOVE:
-            if (open) fa_raster_line(r, cx, cy, mx, my);
+            if (open && !path_line(r, &cells, cx, cy, mx, my)) return;
             mx = cx = x;
             my = cy = y;
             open = 1;
             continue;
         case FA_PATH_LINE:
-            fa_raster_line(r, cx, cy, x, y);
+            if (!path_line(r, &cells, cx, cy, x, y)) return;
             break;
         case FA_PATH_QUAD: {
             float x1 = c->x1 * sx + dx, y1 = c->y1 * sy + dy;
@@ -135,7 +163,7 @@ void fa_raster_path(fa_raster* r, const fa_path* p, float sx, float sy, float dx
                 float t = (float)k / (float)n, u = 1 - t;
                 float qx = u * u * cx + 2 * u * t * x1 + t * t * x, qy = u * u * cy + 2 * u * t * y1 + t * t * y;
                 if (k == n) { qx = x; qy = y; }
-                fa_raster_line(r, px, py, qx, qy);
+                if (!path_line(r, &cells, px, py, qx, qy)) return;
                 px = qx;
                 py = qy;
             }
@@ -152,7 +180,7 @@ void fa_raster_path(fa_raster* r, const fa_path* p, float sx, float sy, float dx
                 float qx = u * u * u * cx + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x;
                 float qy = u * u * u * cy + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y;
                 if (k == n) { qx = x; qy = y; }
-                fa_raster_line(r, px, py, qx, qy);
+                if (!path_line(r, &cells, px, py, qx, qy)) return;
                 px = qx;
                 py = qy;
             }
@@ -164,7 +192,7 @@ void fa_raster_path(fa_raster* r, const fa_path* p, float sx, float sy, float dx
         cx = x;
         cy = y;
     }
-    if (open) fa_raster_line(r, cx, cy, mx, my);
+    if (open) path_line(r, &cells, cx, cy, mx, my);
 }
 
 void fa_raster_end(fa_raster* r, uint8_t* out, size_t stride)

@@ -215,7 +215,8 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   (loop off, jump, loop on), each of which waited for the audio thread and restarted the stretcher.
 - Lyrics: surfaces that use the same font file (a main screen and an operator preview) share one copy of it in memory
   instead of reading it once each; a CJK font is 20-40 MB. The copy is freed when the last surface using it closes, and a
-  file changed on disk is read again.
+  file changed on disk is read again. Surfaces opening the same file at the same moment on different threads read it
+  once too: the others wait for that read.
 - CD+G effects are faster, with the same pixels: a frame whose colours change but not its shapes (a colour fade, a
   lyric being coloured in) blends the new colours with what the effects kept instead of working the effects out again;
   the distance field, the stroke widths and the blend use SSE2; and a large redraw is shared with the engine's idle
@@ -413,6 +414,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   the intro card of gigabytes; such a font now gets the usual 0.9 em ascender and 1.2 em line, layers are never taller
   than the area, and a line that cannot be drawn is not tried again every frame. One glyph's outline is flattened
   into at most 2^20 pieces, so a crafted glyph cannot take seconds.
+- Lyric surfaces: a crafted glyph of many long lines (400k lines across a 2160p layer took about 9 s to draw) now
+  stops after 2^22 pixel cells, about 60 ms; the busiest glyph of a CJK font needs about 12k at 2160p, and every glyph
+  of the test fonts and WenQuanYi Zen Hei draws with the same pixels as before.
+- Lyric and CD+G surfaces: `fa_surface_update_into` read the layout revision without a lock while
+  `fa_surface_get_layout` or a drawing call on another thread wrote it (a data race ThreadSanitizer reports; the value
+  was right in practice).
 - CAF: a `pakt` chunk is read in growing pieces, so a source of unknown length no longer allocates its claimed size
   (up to 256 MB) up front, and the packet table never has more entries than the chunk can hold.
 - MIDI: a Set Tempo under 600 µs a quarter no longer makes the exact beat grid invalid (which made the analysis cache

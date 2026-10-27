@@ -1138,7 +1138,9 @@ fail:
 
 /* Font files opened by path are shared: faces opened from an unchanged file use one
  * buffer, freed when the last of them closes. The key is path, size, modification time
- * and file identity, so a replaced file gets a buffer of its own. */
+ * and file identity, so a replaced file gets a buffer of its own. The first opener puts
+ * a pending entry (no data yet) on the list before it reads the file; later openers of
+ * the same file wait for that read instead of reading the file again. */
 typedef struct font_blob {
     struct font_blob* next;
     char* path;
@@ -1148,29 +1150,38 @@ typedef struct font_blob {
     int64_t mtime_ns;
     uint64_t dev, ino;
     int refs;
+    int state;                        /* BLOB_*, under the list lock */
 } font_blob;
+
+enum { BLOB_PENDING, BLOB_READY, BLOB_FAILED };
 
 static font_blob* g_blobs;
 static fa_atomic32 g_blob_lock;   /* held only for list edits, never while reading a file */
+static fa_atomic32 g_blob_reads;  /* whole-file reads, for the tests */
 
 static void blob_lock(void) { while (!fa_cas32(&g_blob_lock, 0, 1)) fa_sleep_ms(1); }
 static void blob_unlock(void) { fa_store32(&g_blob_lock, 0); }
 
-static void blob_release(font_blob* b)
+/* Takes `b` off the list if it is on it; lock held. */
+static void blob_unlink(font_blob* b)
 {
     font_blob** pp;
+    for (pp = &g_blobs; *pp; pp = &(*pp)->next)
+        if (*pp == b) { *pp = b->next; break; }
+}
+
+static void blob_release(font_blob* b)
+{
     int last;
     blob_lock();
     last = --b->refs == 0;
-    if (last) {
-        for (pp = &g_blobs; *pp; pp = &(*pp)->next)
-            if (*pp == b) { *pp = b->next; break; }
-    }
+    if (last) blob_unlink(b);
     blob_unlock();
     if (last) { free(b->data); free(b->path); free(b); }
 }
 
-/* The shared buffer for an entry that matches `key` (path and stat fields), referenced; NULL if none. */
+/* The entry (ready or pending) that matches `key` (path and stat fields), referenced;
+ * NULL if none. Lock held. */
 static font_blob* blob_find(const font_blob* key)
 {
     font_blob* b;
@@ -1201,12 +1212,32 @@ size_t fa_font_shared_buffers(void)
     return n;
 }
 
+size_t fa_font_file_reads(void) { return (size_t)fa_load32(&g_blob_reads); }
+
+/* Waits for another opener's read of pending entry `b`: 1 when it is ready, else 0
+ * (that read failed or the file changed meanwhile; our reference is dropped). */
+static int blob_wait(font_blob* b)
+{
+    int st;
+    for (;;) {
+        blob_lock();
+        st = b->state;
+        blob_unlock();
+        if (st != BLOB_PENDING) break;
+        fa_sleep_ms(1);
+    }
+    if (st == BLOB_READY) return 1;
+    blob_release(b);
+    return 0;
+}
+
 fa_result fa_font_open_file(const char* path, uint32_t index, fa_font** out)
 {
     FILE* fp;
     long len;
-    font_blob key, now, *b, *other;
-    int share;
+    font_blob key, now, *b, *pending;
+    uint8_t* data;
+    int share, same;
     fa_result r;
     if (!out) return FA_ERROR_INVALID_ARG;
     *out = NULL;
@@ -1221,39 +1252,57 @@ fa_result fa_font_open_file(const char* path, uint32_t index, fa_font** out)
     key.path = (char*)path;
     key.size = (size_t)len;
     share = blob_stat(fp, &key);
-    b = NULL;
-    if (share) {
+    /* The entry for this file (waited for while pending), or a pending one of our own. */
+    b = pending = NULL;
+    while (share && !b && !pending) {
         blob_lock();
         b = blob_find(&key);
+        if (!b) {
+            pending = (font_blob*)calloc(1, sizeof(*pending));
+            if (pending) pending->path = fa_strdup(path);
+            if (pending && pending->path) {
+                pending->size = key.size; pending->mtime_s = key.mtime_s; pending->mtime_ns = key.mtime_ns;
+                pending->dev = key.dev; pending->ino = key.ino;
+                pending->refs = 1;
+                pending->state = BLOB_PENDING;
+                pending->next = g_blobs;
+                g_blobs = pending;
+            } else {
+                free(pending);
+                pending = NULL;
+                share = 0;   /* no memory for an entry: read a copy of our own */
+            }
+        }
         blob_unlock();
+        if (b && !blob_wait(b)) b = NULL;   /* that read failed: look again */
     }
     if (!b) {
-        b = (font_blob*)calloc(1, sizeof(*b));
-        if (b) { b->path = fa_strdup(path); b->data = (uint8_t*)malloc((size_t)len); }
-        if (!b || !b->path || !b->data) {
-            if (b) { free(b->path); free(b->data); free(b); }
-            fclose(fp);
-            return FA_ERROR_OUT_OF_MEMORY;
-        }
-        if (fread(b->data, 1, (size_t)len, fp) != (size_t)len) {
-            free(b->path); free(b->data); free(b);
-            fclose(fp);
-            return FA_ERROR_IO;
-        }
-        b->size = key.size; b->mtime_s = key.mtime_s; b->mtime_ns = key.mtime_ns; b->dev = key.dev; b->ino = key.ino;
-        b->refs = 1;
+        data = (uint8_t*)malloc((size_t)len);
+        r = !data ? FA_ERROR_OUT_OF_MEMORY : fread(data, 1, (size_t)len, fp) != (size_t)len ? FA_ERROR_IO : FA_OK;
+        if (data) fa_fetch_add32(&g_blob_reads, 1);
         /* Shared only when the file didn't change while it was read. */
         memset(&now, 0, sizeof(now));
-        now.path = key.path;
-        now.size = key.size;
-        if (share && blob_stat(fp, &now) && now.mtime_s == key.mtime_s && now.mtime_ns == key.mtime_ns &&
-            now.dev == key.dev && now.ino == key.ino) {
+        same = r == FA_OK && pending && blob_stat(fp, &now) && now.mtime_s == key.mtime_s &&
+               now.mtime_ns == key.mtime_ns && now.dev == key.dev && now.ino == key.ino;
+        if (pending) {
             blob_lock();
-            other = blob_find(&key);   /* another thread may have cached the same file meanwhile */
-            if (!other) { b->next = g_blobs; g_blobs = b; }
+            if (same) {
+                pending->data = data;
+                pending->state = BLOB_READY;
+            } else {
+                pending->state = BLOB_FAILED;   /* its waiters look again */
+                blob_unlink(pending);
+            }
             blob_unlock();
-            if (other) { free(b->path); free(b->data); free(b); b = other; }
-        }   /* else the face keeps a buffer of its own, not on the list */
+            if (same) b = pending;
+            else blob_release(pending);
+        }
+        if (r == FA_OK && !b) {   /* the face keeps a buffer of its own, not on the list */
+            b = (font_blob*)calloc(1, sizeof(*b));
+            if (b) { b->data = data; b->size = key.size; b->refs = 1; }
+            else r = FA_ERROR_OUT_OF_MEMORY;
+        }
+        if (r != FA_OK) { free(data); fclose(fp); return r; }
     }
     fclose(fp);
     r = fa_font_open(b->data, b->size, index, 0, out);
