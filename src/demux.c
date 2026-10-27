@@ -130,10 +130,16 @@ typedef struct codec_info {
 
 static const codec_info codecs[] = {
     /* Transform codecs overlap each packet with the previous one. */
-    { "aac", 1, 0, 1 }, { "ac3", 1, 0, 1 }, { "eac3", 1, 0, 1 }, { "dts", 1, 0, 1 },
+    { "ac3", 1, 0, 1 }, { "eac3", 1, 0, 1 }, { "dts", 1, 0, 1 },
     { "mp2", 1, 0, 1 }, { "mp1", 1, 0, 1 }, { "vorbis", 1, 0, 0 },
     /* An MP3 frame's data may start up to 511 bytes back, in earlier frames. */
     { "mp3", 1, 1024, 1 },
+    /* AAC: one packet settles the MDCT overlap, but SBR and PS carry envelopes,
+     * parameters and smoothing from frame to frame (and Main and LTP their
+     * predictors). After 12 packets the SBR and PS test streams come out as a
+     * straight decode's, except for the noise generators (PNS, SBR noise and
+     * sine index), which run through the whole stream. */
+    { "aac", 12, 0, 1 },
     /* Opus converges within its time pre-roll (seek_preroll_s, OPUS_PREROLL_S). */
     { "opus", 1, 0, 1 },
     /* TrueHD decodes from a major sync, at least every 128 access units. */
