@@ -10,6 +10,7 @@
  * wrong glyph but never read outside the file or loop for long. */
 #include "font.h"
 #include "fa_platform.h"
+#include "fa_util.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,6 +73,7 @@ typedef struct cff_font {
 struct fa_font {
     view file;
     int owned;
+    struct font_blob* shared;         /* the cached file this face reads (fa_font_open_file), or NULL */
     fa_font_info info;
     view head, hhea, hmtx, maxp, loca, glyf, cmap, kern, gpos, os2, name, post;
     int loca_long;
@@ -1134,11 +1136,78 @@ fail:
     return r;
 }
 
+/* Font files opened by path are shared: faces opened from an unchanged file use one
+ * buffer, freed when the last of them closes. The key is path, size, modification time
+ * and file identity, so a replaced file gets a buffer of its own. */
+typedef struct font_blob {
+    struct font_blob* next;
+    char* path;
+    uint8_t* data;
+    size_t size;
+    int64_t mtime_s;
+    int64_t mtime_ns;
+    uint64_t dev, ino;
+    int refs;
+} font_blob;
+
+static font_blob* g_blobs;
+static fa_atomic32 g_blob_lock;   /* held only for list edits, never while reading a file */
+
+static void blob_lock(void) { while (!fa_cas32(&g_blob_lock, 0, 1)) fa_sleep_ms(1); }
+static void blob_unlock(void) { fa_store32(&g_blob_lock, 0); }
+
+static void blob_release(font_blob* b)
+{
+    font_blob** pp;
+    int last;
+    blob_lock();
+    last = --b->refs == 0;
+    if (last) {
+        for (pp = &g_blobs; *pp; pp = &(*pp)->next)
+            if (*pp == b) { *pp = b->next; break; }
+    }
+    blob_unlock();
+    if (last) { free(b->data); free(b->path); free(b); }
+}
+
+/* The shared buffer for an entry that matches `key` (path and stat fields), referenced; NULL if none. */
+static font_blob* blob_find(const font_blob* key)
+{
+    font_blob* b;
+    for (b = g_blobs; b; b = b->next)
+        if (b->size == key->size && b->mtime_s == key->mtime_s && b->mtime_ns == key->mtime_ns &&
+            b->dev == key->dev && b->ino == key->ino && !strcmp(b->path, key->path)) {
+            b->refs++;
+            return b;
+        }
+    return NULL;
+}
+
+static int blob_stat(FILE* fp, font_blob* k)
+{
+    uint64_t id[4];
+    if (!fa_file_identity(fp, id)) return 0;
+    k->dev = id[0]; k->ino = id[1]; k->mtime_s = (int64_t)id[2]; k->mtime_ns = (int64_t)id[3];
+    return 1;
+}
+
+size_t fa_font_shared_buffers(void)
+{
+    size_t n = 0;
+    font_blob* b;
+    blob_lock();
+    for (b = g_blobs; b; b = b->next) n++;
+    blob_unlock();
+    return n;
+}
+
 fa_result fa_font_open_file(const char* path, uint32_t index, fa_font** out)
 {
     FILE* fp;
     long len;
-    uint8_t* data;
+    font_blob key, now, *b, *other;
+    int share;
+    fa_result r;
     if (!out) return FA_ERROR_INVALID_ARG;
     *out = NULL;
     if (!path) return FA_ERROR_INVALID_ARG;
@@ -1148,11 +1217,49 @@ fa_result fa_font_open_file(const char* path, uint32_t index, fa_font** out)
         fclose(fp);
         return FA_ERROR_UNSUPPORTED_FORMAT;
     }
-    data = (uint8_t*)malloc((size_t)len);
-    if (!data) { fclose(fp); return FA_ERROR_OUT_OF_MEMORY; }
-    if (fread(data, 1, (size_t)len, fp) != (size_t)len) { fclose(fp); free(data); return FA_ERROR_IO; }
+    memset(&key, 0, sizeof(key));
+    key.path = (char*)path;
+    key.size = (size_t)len;
+    share = blob_stat(fp, &key);
+    b = NULL;
+    if (share) {
+        blob_lock();
+        b = blob_find(&key);
+        blob_unlock();
+    }
+    if (!b) {
+        b = (font_blob*)calloc(1, sizeof(*b));
+        if (b) { b->path = fa_strdup(path); b->data = (uint8_t*)malloc((size_t)len); }
+        if (!b || !b->path || !b->data) {
+            if (b) { free(b->path); free(b->data); free(b); }
+            fclose(fp);
+            return FA_ERROR_OUT_OF_MEMORY;
+        }
+        if (fread(b->data, 1, (size_t)len, fp) != (size_t)len) {
+            free(b->path); free(b->data); free(b);
+            fclose(fp);
+            return FA_ERROR_IO;
+        }
+        b->size = key.size; b->mtime_s = key.mtime_s; b->mtime_ns = key.mtime_ns; b->dev = key.dev; b->ino = key.ino;
+        b->refs = 1;
+        /* Shared only when the file didn't change while it was read. */
+        memset(&now, 0, sizeof(now));
+        now.path = key.path;
+        now.size = key.size;
+        if (share && blob_stat(fp, &now) && now.mtime_s == key.mtime_s && now.mtime_ns == key.mtime_ns &&
+            now.dev == key.dev && now.ino == key.ino) {
+            blob_lock();
+            other = blob_find(&key);   /* another thread may have cached the same file meanwhile */
+            if (!other) { b->next = g_blobs; g_blobs = b; }
+            blob_unlock();
+            if (other) { free(b->path); free(b->data); free(b); b = other; }
+        }   /* else the face keeps a buffer of its own, not on the list */
+    }
     fclose(fp);
-    return fa_font_open(data, (size_t)len, index, 1, out);
+    r = fa_font_open(b->data, b->size, index, 0, out);
+    if (r != FA_OK) { blob_release(b); return r; }
+    (*out)->shared = b;
+    return FA_OK;
 }
 
 /* Reads `len` bytes at `off` of the file into a new buffer (NULL when it cannot). */
@@ -1222,6 +1329,7 @@ void fa_font_close(fa_font* f)
 {
     if (!f) return;
     if (f->owned) free((void*)f->file.p);
+    if (f->shared) blob_release(f->shared);
     free(f);
 }
 
