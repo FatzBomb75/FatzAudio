@@ -22,10 +22,17 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
+#  include <emmintrin.h>
+#  define FX_SSE 1
+#else
+#  define FX_SSE 0
+#endif
 
-#define FX_TILE 512
+#define FX_TILE FA_FX_TILE
 #define FX_FAR 1e18f              /* no shape pixel within reach */
 #define FX_NONE 32767             /* vertical distance: none within reach */
+#define FX_STRIP 64               /* columns max_cols works on at a time */
 
 static int unit(float v) { return v >= 0.0f && v <= 1.0f; }
 
@@ -99,12 +106,15 @@ int fa_fx_plan_make(fa_fx_plan* p, const fa_surface_effects* e, float outline, f
 
 static int window_side(const fa_fx_plan* p) { return FX_TILE + 2 * p->reach; }
 
+/* Values in a line buffer: a row or column of the window and the reach either side. */
+static size_t line_len(const fa_fx_plan* p) { return (size_t)window_side(p) + 2 * (size_t)p->reach + 4; }
+
 size_t fa_fx_scratch_bytes(const fa_fx_plan* p)
 {
-    size_t n = (size_t)window_side(p), planes = (size_t)(p->bevel ? 3 : 1);
-    /* g and cv, the distance planes, and the line buffers. */
-    return n * n * (sizeof(int16_t) + 1) + planes * n * n * sizeof(float) +
-           n * (3 * sizeof(float) + sizeof(int16_t) + sizeof(int) + 1) + 2 * sizeof(float) + 64;
+    size_t n = (size_t)window_side(p), planes = (size_t)(p->bevel ? 3 : 1), l = line_len(p);
+    /* g and cv, the distance planes, the line buffers, and max_cols' strips (bevel). */
+    return n * n * (sizeof(int16_t) + 1) + planes * n * n * sizeof(float) + l * (3 * sizeof(float) + sizeof(int16_t) + sizeof(int) + 1) +
+           (p->bevel ? (2 * l + 1) * FX_STRIP * sizeof(float) : 0) + sizeof(float) + 128;
 }
 
 typedef struct fx_scratch {
@@ -117,6 +127,7 @@ typedef struct fx_scratch {
     int16_t* arg;
     int* v;
     uint8_t* rows;                /* rows of the window the inside field is wanted for */
+    float *pre, *suf, *neg;       /* max_cols' strips (bevel only) */
 } fx_scratch;
 
 static void* take(uint8_t** at, size_t bytes)
@@ -128,19 +139,22 @@ static void* take(uint8_t** at, size_t bytes)
 
 static void scratch_split(const fa_fx_plan* p, void* mem, fx_scratch* s)
 {
-    size_t n = (size_t)window_side(p);
+    size_t n = (size_t)window_side(p), l = line_len(p);
     uint8_t* at = (uint8_t*)mem;
     s->g = (int16_t*)take(&at, n * n * sizeof(int16_t));
     s->cv = (uint8_t*)take(&at, n * n);
     s->dout = (float*)take(&at, n * n * sizeof(float));
     s->din = p->bevel ? (float*)take(&at, n * n * sizeof(float)) : NULL;
     s->half = p->bevel ? (float*)take(&at, n * n * sizeof(float)) : NULL;
-    s->f = (float*)take(&at, n * sizeof(float));
-    s->dd = (float*)take(&at, n * sizeof(float));
-    s->z = (float*)take(&at, (n + 1) * sizeof(float));
-    s->arg = (int16_t*)take(&at, n * sizeof(int16_t));
-    s->v = (int*)take(&at, n * sizeof(int));
-    s->rows = (uint8_t*)take(&at, n);
+    s->f = (float*)take(&at, l * sizeof(float));
+    s->dd = (float*)take(&at, l * sizeof(float));
+    s->z = (float*)take(&at, (l + 1) * sizeof(float));
+    s->arg = (int16_t*)take(&at, l * sizeof(int16_t));
+    s->v = (int*)take(&at, l * sizeof(int));
+    s->rows = (uint8_t*)take(&at, l);
+    s->pre = p->bevel ? (float*)take(&at, l * FX_STRIP * sizeof(float)) : NULL;
+    s->suf = p->bevel ? (float*)take(&at, l * FX_STRIP * sizeof(float)) : NULL;
+    s->neg = p->bevel ? (float*)take(&at, FX_STRIP * sizeof(float)) : NULL;
 }
 
 /* One dimension: d[q] = min over sites j of (q - j)^2 + f[j] (f[j] >= FX_FAR: not a
@@ -184,27 +198,69 @@ static void edt_1d(const float* f, int n, float* d, int16_t* arg, int* v, float*
 }
 
 /* The distance field of the window (wn x hn at `a`) into `out`,
- * as far as `cap` pixels (alpha bytes `step` apart): inside = 0: the distance outside the shape, from the pixels
+ * as far as `cap` pixels (alpha bytes `step` apart: 1, or 4 with `a` at the last byte of
+ * each pixel): inside = 0: the distance outside the shape, from the pixels
  * with any coverage; inside = 1: the distance inside it, from the pixels not fully
  * covered. Corrected by the nearest pixel's coverage; FX_FAR when there is none
- * within reach. `rows` (inside only): 1 for the rows wanted, NULL = all. */
+ * within reach. `rows` (inside only): 1 for the rows wanted, NULL = all. `shaped`
+ * (unless NULL): 1 for the rows with a pixel of the field's own shape, else 0. */
 static void field(const uint8_t* a, size_t stride, int step, int wn, int hn, int inside, int cap, const uint8_t* rows,
-                  fx_scratch* s, float* out)
+                  fx_scratch* s, float* out, uint8_t* shaped)
 {
     int x, y;
     /* Down, then up: the vertical distance to the nearest shape pixel, and its
-     * coverage. */
+     * coverage. A pixel with no shape within reach keeps whatever coverage: it is
+     * never read. */
     for (y = 0; y < hn; y++) {
         const uint8_t* ar = a + (size_t)y * stride;
         int16_t* g = s->g + (size_t)y * wn;
         uint8_t* cv = s->cv + (size_t)y * wn;
         const int16_t* gu = y ? g - wn : NULL;
         const uint8_t* cvu = y ? cv - wn : NULL;
-        for (x = 0; x < wn; x++) {
+        int any = 0;
+        x = 0;
+#if FX_SSE
+        {
+            /* Eight pixels at a time; the first row as if the one above had nothing. */
+            const __m128i z = _mm_setzero_si128(), vcap = _mm_set1_epi16((int16_t)cap), none = _mm_set1_epi16(FX_NONE);
+            const __m128i full = _mm_set1_epi16(255), one = _mm_set1_epi16(1);
+            __m128i seen = z;
+            for (; x + 8 <= wn; x += 8) {
+                __m128i c, site, up, cu, prop, gn, cn;
+                if (step == 4) {
+                    /* `a` is the alpha, the last byte of each pixel: whole pixels read. */
+                    const uint8_t* px = ar - 3 + (size_t)x * 4;
+                    __m128i lo = _mm_srli_epi32(_mm_loadu_si128((const __m128i*)(const void*)px), 24);
+                    __m128i hi = _mm_srli_epi32(_mm_loadu_si128((const __m128i*)(const void*)(px + 16)), 24);
+                    c = _mm_packs_epi32(lo, hi);
+                } else {
+                    c = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i*)(const void*)(ar + x)), z);
+                }
+                site = inside ? _mm_cmplt_epi16(c, full) : _mm_cmpgt_epi16(c, z);
+                seen = _mm_or_si128(seen, site);
+                if (gu) {
+                    up = _mm_loadu_si128((const __m128i*)(const void*)(gu + x));
+                    cu = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i*)(const void*)(cvu + x)), z);
+                    prop = _mm_cmplt_epi16(up, vcap);
+                    gn = _mm_or_si128(_mm_and_si128(prop, _mm_add_epi16(up, one)), _mm_andnot_si128(prop, none));
+                } else {
+                    cu = c;
+                    gn = none;
+                }
+                gn = _mm_andnot_si128(site, gn);
+                cn = _mm_or_si128(_mm_and_si128(site, c), _mm_andnot_si128(site, cu));
+                _mm_storeu_si128((__m128i*)(void*)(g + x), gn);
+                _mm_storel_epi64((__m128i*)(void*)(cv + x), _mm_packus_epi16(cn, cn));
+            }
+            any = _mm_movemask_epi8(seen);
+        }
+#endif
+        for (; x < wn; x++) {
             uint8_t c = ar[(size_t)x * (size_t)step];
             if (inside ? c < 255 : c > 0) {
                 g[x] = 0;
                 cv[x] = c;
+                any = 1;
             } else if (gu && gu[x] < cap) {
                 g[x] = (int16_t)(gu[x] + 1);
                 cv[x] = cvu[x];
@@ -212,13 +268,31 @@ static void field(const uint8_t* a, size_t stride, int step, int wn, int hn, int
                 g[x] = FX_NONE;
             }
         }
+        if (shaped) shaped[y] = (uint8_t)(any != 0);
     }
     for (y = hn - 2; y >= 0; y--) {
         int16_t* g = s->g + (size_t)y * wn;
         uint8_t* cv = s->cv + (size_t)y * wn;
         const int16_t* gd = g + wn;
         const uint8_t* cvd = cv + wn;
-        for (x = 0; x < wn; x++)
+        x = 0;
+#if FX_SSE
+        {
+            const __m128i z = _mm_setzero_si128(), vcap = _mm_set1_epi16((int16_t)cap), one = _mm_set1_epi16(1);
+            for (; x + 8 <= wn; x += 8) {
+                __m128i d = _mm_loadu_si128((const __m128i*)(const void*)(gd + x));
+                __m128i gv = _mm_loadu_si128((const __m128i*)(const void*)(g + x)), d1 = _mm_add_epi16(d, one);
+                __m128i take = _mm_and_si128(_mm_cmplt_epi16(d, vcap), _mm_cmplt_epi16(d1, gv));
+                __m128i cd = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i*)(const void*)(cvd + x)), z);
+                __m128i cc = _mm_unpacklo_epi8(_mm_loadl_epi64((const __m128i*)(const void*)(cv + x)), z);
+                gv = _mm_or_si128(_mm_and_si128(take, d1), _mm_andnot_si128(take, gv));
+                cc = _mm_or_si128(_mm_and_si128(take, cd), _mm_andnot_si128(take, cc));
+                _mm_storeu_si128((__m128i*)(void*)(g + x), gv);
+                _mm_storel_epi64((__m128i*)(void*)(cv + x), _mm_packus_epi16(cc, cc));
+            }
+        }
+#endif
+        for (; x < wn; x++)
             if (gd[x] < cap && gd[x] + 1 < g[x]) {
                 g[x] = (int16_t)(gd[x] + 1);
                 cv[x] = cvd[x];
@@ -231,7 +305,28 @@ static void field(const uint8_t* a, size_t stride, int step, int wn, int hn, int
         float* o = out + (size_t)y * wn;
         int any = 0;
         if (rows && !rows[y]) continue;
-        for (x = 0; x < wn; x++) {
+        x = 0;
+#if FX_SSE
+        {
+            const __m128i z = _mm_setzero_si128(), none = _mm_set1_epi16(FX_NONE);
+            const __m128 far = _mm_set1_ps(FX_FAR);
+            __m128i seen = z;
+            for (; x + 8 <= wn; x += 8) {
+                __m128i gv = _mm_loadu_si128((const __m128i*)(const void*)(g + x)), no = _mm_cmpeq_epi16(gv, none);
+                __m128i nlo = _mm_unpacklo_epi16(no, no), nhi = _mm_unpackhi_epi16(no, no);
+                __m128 lo = _mm_cvtepi32_ps(_mm_unpacklo_epi16(gv, z)), hi = _mm_cvtepi32_ps(_mm_unpackhi_epi16(gv, z));
+                lo = _mm_mul_ps(lo, lo);
+                hi = _mm_mul_ps(hi, hi);
+                lo = _mm_or_ps(_mm_and_ps(_mm_castsi128_ps(nlo), far), _mm_andnot_ps(_mm_castsi128_ps(nlo), lo));
+                hi = _mm_or_ps(_mm_and_ps(_mm_castsi128_ps(nhi), far), _mm_andnot_ps(_mm_castsi128_ps(nhi), hi));
+                _mm_storeu_ps(s->f + x, lo);
+                _mm_storeu_ps(s->f + x + 4, hi);
+                seen = _mm_or_si128(seen, _mm_andnot_si128(no, _mm_set1_epi16(-1)));
+            }
+            any = _mm_movemask_epi8(seen) != 0;
+        }
+#endif
+        for (; x < wn; x++) {
             if (g[x] == FX_NONE) {
                 s->f[x] = FX_FAR;
             } else {
@@ -244,7 +339,19 @@ static void field(const uint8_t* a, size_t stride, int step, int wn, int hn, int
             continue;
         }
         edt_1d(s->f, wn, s->dd, s->arg, s->v, s->z);
-        for (x = 0; x < wn; x++) {
+        x = 0;
+#if FX_SSE
+        {
+            const __m128 k = _mm_set1_ps(1.0f / 255.0f), h = _mm_set1_ps(0.5f);
+            for (; x + 4 <= wn; x += 4) {
+                __m128 cov = _mm_mul_ps(_mm_cvtepi32_ps(_mm_setr_epi32(cv[s->arg[x]], cv[s->arg[x + 1]], cv[s->arg[x + 2]],
+                                                                       cv[s->arg[x + 3]])), k);
+                __m128 corr = inside ? _mm_sub_ps(cov, h) : _mm_sub_ps(h, cov);
+                _mm_storeu_ps(o + x, _mm_add_ps(_mm_sqrt_ps(_mm_loadu_ps(s->dd + x)), corr));
+            }
+        }
+#endif
+        for (; x < wn; x++) {
             float cov = (float)cv[s->arg[x]] * (1.0f / 255.0f);
             o[x] = sqrtf(s->dd[x]) + (inside ? cov - 0.5f : 0.5f - cov);
         }
@@ -287,29 +394,81 @@ static float sample(const float* d, int wn, int hn, int x, int y, float fx, floa
     return (v[0] * (1.0f - fx) + v[1] * fx) * (1.0f - fy) + (v[2] * (1.0f - fx) + v[3] * fx) * fy;
 }
 
+/* A pixel being drawn, premultiplied, 0..1: with SSE2 the four channels at once (the
+ * same operations, and no fused multiply-add, so the same results). */
+#if FX_SSE
+typedef __m128 fx_px;
+static fx_px px_zero(void) { return _mm_setzero_ps(); }
+#else
+typedef struct fx_px { float c[4]; } fx_px;
+static fx_px px_zero(void) { fx_px v = { { 0.0f, 0.0f, 0.0f, 0.0f } }; return v; }
+#endif
+
 /* `layer` (premultiplied, alpha k) over `acc`. */
-static void over(float acc[4], const float layer[4], float k)
+static fx_px over(fx_px acc, const float layer[4], float k)
 {
     float keep = 1.0f - layer[3] * k;
+#if FX_SSE
+    return _mm_add_ps(_mm_mul_ps(_mm_loadu_ps(layer), _mm_set1_ps(k)), _mm_mul_ps(acc, _mm_set1_ps(keep)));
+#else
     int i;
-    for (i = 0; i < 4; i++) acc[i] = layer[i] * k + acc[i] * keep;
+    for (i = 0; i < 4; i++) acc.c[i] = layer[i] * k + acc.c[i] * keep;
+    return acc;
+#endif
 }
 
-/* out[i] = the largest of in[i - r .. i + r] (in steps of `step`), a sliding window
- * kept as a falling queue of indices. */
-static void max_line(const float* in, size_t step, int n, int r, float* out, size_t ostep, int* q)
+/* o[i] = the larger of a[i] and b[i]. */
+static void max_of(float* o, const float* a, const float* b, int n)
 {
-    int head = 0, tail = 0, j;
-    for (j = 0; j < n + r; j++) {
-        int i = j - r;
-        if (j < n) {
-            float v = in[(size_t)j * step];
-            while (tail > head && in[(size_t)q[tail - 1] * step] <= v) tail--;
-            q[tail++] = j;
+    int i = 0;
+#if FX_SSE
+    for (; i + 4 <= n; i += 4) _mm_storeu_ps(o + i, _mm_max_ps(_mm_loadu_ps(a + i), _mm_loadu_ps(b + i)));
+#endif
+    for (; i < n; i++) o[i] = a[i] > b[i] ? a[i] : b[i];
+}
+
+/* The largest of each row's (n wide) values within r of each, in place: the row with
+ * r of -FX_FAR either side in `e`, the largest of 2, 4, ... in turn, then of two
+ * windows of a power of two that together cover 2r + 1. */
+static void max_row(float* row, int n, int r, float* e)
+{
+    int k = 2 * r + 1, len = n + 2 * r, p, j;
+    for (j = 0; j < r; j++) e[j] = e[n + r + j] = -FX_FAR;
+    memcpy(e + r, row, (size_t)n * sizeof(float));
+    for (p = 1; 2 * p <= k; p *= 2) {
+        /* In order, so e[j + p] is read before it is changed. */
+        j = 0;
+#if FX_SSE
+        for (; j + p + 4 <= len; j += 4) _mm_storeu_ps(e + j, _mm_max_ps(_mm_loadu_ps(e + j), _mm_loadu_ps(e + j + p)));
+#endif
+        for (; j + p < len; j++) e[j] = e[j] > e[j + p] ? e[j] : e[j + p];
+    }
+    max_of(row, e, e + k - p, n);
+}
+
+/* The largest of each column's values within r rows, in place (van Herk and Gil and
+ * Werman: the largest from the start of each block of 2r + 1 rows and to its end,
+ * then of one of each), FX_STRIP columns at a time. */
+static void max_cols(float* plane, int wn, int hn, int r, fx_scratch* s)
+{
+    int k = 2 * r + 1, len = hn + 2 * r, x0, j;
+    for (j = 0; j < FX_STRIP; j++) s->neg[j] = -FX_FAR;
+    for (x0 = 0; x0 < wn; x0 += FX_STRIP) {
+        int sw = wn - x0 < FX_STRIP ? wn - x0 : FX_STRIP;
+        for (j = 0; j < len; j++) {
+            const float* in = j >= r && j - r < hn ? plane + (size_t)(j - r) * wn + x0 : s->neg;
+            float* o = s->pre + (size_t)j * FX_STRIP;
+            if (j % k == 0) memcpy(o, in, (size_t)sw * sizeof(float));
+            else max_of(o, o - FX_STRIP, in, sw);
         }
-        if (i < 0) continue;
-        while (q[head] < i - r) head++;
-        out[(size_t)i * ostep] = in[(size_t)q[head] * step];
+        for (j = len - 1; j >= 0; j--) {
+            const float* in = j >= r && j - r < hn ? plane + (size_t)(j - r) * wn + x0 : s->neg;
+            float* o = s->suf + (size_t)j * FX_STRIP;
+            if (j % k == k - 1 || j == len - 1) memcpy(o, in, (size_t)sw * sizeof(float));
+            else max_of(o, o + FX_STRIP, in, sw);
+        }
+        for (j = 0; j < hn; j++)
+            max_of(plane + (size_t)j * wn + x0, s->suf + (size_t)j * FX_STRIP, s->pre + (size_t)(j + k - 1) * FX_STRIP, sw);
     }
 }
 
@@ -326,13 +485,10 @@ static void half_widths(const fa_fx_plan* p, fx_scratch* s, int wn, int hn)
             for (x = 0; x < wn; x++) o[x] = 0.0f;
             continue;
         }
-        for (x = 0; x < wn; x++) s->f[x] = d[x] < cap ? d[x] : cap;
-        max_line(s->f, 1, wn, r, o, 1, s->v);
+        for (x = 0; x < wn; x++) o[x] = d[x] < cap ? d[x] : cap;
+        max_row(o, wn, r, s->f);
     }
-    for (x = 0; x < wn; x++) {
-        for (y = 0; y < hn; y++) s->dd[y] = s->half[(size_t)y * wn + x];
-        max_line(s->dd, 1, hn, r, s->half + x, (size_t)wn, s->v);
-    }
+    max_cols(s->half, wn, hn, r, s);
     for (y = 0; y < hn; y++)
         for (x = 0; x < wn; x++) s->half[(size_t)y * wn + x] *= 0.5f;
 }
@@ -349,8 +505,83 @@ static float bevel_weight(const fa_fx_plan* p, float din, float half)
     return ease_out(lo, hi, din) * p->b_strength;
 }
 
+/* The alpha of n pixels (4 bytes each) into `ka`: 1 when one of them has colour and no
+ * alpha. */
+static int keep_alpha(const uint8_t* sp, uint8_t* ka, int n)
+{
+    int x = 0, mixed = 0;
+#if FX_SSE
+    const __m128i z = _mm_setzero_si128(), rgb = _mm_set1_epi32(0x00FFFFFF);
+    __m128i bad = z;
+    for (; x + 4 <= n; x += 4) {
+        __m128i v = _mm_loadu_si128((const __m128i*)(const void*)(sp + (size_t)x * 4)), a = _mm_srli_epi32(v, 24);
+        int32_t four;
+        bad = _mm_or_si128(bad, _mm_andnot_si128(_mm_cmpeq_epi32(_mm_and_si128(v, rgb), z), _mm_cmpeq_epi32(a, z)));
+        a = _mm_packs_epi32(a, a);
+        four = _mm_cvtsi128_si32(_mm_packus_epi16(a, a));
+        memcpy(ka + x, &four, 4);
+    }
+    mixed = _mm_movemask_epi8(bad) != 0;
+#endif
+    for (; x < n; x++) {
+        ka[x] = sp[(size_t)x * 4 + 3];
+        if (!ka[x] && (sp[(size_t)x * 4] | sp[(size_t)x * 4 + 1] | sp[(size_t)x * 4 + 2])) mixed = 1;
+    }
+    return mixed;
+}
+
+/* 1 when n pixels have the alpha kept in `ka`, and none has colour and no alpha. */
+static int same_alpha(const uint8_t* sp, const uint8_t* ka, int n)
+{
+    int x = 0;
+#if FX_SSE
+    const __m128i z = _mm_setzero_si128(), rgb = _mm_set1_epi32(0x00FFFFFF);
+    for (; x + 4 <= n; x += 4) {
+        __m128i v = _mm_loadu_si128((const __m128i*)(const void*)(sp + (size_t)x * 4)), a = _mm_srli_epi32(v, 24), k;
+        int32_t four;
+        memcpy(&four, ka + x, 4);
+        k = _mm_unpacklo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128(four), z), z);
+        if (_mm_movemask_epi8(_mm_cmpeq_epi32(a, k)) != 0xFFFF ||
+            _mm_movemask_epi8(_mm_andnot_si128(_mm_cmpeq_epi32(_mm_and_si128(v, rgb), z), _mm_cmpeq_epi32(a, z))))
+            return 0;
+    }
+#endif
+    for (; x < n; x++)
+        if (sp[(size_t)x * 4 + 3] != ka[x] || (!sp[(size_t)x * 4 + 3] && (sp[(size_t)x * 4] | sp[(size_t)x * 4 + 1] | sp[(size_t)x * 4 + 2])))
+            return 0;
+    return 1;
+}
+
+/* The shape over `acc` (what is under it), then the bevel (`bk` > 0: the highlight's
+ * weight, < 0: the shade's), into `dp`. */
+static void finish(const fa_fx_plan* p, fx_px acc, const uint8_t* sp, float bk, uint8_t* dp)
+{
+    float shape[4];
+    int i;
+    for (i = 0; i < 4; i++) shape[i] = (float)sp[i] / 255.0f;
+    acc = over(acc, shape, 1.0f);
+    if (bk > 0.0f) acc = over(acc, p->b_hi_pm, bk);
+    else if (bk < 0.0f) acc = over(acc, p->b_sh_pm, -bk);
+#if FX_SSE
+    {
+        int32_t px;
+        __m128i x;
+        acc = _mm_add_ps(_mm_mul_ps(acc, _mm_set1_ps(255.0f)), _mm_set1_ps(0.5f));
+        x = _mm_cvttps_epi32(_mm_min_ps(_mm_max_ps(acc, _mm_setzero_ps()), _mm_set1_ps(255.0f)));
+        x = _mm_packs_epi32(x, x);
+        px = _mm_cvtsi128_si32(_mm_packus_epi16(x, x));
+        memcpy(dp, &px, 4);
+    }
+#else
+    for (i = 0; i < 4; i++) {
+        float v = acc.c[i] * 255.0f + 0.5f;
+        dp[i] = (uint8_t)(v >= 255.0f ? 255.0f : v <= 0.0f ? 0.0f : v);
+    }
+#endif
+}
+
 static void render_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, int w, int h, uint8_t* dst,
-                        size_t dst_stride, int x0, int y0, int x1, int y1, fx_scratch* s)
+                        size_t dst_stride, int x0, int y0, int x1, int y1, fx_scratch* s, fa_fx_keep* keep)
 {
     int wx0 = x0 - p->reach > 0 ? x0 - p->reach : 0, wy0 = y0 - p->reach > 0 ? y0 - p->reach : 0;
     int wx1 = x1 + p->reach < w ? x1 + p->reach : w, wy1 = y1 + p->reach < h ? y1 + p->reach : h;
@@ -361,31 +592,27 @@ static void render_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_stri
     float sfx = -p->s_dx - (float)sox, sfy = -p->s_dy - (float)soy;
     int snx = sox + (sfx >= 0.5f), sny = soy + (sfy >= 0.5f);
     const uint8_t* wa = src + (size_t)wy0 * src_stride + (size_t)wx0 * 4 + 3;
-    field(wa, src_stride, 4, wn, hn, 0, p->reach, NULL, s, s->dout);
+    field(wa, src_stride, 4, wn, hn, 0, p->reach, NULL, s, s->dout, p->bevel ? s->rows : NULL);
     if (p->bevel) {
         /* Inside: only rows next to the shape matter. */
-        for (y = 0; y < hn; y++) {
-            const uint8_t* ar = wa + (size_t)y * src_stride;
-            int any = 0;
-            for (x = 0; x < wn && !any; x++) any = ar[(size_t)x * 4] != 0;
-            s->rows[y] = (uint8_t)any;
-        }
         for (y = 0; y < hn; y++)
             if (s->rows[y] == 1) {
                 if (y > 0 && !s->rows[y - 1]) s->rows[y - 1] = 2;
                 if (y + 1 < hn && !s->rows[y + 1]) s->rows[y + 1] = 2;
             }
-        field(wa, src_stride, 4, wn, hn, 1, p->reach, s->rows, s, s->din);
+        field(wa, src_stride, 4, wn, hn, 1, p->reach, s->rows, s, s->din, NULL);
         half_widths(p, s, wn, hn);
     }
     for (y = y0; y < y1; y++) {
         const uint8_t* sp = src + (size_t)y * src_stride + (size_t)x0 * 4;
         uint8_t* dp = dst + (size_t)y * dst_stride + (size_t)x0 * 4;
         int ly = y - wy0;
+        if (keep && keep_alpha(sp, keep->alpha + (size_t)y * keep->stride + x0, x1 - x0)) keep->mixed = 1;
         for (x = x0; x < x1; x++, sp += 4, dp += 4) {
-            int lx = x - wx0, i;
+            int lx = x - wx0;
             size_t at = (size_t)ly * wn + lx;
-            float acc[4] = { 0.0f, 0.0f, 0.0f, 0.0f }, shape[4], a = (float)sp[3] / 255.0f;
+            fx_px acc = px_zero();
+            float a = (float)sp[3] / 255.0f, bk = 0.0f;
             if (sp[3] == 255 && !p->bevel) {
                 memcpy(dp, sp, 4);    /* the shape hides what is under it */
                 continue;
@@ -403,12 +630,11 @@ static void render_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_stri
                 }
             }
             if (p->shadow) {
-                float d = sample(s->dout, wn, hn, lx + sox, ly + soy, sfx, sfy);
-                over(acc, p->s_pm, ease_out(p->s_lo, p->s_hi, d));
+                float d = sample(s->dout, wn, hn, lx + sox, ly + soy, sfx, sfy), sw = ease_out(p->s_lo, p->s_hi, d);
+                if (keep) keep->shadow[(size_t)y * keep->stride + x] = sw;
+                acc = over(acc, p->s_pm, sw);
             }
-            if (p->outline) over(acc, p->o_pm, ease_out(p->o_lo, p->o_hi, s->dout[at]));
-            for (i = 0; i < 4; i++) shape[i] = (float)sp[i] / 255.0f;
-            over(acc, shape, 1.0f);
+            if (p->outline) acc = over(acc, p->o_pm, ease_out(p->o_lo, p->o_hi, s->dout[at]));
             if (p->bevel && a > 0.0f) {
                 float din = s->din[at], wgt = bevel_weight(p, din, s->half[at]);
                 if (wgt > 0.0f) {
@@ -421,21 +647,24 @@ static void render_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_stri
                     if (len > 1e-3f && s->din[(size_t)ly * wn + xr] < FX_FAR && s->din[(size_t)ly * wn + xl] < FX_FAR &&
                         s->din[(size_t)yd * wn + lx] < FX_FAR && s->din[(size_t)yu * wn + lx] < FX_FAR) {
                         float facing = -(gx * p->b_lx + gy * p->b_ly) / len;
-                        if (facing > 0.0f) over(acc, p->b_hi_pm, facing * wgt * a);
-                        else over(acc, p->b_sh_pm, -facing * wgt * a);
+                        bk = facing * wgt * a;   /* > 0: the highlight, < 0: the shade */
                     }
                 }
+                if (keep) keep->bevel[(size_t)y * keep->stride + x] = bk;
             }
-            for (i = 0; i < 4; i++) {
-                float v = acc[i] * 255.0f + 0.5f;
-                dp[i] = (uint8_t)(v >= 255.0f ? 255.0f : v <= 0.0f ? 0.0f : v);
-            }
+            finish(p, acc, sp, bk, dp);
         }
     }
 }
 
 void fa_fx_render(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, int w, int h, uint8_t* dst,
                   size_t dst_stride, int x0, int y0, int x1, int y1, void* scratch)
+{
+    fa_fx_render_keep(p, src, src_stride, w, h, dst, dst_stride, x0, y0, x1, y1, scratch, NULL);
+}
+
+void fa_fx_render_keep(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, int w, int h, uint8_t* dst,
+                       size_t dst_stride, int x0, int y0, int x1, int y1, void* scratch, fa_fx_keep* keep)
 {
     fx_scratch s;
     int tx, ty;
@@ -448,7 +677,42 @@ void fa_fx_render(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, in
     for (ty = y0; ty < y1; ty += FX_TILE)
         for (tx = x0; tx < x1; tx += FX_TILE)
             render_tile(p, src, src_stride, w, h, dst, dst_stride, tx, ty, tx + FX_TILE < x1 ? tx + FX_TILE : x1,
-                        ty + FX_TILE < y1 ? ty + FX_TILE : y1, &s);
+                        ty + FX_TILE < y1 ? ty + FX_TILE : y1, &s, keep);
+}
+
+int fa_fx_recolor(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, uint8_t* dst, size_t dst_stride,
+                  int x0, int y0, int x1, int y1, const fa_fx_keep* keep)
+{
+    int x, y;
+    if (keep->mixed) return 0;
+    for (y = y0; y < y1; y++)
+        if (!same_alpha(src + (size_t)y * src_stride + (size_t)x0 * 4, keep->alpha + (size_t)y * keep->stride + x0, x1 - x0))
+            return 0;
+    /* What fa_fx_render does, with the weights it kept. No coverage: only what is
+     * under the shape, which did not change. In it, the field is the pixel's own
+     * coverage (its own distance is 0), so the outline needs nothing kept. */
+    for (y = y0; y < y1; y++) {
+        const uint8_t* sp = src + (size_t)y * src_stride + (size_t)x0 * 4;
+        uint8_t* dp = dst + (size_t)y * dst_stride + (size_t)x0 * 4;
+        size_t at = (size_t)y * keep->stride + x0;
+        for (x = x0; x < x1; x++, sp += 4, dp += 4, at++) {
+            fx_px acc = px_zero();
+            if (!sp[3]) continue;
+            if (sp[3] == 255 && !p->bevel) {
+                memcpy(dp, sp, 4);
+                continue;
+            }
+            /* Fully covered: the shape hides what is under it (finish() gives the shape
+             * whatever acc holds). */
+            if (sp[3] < 255) {
+                float cov = (float)sp[3] * (1.0f / 255.0f);
+                if (p->shadow) acc = over(acc, p->s_pm, keep->shadow[at]);
+                if (p->outline) acc = over(acc, p->o_pm, ease_out(p->o_lo, p->o_hi, 0.5f - cov));
+            }
+            finish(p, acc, sp, p->bevel ? keep->bevel[at] : 0.0f, dp);
+        }
+    }
+    return 1;
 }
 
 /* ---- masks: the effects' weights, coloured later ------------------------------------ */
@@ -463,20 +727,14 @@ static void masks_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_strid
     float sfx = -p->s_dx - (float)sox, sfy = -p->s_dy - (float)soy;
     int snx = sox + (sfx >= 0.5f), sny = soy + (sfy >= 0.5f);
     const uint8_t* wa = src + (size_t)wy0 * src_stride + (size_t)wx0;
-    field(wa, src_stride, 1, wn, hn, 0, p->reach, NULL, s, s->dout);
+    field(wa, src_stride, 1, wn, hn, 0, p->reach, NULL, s, s->dout, p->bevel ? s->rows : NULL);
     if (p->bevel) {
-        for (y = 0; y < hn; y++) {
-            const uint8_t* ar = wa + (size_t)y * src_stride;
-            int any = 0;
-            for (x = 0; x < wn && !any; x++) any = ar[x] != 0;
-            s->rows[y] = (uint8_t)any;
-        }
         for (y = 0; y < hn; y++)
             if (s->rows[y] == 1) {
                 if (y > 0 && !s->rows[y - 1]) s->rows[y - 1] = 2;
                 if (y + 1 < hn && !s->rows[y + 1]) s->rows[y + 1] = 2;
             }
-        field(wa, src_stride, 1, wn, hn, 1, p->reach, s->rows, s, s->din);
+        field(wa, src_stride, 1, wn, hn, 1, p->reach, s->rows, s, s->din, NULL);
         half_widths(p, s, wn, hn);
     }
     for (y = y0; y < y1; y++) {
@@ -549,7 +807,7 @@ int fa_fx_dilate(const uint8_t* src, size_t src_stride, int w, int h, float delt
             int wx0 = tx - p.reach > 0 ? tx - p.reach : 0, wy0 = ty - p.reach > 0 ? ty - p.reach : 0;
             int wx1 = x1 + p.reach < w ? x1 + p.reach : w, wy1 = y1 + p.reach < h ? y1 + p.reach : h;
             int wn = wx1 - wx0, hn = wy1 - wy0;
-            field(src + (size_t)wy0 * src_stride + (size_t)wx0, src_stride, 1, wn, hn, 0, p.reach, NULL, &s, s.dout);
+            field(src + (size_t)wy0 * src_stride + (size_t)wx0, src_stride, 1, wn, hn, 0, p.reach, NULL, &s, s.dout, NULL);
             for (y = ty; y < y1; y++)
                 for (x = tx; x < x1; x++) {
                     float d = s.dout[(size_t)(y - wy0) * wn + (x - wx0)], v = ease_out(delta - 0.5f, delta + 0.5f, d) * 255.0f;

@@ -89,5 +89,7 @@ int fa_cdg_render_one(fa_engine* e);
 int fa_stream_cdg_present(struct fa_stream* s);
 /* Looks for "<path without extension>.cdg" next to an audio file. */
 fa_cdg_data* fa_cdg_find_sibling(const char* audio_path);
+/* Tests: how many blocks of effects were blended for new colours instead of drawn. */
+int32_t fa_cdg_test_blends(void);
 
 #endif

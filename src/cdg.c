@@ -47,6 +47,10 @@
 #define CDG_BORDER_X 6
 #define CDG_BORDER_Y 12
 #define CDG_MAX_OUTPUT 8192
+#define CDG_FX_HELPERS 3           /* engine workers that help draw the effects, at most */
+#define CDG_FX_PIECES 384          /* pieces of the effects shared out at once */
+#define CDG_FX_SHARE (128 * 128)   /* output pixels of effects below which they are not shared */
+#define CDG_KEEP_BLOCK 24          /* screen pixels a block of a colour-only effects update spans */
 #define CDG_CHECKPOINT_PACKS (10 * FA_CDG_PACKS_PER_SECOND)
 #define CDG_CONFIG_V1_SIZE 20       /* fa_cdg_surface_config up to `flags` */
 #define CDG_ALL_FLAGS (FA_CDG_NO_BORDER | FA_CDG_TRANSPARENT | FA_CDG_PREMULTIPLIED | FA_CDG_SMOOTH | \
@@ -191,6 +195,15 @@ struct fa_cdg_surface {
     uint8_t* fxm;
     void* fx_scratch;
     size_t fx_scratch_size;
+    /* What the effects worked out that does not depend on the colours (for fxm, or f2
+     * with the 2N pass): where the shape stays, a change of colours is a blend. */
+    fa_fx_keep keep;
+    fa_fx_plan keep_plan;         /* the plan it holds */
+    int keep_ok;                  /* it holds all of the effects shown */
+    /* Engine workers help draw the effects (fx_run), each with scratch of its own. */
+    fa_engine* eng;               /* the stream's, set by sync_state */
+    void* fx_help[CDG_FX_HELPERS];
+    size_t fx_help_size[CDG_FX_HELPERS];
     /* At N 1-3 the effects are worked out at 2N and box-filtered down (plan 3.3): m2
      * is the master drawn at 2N (by sc2), f2 its effects. */
     int x2;
@@ -927,42 +940,47 @@ static void master_mark(const fa_cdg_surface* f, fa_rects* m, int x0, int y0, in
     if (l != a) master_add(f, m, x0 - a, y0 - l, x1 + a, y1 + l);
 }
 
+/* Moves the rows (h of them, `len` bytes from byte `from`, to byte `to`) of a plane
+ * down by `dy` rows (up when negative). */
+static void shift_plane(uint8_t* b, size_t stride, int h, int dy, size_t len, size_t to, size_t from)
+{
+    int y;
+    if (dy > 0) {
+        for (y = h - 1; y >= dy; y--) memmove(b + (size_t)y * stride + to, b + (size_t)(y - dy) * stride + from, len);
+    } else {
+        for (y = 0; y < h + dy; y++) memmove(b + (size_t)y * stride + to, b + (size_t)(y - dy) * stride + from, len);
+    }
+}
+
 /* The screen moved by (dx, dy) CD+G pixels: the master moves with it, and what came
  * in at its edges is marked for drawing, as is what now lies next to the screen's
  * own edge (drawn there without a neighbour). */
 static void master_shift(fa_cdg_surface* f, int dx, int dy, fa_rects* m)
 {
-    int n = (int)f->sc.n, dxp = dx * n, dyp = dy * n, w = f->mw * n, h = f->mh * n, y;
+    int n = (int)f->sc.n, dxp = dx * n, dyp = dy * n, w = f->mw * n, h = f->mh * n;
     int mx1 = f->mx0 + f->mw, my1 = f->my0 + f->mh;
-    size_t len = (size_t)(w - (dxp < 0 ? -dxp : dxp)) * 4, to = (size_t)(dxp > 0 ? dxp : 0) * 4;
-    size_t from = (size_t)(dxp < 0 ? -dxp : 0) * 4;
-    uint8_t* buf[2];
-    int k, nbuf = 0;
+    size_t len = (size_t)(w - (dxp < 0 ? -dxp : dxp)), to = (size_t)(dxp > 0 ? dxp : 0);
+    size_t from = (size_t)(dxp < 0 ? -dxp : 0);
     /* The effects move with the picture; with the 2N pass the N master is not shown. */
-    if (!(f->fx_on && f->x2)) buf[nbuf++] = f->master;
-    if (f->fx_on) buf[nbuf++] = f->fxm;
-    for (k = 0; k < nbuf; k++) {
-        uint8_t* b = buf[k];
-        if (dyp > 0) {
-            for (y = h - 1; y >= dyp; y--)
-                memmove(b + (size_t)y * f->master_stride + to, b + (size_t)(y - dyp) * f->master_stride + from, len);
-        } else {
-            for (y = 0; y < h + dyp; y++)
-                memmove(b + (size_t)y * f->master_stride + to, b + (size_t)(y - dyp) * f->master_stride + from, len);
-        }
-    }
+    if (!(f->fx_on && f->x2)) shift_plane(f->master, f->master_stride, h, dyp, len * 4, to * 4, from * 4);
+    if (f->fx_on) shift_plane(f->fxm, f->master_stride, h, dyp, len * 4, to * 4, from * 4);
     if (f->fx_on && f->x2) {
         /* The 2N master moves too (its effects are drawn again where they changed). */
-        int d2y = 2 * dyp, h2 = 2 * h;
-        size_t len2 = 2 * len, to2 = 2 * to, from2 = 2 * from;
-        uint8_t* b = f->m2;
-        if (d2y > 0) {
-            for (y = h2 - 1; y >= d2y; y--)
-                memmove(b + (size_t)y * f->m2_stride + to2, b + (size_t)(y - d2y) * f->m2_stride + from2, len2);
-        } else {
-            for (y = 0; y < h2 + d2y; y++)
-                memmove(b + (size_t)y * f->m2_stride + to2, b + (size_t)(y - d2y) * f->m2_stride + from2, len2);
-        }
+        shift_plane(f->m2, f->m2_stride, 2 * h, 2 * dyp, 8 * len, 8 * to, 8 * from);
+    }
+    if (f->fx_on && f->keep_ok) {
+        /* What the effects kept, likewise, and with the 2N pass its effects, which a
+         * blend leaves where nothing is under the shape. */
+        int k = f->x2 ? 2 : 1;
+        fa_fx_keep* kp = &f->keep;
+        if (f->x2) shift_plane(f->f2, f->m2_stride, 2 * h, 2 * dyp, 8 * len, 8 * to, 8 * from);
+        shift_plane(kp->alpha, kp->stride, k * h, k * dyp, k * len, k * to, k * from);
+        if (kp->shadow)
+            shift_plane((uint8_t*)kp->shadow, kp->stride * sizeof(float), k * h, k * dyp, k * len * sizeof(float),
+                        k * to * sizeof(float), k * from * sizeof(float));
+        if (kp->bevel)
+            shift_plane((uint8_t*)kp->bevel, kp->stride * sizeof(float), k * h, k * dyp, k * len * sizeof(float),
+                        k * to * sizeof(float), k * from * sizeof(float));
     }
     if (dx > 0) master_mark(f, m, f->mx0, f->my0, f->mx0 + dx, my1);
     if (dx < 0) master_mark(f, m, mx1 + dx, f->my0, mx1, my1);
@@ -999,6 +1017,39 @@ static void view_to_buffer(const fa_cdg_surface* f, fa_rects* area, int x0, int 
                  (int)f->lay.pic_x + (x1 - cx) * n, (int)f->lay.pic_y + (y1 - cy) * n);
 }
 
+/* What the effects keep; fx_help_free: the helpers' scratch. */
+static void keep_free(fa_cdg_surface* f)
+{
+    free(f->keep.alpha);
+    free(f->keep.shadow);
+    free(f->keep.bevel);
+    memset(&f->keep, 0, sizeof(f->keep));
+    f->keep_ok = 0;
+}
+
+static void fx_help_free(fa_cdg_surface* f)
+{
+    int i;
+    for (i = 0; i < CDG_FX_HELPERS; i++) {
+        free(f->fx_help[i]);
+        f->fx_help[i] = NULL;
+        f->fx_help_size[i] = 0;
+    }
+}
+
+/* f2 [x0, x1) x [y0, y1) at N (fxm pixels) into fxm, each pixel the mean of its four. */
+static void box_down(fa_cdg_surface* f, int x0, int y0, int x1, int y1)
+{
+    int xx, yy, k;
+    for (yy = y0; yy < y1; yy++) {
+        const uint8_t* a = f->f2 + (size_t)(2 * yy) * f->m2_stride + (size_t)(2 * x0) * 4;
+        const uint8_t* b = a + f->m2_stride;
+        uint8_t* o = f->fxm + (size_t)yy * f->master_stride + (size_t)x0 * 4;
+        for (xx = x0; xx < x1; xx++, a += 8, b += 8, o += 4)
+            for (k = 0; k < 4; k++) o[k] = (uint8_t)((a[k] + a[k + 4] + b[k] + b[k + 4] + 2) >> 2);
+    }
+}
+
 /* The effects to draw with presentation scaling, into `plan`, with their buffers
  * ready; 0 when there are none (or no memory for them: drawn without). */
 static int fx_ready(fa_cdg_surface* f, fa_fx_plan* plan)
@@ -1006,6 +1057,10 @@ static int fx_ready(fa_cdg_surface* f, fa_fx_plan* plan)
     int x2 = f->sc.n <= 3;
     float n = (float)(x2 ? 2 * f->sc.n : f->sc.n);
     size_t need;
+    if (!f->has_fx) {
+        keep_free(f);
+        fx_help_free(f);
+    }
     if (!f->has_fx && f->m2) {
         /* Effects off: the 2N buffers go (a full redraw follows when they come back). */
         free(f->m2);
@@ -1039,6 +1094,17 @@ static int fx_ready(fa_cdg_surface* f, fa_fx_plan* plan)
         }
     }
     f->x2 = x2;
+    if (!f->keep.alpha || !f->keep.shadow != !plan->shadow || !f->keep.bevel != !plan->bevel) {
+        /* What the effects keep, for the plan's effects (without it they are drawn in
+         * full every time). */
+        size_t stride = (x2 ? f->m2_stride : f->master_stride) / 4, px = stride * (size_t)f->mh * f->sc.n * (x2 ? 2 : 1);
+        keep_free(f);
+        f->keep.alpha = (uint8_t*)malloc(px);
+        f->keep.shadow = plan->shadow ? (float*)malloc(px * sizeof(float)) : NULL;
+        f->keep.bevel = plan->bevel ? (float*)malloc(px * sizeof(float)) : NULL;
+        f->keep.stride = stride;
+        if (!f->keep.alpha || (plan->shadow && !f->keep.shadow) || (plan->bevel && !f->keep.bevel)) keep_free(f);
+    }
     need = fa_fx_scratch_bytes(plan);
     if (need > f->fx_scratch_size) {
         free(f->fx_scratch);
@@ -1047,6 +1113,189 @@ static int fx_ready(fa_cdg_surface* f, fa_fx_plan* plan)
         if (!f->fx_scratch) return 0;
     }
     return 1;
+}
+
+/* Drawing the effects in pieces, on this thread and idle engine workers at once
+ * (fa_engine_parallel): each piece has its own scratch and writes only its own pixels
+ * of fxm, f2 and what is kept. */
+typedef struct fx_job {
+    fa_cdg_surface* f;
+    const fa_fx_plan* plan;
+    int w, h;                     /* the effects' source, fxm pixels */
+    int (*piece)[4];              /* fx_render: fxm pixels; fx_blend: screen pixels */
+    int* ok;                      /* fx_blend: 1 for each piece blended */
+    void* scratch[1 + CDG_FX_HELPERS];
+    fa_fx_keep keep[1 + CDG_FX_HELPERS]; /* f->keep, each with its own `mixed` */
+} fx_job;
+
+static void fx_render_piece(void* ctx, int item, int slot)
+{
+    fx_job* j = (fx_job*)ctx;
+    fa_cdg_surface* f = j->f;
+    const int* r = j->piece[item];
+    fa_fx_keep* kp = j->keep[slot].alpha ? &j->keep[slot] : NULL;
+    if (!f->x2) {
+        fa_fx_render_keep(j->plan, f->master, f->master_stride, j->w, j->h, f->fxm, f->master_stride, r[0], r[1], r[2],
+                          r[3], j->scratch[slot], kp);
+        return;
+    }
+    /* At 2N, then each output pixel the mean of its four. */
+    fa_fx_render_keep(j->plan, f->m2, f->m2_stride, 2 * j->w, 2 * j->h, f->f2, f->m2_stride, 2 * r[0], 2 * r[1], 2 * r[2],
+                      2 * r[3], j->scratch[slot], kp);
+    box_down(f, r[0], r[1], r[2], r[3]);
+}
+
+static fa_atomic32 g_blends;
+
+int32_t fa_cdg_test_blends(void) { return fa_load32(&g_blends); }
+
+static void fx_blend_piece(void* ctx, int item, int slot)
+{
+    fx_job* j = (fx_job*)ctx;
+    fa_cdg_surface* f = j->f;
+    const int* r = j->piece[item];
+    int n = (int)f->sc.n, k = f->x2 ? 2 : 1;
+    int x0 = (r[0] - f->mx0) * n, y0 = (r[1] - f->my0) * n, x1 = (r[2] - f->mx0) * n, y1 = (r[3] - f->my0) * n;
+    (void)slot;
+    j->ok[item] = fa_fx_recolor(j->plan, f->x2 ? f->m2 : f->master, f->x2 ? f->m2_stride : f->master_stride,
+                                f->x2 ? f->f2 : f->fxm, f->x2 ? f->m2_stride : f->master_stride, k * x0, k * y0, k * x1,
+                                k * y1, &f->keep);
+    if (!j->ok[item]) return;
+    if (f->x2) box_down(f, x0, y0, x1, y1);
+    fa_fetch_add32(&g_blends, 1);
+}
+
+/* Runs `run` over j->piece[0 .. count): shared with idle workers when there is enough
+ * to draw (`px` output pixels), with as many as have scratch when `scratch` (a blend
+ * needs none). */
+static void fx_run(fx_job* j, void (*run)(void*, int, int), int count, int64_t px, int scratch)
+{
+    fa_cdg_surface* f = j->f;
+    fa_par_job pj;
+    int i, slots = 0;
+    memset(&pj, 0, sizeof(pj));
+    if (f->eng && count > 1 && px >= CDG_FX_SHARE) {
+        int want = (int)f->eng->worker_count < CDG_FX_HELPERS ? (int)f->eng->worker_count : CDG_FX_HELPERS;
+        for (; slots < want; slots++) {
+            if (scratch && f->fx_help_size[slots] < f->fx_scratch_size) {
+                free(f->fx_help[slots]);
+                f->fx_help[slots] = malloc(f->fx_scratch_size);
+                f->fx_help_size[slots] = f->fx_help[slots] ? f->fx_scratch_size : 0;
+                if (!f->fx_help[slots]) break;
+            }
+        }
+    }
+    j->scratch[0] = f->fx_scratch;
+    for (i = 0; i <= slots; i++) {
+        if (i) j->scratch[i] = f->fx_help[i - 1];
+        j->keep[i] = f->keep;
+        j->keep[i].mixed = 0;
+    }
+    pj.run = run;
+    pj.ctx = j;
+    pj.count = count;
+    pj.slots = slots;
+    fa_engine_parallel(f->eng, &pj);
+    for (i = 0; i <= slots; i++) f->keep.mixed |= j->keep[i].mixed;
+}
+
+/* The effects of the master rectangles `m` drawn again, as far as they reach. */
+static void fx_draw(fa_cdg_surface* f, const fa_fx_plan* plan, const fa_rects* e, int mx1, int my1)
+{
+    int piece[CDG_FX_PIECES][4], i, count = 0, n = (int)f->sc.n, k = f->x2 ? 2 : 1;
+    int tile = FA_FX_TILE / k, ways = 1 + (f->eng ? (int)f->eng->worker_count : 0);
+    int64_t px = 0;
+    fx_job j;
+    memset(&j, 0, sizeof(j));
+    j.f = f;
+    j.plan = plan;
+    j.w = (mx1 - f->mx0) * n;
+    j.h = (my1 - f->my0) * n;
+    j.piece = piece;
+    if (ways > 1 + CDG_FX_HELPERS) ways = 1 + CDG_FX_HELPERS;
+    for (i = 0; i < e->n; i++) {
+        int x0 = (e->r[i][0] - f->mx0) * n, y0 = (e->r[i][1] - f->my0) * n;
+        int x1 = (e->r[i][2] - f->mx0) * n, y1 = (e->r[i][3] - f->my0) * n, x, y, cols, rows, bh = tile;
+        if (x1 > j.w) x1 = j.w;
+        if (y1 > j.h) y1 = j.h;
+        if (x0 >= x1 || y0 >= y1) continue;
+        /* Tiles as fa_fx_render's, or bands of them when there are too few to share:
+         * each piece works out the field around it as far as the effects reach. */
+        cols = (x1 - x0 + tile - 1) / tile;
+        rows = (y1 - y0 + tile - 1) / tile;
+        if (cols * rows < ways && (int64_t)(x1 - x0) * (y1 - y0) * k * k >= CDG_FX_SHARE) {
+            int want = (ways + cols - 1) / cols, least = (plan->reach + k - 1) / k;
+            bh = (y1 - y0 + want - 1) / want;
+            if (bh < least) bh = least;
+            if (bh > tile) bh = tile;
+        }
+        for (y = y0; y < y1; y += bh)
+            for (x = x0; x < x1; x += tile) {
+                if (count == CDG_FX_PIECES) {
+                    fx_run(&j, fx_render_piece, count, px, 1);
+                    count = 0;
+                    px = 0;
+                }
+                piece[count][0] = x;
+                piece[count][1] = y;
+                piece[count][2] = x + tile < x1 ? x + tile : x1;
+                piece[count][3] = y + bh < y1 ? y + bh : y1;
+                px += (int64_t)(piece[count][2] - x) * (piece[count][3] - y) * k * k;
+                count++;
+            }
+    }
+    if (count) fx_run(&j, fx_render_piece, count, px, 1);
+}
+
+/* Blends pieces [0, count) of `j`, then sorts them: blended into `done`, the others'
+ * effects to draw again as far as they reach into `e`. */
+static void fx_blend_all(fx_job* j, int count, int64_t px, int rc, fa_rects* done, fa_rects* e)
+{
+    int b;
+    if (!count) return;
+    fx_run(j, fx_blend_piece, count, px, 0);
+    for (b = 0; b < count; b++) {
+        const int* r = j->piece[b];
+        if (j->ok[b]) fa_rects_add(done, r[0], r[1], r[2], r[3]);
+        else master_add(j->f, e, r[0] - rc, r[1] - rc, r[2] + rc, r[3] + rc);
+    }
+}
+
+/* Block by block of the master rectangles `m`: where the shape is the same, its new
+ * colours are blended with what the effects kept (into `done`); elsewhere the effects
+ * must be drawn again as far as they reach (into `e`, drawn afterwards, so over any
+ * blend they reach). */
+static void fx_recolor(fa_cdg_surface* f, const fa_fx_plan* plan, const fa_rects* m, int mx1, int my1, int rc,
+                       fa_rects* done, fa_rects* e)
+{
+    int piece[CDG_FX_PIECES][4], ok[CDG_FX_PIECES], i, count = 0, n = (int)f->sc.n, k = f->x2 ? 2 : 1;
+    int64_t px = 0;
+    fx_job j;
+    memset(&j, 0, sizeof(j));
+    j.f = f;
+    j.plan = plan;
+    j.piece = piece;
+    j.ok = ok;
+    for (i = 0; i < m->n; i++) {
+        int bx, by;
+        for (by = m->r[i][1]; by < m->r[i][3] && by < my1; by += CDG_KEEP_BLOCK)
+            for (bx = m->r[i][0]; bx < m->r[i][2] && bx < mx1; bx += CDG_KEEP_BLOCK) {
+                int ex = bx + CDG_KEEP_BLOCK < m->r[i][2] ? bx + CDG_KEEP_BLOCK : m->r[i][2];
+                int ey = by + CDG_KEEP_BLOCK < m->r[i][3] ? by + CDG_KEEP_BLOCK : m->r[i][3];
+                if (count == CDG_FX_PIECES) {
+                    fx_blend_all(&j, count, px, rc, done, e);
+                    count = 0;
+                    px = 0;
+                }
+                piece[count][0] = bx;
+                piece[count][1] = by;
+                piece[count][2] = ex < mx1 ? ex : mx1;
+                piece[count][3] = ey < my1 ? ey : my1;
+                px += (int64_t)(piece[count][2] - bx) * (piece[count][3] - by) * n * n * k * k;
+                count++;
+            }
+    }
+    fx_blend_all(&j, count, px, rc, done, e);
 }
 
 /* advance() with presentation scaling: the master is brought up to the decoder state
@@ -1059,12 +1308,17 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
     fa_rects m, e;
     fa_fx_plan plan;
     int tb = f->tb && !st->hoff && !st->voff, i, y;
-    int moved = st->shift_x || st->shift_y, full, view_full, fx = fx_ready(f, &plan);
+    int moved = st->shift_x || st->shift_y, full, view_full, fx = fx_ready(f, &plan), keep;
     /* The effects see the crop, or with smooth-scroll offsets everything they can show. */
     int wide = st->hoff || st->voff;
     scaled_palette(f, pal, pm);
     full = !f->drawn || memcmp(pm, f->master_pm, sizeof(pm)) != 0 || abs(st->shift_x) >= f->mw ||
            abs(st->shift_y) >= f->mh || fx != f->fx_on || (fx && wide != f->fx_wide);
+    /* What the effects kept still holds unless they or the master were drawn afresh;
+     * a new palette alone (a full redraw) keeps it. */
+    keep = fx && f->keep_ok && f->drawn && f->fx_on && wide == f->fx_wide && abs(st->shift_x) < f->mw &&
+           abs(st->shift_y) < f->mh && memcmp(&plan, &f->keep_plan, sizeof(plan)) == 0;
+    if (!keep) f->keep_ok = 0;
     f->fx_on = fx;
     f->fx_wide = wide;
     fa_rects_clear(&m);
@@ -1108,8 +1362,12 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
          * the edges, where what reached in from outside the master has gone. */
         int n = (int)f->sc.n, pn = f->x2 ? 2 * n : n, rc = (plan.reach + pn - 1) / pn + 1;
         int mx1 = f->mx0 + (wide ? f->mw : (int)f->win_w), my1 = f->my0 + (wide ? f->mh : (int)f->win_h);
+        fa_rects done;
         fa_rects_clear(&e);
-        for (i = 0; i < m.n; i++) master_add(f, &e, m.r[i][0] - rc, m.r[i][1] - rc, m.r[i][2] + rc, m.r[i][3] + rc);
+        fa_rects_clear(&done);
+        if (keep) fx_recolor(f, &plan, &m, mx1, my1, rc, &done, &e);
+        else
+            for (i = 0; i < m.n; i++) master_add(f, &e, m.r[i][0] - rc, m.r[i][1] - rc, m.r[i][2] + rc, m.r[i][3] + rc);
         if (moved && !full) {
             int bx = rc + abs(st->shift_x), by = rc + abs(st->shift_y);
             if (st->shift_x) {
@@ -1121,25 +1379,15 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
                 master_add(f, &e, f->mx0, my1 - by, mx1, my1);
             }
         }
-        for (i = 0; i < e.n; i++) {
-            int x0 = (e.r[i][0] - f->mx0) * n, y0 = (e.r[i][1] - f->my0) * n;
-            int x1 = (e.r[i][2] - f->mx0) * n, y1 = (e.r[i][3] - f->my0) * n, xx, yy, k;
-            if (!f->x2) {
-                fa_fx_render(&plan, f->master, f->master_stride, (mx1 - f->mx0) * n, (my1 - f->my0) * n, f->fxm,
-                             f->master_stride, x0, y0, x1, y1, f->fx_scratch);
-                continue;
-            }
-            /* At 2N, then each output pixel the mean of its four. */
-            fa_fx_render(&plan, f->m2, f->m2_stride, (mx1 - f->mx0) * pn, (my1 - f->my0) * pn, f->f2, f->m2_stride,
-                         2 * x0, 2 * y0, 2 * x1, 2 * y1, f->fx_scratch);
-            for (yy = y0; yy < y1; yy++) {
-                const uint8_t* a = f->f2 + (size_t)(2 * yy) * f->m2_stride + (size_t)(2 * x0) * 4;
-                const uint8_t* b = a + f->m2_stride;
-                uint8_t* o = f->fxm + (size_t)yy * f->master_stride + (size_t)x0 * 4;
-                for (xx = x0; xx < x1; xx++, a += 8, b += 8, o += 4)
-                    for (k = 0; k < 4; k++) o[k] = (uint8_t)((a[k] + a[k + 4] + b[k] + b[k + 4] + 2) >> 2);
-            }
+        /* A full draw rewrites all that is kept, so only its own pixels can be mixed. */
+        if (full && !keep) f->keep.mixed = 0;
+        fx_draw(f, &plan, &e, mx1, my1);
+        if (full && !keep && f->keep.alpha) {
+            /* All of it was drawn: from now on what was kept holds. */
+            f->keep_ok = 1;
+            f->keep_plan = plan;
         }
+        fa_rects_add_all(&e, &done);
         m = e;                    /* what changed in what is shown */
     }
     /* A move or new offsets change where everything is shown. */
@@ -1476,6 +1724,8 @@ static void free_maps(fa_cdg_surface* f)
     cdg_scaler_free(&f->sc);
     free(f->fxm);
     free(f->fx_scratch);
+    keep_free(f);
+    fx_help_free(f);
     free(f->m2);
     free(f->f2);
     free(f->rows2);
@@ -1664,7 +1914,7 @@ static void ra_unqueue(fa_engine* e, fa_cdg_surface* f)
 }
 
 /* Asks a worker to render ahead for the surface (its stream `s` held by the caller).
- * Not with one worker: a 2160p frame with effects takes it 100-220 ms, longer than a
+ * Not with one worker: a full 2160p frame with effects takes it 50-220 ms, longer than a
  * tempo stream's buffer target, so the audio could run dry; update_into draws then. */
 static void ra_request(fa_cdg_surface* f, struct fa_stream* s)
 {
@@ -1954,6 +2204,7 @@ static fa_time sync_state(fa_cdg_surface* f, struct fa_stream* s, fa_time time, 
 {
     size_t target;
     int i;
+    f->eng = s->engine;           /* the stream is held: its engine is there while drawing */
     fa_mutex_lock(&s->cdg_lock);
     time = graphics_time(s, time);
     if (f->gen != s->cdg_gen) {
