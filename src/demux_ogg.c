@@ -926,6 +926,299 @@ static int64_t last_granule(ogg* o, uint32_t serial, int* out_chained)
     return gran;
 }
 
+/* ---- finding the links of a chained file -------------------------------------------------- */
+
+/* Pages of a link's audio stream seen while the links are searched for. They
+ * must run in order (sequence numbers and granules growing with the position,
+ * the end-of-stream mark only on the last), or the link hides another one with
+ * the same serial number. Pages read one after another (a run) are checked as
+ * they come, and the first and last of each run are kept with the single ones,
+ * to be checked together at the end. */
+#define OGG_SEEN 96
+
+typedef struct seen_pg {
+    int64_t pos, gran;
+    uint32_t seq;
+    uint8_t flags;
+} seen_pg;
+
+typedef struct link_seen {
+    const uint32_t* s;      /* the link's streams */
+    int ns;
+    uint32_t serial;        /* its audio stream */
+    int64_t lo;             /* where its audio starts */
+    int n, bad, in_run;
+    seen_pg run_first, run_last;
+    seen_pg p[OGG_SEEN];    /* by position */
+} link_seen;
+
+static int has_serial(const uint32_t* s, int n, uint32_t serial)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (s[i] == serial) return 1;
+    return 0;
+}
+
+/* Two pages of the stream, a before b: in order. */
+static int pg_order(const seen_pg* a, const seen_pg* b)
+{
+    return b->seq > a->seq && !(a->flags & 4) && (a->gran < 0 || b->gran < 0 || b->gran >= a->gran);
+}
+
+static void seen_keep(link_seen* c, const seen_pg* x)
+{
+    int i;
+    for (i = 0; i < c->n; i++)
+        if (c->p[i].pos == x->pos) return;
+    if (c->n == OGG_SEEN) return;
+    for (i = c->n++; i > 0 && c->p[i - 1].pos > x->pos; i--) c->p[i] = c->p[i - 1];
+    c->p[i] = *x;
+}
+
+/* A page read on its own (run 0), or the next one of a run. */
+static void seen_page(link_seen* c, const oggs_page* pg, int run)
+{
+    seen_pg x;
+    if (pg->pos < c->lo) return;
+    if ((pg->flags & 2) && has_serial(c->s, c->ns, pg->serial)) c->bad = 1;   /* one of its streams starts again */
+    if (pg->serial != c->serial) return;
+    x.pos = pg->pos;
+    x.gran = pg->granule;
+    x.seq = pg->seq;
+    x.flags = pg->flags;
+    if (!run) {
+        seen_keep(c, &x);
+    } else if (!c->in_run) {
+        c->run_first = c->run_last = x;
+        c->in_run = 1;
+    } else {
+        if (!pg_order(&c->run_last, &x)) c->bad = 1;
+        c->run_last = x;
+    }
+}
+
+static void seen_run_end(link_seen* c)
+{
+    if (!c->in_run) return;
+    seen_keep(c, &c->run_first);
+    seen_keep(c, &c->run_last);
+    c->in_run = 0;
+}
+
+static int seen_in_order(const link_seen* c)
+{
+    int i;
+    if (c->bad) return 0;
+    for (i = 1; i < c->n; i++)
+        if (!pg_order(&c->p[i - 1], &c->p[i])) return 0;
+    return 1;
+}
+
+/* The page at or after `pos`, if one starts before `end`. */
+static int page_from(ogg* o, int64_t pos, int64_t end, oggs_page* pg)
+{
+    return seek_to(o, pos) == FA_OK && next_page(o, pg, end - pos) == FA_OK && pg->pos < end;
+}
+
+/* The serials of the BOS pages at `pos` (a link's first group); 0 = no BOS page
+ * there, -1 = more than `cap`. */
+static int group_at(ogg* o, int64_t pos, uint32_t* s, int cap)
+{
+    oggs_page pg;
+    int n = 0;
+    if (seek_to(o, pos) != FA_OK) return 0;
+    while (next_page(o, &pg, 0) == FA_OK && (pg.flags & 2)) {
+        if (n == 0 && pg.pos != pos) return 0;
+        if (n == cap) return -1;
+        s[n++] = pg.serial;
+    }
+    return n;
+}
+
+/* Reads link k from where its audio starts, as reading the file through does,
+ * until its first granule is known and its first 64 KB are past. *end = where
+ * the link ends if that came first, else -1; *whole = the link was read to its
+ * end (or the file's), *last = then its last granule; *after = where reading
+ * stopped (a page start). */
+static fa_result link_start(ogg* o, int k, link_seen* c, int64_t* end, int* whole, int64_t* last, int64_t* after)
+{
+    oggs_link* l = o->links[k];
+    oggs_page pg;
+    fa_result r;
+    o->cur = k;
+    o->nq = o->iq = 0;
+    o->gran = OGG_NO_GRAN;
+    o->prev_bs = 0;
+    o->pend_len = 0;
+    o->pend_valid = 1;
+    o->have_seq = 0;
+    o->keep = 0;
+    o->skipping = 0;
+    *end = -1;
+    *whole = 0;
+    *last = OGG_NO_GRAN;
+    *after = l->data;
+    r = seek_to(o, l->data);
+    while (r == FA_OK && (l->first_gran == OGG_NO_GRAN || *after < l->data + 65536)) {
+        r = next_page(o, &pg, OGG_RESYNC_MAX);
+        if (r != FA_OK) break;
+        if (!has_serial(c->s, c->ns, pg.serial)) {
+            *end = pg.pos;
+            *whole = 1;
+            break;
+        }
+        seen_page(c, &pg, 1);
+        if (pg.flags & 2) break;            /* a link inside the link: seen_page marked it */
+        *after = pg.pos + pg.size;
+        if (pg.serial != l->serial) continue;
+        if (pg.granule >= 0) *last = pg.granule;
+        if (l->first_gran != OGG_NO_GRAN) continue;
+        r = page_packets(o, &pg);
+        if (r == FA_OK) time_packets(o, l, &pg);
+    }
+    seen_run_end(c);
+    o->nq = o->iq = 0;
+    if (r == FA_ERROR_END_OF_STREAM) {
+        *whole = 1;                         /* reading through stops here too */
+        r = FA_OK;
+    }
+    return r;
+}
+
+/* Where the link ends: the first page at or after `a` (a page start) that is not
+ * one of its streams, `best` if none starts before `b`. Found by bisection, as
+ * vorbisfile does, since the pages of a link come before every page of the next.
+ * *last = the last granule of the pages read one by one at the end, if any. */
+static int64_t link_end(ogg* o, link_seen* c, int64_t a, int64_t b, int64_t best, int64_t* last)
+{
+    oggs_page pg;
+    *last = OGG_NO_GRAN;
+    while (b - a > 65536) {
+        int64_t mid = a + (b - a) / 2;
+        if (!page_from(o, mid, b, &pg)) {
+            b = mid;                 /* no page starts in [mid, b) */
+            continue;
+        }
+        if (has_serial(c->s, c->ns, pg.serial)) {
+            seen_page(c, &pg, 0);
+            a = pg.pos + pg.size;
+        } else {
+            best = pg.pos;
+            b = mid;
+        }
+    }
+    /* The rest page by page. */
+    if (seek_to(o, a) == FA_OK) {
+        while (next_page(o, &pg, OGG_RESYNC_MAX) == FA_OK && pg.pos < b) {
+            if (!has_serial(c->s, c->ns, pg.serial)) {
+                best = pg.pos;
+                break;
+            }
+            seen_page(c, &pg, 1);
+            if (pg.serial == c->serial && pg.granule >= 0) *last = pg.granule;
+        }
+    }
+    seen_run_end(c);
+    return best;
+}
+
+/* The granule of the link's last audio page before `end`, as reading the link
+ * through leaves it; OGG_NO_GRAN if none. Read backwards from the end. */
+static int64_t last_gran_before(ogg* o, link_seen* c, int64_t end)
+{
+    int64_t from = end, gran = OGG_NO_GRAN;
+    oggs_page pg;
+    while (from > c->lo && gran == OGG_NO_GRAN) {
+        int64_t at = end - 2 * (end - from) - 16384;
+        if (at < c->lo) at = c->lo;
+        if (seek_to(o, at) != FA_OK) break;
+        while (next_page(o, &pg, from - at) == FA_OK && pg.pos < from) {
+            seen_page(c, &pg, 1);
+            if (pg.serial == c->serial && pg.granule >= 0) gran = pg.granule;
+        }
+        seen_run_end(c);
+        from = at;
+    }
+    return gran;
+}
+
+/* Every link of a local chained file without reading all of it: each link's
+ * start is read, its end found by bisection (after doubling steps, which also
+ * sample its pages) and its last page read, then the next link's headers. The
+ * links come out as reading the file through finds them. *full_read = 1 when
+ * the file needs that read after all (a link that isn't audio, serial numbers
+ * used twice, pages that don't run in order); the links after the first are
+ * dropped then. */
+static fa_result find_links(ogg* o, int64_t len, int* full_read)
+{
+    uint32_t s[16], ns[16];
+    int n = o->ngroup, nn, i, j, k;
+    fa_result r;
+    *full_read = 0;
+    if (n < 1 || n > 15) goto full;          /* 16: the first group may have had more */
+    memcpy(s, o->group, sizeof(uint32_t) * (size_t)n);
+    for (k = 0;; k++) {
+        oggs_link* l = o->links[k];
+        link_seen c;
+        oggs_page pg;
+        int64_t end, last, a, b = len, step;
+        int whole;
+        c.s = s;
+        c.ns = n;
+        c.serial = l->serial;
+        c.lo = l->data;
+        c.n = c.bad = c.in_run = 0;
+        r = o->oom ? FA_ERROR_OUT_OF_MEMORY : link_start(o, k, &c, &end, &whole, &last, &a);
+        if (r == FA_ERROR_OUT_OF_MEMORY) return r;
+        if (r != FA_OK) goto full;          /* reading through meets it the same way */
+        if (c.bad) goto full;
+        if (!whole) {
+            /* Steps doubling from there until one lands past the link, then bisection. */
+            for (step = 65536; a + step < len; step *= 2) {
+                if (!page_from(o, a + step, len, &pg)) { b = a + step; break; }
+                if (!has_serial(s, n, pg.serial)) { end = pg.pos; b = a + step; break; }
+                seen_page(&c, &pg, 0);
+                a = pg.pos + pg.size;
+            }
+            end = link_end(o, &c, a, b, end, &last);
+            if (last == OGG_NO_GRAN) last = last_gran_before(o, &c, end >= 0 ? end : len);
+        }
+        l->end = end >= 0 ? end : len;
+        l->last_gran = last;
+        if (o->oom) return FA_ERROR_OUT_OF_MEMORY;
+        if (!seen_in_order(&c)) goto full;
+        if (end < 0) break;
+        /* The next link: a group of BOS pages, of serials not used before. */
+        nn = group_at(o, end, ns, 15);
+        if (nn < 1) goto full;
+        for (i = 0; i < nn; i++) {
+            if (has_serial(s, n, ns[i])) goto full;
+            for (j = 0; j < k; j++)
+                if (o->links[j]->serial == ns[i]) goto full;
+        }
+        {
+            oggs_link* nl;
+            r = add_link(o, &nl);
+            if (r != FA_OK) return r;
+            r = seek_to(o, end);
+            if (r == FA_OK) r = read_link(o, nl, o->want, NULL, NULL);
+            if (r == FA_ERROR_OUT_OF_MEMORY) return r;
+            if (r != FA_OK || nl->start != end) goto full;
+        }
+        memcpy(s, ns, sizeof(uint32_t) * (size_t)nn);
+        n = nn;
+    }
+    return o->oom ? FA_ERROR_OUT_OF_MEMORY : FA_OK;
+full:
+    links_free(o, 1, o->nlinks);
+    o->nlinks = 1;
+    o->links[0]->first_gran = o->links[0]->last_gran = OGG_NO_GRAN;
+    o->links[0]->end = -1;
+    *full_read = 1;
+    return o->oom ? FA_ERROR_OUT_OF_MEMORY : FA_OK;
+}
+
 /* Back to the start of the first link's audio. */
 static fa_result rewind_first(ogg* o)
 {
@@ -972,12 +1265,18 @@ static fa_result ogg_open(fa_decoder* dec)
             l->end = dec->src->length;
             l->last_gran = g >= 0 ? g : OGG_NO_GRAN;
         } else if (!dec->src->remote) {
-            /* Read the whole file once: every link's start, headers and granules. */
+            /* Every link's start, headers and granules: found by bisection, or
+             * else by reading the whole file once. */
+            int full_read;
             o->scanning = 1;
             o->enumerated = 1;
-            r = rewind_first(o);
-            while (r == FA_OK && (r = fill_queue(o)) == FA_OK) o->iq = o->nq;
-            if (r != FA_ERROR_END_OF_STREAM) goto fail;
+            r = find_links(o, dec->src->length, &full_read);
+            if (r != FA_OK) goto fail;
+            if (full_read) {
+                r = rewind_first(o);
+                while (r == FA_OK && (r = fill_queue(o)) == FA_OK) o->iq = o->nq;
+                if (r != FA_ERROR_END_OF_STREAM) goto fail;
+            }
             o->scanning = 0;
             for (i = 0; i < o->nlinks; i++) {
                 oggs_link* li = o->links[i];
