@@ -88052,7 +88052,7 @@ static MA_INLINE ma_uint8 ma_dr_flac__get_channel_count_from_channel_assignment(
     MA_DR_FLAC_ASSERT(channelAssignment <= 10);
     return lookup[channelAssignment];
 }
-static ma_result ma_dr_flac__decode_flac_frame(ma_dr_flac* pFlac)
+static ma_result ma_dr_flac__decode_flac_frame_inner(ma_dr_flac* pFlac)
 {
     int channelCount;
     int i;
@@ -88095,6 +88095,17 @@ static ma_result ma_dr_flac__decode_flac_frame(ma_dr_flac* pFlac)
     pFlac->currentFLACFrame.pcmFramesRemaining = pFlac->currentFLACFrame.header.blockSizeInPCMFrames;
     return MA_SUCCESS;
 }
+/* FatzAudio patch: a frame that fails (also on its CRC) keeps no half-decoded samples, so no later
+ * read or seek of "the current frame" finds some channels missing. */
+static ma_result ma_dr_flac__decode_flac_frame(ma_dr_flac* pFlac)
+{
+    ma_result result = ma_dr_flac__decode_flac_frame_inner(pFlac);
+    if (result != MA_SUCCESS) {
+        MA_DR_FLAC_ZERO_MEMORY(pFlac->currentFLACFrame.subframes, sizeof(pFlac->currentFLACFrame.subframes));
+        pFlac->currentFLACFrame.pcmFramesRemaining = 0;
+    }
+    return result;
+}
 static ma_result ma_dr_flac__seek_flac_frame(ma_dr_flac* pFlac)
 {
     int channelCount;
@@ -88103,6 +88114,9 @@ static ma_result ma_dr_flac__seek_flac_frame(ma_dr_flac* pFlac)
 #ifndef MA_DR_FLAC_NO_CRC
     ma_uint16 actualCRC16;
 #endif
+    /* FatzAudio patch: the frame is skipped, not decoded; drop the previous frame's samples. */
+    MA_DR_FLAC_ZERO_MEMORY(pFlac->currentFLACFrame.subframes, sizeof(pFlac->currentFLACFrame.subframes));
+    pFlac->currentFLACFrame.pcmFramesRemaining = 0;
     channelCount = ma_dr_flac__get_channel_count_from_channel_assignment(pFlac->currentFLACFrame.header.channelAssignment);
     for (i = 0; i < channelCount; ++i) {
         if (!ma_dr_flac__seek_subframe(&pFlac->bs, &pFlac->currentFLACFrame, i)) {
@@ -88125,12 +88139,28 @@ static ma_result ma_dr_flac__seek_flac_frame(ma_dr_flac* pFlac)
 #endif
     return MA_SUCCESS;
 }
+/* FatzAudio patch: a seek that only read frame headers leaves a block size behind with no decoded
+ * samples (or different ones) behind it. The current frame is usable only if it holds samples and
+ * what remains of it fits its block. */
+static MA_INLINE ma_bool32 ma_dr_flac__fa_frame_has_samples(ma_dr_flac* pFlac)
+{
+    return pFlac->currentFLACFrame.subframes[0].pSamplesS32 != NULL &&
+           pFlac->currentFLACFrame.pcmFramesRemaining <= pFlac->currentFLACFrame.header.blockSizeInPCMFrames;
+}
+static MA_INLINE void ma_dr_flac__fa_drop_stale_frame(ma_dr_flac* pFlac)
+{
+    if (!ma_dr_flac__fa_frame_has_samples(pFlac)) {
+        pFlac->currentFLACFrame.pcmFramesRemaining = 0;
+    }
+}
 static ma_bool32 ma_dr_flac__read_and_decode_next_flac_frame(ma_dr_flac* pFlac)
 {
     MA_DR_FLAC_ASSERT(pFlac != NULL);
     for (;;) {
         ma_result result;
         if (!ma_dr_flac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
+            pFlac->currentFLACFrame.header.blockSizeInPCMFrames = 0;
+            pFlac->currentFLACFrame.pcmFramesRemaining = 0;
             return MA_FALSE;
         }
         result = ma_dr_flac__decode_flac_frame(pFlac);
@@ -88138,6 +88168,10 @@ static ma_bool32 ma_dr_flac__read_and_decode_next_flac_frame(ma_dr_flac* pFlac)
             if (result == MA_CRC_MISMATCH) {
                 continue;
             } else {
+                /* FatzAudio patch: a frame that failed to decode has no samples; leave no block size
+                 * behind that a later backwards seek inside "the current frame" would trust. */
+                pFlac->currentFLACFrame.header.blockSizeInPCMFrames = 0;
+                pFlac->currentFLACFrame.pcmFramesRemaining = 0;
                 return MA_FALSE;
             }
         }
@@ -90873,6 +90907,7 @@ MA_API ma_uint64 ma_dr_flac_read_pcm_frames_s32(ma_dr_flac* pFlac, ma_uint64 fra
     unusedBitsPerSample = 32 - pFlac->bitsPerSample;
     framesRead = 0;
     while (framesToRead > 0) {
+        ma_dr_flac__fa_drop_stale_frame(pFlac);
         if (pFlac->currentFLACFrame.pcmFramesRemaining == 0) {
             if (!ma_dr_flac__read_and_decode_next_flac_frame(pFlac)) {
                 break;
@@ -91610,6 +91645,7 @@ MA_API ma_uint64 ma_dr_flac_read_pcm_frames_s16(ma_dr_flac* pFlac, ma_uint64 fra
     unusedBitsPerSample = 32 - pFlac->bitsPerSample;
     framesRead = 0;
     while (framesToRead > 0) {
+        ma_dr_flac__fa_drop_stale_frame(pFlac);
         if (pFlac->currentFLACFrame.pcmFramesRemaining == 0) {
             if (!ma_dr_flac__read_and_decode_next_flac_frame(pFlac)) {
                 break;
@@ -92337,6 +92373,7 @@ MA_API ma_uint64 ma_dr_flac_read_pcm_frames_f32(ma_dr_flac* pFlac, ma_uint64 fra
     unusedBitsPerSample = 32 - pFlac->bitsPerSample;
     framesRead = 0;
     while (framesToRead > 0) {
+        ma_dr_flac__fa_drop_stale_frame(pFlac);
         if (pFlac->currentFLACFrame.pcmFramesRemaining == 0) {
             if (!ma_dr_flac__read_and_decode_next_flac_frame(pFlac)) {
                 break;
@@ -92412,7 +92449,7 @@ MA_API ma_bool32 ma_dr_flac_seek_to_pcm_frame(ma_dr_flac* pFlac, ma_uint64 pcmFr
         }
         if (pcmFrameIndex > pFlac->currentPCMFrame) {
             ma_uint32 offset = (ma_uint32)(pcmFrameIndex - pFlac->currentPCMFrame);
-            if (pFlac->currentFLACFrame.pcmFramesRemaining >  offset) {
+            if (ma_dr_flac__fa_frame_has_samples(pFlac) && pFlac->currentFLACFrame.pcmFramesRemaining >  offset) {
                 pFlac->currentFLACFrame.pcmFramesRemaining -= offset;
                 pFlac->currentPCMFrame = pcmFrameIndex;
                 return MA_TRUE;
@@ -92421,7 +92458,7 @@ MA_API ma_bool32 ma_dr_flac_seek_to_pcm_frame(ma_dr_flac* pFlac, ma_uint64 pcmFr
             ma_uint32 offsetAbs = (ma_uint32)(pFlac->currentPCMFrame - pcmFrameIndex);
             ma_uint32 currentFLACFramePCMFrameCount = pFlac->currentFLACFrame.header.blockSizeInPCMFrames;
             ma_uint32 currentFLACFramePCMFramesConsumed = currentFLACFramePCMFrameCount - pFlac->currentFLACFrame.pcmFramesRemaining;
-            if (currentFLACFramePCMFramesConsumed > offsetAbs) {
+            if (ma_dr_flac__fa_frame_has_samples(pFlac) && currentFLACFramePCMFramesConsumed > offsetAbs) {
                 pFlac->currentFLACFrame.pcmFramesRemaining += offsetAbs;
                 pFlac->currentPCMFrame = pcmFrameIndex;
                 return MA_TRUE;
