@@ -24,7 +24,7 @@
  * glyph draws wrong, but in milliseconds. */
 #define RASTER_MAX_CELLS (1L << 22)
 /* Accumulator size (floats) kept however small the next layer is. */
-#define RASTER_KEEP_CELLS (1 << 20)
+#define RASTER_KEEP_CELLS (1 << 24)
 
 int fa_raster_begin(fa_raster* r, int w, int h)
 {

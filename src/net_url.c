@@ -122,7 +122,9 @@ fa_result fa_proxy_parse(const char* setting, fa_url* out)
     char text[FA_NET_URL_MAX];
     int n = snprintf(text, sizeof(text), "%s%s", strstr(setting, "://") ? "" : "http://", setting);
     if (n < 0 || (size_t)n >= sizeof(text)) return FA_ERROR_INVALID_ARG;
-    return fa_url_parse(text, out);
+    if (fa_url_parse(text, out) != FA_OK) return FA_ERROR_INVALID_ARG;
+    if (strcmp(out->scheme, "http") != 0) return FA_ERROR_INVALID_ARG;   /* only an http proxy */
+    return FA_OK;
 }
 
 fa_result fa_url_resolve(const char* base, const char* ref, char* out, size_t cap)
