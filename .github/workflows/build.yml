@@ -242,6 +242,21 @@ jobs:
         run: cmake --build build --parallel "$(nproc)"
       - name: Test
         run: ctest --test-dir build -j "$(nproc)" --output-on-failure
+      # Short fuzz pass over the small readers (ZIP, HLS, tags); the decoder readers are too slow
+      # for a smoke run, rerun tests/fuzz/run.sh in full after a big decoder change.
+      - name: Fuzz smoke (ZIP, HLS, tags)
+        run: |
+          cmake -S . -B build-fuzz -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFA_FUZZ=ON -DFA_BUILD_TOOLS=OFF \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer"
+          cmake --build build-fuzz --parallel "$(nproc)" --target fuzz_tags fuzz_zip fuzz_hls
+          tests/fuzz/run.sh build-fuzz fuzz-out 20000 zip hls tags
+      - name: Upload fuzz crashes
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: fuzz-out/
+          if-no-files-found: ignore
 
   # Library only, every Android ABI: checks the .so needs nothing but libc, libm
   # and libdl and exports only fa_*.
