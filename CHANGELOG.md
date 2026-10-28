@@ -373,6 +373,18 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- Threading (audit of 2026-10-27):
+  - Deck loops: two loop changes in a row (a failed reversed jump, a beat jump while stopped) could let the audio thread
+    read a half-written loop for one block, the old out point with the new in point. The loop is now read whole.
+  - A deck loop change or loop jump whose seek fails (an I/O error) returns the error and keeps the old loop, instead of
+    reporting the new one. The stream still ends where the change would have joined, as before.
+  - Unloading a deck whose loop has turned no longer re-decodes the loop join (device wait, seek and 100 ms of decoding
+    under the mixer lock) only to throw it away.
+  - Lyric surfaces: turning render-ahead off while another thread drew a frame could make both render-ahead buffers
+    again (up to about 66 MB at 2160p) and keep them while the feature was off.
+  - Lyric drawing no longer allocates a buffer per scaled or moving line per frame (about 280 KB each at 3840 wide).
+  - Opening the same font file from two threads at once: the second opener waits on a condition variable instead of
+    polling every millisecond (about 15.6 ms per poll on Windows), and the list lock is a real mutex.
 - Damaged and hostile files (audit of 2026-10-27):
   - HE-AAC with a 64, 88.2 or 96 kHz core (which the standard doesn't allow with SBR) could hang the decoder forever
     building its SBR tables. SBR data with a core above 48 kHz is now ignored and the core plays alone.

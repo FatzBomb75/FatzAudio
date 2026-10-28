@@ -1205,23 +1205,42 @@ static void update_estimate(struct fa_stream* s, const float* frames, fa_frames 
     }
 }
 
-/* The deck loop (fa_stream_set_loop_region) in force: out 0 = none. */
-static const fa_frames* region_of(struct fa_stream* s) { return s->region[fa_load32(&s->region_idx) & 1]; }
+/* The deck loop (fa_stream_set_loop_region) in force: r = { in, out }, out 0 = none.
+ * Lock-free for the audio thread: region_idx counts the changes, so if it did not
+ * move during the copy, no second change rewrote the slot being read (two changes in
+ * a row reuse it). Writers hold decode_lock and change it rarely, so the retry ends. */
+static void region_read(struct fa_stream* s, fa_frames r[2])
+{
+    int32_t idx;
+    do {
+        idx = fa_load32(&s->region_idx);
+        r[0] = fa_load64(&s->region[idx & 1][0]);
+        r[1] = fa_load64(&s->region[idx & 1][1]);
+    } while (fa_load32(&s->region_idx) != idx);
+}
+
+/* The deck loop's out point; 0 = none. */
+static fa_frames region_out(struct fa_stream* s)
+{
+    fa_frames r[2];
+    region_read(s, r);
+    return r[1];
+}
 
 /* Sets the deck loop; out 0 = none. Caller holds decode_lock (and api_lock, or is the
  * worker carrying out a restart). */
 static void region_store(struct fa_stream* s, fa_frames in, fa_frames out)
 {
     uint32_t next = (uint32_t)fa_load32(&s->region_idx) + 1;
-    s->region[next & 1][0] = out > 0 ? in : 0;
-    s->region[next & 1][1] = out > 0 ? out : 0;
+    fa_store64(&s->region[next & 1][0], out > 0 ? in : 0);
+    fa_store64(&s->region[next & 1][1], out > 0 ? out : 0);
     fa_store32(&s->region_idx, (int32_t)next);
 }
 
 /* Only a seekable source loops (looping seeks back); a forward-only one ends. */
 static int loops(struct fa_stream* s)
 {
-    return (fa_load32(&s->loop) || region_of(s)[1] > 0) && s->decoder.seekable;
+    return (fa_load32(&s->loop) || region_out(s) > 0) && s->decoder.seekable;
 }
 
 /* Where the song ends: CUE_OUT, else the length (for a source without one, where
@@ -1237,8 +1256,8 @@ static fa_frames song_end(struct fa_stream* s)
  * end), and where it loops back to. */
 static fa_frames end_frame(struct fa_stream* s)
 {
-    const fa_frames* r = region_of(s);
-    return r[1] > 0 ? r[1] : song_end(s);
+    fa_frames out = region_out(s);
+    return out > 0 ? out : song_end(s);
 }
 
 /* One reading of the loop: where playback ends or turns (end_frame), where it turns
@@ -1252,9 +1271,11 @@ typedef struct loop_view {
 
 static loop_view loop_view_of(struct fa_stream* s)
 {
-    const fa_frames* r = region_of(s);
-    fa_frames in = r[0], out = r[1];
+    fa_frames r[2], in, out;
     loop_view v;
+    region_read(s, r);
+    in = r[0];
+    out = r[1];
     v.loops = (fa_load32(&s->loop) || out > 0) && s->decoder.seekable;
     if (out > 0) {
         v.end = out;
@@ -1613,8 +1634,11 @@ static fa_result restart_expecting_locked(struct fa_stream* s, fa_frames frame, 
         hold = (int64_t)((double)frame * 1e9 / (double)s->decoder.format.sample_rate + 0.5);
     }
     /* A seek past a deck loop's out point leaves the loop (reversed: before its in point). */
-    if (region_of(s)[1] > 0 && (fa_load32(&s->reverse_want) ? frame < region_of(s)[0] : frame >= region_of(s)[1]))
-        region_store(s, 0, 0);
+    {
+        fa_frames r[2];
+        region_read(s, r);
+        if (r[1] > 0 && (fa_load32(&s->reverse_want) ? frame < r[0] : frame >= r[1])) region_store(s, 0, 0);
+    }
     fa_store64(&s->position, frame);
     s->src_pos = frame;
     timeline_reset(s, frame);
@@ -2107,7 +2131,7 @@ FA_API fa_result FA_CALL fa_stream_set_loop(fa_stream* stream, int32_t on)
     fa_mutex_lock(&stream->api_lock);
     if (fa_load32(&stream->loop) != on) {
         fa_mutex_lock(&stream->decode_lock);
-        if (stream->ring.data && fa_load32(&stream->state) != FA_STATE_ENDED && region_of(stream)[1] == 0) {
+        if (stream->ring.data && fa_load32(&stream->state) != FA_STATE_ENDED && region_out(stream) == 0) {
             end = end_frame(stream);
             head = fa_load64(&stream->seek_base) + stream->decoded;
             restart = on ? (fa_load32(&stream->eof) || stream->draining || stream->tempo_drained || (end >= 0 && head >= end))
@@ -2208,14 +2232,14 @@ static fa_result rejoin_chain_locked(struct fa_stream* s, int64_t j, double lin,
 fa_result fa_stream_set_loop_region(struct fa_stream* s, fa_frames in, fa_frames out)
 {
     fa_result r = FA_OK;
-    const fa_frames* cur;
+    fa_frames cur[2];
     int on = out > in;
     if (!s || in < 0) return FA_ERROR_INVALID_ARG;
     if (!on) in = out = 0;
     if (on && (s->push || !s->decoder.seekable)) return FA_ERROR_NOT_SEEKABLE;
     if (on && s->decoder.length >= 0 && out > s->decoder.length) return FA_ERROR_INVALID_ARG;
     fa_mutex_lock(&s->api_lock);
-    cur = region_of(s);
+    region_read(s, cur);
     if (cur[0] == in && cur[1] == out) { fa_mutex_unlock(&s->api_lock); return FA_OK; }
     if (!is_attached(s) || !s->ring.data || fa_load32(&s->state) == FA_STATE_ENDED ||
         fa_load64(&s->seek_pending) >= 0 || reversed(s)) {
@@ -2267,7 +2291,7 @@ fa_result fa_stream_set_loop_region(struct fa_stream* s, fa_frames in, fa_frames
             int64_t jo = played + frames_until(s, played, (double)out);
             if (jo > j && jo <= write) { j = jo; lj = linear_position(s, j); a = (fa_frames)(lj + 0.5); }
         }
-        region_store(s, in, out);
+        region_store(s, in, out);   /* cur is restored if the join fails */
         if (on && a >= out && a - out < (fa_frames)(sr * FA_LOOP_LATE_MS / 1000.0)) {
             /* Just past the out point: continue as if it had looped there. */
             lin = (fa_frames)(lj + 0.5) == a ? lj : (double)a;
@@ -2284,6 +2308,7 @@ fa_result fa_stream_set_loop_region(struct fa_stream* s, fa_frames in, fa_frames
         fa_tmap_add(m, j, lin, sr / dr * speed_now(s, (int64_t)((double)j * sr / dr + 0.5), s->tempo && fa_tempo_engaged(s->tempo)));
         unflush(s);
         r = rejoin_chain_locked(s, j, lin, x);
+        if (r != FA_OK) region_store(s, cur[0], cur[1]);   /* not joined: the old loop stays */
     }
     fa_mutex_unlock(&s->decode_lock);
     fa_mutex_unlock(&s->api_lock);
@@ -2295,12 +2320,10 @@ void fa_stream_get_loop_region(struct fa_stream* s, fa_frames* out_in, fa_frames
     /* region_idx counts the changes: if it did not move during the copy, no second
      * change rewrote the slot being read. The second read is a read-modify-write so the
      * copy cannot move past it. */
-    int32_t idx;
-    do {
-        idx = fa_load32(&s->region_idx);
-        *out_in = s->region[idx & 1][0];
-        *out_out = s->region[idx & 1][1];
-    } while (fa_fetch_add32(&s->region_idx, 0) != idx);
+    fa_frames r[2];
+    region_read(s, r);
+    *out_in = r[0];
+    *out_out = r[1];
 }
 
 /* Where fa_stream_jump joins the ring (decode_lock held), for the mix at `played`:
@@ -2336,8 +2359,7 @@ static fa_result jump(struct fa_stream* s, fa_frames at, fa_frames delta, const 
         fa_frames old[2];
         if (x < 0) x = 0;
         if (last >= 0 && x > last) x = last;
-        old[0] = region_of(s)[0];
-        old[1] = region_of(s)[1];
+        region_read(s, old);
         if (region) {
             fa_mutex_lock(&s->decode_lock);
             region_store(s, region[0], region[1]);
@@ -2360,7 +2382,7 @@ static fa_result jump(struct fa_stream* s, fa_frames at, fa_frames delta, const 
     {
         double sr = (double)s->decoder.format.sample_rate, dr = (double)s->dev_rate, lj, lin;
         int64_t played, write = fa_load64(&s->ring.write), j;
-        fa_frames a, x, last = s->decoder.length > 0 ? s->decoder.length - 1 : -1;
+        fa_frames a, x, old[2], last = s->decoder.length > 0 ? s->decoder.length - 1 : -1;
         fa_tmap* m = tmap_of(s);
         if (jump_point(s, at, fa_load64(&s->played), write) > write) {
             /* Not decoded yet: asked again until it is (sync.c every few ms), so leave
@@ -2388,12 +2410,14 @@ static fa_result jump(struct fa_stream* s, fa_frames at, fa_frames delta, const 
             if (x < 0) x = 0;
             if (last >= 0 && x > last) x = last;
             lin = (double)x + (lj - floor(lj + 0.5));      /* keeps the fraction of a frame */
+            region_read(s, old);
             if (region) region_store(s, region[0], region[1]);
             fa_store64(&s->ring.write, j);
             fa_tmap_truncate(m, j);
             fa_tmap_add(m, j, lin, sr / dr * speed_now(s, (int64_t)((double)j * sr / dr + 0.5), s->tempo && fa_tempo_engaged(s->tempo)));
             unflush(s);
             r = rejoin_chain_locked(s, j, lin, x);
+            if (r != FA_OK && region) region_store(s, old[0], old[1]);   /* not joined: the old loop stays */
         }
     }
     fa_mutex_unlock(&s->decode_lock);

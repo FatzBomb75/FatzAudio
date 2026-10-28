@@ -100,6 +100,51 @@ static int first_jump(const int* idx, int n, int from)
     return -1;
 }
 
+/* I/O over a memory WAV that counts seeks and fails them on request. */
+typedef struct mem_io {
+    uint8_t* data;
+    int64_t size, pos;
+    fa_atomic32 seeks, fail_seeks;
+} mem_io;
+
+static int64_t FA_CALL mio_read(void* user, void* buffer, size_t bytes)
+{
+    mem_io* m = (mem_io*)user;
+    int64_t n = m->size - m->pos;
+    if (n > (int64_t)bytes) n = (int64_t)bytes;
+    memcpy(buffer, m->data + m->pos, (size_t)n);
+    m->pos += n;
+    return n;
+}
+
+static fa_result FA_CALL mio_seek(void* user, int64_t offset)
+{
+    mem_io* m = (mem_io*)user;
+    fa_fetch_add32(&m->seeks, 1);
+    if (fa_load32(&m->fail_seeks) || offset < 0 || offset > m->size) return FA_ERROR_IO;
+    m->pos = offset;
+    return FA_OK;
+}
+
+static int64_t FA_CALL mio_length(void* user) { return ((mem_io*)user)->size; }
+
+/* A sawtooth stream reading through `m` (freed by the caller after the close). */
+static fa_stream* open_saw_io(mem_io* m, uint32_t frames)
+{
+    fa_io_callbacks io;
+    size_t n;
+    fa_stream* s = NULL;
+    memset(m, 0, sizeof(*m));
+    memset(&io, 0, sizeof(io));
+    m->data = make_wav(g_rate, frames, 0, 0.0, &n);
+    m->size = (int64_t)n;
+    io.read = mio_read;
+    io.seek = mio_seek;
+    io.length = mio_length;
+    if (fa_stream_open_io(g_engine, &io, m, NULL, &s) != FA_OK) s = NULL;
+    return s;
+}
+
 /* ---- events ----------------------------------------------------------------- */
 
 typedef struct recorder {
@@ -301,6 +346,95 @@ static void test_jump_moves_loop(void)
     CHECK_EQ(out, 80000);
     fa_stream_close(s);
     free(idx);
+}
+
+/* A loop change or a jump whose join fails (the decoder cannot seek) reports the
+ * error and leaves the loop as it was. */
+static void test_failed_join_keeps_loop(void)
+{
+    static mem_io m;   /* outlives a failed CHECK's early return (the stream reads it) */
+    fa_stream* s = open_saw_io(&m, 400000);
+    int* idx = (int*)malloc(sizeof(int) * 40000);
+    int n = 0, i;
+    fa_frames in = -1, out = -1;
+    CHECK(s && idx);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    CHECK_EQ(fa_stream_set_loop_region(s, 20000, 30000), FA_OK);
+    render_saw(s, 35000, idx, &n);                     /* turned once */
+    CHECK_EQ(first_jump(idx, n, 0), 30000);
+    fa_store32(&m.fail_seeks, 1);
+    CHECK(fa_stream_jump_loop(s, 50000, 70000, 80000) != FA_OK);
+    fa_stream_get_loop_region(s, &in, &out);
+    CHECK_EQ(in, 20000);
+    CHECK_EQ(out, 30000);
+    fa_stream_close(s);
+    free(m.data);
+
+    s = open_saw_io(&m, 200000);
+    CHECK(s);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    n = 0;
+    render_saw(s, 30000, idx, &n);
+    for (i = 0; i < 2000 && fa_ring_readable(&s->ring) < 8000; i++) fa_sleep_ms(1);
+    CHECK(fa_ring_readable(&s->ring) >= 8000);         /* decoded past the out point: joins */
+    fa_store32(&m.fail_seeks, 1);
+    /* In point well past the start: the first few KB stay buffered and seek without I/O. */
+    CHECK(fa_stream_set_loop_region(s, 20000, 33000) != FA_OK);
+    fa_stream_get_loop_region(s, &in, &out);
+    CHECK_EQ(in, 0);
+    CHECK_EQ(out, 0);
+    fa_stream_close(s);
+    free(m.data);
+    free(idx);
+}
+
+/* The audio thread reads the deck loop while it changes back to back: every reading
+ * is one whole setting (run under TSan, the old reader was a data race). */
+typedef struct loop_flipper {
+    fa_stream* s;
+    fa_atomic32 done;
+    int errors;
+} loop_flipper;
+
+static void flip_loops(void* arg)
+{
+    loop_flipper* f = (loop_flipper*)arg;
+    int i;
+    for (i = 0; i < 200; i++) {
+        fa_frames in = (fa_frames)(1 + i % 8) * 10000;
+        if (fa_stream_set_loop_region(f->s, in, in + 5000) != FA_OK) f->errors++;
+    }
+    fa_store32(&f->done, 1);
+}
+
+static void test_loop_region_readers(void)
+{
+    loop_flipper f;
+    fa_thread th;
+    float out[2 * 256];
+    int rounds = 0, torn = 0;
+    memset(&f, 0, sizeof(f));
+    f.s = playing_saw(400000);
+    CHECK(f.s);
+    render(f.s, out, 256);
+    CHECK_EQ(fa_thread_create(&th, flip_loops, &f), 0);
+    while (!fa_load32(&f.done) || rounds < 100) {
+        fa_frames in = -1, o = -1;
+        fa_fetch_add64(&g_dev->epoch, 1);
+        fa_stream_mix(f.s, g_dev, out, 256);
+        fa_fetch_add64(&g_dev->clock, 256);
+        fa_fetch_add64(&g_dev->epoch, 1);
+        fa_stream_get_loop_region(f.s, &in, &o);
+        if (o - in != 5000 && (in != 0 || o != 0)) torn++;   /* (0, 0) before the first change */
+        rounds++;
+        if (rounds % 8 == 0) fa_sleep_ms(1);
+    }
+    fa_thread_join(&th);
+    CHECK_EQ(f.errors, 0);
+    CHECK_EQ(torn, 0);
+    fa_stream_close(f.s);
 }
 
 /* Loops follow tempo: with the stretcher engaged the position stays in the loop. */
@@ -605,6 +739,35 @@ static void test_deck_meter(void)
     free(buf);
 }
 
+/* Unloading a deck whose loop has turned detaches before it clears the loop, so no
+ * join is made (and thrown away): the only seek is the detach's, to where it was heard. */
+static void test_unload_turned_loop(void)
+{
+    rig r;
+    static mem_io m;
+    float* buf = (float*)malloc(sizeof(float) * 8 * 1024);
+    fa_stream* s = open_saw_io(&m, g_rate * 4);
+    int i, last = -1;
+    CHECK(buf && s && rig_open(&r, FA_CUE_NONE));
+    CHECK_EQ(fa_deck_load(r.a, s, 0), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    CHECK_EQ(fa_deck_set_loop(r.a, 1000, 5000), FA_OK);
+    for (i = 0; i < 8; i++) rig_render(&r, buf, 1024);   /* past the out point: turned */
+    for (i = 0; i < 400 && fa_load32(&m.seeks) != last; i++) {   /* the decode-ahead settles */
+        last = fa_load32(&m.seeks);
+        fa_sleep_ms(20);
+    }
+    CHECK(s->jumped_back);
+    fa_store32(&m.seeks, 0);
+    CHECK_EQ(fa_deck_load(r.a, NULL, FA_DECK_LOAD_FORCE), FA_OK);
+    CHECK(s->device == NULL);
+    CHECK_EQ(fa_load32(&m.seeks), 1);
+    fa_mixer_destroy(r.m);
+    fa_stream_close(s);
+    free(m.data);
+    free(buf);
+}
+
 /* Loading moves a stream between decks; destroying the mixer leaves streams open;
  * closing the mixer's device destroys the mixer. Long callbacks run in blocks. */
 static void test_decks_and_lifetime(void)
@@ -815,6 +978,8 @@ int main(void)
     RUN(test_seek_past_loop_leaves_it);
     RUN(test_jump_moves_loop);
     RUN(test_loop_with_tempo);
+    RUN(test_failed_join_keeps_loop);
+    RUN(test_loop_region_readers);
     RUN(test_isolator_flat);
     RUN(test_isolator_kills);
     RUN(test_gains);
@@ -822,6 +987,7 @@ int main(void)
     RUN(test_cue_channels);
     RUN(test_cue_split);
     RUN(test_deck_meter);
+    RUN(test_unload_turned_loop);
     RUN(test_decks_and_lifetime);
     RUN(test_load_across_mixers);
     RUN(test_lowest_latency_no_delay_line);

@@ -555,8 +555,8 @@ FA_API void FA_CALL fa_mixer_destroy(fa_mixer* mixer)
     for (i = 0; i < mixer->deck_count; i++) {
         fa_stream* s = (fa_stream*)fa_exchange_ptr(&mixer->decks[i].stream, NULL);
         if (!s) continue;
-        fa_stream_set_loop_region(s, 0, 0);
         fa_stream_detach_internal(s);
+        fa_stream_set_loop_region(s, 0, 0);   /* detached first: nothing to join (see fa_deck_load) */
     }
     fa_mutex_unlock(&mixer->lock);
     dev = mixer->device;
@@ -878,8 +878,10 @@ FA_API fa_result FA_CALL fa_deck_load(fa_deck* deck, fa_stream* stream, uint32_t
     fa_deck_sync_loaded(deck);
     fa_automix_loaded(m, deck, stream);
     if (old) {
-        fa_stream_set_loop_region(old, 0, 0);
+        /* Detached first: clearing the loop while attached would join it in the
+         * ring (device wait, decoder seek, prefill) only to throw that away. */
         fa_stream_detach_internal(old);
+        fa_stream_set_loop_region(old, 0, 0);
     }
     fa_mutex_unlock(&m->lock);
     return FA_OK;
