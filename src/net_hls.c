@@ -172,6 +172,7 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
                 out->target_duration = atof(tmp + 22);
             } else if (strncmp(tmp, "#EXT-X-MEDIA-SEQUENCE:", 22) == 0) {
                 seq = out->media_sequence = strtoll(tmp + 22, NULL, 10);
+                if (seq < 0 || seq > INT64_MAX / 2) seq = out->media_sequence = 0;   /* nonsense: counting on would overflow */
             } else if (strncmp(tmp, "#EXT-X-DISCONTINUITY", 20) == 0 && tmp[20] == 0) {
                 discontinuity = 1;
             } else if (strncmp(tmp, "#EXT-X-ENDLIST", 14) == 0) {
@@ -180,6 +181,11 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
                 char* at;
                 br_len = strtoll(tmp + 17, &at, 10);
                 br_off = *at == '@' ? strtoll(at + 1, NULL, 10) : next_br_off;
+                /* A range that is empty, negative or runs past 2^63 is ignored (the whole segment). */
+                if (br_len <= 0 || br_off < 0 || br_off > INT64_MAX - br_len) {
+                    br_len = -1;
+                    next_br_off = -1;   /* a following range without an offset has none to continue from */
+                }
             } else if (strncmp(tmp, "#EXT-X-KEY:", 11) == 0) {
                 char v[FA_NET_URL_MAX];
                 free(key_uri);

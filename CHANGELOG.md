@@ -381,6 +381,11 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- HLS: an `EXT-X-MEDIA-SEQUENCE` of 2^63-1 overflowed the segment counter while parsing (now treated as 0), and an `EXT-X-BYTERANGE` with an offset near 2^63 (or a negative or empty length) overflowed the next range's offset
+  while the playlist was parsed; such a range is now ignored and the whole segment is fetched. Found by fuzzing.
+- A damaged `.flac` could crash the decoder (a null read in dr_flac) when a seek followed a frame that failed to decode.
+  Found by fuzzing the file readers (`tests/fuzz`); the vendored decoder now keeps no half-decoded frame
+  (`third_party/miniaudio/PATCHES.md`).
 - Threading (audit of 2026-10-27):
   - Deck loops: two loop changes in a row (a failed reversed jump, a beat jump while stopped) could let the audio thread
     read a half-written loop for one block, the old out point with the new in point. The loop is now read whole.

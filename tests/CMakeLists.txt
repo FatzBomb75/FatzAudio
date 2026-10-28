@@ -377,6 +377,14 @@ if(MSVC)
     set_property(TARGET fa_whitebox PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
+# Fuzz targets (tests/fuzz/CMakeLists.txt): the library sources get edge coverage for
+# the driver. Build only the fuzz_* targets in such a tree; the other tests lack the driver.
+option(FA_FUZZ "Build the fuzz targets (tests/fuzz)" OFF)
+if(FA_FUZZ)
+    target_compile_options(fa_whitebox PRIVATE -fsanitize-coverage=trace-pc)
+endif()
+add_subdirectory(fuzz)
+
 foreach(t fa_test_internal fa_test_loudness fa_test_crossfade fa_test_handoff fa_test_demux
           fa_test_dolby fa_test_aac fa_test_net fa_test_cdg fa_test_disc fa_test_tempo fa_test_ogg
           fa_test_encode fa_test_midi fa_test_tracker fa_test_flac fa_test_asf fa_test_tags fa_test_font
