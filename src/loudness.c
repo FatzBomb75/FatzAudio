@@ -13,6 +13,7 @@
  * Its 128-tap filter is flat to within 0.1 dB up to 0.83x Nyquist (20 kHz at
  * 48 kHz) and never reads high (passband ripple below 0.001 dB). */
 #include "fa_internal.h"
+#include "mdct.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,17 +26,6 @@
 #endif
 
 /* ---- True peak ------------------------------------------------------------- */
-
-static double bessel_i0(double x)
-{
-    double sum = 1.0, term = 1.0, k;
-    for (k = 1.0; k < 50.0; k += 1.0) {
-        term *= (x / (2.0 * k)) * (x / (2.0 * k));
-        sum += term;
-        if (term < sum * 1e-12) break;
-    }
-    return sum;
-}
 
 fa_result fa_truepeak_init(fa_truepeak* tp, uint32_t rate, uint32_t channels)
 {
@@ -59,7 +49,7 @@ fa_result fa_truepeak_init(fa_truepeak* tp, uint32_t rate, uint32_t channels)
             double fc = 0.97 / (2.0 * tp->phases);       /* cycles per oversampled sample */
             double sinc = x == 0.0 ? 2.0 * fc : sin(2.0 * FA_PI * fc * x) / (FA_PI * x);
             double r = 2.0 * (double)i / (double)(n - 1) - 1.0;
-            double w = bessel_i0(9.0 * sqrt(1.0 - r * r)) / bessel_i0(9.0);
+            double w = fa_bessel_i0(9.0 * sqrt(1.0 - r * r)) / fa_bessel_i0(9.0);
             h[t] = sinc * w;
             sum += h[t];
         }

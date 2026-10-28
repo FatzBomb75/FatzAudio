@@ -35,7 +35,7 @@ enum { CE_OK = 0, CE_WRITE_ERROR = 23, CE_ABORTED_BY_CALLBACK = 42 };
 #define C_GLOBAL_DEFAULT 3L   /* CURL_GLOBAL_SSL | CURL_GLOBAL_WIN32 */
 
 static struct {
-    fa_atomic32 state;        /* 0 not tried, 1 loading, 2 ready, 3 missing */
+    fa_atomic32 state;        /* fa_once */
     curl_easy_init_fn easy_init;
     curl_easy_setopt_fn setopt;
     curl_easy_perform_fn perform;
@@ -46,44 +46,36 @@ static struct {
     curl_slist_free_all_fn slist_free;
 } g_curl;
 
-static int curl_load(void)
+static int curl_load_once(void* ctx)
 {
     static const char* names[] = { "libcurl.so.4", "libcurl.so", "libcurl-gnutls.so.4", "libcurl-nss.so.4" };
-    for (;;) {
-        int32_t st = fa_load32(&g_curl.state);
-        if (st == 2) return 1;
-        if (st == 3) return 0;
-        if (st == 0 && fa_cas32(&g_curl.state, 0, 1)) {
-            void* lib = NULL;
-            size_t i;
-            curl_global_init_fn global_init = NULL;
-            for (i = 0; i < sizeof(names) / sizeof(names[0]) && !lib; i++) lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
-            if (lib) {
-                /* Function pointers through a union: ISO C has no object/function pointer cast. */
+    void* lib = NULL;
+    size_t i;
+    curl_global_init_fn global_init = NULL;
+    (void)ctx;
+    for (i = 0; i < sizeof(names) / sizeof(names[0]) && !lib; i++) lib = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+    if (lib) {
+        /* Function pointers through a union: ISO C has no object/function pointer cast. */
 #define LOAD(dst, name) do { union { void* p; __typeof__(dst) f; } u_; u_.p = dlsym(lib, name); dst = u_.f; } while (0)
-                LOAD(global_init, "curl_global_init");
-                LOAD(g_curl.easy_init, "curl_easy_init");
-                LOAD(g_curl.setopt, "curl_easy_setopt");
-                LOAD(g_curl.perform, "curl_easy_perform");
-                LOAD(g_curl.getinfo, "curl_easy_getinfo");
-                LOAD(g_curl.cleanup, "curl_easy_cleanup");
-                LOAD(g_curl.reset, "curl_easy_reset");
-                LOAD(g_curl.slist_append, "curl_slist_append");
-                LOAD(g_curl.slist_free, "curl_slist_free_all");
+        LOAD(global_init, "curl_global_init");
+        LOAD(g_curl.easy_init, "curl_easy_init");
+        LOAD(g_curl.setopt, "curl_easy_setopt");
+        LOAD(g_curl.perform, "curl_easy_perform");
+        LOAD(g_curl.getinfo, "curl_easy_getinfo");
+        LOAD(g_curl.cleanup, "curl_easy_cleanup");
+        LOAD(g_curl.reset, "curl_easy_reset");
+        LOAD(g_curl.slist_append, "curl_slist_append");
+        LOAD(g_curl.slist_free, "curl_slist_free_all");
 #undef LOAD
-            }
-            if (lib && global_init && g_curl.easy_init && g_curl.setopt && g_curl.perform && g_curl.getinfo &&
-                g_curl.cleanup && g_curl.reset && g_curl.slist_append && g_curl.slist_free && global_init(C_GLOBAL_DEFAULT) == CE_OK) {
-                fa_store32(&g_curl.state, 2);    /* stays loaded for the life of the process */
-                return 1;
-            }
-            if (lib) dlclose(lib);
-            fa_store32(&g_curl.state, 3);
-            return 0;
-        }
-        fa_sleep_ms(1);
     }
+    if (lib && global_init && g_curl.easy_init && g_curl.setopt && g_curl.perform && g_curl.getinfo &&
+        g_curl.cleanup && g_curl.reset && g_curl.slist_append && g_curl.slist_free && global_init(C_GLOBAL_DEFAULT) == CE_OK)
+        return 1;    /* stays loaded for the life of the process */
+    if (lib) dlclose(lib);
+    return -1;
 }
+
+static int curl_load(void) { return fa_once(&g_curl.state, curl_load_once, NULL); }
 
 /* One easy handle per stream: its connection cache keeps connections (and TLS
  * sessions) between requests. curl_easy_reset clears the options, not the cache. */

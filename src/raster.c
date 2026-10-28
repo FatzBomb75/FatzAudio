@@ -23,6 +23,8 @@
  * layer would need 10^9 (9 s). Past it, the rest of the path is left out: such a
  * glyph draws wrong, but in milliseconds. */
 #define RASTER_MAX_CELLS (1L << 22)
+/* Accumulator size (floats) kept however small the next layer is. */
+#define RASTER_KEEP_CELLS (1 << 24)
 
 int fa_raster_begin(fa_raster* r, int w, int h)
 {
@@ -30,20 +32,21 @@ int fa_raster_begin(fa_raster* r, int w, int h)
     if (w <= 0 || h <= 0) { r->w = r->h = 0; return 1; }
     if (w > 65536 || h > 65536 || (size_t)(w + 2) > SIZE_MAX / sizeof(float) / (size_t)h) return 0;
     need = (size_t)(w + 2) * (size_t)h;
-    if (need > r->cap) {
+    /* Grows to fit; a layer much smaller than the biggest so far (a damaged font's huge metrics) gives the rest back. */
+    if (need > r->cap || (r->cap > RASTER_KEEP_CELLS && r->cap / 4 > need)) {
         float* n = (float*)realloc(r->acc, need * sizeof(float));
-        if (!n) return 0;
-        r->acc = n;
-        r->cap = need;
+        if (!n) {
+            if (need > r->cap) return 0;
+        } else {
+            r->acc = n;
+            r->cap = need;
+        }
     }
     r->w = w;
     r->h = h;
     memset(r->acc, 0, need * sizeof(float));
     return 1;
 }
-
-/* The antiderivative of clamp(z, 0, 1). */
-static float ramp(float z) { return z <= 0.0f ? 0.0f : z >= 1.0f ? z - 0.5f : 0.5f * z * z; }
 
 /* Adds the edge's part in one row: from x = a to x = b, signed height d. */
 static void row_edge(float* row, int w, float a, float b, float d)
@@ -59,20 +62,15 @@ static void row_edge(float* row, int w, float a, float b, float d)
     i1 = (int)ceilf(hi);
     if (i1 <= i0) i1 = i0 + 1;
     for (i = i0; i <= i1 && i <= w; i++) {
-        float cov;
-        if (width < 1e-6f) {
-            float z = (float)(i + 1) - lo;
-            cov = z <= 0.0f ? 0.0f : z >= 1.0f ? 1.0f : z;
-        } else {
-            cov = (ramp((float)(i + 1) - lo) - ramp((float)(i + 1) - hi)) / width;
-        }
+        float cov = fa_edge_cover(i, lo, hi, width);
         row[i] += d * (cov - prev);
         prev = cov;
     }
     if (i <= w + 1 && prev < 1.0f) row[i] += d * (1.0f - prev);
 }
 
-void fa_raster_line(fa_raster* r, float x0, float y0, float x1, float y1)
+/* Adds one edge, pixels. */
+static void raster_line(fa_raster* r, float x0, float y0, float x1, float y1)
 {
     float dir = 1.0f, ya, yb;
     int y, ystart, yend;
@@ -99,7 +97,7 @@ void fa_raster_line(fa_raster* r, float x0, float y0, float x1, float y1)
     }
 }
 
-/* The cells fa_raster_line steps through for this edge (the same clipping). */
+/* The cells raster_line steps through for this edge (the same clipping). */
 static long line_cells(const fa_raster* r, float x0, float y0, float x1, float y1)
 {
     float lo = x0 < x1 ? x0 : x1, hi = x0 < x1 ? x1 : x0, ya = y0 < y1 ? y0 : y1, yb = y0 < y1 ? y1 : y0;
@@ -117,7 +115,7 @@ static int path_line(fa_raster* r, long* cells, float x0, float y0, float x1, fl
 {
     *cells -= line_cells(r, x0, y0, x1, y1);
     if (*cells < 0) return 0;
-    fa_raster_line(r, x0, y0, x1, y1);
+    raster_line(r, x0, y0, x1, y1);
     return 1;
 }
 

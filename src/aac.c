@@ -107,11 +107,15 @@ typedef struct aac_elem {
     int nch;
     int ms_mask_present;
     uint8_t ms_used[MAX_GROUPS][MAX_SFB];
-    aac_chan* ch[2];
+    aac_chan* ch[2];               /* ch[1]: CPEs only */
+    float* ps_right;               /* a mono element with PS: its right channel, 2 x FA_AAC_FRAME, allocated on demand */
     fa_aac_sbr* sbr;
     int stereo_out;                /* produced two channels (a CPE, or a mono element with PS) */
     int order;                     /* position among the block's elements of its type */
 } aac_elem;
+
+/* The right channel of an element that produced two. */
+static const float* elem_right(const aac_elem* e) { return e->nch == 2 ? e->ch[1]->out : e->ps_right; }
 
 /* Which decoded element goes to which speakers: plan_mix sorts them, render_mix
  * mixes them into the output. */
@@ -182,58 +186,27 @@ static const uint8_t tns_max_bands_short[13] = { 9, 9, 10, 14, 14, 14, 14, 14, 1
 
 /* ---- windows ------------------------------------------------------------------------------ */
 
-static double bessel_i0(double x)
-{
-    double sum = 1.0, term = 1.0, k;
-    for (k = 1.0; k < 50.0; k += 1.0) {
-        term *= (x / (2.0 * k)) * (x / (2.0 * k));
-        sum += term;
-        if (term < sum * 1e-17) break;
-    }
-    return sum;
-}
-
-/* The rising half (n samples) of the Kaiser-Bessel derived window of length 2n. */
-static void kbd_window(float* w, int n, double alpha)
-{
-    double k[1024 + 1];                /* n is 1024 or 128 */
-    double sum = 0.0, acc = 0.0;
-    int i;
-    for (i = 0; i <= n; i++) {
-        double r = (double)(i - n / 2) / (n / 2);
-        k[i] = bessel_i0(FA_PI * alpha * sqrt(1.0 - r * r));
-        sum += k[i];
-    }
-    for (i = 0; i < n; i++) {
-        acc += k[i];
-        w[i] = (float)sqrt(acc / sum);
-    }
-}
-
 /* The windows and |q|^(4/3) are the same for every decoder: the first one to open
  * builds them. */
 static struct {
-    fa_atomic32 state;             /* 0 not built, 1 being built, 2 built */
+    fa_atomic32 state;             /* fa_once */
     float sine_long[1024], sine_short[128], kbd_long[1024], kbd_short[128];
     float iq[256];                 /* |q|^(4/3) */
 } shared;
 
-static void build_shared(void)
+static int build_shared_once(void* ctx)
 {
-    while (fa_load32(&shared.state) != 2) {
-        if (fa_cas32(&shared.state, 0, 1)) {
-            int i;
-            for (i = 0; i < 1024; i++) shared.sine_long[i] = (float)sin(FA_PI / 2048.0 * (i + 0.5));
-            for (i = 0; i < 128; i++) shared.sine_short[i] = (float)sin(FA_PI / 256.0 * (i + 0.5));
-            kbd_window(shared.kbd_long, 1024, 4.0);
-            kbd_window(shared.kbd_short, 128, 6.0);
-            for (i = 0; i < 256; i++) shared.iq[i] = (float)pow((double)i, 4.0 / 3.0);
-            fa_store32(&shared.state, 2);
-        } else {
-            fa_sleep_ms(1);
-        }
-    }
+    int i;
+    (void)ctx;
+    for (i = 0; i < 1024; i++) shared.sine_long[i] = (float)sin(FA_PI / 2048.0 * (i + 0.5));
+    for (i = 0; i < 128; i++) shared.sine_short[i] = (float)sin(FA_PI / 256.0 * (i + 0.5));
+    fa_kbd_window(shared.kbd_long, 1024, 4.0);
+    fa_kbd_window(shared.kbd_short, 128, 6.0);
+    for (i = 0; i < 256; i++) shared.iq[i] = (float)pow((double)i, 4.0 / 3.0);
+    return 1;
 }
+
+static void build_shared(void) { fa_once(&shared.state, build_shared_once, NULL); }
 
 /* ---- configuration ---------------------------------------------------------------------- */
 
@@ -247,7 +220,7 @@ static int read_aot(fa_aac_bits* b)
 static uint32_t read_rate(fa_aac_bits* b, int* index)
 {
     int i = (int)fa_aac_get(b, 4);
-    *index = i;
+    if (index) *index = i;
     if (i == 15) return fa_aac_get(b, 24);
     return i < 13 ? fa_aac_rates[i] : 0;
 }
@@ -294,7 +267,7 @@ static int core_supported(int aot)
 
 static fa_result read_config(fa_aac* d, fa_aac_bits* b)
 {
-    int aot, ri, ext_ri = -1, sbr = -1, ps = -1;
+    int aot, ri, sbr = -1, ps = -1;
     uint32_t rate;
     int config;
     aot = read_aot(b);
@@ -303,7 +276,7 @@ static fa_result read_config(fa_aac* d, fa_aac_bits* b)
     if (aot == 5 || aot == 29) {
         sbr = 1;
         ps = aot == 29;
-        read_rate(b, &ext_ri);
+        read_rate(b, NULL);
         aot = read_aot(b);
         if (aot == 22) fa_aac_skip(b, 4);
     }
@@ -325,7 +298,7 @@ static fa_result read_config(fa_aac* d, fa_aac_bits* b)
         if (ext_aot == 5) {
             sbr = (int)fa_aac_get(b, 1);
             if (sbr) {
-                read_rate(b, &ext_ri);
+                read_rate(b, NULL);
                 if (fa_aac_left(b) >= 12 && fa_aac_peek(b, 11) == 0x548) {
                     fa_aac_skip(b, 11);
                     ps = (int)fa_aac_get(b, 1);
@@ -339,7 +312,6 @@ static fa_result read_config(fa_aac* d, fa_aac_bits* b)
         for (ri = 0; ri < 12 && rate < bounds[ri]; ri++) {}
     }
     if (rate == 0 || ri > 12 || config > 12 || (config > 7 && config < 11)) return FA_ERROR_UNSUPPORTED_FORMAT;
-    (void)ext_ri;
     if (rate > FA_AAC_SBR_MAX_CORE) sbr = 0;   /* the standard has no SBR above it: the core plays alone */
     d->configured = 1;
     d->from_asc = 1;
@@ -409,6 +381,7 @@ static void free_elem(aac_elem* e)
     if (!e) return;
     free_chan(e->ch[0]);
     free_chan(e->ch[1]);
+    free(e->ps_right);
     fa_aac_sbr_destroy(e->sbr);
     free(e);
 }
@@ -1353,7 +1326,7 @@ static void render_mix(const mix_layout* L, float* out, int frames)
     }
     if (nfp) {
         ADD(fronts_pair[0]->ch[0]->out, SP_L, 1.0f);
-        ADD(fronts_pair[0]->ch[1]->out, SP_R, 1.0f);
+        ADD(elem_right(fronts_pair[0]), SP_R, 1.0f);
     }
     for (i = 0; i < np; i++) {
         aac_elem* e = pairs[i];
@@ -1372,7 +1345,7 @@ static void render_mix(const mix_layout* L, float* out, int frames)
             sr = SP_SR;
         }
         ADD(e->ch[0]->out, sl, g);
-        ADD(e->ch[1]->out, sr, g);
+        ADD(elem_right(e), sr, g);
     }
     for (i = 0; i < nbc; i++) {
         const float* s = backs_c[i]->ch[0]->out;
@@ -1497,8 +1470,8 @@ static int decode_block(fa_aac* d, fa_aac_bits* b, int* frames, int* nch, mix_la
             } else {
                 /* A mono stream's element may turn stereo (parametric stereo):
                  * its right channel goes to a second channel allocated on demand. */
-                if (!e->ch[1] && ps_possible) e->ch[1] = (aac_chan*)calloc(1, sizeof(aac_chan));
-                o[1] = e->ch[1] && ps_possible ? e->ch[1]->out : NULL;
+                if (!e->ps_right && ps_possible) e->ps_right = (float*)calloc(2 * FA_AAC_FRAME, sizeof(float));
+                o[1] = e->ps_right && ps_possible ? e->ps_right : NULL;
             }
             stereo = fa_aac_sbr_apply(e->sbr, in, o);
             if (o[1] && e->nch == 1) {

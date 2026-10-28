@@ -87,7 +87,7 @@ static JNIEnv* get_env(void)
 /* ---- classes and methods ---------------------------------------------------------- */
 
 static struct {
-    fa_atomic32 state;             /* 0 not tried, 1 loading, 2 ready, 3 missing */
+    fa_atomic32 state;             /* fa_once */
     jclass url, proxy, inet, system;
     jmethodID url_init, url_open, url_open_proxy;
     jobject no_proxy, type_http;   /* Proxy.NO_PROXY, Proxy.Type.HTTP */
@@ -167,21 +167,14 @@ static int load_classes(JNIEnv* env)
     return ok;
 }
 
+static int load_classes_once(void* env) { return load_classes((JNIEnv*)env) ? 1 : -1; }
+
 /* The JNIEnv of this thread once the classes are loaded, else NULL. */
 static JNIEnv* java_ready(void)
 {
     JNIEnv* env = get_env();
     if (!env) return NULL;
-    for (;;) {
-        int32_t st = fa_load32(&J.state);
-        if (st == 2) return env;
-        if (st == 3) return NULL;
-        if (st == 0 && fa_cas32(&J.state, 0, 1)) {
-            fa_store32(&J.state, load_classes(env) ? 2 : 3);
-            continue;
-        }
-        fa_sleep_ms(1);
-    }
+    return fa_once(&J.state, load_classes_once, env) ? env : NULL;
 }
 
 /* A Java string of UTF-8 text. Bytes that are not valid UTF-8 are taken as
@@ -319,38 +312,15 @@ static int add_header(void* user, const char* name, const char* value)
 /* A proxy from the request's setting: NULL = the system's (ProxySelector). */
 static jobject make_proxy(JNIEnv* env, const char* setting)
 {
-    char host[256];
-    const char* p;
-    const char* at;
-    size_t len;
-    long port = 80;
+    fa_url pu;
     jstring h;
     jobject addr, proxy;
     if (!setting) return NULL;
     if (!setting[0]) return (*env)->NewLocalRef(env, J.no_proxy);
-    /* "http://user:pass@host:port/" -> host, port (credentials are not passed on). */
-    p = strstr(setting, "://");
-    p = p ? p + 3 : setting;
-    at = strchr(p, '@');
-    if (at) p = at + 1;
-    if (*p == '[') {                                   /* [IPv6]:port */
-        const char* end = strchr(p, ']');
-        if (!end) return NULL;
-        len = (size_t)(end - p - 1);
-        if (len >= sizeof(host)) return NULL;
-        memcpy(host, p + 1, len);
-        p = end + 1;
-    } else {
-        len = strcspn(p, ":/");
-        if (len >= sizeof(host)) return NULL;
-        memcpy(host, p, len);
-        p += len;
-    }
-    host[len] = 0;
-    if (*p == ':') port = strtol(p + 1, NULL, 10);
-    if (!host[0] || port <= 0 || port > 65535) return NULL;
-    h = jstr0(env, host);
-    addr = h ? (*env)->CallStaticObjectMethod(env, J.inet, J.inet_unresolved, h, (jint)port) : NULL;
+    /* Host and port only: credentials are not passed on. */
+    if (fa_proxy_parse(setting, &pu) != FA_OK) return NULL;
+    h = jstr0(env, pu.host);
+    addr = h ? (*env)->CallStaticObjectMethod(env, J.inet, J.inet_unresolved, h, (jint)pu.port) : NULL;
     proxy = addr && !clear_exception(env) ? (*env)->NewObject(env, J.proxy, J.proxy_init, J.type_http, addr) : NULL;
     clear_exception(env);
     return proxy;

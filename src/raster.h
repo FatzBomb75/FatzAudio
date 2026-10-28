@@ -20,10 +20,22 @@ int fa_raster_begin(fa_raster* r, int w, int h);
 /* Adds `path` placed by x' = x * sx + dx, y' = y * sy + dy (pixels, y down: pass
  * a negative sy for font units). */
 void fa_raster_path(fa_raster* r, const fa_path* path, float sx, float sy, float dx, float dy);
-/* Adds one edge, pixels. */
-void fa_raster_line(fa_raster* r, float x0, float y0, float x1, float y1);
 /* Writes the coverage, 0..255, one byte per pixel. */
 void fa_raster_end(fa_raster* r, uint8_t* out, size_t stride);
 void fa_raster_free(fa_raster* r);
+
+/* The antiderivative of clamp(z, 0, 1). */
+static inline float fa_edge_ramp(float z) { return z <= 0.0f ? 0.0f : z >= 1.0f ? z - 0.5f : 0.5f * z * z; }
+
+/* How much of pixels 0..i an edge crossing a row from x = lo to x = hi (width = hi - lo) covers, 0..1: the box
+ * filter's integral. */
+static inline float fa_edge_cover(int i, float lo, float hi, float width)
+{
+    if (width < 1e-6f) {
+        float z = (float)(i + 1) - lo;
+        return z <= 0.0f ? 0.0f : z >= 1.0f ? 1.0f : z;
+    }
+    return (fa_edge_ramp((float)(i + 1) - lo) - fa_edge_ramp((float)(i + 1) - hi)) / width;
+}
 
 #endif

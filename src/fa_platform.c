@@ -426,6 +426,22 @@ void fa_temp_folder_sweep(const char* folder)
 }
 #endif
 
+/* state: 0 not run, 1 running, 2 done, 3 failed for good */
+int fa_once(fa_atomic32* state, int (*init)(void* ctx), void* ctx)
+{
+    for (;;) {
+        int32_t st = fa_load32(state);
+        if (st == 2) return 1;
+        if (st == 3) return 0;
+        if (st == 0 && fa_cas32(state, 0, 1)) {
+            int r = init(ctx);
+            fa_store32(state, r > 0 ? 2 : r < 0 ? 3 : 0);
+            return r > 0;
+        }
+        if (st == 1) fa_sleep_ms(1);
+    }
+}
+
 void fa_lazy_mutex_lock(fa_lazy_mutex* l)
 {
     if (fa_load32(&l->state) != 2) {

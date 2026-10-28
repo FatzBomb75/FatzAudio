@@ -1134,27 +1134,28 @@ static void taps_make(taps* t, float out_centre, float at, float c, float sc, in
     while (t->n > 0 && (t->first + t->n > size || t->w[t->n - 1] <= 0.0f)) t->n--;
 }
 
+/* Grows the scratch buffer behind the pointer at `slot` (any item type) to hold n items of `elem` bytes; 0 = out of memory. */
+static int ensure_scratch(void* slot, size_t* cap, size_t n, size_t elem)
+{
+    void* p;
+    if (n <= *cap) return 1;
+    memcpy(&p, slot, sizeof p);
+    p = realloc(p, n * elem);
+    if (!p) return 0;
+    memcpy(slot, &p, sizeof p);
+    *cap = n;
+    return 1;
+}
+
 static int ensure_tmp(fa_lyric* l, size_t floats)
 {
-    float* n;
-    if (floats <= l->tmp_cap) return 1;
-    n = (float*)realloc(l->tmp, floats * sizeof(float));
-    if (!n) return 0;
-    l->tmp = n;
-    l->tmp_cap = floats;
-    return 1;
+    return ensure_scratch(&l->tmp, &l->tmp_cap, floats, sizeof(float));
 }
 
 /* draw_place's column taps for `n` output columns; 0 = out of memory. */
 static int ensure_cols(fa_lyric* l, size_t n)
 {
-    taps* c;
-    if (n <= l->cols_cap) return 1;
-    c = (taps*)realloc(l->cols, n * sizeof(taps));
-    if (!c) return 0;
-    l->cols = c;
-    l->cols_cap = n;
-    return 1;
+    return ensure_scratch(&l->cols, &l->cols_cap, n, sizeof(taps));
 }
 
 #if LY_SSE

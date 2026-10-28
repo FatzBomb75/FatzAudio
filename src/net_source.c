@@ -873,9 +873,9 @@ static int small_head(void* user, const fa_http_response* resp)
     c->status = resp->status;
     if (c->final_url) snprintf(c->final_url, c->final_cap, "%s", resp->final_url);
     if (resp->status >= 400) return 0;                    /* fa_http_fetch reports it */
-    if (resp->status == 206 && resp->range_start <= c->offset) c->skip = c->offset - resp->range_start;
-    else if (resp->status == 200 || (resp->status != 206 && c->offset == 0 && c->left < 0)) c->skip = c->offset;
-    else { c->bad = 1; return 1; }        /* a range was asked: only 200 or a 206 holding it will do */
+    /* A range was asked: only 200 or a 206 holding it will do. */
+    c->skip = fa_http_range_skip(resp, c->offset, c->offset == 0 && c->left < 0);
+    if (c->skip < 0) { c->skip = 0; c->bad = 1; return 1; }
     return 0;
 }
 

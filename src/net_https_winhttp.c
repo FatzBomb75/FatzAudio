@@ -191,15 +191,14 @@ static HINTERNET open_session(const wchar_t* wua, const char* proxy)
         session = WinHttpOpen(wua, WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     } else if (proxy) {
         /* "http://user:pass@host:port" -> "host:port" (credentials are not passed on). */
-        const char* p = strstr(proxy, "://");
-        const char* at;
+        fa_url pu;
+        char hostport[sizeof(pu.host) + 16];
         wchar_t* wproxy;
-        p = p ? p + 3 : proxy;
-        at = strchr(p, '@');
-        if (at) p = at + 1;
-        wproxy = widen(p);
+        if (fa_proxy_parse(proxy, &pu) != FA_OK) return NULL;
+        if (strchr(pu.host, ':')) snprintf(hostport, sizeof(hostport), "[%s]:%u", pu.host, (unsigned)pu.port);   /* IPv6 */
+        else snprintf(hostport, sizeof(hostport), "%s:%u", pu.host, (unsigned)pu.port);
+        wproxy = widen(hostport);
         if (!wproxy) return NULL;
-        { size_t l = wcslen(wproxy); if (l > 0 && wproxy[l - 1] == L'/') wproxy[l - 1] = 0; }
         session = WinHttpOpen(wua, WINHTTP_ACCESS_TYPE_NAMED_PROXY, wproxy, WINHTTP_NO_PROXY_BYPASS, 0);
         free(wproxy);
     } else {

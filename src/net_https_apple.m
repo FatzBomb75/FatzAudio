@@ -135,9 +135,7 @@ static int session_open(fa_http_session* s, const fa_http_request* req)
         cfg.connectionProxyDictionary = @{};
     } else if (req->proxy) {
         fa_url p;
-        char text[FA_NET_URL_MAX];
-        snprintf(text, sizeof(text), "%s%s", strstr(req->proxy, "://") ? "" : "http://", req->proxy);
-        if (fa_url_parse(text, &p) == FA_OK) {
+        if (fa_proxy_parse(req->proxy, &p) == FA_OK) {
             NSString* host = [NSString stringWithUTF8String:p.host];
             cfg.connectionProxyDictionary = @{ @"HTTPEnable": @1, @"HTTPProxy": host, @"HTTPPort": @(p.port),
                                                @"HTTPSEnable": @1, @"HTTPSProxy": host, @"HTTPSPort": @(p.port) };

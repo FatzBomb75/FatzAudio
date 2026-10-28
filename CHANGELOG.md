@@ -370,6 +370,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Frames pushed at another rate than their push stream's (`fa_stream_push_frame`), and tracks whose rate changes
   partway (chained Ogg), are resampled with the same windowed-sinc resampler (a 17 kHz tone pushed at 44.1 kHz into
   a 48 kHz stream: its image went from 8 dB to 126 dB below the tone).
+- Proxy settings (`proxy` in the net options) are read the same way on every platform: `host:port` or
+  `http://user:pass@host:port/` (an IPv6 literal in brackets, port 80 when none, any path ignored); a setting that is not
+  an http proxy is refused alike by WinHTTP, Android and Apple (before, each parsed it its own way).
+- Memory: the lyric/text rasterizer gives its buffer back when a layer is much smaller than the biggest one before it
+  (a damaged font's huge metrics no longer keep up to 265 MB for the surface's life); a mono HE-AAC v2 stream no longer
+  allocates a whole channel structure (about 14 KB) for its right channel.
+- Internal cleanup with identical output: one run-once helper, one Bessel/KBD window code, one device list publisher, one
+  copy of the effects' tile, shadow and bevel code, and the dead exports and unused arguments removed.
 
 ### Fixed
 

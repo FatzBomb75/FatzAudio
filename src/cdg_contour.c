@@ -38,6 +38,7 @@
  * sum starts there again (or at the screen's left edge, with the colour of the row's
  * first pixel), so a pixel's value depends only on the segments near it. */
 #include "cdg_contour.h"
+#include "raster.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -338,12 +339,6 @@ static void add_seg(cdg_contours* ct, const ct_pt* a, const ct_pt* b, uint8_t l,
     if (s->cx1 > W - 1) s->cx1 = W - 1;
 }
 
-/* A segment between two points with anchors (each point relative to its anchor). */
-static void seg_between(cdg_contours* ct, const ct_pt* a, const ct_pt* b, uint8_t l, uint8_t r)
-{
-    add_seg(ct, a, b, l, r);
-}
-
 /* The outline through points pt[0..np) (closed: back to pt[0]), rounded or fitted with
  * curves at its vertices for levels 7-10, as segments. */
 static void outline(cdg_contours* ct, size_t np, int closed, uint8_t l, uint8_t r)
@@ -372,7 +367,7 @@ static void outline(cdg_contours* ct, size_t np, int closed, uint8_t l, uint8_t 
             if (q->kind == K_CORNER && q->legs >= (level == 7 ? 2 : level == 8 ? 3 : level == 9 ? 4 : 3)) sharp = 1;
         }
         if (sharp) {
-            if (have) seg_between(ct, &cur, q, l, r);
+            if (have) add_seg(ct, &cur, q, l, r);
             else start = *q;
             cur = *q;
             have = 1;
@@ -430,17 +425,17 @@ static void outline(cdg_contours* ct, size_t np, int closed, uint8_t l, uint8_t 
             for (i = 0; i <= steps; i++) {
                 const ct_pt* b = &pts[sw ? steps - i : i];
                 if (i == 0) {
-                    if (have) seg_between(ct, &cur, b, l, r);
+                    if (have) add_seg(ct, &cur, b, l, r);
                     else start = *b;
                     have = 1;
                 } else {
-                    seg_between(ct, &cur, b, l, r);
+                    add_seg(ct, &cur, b, l, r);
                 }
                 cur = *b;
             }
         }
     }
-    if (closed && have) seg_between(ct, &cur, &start, l, r);
+    if (closed && have) add_seg(ct, &cur, &start, l, r);
 }
 
 /* Smooths one traced chain (runs dir/len from corner (x0, y0)) into segments. */
@@ -492,8 +487,8 @@ static void smooth_chain(cdg_contours* ct, int x0, int y0, int m, int closed, ui
         outline(ct, np, closed, l, r);
     } else {
         size_t k;
-        for (k = 0; k + 1 < np; k++) seg_between(ct, &ct->pt[k], &ct->pt[k + 1], l, r);
-        if (closed && np > 1) seg_between(ct, &ct->pt[np - 1], &ct->pt[0], l, r);
+        for (k = 0; k + 1 < np; k++) add_seg(ct, &ct->pt[k], &ct->pt[k + 1], l, r);
+        if (closed && np > 1) add_seg(ct, &ct->pt[np - 1], &ct->pt[0], l, r);
     }
 }
 
@@ -647,8 +642,6 @@ void cdg_contours_free(cdg_contours* ct)
 
 /* ---- drawing -------------------------------------------------------------------------- */
 
-static float ramp(float z) { return z <= 0.0f ? 0.0f : z >= 1.0f ? z - 0.5f : 0.5f * z * z; }
-
 typedef struct row_ctx {
     int32_t* acc;
     int limit;                        /* pixels from the run's start */
@@ -678,13 +671,7 @@ static void row_edge(row_ctx* rc, int base, float a, float b, float d, const int
     int i0 = (int)floorf(lo), i1 = (int)ceilf(hi), i;
     if (i1 <= i0) i1 = i0 + 1;
     for (i = i0; i <= i1; i++) {
-        float cov;
-        if (width < 1e-6f) {
-            float z = (float)(i + 1) - lo;
-            cov = z <= 0.0f ? 0.0f : z >= 1.0f ? 1.0f : z;
-        } else {
-            cov = (ramp((float)(i + 1) - lo) - ramp((float)(i + 1) - hi)) / width;
-        }
+        float cov = fa_edge_cover(i, lo, hi, width);
         put(rc, base + i, d * (cov - prev), delta);
         prev = cov;
     }

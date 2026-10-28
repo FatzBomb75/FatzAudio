@@ -14,9 +14,36 @@
 #  define FA_FFT_NEON 1
 #endif
 
+double fa_bessel_i0(double x)
+{
+    double sum = 1.0, term = 1.0, k;
+    for (k = 1.0; k < 50.0; k += 1.0) {
+        term *= (x / (2.0 * k)) * (x / (2.0 * k));
+        sum += term;
+        if (term < sum * 1e-17) break;
+    }
+    return sum;
+}
+
+void fa_kbd_window(float* w, int n, double alpha)
+{
+    double k[1024 + 1];
+    double sum = 0.0, acc = 0.0;
+    int i;
+    for (i = 0; i <= n; i++) {
+        double r = (double)(i - n / 2) / (n / 2);
+        k[i] = fa_bessel_i0(FA_PI * alpha * sqrt(1.0 - r * r));
+        sum += k[i];
+    }
+    for (i = 0; i < n; i++) {
+        acc += k[i];
+        w[i] = (float)sqrt(acc / sum);
+    }
+}
+
 /* One set of tables per size 2^bits of m (m up to 2^20). */
 typedef struct mdct_tables {
-    fa_atomic32 state;     /* 0 not built, 1 being built, 2 built */
+    fa_atomic32 state;     /* fa_once */
     float* twiddle;
     float* post;
     float* fft_tw;
@@ -78,25 +105,28 @@ static int build_tables(mdct_tables* s, int m)
     return 1;
 }
 
+typedef struct build_req { mdct_tables* s; int m; } build_req;
+
+static int build_tables_once(void* ctx)
+{
+    const build_req* r = (const build_req*)ctx;
+    return build_tables(r->s, r->m) ? 1 : 0;
+}
+
 fa_result fa_imdct_init(fa_mdct* t, int m)
 {
     int bits = 0;
     mdct_tables* s;
+    build_req req;
     memset(t, 0, sizeof(*t));
     if (m < 4 || (m & (m - 1))) return FA_ERROR_INVALID_ARG;
     while ((1 << bits) < m) bits++;
     if (bits >= (int)(sizeof(shared_tables) / sizeof(shared_tables[0]))) return FA_ERROR_INVALID_ARG;
     s = &shared_tables[bits];
-    while (fa_load32(&s->state) != 2) {
-        if (fa_cas32(&s->state, 0, 1)) {
-            /* Out of memory leaves them unbuilt, for a later try. */
-            int ok = build_tables(s, m);
-            fa_store32(&s->state, ok ? 2 : 0);
-            if (!ok) return FA_ERROR_OUT_OF_MEMORY;
-        } else {
-            fa_sleep_ms(1);
-        }
-    }
+    req.s = s;
+    req.m = m;
+    /* Out of memory leaves them unbuilt, for a later try. */
+    if (!fa_once(&s->state, build_tables_once, &req)) return FA_ERROR_OUT_OF_MEMORY;
     t->m = m;
     t->twiddle = s->twiddle;
     t->post = s->post;

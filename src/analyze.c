@@ -230,22 +230,19 @@ static const uint8_t* take(reader* r, size_t n)
 static uint64_t get_u64(reader* r)
 {
     const uint8_t* p = take(r, 8);
-    uint64_t v = 0;
-    int i;
-    if (p) for (i = 7; i >= 0; i--) v = (v << 8) | p[i];
-    return v;
+    return p ? fa_le64(p) : 0;
 }
 
 static uint32_t get_u32(reader* r)
 {
     const uint8_t* p = take(r, 4);
-    return p ? (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24 : 0;
+    return p ? fa_le32(p) : 0;
 }
 
 static uint32_t get_u16(reader* r)
 {
     const uint8_t* p = take(r, 2);
-    return p ? (uint32_t)p[0] | (uint32_t)p[1] << 8 : 0;
+    return p ? fa_le16(p) : 0;
 }
 
 static double get_f64(reader* r) { uint64_t u = get_u64(r); double v; memcpy(&v, &u, 8); return v; }

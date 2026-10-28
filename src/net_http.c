@@ -25,21 +25,14 @@ typedef SOCKET fa_socket;
 #  define fa_closesocket closesocket
 static int sock_would_block(void) { int e = WSAGetLastError(); return e == WSAEWOULDBLOCK || e == WSAEINPROGRESS; }
 static int sock_set_nonblocking(fa_socket s) { u_long on = 1; return ioctlsocket(s, FIONBIO, &on); }
-static fa_atomic32 g_wsa_state;   /* 0 = not started, 1 = starting, 2 = ready */
-static int net_startup(void)
+static fa_atomic32 g_wsa_state;
+static int wsa_start(void* ctx)
 {
-    for (;;) {
-        int32_t st = fa_load32(&g_wsa_state);
-        if (st == 2) return 0;
-        if (st == 0 && fa_cas32(&g_wsa_state, 0, 1)) {
-            WSADATA wsa;
-            if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { fa_store32(&g_wsa_state, 0); return -1; }
-            fa_store32(&g_wsa_state, 2);   /* stays started for the life of the process */
-            return 0;
-        }
-        Sleep(1);
-    }
+    WSADATA wsa;
+    (void)ctx;
+    return WSAStartup(MAKEWORD(2, 2), &wsa) == 0;   /* stays started for the life of the process */
 }
+static int net_startup(void) { return fa_once(&g_wsa_state, wsa_start, NULL) ? 0 : -1; }
 #  define FA_SEND_FLAGS 0
 #else
 #  include <errno.h>
@@ -639,6 +632,13 @@ done:
 }
 
 /* ---- dispatcher ------------------------------------------------------------------ */
+
+int64_t fa_http_range_skip(const fa_http_response* resp, int64_t offset, int any_status)
+{
+    if (resp->status == 206 && resp->range_start <= offset) return offset - resp->range_start;
+    if (resp->status == 200 || (resp->status != 206 && any_status)) return offset;
+    return -1;
+}
 
 fa_result fa_http_fetch(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user)
 {

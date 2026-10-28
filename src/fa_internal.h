@@ -1462,6 +1462,9 @@ double fa_device_speaker_frame(fa_device* device, int64_t now_ns);
  * master (device.c) and the mic inputs (mic.c). */
 #define FA_REROUTE_GRACE_NS 300000000
 void fa_device_wait_quiescent(fa_device* device);
+/* Swaps in a copy of the list in `slot` (dev->voices, dev->buses) without `remove` and `add`, with `add` last, and
+ * frees the old one once the callback let go. Caller holds dev->lock. */
+fa_result fa_device_publish_list(fa_device* dev, fa_atomic_ptr* slot, void* add, void* remove);
 void fa_device_wait_idle(fa_device* device);
 fa_result fa_device_add_voice(fa_device* device, struct fa_stream* stream);
 void fa_device_remove_voice(fa_device* device, struct fa_stream* stream);

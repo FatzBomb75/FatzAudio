@@ -1,5 +1,6 @@
 #include "encode.h"
 #include <math.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -434,21 +435,34 @@ void fa_device_wait_idle(fa_device* dev)
     while ((fa_load64(&dev->epoch) & 1) && fa_monotonic_ns() < until) fa_sleep_ms(0);
 }
 
-/* Publishes a new voice list; the old one is freed once the callback is done with it. */
-static fa_result publish_voices(fa_device* dev, fa_stream* add, fa_stream* remove)
+/* fa_voice_list and fa_bus_list share this layout: a count, then the pointers. The items are moved as bytes, so the
+ * lists are only ever accessed as their own types. */
+fa_result fa_device_publish_list(fa_device* dev, fa_atomic_ptr* slot, void* add, void* remove)
 {
-    fa_voice_list* old = (fa_voice_list*)fa_load_ptr(&dev->voices);
-    uint32_t n = old ? old->count : 0, i, k = 0;
-    fa_voice_list* list = (fa_voice_list*)malloc(sizeof(fa_voice_list) + (size_t)(n + 1) * sizeof(fa_stream*));
-    if (!list) return FA_ERROR_OUT_OF_MEMORY;
-    for (i = 0; i < n; i++)
-        if (old->items[i] != remove && old->items[i] != add) list->items[k++] = old->items[i];
-    if (add) list->items[k++] = add;
-    list->count = k;
-    fa_exchange_ptr(&dev->voices, list);
+    const size_t head = offsetof(fa_voice_list, items), step = sizeof(void*);
+    unsigned char* old = (unsigned char*)fa_load_ptr(slot);
+    uint32_t n = 0, i, k = 0;
+    unsigned char* out;
+    if (old) memcpy(&n, old, sizeof n);
+    out = (unsigned char*)malloc(sizeof(fa_voice_list) + (size_t)(n + 1) * step);
+    if (!out) return FA_ERROR_OUT_OF_MEMORY;
+    for (i = 0; i < n; i++) {
+        void* item;
+        memcpy(&item, old + head + i * step, step);
+        if (item == remove || item == add) continue;
+        memcpy(out + head + k++ * step, &item, step);
+    }
+    if (add) memcpy(out + head + k++ * step, &add, step);
+    memcpy(out, &k, sizeof k);
+    fa_exchange_ptr(slot, out);
     fa_device_wait_quiescent(dev);
     free(old);
     return FA_OK;
+}
+
+static fa_result publish_voices(fa_device* dev, fa_stream* add, fa_stream* remove)
+{
+    return fa_device_publish_list(dev, &dev->voices, add, remove);
 }
 
 fa_result fa_device_add_voice(fa_device* dev, fa_stream* s)

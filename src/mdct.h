@@ -27,4 +27,9 @@ void fa_imdct_free(fa_mdct* t);
  * (it has a work buffer). */
 void fa_mdct_dct4(const fa_mdct* t, const float* in, float* u);
 
+/* Modified Bessel function of the first kind, order 0 (series). */
+double fa_bessel_i0(double x);
+/* The rising half (n samples, n <= 1024) of the Kaiser-Bessel derived window of length 2n. */
+void fa_kbd_window(float* w, int n, double alpha);
+
 #endif

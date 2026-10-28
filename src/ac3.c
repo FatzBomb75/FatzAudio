@@ -129,29 +129,12 @@ static uint8_t frmexpstr[32][6];  /* E-AC-3 frame exponent strategies (Table E2.
 static float spxatten[32][3];
 static float aht_idct[6][6];      /* [block][j]: the AHT's inverse DCT */
 static float ecplamptab[32];
-static fa_atomic32 tables_state;  /* 0 not done, 1 in progress, 2 done */
+static fa_atomic32 tables_state;
 
-static double bessel_i0(double x)
+static int ac3_build_tables(void* ctx)
 {
-    double sum = 1.0, term = 1.0;
-    int k;
-    for (k = 1; k < 64; k++) {
-        term *= (x / (2.0 * k)) * (x / (2.0 * k));
-        sum += term;
-        if (term < sum * 1e-17) break;
-    }
-    return sum;
-}
-
-static void ac3_init_tables(void)
-{
-    double w[AC3_BLOCK + 1], total = 0.0, acc = 0.0;
     int i, b, k;
-    if (fa_load32(&tables_state) == 2) return;
-    if (!fa_cas32(&tables_state, 0, 1)) {
-        while (fa_load32(&tables_state) != 2) fa_sleep_ms(1);
-        return;
-    }
+    (void)ctx;
     for (i = 0; i < 256; i++) {
         uint32_t crc = (uint32_t)i << 8;
         for (b = 0; b < 8; b++) crc = (crc & 0x8000) ? ((crc << 1) ^ 0x8005) & 0xFFFF : (crc << 1) & 0xFFFF;
@@ -167,17 +150,9 @@ static void ac3_init_tables(void)
     for (b = 0; b < 50; b++)
         for (k = bndtab[b]; k < bndtab[b + 1]; k++) masktab[k] = (uint8_t)b;
     for (k = 253; k < 256; k++) masktab[k] = 0;
-    /* KBD window: cumulative Kaiser kernel of length N/2 + 1. */
-    for (i = 0; i <= AC3_BLOCK; i++) {
-        double r = 2.0 * i / AC3_BLOCK - 1.0;
-        w[i] = bessel_i0(FA_PI * 5.0 * sqrt(1.0 - r * r));
-        total += w[i];
-    }
-    for (i = 0; i < AC3_BLOCK; i++) {
-        acc += w[i];
-        kbd[i] = (float)sqrt(acc / total);
-        kbd[2 * AC3_BLOCK - 1 - i] = kbd[i];
-    }
+    /* KBD window, alpha 5 */
+    fa_kbd_window(kbd, AC3_BLOCK, 5.0);
+    for (i = 0; i < AC3_BLOCK; i++) kbd[2 * AC3_BLOCK - 1 - i] = kbd[i];
     /* Symmetric quantizers: level j of L is (2j - (L-1)) / L. */
     for (i = 0; i < 27; i++) {
         b1q[i][0] = (float)(2 * (i / 9) - 2) / 3.0f;
@@ -222,8 +197,10 @@ static void ac3_init_tables(void)
         for (i = 1; i < 31; i++) ecplamptab[i] = ldexpf((float)mant[(i - 1) % 4] / 32.0f, -((i - 1) / 4));
         ecplamptab[31] = 0.0f;
     }
-    fa_store32(&tables_state, 2);
+    return 1;
 }
+
+static void ac3_init_tables(void) { fa_once(&tables_state, ac3_build_tables, NULL); }
 
 /* ---- bit reader --------------------------------------------------------------- */
 

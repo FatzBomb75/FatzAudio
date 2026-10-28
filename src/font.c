@@ -487,7 +487,7 @@ static int emit(fa_path* p, const xform* t, int op, float x1, float y1, float x2
     return 1;
 }
 
-void fa_path_clear(fa_path* p)
+static void path_clear(fa_path* p)
 {
     p->count = 0;
     p->xmin = p->ymin = 1.0f;
@@ -999,7 +999,7 @@ fa_result fa_font_outline(const fa_font* f, uint32_t g, fa_path* p)
 {
     fa_result r;
     if (!f || !p) return FA_ERROR_INVALID_ARG;
-    fa_path_clear(p);
+    path_clear(p);
     if (g >= f->info.glyph_count) return FA_ERROR_INVALID_ARG;
     if (f->info.cff) {
         r = cff_outline(f, g, p, &k_identity);
@@ -1007,7 +1007,7 @@ fa_result fa_font_outline(const fa_font* f, uint32_t g, fa_path* p)
         int budget = FONT_MAX_COMPONENTS;
         r = glyf_outline(f, g, p, &k_identity, 0, &budget);
     }
-    if (r != FA_OK) fa_path_clear(p);
+    if (r != FA_OK) path_clear(p);
     return r;
 }
 

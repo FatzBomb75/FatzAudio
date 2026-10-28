@@ -12,18 +12,7 @@
 /* Publishes a new bus list with `add` added or `remove` removed. Caller holds dev->lock. */
 static fa_result publish_buses(fa_device* dev, fa_bus* add, fa_bus* remove)
 {
-    fa_bus_list* old = (fa_bus_list*)fa_load_ptr(&dev->buses);
-    uint32_t n = old ? old->count : 0, i, k = 0;
-    fa_bus_list* list = (fa_bus_list*)malloc(sizeof(fa_bus_list) + (size_t)(n + 1) * sizeof(fa_bus*));
-    if (!list) return FA_ERROR_OUT_OF_MEMORY;
-    for (i = 0; i < n; i++)
-        if (old->items[i] != remove) list->items[k++] = old->items[i];
-    if (add) list->items[k++] = add;
-    list->count = k;
-    fa_exchange_ptr(&dev->buses, list);
-    fa_device_wait_quiescent(dev);
-    free(old);
-    return FA_OK;
+    return fa_device_publish_list(dev, &dev->buses, add, remove);
 }
 
 FA_API fa_result FA_CALL fa_bus_create(fa_device* device, fa_bus** out_bus)
