@@ -26,6 +26,9 @@ typedef struct fa_url {
 
 /* FA_OK, or FA_ERROR_INVALID_ARG for anything that is not an absolute http(s) URL. */
 fa_result fa_url_parse(const char* text, fa_url* out);
+/* A request's proxy setting ("host:port", "http://user:pass@host:port/"; http assumed, port 80 when none) parsed the
+ * same way for every transport. FA_ERROR_INVALID_ARG if it is not one. */
+fa_result fa_proxy_parse(const char* setting, fa_url* out);
 /* Resolves `ref` (absolute, or relative as in an HLS playlist) against the absolute
  * URL `base` (RFC 3986 section 5). FA_ERROR_INVALID_ARG if it does not fit. */
 fa_result fa_url_resolve(const char* base, const char* ref, char* out, size_t cap);
@@ -87,6 +90,10 @@ typedef int (*fa_http_data_proc)(void* user, const uint8_t* data, size_t n);
  * FA_ERROR_PROVIDER_MISSING when https has no transport on this system;
  * FA_ERROR_BUSY when `cancel` was raised. */
 fa_result fa_http_fetch(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user);
+/* For a request that asked for the bytes from `offset` on: how many bytes of the response body come before them
+ * (a 206 starting at or before `offset`, or a 200 with the whole resource), or -1 when the response does not hold
+ * them. `any_status`: for a request without a Range, any other non-error status is the whole resource too. */
+int64_t fa_http_range_skip(const fa_http_response* resp, int64_t offset, int any_status);
 
 /* One request, no redirects: both set *out_redirect (malloc'd absolute URL)
  * instead of calling on_head for a redirect. The built-in HTTP/1.1 client on plain

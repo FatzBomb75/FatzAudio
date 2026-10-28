@@ -1284,7 +1284,7 @@ int fa_aac_sbr_apply(fa_aac_sbr* s, const float* const in[2], float* out[2])
     /* Parametric stereo turns the mono matrix into two. */
     nout = s->nch;
     if (s->nch == 1 && s->ps_seen && s->ps && out[1]) {
-        fa_aac_ps_apply(s->ps, s->x[0], s->x[1], s->ps_data, data ? s->kx : s->kx_last);
+        fa_aac_ps_apply(s->ps, s->x[0], s->x[1], s->ps_data);
         stereo_ps = 1;
         nout = 2;
     }

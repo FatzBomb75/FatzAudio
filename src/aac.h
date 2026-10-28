@@ -180,6 +180,6 @@ int fa_aac_ps_parse(fa_aac_ps* p, fa_aac_bits* b, int bits_left);
  * filters look ahead into. Writes the left channel's 32 slots back to l and the
  * right channel's to r. `new_data`: this frame carried PS data (else the last
  * parameters hold). */
-void fa_aac_ps_apply(fa_aac_ps* p, float (*l)[64][2], float (*r)[64][2], int new_data, int kx);
+void fa_aac_ps_apply(fa_aac_ps* p, float (*l)[64][2], float (*r)[64][2], int new_data);
 
 #endif

@@ -442,24 +442,22 @@ static uint8_t gmul(uint8_t a, uint8_t b)
  * byte. */
 static uint32_t td[4][256];
 static uint8_t inv_sbox[256];
-static fa_atomic32 aes_tables_state;   /* 0 not done, 1 in progress, 2 done */
+static fa_atomic32 aes_tables_state;
 
-static void aes_init_tables(void)
+static int aes_build_tables(void* ctx)
 {
     int i, k;
-    if (fa_load32(&aes_tables_state) == 2) return;
-    if (!fa_cas32(&aes_tables_state, 0, 1)) {
-        while (fa_load32(&aes_tables_state) != 2) fa_sleep_ms(1);
-        return;
-    }
+    (void)ctx;
     for (i = 0; i < 256; i++) inv_sbox[sbox[i]] = (uint8_t)i;
     for (i = 0; i < 256; i++) {
         uint8_t x = inv_sbox[i];
         td[0][i] = (uint32_t)gmul(x, 14) << 24 | (uint32_t)gmul(x, 9) << 16 | (uint32_t)gmul(x, 13) << 8 | gmul(x, 11);
         for (k = 1; k < 4; k++) td[k][i] = td[k - 1][i] >> 8 | td[k - 1][i] << 24;
     }
-    fa_store32(&aes_tables_state, 2);
+    return 1;
 }
+
+static void aes_init_tables(void) { fa_once(&aes_tables_state, aes_build_tables, NULL); }
 
 static void aes_expand(const uint8_t key[16], uint8_t rk[176])
 {
@@ -666,9 +664,8 @@ static int limited_head(void* user, const fa_http_response* resp)
 {
     range_limit* lim = (range_limit*)user;
     if (resp->status >= 400) return 0;                    /* fa_http_fetch reports it */
-    if (resp->status == 206 && resp->range_start <= lim->offset) lim->skip = lim->offset - resp->range_start;
-    else if (resp->status == 200) lim->skip = lim->offset;
-    else { lim->bad = 1; return 1; }
+    lim->skip = fa_http_range_skip(resp, lim->offset, 0);
+    if (lim->skip < 0) { lim->skip = 0; lim->bad = 1; return 1; }
     return 0;
 }
 

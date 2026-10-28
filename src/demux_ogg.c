@@ -123,16 +123,12 @@ typedef struct ogg {
 /* CRC-32 (polynomial 0x04C11DB7, not reflected) four bytes at a time: crctab[k][i]
  * is byte i followed by k zero bytes. Shared by every stream, computed once. */
 static uint32_t crctab[4][256];
-static fa_atomic32 crc_state;     /* 0 not done, 1 in progress, 2 done */
+static fa_atomic32 crc_state;
 
-static void crc_init(void)
+static int crc_build(void* ctx)
 {
     uint32_t i, j, r;
-    if (fa_load32(&crc_state) == 2) return;
-    if (!fa_cas32(&crc_state, 0, 1)) {
-        while (fa_load32(&crc_state) != 2) fa_sleep_ms(1);
-        return;
-    }
+    (void)ctx;
     for (i = 0; i < 256; i++) {
         r = i << 24;
         for (j = 0; j < 8; j++) r = (r & 0x80000000u) ? (r << 1) ^ 0x04C11DB7u : r << 1;
@@ -140,8 +136,10 @@ static void crc_init(void)
     }
     for (j = 1; j < 4; j++)
         for (i = 0; i < 256; i++) crctab[j][i] = (crctab[j - 1][i] << 8) ^ crctab[0][crctab[j - 1][i] >> 24];
-    fa_store32(&crc_state, 2);
+    return 1;
 }
+
+static void crc_init(void) { fa_once(&crc_state, crc_build, NULL); }
 
 static uint32_t crc_update(uint32_t crc, const uint8_t* p, size_t n)
 {

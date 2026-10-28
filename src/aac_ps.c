@@ -103,18 +103,14 @@ static void make_filter(float (*f)[13][2], const float* proto, int bands)
 }
 
 static ps_tables g_tables;
-static fa_atomic32 g_tables_state;   /* 0 not done, 1 in progress, 2 done */
+static fa_atomic32 g_tables_state;
 
-static void ps_tables_init(void)
+static int ps_tables_build(void* ctx)
 {
     static const float q_link[AP_LINKS] = { 0.43f, 0.75f, 0.347f };
     ps_tables* t = &g_tables;
     int c, k, m, i;
-    if (fa_load32(&g_tables_state) == 2) return;
-    if (!fa_cas32(&g_tables_state, 0, 1)) {
-        while (fa_load32(&g_tables_state) != 2) fa_sleep_ms(1);
-        return;
-    }
+    (void)ctx;
     for (c = 0; c < 2; c++) {
         int nbands = c ? 91 : 71, nhybrid = c ? 32 : 10, qsplit = c ? 5 : 3;
         for (k = 0; k < nbands; k++) {
@@ -141,8 +137,10 @@ static void ps_tables_init(void)
         t->pd_smooth[i][0] = (float)(mag > 0 ? re / mag : 1.0);
         t->pd_smooth[i][1] = (float)(mag > 0 ? im / mag : 0.0);
     }
-    fa_store32(&g_tables_state, 2);
+    return 1;
 }
+
+static void ps_tables_init(void) { fa_once(&g_tables_state, ps_tables_build, NULL); }
 
 fa_aac_ps* fa_aac_ps_create(void)
 {
@@ -716,10 +714,9 @@ static void stereo(fa_aac_ps* p)
     }
 }
 
-void fa_aac_ps_apply(fa_aac_ps* p, float (*l)[64][2], float (*r)[64][2], int new_data, int kx)
+void fa_aac_ps_apply(fa_aac_ps* p, float (*l)[64][2], float (*r)[64][2], int new_data)
 {
     int top = 64;
-    (void)kx;
     if (!new_data) {
         /* No parameters this frame: the last ones over the whole frame. */
         p->num_env = 1;

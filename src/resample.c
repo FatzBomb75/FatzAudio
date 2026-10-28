@@ -5,6 +5,7 @@
  * Speeding up (ratio > 1) widens the kernel by the ratio, which lowers the cutoff
  * to the output's Nyquist frequency, so nothing aliases. */
 #include "tempo.h"
+#include "mdct.h"
 #include "fa_platform.h"
 #include <math.h>
 #include <stdlib.h>
@@ -22,19 +23,6 @@
 #define VS_MAX_RATIO FA_VARISPEED_MAX_RATIO /* widest kernel kept in the history: pitch +36 (x8) at rate 10 */
 #define VS_KEEP ((int64_t)(VS_HALF * VS_MAX_RATIO) + 2)
 
-/* Modified Bessel function of the first kind, order 0 (series). */
-static double bessel_i0(double x)
-{
-    double sum = 1.0, term = 1.0, q = x * x / 4.0;
-    int k;
-    for (k = 1; k < 64; k++) {
-        term *= q / ((double)k * (double)k);
-        sum += term;
-        if (term < sum * 1e-17) break;
-    }
-    return sum;
-}
-
 /* The kernel table is the same for every resampler: built once, shared, kept
  * for the life of the process. */
 static fa_atomic_ptr shared_table;
@@ -47,11 +35,11 @@ static const float* kernel_table(void)
     if (t) return t;
     t = (float*)malloc((size_t)n * sizeof(float));
     if (!t) return NULL;
-    i0b = bessel_i0(VS_BETA);
+    i0b = fa_bessel_i0(VS_BETA);
     for (i = 0; i < n; i++) {
         double p = (double)i / VS_PHASES, x = VS_CUTOFF * p, sinc, w, r = p / VS_HALF;
         sinc = x == 0.0 ? 1.0 : sin(FA_TEMPO_PI * x) / (FA_TEMPO_PI * x);
-        w = r >= 1.0 ? 0.0 : bessel_i0(VS_BETA * sqrt(1.0 - r * r)) / i0b;
+        w = r >= 1.0 ? 0.0 : fa_bessel_i0(VS_BETA * sqrt(1.0 - r * r)) / i0b;
         t[i] = (float)(VS_CUTOFF * sinc * w);
     }
     /* Two threads building it at once: the first one in is kept. */

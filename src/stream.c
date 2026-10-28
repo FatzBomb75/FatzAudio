@@ -54,6 +54,17 @@ static fa_ptsmap* ptsmap_of(struct fa_stream* s) { return ptimes_of(s) ? &ptimes
 /* The tempo position map, NULL until the stream's first chain was made. */
 static fa_tmap* tmap_of(struct fa_stream* s) { return (fa_tmap*)fa_load_ptr(&s->tmap); }
 
+/* The position map, made (empty) when the stream has none yet: readers take it when it appears, as with no map.
+ * NULL when out of memory. */
+static fa_tmap* ensure_tmap(struct fa_stream* s)
+{
+    fa_tmap* m = tmap_of(s);
+    if (m) return m;
+    m = (fa_tmap*)calloc(1, sizeof(*m));
+    if (m) fa_exchange_ptr(&s->tmap, m);
+    return m;
+}
+
 /* The user DSP chain, on whichever thread decodes (caller holds decode_lock). */
 static void run_dsps(struct fa_stream* s, float* buf, fa_frames n, uint32_t channels, uint32_t rate)
 {
@@ -992,12 +1003,7 @@ static fa_tempo* tempo_chain(struct fa_stream* s, uint32_t channels, double src)
         if (!hist_grow(s, s->decoder.format.sample_rate / 2)) goto fail;
         s->hist_chain = 1;
     }
-    if (!tmap_of(s)) {
-        /* Readers take the map when it appears: empty, as with no map. */
-        fa_tmap* m = (fa_tmap*)calloc(1, sizeof(*m));
-        if (!m) goto fail;
-        fa_exchange_ptr(&s->tmap, m);
-    }
+    if (!ensure_tmap(s)) goto fail;
     t = (fa_tempo*)calloc(1, sizeof(*t));
     if (!t) goto fail;
     if (fa_tempo_init(t, channels, s->decoder.format.sample_rate) != FA_OK) {
@@ -2229,6 +2235,19 @@ static fa_result rejoin_chain_locked(struct fa_stream* s, int64_t j, double lin,
     return FA_OK;
 }
 
+/* Cuts the ring at `j` (the stream is flushing) and carries on from source frame `x`, linear position `lin`: the
+ * position map gets the new run, the mixer takes the stream back, the decode side restarts. Caller holds api_lock
+ * and decode_lock. */
+static fa_result join_at_locked(struct fa_stream* s, fa_tmap* m, int64_t j, double lin, fa_frames x)
+{
+    double sr = (double)s->decoder.format.sample_rate, dr = (double)s->dev_rate;
+    fa_store64(&s->ring.write, j);
+    fa_tmap_truncate(m, j);
+    fa_tmap_add(m, j, lin, sr / dr * speed_now(s, (int64_t)((double)j * sr / dr + 0.5), s->tempo && fa_tempo_engaged(s->tempo)));
+    unflush(s);
+    return rejoin_chain_locked(s, j, lin, x);
+}
+
 fa_result fa_stream_set_loop_region(struct fa_stream* s, fa_frames in, fa_frames out)
 {
     fa_result r = FA_OK;
@@ -2259,7 +2278,7 @@ fa_result fa_stream_set_loop_region(struct fa_stream* s, fa_frames in, fa_frames
     }
     fa_mutex_lock(&s->decode_lock);   /* no worker decodes meanwhile */
     {
-        double sr = (double)s->decoder.format.sample_rate, dr = (double)s->dev_rate;
+        double sr = (double)s->decoder.format.sample_rate;
         double head = (double)(fa_load64(&s->seek_base) + s->decoded), lj, lin;
         fa_frames old_end = end_frame(s), a, x, len = out - in;
         int old_loops = loops(s) && old_end > 0;
@@ -2272,11 +2291,10 @@ fa_result fa_stream_set_loop_region(struct fa_stream* s, fa_frames in, fa_frames
             fa_mutex_unlock(&s->api_lock);
             return FA_OK;
         }
-        if (!m) {
-            /* The join needs a position map (readers take it when it appears, empty). */
-            m = (fa_tmap*)calloc(1, sizeof(*m));
-            if (!m) { fa_mutex_unlock(&s->decode_lock); fa_mutex_unlock(&s->api_lock); return FA_ERROR_OUT_OF_MEMORY; }
-            fa_exchange_ptr(&s->tmap, m);
+        if (!m && !(m = ensure_tmap(s))) {   /* the join needs a position map */
+            fa_mutex_unlock(&s->decode_lock);
+            fa_mutex_unlock(&s->api_lock);
+            return FA_ERROR_OUT_OF_MEMORY;
         }
         fa_device_wait_idle(s->device);        /* between callbacks, so none skips the stream */
         fa_store32(&s->flushing, 1);
@@ -2303,11 +2321,7 @@ fa_result fa_stream_set_loop_region(struct fa_stream* s, fa_frames in, fa_frames
             lin = (fa_frames)(lj + 0.5) == a ? lj : (double)a;
             x = a;
         }
-        fa_store64(&s->ring.write, j);
-        fa_tmap_truncate(m, j);
-        fa_tmap_add(m, j, lin, sr / dr * speed_now(s, (int64_t)((double)j * sr / dr + 0.5), s->tempo && fa_tempo_engaged(s->tempo)));
-        unflush(s);
-        r = rejoin_chain_locked(s, j, lin, x);
+        r = join_at_locked(s, m, j, lin, x);
         if (r != FA_OK) region_store(s, cur[0], cur[1]);   /* not joined: the old loop stays */
     }
     fa_mutex_unlock(&s->decode_lock);
@@ -2380,7 +2394,7 @@ static fa_result jump(struct fa_stream* s, fa_frames at, fa_frames delta, const 
     }
     fa_mutex_lock(&s->decode_lock);   /* no worker decodes meanwhile */
     {
-        double sr = (double)s->decoder.format.sample_rate, dr = (double)s->dev_rate, lj, lin;
+        double lj, lin;
         int64_t played, write = fa_load64(&s->ring.write), j;
         fa_frames a, x, old[2], last = s->decoder.length > 0 ? s->decoder.length - 1 : -1;
         fa_tmap* m = tmap_of(s);
@@ -2391,10 +2405,10 @@ static fa_result jump(struct fa_stream* s, fa_frames at, fa_frames delta, const 
             fa_mutex_unlock(&s->api_lock);
             return FA_ERROR_BUSY;
         }
-        if (!m) {
-            m = (fa_tmap*)calloc(1, sizeof(*m));
-            if (!m) { fa_mutex_unlock(&s->decode_lock); fa_mutex_unlock(&s->api_lock); return FA_ERROR_OUT_OF_MEMORY; }
-            fa_exchange_ptr(&s->tmap, m);
+        if (!m && !(m = ensure_tmap(s))) {
+            fa_mutex_unlock(&s->decode_lock);
+            fa_mutex_unlock(&s->api_lock);
+            return FA_ERROR_OUT_OF_MEMORY;
         }
         fa_device_wait_idle(s->device);        /* between callbacks, so none skips the stream */
         fa_store32(&s->flushing, 1);
@@ -2412,11 +2426,7 @@ static fa_result jump(struct fa_stream* s, fa_frames at, fa_frames delta, const 
             lin = (double)x + (lj - floor(lj + 0.5));      /* keeps the fraction of a frame */
             region_read(s, old);
             if (region) region_store(s, region[0], region[1]);
-            fa_store64(&s->ring.write, j);
-            fa_tmap_truncate(m, j);
-            fa_tmap_add(m, j, lin, sr / dr * speed_now(s, (int64_t)((double)j * sr / dr + 0.5), s->tempo && fa_tempo_engaged(s->tempo)));
-            unflush(s);
-            r = rejoin_chain_locked(s, j, lin, x);
+            r = join_at_locked(s, m, j, lin, x);
             if (r != FA_OK && region) region_store(s, old[0], old[1]);   /* not joined: the old loop stays */
         }
     }
@@ -3305,9 +3315,9 @@ static float marker_gain(const mix_markers* mk, double pos)
 }
 
 /* Source position for the fades: wrapped into the loop `v`, not clamped. */
-static double fade_position(struct fa_stream* s, const loop_view* v, int64_t played)
+/* The position inside the loop view for a source position `lin` that linear_position gave. */
+static double fade_position_of(struct fa_stream* s, const loop_view* v, double lin)
 {
-    double lin = linear_position(s, played);
     fa_frames end = v->end, back = v->back, len = end - back;
     if (reversed(s)) {
         if (v->loops && len > 0 && lin < (double)back) return (double)end - fmod((double)back - lin, (double)len);
@@ -3315,6 +3325,11 @@ static double fade_position(struct fa_stream* s, const loop_view* v, int64_t pla
     }
     if (v->loops && end > 0 && lin >= (double)end && len > 0) return (double)back + fmod(lin - (double)end, (double)len);
     return lin;
+}
+
+static double fade_position(struct fa_stream* s, const loop_view* v, int64_t played)
+{
+    return fade_position_of(s, v, linear_position(s, played));
 }
 
 /* FA_EVENT_MARKER for every marker passed between `played0` and `played1`. */
@@ -3702,8 +3717,8 @@ static int steady_gain(struct fa_stream* s, const mix_markers* mk, struct fa_bus
     for (p = 0; p < FA_STREAM_LANES; p++) if (s->lanes[p].v.active) return 0;
     if (bus) for (p = 0; p < FA_MIX_PARAMS; p++) if (bus->lanes[p].v.active) return 0;
     if (!looping && mk->fade_in_to < 0 && mk->fade_out_to < 0) return 1;
-    pos0 = fade_position(s, lv, played);
     lin0 = linear_position(s, played);
+    pos0 = fade_position_of(s, lv, lin0);
     if (looping) {
         int64_t to_end = frames_until(s, played, lin0 + ((double)lv->end - pos0));
         if (to_end <= n) return 0;
@@ -3880,8 +3895,8 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
             else if (v->total - v->done > 0 && v->total - v->done < blk) blk = v->total - v->done;
         }
         if (bus) blk = bus_block(bus, clock, now, blk);
-        pos0 = fade_position(s, &lv, pl);
         lin0 = linear_position(s, pl);
+        pos0 = fade_position_of(s, &lv, lin0);
         if (looping) {
             /* Blocks end at the loop end, so the fades are not interpolated toward
              * the next turn's level before the wrap. */

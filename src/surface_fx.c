@@ -702,29 +702,78 @@ static void finish(const fa_fx_plan* p, fx_px acc, const uint8_t* sp, float bk, 
 #endif
 }
 
-static void render_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, int w, int h, uint8_t* dst,
-                        size_t dst_stride, int x0, int y0, int x1, int y1, fx_scratch* s, fa_fx_keep* keep)
+/* The window of a tile: the tile plus the effects' reach, clipped to the image. */
+typedef struct fx_window { int x0, y0, w, h; } fx_window;
+
+static fx_window tile_window(const fa_fx_plan* p, int w, int h, int x0, int y0, int x1, int y1)
 {
     int wx0 = x0 - p->reach > 0 ? x0 - p->reach : 0, wy0 = y0 - p->reach > 0 ? y0 - p->reach : 0;
     int wx1 = x1 + p->reach < w ? x1 + p->reach : w, wy1 = y1 + p->reach < h ? y1 + p->reach : h;
-    int wn = wx1 - wx0, hn = wy1 - wy0, x, y;
-    /* The shadow at a pixel is the field at (pixel - offset): whole pixels and a
-     * fraction, the same everywhere. */
-    int sox = (int)floorf(-p->s_dx), soy = (int)floorf(-p->s_dy);
-    float sfx = -p->s_dx - (float)sox, sfy = -p->s_dy - (float)soy;
-    int snx = sox + (sfx >= 0.5f), sny = soy + (sfy >= 0.5f);
-    const uint8_t* wa = src + (size_t)wy0 * src_stride + (size_t)wx0 * 4 + 3;
-    field(wa, src_stride, 4, wn, hn, 0, p->reach, NULL, s, s->dout, p->bevel ? s->rows : NULL);
+    fx_window win;
+    win.x0 = wx0;
+    win.y0 = wy0;
+    win.w = wx1 - wx0;
+    win.h = wy1 - wy0;
+    return win;
+}
+
+/* The shadow at a pixel is the field at (pixel - offset): whole pixels and a
+ * fraction, the same everywhere. nx, ny: the nearest pixel. */
+typedef struct fx_shadow { int ox, oy, nx, ny; float fx, fy; } fx_shadow;
+
+static fx_shadow shadow_split(const fa_fx_plan* p)
+{
+    fx_shadow sh;
+    sh.ox = (int)floorf(-p->s_dx);
+    sh.oy = (int)floorf(-p->s_dy);
+    sh.fx = -p->s_dx - (float)sh.ox;
+    sh.fy = -p->s_dy - (float)sh.oy;
+    sh.nx = sh.ox + (sh.fx >= 0.5f);
+    sh.ny = sh.oy + (sh.fy >= 0.5f);
+    return sh;
+}
+
+/* The distance fields of a window: outside the shape, and with a bevel inside it. */
+static void tile_fields(const fa_fx_plan* p, const uint8_t* wa, size_t stride, int comp, const fx_window* win, fx_scratch* s)
+{
+    int y;
+    field(wa, stride, comp, win->w, win->h, 0, p->reach, NULL, s, s->dout, p->bevel ? s->rows : NULL);
     if (p->bevel) {
         /* Inside: only rows next to the shape matter. */
-        for (y = 0; y < hn; y++)
+        for (y = 0; y < win->h; y++)
             if (s->rows[y] == 1) {
                 if (y > 0 && !s->rows[y - 1]) s->rows[y - 1] = 2;
-                if (y + 1 < hn && !s->rows[y + 1]) s->rows[y + 1] = 2;
+                if (y + 1 < win->h && !s->rows[y + 1]) s->rows[y + 1] = 2;
             }
-        field(wa, src_stride, 4, wn, hn, 1, p->reach, s->rows, s, s->din, NULL);
-        half_widths(p, s, wn, hn);
+        field(wa, stride, comp, win->w, win->h, 1, p->reach, s->rows, s, s->din, NULL);
+        half_widths(p, s, win->w, win->h);
     }
+}
+
+/* How much a pixel's edge faces the light (> 0: the highlight, < 0: the shade); 0 where the field has no usable slope. */
+static float bevel_facing(const fa_fx_plan* p, const fx_scratch* s, int lx, int ly, int wn, int hn)
+{
+    /* The field rises inward; the edge faces the other way. */
+    int xl = lx > 0 ? lx - 1 : lx, xr = lx + 1 < wn ? lx + 1 : lx;
+    int yu = ly > 0 ? ly - 1 : ly, yd = ly + 1 < hn ? ly + 1 : ly;
+    float gx = (s->din[(size_t)ly * wn + xr] - s->din[(size_t)ly * wn + xl]) / (float)(xr - xl > 0 ? xr - xl : 1);
+    float gy = (s->din[(size_t)yd * wn + lx] - s->din[(size_t)yu * wn + lx]) / (float)(yd - yu > 0 ? yd - yu : 1);
+    float len = sqrtf(gx * gx + gy * gy);
+    if (len > 1e-3f && s->din[(size_t)ly * wn + xr] < FX_FAR && s->din[(size_t)ly * wn + xl] < FX_FAR &&
+        s->din[(size_t)yd * wn + lx] < FX_FAR && s->din[(size_t)yu * wn + lx] < FX_FAR)
+        return -(gx * p->b_lx + gy * p->b_ly) / len;
+    return 0.0f;
+}
+
+static void render_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, int w, int h, uint8_t* dst,
+                        size_t dst_stride, int x0, int y0, int x1, int y1, fx_scratch* s, fa_fx_keep* keep)
+{
+    fx_window win = tile_window(p, w, h, x0, y0, x1, y1);
+    int wx0 = win.x0, wy0 = win.y0, wn = win.w, hn = win.h, x, y;
+    fx_shadow sh = shadow_split(p);
+    int sox = sh.ox, soy = sh.oy, snx = sh.nx, sny = sh.ny;
+    float sfx = sh.fx, sfy = sh.fy;
+    tile_fields(p, src + (size_t)wy0 * src_stride + (size_t)wx0 * 4 + 3, src_stride, 4, &win, s);
     for (y = y0; y < y1; y++) {
         const uint8_t* sp = src + (size_t)y * src_stride + (size_t)x0 * 4;
         uint8_t* dp = dst + (size_t)y * dst_stride + (size_t)x0 * 4;
@@ -759,19 +808,7 @@ static void render_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_stri
             if (p->outline) acc = over(acc, p->o_pm, ease_out(p->o_lo, p->o_hi, s->dout[at]));
             if (p->bevel && a > 0.0f) {
                 float din = s->din[at], wgt = bevel_weight(p, din, s->half[at]);
-                if (wgt > 0.0f) {
-                    /* The field rises inward; the edge faces the other way. */
-                    int xl = lx > 0 ? lx - 1 : lx, xr = lx + 1 < wn ? lx + 1 : lx;
-                    int yu = ly > 0 ? ly - 1 : ly, yd = ly + 1 < hn ? ly + 1 : ly;
-                    float gx = (s->din[(size_t)ly * wn + xr] - s->din[(size_t)ly * wn + xl]) / (float)(xr - xl > 0 ? xr - xl : 1);
-                    float gy = (s->din[(size_t)yd * wn + lx] - s->din[(size_t)yu * wn + lx]) / (float)(yd - yu > 0 ? yd - yu : 1);
-                    float len = sqrtf(gx * gx + gy * gy);
-                    if (len > 1e-3f && s->din[(size_t)ly * wn + xr] < FX_FAR && s->din[(size_t)ly * wn + xl] < FX_FAR &&
-                        s->din[(size_t)yd * wn + lx] < FX_FAR && s->din[(size_t)yu * wn + lx] < FX_FAR) {
-                        float facing = -(gx * p->b_lx + gy * p->b_ly) / len;
-                        bk = facing * wgt * a;   /* > 0: the highlight, < 0: the shade */
-                    }
-                }
+                if (wgt > 0.0f) bk = bevel_facing(p, s, lx, ly, wn, hn) * wgt * a;   /* > 0: the highlight, < 0: the shade */
                 if (keep) keep->bevel[(size_t)y * keep->stride + x] = bk;
             }
             finish(p, acc, sp, bk, dp);
@@ -842,23 +879,12 @@ int fa_fx_recolor(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, ui
 static void masks_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_stride, int w, int h, uint8_t* dst,
                        size_t dst_stride, int nch, int x0, int y0, int x1, int y1, fx_scratch* s)
 {
-    int wx0 = x0 - p->reach > 0 ? x0 - p->reach : 0, wy0 = y0 - p->reach > 0 ? y0 - p->reach : 0;
-    int wx1 = x1 + p->reach < w ? x1 + p->reach : w, wy1 = y1 + p->reach < h ? y1 + p->reach : h;
-    int wn = wx1 - wx0, hn = wy1 - wy0, x, y;
-    int sox = (int)floorf(-p->s_dx), soy = (int)floorf(-p->s_dy);
-    float sfx = -p->s_dx - (float)sox, sfy = -p->s_dy - (float)soy;
-    int snx = sox + (sfx >= 0.5f), sny = soy + (sfy >= 0.5f);
-    const uint8_t* wa = src + (size_t)wy0 * src_stride + (size_t)wx0;
-    field(wa, src_stride, 1, wn, hn, 0, p->reach, NULL, s, s->dout, p->bevel ? s->rows : NULL);
-    if (p->bevel) {
-        for (y = 0; y < hn; y++)
-            if (s->rows[y] == 1) {
-                if (y > 0 && !s->rows[y - 1]) s->rows[y - 1] = 2;
-                if (y + 1 < hn && !s->rows[y + 1]) s->rows[y + 1] = 2;
-            }
-        field(wa, src_stride, 1, wn, hn, 1, p->reach, s->rows, s, s->din, NULL);
-        half_widths(p, s, wn, hn);
-    }
+    fx_window win = tile_window(p, w, h, x0, y0, x1, y1);
+    int wx0 = win.x0, wy0 = win.y0, wn = win.w, hn = win.h, x, y;
+    fx_shadow sh = shadow_split(p);
+    int sox = sh.ox, soy = sh.oy, snx = sh.nx, sny = sh.ny;
+    float sfx = sh.fx, sfy = sh.fy;
+    tile_fields(p, src + (size_t)wy0 * src_stride + (size_t)wx0, src_stride, 1, &win, s);
     for (y = y0; y < y1; y++) {
         const uint8_t* sp = src + (size_t)y * src_stride + (size_t)x0;
         uint8_t* dp = dst + (size_t)y * dst_stride + (size_t)x0 * (size_t)nch;
@@ -876,16 +902,7 @@ static void masks_tile(const fa_fx_plan* p, const uint8_t* src, size_t src_strid
             if (p->outline) ow = ease_out(p->o_lo, p->o_hi, s->dout[at]);
             if (p->bevel && a > 0.0f) {
                 float din = s->din[at], wgt = bevel_weight(p, din, s->half[at]);
-                if (wgt > 0.0f) {
-                    int xl = lx > 0 ? lx - 1 : lx, xr = lx + 1 < wn ? lx + 1 : lx;
-                    int yu = ly > 0 ? ly - 1 : ly, yd = ly + 1 < hn ? ly + 1 : ly;
-                    float gx = (s->din[(size_t)ly * wn + xr] - s->din[(size_t)ly * wn + xl]) / (float)(xr - xl > 0 ? xr - xl : 1);
-                    float gy = (s->din[(size_t)yd * wn + lx] - s->din[(size_t)yu * wn + lx]) / (float)(yd - yu > 0 ? yd - yu : 1);
-                    float len = sqrtf(gx * gx + gy * gy);
-                    if (len > 1e-3f && s->din[(size_t)ly * wn + xr] < FX_FAR && s->din[(size_t)ly * wn + xl] < FX_FAR &&
-                        s->din[(size_t)yd * wn + lx] < FX_FAR && s->din[(size_t)yu * wn + lx] < FX_FAR)
-                        bv = -(gx * p->b_lx + gy * p->b_ly) / len * wgt * a;
-                }
+                if (wgt > 0.0f) bv = bevel_facing(p, s, lx, ly, wn, hn) * wgt * a;
             }
             dp[0] = (uint8_t)(sw * 255.0f + 0.5f);
             dp[1] = (uint8_t)(ow * 255.0f + 0.5f);

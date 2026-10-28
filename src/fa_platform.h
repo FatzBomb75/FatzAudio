@@ -170,6 +170,11 @@ void fa_temp_folder_sweep(const char* folder);
 uint32_t fa_cpu_count(void);
 int64_t fa_monotonic_ns(void);
 
+/* Runs `init(ctx)` once per process; `state` is a zeroed static. init returns 1 when it is done, 0 when it failed
+ * and a later call may retry, -1 when it failed for good. Callers that arrive meanwhile wait. Returns 1 once init
+ * has succeeded, 0 otherwise. */
+int fa_once(fa_atomic32* state, int (*init)(void* ctx), void* ctx);
+
 /* A mutex for static data, created on first use (process-wide singletons). */
 typedef struct fa_lazy_mutex { fa_atomic32 state; fa_mutex m; } fa_lazy_mutex;
 void fa_lazy_mutex_lock(fa_lazy_mutex* l);

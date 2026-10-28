@@ -780,6 +780,17 @@ static void test_url_parse(void)
     CHECK_EQ(fa_url_parse("ftp://example.com/x", &u), FA_ERROR_INVALID_ARG);
     CHECK_EQ(fa_url_parse("/relative", &u), FA_ERROR_INVALID_ARG);
     CHECK_EQ(fa_url_parse("http://", &u), FA_ERROR_INVALID_ARG);
+    /* Proxy settings: the same host and port for every form. */
+    CHECK_EQ(fa_proxy_parse("proxy.example:3128", &u), FA_OK);
+    CHECK_STR(u.host, "proxy.example");
+    CHECK_EQ(u.port, 3128);
+    CHECK_EQ(fa_proxy_parse("http://user:pw@proxy.example/", &u), FA_OK);
+    CHECK_STR(u.host, "proxy.example");
+    CHECK_EQ(u.port, 80);
+    CHECK_EQ(fa_proxy_parse("http://[::1]:8080/x", &u), FA_OK);
+    CHECK_STR(u.host, "::1");
+    CHECK_EQ(u.port, 8080);
+    CHECK_EQ(fa_proxy_parse("socks5://proxy.example:1080", &u), FA_ERROR_INVALID_ARG);
 }
 
 static void test_url_resolve(void)

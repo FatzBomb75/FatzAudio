@@ -74,7 +74,6 @@ int32_t fa_font_kerning(const fa_font* font, uint32_t left, uint32_t right);
  * be read. */
 fa_result fa_font_outline(const fa_font* font, uint32_t glyph, fa_path* path);
 
-void fa_path_clear(fa_path* path);
 void fa_path_free(fa_path* path);
 
 #endif

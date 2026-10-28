@@ -434,21 +434,27 @@ void fa_device_wait_idle(fa_device* dev)
     while ((fa_load64(&dev->epoch) & 1) && fa_monotonic_ns() < until) fa_sleep_ms(0);
 }
 
-/* Publishes a new voice list; the old one is freed once the callback is done with it. */
-static fa_result publish_voices(fa_device* dev, fa_stream* add, fa_stream* remove)
+/* fa_voice_list and fa_bus_list share this layout: a count, then the pointers. */
+fa_result fa_device_publish_list(fa_device* dev, fa_atomic_ptr* slot, void* add, void* remove)
 {
-    fa_voice_list* old = (fa_voice_list*)fa_load_ptr(&dev->voices);
+    typedef struct list { uint32_t count; void* items[1]; } list;
+    list* old = (list*)fa_load_ptr(slot);
     uint32_t n = old ? old->count : 0, i, k = 0;
-    fa_voice_list* list = (fa_voice_list*)malloc(sizeof(fa_voice_list) + (size_t)(n + 1) * sizeof(fa_stream*));
-    if (!list) return FA_ERROR_OUT_OF_MEMORY;
+    list* out = (list*)malloc(sizeof(list) + (size_t)(n + 1) * sizeof(void*));
+    if (!out) return FA_ERROR_OUT_OF_MEMORY;
     for (i = 0; i < n; i++)
-        if (old->items[i] != remove && old->items[i] != add) list->items[k++] = old->items[i];
-    if (add) list->items[k++] = add;
-    list->count = k;
-    fa_exchange_ptr(&dev->voices, list);
+        if (old->items[i] != remove && old->items[i] != add) out->items[k++] = old->items[i];
+    if (add) out->items[k++] = add;
+    out->count = k;
+    fa_exchange_ptr(slot, out);
     fa_device_wait_quiescent(dev);
     free(old);
     return FA_OK;
+}
+
+static fa_result publish_voices(fa_device* dev, fa_stream* add, fa_stream* remove)
+{
+    return fa_device_publish_list(dev, &dev->voices, add, remove);
 }
 
 fa_result fa_device_add_voice(fa_device* dev, fa_stream* s)

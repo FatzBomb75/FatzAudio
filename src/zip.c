@@ -23,16 +23,12 @@
 /* Slice-by-8: crc_tab[k][n] is the CRC of byte n followed by k zero bytes, so
  * eight bytes are folded in with eight lookups. Built once per process. */
 static uint32_t crc_tab[8][256];
-static fa_atomic32 crc_state;   /* 0 not done, 1 in progress, 2 done */
+static fa_atomic32 crc_state;
 
-static void crc_init(void)
+static int crc_build(void* ctx)
 {
     uint32_t n, k, c;
-    if (fa_load32(&crc_state) == 2) return;
-    if (!fa_cas32(&crc_state, 0, 1)) {
-        while (fa_load32(&crc_state) != 2) fa_sleep_ms(1);
-        return;
-    }
+    (void)ctx;
     for (n = 0; n < 256; n++) {
         c = n;
         for (k = 0; k < 8; k++) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
@@ -40,8 +36,10 @@ static void crc_init(void)
     }
     for (n = 0; n < 256; n++)
         for (k = 1; k < 8; k++) crc_tab[k][n] = (crc_tab[k - 1][n] >> 8) ^ crc_tab[0][crc_tab[k - 1][n] & 0xFF];
-    fa_store32(&crc_state, 2);
+    return 1;
 }
+
+static void crc_init(void) { fa_once(&crc_state, crc_build, NULL); }
 
 /* `crc` is the CRC of the bytes before `data` (0 to start). */
 static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t size)
@@ -382,18 +380,14 @@ static int inf_stored(inf_state* s)
 
 /* The fixed codes (RFC 1951 3.2.6), built once per process. */
 static inf_codes_t inf_fixed_codes;
-static fa_atomic32 inf_fixed_state;   /* 0 not done, 1 in progress, 2 done */
+static fa_atomic32 inf_fixed_state;
 
-static int inf_fixed(inf_state* s)
+static int inf_fixed_build(void* ctx)
 {
     inf_codes_t* c = &inf_fixed_codes;
     uint8_t lengths[INF_MAX_LITLEN];
     int i;
-    if (fa_load32(&inf_fixed_state) == 2) return inf_codes(s, c);
-    if (!fa_cas32(&inf_fixed_state, 0, 1)) {
-        while (fa_load32(&inf_fixed_state) != 2) fa_sleep_ms(1);
-        return inf_codes(s, c);
-    }
+    (void)ctx;
     for (i = 0; i < 144; i++) lengths[i] = 8;
     for (; i < 256; i++) lengths[i] = 9;
     for (; i < 280; i++) lengths[i] = 7;
@@ -403,8 +397,13 @@ static int inf_fixed(inf_state* s)
     inf_build(&c->dist, lengths, INF_MAX_DIST);
     inf_table(c->lit_tab, INF_LIT_ROOT, &c->lit, INF_KIND_LITLEN);
     inf_table(c->dist_tab, INF_DIST_ROOT, &c->dist, INF_KIND_DIST);
-    fa_store32(&inf_fixed_state, 2);
-    return inf_codes(s, c);
+    return 1;
+}
+
+static int inf_fixed(inf_state* s)
+{
+    fa_once(&inf_fixed_state, inf_fixed_build, NULL);
+    return inf_codes(s, &inf_fixed_codes);
 }
 
 static int inf_dynamic(inf_state* s)
