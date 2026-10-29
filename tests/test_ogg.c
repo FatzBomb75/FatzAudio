@@ -478,6 +478,69 @@ static void test_long_chain(void)
     check_long_chain(CHAIN_SAME_SERIAL);
 }
 
+/* A link whose only audio page is also its last (EOS) page plays its end trim, on
+ * its own or chained after other links: playing it through gives what a seek to
+ * its start (or to any link's) gives, and the file's length. */
+static void test_single_page_links(void)
+{
+    static const char* singles[] = { "r128.opus", "surround.ogg" };
+    static const char* chains[][4] = { { "tone.opus", "r128.opus", "tone.opus", "r128.opus" },
+                                       { "surround.ogg", "surround.ogg", "surround.ogg", NULL } };
+    size_t f, i;
+    for (f = 0; f < sizeof(singles) / sizeof(singles[0]); f++) {
+        fa_stream* s;
+        fa_stream_info info;
+        float* full;
+        int64_t n, at[3];
+        double worst;
+        CHECK_EQ(open_file(singles[f], -1, &s, &info), FA_OK);
+        full = read_all(s, info.format.channels, &n);
+        CHECK_EQ(n, info.length_frames);
+        at[0] = 0; at[1] = 1; at[2] = n / 2;
+        CHECK(seek_matches(s, full, n, info.format.channels, at, 3, 1e-3, &worst));
+        free(full);
+        fa_stream_close(s);
+    }
+    for (f = 0; f < sizeof(chains) / sizeof(chains[0]); f++) {
+        size_t cap = 1u << 20, n = 0;
+        uint8_t* data = (uint8_t*)malloc(cap);
+        int64_t expect = 0, full_n, at[10];
+        uint32_t serial = 500, ch, rate0 = 0;
+        int k = 0;
+        fa_open_options o;
+        fa_stream* s = NULL;
+        fa_stream_info info;
+        float* full;
+        double worst;
+        CHECK(data != NULL);
+        for (i = 0; i < 4 && chains[f][i]; i++) {
+            uint32_t rate = 0;
+            int64_t len = append_link(data, &n, chains[f][i], serial += 16, 1, &rate);
+            CHECK(len > 0 && n < cap / 2);
+            if (!rate0) rate0 = rate;
+            CHECK_EQ(rate, rate0);   /* the links of a chain share one rate */
+            at[k++] = expect;
+            at[k++] = expect + 7;
+            expect += len;
+        }
+        fa_open_options_init(&o);
+        o.flags = FA_OPEN_DECODE_ONLY;
+        CHECK_EQ(fa_stream_open_memory(g_engine, data, n, &o, &s), FA_OK);
+        fa_stream_get_info(s, &info);
+        ch = info.format.channels;
+        CHECK_EQ(info.length_frames, expect);
+        full = read_all(s, ch, &full_n);
+        CHECK_EQ(full_n, expect);
+        at[k++] = expect / 2;   /* then back from the middle */
+        at[k++] = 0;
+        CHECK(seek_matches(s, full, full_n, ch, at, k, 1e-3, &worst));
+        printf("  %s chained: seek vs sequential: max difference %.2g\n", chains[f][1], worst);
+        free(full);
+        fa_stream_close(s);
+        free(data);
+    }
+}
+
 /* ---- forward-only sources ------------------------------------------------------------ */
 
 typedef struct mem_io {
@@ -766,6 +829,7 @@ int main(void)
     RUN(test_two_audio_streams);
     RUN(test_chained_file);
     RUN(test_long_chain);
+    RUN(test_single_page_links);
     RUN(test_forward_only_sources);
     RUN(test_opus_packets_pushed);
     RUN(test_loudness_tags);

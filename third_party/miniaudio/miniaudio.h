@@ -88153,6 +88153,15 @@ static MA_INLINE void ma_dr_flac__fa_drop_stale_frame(ma_dr_flac* pFlac)
         pFlac->currentFLACFrame.pcmFramesRemaining = 0;
     }
 }
+/* FatzAudio patch: a seek that reads only a frame's header moves past the frame that was
+ * decoded: drop its samples first, so a failed seek (or a later one) can't take them for
+ * the new header's frame. */
+static ma_bool32 ma_dr_flac__fa_read_frame_header_only(ma_dr_flac* pFlac)
+{
+    MA_DR_FLAC_ZERO_MEMORY(pFlac->currentFLACFrame.subframes, sizeof(pFlac->currentFLACFrame.subframes));
+    pFlac->currentFLACFrame.pcmFramesRemaining = 0;
+    return ma_dr_flac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header);
+}
 static ma_bool32 ma_dr_flac__read_and_decode_next_flac_frame(ma_dr_flac* pFlac)
 {
     MA_DR_FLAC_ASSERT(pFlac != NULL);
@@ -88243,7 +88252,7 @@ static ma_bool32 ma_dr_flac__seek_to_pcm_frame__brute_force(ma_dr_flac* pFlac, m
     if (pcmFrameIndex >= pFlac->currentPCMFrame) {
         runningPCMFrameCount = pFlac->currentPCMFrame;
         if (pFlac->currentPCMFrame == 0 && pFlac->currentFLACFrame.pcmFramesRemaining == 0) {
-            if (!ma_dr_flac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
+            if (!ma_dr_flac__fa_read_frame_header_only(pFlac)) {
                 return MA_FALSE;
             }
         } else {
@@ -88254,7 +88263,7 @@ static ma_bool32 ma_dr_flac__seek_to_pcm_frame__brute_force(ma_dr_flac* pFlac, m
         if (!ma_dr_flac__seek_to_first_frame(pFlac)) {
             return MA_FALSE;
         }
-        if (!ma_dr_flac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
+        if (!ma_dr_flac__fa_read_frame_header_only(pFlac)) {
             return MA_FALSE;
         }
     }
@@ -88302,7 +88311,7 @@ static ma_bool32 ma_dr_flac__seek_to_pcm_frame__brute_force(ma_dr_flac* pFlac, m
             }
         }
     next_iteration:
-        if (!ma_dr_flac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
+        if (!ma_dr_flac__fa_read_frame_header_only(pFlac)) {
             return MA_FALSE;
         }
     }
@@ -88315,7 +88324,7 @@ static ma_bool32 ma_dr_flac__fa_read_next_stream_frame_header(ma_dr_flac* pFlac)
 {
     ma_dr_flac_frame_header* h = &pFlac->currentFLACFrame.header;
     for (;;) {
-        if (!ma_dr_flac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, h)) {
+        if (!ma_dr_flac__fa_read_frame_header_only(pFlac)) {
             return MA_FALSE;
         }
         if (h->blockSizeInPCMFrames <= pFlac->maxBlockSizeInPCMFrames &&
@@ -88532,7 +88541,7 @@ static ma_bool32 ma_dr_flac__seek_to_pcm_frame__seek_table(ma_dr_flac* pFlac, ma
             }
         }
         if (ma_dr_flac__seek_to_byte(&pFlac->bs, pFlac->firstFLACFramePosInBytes + pFlac->pSeekpoints[iClosestSeekpoint].flacFrameOffset)) {
-            if (ma_dr_flac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
+            if (ma_dr_flac__fa_read_frame_header_only(pFlac)) {
                 ma_dr_flac__get_pcm_frame_range_of_current_flac_frame(pFlac, &pFlac->currentPCMFrame, NULL);
                 if (ma_dr_flac__seek_to_pcm_frame__binary_search_internal(pFlac, pcmFrameIndex, byteRangeLo, byteRangeHi)) {
                     return MA_TRUE;
@@ -88544,7 +88553,7 @@ static ma_bool32 ma_dr_flac__seek_to_pcm_frame__seek_table(ma_dr_flac* pFlac, ma
     if (pcmFrameIndex >= pFlac->currentPCMFrame && pFlac->pSeekpoints[iClosestSeekpoint].firstPCMFrame <= pFlac->currentPCMFrame) {
         runningPCMFrameCount = pFlac->currentPCMFrame;
         if (pFlac->currentPCMFrame == 0 && pFlac->currentFLACFrame.pcmFramesRemaining == 0) {
-            if (!ma_dr_flac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
+            if (!ma_dr_flac__fa_read_frame_header_only(pFlac)) {
                 return MA_FALSE;
             }
         } else {
@@ -88555,7 +88564,7 @@ static ma_bool32 ma_dr_flac__seek_to_pcm_frame__seek_table(ma_dr_flac* pFlac, ma
         if (!ma_dr_flac__seek_to_byte(&pFlac->bs, pFlac->firstFLACFramePosInBytes + pFlac->pSeekpoints[iClosestSeekpoint].flacFrameOffset)) {
             return MA_FALSE;
         }
-        if (!ma_dr_flac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
+        if (!ma_dr_flac__fa_read_frame_header_only(pFlac)) {
             return MA_FALSE;
         }
     }
@@ -88603,7 +88612,7 @@ static ma_bool32 ma_dr_flac__seek_to_pcm_frame__seek_table(ma_dr_flac* pFlac, ma
             }
         }
     next_iteration:
-        if (!ma_dr_flac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
+        if (!ma_dr_flac__fa_read_frame_header_only(pFlac)) {
             return MA_FALSE;
         }
     }
@@ -89657,7 +89666,7 @@ static ma_bool32 ma_dr_flac_ogg__seek_to_pcm_frame(ma_dr_flac* pFlac, ma_uint64 
         ma_uint64 firstPCMFrameInFLACFrame = 0;
         ma_uint64 lastPCMFrameInFLACFrame = 0;
         ma_uint64 pcmFrameCountInThisFrame;
-        if (!ma_dr_flac__read_next_flac_frame_header(&pFlac->bs, pFlac->bitsPerSample, &pFlac->currentFLACFrame.header)) {
+        if (!ma_dr_flac__fa_read_frame_header_only(pFlac)) {
             return MA_FALSE;
         }
         ma_dr_flac__get_pcm_frame_range_of_current_flac_frame(pFlac, &firstPCMFrameInFLACFrame, &lastPCMFrameInFLACFrame);

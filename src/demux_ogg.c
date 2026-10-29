@@ -708,6 +708,18 @@ static int64_t link_length(const ogg* o, const oggs_link* l)
 
 /* ---- reading ----------------------------------------------------------------------------- */
 
+/* Reading from the start of link `l`'s audio, as a seek to its start does: the times run
+ * forward from its first granule once that is known (so a link whose only audio page is
+ * its last gets its end trim). */
+static void enter_link(ogg* o, const oggs_link* l)
+{
+    o->gran = l->first_gran;
+    o->prev_bs = 0;
+    o->pend_len = 0;
+    o->pend_valid = 1;
+    o->have_seq = 0;
+}
+
 /* Reads pages until the queue holds packets of the current link. */
 static fa_result fill_queue(ogg* o)
 {
@@ -753,11 +765,7 @@ static fa_result fill_queue(ogg* o)
                 }
                 o->cur = o->nlinks - 1;
             }
-            o->gran = OGG_NO_GRAN;
-            o->prev_bs = 0;
-            o->pend_len = 0;
-            o->pend_valid = 1;
-            o->have_seq = 0;
+            enter_link(o, o->links[o->cur]);
             o->codec_link = o->cur;
             o->reopen = &o->links[o->cur]->params;
             continue;
@@ -1223,12 +1231,8 @@ static fa_result rewind_first(ogg* o)
     o->cur = 0;
     o->at_end = 0;
     o->nq = o->iq = 0;
-    o->gran = OGG_NO_GRAN;
-    o->prev_bs = 0;
+    enter_link(o, o->links[0]);
     o->next_pts = 0;
-    o->pend_len = 0;
-    o->pend_valid = 1;
-    o->have_seq = 0;
     o->codec_link = 0;
     o->reopen = NULL;
     o->keep = 0;
