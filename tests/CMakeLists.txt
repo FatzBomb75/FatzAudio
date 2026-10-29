@@ -361,6 +361,20 @@ if(UNIX)
 endif()
 add_test(NAME flac COMMAND fa_test_flac)
 
+# The patched dr_flac alone: its own static copy of miniaudio's decoders, no library.
+add_executable(fa_test_drflac test_drflac.c)
+target_include_directories(fa_test_drflac PRIVATE ${PROJECT_SOURCE_DIR}/third_party/miniaudio)
+# Built as the library builds miniaudio_impl.c: dr_flac relies on wrapping int overflow.
+if(MSVC)
+    target_compile_options(fa_test_drflac PRIVATE /W0)
+else()
+    target_compile_options(fa_test_drflac PRIVATE -w -fwrapv)
+endif()
+if(UNIX)
+    target_link_libraries(fa_test_drflac PRIVATE m)
+endif()
+add_test(NAME drflac COMMAND fa_test_drflac)
+
 # The white-box tests link the library's sources as objects compiled once for all
 # of them; the vendored codecs come prebuilt.
 add_library(fa_whitebox OBJECT ${FA_SOURCES})

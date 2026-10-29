@@ -381,6 +381,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- Ogg Opus and Ogg Vorbis: a song whose only audio page is also its last one (a short clip) came out 650 to 970 frames
+  off when played straight through, on its own or chained after other songs: its last page was timed back from its
+  granule without its end trim, while a seek timed it forward from its start. A chained file's later songs then played
+  that much off against their seek positions. Playing through now times it as a seek does (`tests/data/ogg`
+  `r128.opus`, `rg.ogg`, `surround.ogg` and `tags/tags.opus` now line up with FFmpeg's decode).
+- FLAC: after a seek that failed partway (a damaged or cut-off `.flac`), the next seek back inside the frame that
+  was playing could return samples from the wrong place in it. The vendored dr_flac now drops the decoded frame
+  before any seek reads on past it (`third_party/miniaudio/PATCHES.md`).
 - HLS: an `EXT-X-MEDIA-SEQUENCE` of 2^63-1 overflowed the segment counter while parsing (now treated as 0), and an `EXT-X-BYTERANGE` with an offset near 2^63 (or a negative or empty length) overflowed the next range's offset
   while the playlist was parsed; such a range is now ignored and the whole segment is fetched. Found by fuzzing.
 - A damaged `.flac` could crash the decoder (a null read in dr_flac) when a seek followed a frame that failed to decode.
