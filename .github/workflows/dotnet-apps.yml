@@ -48,13 +48,11 @@ jobs:
           dotnet-version: 10.0.x
       - name: Build fatzaudio.xcframework
         run: tools/build-xcframework.sh build-ios
-      # Each .NET for iOS release needs one Xcode version, and the hosted Mac may have an older one than the
-      # newest release wants. Use the newest Xcode installed, then the newest workload set that accepts it.
-      - name: Select Xcode
+      # Each .NET for iOS release needs one Xcode version, and the hosted Mac's default may be older than the
+      # newest release wants: try the newest workload set that accepts the Xcode in use.
+      - name: Show Xcode
         run: |
           ls -d /Applications/Xcode*.app
-          x=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
-          sudo xcode-select -s "$x"
           xcodebuild -version
       - name: Build the app for the simulator
         run: |
