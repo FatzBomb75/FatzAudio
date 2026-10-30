@@ -1,0 +1,135 @@
+name: dotnet-apps
+
+# The .NET binding inside a real .NET for iOS app (in the simulator) and a real .NET for Android app (on an
+# emulator): the native library must be found the way an app loads it, and on Android HTTPS runs on the app's
+# own Java VM. Each app (tools/dotnet-apps) decodes a test file, and over HTTPS a test stream, then reports.
+#
+# Pull requests run this only when they touch the binding or these apps (workflow-level path filter, so the
+# plain devices.yml jobs are not started by it); every push to main that touches them, and a manual run, too.
+on:
+  pull_request:
+    paths:
+      - 'bindings/**'
+      - 'tools/dotnet-apps/**'
+      - 'tools/build-xcframework.sh'
+      - '.github/workflows/dotnet-apps.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'bindings/**'
+      - 'tools/dotnet-apps/**'
+      - 'tools/build-xcframework.sh'
+      - '.github/workflows/dotnet-apps.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: dotnet-apps-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CMAKE_C_COMPILER_LAUNCHER: ccache
+  CMAKE_CXX_COMPILER_LAUNCHER: ccache
+  CMAKE_OBJC_COMPILER_LAUNCHER: ccache
+
+jobs:
+  # fatzaudio.xcframework linked into a .NET for iOS app; run in a simulator with the test file and the
+  # local HTTPS server (its CA trusted by the simulator, as in devices.yml).
+  ios-app:
+    runs-on: macos-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hendrikmuhs/ccache-action@v1.2.14
+        with:
+          key: ios-app
+          max-size: 500M
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Build fatzaudio.xcframework
+        run: tools/build-xcframework.sh build-ios
+      - name: Install the iOS workload
+        run: dotnet workload install ios
+      - name: Build the app for the simulator
+        run: dotnet build tools/dotnet-apps/ios -c Release -r iossimulator-arm64
+      - name: Boot a simulator
+        run: |
+          udid=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          d = json.load(sys.stdin)["devices"]
+          print(next(x["udid"] for k in sorted(d, reverse=True) if ".iOS-" in k for x in d[k] if x["name"].startswith("iPhone")))')
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+          echo "FA_IOS_SIM=$udid" >> "$GITHUB_ENV"
+      - name: Start the HTTPS test server
+        run: |
+          python3 tools/test-https/serve.py tests/data "$RUNNER_TEMP/https" > "$RUNNER_TEMP/https.log" 2>&1 &
+          for i in $(seq 100); do nc -z 127.0.0.1 8443 && break; sleep 0.2; done
+          xcrun simctl keychain "$FA_IOS_SIM" add-root-cert "$RUNNER_TEMP/https/ca.crt"
+      - name: Run the app in the simulator
+        run: |
+          app=$(find tools/dotnet-apps/ios/bin -name '*.app' -maxdepth 4 | head -1)
+          xcrun simctl install "$FA_IOS_SIM" "$app"
+          export SIMCTL_CHILD_FA_APP_FILE="$PWD/tests/data/net/tone_cbr.mp3"
+          export SIMCTL_CHILD_FA_APP_URL=https://127.0.0.1:8443/net/tone_cbr.mp3
+          perl -e 'alarm 180; exec @ARGV' xcrun simctl launch --console --terminate-running-process "$FA_IOS_SIM" net.fatzaudio.ciapp | tee "$RUNNER_TEMP/app.log" || true
+          grep -q FATZAUDIO-APP-OK "$RUNNER_TEMP/app.log"
+      - name: HTTPS test server log
+        if: failure()
+        run: cat "$RUNNER_TEMP/https.log"
+
+  # libfatzaudio.so (x86_64) packed into a .NET for Android app; run on the emulator. HTTPS goes to the
+  # host's test server through "adb reverse", over HttpURLConnection on the app's own Java VM, with the test
+  # CA trusted by the app's network security config.
+  android-app:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hendrikmuhs/ccache-action@v1.2.14
+        with:
+          key: android-app
+          max-size: 500M
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - name: Build libfatzaudio.so for Android x86_64
+        run: |
+          cmake -S . -B build-android-x64 -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=x86_64 -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release \
+            -DFA_BUILD_TESTS=OFF -DFA_BUILD_TOOLS=OFF
+          cmake --build build-android-x64 --parallel "$(nproc)"
+      - name: Start the HTTPS test server
+        run: |
+          python3 tools/test-https/serve.py tests/data "$RUNNER_TEMP/https" > "$RUNNER_TEMP/https.log" 2>&1 &
+          for i in $(seq 100); do nc -z 127.0.0.1 8443 && break; sleep 0.2; done
+          mkdir -p tools/dotnet-apps/android/Resources/raw
+          cp "$RUNNER_TEMP/https/ca.crt" tools/dotnet-apps/android/Resources/raw/test_ca.crt
+      - name: Install the Android workload
+        run: dotnet workload install android
+      - name: Build the app
+        run: >
+          dotnet build tools/dotnet-apps/android -c Release
+          -p:AndroidSdkDirectory="$ANDROID_HOME" -p:AcceptAndroidSDKLicenses=true
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run the app on an Android 14 emulator
+        uses: reactivecircus/android-emulator-runner@v2.33.0
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -no-boot-anim -camera-back none -camera-front none
+          disable-animations: true
+          script: >
+            bash -c 'adb push tests/data/net/tone_cbr.mp3 /data/local/tmp/tone_cbr.mp3 &&
+            tools/dotnet-apps/android/run-check.sh
+            "$(find tools/dotnet-apps/android/bin -name "*-Signed.apk" | head -1)"
+            /data/local/tmp/tone_cbr.mp3 https://127.0.0.1:8443/net/tone_cbr.mp3'
+      - name: HTTPS test server log
+        if: failure()
+        run: cat "$RUNNER_TEMP/https.log"
