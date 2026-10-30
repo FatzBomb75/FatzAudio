@@ -68,6 +68,7 @@ internal unsafe struct FaOpenOptions
     public int DynamicRange;
     public nint SoundFont;
     public int TextCodePage;
+    public int* Cancel;
 }
 
 [StructLayout(LayoutKind.Sequential)]

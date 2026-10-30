@@ -32,15 +32,25 @@ fa_result fa_zip_list(fa_source* src, fa_zip_entry** out_entries, uint32_t* out_
 /* Where entry `e`'s data starts in `src`, after checking its local header. */
 fa_result fa_zip_entry_offset(fa_source* src, const fa_zip_entry* e, int64_t* out_offset);
 /* Unpacks one entry into a malloc'ed buffer, CRC checked. FA_ERROR_TOO_LARGE when
- * it is bigger than max_size. */
-fa_result fa_zip_extract(fa_source* src, const fa_zip_entry* e, uint64_t max_size, uint8_t** out_data);
+ * it is bigger than max_size. `cancel` (NULL: none) points at the app's flag, which
+ * stops the unpacking with FA_ERROR_CANCELLED once it reads non-zero (checked
+ * about every 64 KB of a file or callback source, every MB written to a file). */
+fa_result fa_zip_extract(fa_source* src, const fa_zip_entry* e, uint64_t max_size, const volatile int32_t* cancel, uint8_t** out_data);
 /* Unpacks one entry into `f` (written from its current position), CRC checked;
  * memory use stays at about 1 MB whatever the size. FA_ERROR_TOO_LARGE past
  * FA_ZIP_TEMP_LIMIT. */
-fa_result fa_zip_extract_file(fa_source* src, const fa_zip_entry* e, FILE* f);
+fa_result fa_zip_extract_file(fa_source* src, const fa_zip_entry* e, const volatile int32_t* cancel, FILE* f);
+/* The first min(cap, e->size) bytes (a little fewer when a match straddles the
+ * end) of the entry into `buf`, without a CRC check, whatever its size: what a
+ * format probe looks at. *got is how many. */
+fa_result fa_zip_extract_prefix(fa_source* src, const fa_zip_entry* e, uint8_t* buf, size_t cap, size_t* got);
+/* The bytes a probe of an unpacked entry looks at (fa_zip_extract_prefix). */
+#define FA_ZIP_PROBE_BYTES 65536
 /* Raw DEFLATE (RFC 1951). FA_OK only when the stream ends exactly at out_size bytes. */
 fa_result fa_inflate(const uint8_t* in, size_t in_size, uint8_t* out, size_t out_size);
 uint32_t fa_crc32(const uint8_t* data, size_t size);
+/* `crc` is the CRC of the bytes before `data` (0 to start). */
+uint32_t fa_crc32_update(uint32_t crc, const uint8_t* data, size_t size);
 
 /* ---- CD+G (cdg.c) ----------------------------------------------------------- */
 

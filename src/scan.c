@@ -40,8 +40,9 @@ struct fa_scan_job {
     int64_t path_offset, path_length; /* ... or these bytes of it (a stored ZIP entry) ... */
     const char* name_hint;         /* path, or the ZIP entry's name; NULL for memory */
     char entry_name[260];
-    const uint8_t* mem;            /* ... or the memory of a memory stream */
+    const uint8_t* mem;            /* ... or the memory of a memory stream ... */
     size_t mem_size;
+    fa_shared_file* shared;        /* ... or the temp file of an unpacked ZIP song (a reference) */
     int32_t audio_track;
     int use_tags;
     fa_atomic32 cancel;
@@ -214,6 +215,7 @@ static void cache_write(const fa_scan_job* j, const fa_loudness* l)
 
 static fa_result open_source(const fa_scan_job* j, fa_source* src)
 {
+    if (j->shared) return fa_source_open_shared(src, j->shared);
     if (!j->path) return fa_source_open_memory_ref(src, j->mem, j->mem_size);
     return fa_source_open_path_window(src, j->path, j->path_offset, j->path_length);
 }
@@ -484,6 +486,7 @@ static void job_free(fa_scan_job* j)
     if (j->chunks) for (k = 0; k < j->nchunks; k++) free(j->chunks[k].subs);
     free(j->chunks);
     free(j->path);
+    fa_shared_file_release(j->shared);
     fa_soundfont_release(j->env.soundfont);
     free(j);
 }
@@ -491,7 +494,7 @@ static void job_free(fa_scan_job* j)
 fa_scan_job* fa_scan_start_stream(struct fa_stream* s, int use_tags)
 {
     fa_scan_job* j;
-    if (!s->path && s->source.kind != FA_SOURCE_MEMORY) return NULL; /* app I/O: cannot read it twice */
+    if (!s->path && s->source.kind != FA_SOURCE_MEMORY && !s->source.shared) return NULL; /* app I/O: cannot read it twice */
     j = job_new(s->engine);
     if (!j) return NULL;
     j->stream = s;
@@ -505,6 +508,10 @@ fa_scan_job* fa_scan_start_stream(struct fa_stream* s, int use_tags)
         j->path_length = s->path_length;
         memcpy(j->entry_name, s->path_name, sizeof(j->entry_name));
         j->name_hint = s->path_length > 0 ? j->entry_name : j->path;
+    } else if (s->source.shared) {
+        j->shared = fa_shared_file_retain(s->source.shared);
+        memcpy(j->entry_name, s->path_name, sizeof(j->entry_name));
+        j->name_hint = j->entry_name[0] ? j->entry_name : NULL;
     } else {
         j->mem = s->source.mem;
         j->mem_size = s->source.mem_size;
