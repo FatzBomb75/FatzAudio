@@ -48,10 +48,26 @@ jobs:
           dotnet-version: 10.0.x
       - name: Build fatzaudio.xcframework
         run: tools/build-xcframework.sh build-ios
-      - name: Install the iOS workload
-        run: dotnet workload install ios
+      # Each .NET for iOS release needs one Xcode version, and the hosted Mac may have an older one than the
+      # newest release wants. Use the newest Xcode installed, then the newest workload set that accepts it.
+      - name: Select Xcode
+        run: |
+          ls -d /Applications/Xcode*.app
+          x=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          sudo xcode-select -s "$x"
+          xcodebuild -version
       - name: Build the app for the simulator
-        run: dotnet build tools/dotnet-apps/ios -c Release -r iossimulator-arm64
+        run: |
+          dotnet workload install ios
+          versions=$(dotnet workload search version | grep -oE '^[0-9][0-9.]*[0-9]' | head -8)
+          for v in "" $versions; do
+            if [ -n "$v" ]; then echo "== trying workload set $v"; dotnet workload update --version "$v"; fi
+            rc=0; dotnet build tools/dotnet-apps/ios -c Release -r iossimulator-arm64 > build.log 2>&1 || rc=$?
+            tail -5 build.log
+            [ "$rc" = 0 ] && exit 0
+            grep -q 'requires Xcode' build.log || break
+          done
+          exit 1
       - name: Boot a simulator
         run: |
           udid=$(xcrun simctl list devices available -j | python3 -c '
