@@ -1575,9 +1575,13 @@ fa_result fa_float_reserve(float** buf, fa_frames* cap, fa_frames frames, uint32
 enum { FA_SAMPLE_U8 = 0, FA_SAMPLE_S8, FA_SAMPLE_S16, FA_SAMPLE_S24, FA_SAMPLE_S32, FA_SAMPLE_S64,
        FA_SAMPLE_F32, FA_SAMPLE_F64 };
 /* planes: `channels` pointers when planar, else planes[0]. big_endian: byte order of
- * the data (packed formats from files); 0 = native order. */
+ * the data (packed formats from files); 0 = native order. Float input that is not
+ * finite (NaN, infinity, a double too big for a float) becomes 0: one such sample
+ * would stick in every filter and effect after it. */
 void fa_convert_to_f32(const void* const* planes, int kind, int planar, int big_endian,
                        uint32_t channels, fa_frames frames, float* out);
+/* Sets every NaN or infinite sample of p[0..n) to 0 (float PCM read from a file). */
+void fa_zero_non_finite(float* p, size_t n);
 /* fa_sample_format -> FA_SAMPLE_* and planar; -1 if invalid. */
 int fa_sample_kind(fa_sample_format f, int* out_planar);
 

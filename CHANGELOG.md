@@ -388,8 +388,17 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- Float PCM (WAV, Wave64, RF64, AIFF-C, CAF, MP4/MOV, Matroska, ASF, push streams): NaN and infinite samples, and
+  doubles too big for a float, now read as 0. One such sample in a damaged file used to stick in every filter, effect
+  and meter after it. Found by fuzzing (`tests/fuzz/regress/stream/wav-float-nan.wav`).
+- WAV/AIFF: a damaged header with a huge frame count overflowed the audio byte count (undefined behaviour); the byte
+  count is now left unknown. Found by fuzzing.
+- AC-3/E-AC-3: a track whose first packet was empty passed a null buffer to `memmove` (undefined behaviour, no crash
+  seen). Found by fuzzing.
+- A container that claims a sample rate over 768 kHz (a damaged ASF, MP4 or Matroska PCM track) is no longer decoded:
+  the silence for a gap before its first packet could ask for gigabytes. A gap whose silence would pass 2^26 samples
+  (more than 30 s of 32 channels at 48 kHz) is no longer filled, as a gap over 30 s already was not. Found by fuzzing.
 - .NET for iOS: the binding also tries `@rpath/fatzaudio.framework/fatzaudio` when the plain library name is not found. CI now runs the binding in a real .NET for iOS app (simulator) and a .NET for Android app (emulator), see `tools/dotnet-apps/`.
-
 - Ogg Opus and Ogg Vorbis: a song whose only audio page is also its last one (a short clip) came out 650 to 970 frames
   off when played straight through, on its own or chained after other songs: its last page was timed back from its
   granule without its end trim, while a seek timed it forward from its start. A chained file's later songs then played

@@ -111,9 +111,14 @@ uint64_t fa_drwav_read(void* impl, float* out, uint64_t frames)
              w->container == ma_dr_wav_container_w64;
     int fmt_ok = (w->translatedFormatTag == MA_DR_WAVE_FORMAT_PCM && bytes >= 2 && bytes <= 4) ||
                  (w->translatedFormatTag == MA_DR_WAVE_FORMAT_IEEE_FLOAT && bytes == 4);
+    uint64_t got;
     if (ma_dr_wav__is_little_endian() && le && fmt_ok && bytes * w->channels == bpf)
-        return read_pcm_direct(w, out, frames, bytes);
-    return ma_dr_wav_read_pcm_frames_f32(w, frames, out);
+        got = read_pcm_direct(w, out, frames, bytes);
+    else
+        got = ma_dr_wav_read_pcm_frames_f32(w, frames, out);
+    /* Float files can hold NaN or infinity; integer and ADPCM data can't. */
+    if (w->translatedFormatTag == MA_DR_WAVE_FORMAT_IEEE_FLOAT) fa_zero_non_finite(out, (size_t)got * w->channels);
+    return got;
 }
 
 int fa_drwav_seek(void* impl, uint64_t frame)

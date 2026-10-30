@@ -178,7 +178,7 @@ static fa_result ac3c_decode(fa_codec* c, const uint8_t* data, size_t size)
         if (r != FA_OK) return r;
     }
     if (pos > st->len) pos = st->len;
-    memmove(st->buf, st->buf + pos, st->len - pos);
+    if (st->len > pos) memmove(st->buf, st->buf + pos, st->len - pos);   /* buf is NULL before the first byte */
     st->len -= pos;
     /* Garbage that never syncs (bytes held back behind a new format are not). */
     if (st->pend_frames == 0 && st->len > AC3_MAX_AU) st->len = 0;
