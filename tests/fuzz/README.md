@@ -35,3 +35,12 @@ for the decoders (about 20 for trackers, which render whole seconds), 600 to 150
 
 Every input that crashed or hung a reader goes in `regress/<target>/` with a name saying what it hit. A normal build
 (`FA_FUZZ` off) builds `fuzz_regress_<target>`, which runs each saved input once, and ctest runs it with the other tests.
+
+## Runs so far
+
+GCC ASan+UBSan in a 4-core cloud container, `FUZZ_SEED=1`, 128 KiB inputs.
+
+| Round | Formats | Execs each | Found (all fixed, inputs in `regress/`) |
+|---|---|---|---|
+| 1 (PR 141) | AAC/HE-AAC, MP3, FLAC, MKV, MP4, CAF, tags, ZIP, HLS | 1M | dr_flac null reads after a bad frame and a seek (2), HLS BYTERANGE and MEDIA-SEQUENCE overflows |
+| 2a | `stream_ogg`, `stream_asf`, `stream_dolby`, `stream_wav`, `stream_midi` 1M; `stream_tracker` 200k | see left | NaN/infinity passed through from float PCM; AC-3 codec `memmove` from a null buffer; a 2 GHz PCM sample rate asked for gigabytes of gap silence; WAV frame count times frame size overflowed |
