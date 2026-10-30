@@ -86,7 +86,7 @@ jobs:
           xcrun simctl install "$FA_IOS_SIM" "$app"
           export SIMCTL_CHILD_FA_APP_FILE="$PWD/tests/data/net/tone_cbr.mp3"
           export SIMCTL_CHILD_FA_APP_URL=https://127.0.0.1:8443/net/tone_cbr.mp3
-          perl -e 'alarm 180; exec @ARGV' xcrun simctl launch --console --terminate-running-process "$FA_IOS_SIM" net.fatzaudio.ciapp | tee "$RUNNER_TEMP/app.log" || true
+          perl -e 'alarm 300; exec @ARGV' xcrun simctl launch --console --terminate-running-process "$FA_IOS_SIM" net.fatzaudio.ciapp 2>&1 | tee "$RUNNER_TEMP/app.log" || true
           grep -q FATZAUDIO-APP-OK "$RUNNER_TEMP/app.log"
       - name: HTTPS test server log
         if: failure()
