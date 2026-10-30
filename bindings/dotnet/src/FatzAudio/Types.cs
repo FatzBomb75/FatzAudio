@@ -365,7 +365,8 @@ public sealed record NetworkOptions
     /// <summary>The User-Agent header; null sends <c>FatzAudio/&lt;version&gt;</c>.</summary>
     public string? UserAgent { get; init; }
     /// <summary>Extra request headers (cookies, authorization, ...), sent with every request including HLS segments;
-    /// <c>Authorization</c> and <c>Cookie</c> only to the stream URL's own server (scheme, host and port).</summary>
+    /// <c>Authorization</c> and <c>Cookie</c> only to the stream URL's own server (scheme, host and port). Cookies the
+    /// servers set are kept for the stream and sent back to them, after your own.</summary>
     public IReadOnlyDictionary<string, string>? Headers { get; init; }
     /// <summary>
     /// Null uses the system's proxy setting (the http_proxy / https_proxy environment variables, and the
@@ -383,9 +384,24 @@ public sealed record NetworkOptions
     public bool Reconnect { get; init; } = true;
     /// <summary>Ask radio servers for song titles (ICY metadata; default true).</summary>
     public bool SongTitles { get; init; } = true;
-    /// <summary>HLS: play the best variant up to this many bits per second; 0 = the best one.</summary>
+    /// <summary>HLS: play the best variant up to this many bits per second (the audio rendition of that variant's
+    /// audio group when it names one); 0 = the best one.</summary>
     public int HlsMaxBandwidth { get; init; }
+    /// <summary>Receives the stream's raw bytes as they are downloaded, from the very first one, for saving a station
+    /// while it plays; null = none. <see cref="AudioStream.SetDownloadHandler"/> changes it later.</summary>
+    public DownloadHandler? Downloaded { get; init; }
 }
+
+/// <summary>
+/// Receives a web stream's raw bytes as they are downloaded (<see cref="NetworkOptions.Downloaded"/>,
+/// <see cref="AudioStream.SetDownloadHandler"/>): the bytes the decoder reads, so a file as the server sends it,
+/// radio without its song-title blocks, HLS the audio of the segments (decrypted; from MPEG-TS segments the audio
+/// stream inside). Written to a file they make a recording of what plays.
+/// </summary>
+/// <param name="data">The next bytes; valid only during the call.</param>
+/// <remarks>Called on the stream's download thread, in order. The download waits while it runs, so return quickly;
+/// exceptions are swallowed.</remarks>
+public delegate void DownloadHandler(ReadOnlySpan<byte> data);
 
 /// <summary>What a web stream is playing (<see cref="AudioStream.Metadata"/>). Strings are empty when unknown.</summary>
 /// <param name="StreamTitle">The song heard now as the station sends it (ICY StreamTitle), usually "Artist - Title".</param>

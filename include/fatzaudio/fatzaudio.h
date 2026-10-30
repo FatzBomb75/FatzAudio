@@ -465,13 +465,23 @@ typedef enum fa_net_flags {
     FA_NET_NO_ICY       = 1 << 1   /* do not ask radio servers for song titles */
 } fa_net_flags;
 
+/* Receives a web stream's raw bytes as they are downloaded, to save a station while
+ * it plays (fa_net_options.download_proc, fa_stream_set_download_callback). The bytes
+ * are the ones the decoder reads: a file as the server sends it, radio without its
+ * ICY title blocks, HLS the audio of the segments (decrypted; from MPEG-TS segments
+ * the audio stream inside). Called on the stream's download thread, in order; the
+ * download waits while it runs, so return quickly. */
+typedef void (FA_CALL *fa_download_proc)(void* user, const void* data, size_t size);
+
 struct fa_net_options {
     uint32_t struct_size;          /* sizeof(fa_net_options) */
     const char* user_agent;        /* NULL = "FatzAudio/<version>" */
     const char* headers;           /* extra request headers, "Name: value" lines separated
                                       by "\r\n" or "\n" (cookies, authorization, ...); NULL = none.
                                       Authorization and Cookie go only to the URL's own origin
-                                      (not to other servers a redirect or playlist leads to) */
+                                      (not to other servers a redirect or playlist leads to).
+                                      Cookies the servers set are kept for the stream and sent
+                                      back to them, after this Cookie line */
     const char* proxy;             /* NULL = the system's setting (environment http_proxy /
                                       https_proxy, Windows and macOS proxy settings);
                                       "" = connect directly; "host:port" or
@@ -484,7 +494,12 @@ struct fa_net_options {
                                       drops; 0 = 30000 (FA_NET_NO_RECONNECT: never) */
     uint32_t flags;                /* fa_net_flags */
     uint32_t hls_max_bandwidth;    /* HLS: plays the best variant up to this many bits per
-                                      second; 0 = the best one */
+                                      second (the audio rendition of that variant's AUDIO
+                                      group when it names one); 0 = the best one */
+    fa_download_proc download_proc; /* the stream's raw bytes from the first one on (what
+                                      the open reads to detect the format included);
+                                      NULL = none. fa_stream_set_download_callback changes it */
+    void* download_user;           /* download_proc's `user` */
 };
 
 FA_API void FA_CALL fa_net_options_init(fa_net_options* options);
@@ -540,6 +555,13 @@ FA_API fa_result FA_CALL fa_stream_get_net_status(fa_stream* stream, fa_net_stat
 /* A header of the last HTTP response, e.g. "Content-Type" or "icy-name" (any case).
  * FA_ERROR_NOT_FOUND when the response had no such header; truncated to fit. */
 FA_API fa_result FA_CALL fa_stream_get_http_header(fa_stream* stream, const char* name, char* out_value, size_t value_size);
+/* Starts (or, with NULL, stops) handing a web stream's raw bytes to `proc` from the
+ * next downloaded byte on (fa_download_proc). Once it returns, the previous callback
+ * is not called again (a call in progress has finished), so its `user` can be freed;
+ * it can also be called from inside the callback. A seek that restarts the download
+ * elsewhere continues with the bytes from there. FA_ERROR_INVALID_ARG for streams
+ * that are not web streams. */
+FA_API fa_result FA_CALL fa_stream_set_download_callback(fa_stream* stream, fa_download_proc proc, void* user);
 
 /* ---- Audio CDs ------------------------------------------------------------
  *
