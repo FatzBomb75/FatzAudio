@@ -384,6 +384,8 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Float PCM (WAV, Wave64, RF64, AIFF-C, CAF, MP4/MOV, Matroska, ASF, push streams): NaN and infinite samples, and
   doubles too big for a float, now read as 0. One such sample in a damaged file used to stick in every filter, effect
   and meter after it. Found by fuzzing (`tests/fuzz/regress/stream/wav-float-nan.wav`).
+- WAV/AIFF: a damaged header with a huge frame count overflowed the audio byte count (undefined behaviour); the byte
+  count is now left unknown. Found by fuzzing.
 - AC-3/E-AC-3: a track whose first packet was empty passed a null buffer to `memmove` (undefined behaviour, no crash
   seen). Found by fuzzing.
 - A container that claims a sample rate over 768 kHz (a damaged ASF, MP4 or Matroska PCM track) is no longer decoded:

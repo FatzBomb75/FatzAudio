@@ -99,8 +99,12 @@ static fa_result wav_open(fa_decoder* dec)
     if (frames > 0) dec->length = (fa_frames)frames;
     fa_drwav_props(dec->impl, &dec->bits_per_sample, &dec->audio_bytes);
     /* PCM: exactly the samples (AIFF's SSND chunk also counts its offset fields). */
-    if (dec->bits_per_sample && dec->length > 0)
-        dec->audio_bytes = (int64_t)dec->length * channels * ((dec->bits_per_sample + 7) / 8);
+    if (dec->bits_per_sample && dec->length > 0) {
+        int64_t frame_bytes = (int64_t)channels * ((dec->bits_per_sample + 7) / 8);
+        /* A damaged header's frame count can be anything. */
+        dec->audio_bytes = frame_bytes > 0 && (int64_t)dec->length <= INT64_MAX / frame_bytes
+                               ? (int64_t)dec->length * frame_bytes : -1;
+    }
     snprintf(dec->codec, sizeof(dec->codec), "pcm");
     snprintf(dec->container, sizeof(dec->container), "%s", n >= 4 && memcmp(head, "FORM", 4) == 0 ? "aiff" : "wav");
     return FA_OK;
