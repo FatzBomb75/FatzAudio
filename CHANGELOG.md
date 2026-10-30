@@ -18,6 +18,13 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- MIDI scale tuning and drum setup: GS (`40 1x 40`-`4B`) and XG (`08 nn 41`-`4C`) scale tuning, GS drum map edits
+  (`41 mp rr`), XG drum setups (`3n rr pp`, and the drum setup reset) and the GS/XG drum NRPNs (MSB 14-1E) set each drum
+  key's pitch, level, pan, effect sends, exclusive group, note-off and note-on reception, filter and envelope. GS drum
+  map 2 and XG drum setups 1-4 are kept apart. XG SFX kits (bank 126) come from the soundfont's bank 126, else the GS
+  SFX kit, else the standard kit. Files without these messages render bit for bit as before.
+  See [docs/features/midi.md](docs/features/midi.md#scale-tuning-and-drum-setup).
+
 - MIDI controllers and SoundFont modulators: the mod wheel and channel pressure add vibrato (RPN 5 sets its depth),
   CC74/CC71 move the filter cutoff and resonance, CC73/CC75/CC72 the attack, decay and release, CC76-78 the vibrato rate,
   depth and delay, with the GS/XG part NRPNs and part SysEx that set the same values; portamento (CC65, CC5, CC84),
