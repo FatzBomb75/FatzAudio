@@ -381,6 +381,8 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- .NET for iOS: the binding also tries `@rpath/fatzaudio.framework/fatzaudio` when the plain library name is not found. CI now runs the binding in a real .NET for iOS app (simulator) and a .NET for Android app (emulator), see `tools/dotnet-apps/`.
+
 - Ogg Opus and Ogg Vorbis: a song whose only audio page is also its last one (a short clip) came out 650 to 970 frames
   off when played straight through, on its own or chained after other songs: its last page was timed back from its
   granule without its end trim, while a seek timed it forward from its start. A chained file's later songs then played
