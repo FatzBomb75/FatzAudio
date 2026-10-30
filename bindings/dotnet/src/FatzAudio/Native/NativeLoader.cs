@@ -105,6 +105,9 @@ internal static class NativeLoader
             var path = Path.Combine(dir, file);
             if (File.Exists(path) && NativeLibrary.TryLoad(path, out handle)) return handle;
         }
+
+        // .NET for iOS links the native framework into the app bundle (Frameworks/fatzaudio.framework).
+        if (OperatingSystem.IsIOS() && NativeLibrary.TryLoad("@rpath/fatzaudio.framework/fatzaudio", out handle)) return handle;
         return 0; // let the runtime raise DllNotFoundException
     }
 

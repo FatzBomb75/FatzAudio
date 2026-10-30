@@ -20,11 +20,17 @@
  * notes still ringing) of the time before the target are heard after it; held
  * notes restart at that earlier point.
  *
+ * Controllers, pressure and the soundfont's modulators are TinySoundFont's (mod wheel
+ * and pressure vibrato, CC71-78 and their part NRPNs, portamento, sostenuto, soft
+ * pedal); this file passes them on, tracks sostenuto for the seek replay and resets
+ * them with the GM/GS/XG resets.
+ *
  * SysEx: GM, GM2, GS and XG resets, GS rhythm parts and XG drum parts, XG and GM2
  * drum banks (bank select MSB 127 and 120), master volume (universal, GS, XG),
  * master fine and coarse tuning, GS and XG reverb and chorus settings (type,
  * level, time and the GS chorus's parameters; midi_fx.c), and the GS and XG part
- * volume, pan, reverb send and chorus send. Other SysEx is ignored.
+ * volume, pan, reverb send, chorus send and vibrato, filter and envelope offsets.
+ * Other SysEx is ignored.
  *
  * Reverb and chorus (src/midi_fx.c) are fed by each voice's send levels: CC91
  * and CC93 (40 and 0 after a reset, as on GS and GM2 devices) and the
@@ -423,11 +429,11 @@ typedef struct midi_text {
 
 /* ---- The decoder ---------------------------------------------------------------- */
 
-enum { EV_NOTE_OFF, EV_NOTE_ON, EV_CONTROL, EV_PROGRAM, EV_PITCH, EV_SYSEX };
+enum { EV_NOTE_OFF, EV_NOTE_ON, EV_CONTROL, EV_PROGRAM, EV_PITCH, EV_SYSEX, EV_CHANNEL_PRESSURE, EV_KEY_PRESSURE };
 
 typedef struct midi_event {
     fa_frames frame;
-    uint16_t value;             /* velocity, controller value, program, pitch bend; SysEx: index in sysex */
+    uint16_t value;             /* velocity, controller value, program, pitch bend, pressure; SysEx: index in sysex */
     uint8_t type, channel, key; /* key: note or controller number */
 } midi_event;
 
@@ -495,6 +501,13 @@ struct fa_midi {
     uint8_t pedal_held[16][128];
     uint8_t merged[16][128];
     uint8_t pedal[16];
+    /* Sostenuto (CC66): on, and the keys that were down when it was pressed (it holds
+     * those, and only those, after their note-offs; pedal_held then marks them too). */
+    uint8_t sost[16];
+    uint8_t sost_latched[16][128];
+    /* A CC84 (portamento control: the key the next note glides from) met while
+     * replaying before a seek and not yet used by a note there; -1 none. */
+    int16_t porta_ctrl[16];
 
     fa_atomic32 transpose;      /* set by the API */
     fa_atomic32 mute;           /* bit n = channel n */
@@ -526,6 +539,7 @@ static void forget_channel(struct fa_midi* m, int ch)
     memset(m->depth[ch], 0, sizeof(m->depth[ch]));
     memset(m->pedal_held[ch], 0, sizeof(m->pedal_held[ch]));
     memset(m->merged[ch], 0, sizeof(m->merged[ch]));
+    memset(m->sost_latched[ch], 0, sizeof(m->sost_latched[ch]));
 }
 
 /* Master volume at `frame` (at or after the last change). Frames past the ramp,
@@ -581,11 +595,12 @@ static void sync_bank(struct fa_midi* m, int ch);
 /* Defaults, as after a GM/GS/XG reset at `frame` (and at the start: GM). */
 static void reset_channels(struct fa_midi* m, int mode, fa_frames frame)
 {
-    int ch;
+    int ch, cc;
     m->mode = mode;
     memset(m->gs_rhythm, 0, sizeof(m->gs_rhythm));
     memset(m->bank_msb, 0, sizeof(m->bank_msb));
     memset(m->program, 0, sizeof(m->program));
+    memset(m->porta_ctrl, 0xFF, sizeof(m->porta_ctrl));   /* -1: none */
     m->gs_rhythm[FA_MIDI_DRUMS] = mode == MODE_GM || mode == MODE_GS;   /* XG and GM2: the bank decides */
     if (mode == MODE_XG) m->bank_msb[FA_MIDI_DRUMS] = 127;
     if (mode == MODE_GM2) {
@@ -607,8 +622,15 @@ static void reset_channels(struct fa_midi* m, int mode, fa_frames frame)
         tsf_channel_set_pitchwheel(m->synth, ch, 8192);
         tsf_channel_midi_control(m->synth, ch, 91, 40);   /* reverb send: the GM2 / GS default */
         tsf_channel_midi_control(m->synth, ch, 93, 0);
+        /* Sound controllers (CC71-78, the part NRPNs) back to normal, portamento time 0.
+         * Channel pressure adds vibrato on GM devices only: GS, XG and GM2 default to none
+         * (BASSMIDI: GS none, its own default 50 cents). */
+        for (cc = 71; cc <= 78; cc++) tsf_channel_midi_control(m->synth, ch, cc, 64);
+        tsf_channel_midi_control(m->synth, ch, TML_PORTAMENTO_TIME_MSB, 0);
+        tsf_channel_set_pressure_vibrato(m->synth, ch, mode == MODE_GM ? 50.0f : 0.0f);
         sync_bank(m, ch);
         m->pedal[ch] = 0;
+        m->sost[ch] = 0;
         select_program(m, ch);
     }
 }
@@ -640,9 +662,12 @@ static void part_control(struct fa_midi* m, int ch, int cc, int v)
     tsf_channel_midi_control(m->synth, ch, cc, v);
 }
 
-/* GS part parameters 40 1x `a`. Block 0 is part 10, 1..9 parts 1..9, A..F 11..16. */
+/* GS part parameters 40 1x `a`. Block 0 is part 10, 1..9 parts 1..9, A..F 11..16.
+ * 30-37 (vibrato, filter, envelope offsets, 64 = normal) are what the sound controllers
+ * CC71-78 set. */
 static void gs_part(struct fa_midi* m, int block, int a, int v)
 {
+    static const uint8_t sound_cc[8] = { 76, 77, 74, 71, 73, 75, 72, 78 };
     int ch = block == 0 ? 9 : block <= 9 ? block - 1 : block;
     switch (a) {
     case 0x15: set_drum_part(m, ch, v != 0); break;   /* use for rhythm part */
@@ -650,21 +675,54 @@ static void gs_part(struct fa_midi* m, int block, int a, int v)
     case 0x1C: part_control(m, ch, TML_PAN_MSB, v); break;
     case 0x21: part_control(m, ch, 93, v); break;      /* chorus send */
     case 0x22: part_control(m, ch, 91, v); break;      /* reverb send */
-    default: break;
+    default:
+        if (a >= 0x30 && a <= 0x37) part_control(m, ch, sound_cc[a - 0x30], v);
+        break;
     }
 }
 
-/* XG multi part parameters 08 `part` `a`. */
+/* XG multi part parameters 08 `part` `a`; 15-1C as GS's 30-37 above. */
 static void xg_part(struct fa_midi* m, int ch, int a, int v)
 {
+    static const uint8_t sound_cc[8] = { 76, 77, 78, 74, 71, 73, 75, 72 };
     switch (a) {
     case 0x07: set_drum_part(m, ch, v != 0); break;   /* part mode */
     case 0x0B: part_control(m, ch, TML_VOLUME_MSB, v); break;
     case 0x0E: part_control(m, ch, TML_PAN_MSB, v); break;
     case 0x12: part_control(m, ch, 93, v); break;      /* chorus send */
     case 0x13: part_control(m, ch, 91, v); break;      /* reverb send */
-    default: break;
+    default:
+        if (a >= 0x15 && a <= 0x1C) part_control(m, ch, sound_cc[a - 0x15], v);
+        break;
     }
+}
+
+/* Sostenuto pressed or released (also while replaying before a seek): the keys down
+ * now are the ones it holds. On release, the keys it alone held are no longer held. */
+static void set_sostenuto(struct fa_midi* m, int ch, int on)
+{
+    int key;
+    if (on == m->sost[ch]) return;
+    m->sost[ch] = (uint8_t)on;
+    for (key = 0; key < 128; key++) {
+        if (on) { m->sost_latched[ch][key] = m->depth[ch][key] > 0; continue; }
+        if (m->sost_latched[ch][key] && !m->pedal[ch]) m->pedal_held[ch][key] = 0;
+        m->sost_latched[ch][key] = 0;
+    }
+}
+
+/* A key as it sounds now (transposed, drums aside); -1 if out of range. */
+static int transposed_key(const struct fa_midi* m, int ch, int key)
+{
+    int play = key + (m->drums[ch] ? 0 : m->transpose_now);
+    return play >= 0 && play <= 127 ? play : -1;
+}
+
+/* The key a poly pressure message is for, as it sounds; -1 if none. While replaying
+ * before a seek, `sounding` is left from before it: the key restart_held will play. */
+static int pressure_key(const struct fa_midi* m, int ch, int key, int silent)
+{
+    return !silent && m->depth[ch][key] > 0 ? m->sounding[ch][key] : transposed_key(m, ch, key);
 }
 
 /* The SysEx messages FatzAudio acts on (after the F0; device numbers are ignored,
@@ -718,6 +776,7 @@ static void apply_event(struct fa_midi* m, const midi_event* e, int silent)
             if (m->depth[ch][key] == 0 || m->held_vel[ch][key] < e->value) m->held_vel[ch][key] = (uint8_t)e->value;
             if (m->depth[ch][key] < 255) m->depth[ch][key]++;
             m->pedal_held[ch][key] = 0;
+            m->porta_ctrl[ch] = -1;     /* a CC84 before it was for this note */
             return;
         }
         if ((m->mute_now >> ch) & 1) return;
@@ -738,17 +797,36 @@ static void apply_event(struct fa_midi* m, const midi_event* e, int silent)
         m->depth[ch][key]--;
         if (!silent && m->merged[ch][key]) m->merged[ch][key]--;   /* a restarted key: its one voice rings on */
         else if (!silent) tsf_channel_note_off(m->synth, ch, m->sounding[ch][key]);
-        else if (m->depth[ch][key] == 0 && m->pedal[ch]) m->pedal_held[ch][key] = 1;
+        else if (m->depth[ch][key] == 0 && (m->pedal[ch] || (m->sost[ch] && m->sost_latched[ch][key]))) m->pedal_held[ch][key] = 1;
         return;
     case EV_CONTROL:
+        if (key == TML_PORTAMENTO_CTRL) {   /* names a key: transposed as the notes are */
+            if (silent) m->porta_ctrl[ch] = (int16_t)e->value;   /* restart_held passes it on if unused */
+            else if ((key = transposed_key(m, ch, e->value)) >= 0) tsf_channel_midi_control(m->synth, ch, TML_PORTAMENTO_CTRL, key);
+            return;
+        }
         tsf_channel_midi_control(m->synth, ch, key, e->value);
         if (key == TML_BANK_SELECT_MSB) m->bank_msb[ch] = (uint8_t)e->value;   /* takes effect with the next program */
-        if (key == TML_ALL_CTRL_OFF) sync_bank(m, ch);   /* tsf clears the bank; the bank select stays (RP-015) */
+        if (key == TML_ALL_CTRL_OFF) {
+            sync_bank(m, ch);   /* tsf clears the bank; the bank select stays (RP-015) */
+            set_sostenuto(m, ch, 0);
+            m->porta_ctrl[ch] = -1;   /* tsf forgets its CC84 too */
+        }
         if (key == TML_SUSTAIN_SWITCH) {
             m->pedal[ch] = e->value >= 64;
-            if (!m->pedal[ch]) memset(m->pedal_held[ch], 0, sizeof(m->pedal_held[ch]));
+            if (!m->pedal[ch]) {   /* what sostenuto still holds stays held */
+                int k;
+                for (k = 0; k < 128; k++) m->pedal_held[ch][k] &= (uint8_t)(m->sost[ch] && m->sost_latched[ch][k]);
+            }
         }
+        if (key == TML_SOSTENUTO_SWITCH) set_sostenuto(m, ch, e->value >= 64);
         if (key == TML_ALL_SOUND_OFF || key == TML_ALL_NOTES_OFF) forget_channel(m, ch);
+        return;
+    case EV_CHANNEL_PRESSURE:
+        tsf_channel_set_pressure(m->synth, ch, e->value);
+        return;
+    case EV_KEY_PRESSURE:
+        if ((key = pressure_key(m, ch, key, silent)) >= 0) tsf_channel_set_key_pressure(m->synth, ch, key, e->value);
         return;
     case EV_PROGRAM:
         m->program[ch] = (uint8_t)e->value;
@@ -845,23 +923,46 @@ static fa_result midi_read(fa_decoder* dec, float* out, fa_frames frames, fa_fra
  * released at once, so the pedal (restored by the replay) keeps it ringing. */
 static void restart_held(struct fa_midi* m)
 {
-    int ch, key;
-    m->transpose_now = fa_load32(&m->transpose);
-    m->mute_now = (uint32_t)fa_load32(&m->mute);
+    int ch, key, pass;
     for (ch = 0; ch < 16; ch++) {
-        if (m->drums[ch] || (m->mute_now >> ch) & 1) { forget_channel(m, ch); continue; }
-        for (key = 0; key < 128; key++) {
-            int play = key + m->transpose_now;
-            int held = m->depth[ch][key];
-            if (!held && !m->pedal_held[ch][key]) continue;
-            if (play < 0 || play > 127) { m->depth[ch][key] = 0; continue; }
-            /* One voice, at the loudest of the strikes still held; it ends with the
-             * last of their note-offs. */
-            tsf_channel_note_on(m->synth, ch, play, (float)m->held_vel[ch][key] / 127.0f);
-            m->sounding[ch][key] = (uint8_t)play;
-            m->merged[ch][key] = (uint8_t)(held > 1 ? held - 1 : 0);
-            if (!held) tsf_channel_note_off(m->synth, ch, play);
+        int porta, from = m->porta_ctrl[ch] >= 0 ? transposed_key(m, ch, m->porta_ctrl[ch]) : -1;
+        m->porta_ctrl[ch] = -1;
+        if (m->drums[ch] || (m->mute_now >> ch) & 1) {
+            forget_channel(m, ch);
+            if (from >= 0) tsf_channel_midi_control(m->synth, ch, TML_PORTAMENTO_CTRL, from);
+            continue;
         }
+        /* No portamento between the restarted notes. Sostenuto latches the notes it held
+         * (restarted first), not the others. */
+        porta = tsf_channel_get_midi_control(m->synth, ch, TML_PORTAMENTO_SWITCH);
+        if (porta) tsf_channel_midi_control(m->synth, ch, TML_PORTAMENTO_SWITCH, 0);
+        if (m->sost[ch]) tsf_channel_set_sostenuto(m->synth, ch, 0);
+        for (pass = 0; pass < 2; pass++) {
+            for (key = 0; key < 128; key++) {
+                int play = key + m->transpose_now;
+                int held = m->depth[ch][key];
+                if (!held && !m->pedal_held[ch][key]) continue;
+                if ((m->sost[ch] && m->sost_latched[ch][key]) != !pass) continue;
+                if (play < 0 || play > 127) { m->depth[ch][key] = 0; continue; }
+                /* One voice, at the loudest of the strikes still held; it ends with the
+                 * last of their note-offs. */
+                tsf_channel_note_on(m->synth, ch, play, (float)m->held_vel[ch][key] / 127.0f);
+                m->sounding[ch][key] = (uint8_t)play;
+                m->merged[ch][key] = (uint8_t)(held > 1 ? held - 1 : 0);
+                if (!held && pass == 1) tsf_channel_note_off(m->synth, ch, play);
+            }
+            if (pass == 0 && m->sost[ch]) {
+                tsf_channel_set_sostenuto(m->synth, ch, 1);
+                for (key = 0; key < 128; key++) {
+                    int play = key + m->transpose_now;
+                    if (m->sost_latched[ch][key] && !m->depth[ch][key] && m->pedal_held[ch][key] && play >= 0 && play <= 127)
+                        tsf_channel_note_off(m->synth, ch, play);
+                }
+            }
+        }
+        if (porta) tsf_channel_midi_control(m->synth, ch, TML_PORTAMENTO_SWITCH, porta);
+        /* A CC84 no note used before the target is for the next note after it. */
+        if (from >= 0) tsf_channel_midi_control(m->synth, ch, TML_PORTAMENTO_CTRL, from);
     }
 }
 
@@ -875,6 +976,9 @@ static fa_result midi_seek(fa_decoder* dec, fa_frames frame)
     m->synth = fresh;
     fa_midi_fx_reset(m->fx);
     start_song(m);   /* also forgets every held note */
+    /* The controls the API has set now, for the replay (transposed keys) and restart_held. */
+    m->transpose_now = fa_load32(&m->transpose);
+    m->mute_now = (uint32_t)fa_load32(&m->mute);
     /* With effects on, the time before the target is rendered and dropped, so the
      * reverb and chorus of what was playing just before ring on into it. */
     if (fa_load32(&m->effects) && frame < m->length) {
@@ -1205,7 +1309,8 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
     for (msg = first; msg; msg = msg->next) {
         if (msg->seconds > FA_MIDI_MAX_SECONDS) break;
         if (msg->type == TML_NOTE_ON || msg->type == TML_NOTE_OFF || msg->type == TML_CONTROL_CHANGE ||
-            msg->type == TML_PROGRAM_CHANGE || msg->type == TML_PITCH_BEND)
+            msg->type == TML_PROGRAM_CHANGE || msg->type == TML_PITCH_BEND ||
+            msg->type == TML_CHANNEL_PRESSURE || msg->type == TML_KEY_PRESSURE)
             nev++;
         if (msg->type == TML_SYSEX && msg->text && nsysex < 65535) { nev++; nsysex++; }
         if (msg->type == TML_LYRIC && msg->text_length > 0 && msg->text[0] != '%') nlyric_events++;
@@ -1275,7 +1380,8 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
         frame = (fa_frames)(msg->seconds * rate + 0.5);
         if (frame > last) last = frame;
         switch (msg->type) {
-        case TML_NOTE_ON: case TML_NOTE_OFF: case TML_CONTROL_CHANGE: case TML_PROGRAM_CHANGE: case TML_PITCH_BEND: {
+        case TML_NOTE_ON: case TML_NOTE_OFF: case TML_CONTROL_CHANGE: case TML_PROGRAM_CHANGE: case TML_PITCH_BEND:
+        case TML_CHANNEL_PRESSURE: case TML_KEY_PRESSURE: {
             midi_event* e = &m->ev[k++];
             e->frame = frame;
             e->channel = msg->channel & 15;
@@ -1286,6 +1392,8 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
             case TML_NOTE_OFF: e->type = EV_NOTE_OFF; break;
             case TML_CONTROL_CHANGE: e->type = EV_CONTROL; break;
             case TML_PROGRAM_CHANGE: e->type = EV_PROGRAM; e->value = (uint16_t)(msg->program & 0x7F); break;
+            case TML_CHANNEL_PRESSURE: e->type = EV_CHANNEL_PRESSURE; e->value = (uint16_t)(msg->channel_pressure & 0x7F); break;
+            case TML_KEY_PRESSURE: e->type = EV_KEY_PRESSURE; e->value = (uint16_t)(msg->key_pressure & 0x7F); break;
             default: e->type = EV_PITCH; e->value = (uint16_t)(msg->pitch_bend & 0x3FFF); break;
             }
             break;

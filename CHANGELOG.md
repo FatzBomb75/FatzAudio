@@ -18,6 +18,13 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- MIDI controllers and SoundFont modulators: the mod wheel and channel pressure add vibrato (RPN 5 sets its depth),
+  CC74/CC71 move the filter cutoff and resonance, CC73/CC75/CC72 the attack, decay and release, CC76-78 the vibrato rate,
+  depth and delay, with the GS/XG part NRPNs and part SysEx that set the same values; portamento (CC65, CC5, CC84),
+  sostenuto (CC66) and the soft pedal (CC67); a soundfont's own modulators (`pmod`/`imod`) are applied. Seeks replay
+  them. Files that use none of these, with soundfonts that have no modulators of their own, render bit for bit as before.
+  See [docs/features/midi.md](docs/features/midi.md#controllers-and-modulators).
+
 - Position events: `fa_stream_add_position_event` (.NET `AddPositionEvent`, `PositionReached`, new `ClearPositionEvents`)
   now works instead of returning `FA_ERROR_NOT_IMPLEMENTED`. BASS_SYNC_POS: one `FA_EVENT_POSITION` the first time
   playback passes a frame, frame-exact through tempo, loops and seeks, and in reverse playback too; up to 64 armed per
@@ -391,6 +398,7 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - A container that claims a sample rate over 768 kHz (a damaged ASF, MP4 or Matroska PCM track) is no longer decoded:
   the silence for a gap before its first packet could ask for gigabytes. A gap whose silence would pass 2^26 samples
   (more than 30 s of 32 channels at 48 kHz) is no longer filled, as a gap over 30 s already was not. Found by fuzzing.
+- .NET for iOS: the binding also tries `@rpath/fatzaudio.framework/fatzaudio` when the plain library name is not found. CI now runs the binding in a real .NET for iOS app (simulator) and a .NET for Android app (emulator), see `tools/dotnet-apps/`.
 - Ogg Opus and Ogg Vorbis: a song whose only audio page is also its last one (a short clip) came out 650 to 970 frames
   off when played straight through, on its own or chained after other songs: its last page was timed back from its
   granule without its end trim, while a seek timed it forward from its start. A chained file's later songs then played

@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-android</TargetFramework>
+    <OutputType>Exe</OutputType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <SupportedOSPlatformVersion>24</SupportedOSPlatformVersion>
+    <ApplicationId>net.fatzaudio.ciapp</ApplicationId>
+    <AndroidPackageFormat>apk</AndroidPackageFormat>
+    <RuntimeIdentifier>android-x64</RuntimeIdentifier>
+    <!-- The directory with the x86_64 libfatzaudio.so (the emulator job's CMake build/bin). -->
+    <FatzAudioNativeDir Condition="'$(FatzAudioNativeDir)' == ''">$(MSBuildThisFileDirectory)../../../build-android-x64/bin</FatzAudioNativeDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../../bindings/dotnet/src/FatzAudio/FatzAudio.csproj" />
+    <Compile Include="../shared/AppCheck.cs" />
+    <AndroidNativeLibrary Include="$(FatzAudioNativeDir)/libfatzaudio.so" Abi="x86_64" />
+  </ItemGroup>
+
+</Project>

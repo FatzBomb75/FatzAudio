@@ -325,6 +325,14 @@ if(UNIX)
 endif()
 add_test(NAME midi COMMAND fa_test_midi WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
+add_executable(fa_test_midi_controls test_midi_controls.c)
+target_compile_options(fa_test_midi_controls PRIVATE ${FA_WARNINGS})
+target_link_libraries(fa_test_midi_controls PRIVATE fatzaudio)
+if(UNIX)
+    target_link_libraries(fa_test_midi_controls PRIVATE m)
+endif()
+add_test(NAME midi_controls COMMAND fa_test_midi_controls)
+
 # White-box: it plays the audio thread itself for FA_EVENT_TRACKER_ROW.
 add_executable(fa_test_tracker test_tracker.c)
 target_include_directories(fa_test_tracker PRIVATE

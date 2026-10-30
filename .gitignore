@@ -6,3 +6,4 @@ legacy/
 build-*/
 __pycache__/
 fa_analysis_cache/
+tools/dotnet-apps/android/Resources/raw/

@@ -19,9 +19,8 @@
    [OPTIONAL] #define TSF_POW, TSF_POWF, TSF_EXPF, TSF_LOG, TSF_TAN, TSF_LOG10, TSF_SQRT to avoid math.h
 
    NOT YET IMPLEMENTED
-     - Support for ChorusEffectsSend and ReverbEffectsSend generators
      - Better low-pass filter without lowering performance too much
-     - Support for modulators
+     - Linked modulators (FatzAudio: other modulators are supported, see README.md)
 
    LICENSE (MIT)
 
@@ -231,6 +230,13 @@ TSFDEF int tsf_channel_set_pitchrange(tsf* f, int channel, float pitch_range);
 TSFDEF int tsf_channel_set_tuning(tsf* f, int channel, float tuning);
 TSFDEF void tsf_set_tuning(tsf* f, float tuning); // FatzAudio: master tuning in semitones, for every channel
 TSFDEF int tsf_channel_set_sustain(tsf* f, int channel, int flag_sustain);
+// FatzAudio: sostenuto (CC66: holds the notes whose keys are down when it is pressed),
+// channel and polyphonic key pressure (0..127), and the vibrato depth in cents that full
+// channel pressure adds (the SoundFont 2.04 default modulator's 50; 0 after a GS, XG or GM2 reset)
+TSFDEF int tsf_channel_set_sostenuto(tsf* f, int channel, int flag_sostenuto);
+TSFDEF int tsf_channel_set_pressure(tsf* f, int channel, int pressure);
+TSFDEF int tsf_channel_set_key_pressure(tsf* f, int channel, int key, int pressure);
+TSFDEF int tsf_channel_set_pressure_vibrato(tsf* f, int channel, float cents);
 
 // Start or stop playing notes on a channel (needs channel preset to be set)
 //   channel: channel number
@@ -243,6 +249,8 @@ TSFDEF void tsf_channel_note_off_all(tsf* f, int channel); //end with sustain an
 TSFDEF void tsf_channel_sounds_off_all(tsf* f, int channel); //end immediately
 
 // Apply a MIDI control change to the channel (not all controllers are supported!)
+// FatzAudio: also CC1, CC5, CC65-67, CC71-78, CC84, NRPN 01 xx (GS/XG part sound controllers), RPN 5
+// and any controller a soundfont modulator reads
 //    (tsf_channel_midi_control returns 0 on allocation failure of new channel, otherwise 1)
 TSFDEF int tsf_channel_midi_control(tsf* f, int channel, int controller, int control_value);
 
@@ -255,6 +263,7 @@ TSFDEF float tsf_channel_get_volume(tsf* f, int channel);
 TSFDEF int tsf_channel_get_pitchwheel(tsf* f, int channel);
 TSFDEF float tsf_channel_get_pitchrange(tsf* f, int channel);
 TSFDEF float tsf_channel_get_tuning(tsf* f, int channel);
+TSFDEF int tsf_channel_get_midi_control(tsf* f, int channel, int controller); // FatzAudio: last value (0..127)
 
 #ifdef __cplusplus
 #  undef CPP_DEFAULT0
@@ -358,6 +367,10 @@ struct tsf
 	float globalGainDB;
 	int* refCount;
 	float globalTuning; // FatzAudio: semitones added to every channel (master tuning)
+	struct tsf_modulator* modulators; // FatzAudio: every region's modulator list, shared by copies
+	int modulatorNum;
+	tsf_u32 modCC[4];   // FatzAudio: controllers some modulator reads (bit n = CC n)
+	tsf_u32 modGC;      // FatzAudio: general controllers some modulator reads (bit n = source n)
 };
 
 #ifndef TSF_NO_STDIO
@@ -456,7 +469,12 @@ struct tsf_region
 	float delayVibLFO;
 	int freqVibLFO, vibLfoToPitch;
 	float chorusSend, reverbSend; // FatzAudio: effect sends, 0.1% units (generators 15 and 16)
+	int modStart, modNum; // FatzAudio: the region's modulators in tsf::modulators
 };
+
+// FatzAudio: a SoundFont modulator, ready to evaluate: sources as in the file (SF2 2.04
+// section 8.2), the destination as a TSF_MOD_* slot, the amount in the generator's units.
+struct tsf_modulator { tsf_u16 src, amtSrc; unsigned char slot, absolute, kind; float amount; };
 
 struct tsf_preset
 {
@@ -477,6 +495,15 @@ struct tsf_voice
 	struct tsf_voice_envelope ampenv, modenv;
 	struct tsf_voice_lowpass lowpass;
 	struct tsf_voice_lfo modlfo, viblfo;
+	// FatzAudio: the region's values with the modulators and sound controllers applied
+	// (generator units), and what they change on top of the region: gain (dB), pitch
+	// (cents), pan and effect sends (0.1%); a portamento glide (cents, fading to 0 over
+	// portaTotal samples); held by sostenuto; struck with the soft pedal down
+	float vibLfoToPitch, modLfoToPitch, modEnvToPitch, filterFc, filterQ, modLfoToFilterFc, modEnvToFilterFc, modLfoToVolume;
+	float freqVibLFO, freqModLFO, modGainDB, modPitch, modPan, modReverb, modChorus;
+	float portaCents; int portaLeft, portaTotal;
+	float envMod[15]; // the envelope offsets last applied: both envelopes' 6 slots, the sound controllers' 3 times
+	unsigned char sostenuto, soft;
 };
 
 struct tsf_channel
@@ -484,6 +511,13 @@ struct tsf_channel
 	unsigned short presetIndex, bank, pitchWheel, midiPan, midiVolume, midiExpression, midiRPN, midiData : 14, sustain : 1;
 	float panOffset, gainDB, pitchRange, tuning;
 	unsigned char midiReverb, midiChorus; // FatzAudio: CC91 and CC93
+	// FatzAudio: every controller's last value, pressure, NRPN select (0xFFFF none),
+	// sostenuto, modulation depth range (RPN 5) and pressure vibrato in cents, the
+	// last key struck and where the next note glides from (portamento; -1 none)
+	unsigned char cc[128], keyPressure[128], chanPressure, sostenuto;
+	unsigned short midiNRPN;
+	float modRange, pressureVibrato;
+	short lastKey, portaKey, portaFrom;
 };
 
 struct tsf_channels
@@ -755,6 +789,153 @@ static int tsf_hydra_valid(const struct tsf_hydra* h)
 #define TSF_MAX_REGIONS 0x400000 // FatzAudio: refuse soundfonts that would need more regions in total
 #endif
 
+// FatzAudio: modulators (SoundFont 2.04 sections 8.2 to 8.5 and 9.5). Each destination
+// generator TinySoundFont models gets a slot; a voice sums its modulators' outputs per
+// slot (tsf_voice_modulate). Linked modulators and other destinations are left out.
+enum
+{
+	TSF_MOD_MODLFOTOPITCH, TSF_MOD_VIBLFOTOPITCH, TSF_MOD_MODENVTOPITCH, TSF_MOD_FILTERFC, TSF_MOD_FILTERQ,
+	TSF_MOD_MODLFOTOFILTERFC, TSF_MOD_MODENVTOFILTERFC, TSF_MOD_MODLFOTOVOLUME, TSF_MOD_CHORUS, TSF_MOD_REVERB, TSF_MOD_PAN,
+	TSF_MOD_DELAYMODLFO, TSF_MOD_FREQMODLFO, TSF_MOD_DELAYVIBLFO, TSF_MOD_FREQVIBLFO,
+	TSF_MOD_MODENV,                     // delay, attack, hold, decay, sustain, release
+	TSF_MOD_AMPENV = TSF_MOD_MODENV + 6, // the same for the volume envelope
+	TSF_MOD_ATTENUATION = TSF_MOD_AMPENV + 6, TSF_MOD_COARSETUNE, TSF_MOD_FINETUNE,
+	TSF_MOD_SLOTS,
+	TSF_MOD_NONE = 0xFF
+};
+// The two default vibrato modulators scale with the channel's modulation depth range
+// (RPN 5) and pressure vibrato; a soundfont modulator that replaces one is used as it is.
+enum { TSF_MODKIND_FILE, TSF_MODKIND_MODWHEEL, TSF_MODKIND_PRESSURE };
+#define TSF_MAX_ZONE_MODS 64        // per region (instrument and preset level each); more are ignored
+#define TSF_MAX_MODULATORS 0x100000 // per soundfont; regions past it get the default modulators only
+#define TSF_DEFAULT_MODS 2
+
+static unsigned char tsf_mod_slot(tsf_u16 gen)
+{
+	switch (gen)
+	{
+		case  5: return TSF_MOD_MODLFOTOPITCH;    case  6: return TSF_MOD_VIBLFOTOPITCH;  case  7: return TSF_MOD_MODENVTOPITCH;
+		case  8: return TSF_MOD_FILTERFC;         case  9: return TSF_MOD_FILTERQ;        case 10: return TSF_MOD_MODLFOTOFILTERFC;
+		case 11: return TSF_MOD_MODENVTOFILTERFC; case 13: return TSF_MOD_MODLFOTOVOLUME; case 15: return TSF_MOD_CHORUS;
+		case 16: return TSF_MOD_REVERB;           case 17: return TSF_MOD_PAN;            case 21: return TSF_MOD_DELAYMODLFO;
+		case 22: return TSF_MOD_FREQMODLFO;       case 23: return TSF_MOD_DELAYVIBLFO;    case 24: return TSF_MOD_FREQVIBLFO;
+		case 48: return TSF_MOD_ATTENUATION;      case 51: return TSF_MOD_COARSETUNE;     case 52: return TSF_MOD_FINETUNE;
+	}
+	if (gen >= 25 && gen <= 30) return (unsigned char)(TSF_MOD_MODENV + (gen - 25));
+	if (gen >= 33 && gen <= 38) return (unsigned char)(TSF_MOD_AMPENV + (gen - 33));
+	return TSF_MOD_NONE;
+}
+
+// A source the synth feeds (8.2.1): a known curve, and a general controller (velocity, key,
+// poly and channel pressure, pitch wheel and its range) or a MIDI CC the spec allows.
+// "No controller" is 1 as the amount source and makes a primary source unusable.
+static int tsf_mod_source_valid(tsf_u16 src, int primary)
+{
+	int index = src & 127;
+	if ((src >> 10) > 3) return 0;
+	if (src & 0x80) return !(index == 0 || index == 6 || (index >= 32 && index <= 63) || (index >= 98 && index <= 101) || index >= 120);
+	switch (index) { case 0: return !primary; case 2: case 3: case 10: case 13: case 14: case 16: return 1; }
+	return 0;
+}
+
+// The defaults TinySoundFont applies itself (velocity, CC7 and CC11 to attenuation, CC10 to
+// pan, CC91 and CC93 to the sends): a soundfont modulator identical to one of them is not
+// used, so they keep their fixed amounts (as BASSMIDI, which reads no CC modulators but CC21-24).
+static int tsf_mod_builtin(tsf_u16 src, tsf_u16 dest, tsf_u16 amtSrc)
+{
+	return amtSrc == 0 && ((dest == 48 && (src == 0x0502 || src == 0x0587 || src == 0x058B)) ||
+		(dest == 17 && src == 0x028A) || (dest == 16 && src == 0x00DB) || (dest == 15 && src == 0x00DD));
+}
+
+struct tsf_modlist { int num; struct tsf_modulator mods[TSF_MAX_ZONE_MODS]; unsigned char zone[TSF_MAX_ZONE_MODS]; };
+
+// Adds a modulator of `zone`; an identical one (same sources and destination) from an
+// earlier zone is replaced, one from the same zone wins over this one.
+static void tsf_modlist_add(struct tsf_modlist* l, tsf_u16 src, tsf_u16 dest, tsf_s16 amount, tsf_u16 amtSrc, tsf_u16 trans, unsigned char zone)
+{
+	unsigned char slot = ((dest & 0x8000) ? TSF_MOD_NONE : tsf_mod_slot(dest));
+	int i;
+	if (slot == TSF_MOD_NONE || (trans != 0 && trans != 2) || !tsf_mod_source_valid(src, 1) || !tsf_mod_source_valid(amtSrc, 0) || tsf_mod_builtin(src, dest, amtSrc)) return;
+	for (i = 0; i != l->num; i++)
+		if (l->mods[i].src == src && l->mods[i].slot == slot && l->mods[i].amtSrc == amtSrc) break;
+	if (i != l->num && l->zone[i] == zone) return;
+	if (i == l->num) { if (l->num == TSF_MAX_ZONE_MODS) return; l->num++; }
+	l->mods[i].src = src; l->mods[i].amtSrc = amtSrc; l->mods[i].slot = slot;
+	l->mods[i].absolute = (unsigned char)(trans == 2); l->mods[i].kind = TSF_MODKIND_FILE; l->mods[i].amount = amount;
+	l->zone[i] = zone;
+}
+
+// SoundFont 2.04 8.4.3 and 8.4.4: channel pressure and the mod wheel to vibrato depth, 50
+// cents each. 8.4.2 (velocity to filter cutoff) is left out, as in BASSMIDI; the others are
+// built in (tsf_mod_builtin).
+static void tsf_modlist_defaults(struct tsf_modlist* l)
+{
+	static const struct tsf_modulator defaults[TSF_DEFAULT_MODS] = {
+		{ 0x000D, 0, TSF_MOD_VIBLFOTOPITCH, 0, TSF_MODKIND_PRESSURE, 50.0f },
+		{ 0x0081, 0, TSF_MOD_VIBLFOTOPITCH, 0, TSF_MODKIND_MODWHEEL, 50.0f } };
+	int i;
+	l->num = TSF_DEFAULT_MODS;
+	for (i = 0; i != TSF_DEFAULT_MODS; i++) { l->mods[i] = defaults[i]; l->zone[i] = 0; }
+}
+
+static void tsf_modlist_add_pbag(struct tsf_modlist* l, const struct tsf_hydra* h, const struct tsf_hydra_pbag* bag, unsigned char zone)
+{
+	int i;
+	if (bag[0].modNdx > bag[1].modNdx || bag[1].modNdx > h->pmodNum) return; // FatzAudio: out of order or range: none
+	for (i = bag[0].modNdx; i != bag[1].modNdx; i++)
+		tsf_modlist_add(l, h->pmods[i].modSrcOper, h->pmods[i].modDestOper, h->pmods[i].modAmount, h->pmods[i].modAmtSrcOper, h->pmods[i].modTransOper, zone);
+}
+
+static void tsf_modlist_add_ibag(struct tsf_modlist* l, const struct tsf_hydra* h, const struct tsf_hydra_ibag* bag, unsigned char zone)
+{
+	int i;
+	if (bag[0].instModNdx > bag[1].instModNdx || bag[1].instModNdx > h->imodNum) return;
+	for (i = bag[0].instModNdx; i != bag[1].instModNdx; i++)
+		tsf_modlist_add(l, h->imods[i].modSrcOper, h->imods[i].modDestOper, h->imods[i].modAmount, h->imods[i].modAmtSrcOper, h->imods[i].modTransOper, zone);
+}
+
+static int tsf_modulator_equal(const struct tsf_modulator* a, const struct tsf_modulator* b)
+{
+	return a->src == b->src && a->amtSrc == b->amtSrc && a->slot == b->slot && a->absolute == b->absolute && a->kind == b->kind && a->amount == b->amount;
+}
+
+// Stores a region's modulators: the instrument's (defaults replaced), then the preset's,
+// which add to them (9.5). Equal lists share storage with the previous region or the
+// defaults at index 0. Returns 0 when out of memory.
+static int tsf_store_mods(tsf* res, struct tsf_region* region, const struct tsf_modlist* il, const struct tsf_modlist* pl, int* capacity, int* lastStart)
+{
+	int n = il->num + pl->num, i;
+	struct tsf_modulator* m;
+	region->modStart = 0; region->modNum = TSF_DEFAULT_MODS;
+	if (n == TSF_DEFAULT_MODS && !pl->num)
+	{
+		for (i = 0; i != n && tsf_modulator_equal(&il->mods[i], &res->modulators[i]); i++) {}
+		if (i == n) return 1;
+	}
+	if (*lastStart >= 0 && *lastStart + n <= res->modulatorNum)
+	{
+		m = res->modulators + *lastStart;
+		for (i = 0; i != n && tsf_modulator_equal(i < il->num ? &il->mods[i] : &pl->mods[i - il->num], &m[i]); i++) {}
+		if (i == n) { region->modStart = *lastStart; region->modNum = n; return 1; }
+	}
+	if (res->modulatorNum + n > TSF_MAX_MODULATORS) return 1;
+	if (res->modulatorNum + n > *capacity)
+	{
+		int newCapacity = (*capacity * 2 > res->modulatorNum + n ? *capacity * 2 : res->modulatorNum + n);
+		m = (struct tsf_modulator*)TSF_REALLOC(res->modulators, newCapacity * sizeof(struct tsf_modulator));
+		if (!m) return 0;
+		res->modulators = m;
+		*capacity = newCapacity;
+	}
+	m = res->modulators + res->modulatorNum;
+	for (i = 0; i != il->num; i++) m[i] = il->mods[i];
+	for (i = 0; i != pl->num; i++) m[il->num + i] = pl->mods[i];
+	region->modStart = *lastStart = res->modulatorNum;
+	region->modNum = n;
+	res->modulatorNum += n;
+	return 1;
+}
+
 static int tsf_load_presets(tsf* res, struct tsf_hydra *hydra, unsigned int fontSampleCount)
 {
 	enum { GenInstrument = 41, GenKeyRange = 43, GenVelRange = 44, GenSampleID = 53 };
@@ -762,12 +943,17 @@ static int tsf_load_presets(tsf* res, struct tsf_hydra *hydra, unsigned int font
 	struct tsf_hydra_phdr *pphdr, **sortedPhdrs;
 	int phdrIndex;
 	long long totalRegions = 0;
+	struct tsf_modlist instBase, presetGlobal, il, pl; // FatzAudio: modulators
+	int modCapacity = 256, lastModStart = -1;
 	if (!tsf_hydra_valid(hydra)) return 0;
 	res->presetNum = hydra->phdrNum - 1;
 	res->presets = (struct tsf_preset*)TSF_MALLOC(res->presetNum * sizeof(struct tsf_preset));
 	sortedPhdrs = (struct tsf_hydra_phdr**)TSF_MALLOC(res->presetNum * sizeof(struct tsf_hydra_phdr*));
-	if (!res->presets || !sortedPhdrs) { TSF_FREE(res->presets); res->presets = TSF_NULL; TSF_FREE(sortedPhdrs); return 0; }
-	else { int i; for (i = 0; i != res->presetNum; i++) { res->presets[i].regions = TSF_NULL; res->presets[i].regionNum = 0; sortedPhdrs[i] = &hydra->phdrs[i]; } }
+	res->modulators = (struct tsf_modulator*)TSF_MALLOC(modCapacity * sizeof(struct tsf_modulator));
+	if (!res->presets || !sortedPhdrs || !res->modulators) { TSF_FREE(res->presets); res->presets = TSF_NULL; TSF_FREE(sortedPhdrs); TSF_FREE(res->modulators); res->modulators = TSF_NULL; return 0; }
+	tsf_modlist_defaults(&il);
+	for (res->modulatorNum = 0; res->modulatorNum != TSF_DEFAULT_MODS; res->modulatorNum++) res->modulators[res->modulatorNum] = il.mods[res->modulatorNum];
+	{ int i; for (i = 0; i != res->presetNum; i++) { res->presets[i].regions = TSF_NULL; res->presets[i].regionNum = 0; sortedPhdrs[i] = &hydra->phdrs[i]; } }
 	qsort(sortedPhdrs, (size_t)res->presetNum, sizeof(struct tsf_hydra_phdr*), tsf_phdr_compare);
 	for (phdrIndex = 0; phdrIndex != res->presetNum; phdrIndex++)
 	{
@@ -817,9 +1003,11 @@ static int tsf_load_presets(tsf* res, struct tsf_hydra *hydra, unsigned int font
 			TSF_FREE(res->presets);
 			res->presets = TSF_NULL;
 			TSF_FREE(sortedPhdrs);
+			TSF_FREE(res->modulators); res->modulators = TSF_NULL;
 			return 0;
 		}
 		tsf_region_clear(&globalRegion, TSF_TRUE);
+		presetGlobal.num = 0;
 
 		// Zones.
 		for (ppbag = hydra->pbags + pphdr->presetBagNdx, ppbagEnd = hydra->pbags + pphdr[1].presetBagNdx; ppbag != ppbagEnd; ppbag++)
@@ -827,6 +1015,9 @@ static int tsf_load_presets(tsf* res, struct tsf_hydra *hydra, unsigned int font
 			struct tsf_hydra_pgen *ppgen, *ppgenEnd; struct tsf_hydra_inst *pinst; struct tsf_hydra_ibag *pibag, *pibagEnd; struct tsf_hydra_igen *pigen, *pigenEnd;
 			struct tsf_region presetRegion = globalRegion;
 			int hadGenInstrument = 0;
+
+			pl = presetGlobal; // FatzAudio: the zone's modulators over the global zone's
+			tsf_modlist_add_pbag(&pl, hydra, ppbag, 2);
 
 			// Generators.
 			for (ppgen = hydra->pgens + ppbag->genNdx, ppgenEnd = hydra->pgens + ppbag[1].genNdx; ppgen != ppgenEnd; ppgen++)
@@ -839,12 +1030,15 @@ static int tsf_load_presets(tsf* res, struct tsf_hydra *hydra, unsigned int font
 					if (whichInst >= hydra->instNum - 1) continue; // FatzAudio: the last one is the terminal record
 
 					tsf_region_clear(&instRegion, TSF_FALSE);
+					tsf_modlist_defaults(&instBase);
 					pinst = &hydra->insts[whichInst];
 					for (pibag = hydra->ibags + pinst->instBagNdx, pibagEnd = hydra->ibags + pinst[1].instBagNdx; pibag != pibagEnd; pibag++)
 					{
 						// Generators.
 						struct tsf_region zoneRegion = instRegion;
 						int hadSampleID = 0;
+						il = instBase; // FatzAudio: the zone's modulators over the global zone's and the defaults
+						tsf_modlist_add_ibag(&il, hydra, pibag, 2);
 						for (pigen = hydra->igens + pibag->instGenNdx, pigenEnd = hydra->igens + pibag[1].instGenNdx; pigen != pigenEnd; pigen++)
 						{
 							if (pigen->genOper == GenSampleID)
@@ -891,6 +1085,14 @@ static int tsf_load_presets(tsf* res, struct tsf_hydra *hydra, unsigned int font
 								if (zoneRegion.offset > zoneRegion.end) zoneRegion.offset = zoneRegion.end;
 								if (zoneRegion.loop_start > zoneRegion.loop_end) zoneRegion.loop_start = zoneRegion.loop_end;
 
+								if (!tsf_store_mods(res, &zoneRegion, &il, &pl, &modCapacity, &lastModStart)) // FatzAudio
+								{
+									int i; for (i = 0; i != res->presetNum; i++) TSF_FREE(res->presets[i].regions);
+									TSF_FREE(res->presets); res->presets = TSF_NULL;
+									TSF_FREE(sortedPhdrs);
+									TSF_FREE(res->modulators); res->modulators = TSF_NULL;
+									return 0;
+								}
 								preset->regions[region_index] = zoneRegion;
 								region_index++;
 								hadSampleID = 1;
@@ -900,26 +1102,39 @@ static int tsf_load_presets(tsf* res, struct tsf_hydra *hydra, unsigned int font
 
 						// Handle instrument's global zone.
 						if (pibag == hydra->ibags + pinst->instBagNdx && !hadSampleID)
+						{
+							int i;
 							instRegion = zoneRegion;
-
-						// Modulators (TODO)
-						//if (ibag->instModNdx < ibag[1].instModNdx) addUnsupportedOpcode("any modulator");
+							instBase = il; // FatzAudio
+							for (i = 0; i != instBase.num; i++) if (instBase.zone[i] == 2) instBase.zone[i] = 1;
+						}
 					}
 					hadGenInstrument = 1;
 				}
 				else tsf_region_operator(&presetRegion, ppgen->genOper, &ppgen->genAmount, TSF_NULL);
 			}
 
-			// Modulators (TODO)
-			//if (pbag->modNdx < pbag[1].modNdx) addUnsupportedOpcode("any modulator");
-
 			// Handle preset's global zone.
 			if (ppbag == hydra->pbags + pphdr->presetBagNdx && !hadGenInstrument)
+			{
+				int i;
 				globalRegion = presetRegion;
+				presetGlobal = pl; // FatzAudio
+				for (i = 0; i != presetGlobal.num; i++) presetGlobal.zone[i] = 1;
+			}
 		}
 		preset->regionNum = region_index; // FatzAudio: only the regions actually filled in
 	}
 	TSF_FREE(sortedPhdrs);
+	// FatzAudio: which controllers the modulators read, so a change of others costs nothing
+	for (phdrIndex = 0; phdrIndex != res->modulatorNum; phdrIndex++)
+	{
+		tsf_u16 srcs[2]; int k;
+		srcs[0] = res->modulators[phdrIndex].src; srcs[1] = res->modulators[phdrIndex].amtSrc;
+		for (k = 0; k != 2; k++)
+			if (srcs[k] & 0x80) res->modCC[(srcs[k] & 127) >> 5] |= 1u << (srcs[k] & 31);
+			else res->modGC |= 1u << (srcs[k] & 31);
+	}
 	return 1;
 }
 
@@ -1279,8 +1494,232 @@ static void tsf_voice_calcpitchratio(struct tsf_voice* v, float pitchShift, floa
 	double note = v->playingKey + v->region->transpose + v->region->tune / 100.0;
 	double adjustedPitch = v->region->pitch_keycenter + (note - v->region->pitch_keycenter) * (v->region->pitch_keytrack / 100.0);
 	if (pitchShift) adjustedPitch += pitchShift;
+	if (v->modPitch) adjustedPitch += v->modPitch / 100.0; // FatzAudio: tuning modulators
 	v->pitchInputTimecents = adjustedPitch * 100.0;
 	v->pitchOutputFactor = v->region->sample_rate / (tsf_timecents2Secsd(v->region->pitch_keycenter * 100.0) * outSampleRate);
+}
+
+// FatzAudio: modulators and controllers ------------------------------------------------
+
+// GS/XG sound controllers (CC71-78, and the NRPNs that set the same values) move a value by
+// these steps per unit away from 64. Roland and Yamaha publish no curves; these are close
+// enough to be heard the same way: CC74 = 0 closes an open filter to about 500 Hz, CC73 =
+// 127 turns an instant attack into a 0.6 s fade-in.
+#define TSF_SC_CUTOFF    100.0f // cents (CC74, NRPN 01 20)
+#define TSF_SC_RESONANCE   3.0f // centibels (CC71, NRPN 01 21)
+#define TSF_SC_TIME      100.0f // timecents (CC73 attack, CC75 decay, CC72 release, CC78 vibrato delay)
+#define TSF_SC_TIME_FLOOR (-7200.0f) // an instant time lengthened by them starts from 1/64 s
+#define TSF_SC_VIBRATE    37.5f // cents of LFO frequency (CC76, NRPN 01 08)
+#define TSF_SC_VIBDEPTH    1.0f // cents of vibrato depth (CC77, NRPN 01 09)
+#define TSF_SOFT_CUTOFF (-1200.0f) // cents, notes struck with the soft pedal (CC67) down
+#define TSF_SOFT_ATTEN    30.0f // centibels, the same
+
+static float tsf_mod_curve(int type, float x)
+{
+	float v = x * 128.0f, y;
+	switch (type)
+	{
+		case 1: return (v >= 127.0f ? 1.0f : (float)(-(40.0 / 96.0) * TSF_LOG10((127.0f - v) / 127.0f))); // concave
+		case 2: if (v <= 0.0f) return 0.0f; y = (float)(1.0 + (40.0 / 96.0) * TSF_LOG10(v / 127.0f)); return (y < 0.0f ? 0.0f : y); // convex
+		case 3: return (x >= 0.5f ? 1.0f : 0.0f); // switch
+		default: return x;
+	}
+}
+
+// A modulator source's value (SF2 2.04 8.2): the controller as 0..1 (pitch wheel: 0..16383),
+// direction, polarity and curve applied. Without a channel, controllers are at rest.
+static float tsf_mod_source(tsf_u16 src, const struct tsf_channel* c, const struct tsf_voice* v)
+{
+	int index = src & 127, type = src >> 10;
+	float x, range = 128.0f;
+	if (src & 0x80) x = (c ? c->cc[index] : 0.0f);
+	else switch (index)
+	{
+		case 0: return 1.0f;
+		case 2: x = v->ampenv.midiVelocity; break;
+		case 3: x = (float)v->playingKey; break;
+		case 10: x = (c ? c->keyPressure[v->playingKey & 127] : 0.0f); break;
+		case 13: x = (c ? c->chanPressure : 0.0f); break;
+		case 14: x = (c ? c->pitchWheel : 8192.0f); range = 16384.0f; break;
+		case 16: x = (c ? c->pitchRange : 2.0f); break;
+		default: return 0.0f;
+	}
+	// negative: linear 1..1/128 as FluidSynth; concave and convex from 127 - value, so the
+	// controller at its top gives 0 (convex from 128 - value would give 0.12)
+	if (src & 0x100) x = ((type == 1 || type == 2) && !(src & 0x200) ? (range - 1.0f - x) / range : 1.0f - x / range);
+	else x /= range;
+	if (!(src & 0x200)) return tsf_mod_curve(type, x);
+	if (type == 0) return 2.0f * x - 1.0f; // bipolar: -1..1, curves mirrored around the middle
+	if (type == 3) return (x >= 0.5f ? 1.0f : -1.0f);
+	return (x > 0.5f ? tsf_mod_curve(type, 2.0f * x - 1.0f) : -tsf_mod_curve(type, 1.0f - 2.0f * x));
+}
+
+// A time in seconds (0: instant) moved by `tc` timecents of modulators, then by `stc` of a
+// sound controller, which first lifts a very short time to TSF_SC_TIME_FLOOR so it can lengthen it.
+static float tsf_secs_mod(float secs, float tc, float stc)
+{
+	float t;
+	if (!tc && !stc) return secs;
+	t = (secs > 0.0f ? (float)(1200.0 * TSF_LOG(secs) / 0.69314718055994530942) : -12000.0f) + tc;
+	if (stc > 0.0f && t < TSF_SC_TIME_FLOOR) t = TSF_SC_TIME_FLOOR;
+	t += stc;
+	if (t > 8000.0f) t = 8000.0f;
+	return (t < -11950.0f ? 0.0f : tsf_timecents2Secsf(t));
+}
+
+// The same for a hold or decay time still in timecents (scaled by key at note on).
+static float tsf_tc_mod(float tc, float off, float stc)
+{
+	if (!off && !stc) return tc;
+	tc += off;
+	if (stc > 0.0f && tc < TSF_SC_TIME_FLOOR) tc = TSF_SC_TIME_FLOOR;
+	return tc + stc;
+}
+
+// An envelope's parameters with the modulators' offsets (delay, attack, hold, decay,
+// sustain, release; sustain in centibels or 0.1%) and the sound controllers' times.
+static void tsf_envelope_mod(struct tsf_envelope* p, const struct tsf_envelope* region, const float* m, float sAttack, float sDecay, float sRelease, TSF_BOOL isAmp)
+{
+	*p = *region;
+	p->delay = tsf_secs_mod(p->delay, m[0], 0.0f);
+	p->attack = tsf_secs_mod(p->attack, m[1], sAttack);
+	p->hold = (p->keynumToHold ? tsf_tc_mod(p->hold, m[2], 0.0f) : tsf_secs_mod(p->hold, m[2], 0.0f));
+	p->decay = (p->keynumToDecay ? tsf_tc_mod(p->decay, m[3], sDecay) : tsf_secs_mod(p->decay, m[3], sDecay));
+	if (m[4])
+	{
+		if (isAmp) p->sustain *= tsf_decibelsToGain(-m[4] / 10.0f);
+		else p->sustain -= m[4] / 1000.0f;
+		if (p->sustain < 0.0f) p->sustain = 0.0f; else if (p->sustain > 1.0f) p->sustain = 1.0f;
+	}
+	p->release = tsf_secs_mod(p->release, m[5], sRelease);
+}
+
+static float tsf_clampf(float v, float lo, float hi) { return (v < lo ? lo : (v > hi ? hi : v)); }
+
+static float tsf_channel_pitchshift(tsf* f, struct tsf_channel* c)
+{
+	return f->globalTuning + (c->pitchWheel == 8192 ? c->tuning : ((c->pitchWheel / 16383.0f * c->pitchRange * 2.0f) - c->pitchRange + c->tuning)); // FatzAudio: globalTuning
+}
+
+static void tsf_voice_setpan(struct tsf_voice* v, float newpan)
+{
+	if      (newpan <= -0.5f) { v->panFactorLeft = 1.0f; v->panFactorRight = 0.0f; }
+	else if (newpan >=  0.5f) { v->panFactorLeft = 0.0f; v->panFactorRight = 1.0f; }
+	else { v->panFactorLeft = TSF_SQRTF(0.5f - newpan); v->panFactorRight = TSF_SQRTF(0.5f + newpan); }
+}
+
+// Evaluates the voice's modulators and its channel's sound controllers and applies what
+// changed: at note on (`start`, after the region's own setup) and when a source changes.
+// Envelope times change the segments still to come; LFO delays only count at note on.
+static void tsf_voice_modulate(tsf* f, struct tsf_voice* v, TSF_BOOL start)
+{
+	struct tsf_region* r = v->region;
+	struct tsf_channel* c = (f->channels && v->playingChannel >= 0 && v->playingChannel < f->channels->channelNum ? &f->channels->channels[v->playingChannel] : TSF_NULL);
+	const struct tsf_modulator *mod = f->modulators + r->modStart, *modEnd = mod + r->modNum;
+	float m[TSF_MOD_SLOTS], sAttack = 0.0f, sDecay = 0.0f, sRelease = 0.0f, sDelay = 0.0f, depth = 0.0f, val, val2, env[15];
+	TSF_BOOL envChanged = TSF_FALSE;
+	int i;
+	for (i = 0; i != TSF_MOD_SLOTS; i++) m[i] = 0.0f;
+	for (; mod != modEnd; mod++)
+	{
+		float amount = mod->amount;
+		if (mod->kind == TSF_MODKIND_MODWHEEL) amount = (c ? c->modRange : 50.0f);
+		else if (mod->kind == TSF_MODKIND_PRESSURE) amount = (c ? c->pressureVibrato : 50.0f);
+		val = amount * tsf_mod_source(mod->src, c, v);
+		if (val == 0.0f) continue;
+		val *= tsf_mod_source(mod->amtSrc, c, v);
+		m[mod->slot] += (mod->absolute && val < 0.0f ? -val : val);
+	}
+	if (c)
+	{
+		m[TSF_MOD_FILTERFC] += (c->cc[74] - 64) * TSF_SC_CUTOFF;
+		m[TSF_MOD_FILTERQ] += (c->cc[71] - 64) * TSF_SC_RESONANCE;
+		m[TSF_MOD_FREQVIBLFO] += (c->cc[76] - 64) * TSF_SC_VIBRATE;
+		depth = (c->cc[77] - 64) * TSF_SC_VIBDEPTH;
+		sAttack = (c->cc[73] - 64) * TSF_SC_TIME;
+		sDecay = (c->cc[75] - 64) * TSF_SC_TIME;
+		sRelease = (c->cc[72] - 64) * TSF_SC_TIME;
+		sDelay = (c->cc[78] - 64) * TSF_SC_TIME;
+	}
+	if (v->soft) { m[TSF_MOD_FILTERFC] += TSF_SOFT_CUTOFF; m[TSF_MOD_ATTENUATION] += TSF_SOFT_ATTEN; }
+
+	// LFO and envelope depths
+	val = (float)r->vibLfoToPitch + m[TSF_MOD_VIBLFOTOPITCH];
+	if (depth) { val2 = val + depth; val = (val >= 0.0f ? (val2 < 0.0f ? 0.0f : val2) : (val2 > 0.0f ? 0.0f : val2)); } // depth moves toward 0, not past it
+	v->vibLfoToPitch = (m[TSF_MOD_VIBLFOTOPITCH] || depth ? tsf_clampf(val, -12000.0f, 12000.0f) : val);
+	v->modLfoToPitch = (float)r->modLfoToPitch + m[TSF_MOD_MODLFOTOPITCH];
+	v->modEnvToPitch = (float)r->modEnvToPitch + m[TSF_MOD_MODENVTOPITCH];
+	v->modLfoToFilterFc = (float)r->modLfoToFilterFc + m[TSF_MOD_MODLFOTOFILTERFC];
+	v->modEnvToFilterFc = (float)r->modEnvToFilterFc + m[TSF_MOD_MODENVTOFILTERFC];
+	v->modLfoToVolume = (float)r->modLfoToVolume + m[TSF_MOD_MODLFOTOVOLUME];
+	if (m[TSF_MOD_MODLFOTOPITCH]) v->modLfoToPitch = tsf_clampf(v->modLfoToPitch, -12000.0f, 12000.0f);
+	if (m[TSF_MOD_MODENVTOPITCH]) v->modEnvToPitch = tsf_clampf(v->modEnvToPitch, -12000.0f, 12000.0f);
+	if (m[TSF_MOD_MODLFOTOFILTERFC]) v->modLfoToFilterFc = tsf_clampf(v->modLfoToFilterFc, -12000.0f, 12000.0f);
+	if (m[TSF_MOD_MODENVTOFILTERFC]) v->modEnvToFilterFc = tsf_clampf(v->modEnvToFilterFc, -12000.0f, 12000.0f);
+	if (m[TSF_MOD_MODLFOTOVOLUME]) v->modLfoToVolume = tsf_clampf(v->modLfoToVolume, -960.0f, 960.0f);
+
+	// filter
+	val = (float)r->initialFilterFc + m[TSF_MOD_FILTERFC];
+	val2 = (float)r->initialFilterQ + m[TSF_MOD_FILTERQ];
+	if (m[TSF_MOD_FILTERFC]) val = tsf_clampf(val, 1500.0f, 13500.0f);
+	if (m[TSF_MOD_FILTERQ]) val2 = tsf_clampf(val2, 0.0f, 960.0f);
+	if (val != v->filterFc || val2 != v->filterQ)
+	{
+		float lowpassFc = (val <= 13500 ? tsf_cents2Hertz(val) / f->outSampleRate : 1.0f);
+		TSF_BOOL wasActive = v->lowpass.active;
+		v->filterFc = val;
+		v->filterQ = val2;
+		v->lowpass.QInv = 1.0 / TSF_POW(10.0, ((val2 / 10.0f) / 20.0));
+		v->lowpass.active = (lowpassFc < 0.499f);
+		if (v->lowpass.active && !wasActive) v->lowpass.z1 = v->lowpass.z2 = 0;
+		if (v->lowpass.active) tsf_voice_lowpass_setup(&v->lowpass, lowpassFc);
+	}
+
+	// LFO rates and delays
+	val = (float)r->freqVibLFO + m[TSF_MOD_FREQVIBLFO];
+	if (m[TSF_MOD_FREQVIBLFO]) val = tsf_clampf(val, -16000.0f, 4500.0f);
+	if (val != v->freqVibLFO)
+	{
+		float delta = 4.0f * tsf_cents2Hertz(val) / f->outSampleRate;
+		v->freqVibLFO = val;
+		v->viblfo.delta = (v->viblfo.delta < 0.0f ? -delta : delta);
+	}
+	val = (float)r->freqModLFO + m[TSF_MOD_FREQMODLFO];
+	if (m[TSF_MOD_FREQMODLFO]) val = tsf_clampf(val, -16000.0f, 4500.0f);
+	if (val != v->freqModLFO)
+	{
+		float delta = 4.0f * tsf_cents2Hertz(val) / f->outSampleRate;
+		v->freqModLFO = val;
+		v->modlfo.delta = (v->modlfo.delta < 0.0f ? -delta : delta);
+	}
+	if (start && (m[TSF_MOD_DELAYVIBLFO] || sDelay)) v->viblfo.samplesUntil = (int)(tsf_secs_mod(r->delayVibLFO, m[TSF_MOD_DELAYVIBLFO], sDelay) * f->outSampleRate);
+	if (start && m[TSF_MOD_DELAYMODLFO]) v->modlfo.samplesUntil = (int)(tsf_secs_mod(r->delayModLFO, m[TSF_MOD_DELAYMODLFO], 0.0f) * f->outSampleRate);
+
+	// envelopes, when their offsets changed (only from 0 at note on, where they start out)
+	for (i = 0; i != 12; i++) env[i] = m[TSF_MOD_MODENV + i];
+	env[12] = sAttack; env[13] = sDecay; env[14] = sRelease;
+	for (i = 0; i != 15; i++) if (env[i] != v->envMod[i]) { envChanged = TSF_TRUE; v->envMod[i] = env[i]; }
+	if (envChanged && v->ampenv.segment < TSF_SEGMENT_RELEASE)
+	{
+		struct tsf_envelope p; struct tsf_voice_envelope e;
+		tsf_envelope_mod(&p, &r->ampenv, m + TSF_MOD_AMPENV, sAttack, sDecay, sRelease, TSF_TRUE);
+		if (start) tsf_voice_envelope_setup(&v->ampenv, &p, v->playingKey, v->ampenv.midiVelocity, TSF_TRUE, f->outSampleRate);
+		else { tsf_voice_envelope_setup(&e, &p, v->playingKey, v->ampenv.midiVelocity, TSF_TRUE, f->outSampleRate); v->ampenv.parameters = e.parameters; }
+		tsf_envelope_mod(&p, &r->modenv, m + TSF_MOD_MODENV, sAttack, sDecay, sRelease, TSF_FALSE);
+		if (start) tsf_voice_envelope_setup(&v->modenv, &p, v->playingKey, v->modenv.midiVelocity, TSF_FALSE, f->outSampleRate);
+		else { tsf_voice_envelope_setup(&e, &p, v->playingKey, v->modenv.midiVelocity, TSF_FALSE, f->outSampleRate); v->modenv.parameters = e.parameters; }
+	}
+
+	// level (attenuation stays at 0 dB or more), pitch, pan and sends
+	val = m[TSF_MOD_ATTENUATION] * 0.1f;
+	if (r->attenuation + val < 0.0f) val = -r->attenuation;
+	val = -val;
+	if (val != v->modGainDB) { v->noteGainDB += val - v->modGainDB; v->modGainDB = val; }
+	val = m[TSF_MOD_COARSETUNE] * 100.0f + m[TSF_MOD_FINETUNE];
+	if (val != v->modPitch) { v->modPitch = val; tsf_voice_calcpitchratio(v, (c ? tsf_channel_pitchshift(f, c) : 0.0f), f->outSampleRate); }
+	if (m[TSF_MOD_PAN] != v->modPan) { v->modPan = m[TSF_MOD_PAN]; tsf_voice_setpan(v, r->pan + (c ? c->panOffset : 0.0f) + v->modPan * 0.001f); }
+	v->modReverb = m[TSF_MOD_REVERB];
+	v->modChorus = m[TSF_MOD_CHORUS];
 }
 
 static void tsf_voice_render(tsf* f, struct tsf_voice* v, float* outputBuffer, int numSamples)
@@ -1291,32 +1730,34 @@ static void tsf_voice_render(tsf* f, struct tsf_voice* v, float* outputBuffer, i
 	float* outR = (f->outputmode == TSF_STEREO_UNWEAVED ? outL + numSamples : TSF_NULL);
 
 	// Cache some values, to give them at least some chance of ending up in registers.
-	TSF_BOOL updateModEnv = (region->modEnvToPitch || region->modEnvToFilterFc);
-	TSF_BOOL updateModLFO = (v->modlfo.delta && (region->modLfoToPitch || region->modLfoToFilterFc || region->modLfoToVolume));
-	TSF_BOOL updateVibLFO = (v->viblfo.delta && (region->vibLfoToPitch));
+	// FatzAudio: the voice's modulated values (tsf_voice_modulate) instead of the region's.
+	// The envelope and LFOs run whether used or not, so a controller that brings them in
+	// later finds them where they would be.
+	TSF_BOOL updateModLFO = (v->modlfo.delta != 0);
+	TSF_BOOL updateVibLFO = (v->viblfo.delta != 0);
 	TSF_BOOL isLooping    = (v->loopStart < v->loopEnd);
 	unsigned int tmpLoopStart = v->loopStart, tmpLoopEnd = v->loopEnd;
 	double tmpSampleEndDbl = (double)region->end, tmpLoopEndDbl = (double)tmpLoopEnd + 1.0;
 	double tmpSourceSamplePosition = v->sourceSamplePosition;
 	struct tsf_voice_lowpass tmpLowpass = v->lowpass;
 
-	TSF_BOOL dynamicLowpass = (region->modLfoToFilterFc || region->modEnvToFilterFc);
+	TSF_BOOL dynamicLowpass = (v->modLfoToFilterFc || v->modEnvToFilterFc);
 	float tmpSampleRate = f->outSampleRate, tmpInitialFilterFc, tmpModLfoToFilterFc, tmpModEnvToFilterFc;
 
-	TSF_BOOL dynamicPitchRatio = (region->modLfoToPitch || region->modEnvToPitch || region->vibLfoToPitch);
+	TSF_BOOL dynamicPitchRatio = (v->modLfoToPitch || v->modEnvToPitch || v->vibLfoToPitch || v->portaLeft > 0);
 	double pitchRatio;
 	float tmpModLfoToPitch, tmpVibLfoToPitch, tmpModEnvToPitch;
 
-	TSF_BOOL dynamicGain = (region->modLfoToVolume != 0);
+	TSF_BOOL dynamicGain = (v->modLfoToVolume != 0);
 	float noteGain = 0, tmpModLfoToVolume;
 
-	if (dynamicLowpass) tmpInitialFilterFc = (float)region->initialFilterFc, tmpModLfoToFilterFc = (float)region->modLfoToFilterFc, tmpModEnvToFilterFc = (float)region->modEnvToFilterFc;
+	if (dynamicLowpass) tmpInitialFilterFc = v->filterFc, tmpModLfoToFilterFc = v->modLfoToFilterFc, tmpModEnvToFilterFc = v->modEnvToFilterFc;
 	else tmpInitialFilterFc = 0, tmpModLfoToFilterFc = 0, tmpModEnvToFilterFc = 0;
 
-	if (dynamicPitchRatio) pitchRatio = 0, tmpModLfoToPitch = (float)region->modLfoToPitch, tmpVibLfoToPitch = (float)region->vibLfoToPitch, tmpModEnvToPitch = (float)region->modEnvToPitch;
+	if (dynamicPitchRatio) pitchRatio = 0, tmpModLfoToPitch = v->modLfoToPitch, tmpVibLfoToPitch = v->vibLfoToPitch, tmpModEnvToPitch = v->modEnvToPitch;
 	else pitchRatio = tsf_timecents2Secsd(v->pitchInputTimecents) * v->pitchOutputFactor, tmpModLfoToPitch = 0, tmpVibLfoToPitch = 0, tmpModEnvToPitch = 0;
 
-	if (dynamicGain) tmpModLfoToVolume = (float)region->modLfoToVolume * 0.1f;
+	if (dynamicGain) tmpModLfoToVolume = v->modLfoToVolume * 0.1f;
 	else noteGain = tsf_decibelsToGain(v->noteGainDB), tmpModLfoToVolume = 0;
 
 	while (numSamples)
@@ -1334,7 +1775,16 @@ static void tsf_voice_render(tsf* f, struct tsf_voice* v, float* outputBuffer, i
 		}
 
 		if (dynamicPitchRatio)
-			pitchRatio = tsf_timecents2Secsd(v->pitchInputTimecents + (v->modlfo.level * tmpModLfoToPitch + v->viblfo.level * tmpVibLfoToPitch + v->modenv.level * tmpModEnvToPitch)) * v->pitchOutputFactor;
+		{
+			// FatzAudio: a portamento glide, from portaCents away to the note's pitch
+			float glide = 0.0f;
+			if (v->portaLeft > 0)
+			{
+				glide = v->portaCents * (float)v->portaLeft / (float)v->portaTotal;
+				v->portaLeft = (v->portaLeft > blockSamples ? v->portaLeft - blockSamples : 0);
+			}
+			pitchRatio = tsf_timecents2Secsd(v->pitchInputTimecents + (v->modlfo.level * tmpModLfoToPitch + v->viblfo.level * tmpVibLfoToPitch + v->modenv.level * tmpModEnvToPitch + glide)) * v->pitchOutputFactor;
+		}
 
 		if (dynamicGain)
 			noteGain = tsf_decibelsToGain(v->noteGainDB + (v->modlfo.level * tmpModLfoToVolume));
@@ -1343,7 +1793,7 @@ static void tsf_voice_render(tsf* f, struct tsf_voice* v, float* outputBuffer, i
 
 		// Update EG.
 		tsf_voice_envelope_process(&v->ampenv, blockSamples, tmpSampleRate);
-		if (updateModEnv) tsf_voice_envelope_process(&v->modenv, blockSamples, tmpSampleRate);
+		tsf_voice_envelope_process(&v->modenv, blockSamples, tmpSampleRate);
 
 		// Update LFOs.
 		if (updateModLFO) tsf_voice_lfo_process(&v->modlfo, blockSamples);
@@ -1559,6 +2009,7 @@ TSFDEF void tsf_close(tsf* f)
 		for (; preset != presetEnd; preset++) TSF_FREE(preset->regions);
 		TSF_FREE(f->presets);
 		TSF_FREE(f->fontSamples);
+		TSF_FREE(f->modulators); // FatzAudio
 		TSF_FREE(f->refCount);
 	}
 	TSF_FREE(f->channels);
@@ -1694,6 +2145,17 @@ TSFDEF int tsf_note_on(tsf* f, int preset_index, int key, float vel)
 		// FatzAudio: the SF2 default velocity-to-attenuation modulator (concave, 96 dB), which is
 		// 40*log10(vel) dB, as FluidSynth and DLS synths play it (was 20*log10, half the range)
 		voice->noteGainDB = f->globalGainDB - region->attenuation - 2.0f * tsf_gainToDecibels(1.0f / vel);
+		// FatzAudio: the region's values until tsf_voice_modulate below
+		voice->playingChannel = -1;
+		voice->vibLfoToPitch = (float)region->vibLfoToPitch; voice->modLfoToPitch = (float)region->modLfoToPitch;
+		voice->modEnvToPitch = (float)region->modEnvToPitch; voice->modLfoToFilterFc = (float)region->modLfoToFilterFc;
+		voice->modEnvToFilterFc = (float)region->modEnvToFilterFc; voice->modLfoToVolume = (float)region->modLfoToVolume;
+		voice->filterFc = (float)region->initialFilterFc; voice->filterQ = (float)region->initialFilterQ;
+		voice->freqVibLFO = (float)region->freqVibLFO; voice->freqModLFO = (float)region->freqModLFO;
+		voice->modGainDB = voice->modPitch = voice->modPan = voice->modReverb = voice->modChorus = 0.0f;
+		voice->portaCents = 0.0f; voice->portaLeft = voice->portaTotal = 0;
+		voice->sostenuto = voice->soft = 0;
+		TSF_MEMSET(voice->envMod, 0, sizeof(voice->envMod));
 
 		if (f->channels)
 		{
@@ -1730,6 +2192,8 @@ TSFDEF int tsf_note_on(tsf* f, int preset_index, int key, float vel)
 		// Setup LFO filters.
 		tsf_voice_lfo_setup(&voice->modlfo, region->delayModLFO, region->freqModLFO, f->outSampleRate);
 		tsf_voice_lfo_setup(&voice->viblfo, region->delayVibLFO, region->freqVibLFO, f->outSampleRate);
+
+		tsf_voice_modulate(f, voice, TSF_TRUE); // FatzAudio
 	}
 	return 1;
 }
@@ -1845,13 +2309,13 @@ TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* cho
 			if (f->channels && v->playingChannel >= 0 && v->playingChannel < f->channels->channelNum)
 			{
 				struct tsf_channel* c = &f->channels->channels[v->playingChannel];
-				rs = tsf_voice_send(v->region->reverbSend, c->midiReverb);
-				cs = tsf_voice_send(v->region->chorusSend, c->midiChorus);
+				rs = tsf_voice_send(v->region->reverbSend + v->modReverb, c->midiReverb);
+				cs = tsf_voice_send(v->region->chorusSend + v->modChorus, c->midiChorus);
 			}
 			else
 			{
-				rs = tsf_voice_send(v->region->reverbSend, 0);
-				cs = tsf_voice_send(v->region->chorusSend, 0);
+				rs = tsf_voice_send(v->region->reverbSend + v->modReverb, 0);
+				cs = tsf_voice_send(v->region->chorusSend + v->modChorus, 0);
 			}
 			if (rs == 0.0f && cs == 0.0f) { tsf_voice_render(f, v, buffer, k); continue; }
 			TSF_MEMSET(tmp, 0, n * sizeof(float));
@@ -1865,13 +2329,20 @@ TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* cho
 static void tsf_channel_setup_voice(tsf* f, struct tsf_voice* v)
 {
 	struct tsf_channel* c = &f->channels->channels[f->channels->activeChannel];
-	float newpan = v->region->pan + c->panOffset;
 	v->playingChannel = f->channels->activeChannel;
 	v->noteGainDB += c->gainDB;
-	tsf_voice_calcpitchratio(v, f->globalTuning + (c->pitchWheel == 8192 ? c->tuning : ((c->pitchWheel / 16383.0f * c->pitchRange * 2.0f) - c->pitchRange + c->tuning)), f->outSampleRate); // FatzAudio: globalTuning
-	if      (newpan <= -0.5f) { v->panFactorLeft = 1.0f; v->panFactorRight = 0.0f; }
-	else if (newpan >=  0.5f) { v->panFactorLeft = 0.0f; v->panFactorRight = 1.0f; }
-	else { v->panFactorLeft = TSF_SQRTF(0.5f - newpan); v->panFactorRight = TSF_SQRTF(0.5f + newpan); }
+	tsf_voice_calcpitchratio(v, tsf_channel_pitchshift(f, c), f->outSampleRate);
+	tsf_voice_setpan(v, v->region->pan + c->panOffset);
+	// FatzAudio: soft pedal; portamento: a glide from the previous key (or CC84's) taking
+	// 5 ms at CC5 = 0, 0.18 s at 64 and 5.9 s at 127
+	v->soft = (unsigned char)(c->cc[67] >= 64);
+	if (c->portaFrom >= 0 && c->portaFrom != v->playingKey)
+	{
+		v->portaCents = (float)(c->portaFrom - v->playingKey) * 100.0f;
+		v->portaTotal = (int)(0.005f * TSF_POWF(2.0f, c->cc[5] * (10.2f / 127.0f)) * f->outSampleRate);
+		if (v->portaTotal < 1) v->portaTotal = 1;
+		v->portaLeft = v->portaTotal;
+	}
 }
 
 static struct tsf_channel* tsf_channel_init(tsf* f, int channel)
@@ -1908,6 +2379,14 @@ static struct tsf_channel* tsf_channel_init(tsf* f, int channel)
 		c->tuning = 0.0f;
 		c->midiReverb = 40; // FatzAudio: the GM2 / GS default
 		c->midiChorus = 0;
+		TSF_MEMSET(c->cc, 0, sizeof(c->cc)); // FatzAudio: controllers as after a reset
+		TSF_MEMSET(c->cc + 70, 64, 10);
+		c->cc[7] = c->cc[11] = 127; c->cc[10] = 64; c->cc[91] = 40;
+		TSF_MEMSET(c->keyPressure, 0, sizeof(c->keyPressure));
+		c->chanPressure = c->sostenuto = 0;
+		c->midiNRPN = 0xFFFF;
+		c->modRange = c->pressureVibrato = 50.0f;
+		c->lastKey = c->portaKey = c->portaFrom = -1;
 	}
 	return &f->channels->channels[channel];
 }
@@ -1915,7 +2394,7 @@ static struct tsf_channel* tsf_channel_init(tsf* f, int channel)
 static void tsf_channel_applypitch(tsf* f, int channel, struct tsf_channel* c)
 {
 	struct tsf_voice *v, *vEnd;
-	float pitchShift = f->globalTuning + (c->pitchWheel == 8192 ? c->tuning : ((c->pitchWheel / 16383.0f * c->pitchRange * 2.0f) - c->pitchRange + c->tuning)); // FatzAudio: globalTuning
+	float pitchShift = tsf_channel_pitchshift(f, c);
 	for (v = f->voices, vEnd = v + f->voiceNum; v != vEnd; v++)
 		if (v->playingPreset != -1 && v->playingChannel == channel)
 			tsf_voice_calcpitchratio(v, pitchShift, f->outSampleRate);
@@ -1978,12 +2457,7 @@ TSFDEF int tsf_channel_set_pan(tsf* f, int channel, float pan)
 	if (!c) return 0;
 	for (v = f->voices, vEnd = v + f->voiceNum; v != vEnd; v++)
 		if (v->playingPreset != -1 && v->playingChannel == channel)
-		{
-			float newpan = v->region->pan + pan - 0.5f;
-			if      (newpan <= -0.5f) { v->panFactorLeft = 1.0f; v->panFactorRight = 0.0f; }
-			else if (newpan >=  0.5f) { v->panFactorLeft = 0.0f; v->panFactorRight = 1.0f; }
-			else { v->panFactorLeft = TSF_SQRTF(0.5f - newpan); v->panFactorRight = TSF_SQRTF(0.5f + newpan); }
-		}
+			tsf_voice_setpan(v, v->region->pan + pan - 0.5f + v->modPan * 0.001f); // FatzAudio: pan modulators
 	c->panOffset = pan - 0.5f;
 	return 1;
 }
@@ -2052,13 +2526,99 @@ TSFDEF int tsf_channel_set_sustain(tsf* f, int channel, int flag_sustain)
 	//Turning off sustain, actually end voices that got a note_off and were set to heldSustain status
 	struct tsf_voice *v = f->voices, *vEnd = v + f->voiceNum;
 	for (; v != vEnd; v++)
-		if (v->playingPreset != -1 && v->playingChannel == channel && v->ampenv.segment < TSF_SEGMENT_RELEASE && v->heldSustain)
+		if (v->playingPreset != -1 && v->playingChannel == channel && v->ampenv.segment < TSF_SEGMENT_RELEASE && v->heldSustain &&
+			!(c->sostenuto && v->sostenuto)) // FatzAudio: still held by sostenuto
 			tsf_voice_end(f, v);
 	return 1;
 }
 
+// FatzAudio: modulation ---------------------------------------------------------------------
+
+// Re-evaluates the modulators of the channel's voices (of `key` only, when >= 0).
+static void tsf_channel_modulate(tsf* f, int channel, int key)
+{
+	struct tsf_voice *v = f->voices, *vEnd = v + f->voiceNum;
+	for (; v != vEnd; v++)
+		if (v->playingPreset != -1 && v->playingChannel == channel && (key < 0 || v->playingKey == key))
+			tsf_voice_modulate(f, v, TSF_FALSE);
+}
+
+TSFDEF int tsf_channel_set_sostenuto(tsf* f, int channel, int flag_sostenuto)
+{
+	struct tsf_voice *v = f->voices, *vEnd = v + f->voiceNum;
+	struct tsf_channel *c = tsf_channel_init(f, channel);
+	if (!c) return 0;
+	if (!c->sostenuto == !flag_sostenuto) return 1;
+	c->sostenuto = (unsigned char)(flag_sostenuto != 0);
+	for (; v != vEnd; v++)
+	{
+		if (v->playingPreset == -1 || v->playingChannel != channel || v->ampenv.segment >= TSF_SEGMENT_RELEASE) continue;
+		if (flag_sostenuto) { if (!v->heldSustain) v->sostenuto = 1; } // the keys down now
+		else if (v->sostenuto)
+		{
+			v->sostenuto = 0;
+			if (v->heldSustain && !c->sustain) tsf_voice_end(f, v);
+		}
+	}
+	return 1;
+}
+
+TSFDEF int tsf_channel_set_pressure(tsf* f, int channel, int pressure)
+{
+	struct tsf_channel *c = tsf_channel_init(f, channel);
+	if (!c) return 0;
+	if (c->chanPressure == (pressure & 0x7F)) return 1;
+	c->chanPressure = (unsigned char)(pressure & 0x7F);
+	if (f->modGC & (1u << 13)) tsf_channel_modulate(f, channel, -1);
+	return 1;
+}
+
+TSFDEF int tsf_channel_set_key_pressure(tsf* f, int channel, int key, int pressure)
+{
+	struct tsf_channel *c = tsf_channel_init(f, channel);
+	if (!c) return 0;
+	if (c->keyPressure[key & 0x7F] == (pressure & 0x7F)) return 1;
+	c->keyPressure[key & 0x7F] = (unsigned char)(pressure & 0x7F);
+	if (f->modGC & (1u << 10)) tsf_channel_modulate(f, channel, key & 0x7F);
+	return 1;
+}
+
+TSFDEF int tsf_channel_set_pressure_vibrato(tsf* f, int channel, float cents)
+{
+	struct tsf_channel *c = tsf_channel_init(f, channel);
+	if (!c) return 0;
+	if (c->pressureVibrato == cents) return 1;
+	c->pressureVibrato = cents;
+	tsf_channel_modulate(f, channel, -1);
+	return 1;
+}
+
+// GS and XG part NRPNs (MSB 1) that set what the sound controllers set (BASSMIDI's mapping).
+static int tsf_nrpn_controller(unsigned short nrpn)
+{
+	switch (nrpn)
+	{
+		case 0x0088: return 76; // 01 08 vibrato rate
+		case 0x0089: return 77; // 01 09 vibrato depth
+		case 0x008A: return 78; // 01 0A vibrato delay
+		case 0x00A0: return 74; // 01 20 filter cutoff
+		case 0x00A1: return 71; // 01 21 resonance
+		case 0x00E3: return 73; // 01 63 attack
+		case 0x00E4: return 75; // 01 64 decay
+		case 0x00E6: return 72; // 01 66 release
+	}
+	return -1;
+}
+
+static int tsf_controller_modulates(tsf* f, int controller)
+{
+	return controller == 1 || (controller >= 71 && controller <= 78) || (f->modCC[controller >> 5] >> (controller & 31) & 1);
+}
+
 TSFDEF int tsf_channel_note_on(tsf* f, int channel, int key, float vel)
 {
+	struct tsf_channel* c;
+	int res;
 	if (!f->channels || channel >= f->channels->channelNum) return 1;
 	f->channels->activeChannel = channel;
 	if (!vel)
@@ -2066,7 +2626,14 @@ TSFDEF int tsf_channel_note_on(tsf* f, int channel, int key, float vel)
 		tsf_channel_note_off(f, channel, key);
 		return 1;
 	}
-	return tsf_note_on(f, f->channels->channels[channel].presetIndex, key, vel);
+	// FatzAudio: portamento from CC84's key (once), else from the last key while CC65 is on
+	c = &f->channels->channels[channel];
+	c->portaFrom = (c->portaKey >= 0 ? c->portaKey : (c->cc[65] >= 64 ? c->lastKey : -1));
+	c->portaKey = -1;
+	res = tsf_note_on(f, c->presetIndex, key, vel);
+	c->portaFrom = -1;
+	c->lastKey = (short)key;
+	return res;
 }
 
 TSFDEF void tsf_channel_note_off(tsf* f, int channel, int key)
@@ -2087,7 +2654,7 @@ TSFDEF void tsf_channel_note_off(tsf* f, int channel, int key)
 		if (v != vMatchFirst && v != vMatchLast &&
 			(v->playIndex != vMatchFirst->playIndex || v->playingPreset == -1 || v->playingChannel != channel || v->playingKey != key || v->ampenv.segment >= TSF_SEGMENT_RELEASE)) continue;
 		//Don't turn off if sustain is active, just mark as held by sustain so we don't forget it
-		if (sustain)
+		if (sustain || (f->channels->channels[channel].sostenuto && v->sostenuto)) // FatzAudio: or sostenuto
 			v->heldSustain = 1;
 		else
 			tsf_voice_end(f, v);
@@ -2115,6 +2682,12 @@ TSFDEF int tsf_channel_midi_control(tsf* f, int channel, int controller, int con
 {
 	struct tsf_channel* c = tsf_channel_init(f, channel);
 	if (!c) return 0;
+	controller &= 0x7F; control_value &= 0x7F; // FatzAudio
+	if (c->cc[controller] != control_value) // FatzAudio: modulators and sound controllers
+	{
+		c->cc[controller] = (unsigned char)control_value;
+		if (tsf_controller_modulates(f, controller)) tsf_channel_modulate(f, channel, -1);
+	}
 	switch (controller)
 	{
 		case   7 /*VOLUME_MSB*/      : c->midiVolume     = (unsigned short)((c->midiVolume     & 0x7F  ) | (control_value << 7)); goto TCMC_SET_VOLUME;
@@ -2127,11 +2700,13 @@ TSFDEF int tsf_channel_midi_control(tsf* f, int channel, int controller, int con
 		case  38 /*DATA_ENTRY_LSB*/  : c->midiData       = (unsigned short)((c->midiData       & 0x3F80) |  control_value);       goto TCMC_SET_DATA;
 		case   0 /*BANK_SELECT_MSB*/ : c->bank = (unsigned short)(0x8000 | control_value); return 1; //bank select MSB alone acts like LSB
 		case  32 /*BANK_SELECT_LSB*/ : c->bank = (unsigned short)((c->bank & 0x8000 ? ((c->bank & 0x7F) << 7) : 0) | control_value); return 1;
-		case 101 /*RPN_MSB*/         : c->midiRPN = (unsigned short)(((c->midiRPN == 0xFFFF ? 0 : c->midiRPN) & 0x7F  ) | (control_value << 7)); return 1;
-		case 100 /*RPN_LSB*/         : c->midiRPN = (unsigned short)(((c->midiRPN == 0xFFFF ? 0 : c->midiRPN) & 0x3F80) |  control_value); return 1;
-		case  98 /*NRPN_LSB*/        : c->midiRPN = 0xFFFF; return 1;
-		case  99 /*NRPN_MSB*/        : c->midiRPN = 0xFFFF; return 1;
+		case 101 /*RPN_MSB*/         : c->midiRPN = (unsigned short)(((c->midiRPN == 0xFFFF ? 0 : c->midiRPN) & 0x7F  ) | (control_value << 7)); c->midiNRPN = 0xFFFF; return 1;
+		case 100 /*RPN_LSB*/         : c->midiRPN = (unsigned short)(((c->midiRPN == 0xFFFF ? 0 : c->midiRPN) & 0x3F80) |  control_value); c->midiNRPN = 0xFFFF; return 1;
+		case  98 /*NRPN_LSB*/        : c->midiRPN = 0xFFFF; c->midiNRPN = (unsigned short)(((c->midiNRPN == 0xFFFF ? 0 : c->midiNRPN) & 0x3F80) | control_value); return 1; // FatzAudio: NRPN kept
+		case  99 /*NRPN_MSB*/        : c->midiRPN = 0xFFFF; c->midiNRPN = (unsigned short)(((c->midiNRPN == 0xFFFF ? 0 : c->midiNRPN) & 0x7F) | (control_value << 7)); return 1;
 		case  64 /*SUSTAIN*/         : tsf_channel_set_sustain(f, channel, (int)(control_value >= 64)); return 1;
+		case  66 /*SOSTENUTO*/       : tsf_channel_set_sostenuto(f, channel, (int)(control_value >= 64)); return 1; // FatzAudio
+		case  84 /*PORTAMENTO_CTRL*/ : c->portaKey = (short)control_value; return 1; // FatzAudio
 		case  91 /*REVERB*/          : c->midiReverb = (unsigned char)(control_value & 0x7F); return 1; // FatzAudio
 		case  93 /*CHORUS*/          : c->midiChorus = (unsigned char)(control_value & 0x7F); return 1; // FatzAudio
 		case 120 /*ALL_SOUND_OFF*/   : tsf_channel_sounds_off_all(f, channel); return 1;
@@ -2146,6 +2721,17 @@ TSFDEF int tsf_channel_midi_control(tsf* f, int channel, int controller, int con
 			tsf_channel_set_pan(f, channel, 0.5f);
 			tsf_channel_set_pitchrange(f, channel, 2.0f);
 			tsf_channel_set_tuning(f, channel, 0);
+			// FatzAudio: also what RP-015 resets (mod wheel, pressure, pedals but sustain, NRPN) and the
+			// modulation depth range; sound controllers (CC70-79) and sends stay
+			c->cc[7] = c->cc[11] = 127; c->cc[10] = 64;
+			c->cc[1] = c->cc[33] = c->cc[65] = c->cc[66] = c->cc[67] = 0;
+			c->chanPressure = 0;
+			TSF_MEMSET(c->keyPressure, 0, sizeof(c->keyPressure));
+			c->midiNRPN = 0xFFFF;
+			c->portaKey = -1;
+			c->modRange = 50.0f;
+			tsf_channel_set_sostenuto(f, channel, 0);
+			tsf_channel_modulate(f, channel, -1);
 			return 1;
 	}
 	return 1;
@@ -2157,6 +2743,22 @@ TCMC_SET_PAN:
 	tsf_channel_set_pan(f, channel, c->midiPan / 16383.0f);
 	return 1;
 TCMC_SET_DATA:
+	if (c->midiNRPN != 0xFFFF) // FatzAudio: GS/XG part NRPNs, data entry MSB
+	{
+		int target = tsf_nrpn_controller(c->midiNRPN);
+		if (target >= 0 && controller == 6 && c->cc[target] != control_value)
+		{
+			c->cc[target] = (unsigned char)control_value;
+			tsf_channel_modulate(f, channel, -1);
+		}
+		return 1;
+	}
+	if (c->midiRPN == 5) // FatzAudio: modulation depth range, semitones and 1/128 semitones
+	{
+		c->modRange = (c->midiData >> 7) * 100.0f + (c->midiData & 0x7F) * (100.0f / 128.0f);
+		tsf_channel_modulate(f, channel, -1);
+		return 1;
+	}
 	if      (c->midiRPN == 0) tsf_channel_set_pitchrange(f, channel, (c->midiData >> 7) + 0.01f * (c->midiData & 0x7F));
 	else if (c->midiRPN == 1) tsf_channel_set_tuning(f, channel, (int)c->tuning + ((float)c->midiData - 8192.0f) / 8192.0f); //fine tune
 	else if (c->midiRPN == 2 && controller == 6) tsf_channel_set_tuning(f, channel, ((float)control_value - 64.0f) + (c->tuning - (int)c->tuning)); //coarse tune
@@ -2201,6 +2803,11 @@ TSFDEF float tsf_channel_get_pitchrange(tsf* f, int channel)
 TSFDEF float tsf_channel_get_tuning(tsf* f, int channel)
 {
 	return (f->channels && channel < f->channels->channelNum ? f->channels->channels[channel].tuning : 0.0f);
+}
+
+TSFDEF int tsf_channel_get_midi_control(tsf* f, int channel, int controller) // FatzAudio
+{
+	return (f->channels && channel < f->channels->channelNum ? f->channels->channels[channel].cc[controller & 0x7F] : 0);
 }
 
 #ifdef __cplusplus
