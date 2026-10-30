@@ -9,6 +9,7 @@
  * (fa_stream_push_frame). */
 #include "fa_internal.h"
 #include "demux.h"
+#include <float.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,6 +51,9 @@ static uint32_t rd16(const uint8_t* p, int big) { return big ? fa_be16(p) : fa_l
 static uint32_t rd32(const uint8_t* p, int big) { return big ? fa_be32(p) : fa_le32(p); }
 static uint64_t rd64(const uint8_t* p, int big) { return big ? fa_be64(p) : fa_le64(p); }
 
+/* A float's bits are NaN or infinity (all exponent bits set). */
+static int non_finite_bits(uint32_t u) { return (u & 0x7F800000u) == 0x7F800000u; }
+
 /* n samples of one kind, `step` bytes apart, to floats `out_step` apart. One
  * loop per kind, so the format is not looked at again for every sample.
  * `swap`: the bytes are in the other order than this machine's. */
@@ -90,17 +94,16 @@ static void convert_run(const uint8_t* p, size_t step, int kind, int swap, float
             uint32_t u = rd32(p + i * step, big);
             float v;
             memcpy(&v, &u, 4);
-            out[i * out_step] = (u & 0x7F800000u) == 0x7F800000u ? 0.0f : v;
+            out[i * out_step] = non_finite_bits(u) ? 0.0f : v;
         }
         break;
     default:
         for (i = 0; i < n; i++) {
             uint64_t u = rd64(p + i * step, big);
             double v;
-            float f;
             memcpy(&v, &u, 8);
-            f = (float)v;
-            out[i * out_step] = f - f == 0.0f ? f : 0.0f;   /* NaN, infinity or out of float range */
+            /* NaN, infinity or out of float range (whose conversion is undefined) is 0. */
+            out[i * out_step] = v >= -(double)FLT_MAX && v <= (double)FLT_MAX ? (float)v : 0.0f;
         }
         break;
     }
@@ -112,7 +115,7 @@ void fa_zero_non_finite(float* p, size_t n)
     for (i = 0; i < n; i++) {
         uint32_t u;
         memcpy(&u, p + i, 4);
-        if ((u & 0x7F800000u) == 0x7F800000u) p[i] = 0.0f;
+        if (non_finite_bits(u)) p[i] = 0.0f;
     }
 }
 

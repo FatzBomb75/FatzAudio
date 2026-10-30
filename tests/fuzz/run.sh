@@ -21,7 +21,7 @@ for t in "$@"; do
     stream_caf) bin=fuzz_stream; seeds="$DATA/caf" ;;
     stream_ogg) bin=fuzz_stream; seeds="$DATA/ogg $DATA/flac/tone.oga $DATA/flac/surround.oga $DATA/tags/tags.opus" ;;
     stream_asf) bin=fuzz_stream; seeds="$DATA/asf" ;;
-    stream_dolby) bin=fuzz_stream; seeds="$DATA/tone.ac3 $DATA/tone.eac3 $DATA/dolby/tone_ac3.mp4 $DATA/dolby/tone_eac3.mkv $(ls "$DATA"/dolby/*.ec3)" ;;
+    stream_dolby) bin=fuzz_stream; seeds="$DATA/tone.ac3 $DATA/tone.eac3 $DATA/dolby/tone_ac3.mp4 $DATA/dolby/tone_eac3.mkv $DATA/dolby/*.ec3" ;;
     stream_wav) bin=fuzz_stream; seeds="$D/seeds/wav $DATA/tags/tags.aiff" ;;
     stream_midi) bin=fuzz_stream; seeds="$D/seeds/midi" ;;
     stream_tracker) bin=fuzz_stream; seeds="$D/seeds/tracker" ;;

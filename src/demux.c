@@ -317,8 +317,16 @@ static void learn_format(fa_track* t)
     t->format_known = 1;
 }
 
-/* The most silence one gap may add, in samples: 30 s of 8 channels at 96 kHz, 128 MB. */
-#define FA_GAP_MAX_SAMPLES ((fa_frames)1 << 25)
+/* The most silence one gap may add, in samples (256 MB): 30 s of 32 channels at 48 kHz
+ * or of 8 channels at 192 kHz fits. */
+#define FA_GAP_MAX_SAMPLES ((fa_frames)1 << 26)
+
+/* The codec gave audio this track can place. Rates over 768 kHz are corrupt
+ * headers (the gap silence in emit() scales with the rate). */
+static int codec_has_audio(const fa_track* t)
+{
+    return t->codec.out_frames > 0 && t->codec.rate != 0 && t->codec.rate <= 768000 && t->codec.channels != 0;
+}
 
 /* Lays the codec's output for packet `pk` on the timeline and keeps the part
  * that is handed out. */
@@ -474,8 +482,7 @@ static fa_result fill(fa_track* t)
             /* The codec gives back what it still holds (decoders with delayed
              * output), one block per call until it has nothing left. */
             t->draining = 1;
-            if (t->codec_ready && t->codec.vt->decode(&t->codec, NULL, 0) == FA_OK && t->codec.out_frames > 0 &&
-                t->codec.rate != 0 && t->codec.channels != 0) {
+            if (t->codec_ready && t->codec.vt->decode(&t->codec, NULL, 0) == FA_OK && codec_has_audio(t)) {
                 /* A trailing decoder may give a short file's first audio only now. */
                 if (!t->format_known) learn_format(t);
                 if (t->quiet && t->place) pk.pts = t->quiet_pts;
@@ -503,9 +510,7 @@ static fa_result fill(fa_track* t)
         if (!t->codec_ready) return FA_ERROR_UNSUPPORTED_FORMAT;
         r = t->codec.vt->decode(&t->codec, pk.data, pk.size);
         if (r == FA_ERROR_OUT_OF_MEMORY) return r;
-        /* Rates over 768 kHz are corrupt headers (the gap silence below scales with the rate). */
-        if (r != FA_OK || t->codec.out_frames <= 0 || t->codec.rate == 0 || t->codec.rate > 768000 ||
-            t->codec.channels == 0) {
+        if (r != FA_OK || !codec_has_audio(t)) {
             if (r == FA_OK && t->place && t->trails && !t->quiet && pk.pts != FA_DEMUX_NO_PTS) {
                 t->quiet = 1;
                 t->quiet_pts = pk.pts;

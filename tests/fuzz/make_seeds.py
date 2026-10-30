@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Writes the small ZIP and HLS seeds for the fuzz targets into seeds/. The audio
-seeds are the files in tests/data (run.sh passes those directories)."""
+"""Writes the small ZIP, HLS, WAV, MIDI and tracker seeds for the fuzz targets into
+seeds/. The other audio seeds are the files in tests/data (run.sh passes those)."""
 import os, struct, zipfile
 
 here = os.path.dirname(os.path.abspath(__file__))
