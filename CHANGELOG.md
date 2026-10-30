@@ -18,6 +18,13 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- MIDI controllers and SoundFont modulators: the mod wheel and channel pressure add vibrato (RPN 5 sets its depth),
+  CC74/CC71 move the filter cutoff and resonance, CC73/CC75/CC72 the attack, decay and release, CC76-78 the vibrato rate,
+  depth and delay, with the GS/XG part NRPNs and part SysEx that set the same values; portamento (CC65, CC5, CC84),
+  sostenuto (CC66) and the soft pedal (CC67); a soundfont's own modulators (`pmod`/`imod`) are applied. Seeks replay
+  them. Files that use none of these, with soundfonts that have no modulators of their own, render bit for bit as before.
+  See [docs/features/midi.md](docs/features/midi.md#controllers-and-modulators).
+
 - Position events: `fa_stream_add_position_event` (.NET `AddPositionEvent`, `PositionReached`, new `ClearPositionEvents`)
   now works instead of returning `FA_ERROR_NOT_IMPLEMENTED`. BASS_SYNC_POS: one `FA_EVENT_POSITION` the first time
   playback passes a frame, frame-exact through tempo, loops and seeks, and in reverse playback too; up to 64 armed per

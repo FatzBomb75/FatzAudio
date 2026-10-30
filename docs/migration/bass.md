@@ -555,6 +555,11 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | BASS_MIDI_NOFX (reverb and chorus) | Reverb and chorus are on by default; `fa_stream_set_midi_effects(stream, 0)` turns them off ([MIDI](../features/midi.md#reverb-and-chorus)) | `stream.MidiEffects` | ✅ |
 | BASS_MIDI_StreamEvent MIDI_EVENT_REVERB / MIDI_EVENT_CHORUS (send levels) | Set by the file's CC91 and CC93 controllers, with the soundfont's effect sends; not settable from the app | automatic | ✅ (in the file) |
 | BASS_MIDI_StreamEvent MIDI_EVENT_REVERB_MACRO / MIDI_EVENT_CHORUS_MACRO and other reverb or chorus type and level events | Taken from the file's GS and XG SysEx ([reverb and chorus](../features/midi.md#reverb-and-chorus)); not settable from the app | automatic | ✅ (in the file) |
+| MIDI_EVENT_MODULATION, MIDI_EVENT_MOD_VIBRATO (RPN 5), MIDI_EVENT_CHANPRES, MIDI_EVENT_KEYPRES as played from the file | The file's mod wheel, RPN 5 and pressure messages: vibrato as in BASSMIDI (pressure: none after a GS, XG or GM2 reset); poly pressure feeds soundfont modulators ([controllers](../features/midi.md#controllers-and-modulators)); not settable from the app yet | automatic | ✅ (in the file) |
+| MIDI_EVENT_CUTOFF, RESONANCE, ATTACK, DECAY, RELEASE, VIBRATO_RATE, VIBRATO_DEPTH, VIBRATO_DELAY as played from the file | CC74, CC71, CC73, CC75, CC72, CC76-78, the GS/XG part NRPNs and part SysEx; 64 is normal, as in BASSMIDI (step sizes are our own approximation) | automatic | ✅ (in the file) |
+| MIDI_EVENT_PORTAMENTO, PORTATIME, PORTANOTE, SOSTENUTO, SOFT as played from the file | CC65, CC5, CC84, CC66, CC67 | automatic | ✅ (in the file) |
+| SF2 modulators in the soundfont (BASSMIDI: velocity, key and CC21-24 only, no secondary sources) | Applied in full: any controller, curves, secondary sources; identical copies of the built-in defaults are skipped; the default velocity-to-filter modulator is left out, as in BASSMIDI ([modulators](../features/midi.md#soundfont-modulators)) | automatic | ✅ (more than BASSMIDI) |
+| MIDI_EVENT_MODE (mono, legato), GM2 controller destination SysEx, SF2 NRPNs (MSB 120) | Not followed: always polyphonic | — | ➖ |
 | BASS_ATTRIB_MIDI_SRC / BASS_MIDI_SINCINTER | Not configurable: the synthesizer's own interpolation | — | ➖ |
 
 ## 3. Add-on map

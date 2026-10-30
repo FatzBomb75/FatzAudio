@@ -58,3 +58,16 @@ against untrusted files and add what the decoder needs:
   zeroed after allocation. `TSF_MAX_REGIONS` caps the region count.
 - No negative left shift (`GEN_UINT_ADD15`), keynum-scaled hold/decay clamped,
   `offsetof` in `_TSFREGIONOFFSET`, presets sorted with `qsort` (was O(n^2)).
+- Modulators: the `pmod`/`imod` lists are read (global zones, replacement of identical
+  modulators, preset modulators added; bag indices checked, at most 64 per region and 1M per
+  font) into `tsf::modulators`, with the SF2 default mod wheel and channel pressure vibrato;
+  `tsf_voice_modulate` sums them per destination into each voice's own copies of the
+  region's LFO and envelope depths, LFO rates and delays, filter, envelope times, level,
+  pitch, pan and sends, at note on and when a source controller changes. The render loop
+  reads the voice's values, and the LFOs and modulation envelope always run.
+- Channels keep every controller's value, pressure (channel and per key), the NRPN select,
+  RPN 5 (modulation depth range), sostenuto, portamento (CC5, CC65, CC84) and the soft pedal;
+  the GS/XG sound controllers CC71-78 and their part NRPNs offset cutoff, resonance, envelope
+  times and vibrato. `tsf_channel_set_sostenuto`, `_set_pressure`, `_set_key_pressure`,
+  `_set_pressure_vibrato` and `tsf_channel_get_midi_control` are new. CC121 also resets what
+  RP-015 lists (except the sustain pedal, as before).

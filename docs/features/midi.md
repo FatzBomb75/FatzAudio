@@ -241,6 +241,34 @@ song.MidiTranspose = -2;
 song.SetMidiChannelMuted(3, true);
 ```
 
+## Controllers and modulators
+
+The file's controllers shape each note the way a GM, GS or XG module would. Nothing needs setting up: they are part of the file. Files that use none of the controllers below sound exactly as they did before these were added.
+
+| Controller | What it does |
+|---|---|
+| Mod wheel (CC1) | Vibrato, up to ±50 cents at 127, the SoundFont 2 default. RPN 5 (modulation depth range) sets that maximum: data entry MSB in semitones, LSB in 1/128 semitones |
+| Channel pressure | The same vibrato, ±50 cents at full pressure. After a GS, XG or GM2 reset it does nothing, as on those modules (BASSMIDI does the same for GS) |
+| Poly pressure | Kept per key, for soundfonts whose modulators use it; no effect of its own |
+| Brightness (CC74), resonance (CC71) | 64 is the instrument as it is. CC74 moves the filter cutoff 100 cents a step: 0 closes an open filter to about 500 Hz, and above 64 it can only open a filter the instrument closes. CC71 adds or takes 0.3 dB of resonance a step |
+| Attack (CC73), decay (CC75), release (CC72) | 64 is the instrument's own time; each step lengthens or shortens it by 1/12 octave (127 is about 38 times as long, 0 about 40 times as short). A time that starts instant is first lifted to 1/64 s, so CC73 = 127 turns a piano's instant attack into a 0.6 s fade-in. They act on both of the instrument's envelopes; a change reaches notes already playing from their next stage on (a new release time applies to held notes when they are let go) |
+| Vibrato rate, depth, delay (CC76, CC77, CC78) | Rate: 1/32 octave a step (127 about 4 times as fast). Depth: 1 cent a step on top of the instrument's own vibrato and the mod wheel's (toward 0, not past it). Delay: as the envelope times, for notes started after the change |
+| Portamento (CC65), portamento time (CC5), portamento control (CC84) | With CC65 on, each note glides from the channel's previous key to its own, in a time CC5 sets: 5 ms at 0, 0.18 s at 64, 5.9 s at 127, whatever the interval. CC84 names the key the next note glides from, once, also with CC65 off |
+| Sostenuto (CC66) | Holds the notes whose keys are down when it is pressed, after their keys are let go, until it is released; notes started later are not held. With the sustain pedal too, a note ends when neither holds it |
+| Soft pedal (CC67) | Notes struck while it is down play 3 dB softer and a little darker (cutoff 1200 cents lower) |
+| GS and XG part NRPNs (`01 08`, `01 09`, `01 0A`, `01 20`, `01 21`, `01 63`, `01 64`, `01 66`) | The same as CC76, CC77, CC78, CC74, CC71, CC73, CC75 and CC72 (data entry MSB; 64 is normal) |
+| GS part SysEx `40 1x 30`-`37`, XG multi part `08 nn 15`-`1C` | The same values again: vibrato rate, depth and delay, cutoff, resonance, attack, decay and release |
+
+CC121 (reset all controllers) sets the mod wheel, pressure, portamento, sostenuto and soft pedal back to off and RPN 5 to 50 cents, and ends any NRPN selection, as MIDI's RP-015 says; the sound controllers CC71-78 keep their values. A GM, GS or XG reset sets everything back, CC71-78 to 64 and the portamento time to 0 included. A seek replays all of it, so the controllers in force at the target are applied to what plays from there, and a note held only by sostenuto at the target is restarted and held by it.
+
+Roland and Yamaha don't publish how far each step goes, so the steps above are close approximations (the same ones for GS and XG files), not a copy of a particular module.
+
+### Soundfont modulators
+
+A soundfont's own modulators (`pmod` and `imod`, SoundFont 2.04) are applied: any controller, velocity, key, pressure or the pitch wheel, through linear, concave, convex or switch curves, with a second source scaling the first, to the vibrato and modulation LFOs (depth, rate, delay), the modulation envelope's pitch and filter depth, filter cutoff and resonance, both envelopes' times and sustain, level, pan, fine and coarse tune and the reverb and chorus sends. They are evaluated when a note starts and again whenever one of their controllers changes. The modulators of an instrument's zones replace the defaults and those of its global zone, and a preset's add to its instrument's, as the spec says.
+
+Two SoundFont 2.04 defaults work as modulators here, so a soundfont can change or turn them off: the mod wheel and channel pressure to vibrato above. The others are built in and keep their fixed amounts: velocity, CC7 and CC11 to level, CC10 to pan, CC91 and CC93 to the effect sends, the pitch wheel; a soundfont modulator identical to one of them is skipped, so a soundfont can't, for example, raise every channel's reverb send fivefold. The default velocity-to-filter modulator is not applied, as in BASSMIDI (which calls it "slightly strange"): it would darken every softly played note of every file. A soundfont that wants it can say so with its own modulator. Not supported: linked modulators (one modulator feeding another), and destinations TinySoundFont doesn't model (sample offsets, key and velocity overrides, scale tuning, exclusive class).
+
 ## Reverb and chorus
 
 Reverb and chorus are built in and on by default, as in BASSMIDI. Each voice sends part of its sound to them: the soundfont's own effect-send setting for that sound, plus the channel's CC91 (reverb) and CC93 (chorus) controllers, as the SoundFont 2.04 default modulators say (a controller value of 127 adds 20%, and the total is at most 100%). Channels start at CC91 = 40 and CC93 = 0, the GS and GM2 defaults, also after a GM, GS or XG reset; CC121 (reset all controllers) leaves them alone. A file that sets CC91 or CC93 therefore changes its own reverb and chorus. The master volume SysEx scales the effects too.
@@ -290,6 +318,7 @@ The SysEx messages that change how a file sounds are applied; the rest are ignor
 | Master fine and coarse tuning (`7F 04 03`, `7F 04 04`) | Retunes every channel, drums included |
 | GS and XG reverb and chorus (`40 01 30`-`3E`, `02 01 00`-`2C`) | Effect type, level and time ([reverb and chorus](#reverb-and-chorus)) |
 | GS part level, pan, chorus and reverb send (`40 1x 19`, `1C`, `21`, `22`); XG part volume, pan, chorus and reverb send (`08 nn 0B`, `0E`, `12`, `13`) | The same as CC7, CC10, CC93 and CC91 on that part's channel. Pan 0 ("random") is the middle |
+| GS part vibrato, filter and envelope offsets (`40 1x 30`-`37`); XG multi part (`08 nn 15`-`1C`) | The same as the sound controllers CC71-78 ([controllers](#controllers-and-modulators)) |
 
 Without a reset, channel 10 is the drum channel and bank 127 is an ordinary (GS MT-32) melodic bank. A drum kit the soundfont doesn't have falls back to the standard kit (bank 128, program 0). A melodic program missing from the channel's bank comes from bank 0; when bank 0 lacks it too, the channel plays program 0 (with a soundfont that has no program 0, its first preset), never the instrument it played before.
 
@@ -311,9 +340,10 @@ Rendering runs on the engine's worker threads like decoding of any other format.
 - 256 voices per stream. When a dense passage needs more, the voices furthest into their release are cut; if all 256 are held, the new notes are skipped.
 - Damaged files play what can be read: a track cut short plays up to the cut. A file with no usable track fails with `FA_ERROR_UNSUPPORTED_FORMAT`.
 - DLS banks play their regions, samples, loops, envelopes, LFOs, filter and gains. Articulation scaled by a controller (other than the default mod wheel vibrato) and DLS 2 conditional chunks are ignored. A region with its own articulation uses it instead of the instrument's, as the DLS spec says. A region's net gain above 0 dB plays at 0 dB (SoundFont 2 attenuation can't be negative).
-- Note velocity sets the level by the SoundFont 2 default curve (concave, 96 dB range): 40·log10(velocity/127) dB, so velocity 64 is 11.9 dB below 127, as in FluidSynth and DLS synths. A soundfont's own modulators (`pmod`/`imod`) are not read.
+- Note velocity sets the level by the SoundFont 2 default curve (concave, 96 dB range): 40·log10(velocity/127) dB, so velocity 64 is 11.9 dB below 127, as in FluidSynth and DLS synths. A soundfont's own modulators are applied ([modulators](#soundfont-modulators)), except where they repeat a built-in default.
+- Mono and legato modes (CC126/127), GM2 controller destination settings (what pressure and the mod wheel drive, `7F 09 01`-`03`) and the SoundFont NRPNs (MSB 120) are ignored; portamento glides in every mode.
 - Each instrument's level (`initialAttenuation`) is applied as the SoundFont 2 spec states it, 0.1 dB per unit. FluidSynth applies 0.4 of that (an EMU hardware habit), so a bank tuned by ear in FluidSynth can sound with a wider gap between its quiet and loud instruments here.
 - SFZ soundfonts and MIDI input from devices aren't supported yet. See the [engineering notes](../engineering-notes.md).
 - Text in code pages other than UTF-8, Windows-1252 and Shift-JIS (Korean, Chinese, Cyrillic files) comes out as Windows-1252. Shift-JIS user-defined characters (lead bytes F0-F9) come out as U+FFFD.
-- SysEx other than the messages listed [above](#sysex) is ignored: insertion and variation effects, scale tuning, drum setup (per-note drum edits) and other part parameters have no effect.
+- SysEx other than the messages listed [above](#sysex) is ignored: insertion and variation effects, scale tuning, drum setup (per-note drum edits) and the part parameters not listed have no effect.
 - The reverb's tail is cut at the end of the song (a second after the last event), so a long reverb time set by the file doesn't ring out fully at the very end.
