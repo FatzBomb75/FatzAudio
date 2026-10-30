@@ -317,6 +317,9 @@ static void learn_format(fa_track* t)
     t->format_known = 1;
 }
 
+/* The most silence one gap may add, in samples: 30 s of 8 channels at 96 kHz, 128 MB. */
+#define FA_GAP_MAX_SAMPLES ((fa_frames)1 << 25)
+
 /* Lays the codec's output for packet `pk` on the timeline and keeps the part
  * that is handed out. */
 static fa_result emit(fa_track* t, const fa_demux_packet* pk)
@@ -362,7 +365,8 @@ static fa_result emit(fa_track* t, const fa_demux_packet* pk)
         }
         /* Audio starts later than asked (an empty edit, a decoder that waits for a
          * sync frame): silence keeps the positions right. */
-        if (pos > gap_from && pos - gap_from <= (fa_frames)dec->format.sample_rate * 30) {
+        if (pos > gap_from && pos - gap_from <= (fa_frames)dec->format.sample_rate * 30 &&
+            (pos - gap_from) * (fa_frames)ch <= FA_GAP_MAX_SAMPLES) {
             zlo = gap_from > t->drop_before ? gap_from : t->drop_before;
             zhi = pos;
             if (t->p.clip_to_end && t->length >= 0 && zhi > t->length) zhi = t->length;
@@ -499,7 +503,9 @@ static fa_result fill(fa_track* t)
         if (!t->codec_ready) return FA_ERROR_UNSUPPORTED_FORMAT;
         r = t->codec.vt->decode(&t->codec, pk.data, pk.size);
         if (r == FA_ERROR_OUT_OF_MEMORY) return r;
-        if (r != FA_OK || t->codec.out_frames <= 0 || t->codec.rate == 0 || t->codec.channels == 0) {
+        /* Rates over 768 kHz are corrupt headers (the gap silence below scales with the rate). */
+        if (r != FA_OK || t->codec.out_frames <= 0 || t->codec.rate == 0 || t->codec.rate > 768000 ||
+            t->codec.channels == 0) {
             if (r == FA_OK && t->place && t->trails && !t->quiet && pk.pts != FA_DEMUX_NO_PTS) {
                 t->quiet = 1;
                 t->quiet_pts = pk.pts;

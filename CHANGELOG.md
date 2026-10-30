@@ -381,6 +381,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- Float PCM (WAV, Wave64, RF64, AIFF-C, CAF, MP4/MOV, Matroska, ASF, push streams): NaN and infinite samples, and
+  doubles too big for a float, now read as 0. One such sample in a damaged file used to stick in every filter, effect
+  and meter after it. Found by fuzzing (`tests/fuzz/regress/stream/wav-float-nan.wav`).
+- AC-3/E-AC-3: a track whose first packet was empty passed a null buffer to `memmove` (undefined behaviour, no crash
+  seen). Found by fuzzing.
+- A container that claims a sample rate over 768 kHz (a damaged ASF, MP4 or Matroska PCM track) is no longer decoded:
+  the silence for a gap before its first packet could ask for gigabytes. A single gap's silence is also capped at
+  2^25 samples (30 s of 8 channels at 96 kHz). Found by fuzzing.
 - Ogg Opus and Ogg Vorbis: a song whose only audio page is also its last one (a short clip) came out 650 to 970 frames
   off when played straight through, on its own or chained after other songs: its last page was timed back from its
   granule without its end trim, while a seek timed it forward from its start. A chained file's later songs then played

@@ -90,17 +90,29 @@ static void convert_run(const uint8_t* p, size_t step, int kind, int swap, float
             uint32_t u = rd32(p + i * step, big);
             float v;
             memcpy(&v, &u, 4);
-            out[i * out_step] = v;
+            out[i * out_step] = (u & 0x7F800000u) == 0x7F800000u ? 0.0f : v;
         }
         break;
     default:
         for (i = 0; i < n; i++) {
             uint64_t u = rd64(p + i * step, big);
             double v;
+            float f;
             memcpy(&v, &u, 8);
-            out[i * out_step] = (float)v;
+            f = (float)v;
+            out[i * out_step] = f - f == 0.0f ? f : 0.0f;   /* NaN, infinity or out of float range */
         }
         break;
+    }
+}
+
+void fa_zero_non_finite(float* p, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++) {
+        uint32_t u;
+        memcpy(&u, p + i, 4);
+        if ((u & 0x7F800000u) == 0x7F800000u) p[i] = 0.0f;
     }
 }
 
@@ -112,6 +124,7 @@ void fa_convert_to_f32(const void* const* planes, int kind, int planar, int big_
     uint32_t c;
     if (kind == FA_SAMPLE_F32 && !planar && !swap) {
         memcpy(out, planes[0], (size_t)frames * channels * sizeof(float));
+        fa_zero_non_finite(out, (size_t)frames * channels);
         return;
     }
     if (planar)

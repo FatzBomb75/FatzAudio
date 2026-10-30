@@ -41,3 +41,93 @@ stream = ts(0, b"\x00" + pat, True, 0) + ts(0x100, b"\x00" + pmt, True, 0)
 for i in range(0, len(pes), 184):
     stream += ts(0x101, pes[i:i + 184], i == 0, i // 184)
 open(os.path.join(here, "seeds", "hls", "ts.bin"), "wb").write(hls["media.m3u8"].encode() + b"\x00" + stream)
+
+# WAV family (miniaudio's dr_wav and the AIFF reader): PCM 8/16/24/32, float, A-law, mu-law,
+# MS and IMA ADPCM, WAVE_FORMAT_EXTENSIBLE, Wave64, RF64, AIFF and AIFF-C. ffmpeg writes them
+# once; the files are committed, so this only runs when one is missing.
+import shutil, subprocess
+wav = os.path.join(here, "seeds", "wav")
+os.makedirs(wav, exist_ok=True)
+wavs = {
+ "u8.wav": ["-c:a", "pcm_u8"], "s16.wav": ["-c:a", "pcm_s16le"], "s24.wav": ["-c:a", "pcm_s24le"],
+ "s32.wav": ["-c:a", "pcm_s32le"], "f32.wav": ["-c:a", "pcm_f32le"], "f64.wav": ["-c:a", "pcm_f64le"],
+ "alaw.wav": ["-c:a", "pcm_alaw"], "mulaw.wav": ["-c:a", "pcm_mulaw"], "msadpcm.wav": ["-c:a", "adpcm_ms"],
+ "imaadpcm.wav": ["-c:a", "adpcm_ima_wav"], "ext51.wav": ["-ac", "6", "-c:a", "pcm_s16le"],
+ "s16.w64": ["-c:a", "pcm_s16le"], "s16_rf64.wav": ["-rf64", "always", "-c:a", "pcm_s16le"],
+ "s16.aiff": ["-c:a", "pcm_s16be"], "s24.aiff": ["-c:a", "pcm_s24be"], "f32.aifc": ["-f", "aiff", "-c:a", "pcm_f32be"],
+}
+for n, args in wavs.items():
+    out = os.path.join(wav, n)
+    if os.path.exists(out) or not shutil.which("ffmpeg"):
+        continue
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:r=8000:d=0.1",
+                    "-ac", "2"] + args + ["-metadata", "title=Seed", out], check=True)
+
+# MIDI: format 0 and 1, RMID, karaoke .kar words, GS/XG SysEx, RPNs, pitch bend, drums,
+# running status, tempo changes and text events.
+def vlq(v):
+    b = [v & 0x7F]
+    v >>= 7
+    while v:
+        b.insert(0, 0x80 | (v & 0x7F))
+        v >>= 7
+    return bytes(b)
+def trk(events):
+    body = b"".join(vlq(d) + e for d, e in events) + b"\x00\xff\x2f\x00"
+    return b"MTrk" + struct.pack(">I", len(body)) + body
+def smf(fmt, tracks, div=96):
+    return b"MThd" + struct.pack(">IHHH", 6, fmt, len(tracks), div) + b"".join(trk(t) for t in tracks)
+def meta(t, b): return b"\xff" + bytes([t]) + vlq(len(b)) + b
+def sysex(b): return b"\xf0" + vlq(len(b)) + b
+gs_reset = sysex(bytes.fromhex("41 10 42 12 40 00 7f 00 41 f7"))
+gs_rev = sysex(bytes.fromhex("41 10 42 12 40 01 30 04 0b f7"))
+xg_on = sysex(bytes.fromhex("43 10 4c 00 00 7e 00 f7"))
+xg_rev = sysex(bytes.fromhex("43 10 4c 02 01 00 01 10 6c f7"))
+notes = []
+for i, k in enumerate((60, 64, 67, 72)):
+    notes += [(0 if i == 0 else 24, bytes([0x90, k, 100])), (48, bytes([k, 0]))]   # running status note off
+melody = [(0, meta(0x51, b"\x07\xa1\x20")), (0, meta(0x58, b"\x04\x02\x18\x08")), (0, meta(0x03, b"Seed")),
+          (0, b"\xc0\x00"), (0, b"\xb0\x07\x64"), (0, b"\xb0\x5b\x40"), (0, b"\xb0\x5d\x20"),
+          (0, b"\xb0\x65\x00"), (0, b"\xb0\x64\x00"), (0, b"\xb0\x06\x0c"), (0, b"\xe0\x00\x50")] + notes + \
+         [(0, meta(0x51, b"\x03\xd0\x90")), (0, b"\x90\x48\x50"), (96, b"\x80\x48\x00")]
+drums = [(0, b"\x99\x24\x7f"), (24, b"\x89\x24\x00"), (0, b"\x99\x26\x7f"), (24, b"\x89\x26\x00")]
+mw = os.path.join(here, "seeds", "midi")
+os.makedirs(mw, exist_ok=True)
+seeds = {
+ "fmt0.mid": smf(0, [melody + drums]),
+ "fmt1_gs.mid": smf(1, [[(0, gs_reset), (0, gs_rev)], melody, drums]),
+ "fmt1_xg.mid": smf(1, [[(0, xg_on), (0, xg_rev)], melody], div=480),
+ "smpte.mid": smf(0, [melody], div=0xE728),
+ "song.kar": smf(1, [[(0, meta(0x01, b"@KMIDI KARAOKE FILE")), (0, meta(0x01, b"@TSeed"))],
+                     [(0, meta(0x01, b"@I")), (0, meta(0x01, b"\\Hel")), (24, meta(0x01, b"lo ")),
+                      (24, meta(0x01, b"/world")), (24, meta(0x05, b"la"))], melody]),
+}
+seeds["song.rmi"] = b"RIFF" + struct.pack("<I", 4 + 8 + len(seeds["fmt0.mid"])) + b"RMID" + b"data" + \
+    struct.pack("<I", len(seeds["fmt0.mid"])) + seeds["fmt0.mid"]
+for n, b in seeds.items():
+    open(os.path.join(mw, n), "wb").write(b)
+
+# Tracker: a 4-channel ProTracker module (M.K.) and an 8-channel one (8CHN) with a looped
+# sine, a few effects and an order jump. libopenmpt is fuzzed upstream; this covers our glue.
+import math
+def mod(tag, nch):
+    m = b"Seed Module".ljust(20, b"\0")
+    slen = 64
+    for i in range(31):
+        m += (b"Sine" if i == 0 else b"").ljust(22, b"\0")
+        m += struct.pack(">HBBHH", slen // 2 if i == 0 else 0, 0, 64 if i == 0 else 0, 0, slen // 2 if i == 0 else 1)
+    m += bytes([2, 127, 0, 1] + [0] * 126) + tag
+    def cell(smp, period, fx, arg): return bytes([(smp & 0xF0) | (period >> 8), period & 0xFF, ((smp & 15) << 4) | fx, arg])
+    for p in range(2):
+        rows = [[b"\0\0\0\0"] * nch for _ in range(64)]
+        rows[0][0] = cell(1, 428, 0xF, 4)
+        rows[4][1] = cell(1, 214, 0x4, 0x44)
+        rows[8][0] = cell(0, 0, 0xA, 0x02)
+        rows[12][nch - 1] = cell(1, 856, 0xE, 0x91)
+        rows[16][0] = cell(0, 0, 0xB if p else 0xD, 0)
+        m += b"".join(b"".join(r) for r in rows)
+    return m + bytes((int(round(math.sin(2 * math.pi * i / slen) * 100)) & 0xFF) for i in range(slen))
+tw = os.path.join(here, "seeds", "tracker")
+os.makedirs(tw, exist_ok=True)
+open(os.path.join(tw, "mk.mod"), "wb").write(mod(b"M.K.", 4))
+open(os.path.join(tw, "8chn.mod"), "wb").write(mod(b"8CHN", 8))
