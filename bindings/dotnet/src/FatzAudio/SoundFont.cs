@@ -141,7 +141,7 @@ public sealed class SoundFont : IDisposable
     }
 
     /// <summary>The instruments and drum kits, in bank and program order (read once, on first use).</summary>
-    public IReadOnlyList<SoundFontPreset> Presets => _presets ??= ReadPresets();
+    public IReadOnlyList<SoundFontPreset> Presets => LazyInitializer.EnsureInitialized(ref _presets, ReadPresets);
 
     private IReadOnlyList<SoundFontPreset>? _presets;
 

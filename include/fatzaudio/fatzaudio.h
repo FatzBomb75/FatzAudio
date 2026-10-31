@@ -2521,7 +2521,7 @@ FA_API fa_result FA_CALL fa_soundfont_get_info(fa_soundfont* font, fa_soundfont_
 /* One instrument or drum kit of a soundfont, by index (0 .. preset_count - 1, in bank and
  * program order). FA_ERROR_INVALID_ARG past the end. */
 typedef struct fa_soundfont_preset {
-    int32_t bank;                /* bank select MSB 0..127; 128 = drum kits */
+    int32_t bank;                /* bank select MSB 0..127; 128 = drum kits (a stack's to_bank: up to 16383) */
     int32_t program;             /* 0..127 */
     char name[24];               /* UTF-8 */
 } fa_soundfont_preset;

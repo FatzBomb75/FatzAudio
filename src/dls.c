@@ -463,6 +463,12 @@ static void apply_controlled(gens* g, unsigned src, unsigned ctl, unsigned dst, 
     gen = mod_dest(dst, &unit);
     if (gen < 0) return;
     if (src == SRC_NONE) { src = ctl; ctl = SRC_NONE; trans = (trans & ~0xFC00u) | ((trans >> 4 & 0x3F) << 10); }
+    /* DLS's implied connections written out by some editors (CC7 and CC11 to gain, CC10 to
+     * pan, CC91 and CC93 to the sends): the synth applies those itself, whatever curve bits
+     * the file gives them, so a modulator would apply them twice. */
+    if (ctl == SRC_NONE && ((gen == G_ATTENUATION && (src == SRC_CC + 7 || src == SRC_CC + 11)) || (gen == G_PAN && src == SRC_CC + 10) ||
+                            (gen == G_REVERB && src == SRC_CC + 91) || (gen == G_CHORUS && src == SRC_CC + 93)))
+        return;
     a = mod_source(src, trans, 0, art2);
     b = ctl == SRC_NONE ? 0 : mod_source(ctl, trans, 1, art2);
     if (!a || (ctl != SRC_NONE && !b)) return;
@@ -549,8 +555,14 @@ static void finish_zone(gens* g)
     /* DLS 1 has one LFO, which the default mod wheel vibrato also uses: SF2 drives
      * that from its vibrato LFO, so it takes the LFO's rate and delay unless a DLS 2
      * vibrato LFO sets its own. Unset rates are DLS's 5 Hz (SF2's default is 8.18 Hz). */
-    if (!g->set[G_MODLFO_FREQ] && (g->set[G_MODLFO_PITCH] || g->set[G_MODLFO_VOL] || g->set[G_MODLFO_FC]))
-        gen_set(g, G_MODLFO_FREQ, -851.0);
+    if (!g->set[G_MODLFO_FREQ]) {
+        int uses_lfo = g->set[G_MODLFO_PITCH] || g->set[G_MODLFO_VOL] || g->set[G_MODLFO_FC];
+        uint32_t i;
+        /* Also an LFO only a controller scales (a modulator of its depth). */
+        for (i = 0; i < g->nmods && !uses_lfo; i++)
+            uses_lfo = g->mods[i].dst == G_MODLFO_PITCH || g->mods[i].dst == G_MODLFO_VOL || g->mods[i].dst == G_MODLFO_FC;
+        if (uses_lfo) gen_set(g, G_MODLFO_FREQ, -851.0);
+    }
     if (!g->set[G_VIBLFO_FREQ]) gen_set(g, G_VIBLFO_FREQ, g->set[G_MODLFO_FREQ] ? g->v[G_MODLFO_FREQ] : -851.0);
     if (!g->set[G_VIBLFO_DELAY] && g->set[G_MODLFO_DELAY]) gen_set(g, G_VIBLFO_DELAY, g->v[G_MODLFO_DELAY]);
 }

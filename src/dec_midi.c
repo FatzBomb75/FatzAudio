@@ -1407,7 +1407,9 @@ static fa_result seek_to(struct fa_midi* m, fa_frames frame)
     m->rpos = from;
     m->blk_len = m->blk_off = 0;
     if (frame == 0) {
-        /* The start: the first read renders it (with the controls set by then). */
+        /* The start: the first read renders it (with the controls set by then). The values
+         * fa_stream_get_midi_value reads are the start's now, not those before the seek. */
+        refresh_values(m);
     } else if (frame < m->length) {
         while (m->rpos < block) render_block(m);
         render_block(m);
@@ -1452,9 +1454,7 @@ static fa_result measure_length(struct fa_midi* m)
         render_block(m);
     }
     m->length = end > last ? end : last;
-    r = seek_to(m, 0);
-    if (r == FA_OK) refresh_values(m);   /* the values of the start, not of the end */
-    return r;
+    return seek_to(m, 0);   /* also the values of the start, not of the end */
 }
 
 static void midi_free(struct fa_midi* m)
