@@ -204,7 +204,7 @@ void fa_eq_reset(fa_eq_state* st)
     st->seen = -1;
 }
 
-static void design(fa_eq_bandstate* b, uint32_t rate)
+void fa_eq_design(fa_eq_bandstate* b, uint32_t rate)
 {
     double f = b->f, w0, cw, sw, alpha, A, sq, b0, b1, b2, a0, a1, a2;
     if (f > 0.49 * rate) f = 0.49 * rate;
@@ -391,7 +391,7 @@ void fa_eq_process(fa_eq_state* st, float* buf, int64_t n)
         }
         /* While gliding, redesign every fourth call (64 frames): smooth enough, and
          * the trig stays off most blocks. */
-        if (b->dirty && (b->g == b->tg || (st->blocks & 3) == 0)) { design(b, st->rate); b->dirty = 0; }
+        if (b->dirty && (b->g == b->tg || (st->blocks & 3) == 0)) { fa_eq_design(b, st->rate); b->dirty = 0; }
         act[nb++] = b;
     }
     if (nb == 0) return;

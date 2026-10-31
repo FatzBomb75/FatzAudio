@@ -27,15 +27,18 @@
  *
  * SysEx: GM, GM2, GS and XG resets, GS rhythm parts and XG drum parts, XG and GM2
  * drum banks (bank select MSB 127 and 120), master volume (universal, GS, XG),
- * master fine and coarse tuning, GS and XG reverb and chorus settings (type,
- * level, time and the GS chorus's parameters; midi_fx.c), the GS and XG part
- * volume, pan, reverb send, chorus send and vibrato, filter and envelope offsets,
+ * master fine and coarse tuning, GS and XG reverb, chorus, delay and variation
+ * settings (midi_fx.c, midi_var.c), the GS and XG part
+ * volume, pan, reverb, chorus and delay/variation sends and vibrato, filter and envelope offsets,
  * GS and XG scale tuning, GS drum maps and XG drum setups (per-key drum edits, kept
  * in TinySoundFont: tsf_set_drum_param). Other SysEx is ignored.
  *
  * Reverb and chorus (src/midi_fx.c) are fed by each voice's send levels: CC91
  * and CC93 (40 and 0 after a reset, as on GS and GM2 devices) and the
  * soundfont's effect-send generators. They are on unless the app turns them off.
+ * After a GS or XG reset there is a third effect: CC94 sends to the GS delay or the
+ * XG variation (system mode), or the XG variation takes one part's whole sound
+ * (insertion mode: tsf renders that part apart, fa_midi_fx_insert adds it back).
  *
  * Live controls (transpose, channel mute, effects) are atomics the decode thread reads at
  * the start of each block. */
@@ -470,6 +473,7 @@ struct fa_midi {
     /* Rendering: blk holds frames [rpos - blk_len, rpos); blk_off of them were read. */
     float blk[FA_MIDI_BLOCK * 2];
     float rev[FA_MIDI_BLOCK * 2], cho[FA_MIDI_BLOCK * 2];   /* the block's reverb and chorus sends */
+    float var[FA_MIDI_BLOCK * 2], ins[FA_MIDI_BLOCK * 2];   /* CC94 sends; the insertion part's dry sound */
     fa_midi_fx* fx;
     int effects_now;            /* as applied by the decode thread */
     int blk_len, blk_off;
@@ -621,7 +625,7 @@ static void reset_channels(struct fa_midi* m, int mode, fa_frames frame)
     }
     set_master_gain(m, 1.0f, frame);
     m->tune_fine = m->tune_coarse = 0.0f;
-    fa_midi_fx_defaults(m->fx);
+    fa_midi_fx_defaults(m->fx, mode == MODE_GS ? FA_MIDI_FX_GS : mode == MODE_XG ? FA_MIDI_FX_XG : FA_MIDI_FX_GM);
     if (!m->synth) return;
     tsf_set_tuning(m->synth, 0.0f);
     tsf_reset_drum_kit(m->synth, -1);
@@ -636,6 +640,7 @@ static void reset_channels(struct fa_midi* m, int mode, fa_frames frame)
         tsf_channel_set_pitchwheel(m->synth, ch, 8192);
         tsf_channel_midi_control(m->synth, ch, 91, 40);   /* reverb send: the GM2 / GS default */
         tsf_channel_midi_control(m->synth, ch, 93, 0);
+        tsf_channel_midi_control(m->synth, ch, 94, 0);   /* delay / variation send */
         /* Sound controllers (CC71-78, the part NRPNs) back to normal, portamento time 0.
          * Channel pressure adds vibrato on GM devices only: GS, XG and GM2 default to none
          * (BASSMIDI: GS none, its own default 50 cents). */
@@ -692,6 +697,7 @@ static void gs_part(struct fa_midi* m, int block, int a, int v)
     case 0x1C: part_control(m, ch, TML_PAN_MSB, v); break;
     case 0x21: part_control(m, ch, 93, v); break;      /* chorus send */
     case 0x22: part_control(m, ch, 91, v); break;      /* reverb send */
+    case 0x2C: part_control(m, ch, 94, v); break;      /* delay send (SC-88) */
     default:
         if (a >= 0x30 && a <= 0x37) part_control(m, ch, sound_cc[a - 0x30], v);
         else if (a >= 0x40 && a <= 0x4B) tsf_channel_set_scale_tuning(m->synth, ch, a - 0x40, (float)(v - 64));   /* C .. B, cents */
@@ -709,6 +715,7 @@ static void xg_part(struct fa_midi* m, int ch, int a, int v)
     case 0x0E: part_control(m, ch, TML_PAN_MSB, v); break;
     case 0x12: part_control(m, ch, 93, v); break;      /* chorus send */
     case 0x13: part_control(m, ch, 91, v); break;      /* reverb send */
+    case 0x14: part_control(m, ch, 94, v); break;      /* variation send */
     default:
         if (a >= 0x15 && a <= 0x1C) part_control(m, ch, sound_cc[a - 0x15], v);
         else if (a >= 0x41 && a <= 0x4C) tsf_channel_set_scale_tuning(m->synth, ch, a - 0x41, (float)(v - 64));   /* C .. B, cents */
@@ -720,9 +727,10 @@ static void xg_part(struct fa_midi* m, int ch, int a, int v)
  * the pitch the key sounds at, kept as an offset; the rest are as tsf takes them. */
 static void gs_drum(struct fa_midi* m, int map, int a, int key, int v)
 {
-    static const int8_t param[9] = { -1, TSF_DRUM_PITCH_COARSE, TSF_DRUM_LEVEL, TSF_DRUM_GROUP, TSF_DRUM_PAN,
-                                     TSF_DRUM_REVERB, TSF_DRUM_CHORUS, TSF_DRUM_NOTE_OFF, TSF_DRUM_NOTE_ON };
-    if (a >= 9 || param[a] < 0 || key > 127) return;   /* 0: the map's name; 9: delay send */
+    static const int8_t param[10] = { -1, TSF_DRUM_PITCH_COARSE, TSF_DRUM_LEVEL, TSF_DRUM_GROUP, TSF_DRUM_PAN,
+                                      TSF_DRUM_REVERB, TSF_DRUM_CHORUS, TSF_DRUM_NOTE_OFF, TSF_DRUM_NOTE_ON,
+                                      TSF_DRUM_VARIATION };
+    if (a >= 10 || param[a] < 0 || key > 127) return;   /* 0: the map's name */
     if (a == 1) { v += 64 - key; v = v < 0 ? 0 : v > 127 ? 127 : v; }
     tsf_set_drum_param(m->synth, map, key, param[a], v);
 }
@@ -732,10 +740,10 @@ static void gs_drum(struct fa_midi* m, int map, int a, int key, int v)
 static void xg_drum(struct fa_midi* m, int setup, int key, int a, int v)
 {
     static const int8_t param[16] = { TSF_DRUM_PITCH_COARSE, TSF_DRUM_PITCH_FINE, TSF_DRUM_LEVEL, TSF_DRUM_GROUP,
-                                      TSF_DRUM_PAN, TSF_DRUM_REVERB, TSF_DRUM_CHORUS, -1, -1, TSF_DRUM_NOTE_OFF,
+                                      TSF_DRUM_PAN, TSF_DRUM_REVERB, TSF_DRUM_CHORUS, TSF_DRUM_VARIATION, -1, TSF_DRUM_NOTE_OFF,
                                       TSF_DRUM_NOTE_ON, TSF_DRUM_CUTOFF, TSF_DRUM_RESONANCE, TSF_DRUM_ATTACK,
                                       TSF_DRUM_DECAY, TSF_DRUM_RELEASE };
-    if (a >= 16 || param[a] < 0 || key > 127) return;   /* 7: variation send, 8: key assign */
+    if (a >= 16 || param[a] < 0 || key > 127) return;   /* 8: key assign */
     if (a >= 0x0D) v = v ? 128 - v : 127;
     tsf_set_drum_param(m->synth, setup, key, param[a], v);
 }
@@ -914,25 +922,41 @@ static void render_block(struct fa_midi* m)
     fa_frames start = m->rpos, n = m->length - start, done = 0;
     if (n > FA_MIDI_BLOCK) n = FA_MIDI_BLOCK;
     fa_frames i;
+    int ins_part = -1;          /* the part rendered into ins, if any */
     take_controls(m);
     if (m->effects_now) {
         memset(m->rev, 0, sizeof(m->rev));
         memset(m->cho, 0, sizeof(m->cho));
+        memset(m->var, 0, sizeof(m->var));
+        memset(m->ins, 0, sizeof(m->ins));
     }
     while (done < n) {
         fa_frames upto = n;
         while (m->next < m->nev && m->ev[m->next].frame <= start + done) apply_event(m, &m->ev[m->next++], 0);
         if (m->next < m->nev && m->ev[m->next].frame < start + n) upto = m->ev[m->next].frame - start;
-        if (m->effects_now)
-            tsf_render_float_fx(m->synth, m->blk + done * 2, m->rev + done * 2, m->cho + done * 2, (int)(upto - done), 0);
-        else
+        if (m->effects_now) {
+            int route = fa_midi_fx_route(m->fx);   /* SysEx in the block may change it */
+            if (route >= 0) ins_part = route;
+            tsf_render_float_fx(m->synth, m->blk + done * 2, m->rev + done * 2, m->cho + done * 2,
+                                route == -1 ? m->var + done * 2 : NULL, route >= 0 ? m->ins + done * 2 : NULL, route,
+                                (int)(upto - done), 0);
+        } else {
             tsf_render_float(m->synth, m->blk + done * 2, (int)(upto - done), 0);
+        }
         done = upto;
     }
     /* The effects run on the whole block, so their output does not depend on
      * where events split it; master volume is applied after them, to the wet
-     * sound too. */
-    if (m->effects_now) fa_midi_fx_process(m->fx, m->rev, m->cho, m->blk, (int)n, start);
+     * sound too. An insertion part goes through the variation first, then on to
+     * the reverb and chorus at the part's sends (CC91, CC93). */
+    if (m->effects_now) {
+        if (ins_part >= 0) {
+            float rs = (float)tsf_channel_get_midi_control(m->synth, ins_part, 91) * (0.2f / 127.0f);
+            float cs = (float)tsf_channel_get_midi_control(m->synth, ins_part, 93) * (0.2f / 127.0f);
+            fa_midi_fx_insert(m->fx, m->ins, m->blk, m->rev, m->cho, rs, cs, (int)n, start);
+        }
+        fa_midi_fx_process(m->fx, m->rev, m->cho, m->var, m->blk, (int)n, start);
+    }
     for (i = 0; i < n && start + i < m->gain_at + FA_MIDI_GAIN_RAMP; i++) {   /* the ramp */
         float g = gain_at(m, start + i);
         m->blk[i * 2] *= g;

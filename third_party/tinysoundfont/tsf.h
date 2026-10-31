@@ -203,7 +203,11 @@ TSFDEF void tsf_render_float(tsf* f, float* buffer, int samples, int flag_mixing
 // effect-send generator plus CC91 / CC93 * 200 / 127 (the SoundFont 2.04 default
 // modulators), at most 100%. Mono and stereo interleaved output only (stereo
 // unweaved renders dry, like tsf_render_float). The buses are always added to.
-TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* chorus, int samples, int flag_mixing);
+// variation (may be NULL): a third bus, fed by CC94 * 200 / 127 (the GS delay and XG
+// variation send) times the drum key's TSF_DRUM_VARIATION. insert (may be NULL): the
+// voices of channel insertChannel go there, without sends, instead of to the others
+// (an insertion effect's input; the caller sends its output on).
+TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* chorus, float* variation, float* insert, int insertChannel, int samples, int flag_mixing);
 
 // Higher level channel based functions, set up channel parameters
 //   channel: channel number
@@ -251,7 +255,7 @@ enum TSFDrumParam
 {
 	TSF_DRUM_PITCH_COARSE, TSF_DRUM_PITCH_FINE, TSF_DRUM_LEVEL, TSF_DRUM_PAN, TSF_DRUM_REVERB, TSF_DRUM_CHORUS,
 	TSF_DRUM_GROUP, TSF_DRUM_NOTE_OFF, TSF_DRUM_NOTE_ON, TSF_DRUM_CUTOFF, TSF_DRUM_RESONANCE,
-	TSF_DRUM_ATTACK, TSF_DRUM_DECAY, TSF_DRUM_RELEASE, TSF_DRUM_PARAMS
+	TSF_DRUM_ATTACK, TSF_DRUM_DECAY, TSF_DRUM_RELEASE, TSF_DRUM_VARIATION, TSF_DRUM_PARAMS
 };
 #define TSF_DRUM_KITS 4
 TSFDEF int tsf_channel_set_drum_kit(tsf* f, int channel, int kit);
@@ -270,7 +274,7 @@ TSFDEF void tsf_channel_sounds_off_all(tsf* f, int channel); //end immediately
 
 // Apply a MIDI control change to the channel (not all controllers are supported!)
 // FatzAudio: also CC1, CC5, CC65-67, CC71-78, CC84, NRPN 01 xx (GS/XG part sound controllers),
-// NRPN 14-1E rr (GS/XG drum key edits, on a channel with a drum kit), RPN 5
+// NRPN 14-1F rr (GS/XG drum key edits, on a channel with a drum kit), RPN 5
 // and any controller a soundfont modulator reads
 //    (tsf_channel_midi_control returns 0 on allocation failure of new channel, otherwise 1)
 TSFDEF int tsf_channel_midi_control(tsf* f, int channel, int controller, int control_value);
@@ -531,7 +535,7 @@ struct tsf_voice
 	// units), the exclusive group (the region's, or 0x10000 + kit * 128 + an edited group) and
 	// whether the key was set not to receive note-offs when the note started
 	unsigned char drumHold;
-	float scalePitch, drumPitch, basePan, sendReverb, sendChorus, drumFc, drumQ, drumAttack, drumDecay, drumRelease;
+	float scalePitch, drumPitch, basePan, sendReverb, sendChorus, sendVariation, drumFc, drumQ, drumAttack, drumDecay, drumRelease;
 	unsigned int group;
 };
 
@@ -553,7 +557,7 @@ struct tsf_channel
 
 // FatzAudio: a drum key's edits, as the MIDI values tsf_set_drum_param takes
 struct tsf_drumkey { unsigned char edited, param[TSF_DRUM_PARAMS]; };
-static const unsigned char tsf_drumkey_defaults[TSF_DRUM_PARAMS] = { 64, 64, 127, 0, 127, 127, 0xFF, 1, 1, 64, 64, 64, 64, 64 }; // pan 0, group 0xFF: the soundfont's
+static const unsigned char tsf_drumkey_defaults[TSF_DRUM_PARAMS] = { 64, 64, 127, 0, 127, 127, 0xFF, 1, 1, 64, 64, 64, 64, 64, 127 }; // pan 0, group 0xFF: the soundfont's
 
 struct tsf_channels
 {
@@ -2139,6 +2143,7 @@ static void tsf_voice_drum(struct tsf_voice* v, const struct tsf_drumkey* d)
 	if (p[TSF_DRUM_PAN]) v->basePan = (p[TSF_DRUM_PAN] - 64) / 126.0f;
 	v->sendReverb = p[TSF_DRUM_REVERB] / 127.0f;
 	v->sendChorus = p[TSF_DRUM_CHORUS] / 127.0f;
+	v->sendVariation = p[TSF_DRUM_VARIATION] / 127.0f;
 	v->drumFc = (p[TSF_DRUM_CUTOFF] - 64) * TSF_SC_CUTOFF;
 	v->drumQ = (p[TSF_DRUM_RESONANCE] - 64) * TSF_SC_RESONANCE;
 	v->drumAttack = (p[TSF_DRUM_ATTACK] - 64) * TSF_SC_TIME;
@@ -2235,7 +2240,7 @@ TSFDEF int tsf_note_on(tsf* f, int preset_index, int key, float vel)
 		voice->drumHold = (unsigned char)(drum && !drum->param[TSF_DRUM_NOTE_OFF]);
 		voice->scalePitch = voice->drumPitch = 0.0f;
 		voice->basePan = region->pan;
-		voice->sendReverb = voice->sendChorus = 1.0f;
+		voice->sendReverb = voice->sendChorus = voice->sendVariation = 1.0f;
 		voice->drumFc = voice->drumQ = voice->drumAttack = voice->drumDecay = voice->drumRelease = 0.0f;
 		if (drum) tsf_voice_drum(voice, drum);
 
@@ -2374,7 +2379,7 @@ static float tsf_voice_send(float region_send, int cc)
 	return (s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s));
 }
 
-TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* chorus, int samples, int flag_mixing)
+TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* chorus, float* variation, float* insert, int insertChannel, int samples, int flag_mixing)
 {
 	float tmp[TSF_RENDER_EFFECTSAMPLEBLOCK * 2];
 	int chans = (f->outputmode == TSF_MONO ? 1 : 2);
@@ -2386,25 +2391,30 @@ TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* cho
 		int k = (samples < TSF_RENDER_EFFECTSAMPLEBLOCK ? samples : TSF_RENDER_EFFECTSAMPLEBLOCK), n = k * chans, i;
 		for (v = f->voices; v != vEnd; v++)
 		{
-			float rs = 0.0f, cs = 0.0f;
+			float rs = 0.0f, cs = 0.0f, vs = 0.0f;
 			if (v->playingPreset == -1) continue;
+			if (insert && v->playingChannel == insertChannel) { tsf_voice_render(f, v, insert, k); continue; }
 			if (f->channels && v->playingChannel >= 0 && v->playingChannel < f->channels->channelNum)
 			{
 				struct tsf_channel* c = &f->channels->channels[v->playingChannel];
 				rs = tsf_voice_send(v->region->reverbSend + v->modReverb, c->midiReverb) * v->sendReverb;
 				cs = tsf_voice_send(v->region->chorusSend + v->modChorus, c->midiChorus) * v->sendChorus;
+				if (variation) vs = tsf_voice_send(0.0f, c->cc[94]) * v->sendVariation;
 			}
 			else
 			{
 				rs = tsf_voice_send(v->region->reverbSend + v->modReverb, 0);
 				cs = tsf_voice_send(v->region->chorusSend + v->modChorus, 0);
 			}
-			if (rs == 0.0f && cs == 0.0f) { tsf_voice_render(f, v, buffer, k); continue; }
+			if (rs == 0.0f && cs == 0.0f && vs == 0.0f) { tsf_voice_render(f, v, buffer, k); continue; }
 			TSF_MEMSET(tmp, 0, n * sizeof(float));
 			tsf_voice_render(f, v, tmp, k);
 			for (i = 0; i != n; i++) { buffer[i] += tmp[i]; reverb[i] += tmp[i] * rs; chorus[i] += tmp[i] * cs; }
+			if (vs != 0.0f) for (i = 0; i != n; i++) variation[i] += tmp[i] * vs;
 		}
 		buffer += n; reverb += n; chorus += n; samples -= k;
+		if (variation) variation += n;
+		if (insert) insert += n;
 	}
 }
 
@@ -2728,16 +2738,16 @@ TSFDEF void tsf_reset_drum_kit(tsf* f, int kit)
 	for (i = first; i != end; i++) { f->drumKeys[i].edited = 0; TSF_MEMCPY(f->drumKeys[i].param, tsf_drumkey_defaults, TSF_DRUM_PARAMS); }
 }
 
-// GS and XG drum NRPNs (MSB 14-1E, LSB the key), on a channel with a drum kit. Pitch coarse
+// GS and XG drum NRPNs (MSB 14-1F, LSB the key), on a channel with a drum kit. Pitch coarse
 // and fine are offsets from 64, level, pan and sends absolute; XG's attack and decay are
 // rates (higher is faster), so they lengthen the times as they go below 64.
 static void tsf_nrpn_drum(tsf* f, int kit, unsigned short nrpn, int value)
 {
-	static const signed char param[11] = {
+	static const signed char param[12] = {
 		TSF_DRUM_CUTOFF, TSF_DRUM_RESONANCE, TSF_DRUM_ATTACK, TSF_DRUM_DECAY, TSF_DRUM_PITCH_COARSE, TSF_DRUM_PITCH_FINE,
-		TSF_DRUM_LEVEL, -1, TSF_DRUM_PAN, TSF_DRUM_REVERB, TSF_DRUM_CHORUS };
+		TSF_DRUM_LEVEL, -1, TSF_DRUM_PAN, TSF_DRUM_REVERB, TSF_DRUM_CHORUS, TSF_DRUM_VARIATION };
 	int msb = nrpn >> 7;
-	if (msb < 0x14 || msb > 0x1E || param[msb - 0x14] < 0) return;
+	if (msb < 0x14 || msb > 0x1F || param[msb - 0x14] < 0) return;
 	if (msb == 0x16 || msb == 0x17) value = (value ? 128 - value : 127);
 	tsf_set_drum_param(f, kit, nrpn & 0x7F, param[msb - 0x14], value);
 }

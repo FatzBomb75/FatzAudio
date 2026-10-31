@@ -52,10 +52,13 @@ against untrusted files and add what the decoder needs:
 - Scale tuning (`tsf_channel_set_scale_tuning`: cents per note of the octave, per channel) and drum
   key edits (`tsf_set_drum_param`, `tsf_channel_set_drum_kit`, `tsf_reset_drum_kit`: four kits of 128
   keys per synth, allocated on the first edit) for pitch, level, pan, effect sends, exclusive group,
-  note-off/note-on reception, filter and envelope; the GS/XG drum NRPNs (MSB 14-1E) edit the
+  note-off/note-on reception, filter, envelope and the delay/variation send; the GS/XG drum NRPNs (MSB 14-1F) edit the
   channel's kit. Voices carry the resulting pitch, base pan, send factors and offsets.
 - `tsf_render_float_fx`: like `tsf_render_float`, and also adds each voice to the reverb and chorus
-  send buses (the soundfont's sends plus CC91/CC93); the effects themselves are in `src/midi_fx.c`.
+  send buses (the soundfont's sends plus CC91/CC93) and, when asked, a third bus (CC94, the GS delay
+  and XG variation send, times the drum key's send); the voices of one channel can go to a buffer of
+  their own instead (an insertion effect's input). The effects themselves are in `src/midi_fx.c` and
+  `src/midi_var.c`.
 - `tsf_hydra_valid`: minimum record counts, and every bag/generator/instrument/sample
   index checked monotonic and in range; out-of-range sample IDs and instrument indices
   skipped; sample offsets and loop points clamped inside the sample.
