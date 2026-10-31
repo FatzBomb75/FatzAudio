@@ -38,7 +38,16 @@ else()
 endif()
 option(FA_BUILD_TESTS "Build FatzAudio tests" ${FA_EXECUTABLES_DEFAULT})
 option(FA_BUILD_TOOLS "Build the listening and comparison tools (tools/)" ${FA_EXECUTABLES_DEFAULT})
-option(FA_LTO "Link-time optimization of the library in Release and MinSizeRel builds" ON)
+# Link-time optimization: on by default only where it was measured to shrink the
+# library without slowing the build much (extras step 21, PR 165: Linux x64 4.33 to
+# 4.15 MiB). MSVC's /GL took Windows from 4.24 to 4.02 MiB but its CI build from 5 to
+# 23 minutes; Apple's and the NDK's clang made macOS, iOS and three Android ABIs larger.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+    set(FA_LTO_DEFAULT ON)
+else()
+    set(FA_LTO_DEFAULT OFF)
+endif()
+option(FA_LTO "Link-time optimization of the library in Release and MinSizeRel builds" ${FA_LTO_DEFAULT})
 
 set(FA_SOURCES
     src/engine.c
