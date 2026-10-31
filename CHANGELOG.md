@@ -30,6 +30,13 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   found keeps the subcode read so far, and a part read again with different packs redoes the seek checkpoints after it
   at once instead of 10 s per write. See [docs/features/disc.md](docs/features/disc.md#pregaps).
 
+- MIDI scale tuning and drum setup: GS (`40 1x 40`-`4B`) and XG (`08 nn 41`-`4C`) scale tuning, GS drum map edits
+  (`41 mp rr`), XG drum setups (`3n rr pp`, and the drum setup reset) and the GS/XG drum NRPNs (MSB 14-1E) set each drum
+  key's pitch, level, pan, effect sends, exclusive group, note-off and note-on reception, filter and envelope. GS drum
+  map 2 and XG drum setups 1-4 are kept apart. XG SFX kits (bank 126) come from the soundfont's bank 126, else the GS
+  SFX kit, else the standard kit. Files without these messages render bit for bit as before.
+  See [docs/features/midi.md](docs/features/midi.md#scale-tuning-and-drum-setup).
+
 - Dolby downmix (extras step 20): `fa_open_options.dolby_downmix` and `fa_stream_set_dolby_downmix` /
   `fa_stream_get_dolby_downmix` (.NET `StreamOptions.DolbyDownmix`, `AudioStream.DolbyDownmix`) choose Lo/Ro, Lt/Rt
   (Pro Logic matrix surround) or the stream's own preference; `fa_engine_set_dialnorm` (.NET `AudioEngine.SetDialnorm`)
@@ -263,6 +270,16 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   set to the area they show in instead of redrawing the whole surface. Songs without the offsets draw the same pixels
   as before.
 
+- Analysis: the key's chroma FFT carries two windows at once (as the onset side does), and the bars' chroma shares a bin wider than a semitone among the pitch classes it covers (low chord changes show). The accuracy report is unchanged (all 44 bar songs right, 48 of 48 keys).
+- Lyric surface: a line growing in during a page fade-in is drawn again at its size instead of upscaled, and a line or page that failed for lack of memory is tried again after about 90 frames.
+- Reverse playback: the half-second blocks the source is decoded in are each decoded 10 ms past their end and
+  cross-faded with the block above, so where a seek is not exact (AAC noise and prediction, MIDI notes struck again) the
+  joins no longer click; exact decoders give the same audio as before. Markers, `FA_EVENT_LOOPED` (reversed: from the
+  loop start to its end), MIDI texts and tracker rows are now raised while reversed, last first. Deck loops, loop changes
+  and beat jumps join without a gap while reversed instead of restarting like a seek, deck sync pulls a reversed deck
+  into phase (its beats counting down), `fa_deck_play_synced` starts a reversed deck on the beat, and a beat loop set
+  while reversed lies below the beat heard. Forward playback is unchanged. See
+  [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md#reverse-playback).
 - AC-3 and E-AC-3 with more than two channels are mixed down to stereo with the stream's own centre, surround (and
   E-AC-3 LFE) levels and its Lo/Ro or Lt/Rt preference, as ETSI TS 102 366 describes, scaled so the mix cannot clip.
   Without normalization Dolby 5.1 therefore plays about 7.7 dB quieter than with the engine's generic downmix

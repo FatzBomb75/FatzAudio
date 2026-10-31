@@ -79,7 +79,9 @@ public sealed partial class DjDeck
 
     /// <summary>
     /// A loop of <paramref name="beats"/> beats on the grid (1/16..32, e.g. 1, 2, 4, 8, 16) from the beat heard now,
-    /// or, while a loop is on, from its in point (so halving and doubling keep its start). 0 turns the loop off.
+    /// or, while a loop is on, from its in point (so halving and doubling keep its start). On a deck playing in
+    /// <see cref="AudioStream.Reverse"/> it is mirrored: the loop ends at the beat heard and lies below it, and halving
+    /// and doubling keep its end. 0 turns the loop off.
     /// The <see cref="Loop"/> property reads it back in frames.
     /// </summary>
     /// <exception cref="FatzAudioException"><see cref="ErrorCode.NotFound"/> when the deck is empty or has no grid.</exception>

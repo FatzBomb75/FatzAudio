@@ -237,6 +237,26 @@ TSFDEF int tsf_channel_set_sostenuto(tsf* f, int channel, int flag_sostenuto);
 TSFDEF int tsf_channel_set_pressure(tsf* f, int channel, int pressure);
 TSFDEF int tsf_channel_set_key_pressure(tsf* f, int channel, int key, int pressure);
 TSFDEF int tsf_channel_set_pressure_vibrato(tsf* f, int channel, float cents);
+// FatzAudio: scale tuning (GS/XG): cents added to every C (note 0), C# (1) ... B (11) the
+// channel plays, sounding notes included
+TSFDEF int tsf_channel_set_scale_tuning(tsf* f, int channel, int note, float cents);
+// FatzAudio: drum setup (GS drum maps, XG drum setups, the drum NRPNs). A synth holds
+// TSF_DRUM_KITS edit tables of 128 keys; a channel playing drums reads one (`kit`, -1 none).
+// Values are MIDI data bytes (0..127): pitch 64 = as is (coarse: semitones, fine: cents),
+// level 127 = as is (0 silent), pan 1..127 replaces the soundfont's (0: the middle), sends
+// 127 = as is, group 0 = none (1..127: an exclusive group of the kit's own), note off/on
+// 0 = ignored, filter and envelope times 64 = as is (the CC71-78 steps). Edits take effect
+// from the key's next note.
+enum TSFDrumParam
+{
+	TSF_DRUM_PITCH_COARSE, TSF_DRUM_PITCH_FINE, TSF_DRUM_LEVEL, TSF_DRUM_PAN, TSF_DRUM_REVERB, TSF_DRUM_CHORUS,
+	TSF_DRUM_GROUP, TSF_DRUM_NOTE_OFF, TSF_DRUM_NOTE_ON, TSF_DRUM_CUTOFF, TSF_DRUM_RESONANCE,
+	TSF_DRUM_ATTACK, TSF_DRUM_DECAY, TSF_DRUM_RELEASE, TSF_DRUM_PARAMS
+};
+#define TSF_DRUM_KITS 4
+TSFDEF int tsf_channel_set_drum_kit(tsf* f, int channel, int kit);
+TSFDEF int tsf_set_drum_param(tsf* f, int kit, int key, int param, int value);
+TSFDEF void tsf_reset_drum_kit(tsf* f, int kit); // -1: every kit
 
 // Start or stop playing notes on a channel (needs channel preset to be set)
 //   channel: channel number
@@ -249,7 +269,8 @@ TSFDEF void tsf_channel_note_off_all(tsf* f, int channel); //end with sustain an
 TSFDEF void tsf_channel_sounds_off_all(tsf* f, int channel); //end immediately
 
 // Apply a MIDI control change to the channel (not all controllers are supported!)
-// FatzAudio: also CC1, CC5, CC65-67, CC71-78, CC84, NRPN 01 xx (GS/XG part sound controllers), RPN 5
+// FatzAudio: also CC1, CC5, CC65-67, CC71-78, CC84, NRPN 01 xx (GS/XG part sound controllers),
+// NRPN 14-1E rr (GS/XG drum key edits, on a channel with a drum kit), RPN 5
 // and any controller a soundfont modulator reads
 //    (tsf_channel_midi_control returns 0 on allocation failure of new channel, otherwise 1)
 TSFDEF int tsf_channel_midi_control(tsf* f, int channel, int controller, int control_value);
@@ -371,6 +392,7 @@ struct tsf
 	int modulatorNum;
 	tsf_u32 modCC[4];   // FatzAudio: controllers some modulator reads (bit n = CC n)
 	tsf_u32 modGC;      // FatzAudio: general controllers some modulator reads (bit n = source n)
+	struct tsf_drumkey* drumKeys; // FatzAudio: TSF_DRUM_KITS * 128 drum key edits, of this synth only (NULL: none yet)
 };
 
 #ifndef TSF_NO_STDIO
@@ -504,6 +526,13 @@ struct tsf_voice
 	float portaCents; int portaLeft, portaTotal;
 	float envMod[15]; // the envelope offsets last applied: both envelopes' 6 slots, the sound controllers' 3 times
 	unsigned char sostenuto, soft;
+	// FatzAudio: scale tuning and drum key edits: pitch (cents), the pan the channel's is added
+	// to (the region's unless edited), effect send factors, filter and envelope offsets (generator
+	// units), the exclusive group (the region's, or 0x10000 + kit * 128 + an edited group) and
+	// whether the key was set not to receive note-offs when the note started
+	unsigned char drumHold;
+	float scalePitch, drumPitch, basePan, sendReverb, sendChorus, drumFc, drumQ, drumAttack, drumDecay, drumRelease;
+	unsigned int group;
 };
 
 struct tsf_channel
@@ -518,7 +547,13 @@ struct tsf_channel
 	unsigned short midiNRPN;
 	float modRange, pressureVibrato;
 	short lastKey, portaKey, portaFrom;
+	float scaleTune[12]; // FatzAudio: scale tuning, cents per note of the octave
+	signed char drumKit; // FatzAudio: the drum key edits the channel plays with (-1 none)
 };
+
+// FatzAudio: a drum key's edits, as the MIDI values tsf_set_drum_param takes
+struct tsf_drumkey { unsigned char edited, param[TSF_DRUM_PARAMS]; };
+static const unsigned char tsf_drumkey_defaults[TSF_DRUM_PARAMS] = { 64, 64, 127, 0, 127, 127, 0xFF, 1, 1, 64, 64, 64, 64, 64 }; // pan 0, group 0xFF: the soundfont's
 
 struct tsf_channels
 {
@@ -1495,6 +1530,7 @@ static void tsf_voice_calcpitchratio(struct tsf_voice* v, float pitchShift, floa
 	double adjustedPitch = v->region->pitch_keycenter + (note - v->region->pitch_keycenter) * (v->region->pitch_keytrack / 100.0);
 	if (pitchShift) adjustedPitch += pitchShift;
 	if (v->modPitch) adjustedPitch += v->modPitch / 100.0; // FatzAudio: tuning modulators
+	if (v->scalePitch || v->drumPitch) adjustedPitch += (v->scalePitch + v->drumPitch) / 100.0; // FatzAudio: scale tuning, drum pitch
 	v->pitchInputTimecents = adjustedPitch * 100.0;
 	v->pitchOutputFactor = v->region->sample_rate / (tsf_timecents2Secsd(v->region->pitch_keycenter * 100.0) * outSampleRate);
 }
@@ -1640,6 +1676,11 @@ static void tsf_voice_modulate(tsf* f, struct tsf_voice* v, TSF_BOOL start)
 		sDecay = (c->cc[75] - 64) * TSF_SC_TIME;
 		sRelease = (c->cc[72] - 64) * TSF_SC_TIME;
 		sDelay = (c->cc[78] - 64) * TSF_SC_TIME;
+		m[TSF_MOD_FILTERFC] += v->drumFc; // drum key edits
+		m[TSF_MOD_FILTERQ] += v->drumQ;
+		sAttack += v->drumAttack;
+		sDecay += v->drumDecay;
+		sRelease += v->drumRelease;
 	}
 	if (v->soft) { m[TSF_MOD_FILTERFC] += TSF_SOFT_CUTOFF; m[TSF_MOD_ATTENUATION] += TSF_SOFT_ATTEN; }
 
@@ -1717,7 +1758,7 @@ static void tsf_voice_modulate(tsf* f, struct tsf_voice* v, TSF_BOOL start)
 	if (val != v->modGainDB) { v->noteGainDB += val - v->modGainDB; v->modGainDB = val; }
 	val = m[TSF_MOD_COARSETUNE] * 100.0f + m[TSF_MOD_FINETUNE];
 	if (val != v->modPitch) { v->modPitch = val; tsf_voice_calcpitchratio(v, (c ? tsf_channel_pitchshift(f, c) : 0.0f), f->outSampleRate); }
-	if (m[TSF_MOD_PAN] != v->modPan) { v->modPan = m[TSF_MOD_PAN]; tsf_voice_setpan(v, r->pan + (c ? c->panOffset : 0.0f) + v->modPan * 0.001f); }
+	if (m[TSF_MOD_PAN] != v->modPan) { v->modPan = m[TSF_MOD_PAN]; tsf_voice_setpan(v, v->basePan + (c ? c->panOffset : 0.0f) + v->modPan * 0.001f); }
 	v->modReverb = m[TSF_MOD_REVERB];
 	v->modChorus = m[TSF_MOD_CHORUS];
 }
@@ -1996,6 +2037,7 @@ TSFDEF tsf* tsf_copy(tsf* f)
 	res->voices = TSF_NULL;
 	res->voiceNum = 0;
 	res->channels = TSF_NULL;
+	res->drumKeys = TSF_NULL; // FatzAudio
 	(*res->refCount)++;
 	return res;
 }
@@ -2014,6 +2056,7 @@ TSFDEF void tsf_close(tsf* f)
 	}
 	TSF_FREE(f->channels);
 	TSF_FREE(f->voices);
+	TSF_FREE(f->drumKeys); // FatzAudio
 	TSF_FREE(f);
 }
 
@@ -2076,27 +2119,59 @@ TSFDEF int tsf_set_max_voices(tsf* f, int max_voices)
 	return 1;
 }
 
+// FatzAudio: drum key edits ------------------------------------------------------------
+
+// The edits of `key` in the kit of the channel a note starts on; NULL if none.
+static const struct tsf_drumkey* tsf_drumkey_of(tsf* f, int key)
+{
+	const struct tsf_channel* c;
+	if (!f->drumKeys || !f->channels || key < 0 || key > 127) return TSF_NULL;
+	c = &f->channels->channels[f->channels->activeChannel];
+	if (c->drumKit < 0 || !f->drumKeys[c->drumKit * 128 + key].edited) return TSF_NULL;
+	return &f->drumKeys[c->drumKit * 128 + key];
+}
+
+static void tsf_voice_drum(struct tsf_voice* v, const struct tsf_drumkey* d)
+{
+	const unsigned char* p = d->param;
+	v->drumPitch = (p[TSF_DRUM_PITCH_COARSE] - 64) * 100.0f + (p[TSF_DRUM_PITCH_FINE] - 64);
+	if (p[TSF_DRUM_LEVEL] != 127) v->noteGainDB += 2.0f * tsf_gainToDecibels(p[TSF_DRUM_LEVEL] / 127.0f); // as velocity: 40 log10
+	if (p[TSF_DRUM_PAN]) v->basePan = (p[TSF_DRUM_PAN] - 64) / 126.0f;
+	v->sendReverb = p[TSF_DRUM_REVERB] / 127.0f;
+	v->sendChorus = p[TSF_DRUM_CHORUS] / 127.0f;
+	v->drumFc = (p[TSF_DRUM_CUTOFF] - 64) * TSF_SC_CUTOFF;
+	v->drumQ = (p[TSF_DRUM_RESONANCE] - 64) * TSF_SC_RESONANCE;
+	v->drumAttack = (p[TSF_DRUM_ATTACK] - 64) * TSF_SC_TIME;
+	v->drumDecay = (p[TSF_DRUM_DECAY] - 64) * TSF_SC_TIME;
+	v->drumRelease = (p[TSF_DRUM_RELEASE] - 64) * TSF_SC_TIME;
+}
+
 TSFDEF int tsf_note_on(tsf* f, int preset_index, int key, float vel)
 {
 	short midiVelocity = (short)(vel * 127);
 	unsigned int voicePlayIndex;
 	struct tsf_region *region, *regionEnd;
+	const struct tsf_drumkey* drum;
 
 	if (preset_index < 0 || preset_index >= f->presetNum) return 1;
 	if (vel <= 0.0f) { tsf_note_off(f, preset_index, key); return 1; }
+	drum = tsf_drumkey_of(f, key); // FatzAudio
 
 	// Play all matching regions.
 	voicePlayIndex = f->voicePlayIndex++;
 	for (region = f->presets[preset_index].regions, regionEnd = region + f->presets[preset_index].regionNum; region != regionEnd; region++)
 	{
-		struct tsf_voice *voice, *v, *vEnd; TSF_BOOL doLoop; float lowpassFilterQDB, lowpassFc;
+		struct tsf_voice *voice, *v, *vEnd; TSF_BOOL doLoop; float lowpassFilterQDB, lowpassFc; unsigned int group;
 		if (key < region->lokey || key > region->hikey || midiVelocity < region->lovel || midiVelocity > region->hivel) continue;
 
+		// FatzAudio: a drum key's edited exclusive group replaces the region's
+		// (kept apart per kit: the same group number in two kits are two groups)
+		group = (drum && drum->param[TSF_DRUM_GROUP] != 0xFF ? (drum->param[TSF_DRUM_GROUP] ? 0x10000u | (unsigned int)(drum - f->drumKeys) / 128u << 7 | drum->param[TSF_DRUM_GROUP] : 0) : region->group);
 		voice = TSF_NULL, v = f->voices, vEnd = v + f->voiceNum;
-		if (region->group)
+		if (group)
 		{
 			for (; v != vEnd; v++)
-				if (v->playingPreset == preset_index && v->region->group == region->group) tsf_voice_endquick(f, v);
+				if (v->playingPreset == preset_index && v->group == group) tsf_voice_endquick(f, v);
 				else if (v->playingPreset == -1 && !voice) voice = v;
 		}
 		else for (; v != vEnd; v++) if (v->playingPreset == -1) { voice = v; break; }
@@ -2156,6 +2231,13 @@ TSFDEF int tsf_note_on(tsf* f, int preset_index, int key, float vel)
 		voice->portaCents = 0.0f; voice->portaLeft = voice->portaTotal = 0;
 		voice->sostenuto = voice->soft = 0;
 		TSF_MEMSET(voice->envMod, 0, sizeof(voice->envMod));
+		voice->group = group;
+		voice->drumHold = (unsigned char)(drum && !drum->param[TSF_DRUM_NOTE_OFF]);
+		voice->scalePitch = voice->drumPitch = 0.0f;
+		voice->basePan = region->pan;
+		voice->sendReverb = voice->sendChorus = 1.0f;
+		voice->drumFc = voice->drumQ = voice->drumAttack = voice->drumDecay = voice->drumRelease = 0.0f;
+		if (drum) tsf_voice_drum(voice, drum);
 
 		if (f->channels)
 		{
@@ -2309,8 +2391,8 @@ TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* cho
 			if (f->channels && v->playingChannel >= 0 && v->playingChannel < f->channels->channelNum)
 			{
 				struct tsf_channel* c = &f->channels->channels[v->playingChannel];
-				rs = tsf_voice_send(v->region->reverbSend + v->modReverb, c->midiReverb);
-				cs = tsf_voice_send(v->region->chorusSend + v->modChorus, c->midiChorus);
+				rs = tsf_voice_send(v->region->reverbSend + v->modReverb, c->midiReverb) * v->sendReverb;
+				cs = tsf_voice_send(v->region->chorusSend + v->modChorus, c->midiChorus) * v->sendChorus;
 			}
 			else
 			{
@@ -2331,8 +2413,9 @@ static void tsf_channel_setup_voice(tsf* f, struct tsf_voice* v)
 	struct tsf_channel* c = &f->channels->channels[f->channels->activeChannel];
 	v->playingChannel = f->channels->activeChannel;
 	v->noteGainDB += c->gainDB;
+	v->scalePitch = c->scaleTune[v->playingKey % 12]; // FatzAudio
 	tsf_voice_calcpitchratio(v, tsf_channel_pitchshift(f, c), f->outSampleRate);
-	tsf_voice_setpan(v, v->region->pan + c->panOffset);
+	tsf_voice_setpan(v, v->basePan + c->panOffset); // FatzAudio: drum pan
 	// FatzAudio: soft pedal; portamento: a glide from the previous key (or CC84's) taking
 	// 5 ms at CC5 = 0, 0.18 s at 64 and 5.9 s at 127
 	v->soft = (unsigned char)(c->cc[67] >= 64);
@@ -2387,6 +2470,8 @@ static struct tsf_channel* tsf_channel_init(tsf* f, int channel)
 		c->midiNRPN = 0xFFFF;
 		c->modRange = c->pressureVibrato = 50.0f;
 		c->lastKey = c->portaKey = c->portaFrom = -1;
+		TSF_MEMSET(c->scaleTune, 0, sizeof(c->scaleTune));
+		c->drumKit = -1;
 	}
 	return &f->channels->channels[channel];
 }
@@ -2457,7 +2542,7 @@ TSFDEF int tsf_channel_set_pan(tsf* f, int channel, float pan)
 	if (!c) return 0;
 	for (v = f->voices, vEnd = v + f->voiceNum; v != vEnd; v++)
 		if (v->playingPreset != -1 && v->playingChannel == channel)
-			tsf_voice_setpan(v, v->region->pan + pan - 0.5f + v->modPan * 0.001f); // FatzAudio: pan modulators
+			tsf_voice_setpan(v, v->basePan + pan - 0.5f + v->modPan * 0.001f); // FatzAudio: pan modulators, drum pan
 	c->panOffset = pan - 0.5f;
 	return 1;
 }
@@ -2593,6 +2678,70 @@ TSFDEF int tsf_channel_set_pressure_vibrato(tsf* f, int channel, float cents)
 	return 1;
 }
 
+TSFDEF int tsf_channel_set_scale_tuning(tsf* f, int channel, int note, float cents)
+{
+	struct tsf_voice *v = f->voices, *vEnd = v + f->voiceNum;
+	struct tsf_channel *c = tsf_channel_init(f, channel);
+	if (!c || note < 0 || note > 11) return 0;
+	if (c->scaleTune[note] == cents) return 1;
+	c->scaleTune[note] = cents;
+	for (; v != vEnd; v++)
+		if (v->playingPreset != -1 && v->playingChannel == channel && v->playingKey % 12 == note)
+		{
+			v->scalePitch = cents;
+			tsf_voice_calcpitchratio(v, tsf_channel_pitchshift(f, c), f->outSampleRate);
+		}
+	return 1;
+}
+
+TSFDEF int tsf_channel_set_drum_kit(tsf* f, int channel, int kit)
+{
+	struct tsf_channel *c = tsf_channel_init(f, channel);
+	if (!c) return 0;
+	c->drumKit = (signed char)(kit >= 0 && kit < TSF_DRUM_KITS ? kit : -1);
+	return 1;
+}
+
+TSFDEF int tsf_set_drum_param(tsf* f, int kit, int key, int param, int value)
+{
+	struct tsf_drumkey* d;
+	if (kit < 0 || kit >= TSF_DRUM_KITS || key < 0 || key > 127 || param < 0 || param >= TSF_DRUM_PARAMS) return 0;
+	if (!f->drumKeys)
+	{
+		int i;
+		f->drumKeys = (struct tsf_drumkey*)TSF_MALLOC(TSF_DRUM_KITS * 128 * sizeof(struct tsf_drumkey));
+		if (!f->drumKeys) return 0;
+		for (i = 0; i != TSF_DRUM_KITS * 128; i++) { f->drumKeys[i].edited = 0; TSF_MEMCPY(f->drumKeys[i].param, tsf_drumkey_defaults, TSF_DRUM_PARAMS); }
+	}
+	value &= 0x7F;
+	if (param == TSF_DRUM_PAN && !value) value = 64; // "random": the middle
+	d = &f->drumKeys[kit * 128 + key];
+	d->param[param] = (unsigned char)value;
+	d->edited = 1;
+	return 1;
+}
+
+TSFDEF void tsf_reset_drum_kit(tsf* f, int kit)
+{
+	int i, first = (kit < 0 ? 0 : kit * 128), end = (kit < 0 ? TSF_DRUM_KITS * 128 : first + 128);
+	if (!f->drumKeys || kit >= TSF_DRUM_KITS) return;
+	for (i = first; i != end; i++) { f->drumKeys[i].edited = 0; TSF_MEMCPY(f->drumKeys[i].param, tsf_drumkey_defaults, TSF_DRUM_PARAMS); }
+}
+
+// GS and XG drum NRPNs (MSB 14-1E, LSB the key), on a channel with a drum kit. Pitch coarse
+// and fine are offsets from 64, level, pan and sends absolute; XG's attack and decay are
+// rates (higher is faster), so they lengthen the times as they go below 64.
+static void tsf_nrpn_drum(tsf* f, int kit, unsigned short nrpn, int value)
+{
+	static const signed char param[11] = {
+		TSF_DRUM_CUTOFF, TSF_DRUM_RESONANCE, TSF_DRUM_ATTACK, TSF_DRUM_DECAY, TSF_DRUM_PITCH_COARSE, TSF_DRUM_PITCH_FINE,
+		TSF_DRUM_LEVEL, -1, TSF_DRUM_PAN, TSF_DRUM_REVERB, TSF_DRUM_CHORUS };
+	int msb = nrpn >> 7;
+	if (msb < 0x14 || msb > 0x1E || param[msb - 0x14] < 0) return;
+	if (msb == 0x16 || msb == 0x17) value = (value ? 128 - value : 127);
+	tsf_set_drum_param(f, kit, nrpn & 0x7F, param[msb - 0x14], value);
+}
+
 // GS and XG part NRPNs (MSB 1) that set what the sound controllers set (BASSMIDI's mapping).
 static int tsf_nrpn_controller(unsigned short nrpn)
 {
@@ -2628,6 +2777,7 @@ TSFDEF int tsf_channel_note_on(tsf* f, int channel, int key, float vel)
 	}
 	// FatzAudio: portamento from CC84's key (once), else from the last key while CC65 is on
 	c = &f->channels->channels[channel];
+	{ const struct tsf_drumkey* d = tsf_drumkey_of(f, key); if (d && !d->param[TSF_DRUM_NOTE_ON]) return 1; } // FatzAudio: a drum key set not to receive note-ons
 	c->portaFrom = (c->portaKey >= 0 ? c->portaKey : (c->cc[65] >= 64 ? c->lastKey : -1));
 	c->portaKey = -1;
 	res = tsf_note_on(f, c->presetIndex, key, vel);
@@ -2643,7 +2793,7 @@ TSFDEF void tsf_channel_note_off(tsf* f, int channel, int key)
 	for (; v != vEnd; v++)
 	{
 		//Find the first and last entry in the voices list with matching channel, key and look up the smallest play index
-		if (v->playingPreset == -1 || v->playingChannel != channel || v->playingKey != key || v->ampenv.segment >= TSF_SEGMENT_RELEASE || v->heldSustain) continue;
+		if (v->playingPreset == -1 || v->playingChannel != channel || v->playingKey != key || v->ampenv.segment >= TSF_SEGMENT_RELEASE || v->heldSustain || v->drumHold) continue; // FatzAudio: drumHold
 		else if (!vMatchFirst || v->playIndex < vMatchFirst->playIndex) vMatchFirst = vMatchLast = v;
 		else if (v->playIndex == vMatchFirst->playIndex) vMatchLast = v;
 	}
@@ -2652,7 +2802,7 @@ TSFDEF void tsf_channel_note_off(tsf* f, int channel, int key)
 	{
 		//Stop all voices with matching channel, key and the smallest play index which was enumerated above
 		if (v != vMatchFirst && v != vMatchLast &&
-			(v->playIndex != vMatchFirst->playIndex || v->playingPreset == -1 || v->playingChannel != channel || v->playingKey != key || v->ampenv.segment >= TSF_SEGMENT_RELEASE)) continue;
+			(v->playIndex != vMatchFirst->playIndex || v->playingPreset == -1 || v->playingChannel != channel || v->playingKey != key || v->ampenv.segment >= TSF_SEGMENT_RELEASE || v->drumHold)) continue;
 		//Don't turn off if sustain is active, just mark as held by sustain so we don't forget it
 		if (sustain || (f->channels->channels[channel].sostenuto && v->sostenuto)) // FatzAudio: or sostenuto
 			v->heldSustain = 1;
@@ -2746,6 +2896,7 @@ TCMC_SET_DATA:
 	if (c->midiNRPN != 0xFFFF) // FatzAudio: GS/XG part NRPNs, data entry MSB
 	{
 		int target = tsf_nrpn_controller(c->midiNRPN);
+		if (controller == 6 && c->drumKit >= 0) tsf_nrpn_drum(f, c->drumKit, c->midiNRPN, control_value);
 		if (target >= 0 && controller == 6 && c->cc[target] != control_value)
 		{
 			c->cc[target] = (unsigned char)control_value;

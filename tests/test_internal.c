@@ -1378,6 +1378,56 @@ static void test_loop_toggle_while_playing(void)
     rec_free(&rec);
 }
 
+/* Reversed and looping (CUE_IN..CUE_OUT): the audio counts down from CUE_OUT and
+ * wraps from CUE_IN back up to it without a gap. Markers are raised as the position
+ * counts down past them (CUE_OUT where playback starts and each time it wraps to it),
+ * and LOOPED at each wrap, with the loop start it left and the end it went to. */
+static void test_reverse_markers_and_loop(void)
+{
+    uint32_t i, done = 0, len = 20000, in = 2000, out = 12000, turn = 12000 - 2000;
+    fa_stream* s = open_attached(len, 1, FA_OPEN_LOOP);
+    float buf[2 * 1000];
+    recorder rec;
+    int k, markers[FA_MARKER_COUNT] = { 0 }, looped = 0;
+    rec_init(&rec);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_marker(s, FA_MARKER_CUE_IN, in), FA_OK);
+    CHECK_EQ(fa_stream_set_marker(s, FA_MARKER_CUE_OUT, out), FA_OK);
+    CHECK_EQ(fa_stream_set_marker(s, FA_MARKER_MIX_POINT, 7000), FA_OK);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    CHECK_EQ(fa_stream_set_reverse(s, 1), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);                /* from CUE_OUT */
+    while (done < 2 * turn + 3000) {
+        render(s, buf, 1000);
+        for (i = 0; i < 1000; i++) CHECK(buf[i * 2] == expected(1, out - 1 - (done + i) % turn));
+        done += 1000;
+    }
+    CHECK_EQ(count_events(&rec, FA_EVENT_LOOPED, 2), 2);
+    CHECK_EQ(count_events(&rec, FA_EVENT_MARKER, 7), 7);
+    fa_sleep_ms(20);
+    fa_mutex_lock(&rec.lock);
+    CHECK_EQ(rec.count, 9);
+    for (k = 0; k < rec.count; k++) {
+        if (rec.ev[k].type == FA_EVENT_MARKER) markers[rec.ev[k].value]++;
+        if (rec.ev[k].type == FA_EVENT_LOOPED) {
+            looped++;
+            CHECK_EQ(rec.ev[k].frame, in);
+            CHECK_EQ(rec.ev[k].value, out);
+        }
+    }
+    fa_mutex_unlock(&rec.lock);
+    CHECK_EQ(looped, 2);
+    CHECK_EQ(markers[FA_MARKER_CUE_OUT], 3);           /* the start and two wraps to it */
+    CHECK_EQ(markers[FA_MARKER_MIX_POINT], 2);
+    CHECK_EQ(markers[FA_MARKER_CUE_IN], 2);
+    /* The first ones in the order heard: CUE_OUT, the mix point, CUE_IN, the wrap. */
+    CHECK_EQ(rec.ev[0].value, FA_MARKER_CUE_OUT);
+    CHECK_EQ(rec.ev[1].value, FA_MARKER_MIX_POINT);
+    CHECK_EQ(rec.ev[2].value, FA_MARKER_CUE_IN);
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
 /* A loop shorter than a callback jumps back several times per callback: one
  * LOOPED for each jump. */
 static void test_short_loop_counts_every_jump(void)
@@ -1913,6 +1963,7 @@ int main(void)
     RUN(test_source_prefix_dropped);
     RUN(test_loop_toggle_while_playing);
     RUN(test_short_loop_counts_every_jump);
+    RUN(test_reverse_markers_and_loop);
     RUN(test_loop_without_length);
     RUN(test_loop_needs_seekable);
     RUN(test_mute_glides_and_keeps_volume);

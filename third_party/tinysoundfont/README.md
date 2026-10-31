@@ -49,6 +49,11 @@ against untrusted files and add what the decoder needs:
   region; they were skipped upstream.
 - Per-channel CC91 and CC93 (`midiReverb`, default 40, and `midiChorus`, default 0) are stored
   and set from the controller messages.
+- Scale tuning (`tsf_channel_set_scale_tuning`: cents per note of the octave, per channel) and drum
+  key edits (`tsf_set_drum_param`, `tsf_channel_set_drum_kit`, `tsf_reset_drum_kit`: four kits of 128
+  keys per synth, allocated on the first edit) for pitch, level, pan, effect sends, exclusive group,
+  note-off/note-on reception, filter and envelope; the GS/XG drum NRPNs (MSB 14-1E) edit the
+  channel's kit. Voices carry the resulting pitch, base pan, send factors and offsets.
 - `tsf_render_float_fx`: like `tsf_render_float`, and also adds each voice to the reverb and chorus
   send buses (the soundfont's sends plus CC91/CC93); the effects themselves are in `src/midi_fx.c`.
 - `tsf_hydra_valid`: minimum record counts, and every bag/generator/instrument/sample

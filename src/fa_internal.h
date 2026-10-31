@@ -277,6 +277,8 @@ int fa_probe_mp3_header(const uint8_t* data, size_t size, size_t start, uint32_t
 #define FA_WORKER_POLL_MIN_MS 5     /* the polling worker's shortest and longest sleep (worker_main) */
 #define FA_WORKER_POLL_MAX_MS 50
 #define FA_WORKER_POLL_IDLE_MS 100  /* ... while no stream has anything to decode */
+#define FA_REVERSE_BLOCK_MS 500     /* reversed: source decoded per seek (reverse_read) */
+#define FA_REVERSE_OVERLAP_MS 10    /* ... each block this far past its end, cross-faded with the one above */
 
 /* Soundfont references: retain returns `f` (NULL-safe); the last release frees it. */
 /* DLS banks (dls.c), turned into a SoundFont 2 image the synthesizer loads. */
@@ -1393,11 +1395,13 @@ struct fa_stream {
      * chain and the tmap count) run up while the source position runs down: linear
      * frame L is source position 2 * seek_base - L. The source is decoded forward in
      * blocks into rev_buf and handed out last frame first: rev_n frames are left,
-     * ending at source frame rev_pos (decode side, under decode_lock). */
+     * ending at source frame rev_pos, the first rev_hold of them held back for the
+     * cross-fade with the block below (see reverse_read; decode side, under decode_lock). */
     fa_atomic32 reverse_want;
     fa_atomic32 reverse;
     float* rev_buf;
-    fa_frames rev_cap, rev_n, rev_pos;
+    float* rev_ov;               /* inside rev_buf: the held frames while the block below decodes */
+    fa_frames rev_cap, rev_n, rev_pos, rev_hold;
 
     /* CD+G graphics (cdg.c): the packs, the surfaces drawing them, and a generation
      * count that tells surfaces the graphics were replaced. Never touched by the

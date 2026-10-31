@@ -600,7 +600,7 @@ static void test_wipe_area(void)
 static void test_stateless(void)
 {
     static const int ms[] = { 0, 400, 1150, 1700, 2300, 2900, 3300, 3800, 4300, 6000, 7600, 9900, 10400, 11000,
-                              16500, 2600, 9000, 1200, 3600 };
+                              16500, 2600, 9000, 1200, 3600, 3500, 3800, 4000, 4150, 4300, 3900, 4600 };
     fa_stream* s = open_song();
     fa_lyric_style st;
     fa_surface *a = NULL, *b = NULL;

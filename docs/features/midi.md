@@ -8,7 +8,7 @@ FatzAudio plays MIDI files itself, with a built-in SoundFont 2 synthesizer. They
 | Karaoke (`.kar`) | Lyrics from the "Words" track, `@T` title and artist lines, line and paragraph marks |
 | RIFF MIDI (`.rmi`) | The Standard MIDI File inside it |
 | Instruments | A SoundFont 2 (`.sf2`, also SF3 with compressed samples) or DLS (`.dls`) bank you load, else the one the OS ships (Windows `gm.dls`, macOS `gs_instruments.dls`, a Linux GM `.sf2` package): General MIDI; GS/XG variation banks through bank select (falling back to bank 0 when the soundfont lacks them); drums on channel 10 and on the parts GS, XG and GM2 files make drum parts |
-| SysEx | GM, GM2, GS and XG resets, GS rhythm parts, XG drum parts and drum banks (127, and 120 in GM2), master volume and master tuning, GS and XG reverb and chorus settings, part volume, pan and effect sends ([below](#sysex)) |
+| SysEx | GM, GM2, GS and XG resets, GS rhythm parts, XG drum parts and drum banks (127, and 120 in GM2), master volume and master tuning, GS and XG reverb and chorus settings, part volume, pan and effect sends, scale tuning, GS drum maps and XG drum setups ([below](#sysex)) |
 | Lyrics and other text | Lyric, text, marker, cue, track and instrument name, copyright: listed and raised as events |
 | Tempo and signatures | Tempo changes, time and key signatures, listed with their numbers |
 | Effects | Reverb and chorus, on by default: the soundfont's effect sends plus CC91 and CC93; the file's GS or XG SysEx picks their type, level and time ([below](#reverb-and-chorus)) |
@@ -98,7 +98,7 @@ using var etude = engine.OpenFile("etude.mid", new StreamOptions { SoundFont = p
 
 ## Lyrics and text events
 
-Every text event of the file is listed in time order by `fa_stream_get_midi_text` (`AudioStream.MidiTexts`), with its frame, time, type, track and UTF-8 text. While the stream plays on a device, `FA_EVENT_MIDI_TEXT` (`AudioStream.MidiTextReached`) is raised as each one is heard, with `value` = its index.
+Every text event of the file is listed in time order by `fa_stream_get_midi_text` (`AudioStream.MidiTexts`), with its frame, time, type, track and UTF-8 text. While the stream plays on a device, `FA_EVENT_MIDI_TEXT` (`AudioStream.MidiTextReached`) is raised as each one is heard, with `value` = its index. In [reverse playback](tempo-pitch.md#reverse-playback) they come last first, as the position counts down past them.
 
 Lyrics come cleaned up for display. The marks karaoke files use for layout (`/` and `\` before a syllable in `.kar` files; CR and LF in lyric events) are removed from the text and given as `FA_MIDI_NEW_LINE` and `FA_MIDI_NEW_PARAGRAPH` flags on the syllable that starts the new line. A karaoke screen joins the syllables of a line as they are and breaks before the flagged ones. In a `.kar` file the words are `FA_MIDI_LYRIC` and its `@` header lines are `FA_MIDI_TEXT`; `fa_stream_get_midi_info` gives the title and artist from the `@T` lines, and the copyright.
 
@@ -319,8 +319,29 @@ The SysEx messages that change how a file sounds are applied; the rest are ignor
 | GS and XG reverb and chorus (`40 01 30`-`3E`, `02 01 00`-`2C`) | Effect type, level and time ([reverb and chorus](#reverb-and-chorus)) |
 | GS part level, pan, chorus and reverb send (`40 1x 19`, `1C`, `21`, `22`); XG part volume, pan, chorus and reverb send (`08 nn 0B`, `0E`, `12`, `13`) | The same as CC7, CC10, CC93 and CC91 on that part's channel. Pan 0 ("random") is the middle |
 | GS part vibrato, filter and envelope offsets (`40 1x 30`-`37`); XG multi part (`08 nn 15`-`1C`) | The same as the sound controllers CC71-78 ([controllers](#controllers-and-modulators)) |
+| GS scale tuning (`40 1x 40`-`4B`), XG scale tuning (`08 nn 41`-`4C`) | Moves each note of the octave, C to B, by -64 to +63 cents (64 is in tune) on that part, notes already sounding included ([scale tuning and drum setup](#scale-tuning-and-drum-setup)) |
+| GS drum maps (`41 m1`-`m8 rr`), XG drum setups (`3n rr 00`-`0F`), XG drum setup reset (`00 00 7D`) | Per-key edits of a drum kit: pitch, level, pan, sends, exclusive group, note-off and note-on reception, and on XG filter and envelope ([below](#scale-tuning-and-drum-setup)) |
 
-Without a reset, channel 10 is the drum channel and bank 127 is an ordinary (GS MT-32) melodic bank. A drum kit the soundfont doesn't have falls back to the standard kit (bank 128, program 0). A melodic program missing from the channel's bank comes from bank 0; when bank 0 lacks it too, the channel plays program 0 (with a soundfont that has no program 0, its first preset), never the instrument it played before.
+Without a reset, channel 10 is the drum channel and bank 127 is an ordinary (GS MT-32) melodic bank. A drum kit the soundfont doesn't have falls back to the standard kit (bank 128, program 0). An XG SFX kit (bank 126) comes from the soundfont's bank 126 (where XG soundfonts keep their SFX kits), else from the GS SFX kit (drum kit 56), which has the same kind of sounds, else it falls back like any other drum kit (to the standard kit). A melodic program missing from the channel's bank comes from bank 0; when bank 0 lacks it too, the channel plays program 0 (with a soundfont that has no program 0, its first preset), never the instrument it played before.
+
+### Scale tuning and drum setup
+
+Scale tuning retunes the twelve notes of the octave on one part, each by -64 to +63 cents, for the Arabic, Indian or historical temperaments some GS and XG files ask for. It applies to the notes sounding when it changes too, and to drum parts as well as melodic ones.
+
+Drum setup edits a drum kit key by key. GS has two drum maps: channel 10 and the parts set to "map 1" use the first, the parts set to "map 2" (`40 1x 15` = 2) the second. XG has four drum setups: drum parts and part mode "DrumS1" use the first, "DrumS2" to "DrumS4" the others. The drum NRPNs on a drum part edit the map or setup that part plays. Edits take effect from the key's next note.
+
+| Edit | GS map (`41 mp rr`, rr = key) | XG setup (`3n rr pp`) | NRPN (MSB, LSB = key) | What it does |
+|---|---|---|---|---|
+| Pitch | Play note number `p=1` (the key it sounds as) | Coarse `00`, fine `01` (64 = as is) | Coarse `18`, fine `19` (XG) | Semitones and cents |
+| Level | `2` | `02` | `1A` | 127 is the soundfont's level, lower is softer like velocity (64 is 11.9 dB down), 0 is silent |
+| Pan | `4` | `04` | `1C` | 1 to 127, left to right, in place of the soundfont's pan; 0 ("random") is the middle. The part's pan moves it as usual |
+| Reverb and chorus send | `5`, `6` | `05`, `06` | `1D`, `1E` | 127 is the key's full send, lower scales it down |
+| Exclusive group | Assign group `3` | Alternate group `03` | | Keys of one group (1 to 127) cut each other, as open and closed hi-hats do; 0 takes the key out of any group. It replaces the soundfont's own exclusive class for that key |
+| Note-off and note-on reception | `7`, `8` | `09`, `0A` | | 0 ignores the key's note-offs (it rings until its sound ends) or its note-ons (it is silent) |
+| Filter | | Cutoff `0B`, resonance `0C` | `14`, `15` (XG) | 64 is as is; the same steps as CC74 and CC71 |
+| Envelope | | Attack rate `0D`, decay 1 rate `0E`, decay 2 rate `0F` | `16`, `17` (XG) | Rates: above 64 is faster, below slower, in the steps of CC73 and CC75; decay 2 acts as the release |
+
+GM, GS and XG resets clear scale tuning and every drum edit; the XG drum setup reset (`00 00 7D`, data = setup 0-3) clears one setup. A seek replays them all. Not followed: the variation and delay sends (no such effect yet) and XG key assign (single or multi).
 
 ## Seeking and length
 
@@ -345,5 +366,5 @@ Rendering runs on the engine's worker threads like decoding of any other format.
 - Each instrument's level (`initialAttenuation`) is applied as the SoundFont 2 spec states it, 0.1 dB per unit. FluidSynth applies 0.4 of that (an EMU hardware habit), so a bank tuned by ear in FluidSynth can sound with a wider gap between its quiet and loud instruments here.
 - SFZ soundfonts and MIDI input from devices aren't supported yet. See the [engineering notes](../engineering-notes.md).
 - Text in code pages other than UTF-8, Windows-1252 and Shift-JIS (Korean, Chinese, Cyrillic files) comes out as Windows-1252. Shift-JIS user-defined characters (lead bytes F0-F9) come out as U+FFFD.
-- SysEx other than the messages listed [above](#sysex) is ignored: insertion and variation effects, scale tuning, drum setup (per-note drum edits) and the part parameters not listed have no effect.
+- SysEx other than the messages listed [above](#sysex) is ignored: insertion and variation effects and the part parameters not listed have no effect.
 - The reverb's tail is cut at the end of the song (a second after the last event), so a long reverb time set by the file doesn't ring out fully at the very end.
