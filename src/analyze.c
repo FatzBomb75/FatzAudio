@@ -45,6 +45,7 @@ typedef struct job {
     const char* name_hint;
     const uint8_t* mem;
     size_t mem_size;
+    fa_shared_file* shared;      /* the temp file of an unpacked ZIP song, or NULL */
     int32_t audio_track;
     fa_decoder_env env;
     fa_analysis_options opt;
@@ -430,6 +431,7 @@ static void cache_write(const char* dir, const char* path, const fa_analysis* a)
 
 static fa_result open_source(const job* j, fa_source* src)
 {
+    if (j->shared) return fa_source_open_shared(src, j->shared);
     if (!j->path) return fa_source_open_memory_ref(src, j->mem, j->mem_size);
     return fa_source_open_path_window(src, j->path, j->path_offset, j->path_length);
 }
@@ -440,7 +442,7 @@ static double tag_bpm(const job* j)
     fa_tags* tags = NULL;
     double v = 0.0;
     fa_result r;
-    if (j->path && (j->path_offset || j->path_length)) return 0.0;
+    if (j->shared || (j->path && (j->path_offset || j->path_length))) return 0.0;
     r = j->path ? fa_tags_read_path(j->path, 0, &tags) : fa_tags_read_memory(j->mem, j->mem_size, 0, &tags);
     if (r == FA_OK && tags) {
         const char* s = fa_tags_get(tags, FA_TAG_BPM);
@@ -672,7 +674,7 @@ FA_API fa_result FA_CALL fa_analyze_stream(fa_stream* stream, const fa_analysis_
     if (!stream || !out_analysis) return FA_ERROR_INVALID_ARG;
     memset(&j, 0, sizeof(j));
     if (!read_options(options, &j.opt)) return FA_ERROR_INVALID_ARG;
-    if (!stream->path && stream->source.kind != FA_SOURCE_MEMORY) return FA_ERROR_NOT_SEEKABLE;
+    if (!stream->path && stream->source.kind != FA_SOURCE_MEMORY && !stream->source.shared) return FA_ERROR_NOT_SEEKABLE;
     j.engine = stream->engine;
     j.audio_track = stream->audio_track;
     j.env.midi_rate = stream->midi || stream->tracker ? stream->decoder.format.sample_rate : fa_engine_midi_rate(stream->engine);
@@ -682,6 +684,9 @@ FA_API fa_result FA_CALL fa_analyze_stream(fa_stream* stream, const fa_analysis_
         j.path_offset = stream->path_offset;
         j.path_length = stream->path_length;
         j.name_hint = stream->path_length > 0 ? stream->path_name : stream->path;
+    } else if (stream->source.shared) {
+        j.shared = stream->source.shared;   /* the stream outlives the call */
+        j.name_hint = stream->path_name[0] ? stream->path_name : NULL;
     } else {
         j.mem = stream->source.mem;
         j.mem_size = stream->source.mem_size;

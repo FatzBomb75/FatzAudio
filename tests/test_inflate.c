@@ -159,12 +159,12 @@ static void test_zip_paths(void)
             }
             CHECK_EQ(fa_zip_list(&src, &e, &count), FA_OK);
             CHECK_EQ(count, 1);
-            CHECK_EQ(fa_zip_extract(&src, e, (uint64_t)1 << 30, &got), FA_OK);
+            CHECK_EQ(fa_zip_extract(&src, e, (uint64_t)1 << 30, NULL, &got), FA_OK);
             CHECK(memcmp(got, data, n) == 0);
             free(got);
             f = tmpfile();
             CHECK(f);
-            CHECK_EQ(fa_zip_extract_file(&src, e, f), FA_OK);
+            CHECK_EQ(fa_zip_extract_file(&src, e, NULL, f), FA_OK);
             len = ftell(f);
             CHECK_EQ(len, (long)n);
             got = (uint8_t*)malloc(n);
@@ -179,16 +179,16 @@ static void test_zip_paths(void)
                 big.size = FA_ZIP_TEMP_LIMIT + 1;
                 f = tmpfile();
                 CHECK(f);
-                CHECK_EQ(fa_zip_extract_file(&src, &big, f), FA_ERROR_TOO_LARGE);
+                CHECK_EQ(fa_zip_extract_file(&src, &big, NULL, f), FA_ERROR_TOO_LARGE);
                 CHECK_EQ(ftell(f), 0);
                 fclose(f);
             }
             /* A wrong CRC is caught on both paths. */
             e->crc32 ^= 1;
             got = NULL;
-            CHECK(fa_zip_extract(&src, e, (uint64_t)1 << 30, &got) != FA_OK);
+            CHECK(fa_zip_extract(&src, e, (uint64_t)1 << 30, NULL, &got) != FA_OK);
             f = tmpfile();
-            CHECK(fa_zip_extract_file(&src, e, f) != FA_OK);
+            CHECK(fa_zip_extract_file(&src, e, NULL, f) != FA_OK);
             fclose(f);
             free(e);
             fa_source_close(&src);

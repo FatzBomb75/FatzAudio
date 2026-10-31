@@ -18,9 +18,16 @@
 
 enum { FA_SOURCE_FILE = 1, FA_SOURCE_MEMORY, FA_SOURCE_IO };
 
+/* A file read through several sources at once, each at positions of its own
+ * (the temp file of an unpacked ZIP song: the stream plays it while scans and
+ * tag reads open it again, which the delete-on-close file allows no other way).
+ * Reference counted; the last release closes the file. */
+typedef struct fa_shared_file fa_shared_file;
+
 typedef struct fa_source {
     int kind;
     FILE* file;
+    fa_shared_file* shared;  /* FA_SOURCE_FILE: `file` belongs to it (reads take its lock), else NULL */
     const uint8_t* mem;
     size_t mem_size;
     uint8_t* owned;
@@ -44,6 +51,13 @@ typedef struct fa_source {
 
 fa_result fa_source_open_path(fa_source* src, const char* path);
 fa_result fa_source_open_memory(fa_source* src, const void* data, size_t size);
+/* Takes over the open `file` (rewound or not: sources seek before every read) of
+ * `length` bytes; FA_OK, or FA_ERROR_OUT_OF_MEMORY with `file` closed. */
+fa_result fa_shared_file_new(FILE* file, int64_t length, fa_shared_file** out);
+fa_shared_file* fa_shared_file_retain(fa_shared_file* sf);
+void fa_shared_file_release(fa_shared_file* sf);
+/* A source of its own on the shared file (retains it), reading all of it. */
+fa_result fa_source_open_shared(fa_source* src, fa_shared_file* sf);
 /* Like fa_source_open_memory but without a copy: `data` must outlive the source. */
 fa_result fa_source_open_memory_ref(fa_source* src, const void* data, size_t size);
 fa_result fa_source_open_io(fa_source* src, const fa_io_callbacks* io, void* user);
@@ -152,6 +166,11 @@ typedef struct fa_decoder_env {
     uint32_t midi_rate;               /* MIDI and tracker modules: output rate, 0 = FA_MIDI_DEFAULT_RATE */
     int32_t text_code_page;           /* MIDI: fa_open_options.text_code_page, 0 = detect */
 } fa_decoder_env;
+
+/* Could `data` (the start of a file, any length) be audio some decoder opens? The same
+ * content probes as fa_decoder_open: 0 only when none of them claims the bytes (a text
+ * file, a picture); 1 when one does or the bytes cannot tell (a tag that fills them). */
+int fa_decoder_recognizes(const uint8_t* data, size_t size);
 
 /* Detects the format of `src` and opens the matching decoder. `name_hint` (a path
  * or NULL) and `mime_hint` only break ties when the content is ambiguous.
@@ -1275,6 +1294,15 @@ struct fa_stream {
     int64_t path_length;         /* (a stored ZIP entry); 0 = all of it */
     char path_name[260];         /* that entry's name, the decoder's hint; "" = none */
     int64_t zip_size;            /* bytes of the ZIP the audio came from, 0 = not a ZIP */
+    /* A stored ZIP entry played in place is checked against its CRC by the worker, a chunk
+     * at a time while the stream is attached (zip_crc_step in stream.c). */
+    fa_atomic32 zcrc_pending;    /* 1 from open until the check ended (or was given up) */
+    uint32_t zcrc_expect;        /* the CRC the archive lists for the entry */
+    uint32_t zcrc_acc;           /* of the bytes read so far; the fields from here are the worker's */
+    int64_t zcrc_done;
+    fa_source zcrc_src;          /* path streams read the entry again through a source of their own */
+    int zcrc_open;
+    uint8_t* zcrc_buf;
     int32_t audio_track;
     int32_t text_code_page;      /* fa_open_options.text_code_page (MIDI), 0 = detect */
     fa_mutex norm_lock;          /* scan_job, loud, loud_source */

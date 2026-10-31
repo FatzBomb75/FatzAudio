@@ -381,7 +381,25 @@ Only what is needed is read: the archive's directory at the end of the file, the
 
 The `.cdg` is always unpacked into memory (a song's graphics are a few MB).
 
-A stored entry played in place is not CRC checked at open, since that would read the whole song first. A damaged byte then plays like a damaged byte in an unzipped MP3: a short glitch, never a crash. Compressed entries are always checked while they are unpacked.
+**Other files in the archive** (a bundled video, a PDF, a text file) are told from the audio by their first 64 KB: for a compressed entry bigger than that, FatzAudio unpacks 64 KB and runs the same content probes the decoders use, and only unpacks the whole entry when one of them claims it. A 200 MB video in a karaoke ZIP costs a 64 KB read, whether the song is opened, tagged (`fa_tags_read_path`) or probed for a `.cdg`.
+
+**Cancelling a long unpack.** Unpacking a big song into memory or a temp file is the one slow step of an open. Set `fa_open_options.cancel` to point at an `int32_t` flag, and set the flag to non-zero from another thread to stop it: the open returns `FA_ERROR_CANCELLED` (.NET `ErrorCode.Cancelled`) within a fraction of a second, no stream is created and no temp file is left behind. In .NET pass `StreamOptions.CancellationToken`. Stored entries need no unpacking, so they open at once either way.
+
+```c
+volatile int32_t stop = 0;               /* set to 1 from the UI thread */
+fa_open_options o;
+fa_open_options_init(&o);
+o.cancel = &stop;
+fa_result r = fa_stream_open_path(engine, "Big Song.zip", &o, &stream);   /* FA_ERROR_CANCELLED */
+```
+
+```csharp
+using var cts = new CancellationTokenSource();
+var stream = engine.OpenFile("Big Song.zip", new StreamOptions { CancellationToken = cts.Token });   // on a worker thread
+cts.Cancel();   // from the UI: the open throws FatzAudioException (ErrorCode.Cancelled)
+```
+
+A stored entry played in place is not CRC checked at open, since that would read the whole song first. Instead the engine's decode worker checks it in the background, 256 KB at a time, while the stream is attached to a device (decode-only streams, and archives opened with `fa_stream_open_io`, whose callbacks cannot be read twice, are not checked). A mismatch is reported once as `FA_EVENT_DECODE_ERROR` (value `FA_ERROR_UNSUPPORTED_FORMAT`; .NET `AudioStream.DecodeError`) and playback goes on: a damaged byte plays like a damaged byte in an unzipped MP3, a short glitch, never a crash. The check ends within a second or two on a normal song, so set the event callback right after the open. Compressed entries are always checked while they are unpacked, and a bad one fails the open.
 
 The temp directory is off by default, so FatzAudio never writes to disk unless the app asks. When it is set, FatzAudio works in a `fatzaudio-tmp` folder inside it and never touches anything else there. The directory and that folder are created if missing (not the directory's parents); if they cannot be written when a song needs them, the open fails with `FA_ERROR_IO`. Each unpacked song is deleted when its stream closes, and also if the app crashes: Windows opens the file with delete-on-close, and Linux, macOS, iOS and Android remove its name as soon as it exists. Files left by a power cut are deleted the next time an engine is created with that directory. On Android and iOS, pass the app's cache directory.
 
@@ -396,7 +414,7 @@ fa_engine_create(&cfg, &engine);
 using var engine = AudioEngine.Create(new AudioEngineOptions { TempDirectory = Path.GetTempPath() });
 ```
 
-`fa_stream_open_io` needs `seek` and `length` callbacks for a ZIP, because its directory is at the end (`FA_ERROR_NOT_SEEKABLE` without them). When the audio was unpacked, the archive is no longer read, but `close` is still called once, when the stream closes. Loudness scans and `fa_stream_get_tags` read a stored entry again from the archive file or block; a song unpacked into a temp file gets the running loudness estimate instead of a scan (as with app callbacks).
+`fa_stream_open_io` needs `seek` and `length` callbacks for a ZIP, because its directory is at the end (`FA_ERROR_NOT_SEEKABLE` without them). When the audio was unpacked, the archive is no longer read, but `close` is still called once, when the stream closes. Loudness scans, analysis (`fa_analyze_stream`) and `fa_stream_get_tags` read a stored entry again from the archive file or block, and a song unpacked into a temp file through the same open file (every read moves to its own position first, so they never disturb playback), so both get the same final loudness, tags and analysis as an unzipped file. A stored song from app callbacks (`fa_stream_open_io`) still gets the running loudness estimate only, since the callbacks cannot be read twice.
 
 ## The CD+G format
 

@@ -13,7 +13,7 @@ Each stream has one event callback. The audio thread queues events without locki
 | `FA_EVENT_STARTED` | position at the start | 0 | ✅ after `play_at`, a crossfade or a queue ([crossfade](crossfade.md)) |
 | `FA_EVENT_METADATA` | position where the new title starts | `fa_metadata.seq` of the title | ✅ radio song titles ([web streams](web-streams.md#song-titles-icy-metadata)) |
 | `FA_EVENT_STALLED` / `RESUMED` | position | 0 | ✅ push and packet streams ([FFmpeg hand-off](ffmpeg.md#buffering-the-end-and-seeking)), web streams ([buffering](web-streams.md#buffering-stalls-and-reconnects)) |
-| `FA_EVENT_DECODE_ERROR` | position | the `fa_result` | ✅ packet streams (the packet is skipped); disc streams (`FA_ERROR_IO` for a sector that stays unreadable, which plays as silence) |
+| `FA_EVENT_DECODE_ERROR` | position | the `fa_result` | ✅ packet streams (the packet is skipped); disc streams (`FA_ERROR_IO` for a sector that stays unreadable, which plays as silence); stored ZIP songs whose bytes do not match the archive's CRC (`FA_ERROR_UNSUPPORTED_FORMAT`, once, [CD+G](cdg.md#zip-archives)) |
 | `FA_EVENT_DEVICE_CHANGED` | position | 0: the system moved the output to the new default; 1: the device went away and the output was reopened on the default | ✅ every stream on the device ([devices](devices.md#when-the-device-changes-or-goes-away)) |
 | `FA_EVENT_LOUDNESS_FINAL` | position | 0 | ✅ ([normalization](normalization.md)) |
 | `FA_EVENT_MIDI_TEXT` | the text's frame | its index for `fa_stream_get_midi_text` | ✅ MIDI lyrics and text, streams on a device ([MIDI](midi.md#lyrics-and-text-events)) |
