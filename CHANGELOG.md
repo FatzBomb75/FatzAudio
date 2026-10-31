@@ -27,6 +27,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   the server closes cleanly now reconnects instead of ending. `fa_stream_close` returns at once while a host name lookup
   hangs. See [docs/features/web-streams.md](docs/features/web-streams.md#saving-a-station-as-it-plays).
 
+- ZIP leftovers: other entries of a karaoke archive (a bundled video or PDF) are probed from a 64 KB prefix instead of
+  being unpacked first, in `fa_stream_open_*` and in tag reads; `fa_open_options.cancel` (new last field; .NET
+  `StreamOptions.CancellationToken`) stops a long unpack with the new `FA_ERROR_CANCELLED` (.NET `ErrorCode.Cancelled`);
+  a song unpacked into a temp file now gets its loudness scan, `fa_stream_get_tags` and `fa_analyze_stream` like any
+  file; a stored entry played in place is CRC checked by the worker while it plays, and a mismatch raises one
+  `FA_EVENT_DECODE_ERROR` (.NET `DecodeError`) without stopping playback.
+  See [docs/features/cdg.md](docs/features/cdg.md#zip-archives).
+
 - MIDI controllers and SoundFont modulators: the mod wheel and channel pressure add vibrato (RPN 5 sets its depth),
   CC74/CC71 move the filter cutoff and resonance, CC73/CC75/CC72 the attack, decay and release, CC76-78 the vibrato rate,
   depth and delay, with the GS/XG part NRPNs and part SysEx that set the same values; portamento (CC65, CC5, CC84),

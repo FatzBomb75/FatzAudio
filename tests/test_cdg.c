@@ -385,11 +385,11 @@ static void test_zip_edge_cases(void)
         zip = make_zip(files, 1);
         e.header_offset = 0;
         fa_source_open_memory_ref(&zs, zip.p, zip.n);
-        CHECK_EQ(fa_zip_extract(&zs, &e, UINT64_MAX, &out), FA_ERROR_UNSUPPORTED_FORMAT);
+        CHECK_EQ(fa_zip_extract(&zs, &e, UINT64_MAX, NULL, &out), FA_ERROR_UNSUPPORTED_FORMAT);
         CHECK(out == NULL);
         /* Past the caller's limit: too large, also before allocating */
         e.size = 2000;
-        CHECK_EQ(fa_zip_extract(&zs, &e, 1000, &out), FA_ERROR_TOO_LARGE);
+        CHECK_EQ(fa_zip_extract(&zs, &e, 1000, NULL, &out), FA_ERROR_TOO_LARGE);
         CHECK(out == NULL);
         free(zip.p);
         free(body.p);
@@ -556,7 +556,7 @@ static void test_inflate_streaming(void)
     CHECK_EQ(count, 1);
     tmp = tmpfile();
     CHECK(tmp != NULL);
-    CHECK_EQ(fa_zip_extract_file(&zs, &e[0], tmp), FA_OK);
+    CHECK_EQ(fa_zip_extract_file(&zs, &e[0], NULL, tmp), FA_OK);
     CHECK_EQ(ftell(tmp), (long)wav.n);
     rewind(tmp);
     out = (uint8_t*)malloc(wav.n);
@@ -565,7 +565,7 @@ static void test_inflate_streaming(void)
     free(out);
     out = NULL;
     /* And into memory from the file source */
-    CHECK_EQ(fa_zip_extract(&zs, &e[0], wav.n, &out), FA_OK);
+    CHECK_EQ(fa_zip_extract(&zs, &e[0], wav.n, NULL, &out), FA_OK);
     CHECK(memcmp(out, wav.p, wav.n) == 0);
     free(out);
     fclose(tmp);
@@ -576,7 +576,7 @@ static void test_inflate_streaming(void)
     fa_source_open_memory_ref(&zs, zip.p, zip.n);
     CHECK_EQ(fa_zip_list(&zs, &e, &count), FA_OK);
     out = NULL;
-    CHECK(fa_zip_extract(&zs, &e[0], wav.n, &out) != FA_OK);
+    CHECK(fa_zip_extract(&zs, &e[0], wav.n, NULL, &out) != FA_OK);
     CHECK(out == NULL);
     free(e);
     free(zip.p); free(z.p); free(wav.p);
@@ -584,7 +584,12 @@ static void test_inflate_streaming(void)
 }
 
 /* App callbacks over a memory block, counting closes. */
-typedef struct mem_io { const buf* b; int64_t pos; int closes; int seekable; } mem_io;
+typedef struct mem_io {
+    const buf* b; int64_t pos; int closes; int seekable;
+    int64_t read_bytes;               /* all bytes handed out */
+    int64_t cancel_after;             /* sets *flag once this many have been (0 = never) */
+    volatile int32_t* flag;
+} mem_io;
 static int64_t FA_CALL mio_read(void* u, void* dst, size_t n)
 {
     mem_io* m = (mem_io*)u;
@@ -592,6 +597,8 @@ static int64_t FA_CALL mio_read(void* u, void* dst, size_t n)
     if (n > left) n = left;
     memcpy(dst, m->b->p + m->pos, n);
     m->pos += (int64_t)n;
+    m->read_bytes += (int64_t)n;
+    if (m->flag && m->cancel_after && m->read_bytes >= m->cancel_after) *m->flag = 1;
     return (int64_t)n;
 }
 static fa_result FA_CALL mio_seek(void* u, int64_t off)
@@ -1014,6 +1021,241 @@ static void test_zip_over_limit(void)
     fa_engine_destroy(e);
     remove("cdg_big.zip");
     free(zip.p); free(wav.p); free(cdg.p);
+}
+
+
+/* ---- ZIP leftovers: prefix probe, cancel, temp-file songs, stored-entry CRC -------------- */
+
+/* Lower-case letters from a generator: no format claims them, and stored blocks keep them
+ * at their size. */
+static buf make_text_junk(size_t n)
+{
+    buf b = { 0 };
+    uint32_t seed = 99;
+    size_t i;
+    for (i = 0; i < n; i++) { seed = seed * 1103515245u + 12345u; put8(&b, 'a' + ((seed >> 16) % 26)); }
+    return b;
+}
+
+/* A WAV with a title in its LIST chunk. */
+static buf make_titled_wav(uint32_t frames, const char* title)
+{
+    buf b = { 0 };
+    uint32_t i, data = frames * 2, tl = (uint32_t)strlen(title) + 1, list = 4 + 8 + ((tl + 1) & ~1u);
+    put(&b, "RIFF", 4); le32(&b, 4 + 24 + 8 + list + 8 + data); put(&b, "WAVE", 4);
+    put(&b, "fmt ", 4); le32(&b, 16); le16(&b, 1); le16(&b, 1);
+    le32(&b, 44100); le32(&b, 88200); le16(&b, 2); le16(&b, 16);
+    put(&b, "LIST", 4); le32(&b, list); put(&b, "INFO", 4);
+    put(&b, "INAM", 4); le32(&b, tl); put(&b, title, tl);
+    if (tl & 1) put8(&b, 0);
+    put(&b, "data", 4); le32(&b, data);
+    for (i = 0; i < frames; i++) le16(&b, (uint16_t)(int16_t)(sin(i * 6.283185307 / 160.0) * 8000.0));
+    return b;
+}
+
+static int count_temp_files(void)
+{
+    int n = 0;
+#ifndef _WIN32
+    DIR* d = opendir("cdg_tmp/fatzaudio-tmp");
+    struct dirent* ent;
+    if (!d) return 0;
+    while ((ent = readdir(d)) != NULL) if (ent->d_name[0] != '.') n++;
+    closedir(d);
+#endif
+    return n;
+}
+
+/* A bundled file that is no audio costs a 64 KB prefix, not its unpacking. */
+static void test_zip_prefix_probe(void)
+{
+    buf junk = make_text_junk(4 << 20), wav = make_wav(8000, 8000), zip;
+    zip_file files[2];
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_io_callbacks io;
+    mem_io m;
+    fa_tags* t = NULL;
+    files[0].name = "Notes.bin"; files[0].data = &junk; files[0].deflate = 1; files[0].crc_xor = 0;
+    files[1].name = "Song.wav"; files[1].data = &wav; files[1].deflate = 1; files[1].crc_xor = 0;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    memset(&io, 0, sizeof(io));
+    io.read = mio_read; io.seek = mio_seek; io.length = mio_length; io.close = mio_close;
+
+    /* Only the junk: refused after the prefix (the archive is 4 MB) */
+    zip = make_zip(files, 1);
+    memset(&m, 0, sizeof(m));
+    m.b = &zip; m.seekable = 1;
+    CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_ERROR_UNSUPPORTED_FORMAT);
+    CHECK(s == NULL);
+    CHECK(m.read_bytes < 300000);
+    CHECK_EQ(fa_tags_read_memory(zip.p, zip.n, 0, &t), FA_OK);   /* no tags, no unpack of 4 MB */
+    fa_tags_close(t);
+    free(zip.p);
+
+    /* The junk first, then the song: the song plays, the junk is skipped */
+    zip = make_zip(files, 2);
+    memset(&m, 0, sizeof(m));
+    m.b = &zip; m.seekable = 1;
+    CHECK_EQ(fa_stream_open_io(g_engine, &io, &m, &o, &s), FA_OK);
+    CHECK_EQ(decode_all(s), 8000);
+    CHECK(m.read_bytes < 4000000);   /* the 4 MB entry was not read through */
+    fa_stream_close(s);
+    free(zip.p); free(junk.p); free(wav.p);
+}
+
+/* The cancel flag stops the unpacking of a compressed song, into memory and into a temp file. */
+static void test_zip_cancel(void)
+{
+    buf wav = make_long_wav(1500000), zip;   /* 3 MB, stored blocks: about the same compressed */
+    zip_file f;
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_io_callbacks io;
+    mem_io m;
+    fa_engine_config cfg;
+    fa_engine* e = NULL;
+    volatile int32_t flag = 0;
+    int pass;
+    f.name = "Big.wav"; f.data = &wav; f.deflate = 1; f.crc_xor = 0;
+    zip = make_zip(&f, 1);
+    write_file("cdg_cancel.zip", &zip);
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    o.cancel = &flag;
+    memset(&io, 0, sizeof(io));
+    io.read = mio_read; io.seek = mio_seek; io.length = mio_length; io.close = mio_close;
+    fa_engine_config_init(&cfg);
+    cfg.flags = FA_ENGINE_NULL_OUTPUT;
+    cfg.zip_memory_limit_mb = 1;
+    cfg.temp_directory = "cdg_tmp";
+    CHECK_EQ(fa_engine_create(&cfg, &e), FA_OK);
+
+    /* Already set: nothing is unpacked */
+    flag = 1;
+    CHECK_EQ(fa_stream_open_path(e, "cdg_cancel.zip", &o, &s), FA_ERROR_CANCELLED);
+    CHECK(s == NULL);
+    CHECK_EQ(fa_stream_open_path(g_engine, "cdg_cancel.zip", &o, &s), FA_ERROR_CANCELLED);
+    CHECK(s == NULL);
+
+    /* Set by the app's callbacks after 1 MB: into memory (default engine), then a temp file */
+    for (pass = 0; pass < 2; pass++) {
+        fa_engine* eng = pass ? e : g_engine;
+        flag = 0;
+        memset(&m, 0, sizeof(m));
+        m.b = &zip; m.seekable = 1; m.flag = &flag; m.cancel_after = 1 << 20;
+        CHECK_EQ(fa_stream_open_io(eng, &io, &m, &o, &s), FA_ERROR_CANCELLED);
+        CHECK(s == NULL);
+        CHECK(m.read_bytes < (2 << 20));   /* stopped well before the 3 MB end */
+        CHECK_EQ(m.closes, 0);             /* a failed open leaves the callbacks to the app */
+        CHECK_EQ(count_temp_files(), 0);
+    }
+
+    /* Left clear, the same open plays */
+    flag = 0;
+    CHECK_EQ(fa_stream_open_path(e, "cdg_cancel.zip", &o, &s), FA_OK);
+    CHECK_EQ(decode_all(s), 1500000);
+    fa_stream_close(s);
+    fa_engine_destroy(e);
+    remove("cdg_cancel.zip");
+    free(zip.p); free(wav.p);
+}
+
+static fa_atomic32 g_crc_events;
+static fa_atomic32 g_crc_value;
+static void FA_CALL on_crc_event(const fa_event* ev, void* user)
+{
+    (void)user;
+    if (ev->type != FA_EVENT_DECODE_ERROR) return;
+    fa_store32(&g_crc_value, (int32_t)ev->value);
+    fa_fetch_add32(&g_crc_events, 1);
+}
+
+/* A song unpacked into a temp file gets tags, a loudness scan and analysis, like any file. */
+static void test_zip_temp_song(void)
+{
+    buf wav = make_titled_wav(700000, "Temp Title"), zip;
+    zip_file f;
+    fa_engine_config cfg;
+    fa_engine* e = NULL;
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_tags* t = NULL;
+    fa_loudness l;
+    fa_analysis* a = NULL;
+    int64_t deadline;
+    f.name = "Temp.wav"; f.data = &wav; f.deflate = 1; f.crc_xor = 0;
+    zip = make_zip_lz(&f, 1);
+    write_file("cdg_temp.zip", &zip);
+    fa_engine_config_init(&cfg);
+    cfg.flags = FA_ENGINE_NULL_OUTPUT;
+    cfg.zip_memory_limit_mb = 1;
+    cfg.temp_directory = "cdg_tmp";
+    CHECK(wav.n > (1u << 20));
+    CHECK_EQ(fa_engine_create(&cfg, &e), FA_OK);
+    fa_open_options_init(&o);
+    CHECK_EQ(fa_stream_open_path(e, "cdg_temp.zip", &o, &s), FA_OK);
+    CHECK_EQ(fa_stream_get_tags(s, 0, &t), FA_OK);
+    CHECK(fa_tags_get(t, FA_TAG_TITLE) != NULL);
+    CHECK(strcmp(fa_tags_get(t, FA_TAG_TITLE), "Temp Title") == 0);
+    fa_tags_close(t);
+    deadline = fa_monotonic_ns() + 10000000000LL;
+    do {
+        fa_sleep_ms(20);
+        CHECK_EQ(fa_stream_get_loudness(s, &l), FA_OK);
+    } while (!l.is_final && fa_monotonic_ns() < deadline);
+    CHECK_EQ(l.is_final, 1);
+    CHECK_EQ(l.source, FA_LOUDNESS_SCAN);
+    CHECK(l.integrated_lufs < 0.0);
+    CHECK_EQ(fa_analyze_stream(s, NULL, &a), FA_OK);
+    fa_analysis_free(a);
+    CHECK_EQ(decode_all(s), 700000);
+    fa_stream_close(s);
+    CHECK_EQ(count_temp_files(), 0);
+    fa_engine_destroy(e);
+    remove("cdg_temp.zip");
+    free(zip.p); free(wav.p);
+}
+
+/* A stored entry is checked against its CRC while the stream plays; a mismatch is reported once. */
+static void test_zip_stored_crc(void)
+{
+    buf wav = make_wav(44100, 44100), zip;
+    zip_file f;
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_device* dev = NULL;
+    int bad, from_memory;
+    f.name = "Song.wav"; f.data = &wav; f.deflate = 0;
+    CHECK_EQ(fa_device_open(g_engine, NULL, &dev), FA_OK);
+    CHECK_EQ(fa_device_start(dev), FA_OK);
+    fa_open_options_init(&o);
+    for (bad = 0; bad < 2; bad++) {
+        for (from_memory = 0; from_memory < 2; from_memory++) {
+            int64_t deadline;
+            f.crc_xor = bad ? 0x1234 : 0;
+            zip = make_zip(&f, 1);
+            write_file("cdg_crc.zip", &zip);
+            fa_store32(&g_crc_events, 0);
+            if (from_memory) CHECK_EQ(fa_stream_open_memory(g_engine, zip.p, zip.n, &o, &s), FA_OK);
+            else CHECK_EQ(fa_stream_open_path(g_engine, "cdg_crc.zip", &o, &s), FA_OK);
+            CHECK_EQ(fa_stream_set_event_callback(s, on_crc_event, NULL), FA_OK);
+            CHECK_EQ(fa_stream_attach(s, dev, NULL), FA_OK);
+            CHECK_EQ(fa_stream_play(s), FA_OK);
+            deadline = fa_monotonic_ns() + 5000000000LL;
+            while (bad && fa_load32(&g_crc_events) == 0 && fa_monotonic_ns() < deadline) fa_sleep_ms(10);
+            if (!bad) fa_sleep_ms(300);   /* long enough for the check to have ended */
+            fa_sleep_ms(100);
+            CHECK_EQ(fa_load32(&g_crc_events), bad ? 1 : 0);
+            if (bad) CHECK_EQ(fa_load32(&g_crc_value), FA_ERROR_UNSUPPORTED_FORMAT);
+            fa_stream_close(s);
+            free(zip.p);
+        }
+    }
+    fa_device_close(dev);
+    remove("cdg_crc.zip");
+    free(wav.p);
 }
 
 /* ---- the decoder and surfaces ---------------------------------------------------------- */
@@ -3946,6 +4188,10 @@ int main(void)
     RUN(test_inflate_streaming);
     RUN(test_zip_lean);
     RUN(test_zip_over_limit);
+    RUN(test_zip_prefix_probe);
+    RUN(test_zip_cancel);
+    RUN(test_zip_temp_song);
+    RUN(test_zip_stored_crc);
     RUN(test_zip64_basic);
     RUN(test_zip64_many_entries);
     RUN(test_zip64_over_4gb);

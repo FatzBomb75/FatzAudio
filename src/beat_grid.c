@@ -70,13 +70,15 @@ static fa_result file_grid(struct fa_stream* s, fa_grid_data* out, fa_atomic32* 
     memset(out, 0, sizeof(*out));
     if (s->midi) return fa_midi_exact_grid(s->midi, out);
     if (!s->tracker) return FA_ERROR_NOT_FOUND;
-    if (s->path) r = fa_source_open_path_window(&src, s->path, s->path_offset, s->path_length);
+    if (s->source.shared) r = fa_source_open_shared(&src, s->source.shared);
+    else if (s->path) r = fa_source_open_path_window(&src, s->path, s->path_offset, s->path_length);
     else if (s->source.kind == FA_SOURCE_MEMORY) r = fa_source_open_memory_ref(&src, s->source.mem, s->source.mem_size);
     else return FA_ERROR_NOT_FOUND;
     if (r != FA_OK) return r;
     memset(&env, 0, sizeof(env));
     env.midi_rate = s->decoder.format.sample_rate;
-    r = fa_decoder_open(&dec, &src, s->path && s->path_length > 0 ? s->path_name : s->path, NULL, s->audio_track, &env);
+    r = fa_decoder_open(&dec, &src, s->source.shared || (s->path && s->path_length > 0) ? s->path_name : s->path, NULL,
+                        s->audio_track, &env);
     if (r == FA_OK) {
         r = fa_tracker_of(&dec) ? fa_tracker_grid_render(&dec, out, cancel) : FA_ERROR_NOT_FOUND;
         fa_decoder_close(&dec);

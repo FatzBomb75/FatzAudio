@@ -90,8 +90,9 @@ enum {
     FA_ERROR_PERMISSION_DENIED = -20 /* the OS refused the microphone: the app has no
                                         permission (Android RECORD_AUDIO, the macOS and iOS
                                         microphone prompt, Windows privacy settings) */,
-    FA_ERROR_OUT_OF_RANGE = -21      /* fa_deck_sync: the tempo it needs is outside the deck's
+    FA_ERROR_OUT_OF_RANGE = -21,     /* fa_deck_sync: the tempo it needs is outside the deck's
                                         FA_DECK_SYNC_RANGE, also at half or double time */
+    FA_ERROR_CANCELLED = -22         /* the app's fa_open_options.cancel flag stopped an open */
 };
 
 typedef struct fa_engine fa_engine;   /* one per process is typical */
@@ -297,6 +298,13 @@ typedef struct fa_open_options {
                                 valid UTF-8 stays UTF-8 and the others are read as
                                 Windows-1252; forced Windows-1252 and Shift-JIS read
                                 every event that way */
+    const volatile int32_t* cancel; /* NULL = none. A flag the app sets to non-zero (from
+                                another thread) to stop the open: unpacking a ZIP
+                                song (the one long step of an open from a file or
+                                memory) then returns FA_ERROR_CANCELLED within about
+                                a block of the compressed data, and the song is not opened.
+                                Read only during the call, so it may be freed
+                                after. Other opens ignore it */
 } fa_open_options;
 
 /* fa_open_options.text_code_page, and fa_midi_credits.code_page. */
@@ -2725,7 +2733,8 @@ FA_API fa_result FA_CALL fa_stream_get_tracker_channel_mute(fa_stream* stream, u
  * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); TRACKER_ROW from
  * tracker modules played on a device (when asked for); METADATA from web
  * streams; STALLED and RESUMED from push, packet and web streams; DECODE_ERROR from packet
- * and disc streams. The others are raised by the features that produce them as those land (see docs/features). */
+ * and disc streams, and once for a stored ZIP song that does not match its archive's CRC (value
+ * FA_ERROR_UNSUPPORTED_FORMAT). The others are raised by the features that produce them as those land (see docs/features). */
 typedef enum fa_event_type {
     FA_EVENT_ENDED = 0,
     FA_EVENT_POSITION,        /* reached a requested frame */

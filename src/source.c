@@ -49,6 +49,69 @@ fa_result fa_source_open_path(fa_source* src, const char* path)
     return FA_OK;
 }
 
+struct fa_shared_file {
+    FILE* file;
+    int64_t length;
+    fa_mutex lock;      /* a read is a seek and an fread */
+    fa_atomic32 refs;
+};
+
+fa_result fa_shared_file_new(FILE* file, int64_t length, fa_shared_file** out)
+{
+    fa_shared_file* sf = (fa_shared_file*)calloc(1, sizeof(*sf));
+    *out = NULL;
+    if (!sf || fa_mutex_init(&sf->lock) != 0) {
+        free(sf);
+        fclose(file);
+        return FA_ERROR_OUT_OF_MEMORY;
+    }
+    sf->file = file;
+    sf->length = length;
+    fa_store32(&sf->refs, 1);
+    *out = sf;
+    return FA_OK;
+}
+
+fa_shared_file* fa_shared_file_retain(fa_shared_file* sf)
+{
+    if (sf) fa_fetch_add32(&sf->refs, 1);
+    return sf;
+}
+
+void fa_shared_file_release(fa_shared_file* sf)
+{
+    if (!sf || fa_fetch_add32(&sf->refs, -1) != 1) return;
+    fclose(sf->file);
+    fa_mutex_destroy(&sf->lock);
+    free(sf);
+}
+
+fa_result fa_source_open_shared(fa_source* src, fa_shared_file* sf)
+{
+    memset(src, 0, sizeof(*src));
+    src->kind = FA_SOURCE_FILE;
+    src->file = sf->file;
+    src->shared = fa_shared_file_retain(sf);
+    src->seekable = 1;
+    src->length = sf->length;
+    return FA_OK;
+}
+
+/* fread at the source's own position: a shared file is moved to it first, under its lock. */
+static size_t file_read_at(fa_source* src, int64_t offset, void* buf, size_t n, int* failed)
+{
+    size_t got;
+    fa_mutex_lock(&src->shared->lock);
+    file_seek(src->file, offset, SEEK_SET);
+    got = fread(buf, 1, n, src->file);
+    /* The error flag is the file's, not this source's: taken and cleared here, so one
+     * failed read is not seen by every other source. */
+    *failed = ferror(src->file) != 0;
+    if (*failed) clearerr(src->file);
+    fa_mutex_unlock(&src->shared->lock);
+    return got;
+}
+
 fa_result fa_source_open_memory(fa_source* src, const void* data, size_t size)
 {
     memset(src, 0, sizeof(*src));
@@ -123,9 +186,14 @@ size_t fa_source_peek(fa_source* src, const uint8_t** out_data)
             } else if (src->kind == FA_SOURCE_FILE) {
                 size_t want = FA_PROBE_BYTES;
                 if (src->windowed && src->length < (int64_t)want) want = (size_t)src->length;
-                file_seek(src->file, src->base, SEEK_SET);
-                got = (int64_t)fread(src->prefix_buf, 1, want, src->file);
-                file_seek(src->file, src->base + src->pos, SEEK_SET);
+                if (src->shared) {
+                    int failed;
+                    got = (int64_t)file_read_at(src, src->base, src->prefix_buf, want, &failed);
+                } else {
+                    file_seek(src->file, src->base, SEEK_SET);
+                    got = (int64_t)fread(src->prefix_buf, 1, want, src->file);
+                    file_seek(src->file, src->base + src->pos, SEEK_SET);
+                }
             } else {
                 size_t want = FA_PROBE_BYTES;
                 if (src->windowed && src->length < (int64_t)want) want = (size_t)src->length;
@@ -179,9 +247,10 @@ int64_t fa_source_read(fa_source* src, void* buf, size_t n)
         if ((uint64_t)n > (uint64_t)left) n = (size_t)left;
     }
     if (src->kind == FA_SOURCE_FILE) {
-        size_t got = fread(out, 1, n, src->file);
+        int failed = 0;
+        size_t got = src->shared ? file_read_at(src, src->base + src->pos, out, n, &failed) : fread(out, 1, n, src->file);
         src->pos += (int64_t)got;
-        if (ferror(src->file)) {
+        if (src->shared ? failed : ferror(src->file)) {
             if (src->error == FA_OK) src->error = FA_ERROR_IO;
             if (got == 0) return FA_ERROR_IO;
         }
@@ -222,7 +291,7 @@ fa_result fa_source_seek(fa_source* src, int64_t offset)
         if (offset > (int64_t)src->mem_size) return FA_ERROR_INVALID_ARG;
         break;
     case FA_SOURCE_FILE:
-        if (file_seek(src->file, src->base + offset, SEEK_SET) != 0) return FA_ERROR_IO;
+        if (!src->shared && file_seek(src->file, src->base + offset, SEEK_SET) != 0) return FA_ERROR_IO;
         break;
     default:
         if (src->seekable && offset >= (int64_t)src->prefix_len) {
@@ -314,7 +383,7 @@ fa_result fa_source_set_window(fa_source* src, int64_t base, int64_t size)
     if (whole < 0 || base < 0 || size < 0 || base > whole || size > whole - base) return FA_ERROR_INVALID_ARG;
     if (src->kind == FA_SOURCE_IO && !src->seekable) return FA_ERROR_NOT_SEEKABLE;
     if (src->kind == FA_SOURCE_IO && src->io.seek(src->io_user, base) != FA_OK) return FA_ERROR_IO;
-    if (src->kind == FA_SOURCE_FILE && file_seek(src->file, base, SEEK_SET) != 0) return FA_ERROR_IO;
+    if (src->kind == FA_SOURCE_FILE && !src->shared && file_seek(src->file, base, SEEK_SET) != 0) return FA_ERROR_IO;
     if (src->kind == FA_SOURCE_MEMORY) {
         src->mem = src->mem - src->base + base;
         src->mem_size = (size_t)size;
@@ -345,7 +414,8 @@ fa_result fa_source_open_path_window(fa_source* src, const char* path, int64_t o
 
 void fa_source_close(fa_source* src)
 {
-    if (src->kind == FA_SOURCE_FILE && src->file) fclose(src->file);
+    if (src->shared) fa_shared_file_release(src->shared);
+    else if (src->kind == FA_SOURCE_FILE && src->file) fclose(src->file);
     /* Any kind: a ZIP entry unpacked from app callbacks keeps their close (stream.c). */
     if (src->io.close) src->io.close(src->io_user);
     free(src->owned);
