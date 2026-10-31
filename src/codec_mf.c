@@ -5,8 +5,9 @@
  *    (CLSID_CWMSPDecMediaObject); one ASF media object per packet.
  *  - AAC (LC, HE-AAC, HE-AAC v2): the system's AAC decoder, found by MFTEnumEx,
  *    raw access units (payload type 0) with the AudioSpecificConfig after an
- *    HEAACWAVEINFO's fields as MF_MT_USER_DATA. ADTS frames lose their header
- *    first (codec_os.c). SBR doubles the rate: the output type says the rate.
+ *    HEAACWAVEINFO's fields as MF_MT_USER_DATA (only configurations aac.c does not
+ *    decode come here; ADTS frames never do). SBR doubles the rate: the output type
+ *    says the rate.
  *  - ALAC is not taken: Windows' ALAC decoder accepts the stream's configuration
  *    (bare or in its 'alac' box) and then decodes nothing; codec_alac.c decodes it.
  * Their output is in WAVE channel order, which is the library's.
@@ -110,7 +111,6 @@ typedef struct mf_state {
     DWORD com_thread;
     int started;                /* MFStartup succeeded */
     int drained;
-    int adts;                   /* AAC: ADTS headers come off the packets */
     LONGLONG time;              /* input sample times, 100 ns */
     int64_t frames_out;
 } mf_state;
@@ -253,8 +253,6 @@ static fa_result mf_decode(fa_codec* c, const uint8_t* data, size_t size)
         return pull(c, st);
     }
     if (size == 0 || size > 0x7FFFFFF0 || st->drained) return FA_OK;
-    /* Several raw data blocks in one ADTS frame: not one access unit, skipped. */
-    if (st->adts && fa_adts_strip(&data, &size) < 0) return FA_ERROR_UNSUPPORTED_FORMAT;
     hr = mf.create_buffer((DWORD)size, &buf);
     if (SUCCEEDED(hr)) hr = IMFMediaBuffer_Lock(buf, &p, NULL, NULL);
     if (SUCCEEDED(hr)) {
@@ -459,7 +457,6 @@ static fa_result open_enum(fa_codec* c, const GUID* subtype, const uint32_t* rat
         mf_free(st);
         return hr == E_OUTOFMEMORY ? FA_ERROR_OUT_OF_MEMORY : FA_ERROR_UNSUPPORTED_FORMAT;
     }
-    st->adts = aac;
     return mf_finish(c, st, S_OK);
 }
 

@@ -15,6 +15,7 @@
 #include "demux.h"
 #include "net.h"
 #include "pkt_index.h"
+#include "walk.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -65,47 +66,19 @@ typedef struct mp4 {
 
 /* ---- boxes in memory ---------------------------------------------------------------- */
 
-typedef struct box {
-    uint32_t type;
-    const uint8_t* p;
-    size_t len;
-} box;
-
-static int next_box(const uint8_t** cur, const uint8_t* end, box* b)
-{
-    size_t n = (size_t)(end - *cur), hdr = 8;
-    uint64_t size;
-    if (n < 8) return 0;
-    size = fa_be32(*cur);
-    b->type = fa_be32(*cur + 4);
-    if (size == 1) {
-        if (n < 16) return 0;
-        size = fa_be64(*cur + 8);
-        hdr = 16;
-    } else if (size == 0) {
-        size = n;
-    }
-    if (size < hdr) return 0;
-    if (size > n) size = n;          /* cut short: keep what is there */
-    b->p = *cur + hdr;
-    b->len = (size_t)size - hdr;
-    *cur += size;
-    return 1;
-}
-
-static int find_box(const uint8_t* p, size_t len, uint32_t type, box* out)
+static int find_box(const uint8_t* p, size_t len, uint32_t type, fa_mp4_box* out)
 {
     const uint8_t* cur = p;
-    box b;
-    while (next_box(&cur, p + len, &b))
+    fa_mp4_box b;
+    while (fa_mp4_next_box(&cur, p + len, &b))
         if (b.type == type) { *out = b; return 1; }
     return 0;
 }
 
 /* Follows a path of nested boxes, e.g. "mdia", "minf", "stbl". */
-static int find_path(const box* in, const uint32_t* path, int depth, box* out)
+static int find_path(const fa_mp4_box* in, const uint32_t* path, int depth, fa_mp4_box* out)
 {
-    box b = *in;
+    fa_mp4_box b = *in;
     int i;
     for (i = 0; i < depth; i++)
         if (!find_box(b.p, b.len, path[i], &b)) return 0;
@@ -179,9 +152,9 @@ static uint32_t pcm_sample_bytes(const mp4* m, uint32_t listed)
 }
 
 /* Expands stts / stsc / stsz (stz2) / stco (co64) into packets. */
-static fa_result build_packets(mp4* m, const box* stbl)
+static fa_result build_packets(mp4* m, const fa_mp4_box* stbl)
 {
-    box stts, stsc, stsz, stco;
+    fa_mp4_box stts, stsc, stsz, stco;
     int co64 = 0, z2 = 0;
     uint32_t n_stts, n_stsc, n_chunks, sample_size = 0, field = 32;
     uint64_t total, sample = 0, stts_i = 0, stts_left = 0, stsc_i = 0, chunk;
@@ -292,10 +265,10 @@ static fa_result build_packets(mp4* m, const box* stbl)
 static fa_result parse_moof(mp4* m, const uint8_t* p, size_t len, int64_t moof_off)
 {
     const uint8_t* cur = p;
-    box traf;
-    while (next_box(&cur, p + len, &traf)) {
+    fa_mp4_box traf;
+    while (fa_mp4_next_box(&cur, p + len, &traf)) {
         const uint8_t* c2 = traf.p;
-        box b, tfhd;
+        fa_mp4_box b, tfhd;
         uint32_t flags, def_dur = m->trex_duration, def_size = m->trex_size;
         int64_t base = moof_off, next_off;
         int64_t pts = m->end_pts;
@@ -314,7 +287,7 @@ static fa_result parse_moof(mp4* m, const uint8_t* p, size_t len, int64_t moof_o
         if (find_box(traf.p, traf.len, FA_FOURCC('t', 'f', 'd', 't'), &b) && b.len >= 8)
             pts = b.p[0] == 1 && b.len >= 12 ? (int64_t)fa_be64(b.p + 4) : (int64_t)fa_be32(b.p + 4);
         next_off = base;
-        while (next_box(&c2, traf.p + traf.len, &b)) {
+        while (fa_mp4_next_box(&c2, traf.p + traf.len, &b)) {
             uint32_t tf, count, i, rec;
             int64_t off;
             if (b.type != FA_FOURCC('t', 'r', 'u', 'n') || b.len < 8) continue;
@@ -361,16 +334,10 @@ static int read_box_header(mp4* m, int64_t pos, uint32_t* type, int64_t* size, i
     uint64_t s;
     if (fa_br_seek(&m->br, pos) != FA_OK) return 0;
     if (fa_br_read(&m->br, h, 8) < 8) return 0;
-    s = fa_be32(h);
-    *type = fa_be32(h + 4);
-    *hdr = 8;
-    if (s == 1) {
-        if (fa_br_read(&m->br, h + 8, 8) < 8) return 0;
-        s = fa_be64(h + 8);
-        *hdr = 16;
-    }
+    if (fa_be32(h) == 1 && fa_br_read(&m->br, h + 8, 8) < 8) return 0;
+    if (!fa_mp4_box_header(h, sizeof(h), type, &s, hdr)) return 0;
     if (s == 0) { *size = -1; return 1; }
-    if (s < (uint64_t)*hdr || s > (uint64_t)INT64_MAX / 2) return 0;
+    if (s > (uint64_t)INT64_MAX / 2) return 0;
     *size = (int64_t)s;
     return 1;
 }
@@ -529,23 +496,23 @@ static int read_mfra(mp4* m, int64_t* out_end)
     }
     {
         const uint8_t* cur = buf + n - mfra_size;
-        box mfra, b;
-        if (!next_box(&cur, buf + n, &mfra) || mfra.type != FA_FOURCC('m', 'f', 'r', 'a')) goto done;
+        fa_mp4_box mfra, b;
+        if (!fa_mp4_next_box(&cur, buf + n, &mfra) || mfra.type != FA_FOURCC('m', 'f', 'r', 'a')) goto done;
         cur = mfra.p;
-        while (!ok && next_box(&cur, mfra.p + mfra.len, &b))
+        while (!ok && fa_mp4_next_box(&cur, mfra.p + mfra.len, &b))
             if (b.type == FA_FOURCC('t', 'f', 'r', 'a')) ok = parse_tfra(m, b.p, b.len);
     }
     if (ok && m->frags[m->nfrags - 1].off >= from && m->frags[m->nfrags - 1].off + 8 <= from + (int64_t)n) {
         /* The last fragment's moof is here too: its samples give the end. */
         const uint8_t* cur = buf + (m->frags[m->nfrags - 1].off - from);
         size_t left = n - (size_t)(cur - buf);
-        box moof;
-        if (fa_be32(cur) <= left && next_box(&cur, buf + n, &moof) && moof.type == FA_FOURCC('m', 'o', 'o', 'f')) {
+        fa_mp4_box moof;
+        if (fa_be32(cur) <= left && fa_mp4_next_box(&cur, buf + n, &moof) && moof.type == FA_FOURCC('m', 'o', 'o', 'f')) {
             /* Only when it is the file's last moof: tfra need not list every fragment. */
             const uint8_t* after = cur;
-            box x;
+            fa_mp4_box x;
             int last = 1;
-            while (last && next_box(&after, buf + n - mfra_size, &x)) if (x.type == FA_FOURCC('m', 'o', 'o', 'f')) last = 0;
+            while (last && fa_mp4_next_box(&after, buf + n - mfra_size, &x)) if (x.type == FA_FOURCC('m', 'o', 'o', 'f')) last = 0;
             m->end_pts = m->frags[m->nfrags - 1].pts;
             if (last && parse_moof(m, moof.p, moof.len, m->frags[m->nfrags - 1].off) == FA_OK && m->pk.n > 0)
                 *out_end = m->pk.end_pts;
@@ -756,9 +723,9 @@ static int set_extra(mp4* m, const uint8_t* p, size_t n)
 }
 
 /* The first sample description of the track: codec name, rate, channels, extradata. */
-static fa_result parse_stsd(mp4* m, const box* stbl, fa_codec_params* cp)
+static fa_result parse_stsd(mp4* m, const fa_mp4_box* stbl, fa_codec_params* cp)
 {
-    box stsd, wave, b;
+    fa_mp4_box stsd, wave, b;
     const uint8_t* e;
     const uint8_t* kids;
     size_t elen, klen;
@@ -769,8 +736,8 @@ static fa_result parse_stsd(mp4* m, const box* stbl, fa_codec_params* cp)
     if (!find_box(stbl->p, stbl->len, FA_FOURCC('s', 't', 's', 'd'), &stsd) || stsd.len < 16) return FA_ERROR_UNSUPPORTED_FORMAT;
     {
         const uint8_t* cur = stsd.p + 8;
-        box entry;
-        if (!next_box(&cur, stsd.p + stsd.len, &entry)) return FA_ERROR_UNSUPPORTED_FORMAT;
+        fa_mp4_box entry;
+        if (!fa_mp4_next_box(&cur, stsd.p + stsd.len, &entry)) return FA_ERROR_UNSUPPORTED_FORMAT;
         fourcc = entry.type;
         e = entry.p;
         elen = entry.len;
@@ -878,7 +845,7 @@ static fa_result parse_stsd(mp4* m, const box* stbl, fa_codec_params* cp)
         break;
     case FA_FOURCC('a', 'l', 'a', 'c'): {
         /* The decoder wants the whole 'alac' child box, header included. */
-        box a;
+        fa_mp4_box a;
         if (!find_box(kids, klen, FA_FOURCC('a', 'l', 'a', 'c'), &a)) {
             if (!have_wave || !find_box(wave.p, wave.len, FA_FOURCC('a', 'l', 'a', 'c'), &a)) return FA_ERROR_UNSUPPORTED_FORMAT;
         }
@@ -938,36 +905,36 @@ static fa_result parse_stsd(mp4* m, const box* stbl, fa_codec_params* cp)
 
 /* ---- the movie ---------------------------------------------------------------------- */
 
-static int is_audio(const box* trak)
+static int is_audio(const fa_mp4_box* trak)
 {
     static const uint32_t path[2] = { FA_FOURCC('m', 'd', 'i', 'a'), FA_FOURCC('h', 'd', 'l', 'r') };
-    box h;
+    fa_mp4_box h;
     return find_path(trak, path, 2, &h) && h.len >= 12 && fa_be32(h.p + 8) == FA_FOURCC('s', 'o', 'u', 'n');
 }
 
-static int track_enabled(const box* trak)
+static int track_enabled(const fa_mp4_box* trak)
 {
-    box t;
+    fa_mp4_box t;
     return find_box(trak->p, trak->len, FA_FOURCC('t', 'k', 'h', 'd'), &t) && t.len >= 4 && (fa_be32(t.p) & 1);
 }
 
-static uint32_t track_id(const box* trak)
+static uint32_t track_id(const fa_mp4_box* trak)
 {
-    box t;
+    fa_mp4_box t;
     if (!find_box(trak->p, trak->len, FA_FOURCC('t', 'k', 'h', 'd'), &t) || t.len < 24) return 0;
     return fa_be32(t.p + (t.p[0] == 1 ? 20 : 12));
 }
 
 /* Picks audio track `want` (-1 = the first enabled one) and counts them. */
-static int pick_track(const box* moov, int32_t want, box* out)
+static int pick_track(const fa_mp4_box* moov, int32_t want, fa_mp4_box* out)
 {
     const uint8_t* cur = moov->p;
-    box b;
+    fa_mp4_box b;
     int count = 0, first = -1, enabled = -1;
-    box first_b, enabled_b;
+    fa_mp4_box first_b, enabled_b;
     memset(&first_b, 0, sizeof(first_b));
     memset(&enabled_b, 0, sizeof(enabled_b));
-    while (next_box(&cur, moov->p + moov->len, &b)) {
+    while (fa_mp4_next_box(&cur, moov->p + moov->len, &b)) {
         if (b.type != FA_FOURCC('t', 'r', 'a', 'k') || !is_audio(&b)) continue;
         if (count == want) *out = b;
         if (first < 0) { first = count; first_b = b; }
@@ -1053,7 +1020,7 @@ static fa_result mp4_open(fa_decoder* dec)
     int64_t pos = 0;
     int qt = 1, have_moov = 0, count;
     int64_t index_end = FA_DEMUX_NO_PTS, mehd_end = FA_DEMUX_NO_PTS;
-    box moov, trak, b;
+    fa_mp4_box moov, trak, b;
     fa_result r;
     static const uint32_t mdhd_path[2] = { FA_FOURCC('m', 'd', 'i', 'a'), FA_FOURCC('m', 'd', 'h', 'd') };
     static const uint32_t stbl_path[3] = { FA_FOURCC('m', 'd', 'i', 'a'), FA_FOURCC('m', 'i', 'n', 'f'), FA_FOURCC('s', 't', 'b', 'l') };
@@ -1111,7 +1078,7 @@ static fa_result mp4_open(fa_decoder* dec)
     if (m->timescale == 0) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
 
     {
-        box stbl;
+        fa_mp4_box stbl;
         if (!find_path(&trak, stbl_path, 3, &stbl)) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
         memset(&tp, 0, sizeof(tp));
         fa_codec_params_init(&tp.codec);
@@ -1125,8 +1092,8 @@ static fa_result mp4_open(fa_decoder* dec)
     if (find_box(moov.p, moov.len, FA_FOURCC('m', 'v', 'e', 'x'), &b)) {
         const uint8_t* cur = b.p;
         uint64_t mehd = 0;            /* the whole length, movie timescale */
-        box x;
-        while (next_box(&cur, b.p + b.len, &x)) {
+        fa_mp4_box x;
+        while (fa_mp4_next_box(&cur, b.p + b.len, &x)) {
             if (x.type == FA_FOURCC('t', 'r', 'e', 'x') && x.len >= 20 && fa_be32(x.p + 4) == m->track_id) {
                 m->trex_duration = fa_be32(x.p + 12);
                 m->trex_size = fa_be32(x.p + 16);
@@ -1157,7 +1124,7 @@ static fa_result mp4_open(fa_decoder* dec)
     tp.end = m->lazy ? FA_DEMUX_NO_PTS : m->indexed ? index_end : m->end_pts;
     {
         static const uint32_t elst_path[2] = { FA_FOURCC('e', 'd', 't', 's'), FA_FOURCC('e', 'l', 's', 't') };
-        box e;
+        fa_mp4_box e;
         if (find_path(&trak, elst_path, 2, &e) && e.len >= 8 && m->movie_timescale > 0) {
             int v1 = e.p[0] == 1;
             size_t esz = v1 ? 20 : 12, i, n = fa_be32(e.p + 4);

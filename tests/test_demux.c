@@ -7,6 +7,7 @@
 #endif
 #include "fa_internal.h"
 #include "demux.h"
+#include "walk.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1082,17 +1083,73 @@ static void test_aac_config_explicit_rates(void)
 
 /* ---- what the systems' AAC and ALAC decoders are given (codec_os.c) --------------- */
 
+/* The shared walkers (walk.c) and ADTS header parser (demux.c): bounds rules. */
+static void test_walkers(void)
+{
+    /* EBML: a 2-byte ID, a known size, then one of unknown size, then one past its parent. */
+    static const uint8_t ebml[] = { 0x42, 0x86, 0x81, 0x07, 0x42, 0x87, 0xFF, 0x01, 0x02 };
+    static const uint8_t cut[] = { 0x42, 0x86, 0x85, 0x01, 0x02 };
+    /* Boxes: 'free' of 12, a 64-bit 'skip' of 16, size 0 to the end. */
+    static const uint8_t boxes[] = { 0, 0, 0, 12, 'f', 'r', 'e', 'e', 1, 2, 3, 4,
+                                     0, 0, 0, 1, 's', 'k', 'i', 'p', 0, 0, 0, 0, 0, 0, 0, 16,
+                                     0, 0, 0, 0, 'm', 'd', 'a', 't', 9, 9 };
+    static const uint8_t box64_small[] = { 0, 0, 0, 1, 'f', 'r', 'e', 'e', 0, 0, 0, 0, 0, 0, 0, 8 };
+    uint8_t adts[9] = { 0xFF, 0xF1, 0x50, 0x80, 0, 0, 0xFC, 0, 0 };
+    const uint8_t* cur;
+    fa_ebml_el e;
+    fa_mp4_box b;
+    fa_adts_header h;
+    uint32_t id;
+    int64_t size;
+
+    CHECK_EQ(fa_ebml_vint_len(0x80), 1);
+    CHECK_EQ(fa_ebml_vint_len(0x01), 8);
+    CHECK_EQ(fa_ebml_vint_len(0x00), 9);
+    CHECK_EQ(fa_ebml_header(ebml + 4, 3, &id, &size), 3);
+    CHECK(id == 0x4287 && size == -1);
+    cur = ebml;
+    CHECK(fa_ebml_next(&cur, ebml + sizeof(ebml), &e));
+    CHECK(e.id == 0x4286 && e.len == 1 && fa_ebml_uint(&e) == 7);
+    CHECK(fa_ebml_next(&cur, ebml + sizeof(ebml), &e));   /* unknown size: to the end */
+    CHECK(e.id == 0x4287 && e.len == 2 && cur == ebml + sizeof(ebml));
+    CHECK(!fa_ebml_next(&cur, ebml + sizeof(ebml), &e));
+    cur = cut;
+    CHECK(fa_ebml_next(&cur, cut + sizeof(cut), &e));     /* past its parent: cut to it */
+    CHECK(e.len == 2 && cur == cut + sizeof(cut));
+
+    cur = boxes;
+    CHECK(fa_mp4_next_box(&cur, boxes + sizeof(boxes), &b));
+    CHECK(b.type == FA_FOURCC('f', 'r', 'e', 'e') && b.len == 4);
+    CHECK(fa_mp4_next_box(&cur, boxes + sizeof(boxes), &b));
+    CHECK(b.type == FA_FOURCC('s', 'k', 'i', 'p') && b.len == 0);
+    CHECK(fa_mp4_next_box(&cur, boxes + sizeof(boxes), &b));
+    CHECK(b.type == FA_FOURCC('m', 'd', 'a', 't') && b.len == 2 && cur == boxes + sizeof(boxes));
+    cur = box64_small;                                     /* a 64-bit size under 16 */
+    CHECK(!fa_mp4_next_box(&cur, box64_small + sizeof(box64_small), &b));
+
+    /* ADTS: LC 44.1 kHz stereo, 20 bytes, no CRC; then with a CRC. */
+    adts[4] = (uint8_t)(20 >> 3);
+    adts[5] = (uint8_t)((20 & 7) << 5) | 0x1F;
+    CHECK(fa_adts_parse(adts, 7, &h));
+    CHECK(h.len == 20 && h.header == 7 && h.profile == 1 && h.rate_index == 4 && h.config == 2 && h.blocks == 1);
+    adts[1] = 0xF0;
+    CHECK(fa_adts_parse(adts, 7, &h) && h.header == 9 && h.crc);
+    adts[4] = 0;
+    adts[5] = (uint8_t)(8 << 5);                           /* shorter than its header */
+    CHECK(!fa_adts_parse(adts, 7, &h));
+    CHECK(!fa_adts_parse(adts, 6, &h));
+}
+
 static void test_os_codec_helpers(void)
 {
     static const uint8_t lc[2] = { 0x12, 0x10 };   /* LC, 44.1 kHz, stereo */
     /* LC 22.05 kHz stereo, then the sync extension: SBR at 44.1 kHz and PS. */
     static const uint8_t ext[7] = { 0x13, 0x90, 0x56, 0xE5, 0xA5, 0x48, 0x80 };
     static const uint8_t ext_off[5] = { 0x13, 0x90, 0x56, 0xE5, 0x00 };   /* SBR signalled absent */
-    uint8_t asc[FA_AAC_ASC_MAX + 8], esds[64], adts[64], alac[48];
+    uint8_t asc[FA_AAC_ASC_MAX + 8], esds[64], alac[48];
     fa_aac_asc_info info;
     fa_codec_params p;
     fa_alac_info a;
-    const uint8_t* d;
     size_t n, m;
     uint32_t map[8];
 
@@ -1123,26 +1180,12 @@ static void test_os_codec_helpers(void)
     CHECK_EQ(fa_aac_config_channels(6), 6);
     CHECK_EQ(fa_aac_config_channels(7), 8);
 
-    /* ADTS frames (no extradata): LC from the header's rate and channels, or at low
-     * rates HE-AAC (HE-AAC v2 for mono) for decoders that do not find SBR alone. */
+    /* No extradata (ADTS frames, which the built-in decoder always takes): none. */
     fa_codec_params_init(&p);
     p.codec = "aac";
     p.sample_rate = 44100;
     p.channels = 2;
-    n = fa_aac_os_asc(&p, 1, asc, sizeof(asc));
-    CHECK(n == 2 && memcmp(asc, lc, 2) == 0);
-    p.sample_rate = 24000;
-    p.channels = 1;
-    n = fa_aac_os_asc(&p, 1, asc, sizeof(asc));
-    CHECK(n > 0 && fa_aac_parse_asc(asc, n, &info));
-    CHECK_EQ(info.sbr, 1);
-    CHECK_EQ(info.ps, 1);
-    CHECK_EQ(info.rate, 24000);
-    CHECK_EQ(info.ext_rate, 48000);
-    CHECK_EQ(info.channel_config, 1);
-    n = fa_aac_os_asc(&p, 0, asc, sizeof(asc));
-    CHECK(n > 0 && fa_aac_parse_asc(asc, n, &info));
-    CHECK_EQ(info.sbr, -1);
+    CHECK_EQ(fa_aac_os_asc(&p, 1, asc, sizeof(asc)), 0);
     p.extradata = ext;                               /* the stream's own config wins */
     p.extradata_size = sizeof(ext);
     n = fa_aac_os_asc(&p, 1, asc, sizeof(asc));
@@ -1173,28 +1216,6 @@ static void test_os_codec_helpers(void)
     CHECK(esds[26] == 0x05 && esds[30] == 2 && esds[31] == 0x12 && esds[32] == 0x10);
     CHECK(esds[33] == 0x06 && esds[37] == 1 && esds[38] == 0x02);
     CHECK_EQ(fa_aac_esds(lc, 2, esds, 38), 0);
-
-    /* ADTS headers: 7 bytes, 9 with a CRC; several raw blocks are refused. */
-    memset(adts, 0x55, sizeof(adts));
-    adts[0] = 0xFF; adts[1] = 0xF1; adts[2] = 0x50; adts[3] = 0x80;
-    adts[4] = (uint8_t)(20 >> 3); adts[5] = (uint8_t)((20 & 7) << 5) | 0x1F; adts[6] = 0xFC;
-    d = adts; m = 20;
-    CHECK_EQ(fa_adts_strip(&d, &m), 1);
-    CHECK(d == adts + 7 && m == 13);
-    adts[1] = 0xF0;
-    d = adts; m = 20;
-    CHECK_EQ(fa_adts_strip(&d, &m), 1);
-    CHECK(d == adts + 9 && m == 11);
-    adts[1] = 0xF1;
-    adts[6] = 0xFD;
-    d = adts; m = 20;
-    CHECK_EQ(fa_adts_strip(&d, &m), -1);
-    adts[6] = 0xFC;
-    d = adts; m = 21;                                /* the length does not match */
-    CHECK_EQ(fa_adts_strip(&d, &m), 0);
-    CHECK(d == adts && m == 21);
-    d = lc; m = 2;
-    CHECK_EQ(fa_adts_strip(&d, &m), 0);
 
     /* ALAC: the bare config, the 'alac' box, and Core Audio's cookie with 'frma'. */
     memset(alac, 0, sizeof(alac));
@@ -1958,6 +1979,7 @@ int main(void)
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) { fprintf(stderr, "engine create failed\n"); return 1; }
 
     RUN(test_aac_config_explicit_rates);
+    RUN(test_walkers);
     RUN(test_os_codec_helpers);
     RUN(test_registry_lists_containers);
     RUN(test_mp4_info_and_tracks);
