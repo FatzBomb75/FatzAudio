@@ -90,6 +90,7 @@ set(FA_SOURCES
     src/dls.c
     src/sf3.c
     src/midi_fx.c
+    src/midi_var.c
     src/tinysoundfont_impl.c
     src/mdct.c
     src/push.c

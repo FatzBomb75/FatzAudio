@@ -289,27 +289,60 @@ fa_result fa_dls_to_sf2(const uint8_t* data, size_t size, uint8_t** out_sf2, siz
 int fa_sf3_probe(const uint8_t* data, size_t size);
 fa_result fa_sf3_to_sf2(const uint8_t* data, size_t size, uint8_t** out_sf2, size_t* out_size);
 
-/* MIDI reverb and chorus (src/midi_fx.c), stereo at the stream's rate: process
- * adds the effects of the two send buses (interleaved, `frames` each) to `out`;
- * `song_frame` is the song position of the first frame (the chorus LFO follows
- * it). Reset clears the tails (a seek). */
+/* MIDI reverb, chorus and the third effect (GS delay / XG variation; src/midi_fx.c),
+ * stereo at the stream's rate: process adds the effects of the send buses
+ * (interleaved, `frames` each; var_in may be NULL) to `out`; `song_frame` is the song
+ * position of the first frame (the LFOs follow it). Reset clears the tails (a seek). */
 typedef struct fa_midi_fx fa_midi_fx;
 fa_midi_fx* fa_midi_fx_new(uint32_t rate);
 void fa_midi_fx_free(fa_midi_fx* fx);
 void fa_midi_fx_reset(fa_midi_fx* fx);
-void fa_midi_fx_process(fa_midi_fx* fx, const float* reverb_in, const float* chorus_in, float* out, int frames, fa_frames song_frame);
+void fa_midi_fx_process(fa_midi_fx* fx, const float* reverb_in, const float* chorus_in, const float* var_in, float* out, int frames, fa_frames song_frame);
+/* Where the third effect's input comes from now: -2 nowhere (no third effect), -1 the
+ * CC94 send bus, 0-15 that MIDI part's whole sound (XG insertion). */
+int fa_midi_fx_route(const fa_midi_fx* fx);
+/* XG insertion: the part's dry sound `in` through the variation, mixed by its dry/wet
+ * setting, added to `out` and, at the part's sends rs and cs, to the reverb and chorus
+ * buses (before process). Nothing when the route is not a part. */
+void fa_midi_fx_insert(fa_midi_fx* fx, const float* in, float* out, float* reverb, float* chorus, float rs, float cs, int frames, fa_frames song_frame);
+/* The chorus alone (the XG variation's chorus types). */
+void fa_midi_fx_chorus(fa_midi_fx* fx, const float* in, float* out, int frames, fa_frames song_frame);
 /* The reverb alone, with its own tuning (the DJ mixer's mic reverb): room is the comb
  * feedback (0.7..0.98), damp the lowpass in it (0..0.4), then the input and wet gains.
  * Call set_reverb on the thread that processes; it takes effect at once. */
 void fa_midi_fx_set_reverb(fa_midi_fx* fx, float room, float damp, float in_gain, float wet);
 void fa_midi_fx_reverb(fa_midi_fx* fx, const float* in, float* out, int frames);
 /* GS and XG effect SysEx (dec_midi.c, on the thread that processes): defaults puts
- * back the reverb and chorus every reset gives; gs takes Roland's 40 01 `addr`
- * (reverb 30-35, chorus 38-3E), xg Yamaha's 02 01 `addr` (reverb 00-0C, chorus
- * 20-2C), one data byte each. Others are ignored. */
-void fa_midi_fx_defaults(fa_midi_fx* fx);
+ * back the effects a GM, GS or XG reset gives (GS: the SC-88 delay, XG: the variation
+ * effect, GM: neither); gs takes Roland's 40 01 `addr` (reverb 30-37, chorus 38-40,
+ * delay 50-5A), xg Yamaha's 02 01 `addr` (reverb 00-0C, chorus 20-2E, variation 40-5B
+ * and 70-75), one data byte each. Others are ignored. */
+enum { FA_MIDI_FX_GM, FA_MIDI_FX_GS, FA_MIDI_FX_XG };
+void fa_midi_fx_defaults(fa_midi_fx* fx, int mode);
 void fa_midi_fx_gs(fa_midi_fx* fx, int addr, int value);
 void fa_midi_fx_xg(fa_midi_fx* fx, int addr, int value);
+/* The third effect itself (src/midi_var.c). set_type takes an XG variation type
+ * (MSB, LSB) with its default parameters and returns whether it is one we play;
+ * set_param sets parameter index (0-15) from a byte: `part` 1 its MSB, 2 its LSB, 0
+ * the whole (one-byte) value. gs takes GS delay SysEx 40 01 50-5A (and becomes the
+ * GS delay), gs_get reads one back (level 58, send to reverb 5A). process writes the
+ * wet sound to `wet` and returns 1, or returns 0 when there is none (wet untouched). */
+typedef struct fa_midi_var fa_midi_var;
+fa_midi_var* fa_midi_var_new(uint32_t rate);
+void fa_midi_var_free(fa_midi_var* v);
+void fa_midi_var_reset(fa_midi_var* v);
+int fa_midi_var_set_type(fa_midi_var* v, int msb, int lsb);
+void fa_midi_var_set_param(fa_midi_var* v, int index, int value, int part);
+int fa_midi_var_dry_wet(const fa_midi_var* v);
+void fa_midi_var_gs(fa_midi_var* v, int addr, int value);
+int fa_midi_var_gs_get(const fa_midi_var* v, int addr);
+int fa_midi_var_process(fa_midi_var* v, const float* in, float* wet, int frames, fa_frames song_frame);
+/* XG parameter tables: LFO frequency (Hz), modulation delay offset and depth (ms),
+ * feedback level (1-127 as -0.98..0.98). */
+double fa_xg_lfo_hz(int v);
+double fa_xg_mod_delay_ms(int v);
+double fa_xg_mod_depth_ms(int v);
+float fa_xg_feedback(int v);
 struct fa_soundfont* fa_soundfont_retain(struct fa_soundfont* f);
 void fa_soundfont_release(struct fa_soundfont* f);
 /* A fingerprint of the soundfont's content, for the loudness cache. */
@@ -1068,6 +1101,8 @@ fa_result fa_eq_check_bands(const fa_eq_band* bands, uint32_t count);
 void fa_eq_shared_set(fa_eq_shared* sh, const fa_eq_band* bands, uint32_t count);
 uint32_t fa_eq_shared_get(fa_eq_shared* sh, fa_eq_band* out_bands, uint32_t capacity);
 void fa_eq_reset(fa_eq_state* st);
+/* RBJ coefficients for a band's type, f, q and g (the MIDI variation effect's EQs use it too). */
+void fa_eq_design(fa_eq_bandstate* b, uint32_t rate);
 /* Start of a mix: takes new bands; `restart` clears the filter memory (the audio
  * does not continue the last mix). Returns 0 when the EQ is flat (skip it). */
 int fa_eq_begin(fa_eq_state* st, fa_eq_shared* sh, uint32_t rate, int restart);

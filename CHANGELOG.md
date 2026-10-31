@@ -18,6 +18,16 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- MIDI GS/XG effects A (extras step 6): the GS reverb pre-delay (`40 01 37`), chorus send to reverb (GS `3F`, XG `2E`)
+  and to delay (`40`), the SC-88 delay (`40 01 50`-`5A`: macros, three taps, feedback, send to reverb) with CC94 and the
+  part delay send as its send, the XG chorus's LFO frequency, depth, feedback and delay offset (`02 01 22`-`25`), and the
+  XG variation effect (`02 01 40`-`5B`, `70`-`75`) in system mode (CC94, part variation send) and insertion mode (one
+  part's whole sound): reverb, delay, echo, cross delay, karaoke, early reflection and gate, chorus, celeste, flanger,
+  symphonic, rotary, tremolo, auto pan, phaser, distortion, overdrive, amp simulator, 3- and 2-band EQ and auto wah
+  types. Drum keys' delay/variation sends (GS map `9`, XG setup `07`, NRPN `1F`). In GM files CC94 still does nothing.
+  Files without these messages (and without CC94 after a GS reset) render bit for bit as before. New internal file
+  `src/midi_var.c`. See [docs/features/midi.md](docs/features/midi.md#delay-gs-and-variation-xg).
+
 - MIDI scale tuning and drum setup: GS (`40 1x 40`-`4B`) and XG (`08 nn 41`-`4C`) scale tuning, GS drum map edits
   (`41 mp rr`), XG drum setups (`3n rr pp`, and the drum setup reset) and the GS/XG drum NRPNs (MSB 14-1E) set each drum
   key's pitch, level, pan, effect sends, exclusive group, note-off and note-on reception, filter and envelope. GS drum

@@ -341,6 +341,11 @@ if(UNIX)
 endif()
 add_test(NAME midi_drums COMMAND fa_test_midi_drums)
 
+# White-box (the effect blocks) and whole songs: GS delay, XG chorus parameters and variation.
+add_executable(fa_test_midi_fx test_midi_fx.c)
+target_compile_options(fa_test_midi_fx PRIVATE ${FA_WARNINGS})
+add_test(NAME midi_fx COMMAND fa_test_midi_fx)
+
 # White-box: it plays the audio thread itself for FA_EVENT_TRACKER_ROW.
 add_executable(fa_test_tracker test_tracker.c)
 target_include_directories(fa_test_tracker PRIVATE
@@ -418,7 +423,7 @@ add_subdirectory(fuzz)
 foreach(t fa_test_internal fa_test_loudness fa_test_crossfade fa_test_handoff fa_test_demux
           fa_test_dolby fa_test_aac fa_test_net fa_test_cdg fa_test_disc fa_test_tempo fa_test_ogg
           fa_test_encode fa_test_midi fa_test_tracker fa_test_flac fa_test_asf fa_test_tags fa_test_font
-          fa_test_lyric fa_test_mixer fa_test_sync fa_test_mic fa_test_device)
+          fa_test_lyric fa_test_mixer fa_test_sync fa_test_mic fa_test_device fa_test_midi_fx)
     target_link_libraries(${t} PRIVATE fa_whitebox)
     # The same static C runtime as those libraries: libopenmpt is C++, and MSVC
     # refuses to link C++ objects built for different runtimes.
