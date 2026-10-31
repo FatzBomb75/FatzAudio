@@ -73,7 +73,7 @@ using var track = engine.OpenDisc(disc, 1);
 track.PlayOn(output);
 ```
 
-Other members: `disc.Status` (`State`, `Locked`, `ChangeCount`), `disc.Eject()`, `disc.Load()`, `disc.Locked`, `disc.Speed`, `DiscOptions` (`ReadOffset`, `Retries`, `DeEmphasis`, `UseC2`), `toc[number]`, `toc.FreedbId`, `toc.FreedbQuery`.
+Other members: `disc.Status` (`State`, `Locked`, `ChangeCount`), `disc.GetPregap(track)`, `disc.Eject()`, `disc.Load()`, `disc.Locked`, `disc.Speed`, `DiscOptions` (`ReadOffset`, `Retries`, `DeEmphasis`, `UseC2`), `toc[number]`, `toc.FreedbId`, `toc.FreedbQuery`.
 
 ## Drives
 
@@ -93,6 +93,23 @@ A disc track stream belongs to the disc it was opened on. When the disc is taken
 `fa_disc_toc` lists every track with its number, start, length in sectors, frames and time, and its flags: `is_audio` (data tracks of Enhanced CDs cannot be played), `preemphasis`, `copy_permitted`, `four_channel`. 75 sectors make a second; a sector holds 588 stereo frames (`FA_DISC_SECTOR_FRAMES`).
 
 On an Enhanced CD (audio session, then a data session) the last audio track ends before the gap between the sessions, so its length is the real one.
+
+### Pregaps
+
+Many discs have a pause before a track (its pregap, index 0 on the disc; 2 seconds is common), and some put a count-in or a hidden intro there. A track's start in the TOC is where it really starts (index 1), so its stream does not play its pregap: the pregap is the end of the track before, and the TOC counts it in that track's length, as players and rippers do. `fa_disc_get_pregap(disc, track, &sectors)` (.NET `disc.GetPregap(track)`) gives its length in sectors, 0 for a track that starts right after the one before. A player that shows a count-down into the next track, or skips the pause between songs, uses it:
+
+```c
+int64_t gap;
+if (fa_disc_get_pregap(disc, 5, &gap) == FA_OK && gap > 0) {
+    /* Track 4 ends with track 5's pause: stop track 4 that much early to skip it. */
+    fa_time pause = gap * 1000000000LL / 75;
+}
+```
+
+- **Disc images** answer from the cue sheet: `INDEX 00` before `INDEX 01`, plus any `PREGAP` (silence that is not in the file). No disc access.
+- **Drives** answer from the Q subcode, which says on every sector which track and index it belongs to: FatzAudio reads a few single sectors before the track (the usual 2 s gap is confirmed with 3-4 reads, other lengths are found by halving the range, some 10-20 reads), once per track; the answer is kept until the disc changes. Sectors whose subcode cannot be read are stepped over. `FA_ERROR_NOT_IMPLEMENTED` from a drive that returns no subcode.
+- **The first track** counts from sector 0: its pregap is its start sector (usually 0; more on a disc with a hidden track before track 1). The 2 seconds before sector 0 that every disc has are not counted, since no drive reads them.
+- Data tracks give `FA_ERROR_UNSUPPORTED_FORMAT`.
 
 | Field | Use |
 |---|---|
@@ -146,7 +163,8 @@ song.PlayOn(output);
 ```
 
 - **When the graphics appear.** Whether a track carries graphics is only known once its subcode is read, so `has_cdg` (`HasCdg`) turns 1 within the first second or so of play (karaoke tracks start with a screen clear). Create the surface right away: it stays blank until then. A track without graphics never gets them, and FatzAudio stops reading its subcode after 90 seconds of finding nothing.
-- **Seeking.** The graphics are read as the audio is. After a seek forward, the part skipped over is read when it plays; until then the picture shows what was drawn before it (the next full-screen redraw of the song puts it right).
+- **Seeking.** The graphics are read as the audio is. After a seek forward, the part skipped over is read when it plays; until then the picture shows what was drawn before it (the next full-screen redraw of the song puts it right). A seek before the graphics were found keeps what was read so far: once they are found, the part played before the seek has its graphics without being read again. When a part is read again with different packs (a gap filled in), the seek checkpoints after it are redone at once, so a jump there still replays at most 10 s.
+- **Scratches.** Each pack carries Reed-Solomon parity. A pack with one or two damaged symbols is repaired from it, and one with more is dropped instead of drawing garbage tiles; `fa_stream_get_cdg_info` counts both (`disc_corrected`, `disc_dropped`; .NET `CdgInfo.DiscCorrected`, `DiscDropped`). See [CD+G](cdg.md#graphics-info).
 - **Drives.** Drives deliver the subcode in different layouts (raw and interleaved, or already sorted); FatzAudio tells them apart from the packs' parity and handles all of them. A drive that cannot read subcode with audio plays the audio without graphics. `FA_DISC_NO_CDG` (`DiscOptions.ReadCdg = false`) skips the subcode, for a drive that reads it slowly.
 - **Disc images.** A `.sub` file beside an image file (`album.bin` + `album.sub`, 96 bytes per sector, as CD+G rippers write it) supplies the subcode, with the 96 bytes as read from a drive or with the channels one after another.
 - **Timing.** `fa_stream_set_cdg_offset` works as for files, for a drive whose subcode runs early or late against its audio.

@@ -171,7 +171,7 @@ static void mac_close(void* h)
 
 static const fa_disc_ops mac_ops = {
     mac_inquiry, mac_test_ready, mac_read_toc, mac_read_cd, mac_read_code,
-    mac_set_speed, mac_get_speed, mac_tray, NULL, mac_close
+    mac_set_speed, mac_get_speed, mac_tray, NULL, mac_close, NULL
 };
 
 uint32_t fa_disc_platform_list(char (*ids)[256], uint32_t cap)

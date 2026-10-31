@@ -572,6 +572,9 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_disc_get_text(DiscHandle disc, int track, int field, byte* text, nuint size);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_disc_get_pregap(DiscHandle disc, int track, out long sectors);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_disc_eject(DiscHandle disc);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

@@ -16,7 +16,19 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ## Unreleased
 
+### Breaking
+
+- `fa_cdg_info` gained `disc_corrected` and `disc_dropped` at its end (it has no `struct_size`): rebuild against the new
+  header. .NET `CdgInfo` gained the two matching positional parameters.
+
 ### Added
+
+- Disc and CD+G (extras step 19): `fa_disc_get_pregap` (.NET `Disc.GetPregap`, basscd's `BASS_CD_GetTrackPregap`)
+  gives a track's pregap in sectors, from the cue sheet (`INDEX 00`, `PREGAP`) or from a drive's Q subcode. CD+G packs
+  read from a disc with two damaged symbols are now repaired as well as those with one (three or more are still
+  dropped), and `fa_cdg_info.disc_corrected` / `disc_dropped` count them. A seek before a disc track's graphics were
+  found keeps the subcode read so far, and a part read again with different packs redoes the seek checkpoints after it
+  at once instead of 10 s per write. See [docs/features/disc.md](docs/features/disc.md#pregaps).
 
 - Web streams: MP4 and Matroska files over the network read only what they need. A fragmented MP4 with a `sidx` (or an
   `mfra` at the end) reads its fragments as playback or a seek reaches them instead of every fragment at open, and
@@ -238,6 +250,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
 ### Changed
+
+- CD+G presentation scaling with smooth-scroll offsets: the picture is smoothed, edge-blended and given its effects
+  as shown, with the picture area moved, so the seam where it meets the border is drawn against its real neighbours and
+  a transparent border stays transparent under the effects. The classic picture maps tiles drawn while the offsets are
+  set to the area they show in instead of redrawing the whole surface. Songs without the offsets draw the same pixels
+  as before.
 
 - Chained Ogg files (several songs one after another) find where each song ends by bisection on the serial numbers,
   as vorbisfile does, instead of reading every page: an hour of 20 songs opens in about 6 ms instead of 41 ms. Links,
