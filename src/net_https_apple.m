@@ -305,7 +305,12 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
                         continue;    /* its body is read to the end, so the connection can be kept */
                     }
                     fa_http_fill_lengths(&fr);
-                    unframed = fa_http_unframed(fr.headers);
+                    /* URLSession accepts a chunked body the server closes before its last
+                     * chunk, so a body without a Content-Length may have been cut either way. */
+                    {
+                        char v[64];
+                        unframed = !fa_http_header(fr.headers, "Content-Length", v, sizeof(v));
+                    }
                     pthread_mutex_unlock(&d->mutex);
                     stop = on_head ? on_head(user, &fr) : 0;
                     free(headers);
@@ -333,7 +338,7 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
             }
             if (d->done) {
                 r = d->error && !redirect ? FA_ERROR_NETWORK : FA_OK;
-                /* A short body or a chunked one without its end is an error above. */
+                /* A short body is an error above; one without a length may have been cut. */
                 if (r == FA_OK && !redirect && req->closed_end && unframed && !d->multiplexed) *req->closed_end = 1;
                 break;
             }

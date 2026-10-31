@@ -2455,7 +2455,8 @@ static void test_https_hls_optional(void)
 /* Through the system's TLS stack, against serve.py (FA_NET_HTTPS_ECHO_URL): how a
  * body ended. One with a length or chunked framing is complete (never "closed"); one
  * without either that the server closes is reported as such (or as a network error:
- * a reconnect either way); a chunked one cut before its last chunk is an error. And
+ * a reconnect either way); a chunked one cut before its last chunk is an error (on
+ * Apple, where URLSession doesn't report that, every chunked body counts as closed). And
  * an HLS stream behind cookies: the master playlist's two cookies (URLSession joins
  * them into one header) come back on the media playlist and the segments. */
 static void test_https_framing_optional(void)
@@ -2479,14 +2480,26 @@ static void test_https_framing_optional(void)
         req.closed_end = &closed;
         r = fa_http_fetch(&req, cf_head, cf_data, &c);
         printf("  %s: result %d, %zu bytes, closed_end %d\n", framing[i], (int)r, c.body.n, closed);
-        if (i < 2) {
+        if (i == 0) {
             CHECK_EQ(r, FA_OK);
             CHECK_EQ(c.body.n, 20000);
             CHECK_EQ(closed, 0);
+        } else if (i == 1) {
+            CHECK_EQ(r, FA_OK);
+            CHECK_EQ(c.body.n, 20000);
+#ifdef __APPLE__
+            CHECK_EQ(closed, 1);    /* URLSession can't tell a whole chunked body from a cut one */
+#else
+            CHECK_EQ(closed, 0);
+#endif
         } else if (i == 2) {
             CHECK((r == FA_OK && closed == 1 && c.body.n == 20000) || r == FA_ERROR_NETWORK);
         } else {
+#ifdef __APPLE__
+            CHECK((r == FA_OK && closed == 1) || r == FA_ERROR_NETWORK);
+#else
             CHECK_EQ(r, FA_ERROR_NETWORK);
+#endif
         }
         free(c.body.p);
     }
