@@ -248,12 +248,12 @@ static void notification_callback(const ma_device_notification* n)
         fa_store32(&dev->lost, 0);
         fa_store32(&dev->rerouted, 1);
         fa_store32(&dev->changed, 1);
-        fa_cond_broadcast(&dev->engine->event_cond);
+        fa_wake_signal(&dev->engine->event_wake);
     } else if (n->type == ma_device_notification_type_stopped && fa_load32(&dev->want_started)) {
         /* Stopped without fa_device_stop: unplugged or disabled. */
         fa_store64(&dev->lost_at, fa_monotonic_ns());
         fa_store32(&dev->lost, 1);
-        fa_cond_broadcast(&dev->engine->event_cond);
+        fa_wake_signal(&dev->engine->event_wake);
     }
 }
 
@@ -366,7 +366,7 @@ fa_result fa_device_reopen_mode(fa_device* d, fa_latency_mode mode, void (*betwe
         /* Gone meanwhile: the event thread reopens it on the default, as after a loss. */
         fa_store64(&d->lost_at, fa_monotonic_ns());
         fa_store32(&d->lost, 1);
-        fa_cond_broadcast(&d->engine->event_cond);
+        fa_wake_signal(&d->engine->event_wake);
     } else {
         fa_store32(&d->lost, 0);   /* open again: a loss before the switch is over */
     }
@@ -391,10 +391,32 @@ static int wants_service(fa_device* d, int64_t now)
     return needs_service(d, now) || fa_load32(&d->mixer_events) || tick_due(d, now);
 }
 
-/* Event thread (it looks every few milliseconds). */
-void fa_devices_service(fa_engine* e)
+/* Caller holds list_lock: the monotonic time the event thread next has timed work
+ * for (a mixer tick, a reopen try after a loss), INT64_MAX for none. */
+int64_t fa_devices_next_due_locked(fa_engine* e)
+{
+    fa_device* d;
+    int64_t due = INT64_MAX;
+    for (d = e->devices; d; d = d->next) {
+        int64_t t = fa_load64(&d->mixer_tick_at);
+        if (t != 0 && t < due) due = t;
+        if (fa_load32(&d->rerouted) || fa_load32(&d->mixer_events)) return 0;
+        if (fa_load32(&d->lost)) {
+            t = fa_load64(&d->lost_at) + FA_REROUTE_GRACE_NS;
+            if (d->retry_at > t) t = d->retry_at;
+            if (t < due) due = t;
+        }
+    }
+    return due;
+}
+
+/* Event thread: when woken, and at fa_devices_next_due_locked. Returns 1 when a
+ * device that wants service was skipped (its life_lock is held: a close or a mode
+ * switch), so the caller waits a little instead of spinning on its due time. */
+int fa_devices_service(fa_engine* e)
 {
     int64_t now = fa_monotonic_ns();
+    int busy = 0;
     for (;;) {
         fa_device* d;
         fa_device* pick = NULL;
@@ -402,9 +424,12 @@ void fa_devices_service(fa_engine* e)
         struct fa_mixer* mixer = NULL;
         for (d = e->devices; d; d = d->next)
             /* Only tried: fa_device_close holds it while it takes the device away. */
-            if (wants_service(d, now) && fa_mutex_trylock(&d->life_lock)) { pick = d; break; }
+            if (wants_service(d, now)) {
+                if (fa_mutex_trylock(&d->life_lock)) { pick = d; break; }
+                busy = 1;
+            }
         fa_mutex_unlock(&e->list_lock);
-        if (!pick) return;
+        if (!pick) return busy;
         {
             int64_t t = fa_load64(&pick->mixer_tick_at);
             /* A wake set meanwhile for later stays (the CAS fails, and it is not due yet). */

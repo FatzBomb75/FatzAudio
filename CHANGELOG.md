@@ -327,6 +327,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Idle threads sleep instead of polling every 5 ms: the event thread and encoders recording a device, a stream or a
+  DJ mixer are woken by the audio thread through a lock-free wake-up (a futex on Linux and Android, a dispatch
+  semaphore on Apple, an event on Windows). Events are delivered as soon as they are raised; a recording encoder wakes
+  once per 4096 queued frames (about 12 times a second) instead of 200. Fewer wake-ups save battery on phones.
+- Smaller libraries: Linux Release builds use link-time optimization (`FA_LTO`, 4.33 to 4.15 MiB), and MSVC builds
+  compile with `/Gw`. LTO is off by default on Windows (a much slower build), Apple and Android (larger there).
 - CD+G presentation scaling with smooth-scroll offsets: the picture is smoothed, edge-blended and given its effects
   as shown, with the picture area moved, so the seam where it meets the border is drawn against its real neighbours and
   a transparent border stays transparent under the effects. The classic picture maps tiles drawn while the offsets are

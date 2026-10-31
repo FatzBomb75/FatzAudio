@@ -930,7 +930,7 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
     fa_mutex_lock(&e->list_lock);
     stream->next = e->graveyard;
     e->graveyard = stream;
-    fa_cond_broadcast(&e->event_cond);
+    fa_wake_signal(&e->event_wake);
     fa_mutex_unlock(&e->list_lock);
 }
 

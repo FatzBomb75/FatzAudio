@@ -50,6 +50,18 @@ void fa_cond_wait_ms(fa_cond* c, fa_mutex* m, uint32_t timeout_ms)
 void fa_cond_broadcast(fa_cond* c) { WakeAllConditionVariable((CONDITION_VARIABLE*)c->impl); }
 void fa_cond_signal(fa_cond* c) { WakeConditionVariable((CONDITION_VARIABLE*)c->impl); }
 
+static int wake_os_init(fa_wake* w)
+{
+    w->impl = CreateEventW(NULL, FALSE, FALSE, NULL);   /* auto-reset: keeps one signal */
+    return w->impl ? 0 : -1;
+}
+static void wake_os_destroy(fa_wake* w) { CloseHandle((HANDLE)w->impl); }
+static void wake_os_post(fa_wake* w) { SetEvent((HANDLE)w->impl); }
+static void wake_os_wait(fa_wake* w, uint32_t timeout_ms)
+{
+    WaitForSingleObject((HANDLE)w->impl, timeout_ms == UINT32_MAX ? INFINITE : timeout_ms);
+}
+
 typedef struct { fa_thread_proc proc; void* arg; } thread_start;
 
 static DWORD WINAPI thread_main(LPVOID p)
@@ -223,6 +235,14 @@ int64_t fa_monotonic_ns(void)
 #  include <sys/stat.h>
 #  include <sys/types.h>
 #  include <dirent.h>
+#  if defined(__linux__) || defined(__ANDROID__)
+#    include <linux/futex.h>
+#    include <sys/syscall.h>
+#  elif defined(__APPLE__)
+#    include <dispatch/dispatch.h>
+#  else
+#    include <semaphore.h>
+#  endif
 
 int fa_mutex_init(fa_mutex* m)
 {
@@ -294,6 +314,61 @@ void fa_cond_wait_ms(fa_cond* c, fa_mutex* m, uint32_t timeout_ms)
 void fa_cond_broadcast(fa_cond* c) { pthread_cond_broadcast((pthread_cond_t*)c->impl); }
 void fa_cond_signal(fa_cond* c) { pthread_cond_signal((pthread_cond_t*)c->impl); }
 
+#  if defined(__linux__) || defined(__ANDROID__)
+/* A futex on `state` itself: nothing to create. FUTEX_WAIT returns at once when the
+ * state is no longer "asleep", and its relative timeout runs on the monotonic clock. */
+static int wake_os_init(fa_wake* w) { w->impl = w; return 0; }
+static void wake_os_destroy(fa_wake* w) { (void)w; }
+static void wake_os_post(fa_wake* w)
+{
+    syscall(SYS_futex, (int32_t*)&w->state.v, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+}
+static void wake_os_wait(fa_wake* w, uint32_t timeout_ms)
+{
+    struct timespec ts;
+    ts.tv_sec = timeout_ms / 1000;
+    ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
+    syscall(SYS_futex, (int32_t*)&w->state.v, FUTEX_WAIT_PRIVATE, 2, timeout_ms == UINT32_MAX ? NULL : &ts, NULL, 0);
+}
+#  elif defined(__APPLE__)
+static int wake_os_init(fa_wake* w)
+{
+    w->impl = (void*)dispatch_semaphore_create(0);
+    return w->impl ? 0 : -1;
+}
+static void wake_os_destroy(fa_wake* w) { dispatch_release((dispatch_semaphore_t)w->impl); }
+static void wake_os_post(fa_wake* w) { dispatch_semaphore_signal((dispatch_semaphore_t)w->impl); }
+static void wake_os_wait(fa_wake* w, uint32_t timeout_ms)
+{
+    dispatch_time_t t = timeout_ms == UINT32_MAX ? DISPATCH_TIME_FOREVER
+                                                 : dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeout_ms * 1000000);
+    dispatch_semaphore_wait((dispatch_semaphore_t)w->impl, t);
+}
+#  else
+/* Other POSIX systems: a semaphore (sem_post is async-signal-safe, so lock-free
+ * enough); its timed wait is on the wall clock, which only stretches a timeout. */
+static int wake_os_init(fa_wake* w)
+{
+    sem_t* sem = (sem_t*)malloc(sizeof(sem_t));
+    if (!sem) return -1;
+    if (sem_init(sem, 0, 0) != 0) { free(sem); return -1; }
+    w->impl = sem;
+    return 0;
+}
+static void wake_os_destroy(fa_wake* w) { sem_destroy((sem_t*)w->impl); free(w->impl); }
+static void wake_os_post(fa_wake* w) { sem_post((sem_t*)w->impl); }
+static void wake_os_wait(fa_wake* w, uint32_t timeout_ms)
+{
+    struct timespec ts;
+    if (timeout_ms == UINT32_MAX) { sem_wait((sem_t*)w->impl); return; }
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_ms / 1000;
+    ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    sem_timedwait((sem_t*)w->impl, &ts);
+}
+#  endif
+
 typedef struct { fa_thread_proc proc; void* arg; } thread_start;
 
 static void* thread_main(void* p)
@@ -350,6 +425,36 @@ int64_t fa_monotonic_ns(void)
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 #endif
+
+/* ---- fa_wake (both halves above give wake_os_*) ---- */
+
+int fa_wake_init(fa_wake* w)
+{
+    fa_store32(&w->state, 0);
+    w->impl = NULL;
+    return wake_os_init(w);
+}
+
+void fa_wake_destroy(fa_wake* w)
+{
+    if (!w->impl) return;
+    wake_os_destroy(w);
+    w->impl = NULL;
+}
+
+void fa_wake_signal(fa_wake* w)
+{
+    if (fa_exchange32(&w->state, 1) == 2) wake_os_post(w);   /* only a sleeper needs the system */
+}
+
+void fa_wake_wait_ms(fa_wake* w, uint32_t timeout_ms)
+{
+    if (fa_cas32(&w->state, 1, 0)) return;   /* signalled since the last wait */
+    /* Asleep from here: a signal now posts, and a futex wait finds the state changed. */
+    if (fa_cas32(&w->state, 0, 2)) wake_os_wait(w, timeout_ms);
+    fa_exchange32(&w->state, 0);   /* a signal from the meantime woke this wait: taken */
+}
+
 
 #if !defined(_WIN32)
 #  include <sys/stat.h>

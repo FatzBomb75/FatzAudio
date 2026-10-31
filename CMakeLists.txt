@@ -38,6 +38,16 @@ else()
 endif()
 option(FA_BUILD_TESTS "Build FatzAudio tests" ${FA_EXECUTABLES_DEFAULT})
 option(FA_BUILD_TOOLS "Build the listening and comparison tools (tools/)" ${FA_EXECUTABLES_DEFAULT})
+# Link-time optimization: on by default only where it was measured to shrink the
+# library without slowing the build much (extras step 21, PR 165: Linux x64 4.33 to
+# 4.15 MiB). MSVC's /GL took Windows from 4.24 to 4.02 MiB but its CI build from 5 to
+# 23 minutes; Apple's and the NDK's clang made macOS, iOS and three Android ABIs larger.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANDROID)
+    set(FA_LTO_DEFAULT ON)
+else()
+    set(FA_LTO_DEFAULT OFF)
+endif()
+option(FA_LTO "Link-time optimization of the library in Release and MinSizeRel builds" ${FA_LTO_DEFAULT})
 
 set(FA_SOURCES
     src/engine.c
@@ -219,6 +229,34 @@ endif()
 if(NOT MSVC AND NOT APPLE)
     foreach(t fatzaudio fa_opus fa_vorbis)
         target_compile_options(${t} PRIVATE -ffunction-sections -fdata-sections)
+    endforeach()
+endif()
+
+# Smaller release libraries: link-time optimization across our code and the vendored
+# codecs (Release and MinSizeRel only, so Debug, sanitizer and fuzz builds are as
+# before), and on MSVC a section per global variable (/Gw) so /OPT:REF can drop the
+# unused tables as it already drops unused functions.
+if(FA_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT fa_ipo_ok OUTPUT fa_ipo_why LANGUAGES C CXX)
+    if(fa_ipo_ok)
+        foreach(t fatzaudio fa_opus fa_vorbis fa_openmpt)
+            set_target_properties(${t} PROPERTIES
+                INTERPROCEDURAL_OPTIMIZATION_RELEASE ON
+                INTERPROCEDURAL_OPTIMIZATION_MINSIZEREL ON)
+        endforeach()
+        if(CMAKE_C_COMPILER_ID STREQUAL "GNU")
+            # GCC repeats at link time a warning miniaudio's MP3 decoder gets (iscf[] in
+            # L3_decode_scalefactors: indices stay below 40, a known false positive).
+            target_link_options(fatzaudio PRIVATE $<$<CONFIG:Release,MinSizeRel>:-Wno-stringop-overflow>)
+        endif()
+    else()
+        message(STATUS "FatzAudio: no link-time optimization (${fa_ipo_why})")
+    endif()
+endif()
+if(MSVC)
+    foreach(t fatzaudio fa_opus fa_vorbis fa_openmpt)
+        target_compile_options(${t} PRIVATE $<$<CONFIG:Release,MinSizeRel,RelWithDebInfo>:/Gw>)
     endforeach()
 endif()
 

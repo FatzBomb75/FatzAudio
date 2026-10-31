@@ -1,6 +1,6 @@
 # Events
 
-Each stream has one event callback. The audio thread queues events without locking. The engine's **event thread** delivers them in order, a few milliseconds later, so your callback never runs on the audio thread and can call any FatzAudio function, including closing the stream.
+Each stream has one event callback. The audio thread queues events without locking. The engine's **event thread** delivers them in order, at once (the audio thread wakes it without locking; it sleeps while nothing happens), so your callback never runs on the audio thread and can call any FatzAudio function, including closing the stream.
 
 ## Event fields
 
