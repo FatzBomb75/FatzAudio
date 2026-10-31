@@ -43,6 +43,7 @@ struct fa_deck {
     fa_atomic32 side;            /* FA_DECK_XFADER_SIDE */
     fa_atomic_ptr tap;           /* fa_tap*, the channel meter (post fader) */
     fa_atomic32 sync_range;      /* FA_DECK_SYNC_RANGE, float bits */
+    fa_atomic32 slip;            /* fa_deck_set_slip; read by its stream under its api_lock */
     /* Sync (sync.c), mixer lock: leader NULL = not synced. */
     struct fa_deck* leader;
     uint32_t sync_flags;         /* fa_sync_flags */

@@ -483,6 +483,7 @@ FA_API fa_result FA_CALL fa_deck_beat_jump(fa_deck* deck, double beats)
     fa_frames in = 0, out = 0, last;
     double delta;
     fa_result r;
+    int began;
     if (!deck || !(fabs(beats) >= 1.0 / 16.0 - 1e-9 && fabs(beats) <= 1024.0)) return FA_ERROR_INVALID_ARG;
     m = deck->mixer;
     fa_mutex_lock(&m->lock);
@@ -513,8 +514,11 @@ FA_API fa_result FA_CALL fa_deck_beat_jump(fa_deck* deck, double beats)
         if (r == FA_OK && out > in) r = fa_stream_set_loop_region(dn.s, in, out);
         goto done;
     }
-    /* The jump, and a loop moved with it at the same seamless join. */
+    /* The jump, and a loop moved with it at the same seamless join (with slip mode on,
+     * the deck goes on counting where it would be: fa_deck_slip_return comes back). */
+    began = fa_stream_slip_begin(dn.s);
     r = out > in ? fa_stream_jump_loop(dn.s, (fa_frames)delta, in, out) : fa_stream_jump(dn.s, -1, (fa_frames)delta);
+    if (began && r != FA_OK && r != FA_ERROR_BUSY) fa_stream_slip_cancel(dn.s);   /* no jump: no slip (BUSY is tried again) */
 done:
     fa_mutex_unlock(&m->lock);
     return r;

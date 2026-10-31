@@ -421,12 +421,15 @@ int fa_chroma_key(fa_chroma* c, fa_key_info* out);
 typedef struct fa_ring {
     float* data;
     uint32_t channels;
-    int64_t capacity;     /* frames */
+    int64_t capacity;     /* frames readable at most */
+    int64_t size;         /* frames held: capacity + the kept ones (fa_ring_init_kept) */
     fa_atomic64 write;    /* total frames written (producer) */
     fa_atomic64 read;     /* total frames read (consumer) */
 } fa_ring;
 
 fa_result fa_ring_init(fa_ring* r, uint32_t channels, int64_t capacity);
+/* The same, also keeping the last `keep` frames read: the writer never reaches them. */
+fa_result fa_ring_init_kept(fa_ring* r, uint32_t channels, int64_t capacity, int64_t keep);
 void fa_ring_free(fa_ring* r);
 int64_t fa_ring_readable(fa_ring* r);
 int64_t fa_ring_writable(fa_ring* r);
@@ -438,6 +441,8 @@ void fa_ring_commit(fa_ring* r, int64_t frames);
 /* Consumer: up to two contiguous regions holding `frames` readable frames. */
 void fa_ring_regions(fa_ring* r, int64_t frames, const float** p1, int64_t* n1, const float** p2, int64_t* n2);
 void fa_ring_advance_read(fa_ring* r, int64_t frames);
+/* Frame `idx` (a total count), read or not: valid back to `keep` before the read count. */
+const float* fa_ring_frame(fa_ring* r, int64_t idx);
 /* Only while neither side can run (stream flushing and decode lock held). */
 void fa_ring_reset(fa_ring* r);
 
@@ -588,6 +593,10 @@ void fa_tmap_add(fa_tmap* m, int64_t at, double src, double slope);
 /* Source position at ring frame `at`; *out_slope and *out_next (where the segment
  * ends, INT64_MAX = open) may be NULL. */
 double fa_tmap_pos(fa_tmap* m, int64_t at, double base_src, double base_slope, double* out_slope, int64_t* out_next);
+/* The segment holding ring frame `at`: where it starts (0 for the base), its source
+ * position there and its slope. */
+void fa_tmap_segment_at(fa_tmap* m, int64_t at, double base_src, double base_slope, int64_t* out_start,
+                        double* out_src, double* out_slope);
 /* Ring frames from `at` until the source position reaches `target` (0 if it has). */
 int64_t fa_tmap_frames_to(fa_tmap* m, int64_t at, double target, double base_src, double base_slope);
 void fa_tmap_release(fa_tmap* m, int64_t at);   /* audio thread */
@@ -1402,6 +1411,15 @@ struct fa_stream {
     float* rev_buf;
     float* rev_ov;               /* inside rev_buf: the held frames while the block below decodes */
     fa_frames rev_cap, rev_n, rev_pos, rev_hold;
+    /* Slip (fa_deck_set_slip): while a reverse, a deck loop or a beat jump takes the deck
+     * elsewhere, where it would be playing is slip_from (the source frame heard when the
+     * slip began, going on the way slip_rev says) plus slip_run timeline frames (counted
+     * as linear frames run, see above) up to where that count stood at the run value
+     * slip_mark, plus what the timeline ran since. slip_active is cleared by any restart,
+     * a worker's too; the rest is under api_lock. */
+    fa_atomic32 slip_active;
+    int slip_rev;
+    double slip_from, slip_run, slip_mark;
 
     /* CD+G graphics (cdg.c): the packs, the surfaces drawing them, and a generation
      * count that tells surfaces the graphics were replaced. Never touched by the
@@ -1505,6 +1523,15 @@ fa_result fa_stream_jump(struct fa_stream* s, fa_frames at, fa_frames delta);
 /* Moves a playing deck loop: a jump of `delta` a margin ahead of the mix that sets the
  * loop to `in`..`out` at the same join (out > in), so either both happen or neither. */
 fa_result fa_stream_jump_loop(struct fa_stream* s, fa_frames delta, fa_frames in, fa_frames out);
+/* Slip (fa_deck_set_slip, mixer.c): a beat jump begins one (a no-op when one runs or the
+ * stream is not playing); the return joins where playback would be; cancel forgets it. */
+int fa_stream_slip_begin(struct fa_stream* s);   /* 1 = began one */
+fa_result fa_stream_slip_return(struct fa_stream* s);
+void fa_stream_slip_cancel(struct fa_stream* s);
+/* FA_FRAMES_UNSET when no slip runs. */
+fa_frames fa_stream_slip_position(struct fa_stream* s);
+/* Whether a stream on this bus slips: its deck has slip mode on (mixer.c). */
+int fa_mixer_bus_slips(fa_bus* bus);
 /* A TEMPO ramp from where it is that raises no FA_EVENT_RAMP_DONE (auto-mix's glide back). */
 fa_result fa_stream_ramp_tempo_quiet(struct fa_stream* s, float target, fa_time duration);
 /* Device frame at the speaker at monotonic time `now_ns` (latency included). */

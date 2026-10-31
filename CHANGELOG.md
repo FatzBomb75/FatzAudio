@@ -23,6 +23,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- DJ instant reverse and slip mode (extras step 9): `fa_stream_set_reverse` while playing or paused now turns at once,
+  playing the last 200 ms heard back the other way out of the stream's buffer while the decoder catches up (no gap,
+  no re-buffer). Slip mode: `fa_deck_set_slip` / `fa_deck_get_slip`, `fa_deck_slip_return`, `fa_deck_get_slip_position`
+  (.NET `DjDeck.Slip`, `SlipReturn`, `SlipPosition`): reverses, deck loops and beat jumps count on underneath and come
+  back to where the deck would be, to the frame. See [docs/features/dj-mixer.md](docs/features/dj-mixer.md#slip-mode).
+
 - Disc and CD+G (extras step 19): `fa_disc_get_pregap` (.NET `Disc.GetPregap`, basscd's `BASS_CD_GetTrackPregap`)
   gives a track's pregap in sectors, from the cue sheet (`INDEX 00`, `PREGAP`) or from a drive's Q subcode. CD+G packs
   read from a disc with two damaged symbols are now repaired as well as those with one (three or more are still

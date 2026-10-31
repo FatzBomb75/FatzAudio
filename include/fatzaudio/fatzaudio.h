@@ -1004,7 +1004,10 @@ FA_API fa_result FA_CALL fa_stream_get_loop(fa_stream* stream, int32_t* out_on);
  * at CUE_IN or the start. Playing from stopped or ended starts at CUE_OUT or the end.
  * A loop (fa_stream_set_loop, a deck loop) wraps from its start to its end. Tempo,
  * pitch, rate, volume, effects and the fade markers work as forward. Changing the
- * direction restarts at the position heard, as fa_stream_seek does. Events are raised
+ * direction while playing or paused turns at once, at the frame being mixed: the last
+ * 200 ms heard play back the other way out of the stream's buffer while the decoder
+ * catches up behind them, so there is no gap (stopped and ended streams start over at
+ * the position, as fa_stream_seek does). Events are raised
  * as the position counts down past their frames: markers, loop turns, MIDI texts,
  * tracker rows and position events, last first. Deck loops, beat jumps and deck sync
  * work as forward, mirrored: a loop turns at its in point, a jump joins without a gap,
@@ -1460,6 +1463,23 @@ FA_API fa_result FA_CALL fa_deck_cue(fa_deck* deck);
  * seekable streams loop (FA_ERROR_NOT_SEEKABLE). */
 FA_API fa_result FA_CALL fa_deck_set_loop(fa_deck* deck, fa_frames loop_in, fa_frames loop_out);
 FA_API fa_result FA_CALL fa_deck_get_loop(fa_deck* deck, fa_frames* out_loop_in, fa_frames* out_loop_out);  /* 0, 0 = none */
+
+/* Slip mode (a CDJ's SLIP), off by default. While it is on, reversing the deck's stream
+ * (fa_stream_set_reverse), a deck loop (fa_deck_set_loop, fa_deck_set_loop_beats) and a
+ * beat jump (fa_deck_beat_jump) take playback elsewhere while the deck goes on counting
+ * where it would be playing: from where it was heard when the first of them began, at
+ * the speed it plays (TEMPO x RATE, ramps included). When they end (the direction back
+ * to what it was and no deck loop), the deck joins there, 15 ms ahead of the mix and
+ * without a gap, so it lands on the beat it would have been on. A beat jump has no end
+ * of its own: fa_deck_slip_return comes back (from all of them at once: it also ends the
+ * reverse and the loop). A seek, a cue, a stop or a load forget the slip, and so does
+ * turning slip mode off: playback carries on from where it is. Pausing pauses the count.
+ * fa_deck_get_slip_position: where the deck would be playing now (a source frame), or
+ * FA_FRAMES_UNSET when no slip runs. fa_deck_slip_return without one does nothing. */
+FA_API fa_result FA_CALL fa_deck_set_slip(fa_deck* deck, int32_t on);
+FA_API fa_result FA_CALL fa_deck_get_slip(fa_deck* deck, int32_t* out_on);
+FA_API fa_result FA_CALL fa_deck_get_slip_position(fa_deck* deck, fa_frames* out_frame);
+FA_API fa_result FA_CALL fa_deck_slip_return(fa_deck* deck);
 
 /* The deck's channel meter: after trim, EQ and fader, before the crossfader, as
  * heard now (like fa_stream_get_levels). Zeros while the deck is silent. */

@@ -708,6 +708,18 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_deck_get_loop(nint deck, out long loopIn, out long loopOut);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_deck_set_slip(nint deck, int on);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_deck_get_slip(nint deck, out int on);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_deck_get_slip_position(nint deck, out long frame);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_deck_slip_return(nint deck);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_deck_get_levels(nint deck, long window, float* peak, float* rms, uint channels);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
