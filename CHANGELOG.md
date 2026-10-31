@@ -23,6 +23,16 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- Tracker parity (extras step 18): the module's own live state, as `BASS_ATTRIB_MUSIC_*` had it. `fa_stream_set_tracker_tempo` /
+  `_get_` and `fa_stream_set_tracker_speed` / `_get_` (the song's tempo and speed, not a time-stretch),
+  `fa_stream_set_tracker_global_volume`, `fa_stream_set_tracker_channel_volume` (kept through seeks),
+  `fa_stream_set_tracker_instrument_mute`, `FA_TRACKER_AMPLIFY` (millibel), `fa_stream_get_tracker_orders` (the order list),
+  and `FA_TRACKER_CELL_EVENTS` with the new events `FA_EVENT_TRACKER_INSTRUMENT` (a note with an instrument) and
+  `FA_EVENT_TRACKER_SYNC` (the `Zxx` command). A module is now read by libopenmpt through the stream's source, so the
+  file is no longer held in memory twice while it opens. .NET: `TrackerTempo`, `TrackerSpeed`, `TrackerGlobalVolume`,
+  `SetTrackerChannelVolume` / `GetTrackerChannelVolume`, `SetTrackerInstrumentMuted` / `IsTrackerInstrumentMuted`,
+  `TrackerAmplificationDb`, `GetTrackerOrders`, `TrackerCellEvents`, `TrackerInstrumentPlayed`, `TrackerSyncReached`.
+  See [docs/features/trackers.md](docs/features/trackers.md#module-tempo-volumes-and-the-order-list).
 - DJ instant reverse and slip mode (extras step 9): `fa_stream_set_reverse` while playing or paused now turns at once,
   playing the last 200 ms heard back the other way out of the stream's buffer while the decoder catches up (no gap,
   no re-buffer). Slip mode: `fa_deck_set_slip` / `fa_deck_get_slip`, `fa_deck_slip_return`, `fa_deck_get_slip_position`

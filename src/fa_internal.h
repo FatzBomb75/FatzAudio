@@ -339,6 +339,11 @@ int fa_tracker_row_at(const struct fa_tracker* t, fa_frames frame, uint32_t* ord
 int fa_tracker_row_events_on(const struct fa_tracker* t);   /* FA_TRACKER_ROW_EVENTS is not 0 */
 uint32_t fa_tracker_rows_in(const struct fa_tracker* t, fa_frames from, fa_frames to, fa_frames* frames,
                             int64_t* values, uint32_t cap);
+/* The instrument and sync events (FA_TRACKER_CELL_EVENTS) of the rows starting in [from, to):
+ * values are kind << 32 | channel << 16 | data, kind 1 instrument, 2 sync. */
+int fa_tracker_cell_events_on(const struct fa_tracker* t);
+uint32_t fa_tracker_cells_in(const struct fa_tracker* t, fa_frames from, fa_frames to, fa_frames* frames,
+                             int64_t* values, uint32_t cap);
 /* Frames of the text events, sorted, fixed while the decoder is open (read by the
  * audio thread to raise FA_EVENT_MIDI_TEXT). */
 const fa_frames* fa_midi_text_frames(const struct fa_midi* m, uint32_t* out_count);

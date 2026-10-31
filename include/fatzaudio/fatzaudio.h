@@ -2865,6 +2865,9 @@ FA_API fa_result FA_CALL fa_stream_seek_tracker(fa_stream* stream, uint32_t orde
  * FA_TRACKER_VOLUME_RAMPING      -1 default, 0 off (may click), 1..10 softer
  * FA_TRACKER_AMIGA_RESAMPLER     0 (default) off; 1 Amiga MOD files sound as on an Amiga's Paula chip
  *                                (about 19 times the CPU on those files)
+ * FA_TRACKER_AMPLIFY            output gain of the module in millibel (hundredths of a dB), -6000 .. 6000; 0 (default)
+ * FA_TRACKER_CELL_EVENTS         bits: 1 FA_EVENT_TRACKER_INSTRUMENT for each note with an instrument, 2
+ *                                FA_EVENT_TRACKER_SYNC for each Zxx command, in the rows heard; 0 (default) none
  * FA_TRACKER_ROW_EVENTS          0 (default) none; 1 FA_EVENT_TRACKER_ROW for every row heard;
  *                                2 only for the first row of each order
  * FA_ERROR_INVALID_ARG for other values and for streams that are not modules. */
@@ -2873,7 +2876,9 @@ typedef enum fa_tracker_param {
     FA_TRACKER_STEREO_SEPARATION = 1,
     FA_TRACKER_VOLUME_RAMPING = 2,
     FA_TRACKER_AMIGA_RESAMPLER = 3,
-    FA_TRACKER_ROW_EVENTS = 4
+    FA_TRACKER_ROW_EVENTS = 4,
+    FA_TRACKER_AMPLIFY = 5,
+    FA_TRACKER_CELL_EVENTS = 6
 } fa_tracker_param;
 FA_API fa_result FA_CALL fa_stream_set_tracker_param(fa_stream* stream, fa_tracker_param param, int32_t value);
 FA_API fa_result FA_CALL fa_stream_get_tracker_param(fa_stream* stream, fa_tracker_param param, int32_t* out_value);
@@ -2888,6 +2893,33 @@ FA_API fa_result FA_CALL fa_stream_get_tracker_position(fa_stream* stream, uint3
  * FA_ERROR_NOT_IMPLEMENTED if libopenmpt offers no channel control for the module. */
 FA_API fa_result FA_CALL fa_stream_set_tracker_channel_mute(fa_stream* stream, uint32_t channel, int32_t muted);
 FA_API fa_result FA_CALL fa_stream_get_tracker_channel_mute(fa_stream* stream, uint32_t channel, int32_t* out_muted);
+
+/* Live state of the module itself (BASS_ATTRIB_MUSIC_BPM / SPEED / VOL_GLOBAL / VOL_CHAN / VOL_INST). These change
+ * the song's own tempo and speed, not a time-stretch of its audio (FA_PARAM_TEMPO does that), and are heard after
+ * the decode-ahead buffer. The module's own commands change them again (a Fxx or Gxx later in the song), and a
+ * seek puts the module back in its own state at the target, except channel volumes and instrument mutes, which
+ * stay. The stream keeps its length: a song made faster ends early (silence follows), a slower one is cut.
+ * Tempo is in beats per minute, 32 .. 512 (the exact meaning depends on the format's tempo mode); speed in ticks
+ * per row, 1 .. 255; the volumes 0.0 .. 1.0. The getters read the song as decoded so far. Instrument is the
+ * 0-based index of the instrument, or of the sample in formats without instruments (MOD, S3M). Channels are the
+ * first 64. FA_ERROR_INVALID_ARG for a value or index out of range and for streams that are not modules;
+ * FA_ERROR_NOT_IMPLEMENTED if libopenmpt offers no control for the module. */
+FA_API fa_result FA_CALL fa_stream_set_tracker_tempo(fa_stream* stream, double bpm);
+FA_API fa_result FA_CALL fa_stream_get_tracker_tempo(fa_stream* stream, double* out_bpm);
+FA_API fa_result FA_CALL fa_stream_set_tracker_speed(fa_stream* stream, int32_t ticks_per_row);
+FA_API fa_result FA_CALL fa_stream_get_tracker_speed(fa_stream* stream, int32_t* out_ticks_per_row);
+FA_API fa_result FA_CALL fa_stream_set_tracker_global_volume(fa_stream* stream, double volume);
+FA_API fa_result FA_CALL fa_stream_get_tracker_global_volume(fa_stream* stream, double* out_volume);
+FA_API fa_result FA_CALL fa_stream_set_tracker_channel_volume(fa_stream* stream, uint32_t channel, double volume);
+FA_API fa_result FA_CALL fa_stream_get_tracker_channel_volume(fa_stream* stream, uint32_t channel, double* out_volume);
+FA_API fa_result FA_CALL fa_stream_set_tracker_instrument_mute(fa_stream* stream, uint32_t instrument, int32_t muted);
+FA_API fa_result FA_CALL fa_stream_get_tracker_instrument_mute(fa_stream* stream, uint32_t instrument, int32_t* out_muted);
+
+/* The order list: the pattern of each order (BASS_TAG_MUSIC_ORDERS). `out_count` is the number of orders
+ * (fa_tracker_info.orders); up to `capacity` patterns are written (capacity 0 asks only for the count).
+ * 65534 marks a skipped order ("+++") and 65535 the end of the song ("---"). */
+FA_API fa_result FA_CALL fa_stream_get_tracker_orders(fa_stream* stream, uint32_t* patterns, uint32_t capacity,
+                                                      uint32_t* out_count);
 
 /* ---- Events ----------------------------------------------------------- */
 
@@ -2912,9 +2944,11 @@ FA_API fa_result FA_CALL fa_stream_get_tracker_channel_mute(fa_stream* stream, u
  * FA_EVENT_CDG_CHANGED     CD+G packs now shown   what changed: FA_CDG_CHANGE_* (CD+G above)
  * FA_EVENT_SEEK_FAILED     the target not reached the fa_result (fa_stream_seek_async)
  * FA_EVENT_TRACKER_ROW     the row's first frame  order << 16 | row (FA_TRACKER_ROW_EVENTS)
+ * FA_EVENT_TRACKER_INSTRUMENT the row's first frame channel << 16 | instrument, 0-based (FA_TRACKER_CELL_EVENTS)
+ * FA_EVENT_TRACKER_SYNC     the row's first frame  channel << 16 | the Zxx parameter (FA_TRACKER_CELL_EVENTS)
  *
  * Delivered today: ENDED, POSITION, MARKER, LOOPED, CDG_CHANGED (when asked for), LOUDNESS_FINAL, RAMP_DONE, STARTED, SEEK_FAILED and DEVICE_CHANGED; MIDI_TEXT from MIDI
- * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); TRACKER_ROW from
+ * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); TRACKER_ROW, TRACKER_INSTRUMENT and TRACKER_SYNC from
  * tracker modules played on a device (when asked for); METADATA from web
  * streams; STALLED and RESUMED from push, packet and web streams; DECODE_ERROR from packet
  * and disc streams, and once for a stored ZIP song that does not match its archive's CRC (value
@@ -2940,7 +2974,9 @@ typedef enum fa_event_type {
     FA_EVENT_CUE_LOST,        /* a mixer's headphone device (FA_CUE_DEVICE) went away */
     FA_EVENT_AUTOMIX_STARTED, /* auto-mix: the incoming deck is heard (fa_mixer_set_automix) */
     FA_EVENT_AUTOMIX_DONE,    /* auto-mix: the transition is done */
-    FA_EVENT_DECK_EMPTY       /* auto-mix: the idle deck needs its next song */
+    FA_EVENT_DECK_EMPTY,      /* auto-mix: the idle deck needs its next song */
+    FA_EVENT_TRACKER_INSTRUMENT, /* a note with an instrument is heard in a tracker module (FA_TRACKER_CELL_EVENTS) */
+    FA_EVENT_TRACKER_SYNC     /* a tracker module's Zxx command is heard (FA_TRACKER_CELL_EVENTS) */
 } fa_event_type;
 
 typedef struct fa_event {

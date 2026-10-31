@@ -227,18 +227,18 @@ MOD, S3M, XM, IT, MPTM and many more play through the statically linked libopenm
 | BASS_ChannelGetTags(BASS_TAG_MUSIC_INST + n) | `fa_stream_get_tracker_text(FA_TRACKER_TEXT_INSTRUMENT, n)` | `TrackerInfo.Instruments` | ✅ |
 | BASS_ChannelGetTags(BASS_TAG_MUSIC_SAMPLE + n) | `fa_stream_get_tracker_text(FA_TRACKER_TEXT_SAMPLE, n)` | `TrackerInfo.Samples` | ✅ |
 | BASS_ChannelGetTags(BASS_TAG_MUSIC_AUTH) (author) | `fa_tracker_info.artist`; `FA_TAG_ARTIST` | `TrackerInfo.Artist` | ✅ (where the format stores one) |
-| BASS_ChannelGetTags(BASS_TAG_MUSIC_ORDERS) (order list) | Not exposed: only the order count, and the time of each order and row | `GetTrackerTime` | 🗓️ planned |
-| BASS_ChannelGetAttribute(BASS_ATTRIB_MUSIC_AMPLIFY) (amplification) | Not exposed; use `FA_PARAM_VOLUME` or normalization | — | 🗓️ planned |
+| BASS_ChannelGetTags(BASS_TAG_MUSIC_ORDERS) (order list) | `fa_stream_get_tracker_orders`: the pattern of each order (65534 skipped, 65535 end); the time of each order and row is `fa_stream_get_tracker_time` | `GetTrackerOrders()`, `GetTrackerTime` | ✅ |
+| BASS_ChannelGetAttribute(BASS_ATTRIB_MUSIC_AMPLIFY) (amplification) | `fa_stream_set_tracker_param(FA_TRACKER_AMPLIFY, millibel)`, -6000 to 6000 (hundredths of a dB); stays through seeks. `FA_PARAM_VOLUME` and normalization work as for any stream | `TrackerAmplificationDb` | ✅ (in dB, not BASS's 0 to 100 scale) |
 | BASS_ATTRIB_MUSIC_PANSEP | `FA_TRACKER_STEREO_SEPARATION`, 0 to 200 percent (BASS: 0 to 100 around a default of 50) | `TrackerStereoSeparation` | ✅ (different scale: 100 is the module's own) |
 | BASS_ATTRIB_MUSIC_PSCALER (positional scaler) | No counterpart: libopenmpt has no such control | — | ➖ |
-| BASS_ATTRIB_MUSIC_BPM / BASS_ATTRIB_MUSIC_SPEED (live tempo and speed) | Not exposed. `FA_PARAM_TEMPO` time-stretches the finished audio instead (the module's own tempo and speed are not changed) | `Tempo` | 🗓️ planned (the stretch is a substitute) |
-| BASS_ATTRIB_MUSIC_VOL_GLOBAL | Not exposed; use `FA_PARAM_VOLUME` | — | 🗓️ planned |
-| BASS_ATTRIB_MUSIC_VOL_CHAN + n (channel volume) | `fa_stream_set_tracker_channel_mute` mutes a channel (0 or full); a volume per channel is not exposed | `SetTrackerChannelMuted`, `IsTrackerChannelMuted` | ✅ mute; volume 🗓️ planned |
-| BASS_ATTRIB_MUSIC_VOL_INST + n (instrument volume) | Not exposed | — | 🗓️ planned |
+| BASS_ATTRIB_MUSIC_BPM / BASS_ATTRIB_MUSIC_SPEED (live tempo and speed) | `fa_stream_set_tracker_tempo` (32 to 512 bpm) / `fa_stream_set_tracker_speed` (1 to 255 ticks per row) and the getters: the song's own tempo and speed, not a stretch; the song's own commands set them again and a seek restores them ([trackers.md](../features/trackers.md#module-tempo-volumes-and-the-order-list)). `FA_PARAM_TEMPO` still time-stretches the finished audio | `TrackerTempo`, `TrackerSpeed` | ✅ |
+| BASS_ATTRIB_MUSIC_VOL_GLOBAL | `fa_stream_set_tracker_global_volume` / `_get_`, 0.0 to 1.0 (BASS: 0 to 64); the song's own global volume commands set it again, a seek restores it. `FA_PARAM_VOLUME` is the stream's own | `TrackerGlobalVolume` | ✅ |
+| BASS_ATTRIB_MUSIC_VOL_CHAN + n (channel volume) | `fa_stream_set_tracker_channel_volume` / `_get_`, 0.0 to 1.0 (BASS: 0 to 128), the first 64 channels, kept through seeks; `fa_stream_set_tracker_channel_mute` mutes | `SetTrackerChannelVolume`, `GetTrackerChannelVolume`, `SetTrackerChannelMuted`, `IsTrackerChannelMuted` | ✅ |
+| BASS_ATTRIB_MUSIC_VOL_INST + n (instrument volume) | `fa_stream_set_tracker_instrument_mute` / `_get_` (the instrument, or the sample in MOD and S3M). libopenmpt has no volume per instrument: use the volume of the channel it plays on | `SetTrackerInstrumentMuted`, `IsTrackerInstrumentMuted` | ➖ (mute, not volume) |
 | BASS_ATTRIB_MUSIC_ACTIVE (voices in use) | Not exposed | — | ➖ |
 | BASS_SYNC_MUSICPOS (row reached) | `FA_TRACKER_ROW_EVENTS` (1 every row, 2 first row of each order) raises `FA_EVENT_TRACKER_ROW` (value = order << 16 \| row). BASS lets you pick one position; here you filter in the handler ([trackers.md](../features/trackers.md#row-events)) | `TrackerRowEvents`, `TrackerRowReached` | ✅ |
-| BASS_SYNC_MUSICINST (instrument played) | Not available | — | 🗓️ planned |
-| BASS_SYNC_MUSICFX (effect `Zxx`/sync command hit) | Not available | — | 🗓️ planned |
+| BASS_SYNC_MUSICINST (instrument played) | `FA_TRACKER_CELL_EVENTS` bit 1 raises `FA_EVENT_TRACKER_INSTRUMENT` (value = channel << 16 \| instrument, 0-based) for each note with an instrument number, from the pattern data ([trackers.md](../features/trackers.md#instrument-and-sync-events)) | `TrackerCellEvents.Instruments`, `TrackerInstrumentPlayed` | ✅ |
+| BASS_SYNC_MUSICFX (effect `Zxx`/sync command hit) | `FA_TRACKER_CELL_EVENTS` bit 2 raises `FA_EVENT_TRACKER_SYNC` (value = channel << 16 \| the Zxx parameter) | `TrackerCellEvents.Sync`, `TrackerSyncReached` | ✅ (Zxx of IT and S3M; BASS's per-tick positions are not kept) |
 | BASS_SYNC_END | `FA_EVENT_ENDED` | `Ended` | ✅ |
 
 ### Recording
