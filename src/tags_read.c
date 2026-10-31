@@ -674,6 +674,7 @@ static void flac_cuesheet(const uint8_t* p, size_t n, uint32_t rate, fa_tag_sink
         for (k = 0; k < nidx; k++, at += 12)
             if (p[at + 8] == 1) { first = off + fa_be64(p + at); break; }
         if (number == 170 || number == 255) { pos = pos + 36 + (size_t)nidx * 12; continue; }
+        if (first / rate > 100000000u) { pos += 36 + (size_t)nidx * 12; continue; }     /* damaged: more than 3 years */
         cue_time(value, sizeof(value), first, rate);
         snprintf(key, sizeof(key), "CUESHEET/TRACK%02u", number);
         sink->text(sink, FA_TAG_FORMAT_VORBIS, key, value);
@@ -1081,6 +1082,7 @@ static void mkv_tags(const uint8_t* p, size_t n, fa_tag_sink* sink)
             uint32_t id2;
             uint64_t ttv = 50, uid = 0;
             const char* kind = NULL;
+            int kind_rank = 4;
             char prefix[48] = "";
             if (id != MKV_TAG) continue;
             while (mem_el(&c2, tag + tsize, &id2, &b, &bs)) {
@@ -1094,7 +1096,9 @@ static void mkv_tags(const uint8_t* p, size_t n, fa_tag_sink* sink)
                         } else if ((id3 == 0x63C5 || id3 == 0x63C4 || id3 == 0x63C9 || id3 == 0x63C6) && mem_uint(b3, s3) != 0) {
                             /* The first kind in the order track, chapter, edition, attachment names the tag. */
                             const char* k = id3 == 0x63C5 ? "TRACK" : id3 == 0x63C4 ? "CHAPTER" : id3 == 0x63C9 ? "EDITION" : "ATTACHMENT";
-                            if (!kind || (id3 == 0x63C5) || (id3 == 0x63C4 && kind[0] != 'T')) {
+                            int rank = id3 == 0x63C5 ? 0 : id3 == 0x63C4 ? 1 : id3 == 0x63C9 ? 2 : 3;
+                            if (!kind || rank < kind_rank) {
+                                kind_rank = rank;
                                 kind = k;
                                 uid = mem_uint(b3, s3);
                             }

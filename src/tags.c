@@ -562,8 +562,6 @@ static int read_source(fa_tags* t, fa_source* src, const char* name, uint32_t fl
             fa_source_seek(src, 0);
             if (fa_midi_read_tags(src, (flags & FA_TAGS_NO_INFO) ? NULL : &t->info, &t->sink) == FA_OK && !(flags & FA_TAGS_NO_INFO))
                 t->have_info = 1;
-            fa_source_seek(src, 0);
-            return 1;
         } else if (audio_only) {
             return 0;
         }
