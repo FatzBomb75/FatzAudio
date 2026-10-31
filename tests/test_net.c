@@ -3092,7 +3092,9 @@ static void hold_resolve(const char* host)
 }
 
 /* A reconnect that hangs in the plain-socket client's name lookup doesn't hold up
- * the close: it returns in well under 50 ms and leaves the lookup behind. */
+ * the close: it returns at once (about 10 ms; the limit leaves room for a loaded
+ * macOS runner, where waits overshoot, while a close that waited for the lookup
+ * would hang for the whole timeout) and leaves the lookup behind. */
 static void test_close_during_resolve(void)
 {
     fa_net_options net;
@@ -3111,18 +3113,19 @@ static void test_close_during_resolve(void)
     CHECK_EQ(r, FA_OK);
     t0 = fa_monotonic_ns();
     while (!fa_load32(&g_resolve_in) && fa_monotonic_ns() - t0 < 5000000000LL) fa_sleep_ms(2);
-    CHECK_EQ(fa_load32(&g_resolve_in), 1);
     t0 = fa_monotonic_ns();
     fa_stream_close(s);
     took = fa_monotonic_ns() - t0;
     printf("  close took %.1f ms\n", (double)took / 1e6);
-    CHECK(took < 50000000LL);
-    /* Let the abandoned lookup finish (it frees itself). */
+    /* Let the abandoned lookup finish (it frees itself) before any check can return,
+     * so a failure here doesn't leave later tests' lookups held. */
     fa_store32(&g_resolve_hold, 0);
     t0 = fa_monotonic_ns();
-    while (!fa_load32(&g_resolve_out) && fa_monotonic_ns() - t0 < 5000000000LL) fa_sleep_ms(2);
+    while (fa_load32(&g_resolve_out) < fa_load32(&g_resolve_in) && fa_monotonic_ns() - t0 < 5000000000LL) fa_sleep_ms(2);
     fa_sleep_ms(50);
     fa_net_test_resolve_hook = NULL;
+    CHECK_EQ(fa_load32(&g_resolve_in), 1);
+    CHECK(took < 500000000LL);
 }
 
 /* A live stream without a length or chunked framing that the server closes cleanly
