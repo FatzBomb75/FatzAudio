@@ -3957,6 +3957,21 @@ static void post_tracker_rows(struct fa_stream* s, fa_device* dev, fa_frames fro
     } while (n == 32);
 }
 
+/* Tracker modules: FA_EVENT_TRACKER_INSTRUMENT and FA_EVENT_TRACKER_SYNC (value = channel << 16 | data)
+ * for the rows starting between `from` and `to`. One batch: a window holds a few rows. */
+#define FA_TRACKER_CELL_BATCH 256
+static void post_tracker_cells(struct fa_stream* s, fa_device* dev, fa_frames from, fa_frames to, int down)
+{
+    fa_frames at[FA_TRACKER_CELL_BATCH];
+    int64_t v[FA_TRACKER_CELL_BATCH];
+    uint32_t n = fa_tracker_cells_in(s->tracker, from, to, at, v, FA_TRACKER_CELL_BATCH), i;
+    for (i = 0; i < n; i++) {
+        uint32_t k = down ? n - 1 - i : i;
+        fa_audio_post_event(dev, s, (v[k] >> 32) == 1 ? FA_EVENT_TRACKER_INSTRUMENT : FA_EVENT_TRACKER_SYNC, at[k],
+                            v[k] & 0xFFFFFFFF);
+    }
+}
+
 /* Events tied to fixed source frames (MIDI texts, tracker rows): `post` for each
  * range of source frames playback passed between `played0` and `played1`, in the
  * order heard; wrapping into a loop gives two ranges. Reversed, the ranges are
@@ -4041,6 +4056,7 @@ static void heard_events(struct fa_stream* s, fa_device* dev, int64_t played0, i
     position_events(s, dev, played0, played1, ended);
     if (s->midi) frame_events(s, dev, played0, played1, ended, post_midi_texts);
     if (s->tracker && fa_tracker_row_events_on(s->tracker)) frame_events(s, dev, played0, played1, ended, post_tracker_rows);
+    if (s->tracker && fa_tracker_cell_events_on(s->tracker)) frame_events(s, dev, played0, played1, ended, post_tracker_cells);
 }
 
 /* Ends the stream from the audio thread (its data ran out, or a crossfade-out

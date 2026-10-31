@@ -487,13 +487,24 @@ typedef struct row_rec {
     int64_t values[64];
     fa_frames frames[64];
     int ended;
+    int cells;                       /* FA_EVENT_TRACKER_INSTRUMENT / _SYNC events */
+    int cell_type[64];
+    int64_t cell_value[64];
+    fa_frames cell_frame[64];
 } row_rec;
+
+static int g_cell_mask;              /* FA_TRACKER_CELL_EVENTS for play_rows */
 
 static void FA_CALL on_event(const fa_event* ev, void* user)
 {
     row_rec* r = (row_rec*)user;
     fa_mutex_lock(&r->lock);
     if (ev->type == FA_EVENT_TRACKER_ROW && r->count < 64) { r->values[r->count] = ev->value; r->frames[r->count] = ev->frame; r->count++; }
+    if ((ev->type == FA_EVENT_TRACKER_INSTRUMENT || ev->type == FA_EVENT_TRACKER_SYNC) && r->cells < 64) {
+        r->cell_type[r->cells] = ev->type;
+        r->cell_value[r->cells] = ev->value;
+        r->cell_frame[r->cells++] = ev->frame;
+    }
     if (ev->type == FA_EVENT_ENDED) r->ended = 1;
     fa_mutex_unlock(&r->lock);
 }
@@ -515,6 +526,7 @@ static void play_rows(const buf* mod, int32_t mode, int loop, fa_frames seek, in
     fa_open_options_init(&o);
     if (fa_stream_open_memory(g_engine, mod->d, mod->n, &o, &s) != FA_OK) { fa_device_close(dev); return; }
     fa_stream_set_tracker_param(s, FA_TRACKER_ROW_EVENTS, mode);
+    if (g_cell_mask) fa_stream_set_tracker_param(s, FA_TRACKER_CELL_EVENTS, g_cell_mask);
     fa_stream_set_loop(s, loop);
     if (seek > 0) fa_stream_seek(s, seek);
     if (reverse) fa_stream_set_reverse(s, 1);
@@ -672,6 +684,267 @@ static void test_damaged(void)
     free(mod.d);
 }
 
+
+/* ---- Live module controls, order list, instrument and sync events ------------------ */
+
+static void le32(buf* b, uint32_t v) { put8(b, v & 255); put8(b, (v >> 8) & 255); put8(b, (v >> 16) & 255); put8(b, v >> 24); }
+static void le16(buf* b, unsigned v) { put8(b, v & 255); put8(b, v >> 8); }
+
+/* A tiny S3M: one looped sample, one pattern of 32 rows at speed 2 (40 ms each) that
+ * ends with a pattern break, 4 channels. Row 0: channel 0 plays the sample (instrument 1)
+ * with Z42; row 4: channel 1 has Z07 and no note; row 8: channel 2 plays a note without
+ * an instrument number. */
+static buf make_s3m(void)
+{
+    buf m = { 0 }, pat = { 0 };
+    int row, i;
+    unsigned sample_para;
+    for (row = 0; row < 32; row++) {
+        if (row == 0) { put8(&pat, 0x20 | 0x80 | 0); put8(&pat, 0x40); put8(&pat, 1); put8(&pat, 26); put8(&pat, 0x42); }
+        if (row == 4) { put8(&pat, 0x80 | 1); put8(&pat, 26); put8(&pat, 0x07); }
+        if (row == 8) { put8(&pat, 0x20 | 2); put8(&pat, 0x40); put8(&pat, 0); }
+        if (row == 31) { put8(&pat, 0x80 | 3); put8(&pat, 3); put8(&pat, 0); }   /* C00: pattern break */
+        put8(&pat, 0);
+    }
+    sample_para = (unsigned)((0xE0 + 2 + pat.n + 15) / 16);
+    putstr(&m, "S3M test", 28);
+    put8(&m, 0x1A);
+    put8(&m, 16);
+    le16(&m, 0);
+    le16(&m, 2);      /* orders: the pattern and the end marker */
+    le16(&m, 1);      /* instruments */
+    le16(&m, 1);      /* patterns */
+    le16(&m, 0);
+    le16(&m, 0x1320);
+    le16(&m, 2);      /* unsigned samples */
+    put(&m, "SCRM", 4);
+    put8(&m, 64);     /* global volume */
+    put8(&m, 2);      /* initial speed */
+    put8(&m, 125);    /* initial tempo */
+    put8(&m, 0xB0);   /* master volume, stereo */
+    put8(&m, 0);
+    put8(&m, 0);      /* no panning table */
+    for (i = 0; i < 8; i++) put8(&m, 0);
+    le16(&m, 0);
+    for (i = 0; i < 32; i++) put8(&m, i < 4 ? (i & 1 ? 8 : 0) : 255);   /* four channels, L R L R */
+    put8(&m, 0);
+    put8(&m, 255);
+    le16(&m, 0x0008);   /* instrument at 0x80 */
+    le16(&m, 0x000E);   /* pattern at 0xE0 */
+    while (m.n < 0x80) put8(&m, 0);
+    put8(&m, 1);
+    putstr(&m, "sine.smp", 12);
+    put8(&m, 0);
+    le16(&m, sample_para);
+    le32(&m, SINE_LEN);
+    le32(&m, 0);
+    le32(&m, SINE_LEN);
+    put8(&m, 64);
+    put8(&m, 0);
+    put8(&m, 0);
+    put8(&m, 1);                      /* looped */
+    le32(&m, 8363);
+    for (i = 0; i < 12; i++) put8(&m, 0);
+    putstr(&m, "Sine", 28);
+    put(&m, "SCRS", 4);
+    while (m.n < 0xE0) put8(&m, 0);
+    le16(&m, (unsigned)pat.n + 2);
+    put(&m, pat.d, pat.n);
+    free(pat.d);
+    while (m.n < (size_t)sample_para * 16) put8(&m, 0);
+    for (i = 0; i < SINE_LEN; i++) put8(&m, (unsigned)(128 + lrint(sin(2.0 * PI * i / SINE_LEN) * 100.0)));
+    return m;
+}
+
+static void test_module_controls(void)
+{
+    buf mod = make_mod();
+    fa_stream* s = open_mod(&mod, NULL);
+    float* x = (float*)calloc((size_t)at(2.0) * 2, sizeof(float));
+    uint32_t orders[8], count = 0;
+    double d = 0;
+    int32_t v = 0;
+    CHECK(s && x);
+    /* The order list: patterns 0 and 1. */
+    CHECK_EQ(fa_stream_get_tracker_orders(s, NULL, 0, &count), FA_OK);
+    CHECK_EQ(count, 2);
+    CHECK_EQ(fa_stream_get_tracker_orders(s, orders, 8, &count), FA_OK);
+    CHECK_EQ(count, 2);
+    CHECK_EQ(orders[0], 0);
+    CHECK_EQ(orders[1], 1);
+    CHECK_EQ(fa_stream_get_tracker_orders(s, NULL, 4, &count), FA_ERROR_INVALID_ARG);
+    /* Tempo and speed: the song's own (speed 3 at tempo 125 after the first row). */
+    CHECK_EQ(fa_stream_get_tracker_speed(s, &v), FA_OK);
+    CHECK(v >= 1);
+    CHECK_EQ(fa_stream_get_tracker_tempo(s, &d), FA_OK);
+    CHECK_NEAR(d, 125.0, 0.5);
+    CHECK_EQ(fa_stream_set_tracker_tempo(s, 20.0), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_set_tracker_tempo(s, 600.0), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_set_tracker_speed(s, 0), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_set_tracker_speed(s, 300), FA_ERROR_INVALID_ARG);
+    /* Playing on past the first row, then doubling the speed (6 ticks): the rows take twice as long, so
+     * the note cut at row 8 comes later. */
+    CHECK_EQ(read_all(s, x, at(0.1), 1000), at(0.1));
+    CHECK_EQ(fa_stream_set_tracker_speed(s, 6), FA_OK);
+    CHECK_EQ(fa_stream_get_tracker_speed(s, &v), FA_OK);
+    CHECK_EQ(v, 6);
+    CHECK_EQ(read_all(s, x + at(0.1) * 2, at(0.9), 1000), at(0.9));
+    CHECK(rms_ch(x, at(0.6), at(0.9), 0) > 0.05);     /* unchanged song: silent after 0.48 s */
+    /* Tempo: faster notes end sooner. 250 bpm halves the rows (at speed 3: 30 ms). */
+    CHECK_EQ(fa_stream_seek(s, 0), FA_OK);
+    CHECK_EQ(fa_stream_set_tracker_tempo(s, 250.0), FA_OK);
+    CHECK_EQ(fa_stream_get_tracker_tempo(s, &d), FA_OK);
+    CHECK_NEAR(d, 250.0, 0.5);
+    CHECK_EQ(read_all(s, x, at(1.0), 1000), at(1.0));
+    CHECK(rms_ch(x, at(0.05), at(0.2), 0) > 0.05);
+    CHECK(rms_ch(x, at(0.3), at(0.44), 0) < 1e-4);    /* the cut came at about 0.24 s */
+    /* Channel volume: half. It stays through a seek. */
+    CHECK_EQ(fa_stream_seek(s, 0), FA_OK);
+    CHECK_EQ(read_all(s, x, at(0.45), 1000), at(0.45));
+    {
+        double full = rms_ch(x, at(0.1), at(0.4), 0), half;
+        CHECK(full > 0.05);
+        CHECK_EQ(fa_stream_seek(s, 0), FA_OK);
+        CHECK_EQ(fa_stream_set_tracker_channel_volume(s, 4, 0.5), FA_ERROR_INVALID_ARG);
+        CHECK_EQ(fa_stream_set_tracker_channel_volume(s, 0, 1.5), FA_ERROR_INVALID_ARG);
+        CHECK_EQ(fa_stream_set_tracker_channel_volume(s, 0, 0.5), FA_OK);
+        CHECK_EQ(read_all(s, x, at(0.45), 1000), at(0.45));
+        half = rms_ch(x, at(0.1), at(0.4), 0);
+        CHECK_NEAR(half / full, 0.5, 0.05);
+        CHECK_EQ(fa_stream_seek(s, at(0.06)), FA_OK);
+        CHECK_EQ(read_all(s, x, at(0.4), 1000), at(0.4));
+        CHECK_NEAR(rms_ch(x, at(0.05), at(0.35), 0) / full, 0.5, 0.05);
+        CHECK_EQ(fa_stream_get_tracker_channel_volume(s, 0, &d), FA_OK);
+        CHECK_NEAR(d, 0.5, 0.01);
+        CHECK_EQ(fa_stream_set_tracker_channel_volume(s, 0, 1.0), FA_OK);
+        /* Global volume: half of the song's. */
+        CHECK_EQ(fa_stream_seek(s, 0), FA_OK);
+        CHECK_EQ(fa_stream_set_tracker_global_volume(s, 0.5), FA_OK);
+        CHECK_EQ(fa_stream_get_tracker_global_volume(s, &d), FA_OK);
+        CHECK_NEAR(d, 0.5, 0.01);
+        CHECK_EQ(read_all(s, x, at(0.45), 1000), at(0.45));
+        CHECK_NEAR(rms_ch(x, at(0.1), at(0.4), 0) / full, 0.5, 0.05);
+        CHECK_EQ(fa_stream_set_tracker_global_volume(s, 1.0), FA_OK);
+        /* Amplification: +6.02 dB doubles it; the range is checked. */
+        CHECK_EQ(fa_stream_set_tracker_param(s, FA_TRACKER_AMPLIFY, 6001), FA_ERROR_INVALID_ARG);
+        CHECK_EQ(fa_stream_set_tracker_param(s, FA_TRACKER_AMPLIFY, 602), FA_OK);
+        CHECK_EQ(fa_stream_get_tracker_param(s, FA_TRACKER_AMPLIFY, &v), FA_OK);
+        CHECK_EQ(v, 602);
+        CHECK_EQ(fa_stream_seek(s, 0), FA_OK);
+        CHECK_EQ(read_all(s, x, at(0.45), 1000), at(0.45));
+        CHECK_NEAR(rms_ch(x, at(0.1), at(0.4), 0) / full, 2.0, 0.1);
+        CHECK_EQ(fa_stream_set_tracker_param(s, FA_TRACKER_AMPLIFY, 0), FA_OK);
+    }
+    /* Instrument mute (a MOD has 31 samples, no instruments). */
+    CHECK_EQ(fa_stream_set_tracker_instrument_mute(s, 31, 1), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_set_tracker_instrument_mute(s, 0, 1), FA_OK);
+    CHECK_EQ(fa_stream_get_tracker_instrument_mute(s, 0, &v), FA_OK);
+    CHECK_EQ(v, 1);
+    CHECK_EQ(fa_stream_seek(s, 0), FA_OK);
+    CHECK_EQ(read_all(s, x, at(0.45), 1000), at(0.45));
+    CHECK(rms_ch(x, at(0.1), at(0.4), 0) < 1e-4);
+    CHECK_EQ(fa_stream_set_tracker_instrument_mute(s, 0, 0), FA_OK);
+    CHECK_EQ(fa_stream_seek(s, 0), FA_OK);
+    CHECK_EQ(read_all(s, x, at(0.45), 1000), at(0.45));
+    CHECK(rms_ch(x, at(0.1), at(0.4), 0) > 0.05);
+    fa_stream_close(s);
+    free(x);
+    free(mod.d);
+}
+
+static void test_cell_events(void)
+{
+    buf mod = make_mod(), s3m = make_s3m();
+    row_rec rec;
+    fa_frames row = (fa_frames)llround(ROW_S * RATE), row40 = (fa_frames)llround(0.04 * RATE);
+    int i;
+    /* The MOD: a note with sample 1 on channel 0 in order 0 and on channel 1 in order 1, nothing else. */
+    g_cell_mask = 3;
+    play_rows(&mod, 0, 0, 0, 0, &rec);
+    CHECK(rec.ended);
+    CHECK_EQ(rec.cells, 2);
+    CHECK_EQ(rec.cell_type[0], FA_EVENT_TRACKER_INSTRUMENT);
+    CHECK_EQ(rec.cell_value[0], 0);                              /* channel 0, instrument 0 */
+    CHECK(rec.cell_frame[0] <= FA_TRACKER_STEP_TEST);
+    CHECK_EQ(rec.cell_type[1], FA_EVENT_TRACKER_INSTRUMENT);
+    CHECK_EQ(rec.cell_value[1], (1 << 16) | 0);                  /* channel 1 */
+    CHECK(rec.cell_frame[1] >= 16 * row && rec.cell_frame[1] <= 16 * row + FA_TRACKER_STEP_TEST);
+    fa_mutex_destroy(&rec.lock);
+    /* Only Zxx (none in a MOD). */
+    g_cell_mask = 2;
+    play_rows(&mod, 0, 0, 0, 0, &rec);
+    CHECK_EQ(rec.cells, 0);
+    fa_mutex_destroy(&rec.lock);
+    /* The S3M: the note with its instrument and Z42 at row 0, Z07 at row 4; the note without an instrument
+     * number (row 8) is not an instrument event. */
+    g_cell_mask = 3;
+    play_rows(&s3m, 0, 0, 0, 0, &rec);
+    CHECK(rec.ended);
+    CHECK_EQ(rec.cells, 3);
+    CHECK_EQ(rec.cell_type[0], FA_EVENT_TRACKER_INSTRUMENT);
+    CHECK_EQ(rec.cell_value[0], 0);
+    CHECK_EQ(rec.cell_type[1], FA_EVENT_TRACKER_SYNC);
+    CHECK_EQ(rec.cell_value[1], 0x42);
+    CHECK_EQ(rec.cell_type[2], FA_EVENT_TRACKER_SYNC);
+    CHECK_EQ(rec.cell_value[2], (1 << 16) | 0x07);
+    CHECK(rec.cell_frame[2] >= 4 * row40 && rec.cell_frame[2] <= 4 * row40 + FA_TRACKER_STEP_TEST);
+    fa_mutex_destroy(&rec.lock);
+    g_cell_mask = 1;
+    play_rows(&s3m, 0, 0, 0, 0, &rec);
+    CHECK_EQ(rec.cells, 1);
+    fa_mutex_destroy(&rec.lock);
+    /* From a seek past row 4: only what comes after. */
+    g_cell_mask = 2;
+    play_rows(&s3m, 0, 0, 5 * row40, 0, &rec);
+    CHECK_EQ(rec.cells, 0);
+    fa_mutex_destroy(&rec.lock);
+    /* Reversed: last first. */
+    g_cell_mask = 2;
+    play_rows(&s3m, 0, 0, 0, 1, &rec);
+    CHECK_EQ(rec.cells, 2);
+    CHECK_EQ(rec.cell_value[0], (1 << 16) | 0x07);
+    CHECK_EQ(rec.cell_value[1], 0x42);
+    fa_mutex_destroy(&rec.lock);
+    /* Looping: the same events again, at the same frames. */
+    g_cell_mask = 2;
+    play_rows(&s3m, 0, 1, 0, 0, &rec);
+    CHECK(rec.cells >= 4);
+    for (i = 2; i < rec.cells; i++) {
+        CHECK_EQ(rec.cell_value[i], rec.cell_value[i % 2]);
+        CHECK_EQ(rec.cell_frame[i], rec.cell_frame[i % 2]);
+    }
+    fa_mutex_destroy(&rec.lock);
+    /* Off by default. */
+    g_cell_mask = 0;
+    play_rows(&s3m, 0, 0, 0, 0, &rec);
+    CHECK_EQ(rec.cells, 0);
+    fa_mutex_destroy(&rec.lock);
+    free(mod.d);
+    free(s3m.d);
+}
+
+static void test_s3m_plays(void)
+{
+    buf s3m = make_s3m();
+    fa_stream* s = open_mod(&s3m, NULL);
+    fa_tracker_info ti;
+    float* x = (float*)calloc((size_t)at(1.0) * 2, sizeof(float));
+    CHECK(s && x);
+    ti.struct_size = sizeof ti;
+    CHECK_EQ(fa_stream_get_tracker_info(s, &ti), FA_OK);
+    CHECK_EQ(ti.channels, 4);
+    CHECK_EQ(ti.instruments, 0);
+    CHECK_EQ(ti.samples, 1);
+    CHECK_EQ(read_all(s, x, at(0.3), 1000), at(0.3));
+    CHECK(rms_ch(x, at(0.05), at(0.25), 0) > 0.02);
+    /* A sample-only module: the instrument mute index is the sample. */
+    CHECK_EQ(fa_stream_set_tracker_instrument_mute(s, 1, 1), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_set_tracker_instrument_mute(s, 0, 1), FA_OK);
+    fa_stream_close(s);
+    free(x);
+    free(s3m.d);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -687,6 +960,9 @@ int main(void)
     RUN(test_subsongs);
     RUN(test_position);
     RUN(test_row_events_on_device);
+    RUN(test_module_controls);
+    RUN(test_s3m_plays);
+    RUN(test_cell_events);
     RUN(test_not_a_module);
     RUN(test_damaged);
     fa_engine_destroy(g_engine);

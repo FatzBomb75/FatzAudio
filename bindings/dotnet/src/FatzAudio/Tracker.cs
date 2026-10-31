@@ -84,3 +84,39 @@ public enum TrackerInterpolation
     /// <summary>8-tap windowed sinc.</summary>
     Sinc = 8,
 }
+
+/// <summary>Which notes and commands of a tracker module raise events (<see cref="AudioStream.TrackerCellEvents"/>).</summary>
+[Flags]
+public enum TrackerCellEvents
+{
+    /// <summary>None (the default).</summary>
+    None = 0,
+    /// <summary>A note with an instrument number: <see cref="AudioStream.TrackerInstrumentPlayed"/>.</summary>
+    Instruments = 1,
+    /// <summary>The Zxx command (IT, S3M): <see cref="AudioStream.TrackerSyncReached"/>.</summary>
+    Sync = 2,
+}
+
+/// <summary>A note or command of a tracker module being heard (<see cref="AudioStream.TrackerInstrumentPlayed"/>, <see cref="AudioStream.TrackerSyncReached"/>).</summary>
+public sealed class TrackerCellEventArgs : EventArgs
+{
+    internal TrackerCellEventArgs(int channel, int value, TimeSpan time, long frame)
+    {
+        Channel = channel;
+        Value = value;
+        Time = time;
+        Frame = frame;
+    }
+
+    /// <summary>The pattern channel, 0-based.</summary>
+    public int Channel { get; }
+
+    /// <summary>For an instrument event, the 0-based instrument; for a sync event, the Zxx parameter (0 to 255).</summary>
+    public int Value { get; }
+
+    /// <summary>Where the row starts in the song.</summary>
+    public TimeSpan Time { get; }
+
+    /// <summary>Where the row starts, in frames of the stream.</summary>
+    public long Frame { get; }
+}

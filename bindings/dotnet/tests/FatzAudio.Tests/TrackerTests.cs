@@ -120,6 +120,37 @@ public class TrackerTests
     }
 
     [Fact]
+    public void ModuleControls_TempoVolumes_Orders_AndEvents()
+    {
+        using var engine = CreateHeadless();
+        using var s = engine.OpenMemory(Module(), DecodeOnly);
+        Assert.Equal(new[] { 0, 1 }, s.GetTrackerOrders());
+        Assert.Equal(125.0, s.TrackerTempo, 1);
+        s.TrackerTempo = 250.0;
+        Assert.Equal(250.0, s.TrackerTempo, 1);
+        Assert.Throws<ArgumentOutOfRangeException>(() => s.TrackerTempo = 20.0);
+        s.TrackerSpeed = 6;
+        Assert.Equal(6, s.TrackerSpeed);
+        Assert.Throws<ArgumentOutOfRangeException>(() => s.TrackerSpeed = 0);
+        s.SetTrackerChannelVolume(0, 0.5);
+        Assert.Equal(0.5, s.GetTrackerChannelVolume(0), 2);
+        Assert.Throws<FatzAudioException>(() => s.SetTrackerChannelVolume(4, 0.5));
+        Assert.Throws<ArgumentOutOfRangeException>(() => s.SetTrackerChannelVolume(0, 1.5));
+        s.TrackerGlobalVolume = 0.5;
+        Assert.Equal(0.5, s.TrackerGlobalVolume, 2);
+        s.TrackerAmplificationDb = 6.02;
+        Assert.Equal(6.02, s.TrackerAmplificationDb, 2);
+        Assert.Throws<ArgumentOutOfRangeException>(() => s.TrackerAmplificationDb = 61.0);
+        s.SetTrackerInstrumentMuted(0, true);
+        Assert.True(s.IsTrackerInstrumentMuted(0));
+        Assert.Throws<FatzAudioException>(() => s.SetTrackerInstrumentMuted(31, true));
+        Assert.Equal(TrackerCellEvents.None, s.TrackerCellEvents);
+        s.TrackerCellEvents = TrackerCellEvents.Instruments | TrackerCellEvents.Sync;
+        Assert.Equal(TrackerCellEvents.Instruments | TrackerCellEvents.Sync, s.TrackerCellEvents);
+        Assert.Throws<FatzAudioException>(() => s.TrackerCellEvents = (TrackerCellEvents)4);
+    }
+
+    [Fact]
     public void Plays_SeeksByOrderRow_AndMutes()
     {
         using var engine = CreateHeadless();
