@@ -18,6 +18,15 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- Web streams: MP4 and Matroska files over the network read only what they need. A fragmented MP4 with a `sidx` (or an
+  `mfra` at the end) reads its fragments as playback or a seek reaches them instead of every fragment at open, and
+  Matroska reads Cues stored after the clusters, with the last cluster for the exact length, in one range request of
+  its own while the download stays at the start. The download is told where the next audio packets are, and decode
+  workers wait for 0.3 s of the whole file's bytes, so a worker never waits in a read for video between the audio.
+  Tested over HTTP: fragmented MP4 with `sidx`, with `mfra` and with neither, Matroska with Cues at the end, video
+  files with several audio tracks, fMP4 HLS. See
+  [docs/features/web-streams.md](docs/features/web-streams.md#mp4-and-matroska-files).
+
 - Web streams: a raw-bytes tap for saving a station as it plays (BASS's `DOWNLOADPROC`): `fa_net_options.download_proc`
   from the first byte, `fa_stream_set_download_callback` to start or stop it while playing (.NET
   `NetworkOptions.Downloaded`, `AudioStream.SetDownloadHandler`); radio comes without its ICY title blocks, HLS as the

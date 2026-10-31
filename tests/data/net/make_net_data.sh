@@ -10,3 +10,8 @@ ffmpeg -y -f lavfi -i "sine=frequency=330:sample_rate=44100:duration=3" -ac 2 -c
 # tone.aac: AAC-LC in ADTS frames (needs only FFmpeg's own AAC encoder).
 ffmpeg -y -f lavfi -i "sine=frequency=440:sample_rate=44100:duration=3" -ac 2 -c:a aac -b:a 64k \
     -map_metadata -1 -fflags +bitexact -f adts tone.aac
+# frag.m4a: AAC-LC in 6 fragmented-MP4 fragments of 0.5 s, with a sidx in front and
+# an mfra at the end (test_net.c pads the fragments apart and switches the indexes off).
+ffmpeg -y -f lavfi -i "sine=frequency=440:sample_rate=44100:duration=3" -ac 2 -c:a aac -b:a 64k \
+    -movflags +frag_keyframe+empty_moov+default_base_moof+global_sidx -frag_duration 500000 \
+    -map_metadata -1 -fflags +bitexact frag.m4a

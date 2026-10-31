@@ -235,7 +235,7 @@ struct fa_net {
     uint32_t reconnects;
     char* headers;           /* of the last response */
     fa_http_session* http;   /* the download thread's connections (NULL: one per request) */
-    fa_http_cookies* cookies;   /* the stream's cookie jar (download thread only) */
+    fa_http_cookies* cookies;   /* the stream's cookie jar (fa_net_open to fa_net_close; locked) */
     /* The raw-bytes tap: called on the download thread under tap_lock, which
      * fa_net_set_tap takes to change it, so a replaced callback is never called again. */
     fa_mutex tap_lock;
@@ -246,6 +246,11 @@ struct fa_net {
     char content_type[128];
     uint32_t icy_br;
     uint32_t sample_rate;    /* of the decoded audio, set once the decoder is open */
+    double file_rate;        /* bytes per second of the whole file (with any video), 0 = unknown */
+    /* The demuxer's next reads (fa_net_will_read): bytes [want_start, want_end), which
+     * may lie ahead of read_pos (MP4 audio after a stretch of video). -1 = none. */
+    int64_t want_start, want_end;
+    fa_atomic32 side_cancel; /* stops fa_net_read_range requests (close) */
 
     /* HLS (net_hls.c) */
     char* playlist;          /* the first response, collected while hls is set */
@@ -293,6 +298,20 @@ void fa_net_set_tap(fa_net* n, fa_download_proc proc, void* user);
 int fa_net_can_decode(fa_net* n, int* out_starving);
 /* The decoder produced `frames` more source frames: refines the byte rate. */
 void fa_net_note_decoded(fa_net* n, int64_t frames);
+/* Decoder side: its next reads are bytes [start, end) of the file (the next MP4
+ * packets, a fragment's header). Decode workers then wait until those are here
+ * (fa_net_can_decode), and when `start` is beyond the download's reach the download
+ * moves there now, so the worker doesn't wait for it in a read. Seekable files only. */
+void fa_net_will_read(fa_net* n, int64_t start, int64_t end);
+/* Decoder side: bytes [offset, offset + length) of the file over a request of its
+ * own (an index at the end of the file), leaving the download where it is. At most
+ * 2 MiB; malloc'ed into *out. Not on the download thread. */
+fa_result fa_net_read_range(fa_net* n, int64_t offset, int64_t length, uint8_t** out, size_t* out_len);
+/* The fa_net behind a source the stream opened on a URL (fa_net_io callbacks), else NULL. */
+fa_net* fa_net_of(const fa_source* src);
+/* Tests: reads that waited for the download once the stream was open (the decoder
+ * ran ahead of the bytes; a decode worker would wait holding the decode lock). */
+extern fa_atomic32 fa_net_test_read_waits;
 
 /* ICY metadata: a title change heard at source frame `frame`. */
 typedef struct fa_net_meta {
@@ -310,8 +329,9 @@ int64_t fa_net_meta_update(fa_net* n, int64_t frame_at_cursor, int64_t lag_bytes
 /* A title change at source frame `frame` that the audio itself announces (the
  * comments of a chained Ogg stream's next song). */
 void fa_net_meta_add_frame(fa_net* n, int64_t frame, const char* title);
-/* The decoder is open: its sample rate turns bytes per frame into a byte rate. */
-void fa_net_set_sample_rate(fa_net* n, uint32_t rate);
+/* The decoder is open: its sample rate turns bytes per frame into a byte rate, and
+ * its length (frames, -1 = unknown) gives the file's bytes per second. */
+void fa_net_set_sample_rate(fa_net* n, uint32_t rate, int64_t length_frames);
 /* The metadata in effect at source frame `heard` (seq 0 = none yet). */
 void fa_net_meta_at(fa_net* n, int64_t heard, fa_net_meta* out);
 /* Seq of the metadata in effect at `heard`. */
