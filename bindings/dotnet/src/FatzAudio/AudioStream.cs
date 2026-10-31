@@ -2066,9 +2066,14 @@ public unsafe partial class AudioStream : IDisposable
         {
             lock (_cdgEventLock)
             {
-                if (_cdgChanged == null && value != null)
-                    FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_cdg_events(Handle, 1));
+                if (value == null) return;
+                bool first = _cdgChanged == null;
+                // The handler goes in first: the event thread can raise the first event
+                // (the whole screen) before fa_stream_set_cdg_events even returns.
                 _cdgChanged += value;
+                if (!first) return;
+                try { FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_set_cdg_events(Handle, 1)); }
+                catch { _cdgChanged -= value; throw; }
             }
         }
         remove

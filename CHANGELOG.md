@@ -563,6 +563,10 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Fixed
 
+- .NET `AudioStream.CdgChanged`: the first event (the whole screen) was sometimes lost. Adding the first handler turned
+  the native events on before storing the handler, and since the event thread now wakes at once it could raise
+  that event in between; on a paused or decode-only stream no later event followed. The handler is now stored first.
+  Flaky `CdgChanged_RaisedWithTheWholeScreenFirst` on CI; under 4 CPU burners 44 of 300 tries lost it, 0 of 1000 now.
 - Float PCM (WAV, Wave64, RF64, AIFF-C, CAF, MP4/MOV, Matroska, ASF, push streams): NaN and infinite samples, and
   doubles too big for a float, now read as 0. One such sample in a damaged file used to stick in every filter, effect
   and meter after it. Found by fuzzing (`tests/fuzz/regress/stream/wav-float-nan.wav`).
