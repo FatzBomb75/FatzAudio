@@ -193,12 +193,12 @@ static void test_stats_and_loudness(void)
     CHECK(st.worker_load > 0.0f && st.worker_load < 100.0f * st.workers);
     /* An older, shorter struct gets its part only. */
     {
-        fa_engine_stats small;
-        memset(&small, 0xAB, sizeof(small));
-        small.struct_size = (uint32_t)(sizeof(uint32_t) + sizeof(float));
-        CHECK_EQ(fa_engine_get_stats(g_engine, &small), FA_OK);
-        CHECK(small.audio_load >= 0.0f);
-        CHECK_EQ(small.workers, 0xABABABABu);
+        fa_engine_stats older;
+        memset(&older, 0xAB, sizeof(older));
+        older.struct_size = (uint32_t)(sizeof(uint32_t) + sizeof(float));
+        CHECK_EQ(fa_engine_get_stats(g_engine, &older), FA_OK);
+        CHECK(older.audio_load >= 0.0f);
+        CHECK_EQ(older.workers, 0xABABABABu);
     }
 
     /* Stopped: silence again. */
