@@ -1916,6 +1916,105 @@ static void test_dsp_on_decode_only(void)
     fa_stream_close(s);
 }
 
+
+/* ---- wake-ups ---------------------------------------------------------------- */
+
+typedef struct { fa_wake* w; fa_atomic32 done; } wake_waiter;
+static void wake_waiter_main(void* arg)
+{
+    wake_waiter* ww = (wake_waiter*)arg;
+    fa_wake_wait_ms(ww->w, UINT32_MAX);
+    fa_store32(&ww->done, 1);
+}
+
+/* Waits until the thread waiting on `w` is asleep in it (the state says so). */
+static int wait_asleep(fa_wake* w)
+{
+    int64_t until = fa_monotonic_ns() + 5000000000LL;
+    while (fa_load32(&w->state) != 2)
+        if (fa_monotonic_ns() > until) return 0;
+        else fa_sleep_ms(1);
+    return 1;
+}
+
+/* A signal given before the wait is kept, a wait without one times out, and a
+ * sleeper with no timeout wakes at once when signalled. */
+static void test_wake(void)
+{
+    fa_wake w;
+    wake_waiter ww;
+    fa_thread t;
+    int64_t t0, until;
+    CHECK_EQ(fa_wake_init(&w), 0);
+    fa_wake_signal(&w);
+    t0 = fa_monotonic_ns();
+    fa_wake_wait_ms(&w, 10000);
+    CHECK(fa_monotonic_ns() - t0 < 2000000000LL);
+    t0 = fa_monotonic_ns();
+    fa_wake_wait_ms(&w, 30);
+    CHECK(fa_monotonic_ns() - t0 >= 20000000LL);
+    CHECK_EQ(fa_load32(&w.state), 0);
+
+    ww.w = &w;
+    fa_store32(&ww.done, 0);
+    CHECK_EQ(fa_thread_create(&t, wake_waiter_main, &ww), 0);
+    CHECK(wait_asleep(&w));
+    fa_sleep_ms(20);
+    CHECK_EQ(fa_load32(&ww.done), 0);   /* no timeout: it sleeps until signalled */
+    fa_wake_signal(&w);
+    until = fa_monotonic_ns() + 2000000000LL;
+    while (!fa_load32(&ww.done) && fa_monotonic_ns() < until) fa_sleep_ms(1);
+    if (!fa_load32(&ww.done)) fa_wake_signal(&w);   /* let the join return before failing */
+    fa_thread_join(&t);
+    fa_wake_destroy(&w);
+    CHECK(fa_monotonic_ns() < until);
+}
+
+/* The idle event thread sleeps (up to a second) instead of polling, and an event
+ * the audio thread posts wakes it at once. */
+static void test_event_thread_wakes(void)
+{
+    fa_stream* s = open_attached(g_dev->rate, 0, 0);
+    recorder rec;
+    int k;
+    rec_init(&rec);
+    CHECK(s != NULL);
+    CHECK_EQ(fa_stream_set_event_callback(s, record, &rec), FA_OK);
+    for (k = 0; k < 3; k++) {
+        int64_t t0;
+        int n = 0;
+        CHECK(wait_asleep(&g_engine->event_wake));
+        t0 = fa_monotonic_ns();
+        fa_audio_post_event(g_dev, s, FA_EVENT_MARKER, 0, k);
+        while (n <= k && fa_monotonic_ns() - t0 < 2000000000LL) {
+            fa_mutex_lock(&rec.lock);
+            n = rec.by_type[FA_EVENT_MARKER];
+            fa_mutex_unlock(&rec.lock);
+            if (n <= k) fa_sleep_ms(1);
+        }
+        CHECK_EQ(n, k + 1);
+        CHECK(fa_monotonic_ns() - t0 < 500000000LL);   /* not the one-second safety net */
+    }
+    fa_stream_close(s);
+    rec_free(&rec);
+}
+
+/* An engine whose event thread sleeps shuts down at once. */
+static void test_engine_destroy_wakes(void)
+{
+    fa_engine_config cfg;
+    fa_engine* e = NULL;
+    int64_t t0;
+    fa_engine_config_init(&cfg);
+    cfg.flags = FA_ENGINE_NULL_OUTPUT;
+    cfg.worker_threads = 1;
+    CHECK_EQ(fa_engine_create(&cfg, &e), FA_OK);
+    if (!wait_asleep(&e->event_wake)) { fa_engine_destroy(e); CHECK(0); }
+    t0 = fa_monotonic_ns();
+    fa_engine_destroy(e);
+    CHECK(fa_monotonic_ns() - t0 < 500000000LL);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -1927,6 +2026,9 @@ int main(void)
     printf("null device at %u Hz (not started: this test is the audio thread)\n", g_dev->rate);
 
     RUN(test_ring_wraps);
+    RUN(test_wake);
+    RUN(test_event_thread_wakes);
+    RUN(test_engine_destroy_wakes);
     RUN(test_curves);
     RUN(test_mix_is_bit_exact);
     RUN(test_seek_while_attached);

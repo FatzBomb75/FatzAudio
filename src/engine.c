@@ -323,8 +323,8 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
     fa_store32(&e->limiter_mode, FA_LIMITER_AUTO);
     fa_store_float(&e->limiter_ceiling, -1.0f);
     if (fa_mutex_init(&e->list_lock) != 0 || fa_mutex_init(&e->system_soundfont_lock) != 0 || fa_cond_init(&e->work_cond) != 0 ||
-        fa_cond_init(&e->event_cond) != 0) {
-        fa_cond_destroy(&e->event_cond); fa_cond_destroy(&e->work_cond); fa_mutex_destroy(&e->list_lock);
+        fa_wake_init(&e->event_wake) != 0) {
+        fa_wake_destroy(&e->event_wake); fa_cond_destroy(&e->work_cond); fa_mutex_destroy(&e->list_lock);
         fa_mutex_destroy(&e->system_soundfont_lock);
         fa_cond_destroy(&e->scan_cond); fa_mutex_destroy(&e->scan_lock);
         ma_mutex_uninit(&e->lock);
@@ -338,7 +338,7 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
         r = ma_context_init(NULL, 0, NULL, &e->context);
     }
     if (r != MA_SUCCESS) {
-        fa_cond_destroy(&e->event_cond); fa_cond_destroy(&e->work_cond); fa_mutex_destroy(&e->list_lock);
+        fa_wake_destroy(&e->event_wake); fa_cond_destroy(&e->work_cond); fa_mutex_destroy(&e->list_lock);
         fa_mutex_destroy(&e->system_soundfont_lock);
         fa_cond_destroy(&e->scan_cond); fa_mutex_destroy(&e->scan_lock);
         ma_mutex_uninit(&e->lock);
@@ -367,7 +367,7 @@ void fa_engine_free(fa_engine* e)
     ma_mutex_uninit(&e->lock);
     fa_cond_destroy(&e->scan_cond);
     fa_mutex_destroy(&e->scan_lock);
-    fa_cond_destroy(&e->event_cond);
+    fa_wake_destroy(&e->event_wake);
     fa_cond_destroy(&e->work_cond);
     fa_mutex_destroy(&e->list_lock);
     fa_mutex_destroy(&e->system_soundfont_lock);
@@ -392,7 +392,7 @@ FA_API void FA_CALL fa_engine_destroy(fa_engine* engine)
     fa_mutex_lock(&engine->list_lock);
     if (on_event_thread) engine->destroy_on_event_thread = 1;
     fa_cond_broadcast(&engine->work_cond);
-    fa_cond_broadcast(&engine->event_cond);
+    fa_wake_signal(&engine->event_wake);
     fa_mutex_unlock(&engine->list_lock);
     for (i = 0; i < engine->worker_count; i++) fa_thread_join(&engine->workers[i]);
     fa_scan_shutdown(engine);

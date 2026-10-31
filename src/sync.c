@@ -34,8 +34,9 @@ void fa_mixer_wake(struct fa_mixer* m, int64_t at)
     for (;;) {
         int64_t t = fa_load64(&dev->mixer_tick_at);
         if (t != 0 && t <= at) return;
-        if (fa_cas64(&dev->mixer_tick_at, t, at)) return;
+        if (fa_cas64(&dev->mixer_tick_at, t, at)) break;
     }
+    fa_wake_signal(&dev->engine->event_wake);   /* sooner than it planned to look */
 }
 
 /* ---- grids ---------------------------------------------------------------------- */

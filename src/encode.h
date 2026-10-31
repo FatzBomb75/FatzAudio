@@ -98,6 +98,8 @@ typedef struct fa_enc_list {
 void fa_encode_push(struct fa_encoder* e, const float* frames, int64_t count, uint32_t rate);
 /* Audio thread: frames for an encoder that cannot take them (lost). */
 void fa_encode_drop(struct fa_encoder* e, int64_t count);
+/* Tests: the wake-up the encoder thread sleeps on. */
+fa_wake* fa_encode_wake(struct fa_encoder* e);
 
 /* The device or stream is going away: its encoders lose their source. Called at the
  * very start of fa_device_close / fa_stream_close, holding no locks. */

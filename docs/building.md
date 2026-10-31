@@ -33,6 +33,11 @@ C library (`libc`, `libm`), whatever GCC version built it. On Linux only the
 cannot clash with the app's. The `deps` test checks both on Windows and Linux.
 MinGW builds name the library `fatzaudio.dll`, like Visual Studio.
 
+Release and MinSizeRel builds use link-time optimization across FatzAudio and the
+codecs it carries (`FA_LTO`, on by default; `-DFA_LTO=OFF` turns it off, for example
+to profile), and MSVC also compiles with `/Gw` so unused tables are dropped like
+unused functions. Debug builds, and the sanitizer and fuzz builds, are unaffected.
+
 ## NuGet package and versions
 
 CI builds the NuGet package `FatzAudio` on every run, from the `win-x64` and
