@@ -91,11 +91,13 @@ static int parse_range(const char* s, int64_t* len, int64_t* off)
 void fa_hls_playlist_free(fa_hls_playlist* p)
 {
     int i;
-    for (i = 0; i < p->variant_count; i++) { free(p->variant_uri[i]); free(p->variant_codecs[i]); }
+    for (i = 0; i < p->variant_count; i++) { free(p->variant_uri[i]); free(p->variant_codecs[i]); free(p->variant_audio[i]); }
     free(p->variant_uri);
     free(p->variant_bandwidth);
     free(p->variant_codecs);
-    free(p->audio_group_uri);
+    free(p->variant_audio);
+    for (i = 0; i < p->rendition_count; i++) { free(p->renditions[i].group); free(p->renditions[i].uri); }
+    free(p->renditions);
     for (i = 0; i < p->segment_count; i++) {
         free(p->segments[i].uri);
         free(p->segments[i].key_uri);
@@ -110,12 +112,13 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
     const char* line = text;
     const char* end = text + n;
     char tmp[FA_NET_URL_MAX], resolved[FA_NET_URL_MAX];
-    int seg_cap = 0, var_cap = 0;
+    int seg_cap = 0, var_cap = 0, ren_cap = 0;
     /* State carried to the next URI line. */
     double extinf = -1.0;
-    int pending_variant = 0, discontinuity = 0, key_method = 0, has_iv = 0, audio_default = 0;
+    int pending_variant = 0, discontinuity = 0, key_method = 0, has_iv = 0;
     uint32_t bandwidth = 0;
     char* codecs = NULL;
+    char* audio_group = NULL;
     char* key_uri = NULL;
     char* map_uri = NULL;
     int64_t map_off = 0, map_len = -1;
@@ -154,17 +157,29 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
                 bandwidth = attr(tmp + 18, "BANDWIDTH", v, sizeof(v)) ? (uint32_t)strtoul(v, NULL, 10) : 0;
                 free(codecs);
                 codecs = attr(tmp + 18, "CODECS", v, sizeof(v)) ? fa_strdup(v) : NULL;
+                free(audio_group);
+                audio_group = attr(tmp + 18, "AUDIO", v, sizeof(v)) ? fa_strdup(v) : NULL;
             } else if (strncmp(tmp, "#EXT-X-MEDIA:", 13) == 0) {
-                char type[32], uri[FA_NET_URL_MAX], def[8];
+                char type[32], uri[FA_NET_URL_MAX], v[256];
                 out->is_master = 1;
-                if (attr(tmp + 13, "TYPE", type, sizeof(type)) && strcmp(type, "AUDIO") == 0 &&
-                    attr(tmp + 13, "URI", uri, sizeof(uri)) && fa_url_resolve(base, uri, resolved, sizeof(resolved)) == FA_OK) {
-                    int is_default = attr(tmp + 13, "DEFAULT", def, sizeof(def)) && strcmp(def, "YES") == 0;
-                    if (!out->audio_group_uri || (is_default && !audio_default)) {
-                        free(out->audio_group_uri);
-                        out->audio_group_uri = fa_strdup(resolved);
-                        audio_default = is_default;
+                if (attr(tmp + 13, "TYPE", type, sizeof(type)) && strcmp(type, "AUDIO") == 0) {
+                    fa_hls_rendition* ren;
+                    if (out->rendition_count == ren_cap) {
+                        int cap = ren_cap ? ren_cap * 2 : 8;
+                        fa_hls_rendition* nr = (fa_hls_rendition*)realloc(out->renditions, sizeof(*nr) * (size_t)cap);
+                        if (!nr) { r = FA_ERROR_OUT_OF_MEMORY; break; }
+                        out->renditions = nr;
+                        ren_cap = cap;
                     }
+                    ren = &out->renditions[out->rendition_count];
+                    memset(ren, 0, sizeof(*ren));
+                    ren->group = fa_strdup(attr(tmp + 13, "GROUP-ID", v, sizeof(v)) ? v : "");
+                    if (attr(tmp + 13, "URI", uri, sizeof(uri)) && fa_url_resolve(base, uri, resolved, sizeof(resolved)) == FA_OK)
+                        ren->uri = fa_strdup(resolved);
+                    ren->is_default = attr(tmp + 13, "DEFAULT", v, sizeof(v)) && strcmp(v, "YES") == 0;
+                    ren->autoselect = attr(tmp + 13, "AUTOSELECT", v, sizeof(v)) && strcmp(v, "YES") == 0;
+                    if (!ren->group) { free(ren->uri); r = FA_ERROR_OUT_OF_MEMORY; break; }
+                    out->rendition_count++;
                 }
             } else if (strncmp(tmp, "#EXTINF:", 8) == 0) {
                 extinf = atof(tmp + 8);
@@ -224,6 +239,7 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
                 char** u = (char**)realloc(out->variant_uri, sizeof(char*) * (size_t)cap);
                 uint32_t* b;
                 char** c;
+                char** a;
                 if (!u) { r = FA_ERROR_OUT_OF_MEMORY; break; }
                 out->variant_uri = u;
                 b = (uint32_t*)realloc(out->variant_bandwidth, sizeof(uint32_t) * (size_t)cap);
@@ -232,12 +248,17 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
                 c = (char**)realloc(out->variant_codecs, sizeof(char*) * (size_t)cap);
                 if (!c) { r = FA_ERROR_OUT_OF_MEMORY; break; }
                 out->variant_codecs = c;
+                a = (char**)realloc(out->variant_audio, sizeof(char*) * (size_t)cap);
+                if (!a) { r = FA_ERROR_OUT_OF_MEMORY; break; }
+                out->variant_audio = a;
                 var_cap = cap;
             }
             out->variant_uri[out->variant_count] = fa_strdup(resolved);
             out->variant_bandwidth[out->variant_count] = bandwidth;
             out->variant_codecs[out->variant_count] = codecs;
+            out->variant_audio[out->variant_count] = audio_group;
             codecs = NULL;
+            audio_group = NULL;
             out->variant_count++;
             pending_variant = 0;
             continue;
@@ -275,6 +296,7 @@ fa_result fa_hls_parse(const char* text, size_t n, const char* base, fa_hls_play
         }
     }
     free(codecs);
+    free(audio_group);
     free(key_uri);
     free(map_uri);
     out->total_duration = t;
@@ -301,6 +323,20 @@ int fa_hls_pick_variant(const fa_hls_playlist* p, uint32_t max_bw)
         if (best < 0 || bw > p->variant_bandwidth[best]) best = i;
     }
     return best >= 0 ? best : lowest;
+}
+
+const char* fa_hls_audio_uri(const fa_hls_playlist* p, int v)
+{
+    const char* group = v >= 0 && v < p->variant_count ? p->variant_audio[v] : NULL;
+    int i, pick = -1, rank = -1;
+    if (v >= 0 && !group) return NULL;
+    for (i = 0; i < p->rendition_count; i++) {
+        const fa_hls_rendition* ren = &p->renditions[i];
+        int k = ren->is_default ? 2 : ren->autoselect && group ? 1 : 0;
+        if (group ? strcmp(ren->group, group) != 0 : !ren->uri) continue;
+        if (k > rank) { pick = i; rank = k; }
+    }
+    return pick >= 0 ? p->renditions[pick].uri : NULL;
 }
 
 /* ---- MPEG-TS ------------------------------------------------------------------ */
@@ -829,7 +865,8 @@ fa_result fa_hls_run(fa_net* n, const char* text, size_t len, const char* url)
     if (r != FA_OK) { free(h); return r; }
     if (top.is_master) {
         int v = fa_hls_pick_variant(&top, n->cfg.hls_max_bandwidth);
-        if (top.audio_group_uri) snprintf(h->media_url, sizeof(h->media_url), "%s", top.audio_group_uri);
+        const char* audio = fa_hls_audio_uri(&top, v);
+        if (audio) snprintf(h->media_url, sizeof(h->media_url), "%s", audio);
         else if (v >= 0) snprintf(h->media_url, sizeof(h->media_url), "%s", top.variant_uri[v]);
         fa_hls_playlist_free(&top);
         if (!h->media_url[0]) { free(h); return FA_ERROR_UNSUPPORTED_FORMAT; }

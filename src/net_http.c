@@ -222,6 +222,7 @@ fa_result fa_http_each_header(const fa_http_request* req, const fa_url* url, fa_
     const char* own[6][2];
     char range[48], auth[512];
     char* app = NULL;
+    char* jar = NULL;
     size_t napp = 0, nown = 0, i, j;
     fa_result r = FA_OK;
     if (req->headers && req->headers[0]) {
@@ -229,6 +230,7 @@ fa_result fa_http_each_header(const fa_http_request* req, const fa_url* url, fa_
         if (!app) return FA_ERROR_OUT_OF_MEMORY;
         napp = parse_app_headers(req->headers, app, req->other_origin);
     }
+    if (req->cookies) jar = fa_http_cookies_for(req->cookies, req->url);   /* NULL also when out of memory: sent without */
     if (req->user_agent) { own[nown][0] = "User-Agent"; own[nown++][1] = req->user_agent; }
     own[nown][0] = "Accept"; own[nown++][1] = "*/*";
     /* The bytes as the server stores them: byte ranges and offsets must match. */
@@ -264,25 +266,51 @@ fa_result fa_http_each_header(const fa_http_request* req, const fa_url* url, fa_
             const char* name = p;
             const char* value = p + strlen(p) + 1;
             p = value + strlen(value) + 1;
+            if (jar && same_name(name, "Cookie")) {
+                /* One Cookie line: the app's cookies, then the servers'. */
+                size_t lv = strlen(value), lj = strlen(jar);
+                char* both = (char*)malloc(lv + lj + 3);
+                if (!both) { r = FA_ERROR_OUT_OF_MEMORY; break; }
+                memcpy(both, value, lv);
+                memcpy(both + lv, "; ", 2);
+                memcpy(both + lv + 2, jar, lj + 1);
+                if (lv + lj + 2 <= FA_HTTP_LINE_MAX && add(user, name, both)) r = FA_ERROR_OUT_OF_MEMORY;
+                else if (lv + lj + 2 > FA_HTTP_LINE_MAX && add(user, name, value)) r = FA_ERROR_OUT_OF_MEMORY;
+                free(both);
+                free(jar);
+                jar = NULL;
+                continue;
+            }
             if (add(user, name, value)) r = FA_ERROR_OUT_OF_MEMORY;
         }
     }
+    /* Too long a line is left out, as on the joined line above. */
+    if (r == FA_OK && jar && strlen(jar) <= FA_HTTP_LINE_MAX && add(user, "Cookie", jar)) r = FA_ERROR_OUT_OF_MEMORY;
+    free(jar);
     free(app);
     return r;
 }
 
 /* ---- redirects ------------------------------------------------------------------- */
 
-int fa_http_redirect_target(const char* url, int status, const char* headers, char** out)
+int fa_http_redirect_target(const fa_http_request* req, int status, const char* headers, char** out)
 {
     char loc[FA_NET_URL_MAX];
     *out = NULL;
     if (status != 301 && status != 302 && status != 303 && status != 307 && status != 308) return 0;
     if (!fa_http_header(headers, "Location", loc, sizeof(loc))) return 0;   /* delivered as it is */
+    /* A login redirect often sets the session cookie the next hop wants. */
+    if (req->cookies) fa_http_cookies_take(req->cookies, req->url, headers);
     *out = (char*)malloc(FA_NET_URL_MAX);
     if (!*out) return -1;
-    if (fa_url_resolve(url, loc, *out, FA_NET_URL_MAX) != FA_OK) { free(*out); *out = NULL; return -1; }
+    if (fa_url_resolve(req->url, loc, *out, FA_NET_URL_MAX) != FA_OK) { free(*out); *out = NULL; return -1; }
     return 1;
+}
+
+int fa_http_unframed(const char* headers)
+{
+    char v[64];
+    return !fa_http_header(headers, "Content-Length", v, sizeof(v)) && !fa_http_header(headers, "Transfer-Encoding", v, sizeof(v));
 }
 
 static int same_origin(const fa_url* a, const fa_url* b)
@@ -344,19 +372,99 @@ static int wait_socket(fa_socket s, int write)
     return FD_ISSET(s, &set) ? 1 : -1;
 }
 
-static fa_result connect_to(const fa_http_request* req, const char* host, uint16_t port, fa_socket* out)
-{
-    struct addrinfo hints, *res = NULL, *ai;
+/* ---- resolving ------------------------------------------------------------------ */
+
+void (*fa_net_test_resolve_hook)(const char* host);
+
+/* getaddrinfo can't be cancelled, so it runs on a detached helper thread: a close
+ * (or a timeout) leaves it behind instead of waiting for it. The caller and the
+ * helper each hold a reference; the last one to let go frees the lookup. */
+typedef struct resolve_job {
+    fa_atomic32 refs;
+    fa_mutex lock;
+    fa_cond cond;
+    int done;
+    int status;               /* getaddrinfo's */
+    struct addrinfo* res;
     char service[8];
-    fa_result result = FA_ERROR_NETWORK;
-    *out = FA_BAD_SOCKET;
-    if (net_startup() != 0) return FA_ERROR_NETWORK;
+    char host[sizeof(((fa_url*)0)->host)];
+} resolve_job;
+
+static void resolve_release(resolve_job* j)
+{
+    if (fa_fetch_add32(&j->refs, -1) != 1) return;
+    if (j->res) freeaddrinfo(j->res);
+    fa_cond_destroy(&j->cond);
+    fa_mutex_destroy(&j->lock);
+    free(j);
+}
+
+static void resolve_main(void* arg)
+{
+    resolve_job* j = (resolve_job*)arg;
+    struct addrinfo hints, *res = NULL;
+    int status;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_protocol = IPPROTO_TCP;
-    snprintf(service, sizeof(service), "%u", (unsigned)port);
-    if (getaddrinfo(host, service, &hints, &res) != 0 || !res) return FA_ERROR_NETWORK;
+    if (fa_net_test_resolve_hook) fa_net_test_resolve_hook(j->host);
+    status = getaddrinfo(j->host, j->service, &hints, &res);
+    fa_mutex_lock(&j->lock);
+    j->status = status;
+    j->res = status == 0 ? res : NULL;
+    j->done = 1;
+    fa_cond_broadcast(&j->cond);
+    fa_mutex_unlock(&j->lock);
+    resolve_release(j);
+}
+
+/* The addresses of host:port, or FA_ERROR_BUSY when `cancel` was raised and
+ * FA_ERROR_NETWORK when the lookup failed or took longer than the timeout. On FA_OK
+ * the caller frees *out_job (resolve_release) when done with *out_res. */
+static fa_result resolve(const fa_http_request* req, const char* host, uint16_t port, resolve_job** out_job,
+                         struct addrinfo** out_res)
+{
+    resolve_job* j = (resolve_job*)calloc(1, sizeof(*j));
+    fa_thread t;
+    int64_t deadline = fa_monotonic_ns() + (int64_t)req->timeout_ms * 1000000;
+    fa_result r;
+    *out_job = NULL;
+    *out_res = NULL;
+    if (!j) return FA_ERROR_OUT_OF_MEMORY;
+    if (strlen(host) >= sizeof(j->host)) { free(j); return FA_ERROR_NETWORK; }
+    if (fa_mutex_init(&j->lock) != 0) { free(j); return FA_ERROR_OUT_OF_MEMORY; }
+    if (fa_cond_init(&j->cond) != 0) { fa_mutex_destroy(&j->lock); free(j); return FA_ERROR_OUT_OF_MEMORY; }
+    strcpy(j->host, host);
+    snprintf(j->service, sizeof(j->service), "%u", (unsigned)port);
+    fa_store32(&j->refs, 2);
+    if (fa_thread_create(&t, resolve_main, j) != 0) {
+        fa_store32(&j->refs, 1);
+        resolve_release(j);
+        return FA_ERROR_GENERIC;
+    }
+    fa_thread_detach(&t);
+    fa_mutex_lock(&j->lock);
+    /* Short slices: nothing wakes this wait on a close but the flag. */
+    while (!j->done && !cancelled(req) && fa_monotonic_ns() < deadline) fa_cond_wait_ms(&j->cond, &j->lock, 10);
+    r = j->done ? (j->status == 0 && j->res ? FA_OK : FA_ERROR_NETWORK) : cancelled(req) ? FA_ERROR_BUSY : FA_ERROR_NETWORK;
+    fa_mutex_unlock(&j->lock);
+    if (r != FA_OK) { resolve_release(j); return r; }
+    *out_job = j;
+    *out_res = j->res;
+    return FA_OK;
+}
+
+static fa_result connect_to(const fa_http_request* req, const char* host, uint16_t port, fa_socket* out)
+{
+    struct addrinfo *res = NULL, *ai;
+    resolve_job* job;
+    fa_result result;
+    *out = FA_BAD_SOCKET;
+    if (net_startup() != 0) return FA_ERROR_NETWORK;
+    result = resolve(req, host, port, &job, &res);
+    if (result != FA_OK) return result;
+    result = FA_ERROR_NETWORK;
     for (ai = res; ai; ai = ai->ai_next) {
         fa_socket s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         uint32_t waited = 0;
@@ -386,7 +494,7 @@ static fa_result connect_to(const fa_http_request* req, const char* host, uint16
         fa_closesocket(s);
         if (cancelled(req)) { result = FA_ERROR_BUSY; break; }
     }
-    freeaddrinfo(res);
+    resolve_release(job);
     return result;
 }
 
@@ -496,7 +604,14 @@ static int add_text_line(void* user, const char* name, const char* value)
 {
     text_sink* t = (text_sink*)user;
     size_t ln = strlen(name), lv = strlen(value);
-    if (t->n + ln + lv + 7 > t->cap) return 1;   /* + ": ", CRLF, and the blank line's CRLF and NUL */
+    if (t->n + ln + lv + 7 > t->cap) {   /* + ": ", CRLF, and the blank line's CRLF and NUL */
+        /* Grows for lines not counted up front (the cookie jar's Cookie line). */
+        size_t cap = (t->n + ln + lv + 7) * 2;
+        char* p = (char*)realloc(t->buf, cap);
+        if (!p) return 1;
+        t->buf = p;
+        t->cap = cap;
+    }
     memcpy(t->buf + t->n, name, ln);
     memcpy(t->buf + t->n + ln, ": ", 2);
     memcpy(t->buf + t->n + ln + 2, value, lv);
@@ -551,6 +666,8 @@ fa_result fa_http_fetch_socket(const fa_http_request* req, fa_http_head_proc on_
         sink.n = (size_t)n;
         sink.cap = req_cap;
         r = fa_http_each_header(req, &url, add_text_line, &sink);
+        request = sink.buf;
+        req_cap = sink.cap;
         if (r != FA_OK) goto done;
         n = (int)sink.n;
     }
@@ -592,7 +709,7 @@ fa_result fa_http_fetch_socket(const fa_http_request* req, fa_http_head_proc on_
             resp.final_url = req->url;
             fa_http_fill_lengths(&resp);
 
-            switch (fa_http_redirect_target(req->url, status, lines, out_redirect)) {
+            switch (fa_http_redirect_target(req, status, lines, out_redirect)) {
             case 1: r = FA_OK; goto done;          /* the connection closes: its body doesn't matter */
             case -1: r = FA_ERROR_NETWORK; goto done;
             default: break;
@@ -615,6 +732,7 @@ fa_result fa_http_fetch_socket(const fa_http_request* req, fa_http_head_proc on_
                     if (got2 == 0) {
                         /* Closed: complete only if no length was promised. */
                         r = (body.chunked || body.left > 0) ? FA_ERROR_NETWORK : FA_OK;
+                        if (r == FA_OK && req->closed_end) *req->closed_end = 1;
                         goto done;
                     }
                     fr = body_feed(&body, head, (size_t)got2, on_data, user);
@@ -640,17 +758,50 @@ int64_t fa_http_range_skip(const fa_http_response* resp, int64_t offset, int any
     return -1;
 }
 
+/* fa_http_fetch's callbacks when the request has a cookie jar: the response's
+ * cookies are kept, then the caller's callbacks run. */
+typedef struct cookie_wrap {
+    const fa_http_request* req;   /* the hop being fetched */
+    fa_http_head_proc on_head;
+    fa_http_data_proc on_data;
+    void* user;
+} cookie_wrap;
+
+static int cookie_head_proc(void* user, const fa_http_response* resp)
+{
+    cookie_wrap* w = (cookie_wrap*)user;
+    fa_http_cookies_take(w->req->cookies, w->req->url, resp->headers);
+    return w->on_head ? w->on_head(w->user, resp) : 0;
+}
+
+static int cookie_data_proc(void* user, const uint8_t* data, size_t n)
+{
+    cookie_wrap* w = (cookie_wrap*)user;
+    return w->on_data(w->user, data, n);
+}
+
 fa_result fa_http_fetch(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user)
 {
     fa_http_request cur = *req;
     char* owned = NULL;
     fa_url first, app;
+    cookie_wrap cw;
     int hops;
     fa_result r = FA_ERROR_NETWORK;
     if (fa_url_parse(req->url, &first) != FA_OK) return FA_ERROR_INVALID_ARG;
     if (!req->app_origin) app = first;
     else if (fa_url_parse(req->app_origin, &app) != FA_OK) memset(&app, 0, sizeof(app));   /* matches nothing */
     cur.other_origin = !same_origin(&app, &first);
+    if (req->closed_end) *req->closed_end = 0;
+    if (req->cookies) {
+        cw.req = &cur;
+        cw.on_head = on_head;
+        cw.on_data = on_data;
+        cw.user = user;
+        on_head = cookie_head_proc;
+        on_data = cookie_data_proc;
+        user = &cw;
+    }
     for (hops = 0; hops <= FA_NET_MAX_REDIRECTS; hops++) {
         fa_url u;
         char* next = NULL;

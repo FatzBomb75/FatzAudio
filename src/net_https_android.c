@@ -433,8 +433,9 @@ static fa_result run_response(JNIEnv* env, const fa_http_request* req, const cha
     jbyteArray buf;
     jbyte* chunk;
     fa_result r = FA_OK;
+    int unframed;
     if (!headers) return head_err;
-    switch (fa_http_redirect_target(url, status, headers, out_redirect)) {
+    switch (fa_http_redirect_target(req, status, headers, out_redirect)) {
     case 1: free(headers); return FA_OK;     /* its body is left unread: the connection closes */
     case -1: free(headers); return FA_ERROR_NETWORK;
     default: break;
@@ -445,6 +446,7 @@ static fa_result run_response(JNIEnv* env, const fa_http_request* req, const cha
     resp.final_url = url;
     fa_http_fill_lengths(&resp);
     if (on_head && on_head(user, &resp)) { free(headers); return FA_OK; }
+    unframed = fa_http_unframed(headers);
     free(headers);
     if (status >= 400) return FA_ERROR_NOT_FOUND;
 
@@ -458,7 +460,14 @@ static fa_result run_response(JNIEnv* env, const fa_http_request* req, const cha
         if (req->cancel && fa_load32(req->cancel)) { r = FA_ERROR_BUSY; break; }
         got = (*env)->CallIntMethod(env, in, J.read, buf, 0, 65536);
         if (clear_exception(env)) { r = FA_ERROR_NETWORK; break; }   /* also a body cut short */
-        if (got < 0) { r = FA_OK; *out_whole = 1; break; }
+        if (got < 0) {
+            /* A short body or a chunked one without its end throws above. The
+             * platform's HttpURLConnection speaks HTTP/1.1. */
+            r = FA_OK;
+            *out_whole = 1;
+            if (req->closed_end && unframed) *req->closed_end = 1;
+            break;
+        }
         if (got == 0) continue;
         (*env)->GetByteArrayRegion(env, buf, 0, got, chunk);
         if (on_data(user, (const uint8_t*)chunk, (size_t)got)) { r = FA_OK; break; }
