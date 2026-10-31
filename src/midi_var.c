@@ -43,7 +43,7 @@
 enum {
     FAM_OFF, FAM_THRU, FAM_REVERB, FAM_CHORUS, FAM_GS_DELAY, FAM_LCR, FAM_LR, FAM_ECHO, FAM_CROSS, FAM_KARAOKE,
     FAM_ER, FAM_GATE, FAM_RGATE, FAM_ROTARY, FAM_TREMOLO, FAM_AUTOPAN, FAM_PHASER, FAM_DIST, FAM_OD, FAM_AMP,
-    FAM_EQ3, FAM_EQ2, FAM_WAH
+    FAM_EQ3, FAM_EQ2, FAM_WAH, FAM_EFX
 };
 enum { IN_STEREO, IN_MONO, IN_LEFT, IN_RIGHT };
 
@@ -82,6 +82,7 @@ static const var_type var_types[] = {
     { 0x42, 0, FAM_CHORUS, { 12, 32, 64, 0, 0, 0, 0, 0, 0, 64 } },    /* Celeste 1-3 */
     { 0x42, 1, FAM_CHORUS, { 28, 18, 90, 2, 0, 0, 0, 0, 0, 64 } },
     { 0x42, 2, FAM_CHORUS, { 4, 63, 44, 2, 0, 0, 0, 0, 0, 64 } },
+    { 0x42, 8, FAM_CHORUS, { 8, 40, 64, 4, 0, 0, 0, 0, 0, 64 } },     /* Celeste 4 (MU100) */
     { 0x43, 0, FAM_CHORUS, { 14, 14, 104, 2, 0, 0, 0, 0, 0, 64 } },   /* Flanger 1-3 */
     { 0x43, 1, FAM_CHORUS, { 32, 17, 26, 2, 0, 0, 0, 0, 0, 64 } },
     { 0x43, 8, FAM_CHORUS, { 4, 109, 109, 2, 0, 0, 0, 0, 0, 64 } },
@@ -91,6 +92,7 @@ static const var_type var_types[] = {
     { 0x47, 0, FAM_AUTOPAN, { 76, 80, 32, 5, 0, 0, 0, 0, 0, 64 } },
     { 0x48, 0, FAM_PHASER, { 8, 111, 74, 104, 0, 0, 0, 0, 0, 64 } },  /* Phaser 1, 2 */
     { 0x48, 1, FAM_PHASER, { 8, 111, 74, 108, 0, 0, 0, 0, 0, 64 } },
+    { 0x48, 8, FAM_PHASER, { 8, 111, 74, 108, 0, 0, 0, 0, 0, 64 } },  /* Phaser 2 as the MU100 numbers it */
     { 0x49, 0, FAM_DIST, { 40, 20, 72, 53, 48, 0, 43, 74, 10, 127, 120 } },
     { 0x4A, 0, FAM_OD, { 29, 24, 68, 45, 55, 0, 41, 72, 10, 127, 104 } },
     { 0x4B, 0, FAM_AMP, { 39, 1, 48, 55, 0, 0, 0, 0, 0, 127, 112 } },
@@ -120,6 +122,10 @@ struct fa_midi_var {
     uint32_t rate;
     int family, msb, lsb;
     int p[16];                  /* XG parameters 1-16 */
+    int pe[16];                 /* the same with the controllers (MW, bend, ...) on the controlled one */
+    float ctl;                  /* the controllers' sum, -1..1 of the range */
+    fa_midi_efx* efx;           /* FAM_EFX: the MU100 types and the GS EFX (midi_efx.c) */
+    int gs_efx, efx_msb, efx_lsb, efx_on;
     uint8_t gs[11];             /* GS delay 40 01 50-5A */
     /* Delays, reflections, rotary: the lines (stereo, made when first needed). */
     float* line[2];
@@ -174,8 +180,8 @@ float fa_xg_feedback(int v)
 }
 
 /* EQ frequency (table #3): 20 Hz to 20 kHz in sixth-octave steps (0..60). */
-static double eq_hz(int v) { return 20.0 * pow(2.0, (v < 0 ? 0 : v > 60 ? 60 : v) / 6.0); }
-static double eq_db(int v) { return v < 52 ? -12.0 : v > 76 ? 12.0 : v - 64; }
+double fa_xg_eq_hz(int v) { return 20.0 * pow(2.0, (v < 0 ? 0 : v > 60 ? 60 : v) / 6.0); }
+double fa_xg_eq_db(int v) { return v < 52 ? -12.0 : v > 76 ? 12.0 : v - 64; }
 
 /* GS delay time center (40 01 52): 0.1 to 1000 ms, in steps that grow with the time. */
 static double gs_delay_ms(int v)
@@ -208,6 +214,7 @@ void fa_midi_var_free(fa_midi_var* v)
     if (!v) return;
     free(v->line[0]);
     fa_midi_fx_free(v->sub);
+    fa_midi_efx_free(v->efx);
     free(v);
 }
 
@@ -226,6 +233,7 @@ void fa_midi_var_reset(fa_midi_var* v)
     v->soft = 0;
     v->idle = 1;
     if (v->sub) fa_midi_fx_reset(v->sub);
+    if (v->efx) fa_midi_efx_reset(v->efx);
 }
 
 /* The lines, made the first time a type that uses them has something to play. */
@@ -299,7 +307,7 @@ static const float er_time[6][12] = {
 /* The reflection and gate types: taps over a span the room size (0.1-7.0) sets. */
 static void taps_update(fa_midi_var* v)
 {
-    const int* p = v->p;
+    const int* p = v->pe;
     double size = 0.1 + (p[1] < 0 ? 0 : p[1] > 44 ? 44 : p[1]) * (6.9 / 44.0);
     double span = size * (v->family == FAM_ER ? 25.0 : 40.0), pre = fa_xg_mod_delay_ms(p[3]) + 1.0;
     int kind = p[0] < 0 || p[0] > 5 ? 0 : p[0], n = v->family == FAM_ER ? 12 : 16, i;
@@ -317,15 +325,36 @@ static void taps_update(fa_midi_var* v)
         add_tap(v, 0, t, i % 2 ? 0.4f * a : a, i % 2 ? a : 0.4f * a);
     }
     set_fb(v, 0, 0, pre + span, fa_xg_feedback(p[4]) * 0.5f);
-    v->pre_a = pole(v, p[6] >= 34 && p[6] < 60 ? eq_hz(p[6]) : 0.0);
-    v->hp_a = pole(v, p[5] > 0 && p[5] <= 52 ? eq_hz(p[5]) : 0.0);
+    v->pre_a = pole(v, p[6] >= 34 && p[6] < 60 ? fa_xg_eq_hz(p[6]) : 0.0);
+    v->hp_a = pole(v, p[5] > 0 && p[5] <= 52 ? fa_xg_eq_hz(p[5]) : 0.0);
+}
+
+/* The parameter the MW/bend/aftertouch/AC controllers move in insertion mode: the
+ * LFO frequency of the modulation types, the drive, the wah's cutoff, else dry/wet. */
+static int control_index(const fa_midi_var* v)
+{
+    switch (v->family) {
+    case FAM_CHORUS: case FAM_ROTARY: case FAM_TREMOLO: case FAM_AUTOPAN: case FAM_PHASER: case FAM_DIST: case FAM_OD: case FAM_AMP:
+        return 0;
+    case FAM_WAH:
+        return 2;
+    case FAM_GS_DELAY: case FAM_OFF: case FAM_EFX:
+        return -1;
+    default:
+        return 9;
+    }
 }
 
 /* Turns the parameters into the block's settings. */
 static void update(fa_midi_var* v)
 {
-    const int* p = v->p;
-    int i;
+    const int* p = v->pe;
+    int i, k = control_index(v);
+    for (i = 0; i < 16; i++) v->pe[i] = v->p[i];
+    if (k >= 0 && v->ctl != 0.0f) {
+        int x = (int)lrintf((float)v->p[k] + v->ctl * 127.0f);
+        v->pe[k] = x < 0 ? 0 : x > (v->p[k] > 127 ? 16383 : 127) ? (v->p[k] > 127 ? 16383 : 127) : x;
+    }
     v->ntaps = 0;
     v->nlines = 1;
     v->in_mode = IN_MONO;
@@ -360,7 +389,7 @@ static void update(fa_midi_var* v)
         if (v->family == FAM_PHASER) {
             v->base = (float)(100.0 * pow(2.0, p[2] * 4.0 / 127.0));
             v->fb = fa_xg_feedback(p[3]) * 0.9f;
-            v->stages = v->lsb == 1 ? 8 : 6;
+            v->stages = v->lsb ? 8 : 6;
         }
         if (v->family == FAM_WAH) {
             v->base = (float)(200.0 * pow(2.0, p[2] * 4.0 / 127.0));
@@ -372,24 +401,24 @@ static void update(fa_midi_var* v)
         v->drive = (float)pow(10.0, p[0] / 127.0 * 2.5);
         v->edge = (float)p[10] / 127.0f * (v->family == FAM_OD ? 0.5f : 1.0f);
         v->level = (float)(amp ? p[3] : p[4]) / 127.0f * 0.5f;
-        v->sec[v->nsec++] = fa_mixer_design(0, eq_hz(amp ? p[2] : p[3]), v->rate);
+        v->sec[v->nsec++] = fa_mixer_design(0, fa_xg_eq_hz(amp ? p[2] : p[3]), v->rate);
         if (amp) {
             static const double cab[4] = { 0.0, 3500.0, 2800.0, 2200.0 };   /* off, stack, combo, tube */
             if (p[1] > 0 && p[1] < 4) v->sec[v->nsec++] = fa_mixer_design(0, cab[p[1]], v->rate);
         } else {
-            v->sec[v->nsec++] = section(v, FA_EQ_LOW_SHELF, eq_hz(p[1]), 0.7071, eq_db(p[2]));
-            v->sec[v->nsec++] = section(v, FA_EQ_PEAK, eq_hz(p[6]), p[8] < 10 ? 1.0 : p[8] / 10.0, eq_db(p[7]));
+            v->sec[v->nsec++] = section(v, FA_EQ_LOW_SHELF, fa_xg_eq_hz(p[1]), 0.7071, fa_xg_eq_db(p[2]));
+            v->sec[v->nsec++] = section(v, FA_EQ_PEAK, fa_xg_eq_hz(p[6]), p[8] < 10 ? 1.0 : p[8] / 10.0, fa_xg_eq_db(p[7]));
         }
         return;
     }
     case FAM_EQ3:
-        v->sec[v->nsec++] = section(v, FA_EQ_LOW_SHELF, eq_hz(p[5]), 0.7071, eq_db(p[0]));
-        v->sec[v->nsec++] = section(v, FA_EQ_PEAK, eq_hz(p[1]), p[3] < 10 ? 1.0 : p[3] / 10.0, eq_db(p[2]));
-        v->sec[v->nsec++] = section(v, FA_EQ_HIGH_SHELF, eq_hz(p[6]), 0.7071, eq_db(p[4]));
+        v->sec[v->nsec++] = section(v, FA_EQ_LOW_SHELF, fa_xg_eq_hz(p[5]), 0.7071, fa_xg_eq_db(p[0]));
+        v->sec[v->nsec++] = section(v, FA_EQ_PEAK, fa_xg_eq_hz(p[1]), p[3] < 10 ? 1.0 : p[3] / 10.0, fa_xg_eq_db(p[2]));
+        v->sec[v->nsec++] = section(v, FA_EQ_HIGH_SHELF, fa_xg_eq_hz(p[6]), 0.7071, fa_xg_eq_db(p[4]));
         return;
     case FAM_EQ2:
-        v->sec[v->nsec++] = section(v, FA_EQ_LOW_SHELF, eq_hz(p[0]), 0.7071, eq_db(p[1]));
-        v->sec[v->nsec++] = section(v, FA_EQ_HIGH_SHELF, eq_hz(p[2]), 0.7071, eq_db(p[3]));
+        v->sec[v->nsec++] = section(v, FA_EQ_LOW_SHELF, fa_xg_eq_hz(p[0]), 0.7071, fa_xg_eq_db(p[1]));
+        v->sec[v->nsec++] = section(v, FA_EQ_HIGH_SHELF, fa_xg_eq_hz(p[2]), 0.7071, fa_xg_eq_db(p[3]));
         return;
     case FAM_OFF: case FAM_THRU:
         return;
@@ -452,8 +481,8 @@ static void update(fa_midi_var* v)
         double t = (p[0] + 1) * 3.0;   /* about 3 ms a step */
         add_tap(v, 0, t, 1.0f, 1.0f);
         set_fb(v, 0, 0, t, fa_xg_feedback(p[1]));
-        v->hp_a = pole(v, p[2] > 0 && p[2] <= 52 ? eq_hz(p[2]) : 0.0);
-        v->pre_a = pole(v, p[3] >= 34 && p[3] < 60 ? eq_hz(p[3]) : 0.0);
+        v->hp_a = pole(v, p[2] > 0 && p[2] <= 52 ? fa_xg_eq_hz(p[2]) : 0.0);
+        v->pre_a = pole(v, p[3] >= 34 && p[3] < 60 ? fa_xg_eq_hz(p[3]) : 0.0);
         break;
     }
     case FAM_ER: case FAM_GATE: case FAM_RGATE:
@@ -468,17 +497,38 @@ static void update(fa_midi_var* v)
     if (v->pos >= v->cap) v->pos = 0;
 }
 
+/* The MU100 types (and the GS EFX) are midi_efx.c's. */
+static int set_efx(fa_midi_var* v, int gs, int msb, int lsb)
+{
+    int i;
+    fa_midi_var_reset(v);
+    v->family = FAM_EFX;
+    v->gs_efx = gs;
+    v->msb = v->efx_msb = msb;
+    v->lsb = v->efx_lsb = lsb;
+    v->ctl = 0.0f;
+    if (!v->efx && !(v->efx = fa_midi_efx_new(v->rate))) { v->family = FAM_OFF; return v->efx_on = 0; }
+    v->efx_on = fa_midi_efx_set_type(v->efx, gs, msb, lsb);
+    for (i = 0; i < 16; i++) v->p[i] = v->pe[i] = fa_midi_efx_param(v->efx, i);
+    v->tail = 1;
+    return v->efx_on;
+}
+
 int fa_midi_var_set_type(fa_midi_var* v, int msb, int lsb)
 {
     const var_type* t = NULL;
     size_t i;
     if (!v) return 0;
+    if (fa_midi_efx_known(0, msb, lsb, 1)) return set_efx(v, 0, msb, lsb);
     for (i = 0; i < sizeof(var_types) / sizeof(var_types[0]); i++) {
         if (var_types[i].msb != msb) continue;
         if (var_types[i].lsb == lsb) { t = &var_types[i]; break; }
         if (var_types[i].lsb == 0 && !t) t = &var_types[i];
     }
+    if (!t && fa_midi_efx_known(0, msb, lsb, 0)) return set_efx(v, 0, msb, lsb);
     fa_midi_var_reset(v);
+    v->gs_efx = 0;
+    v->ctl = 0.0f;
     v->msb = msb;
     v->lsb = t ? t->lsb : 0;
     v->family = t ? t->family : FAM_OFF;
@@ -489,16 +539,46 @@ int fa_midi_var_set_type(fa_midi_var* v, int msb, int lsb)
 
 void fa_midi_var_set_param(fa_midi_var* v, int index, int value, int part)
 {
-    if (!v || index < 0 || index >= 16 || v->family == FAM_GS_DELAY) return;
+    if (!v || index < 0 || index >= 16 || v->family == FAM_GS_DELAY || (v->family == FAM_EFX && v->gs_efx)) return;
     if (part == 1) v->p[index] = (value & 0x7F) << 7 | (v->p[index] & 0x7F);
     else if (part == 2) v->p[index] = (v->p[index] & ~0x7F) | (value & 0x7F);
     else v->p[index] = value & 0x7F;
-    update(v);
+    if (v->family == FAM_EFX) fa_midi_efx_set_param(v->efx, index, v->p[index]);
+    else update(v);
 }
 
 int fa_midi_var_dry_wet(const fa_midi_var* v)
 {
-    return v && v->family != FAM_GS_DELAY ? v->p[9] : 64;
+    if (v && v->family == FAM_EFX) return fa_midi_efx_dry_wet(v->efx);
+    return v && v->family != FAM_GS_DELAY ? v->pe[9] : 64;
+}
+
+void fa_midi_var_control(fa_midi_var* v, int which, float amount)
+{
+    if (!v) return;
+    if (v->family == FAM_EFX) { fa_midi_efx_control(v->efx, which, amount); return; }
+    if (which != 2 || v->family == FAM_GS_DELAY || v->ctl == amount) return;
+    v->ctl = amount;
+    update(v);
+}
+
+int fa_midi_var_gs_efx(fa_midi_var* v, int addr, int value)
+{
+    if (!v || addr < 0x00 || addr > 0x16 || addr == 0x02) return v && v->family == FAM_EFX && v->gs_efx && v->efx_on;
+    value &= 0x7F;
+    if (addr == 0x00) return set_efx(v, 1, value, 0);
+    if (v->family != FAM_EFX || !v->gs_efx) set_efx(v, 1, 0, 0);   /* Thru */
+    if (addr == 0x01) return set_efx(v, 1, v->efx_msb, value);
+    fa_midi_efx_set_param(v->efx, addr - 3, value);
+    return v->efx_on;
+}
+
+int fa_midi_var_gs_efx_get(const fa_midi_var* v, int addr)
+{
+    if (!v || v->family != FAM_EFX || !v->gs_efx) return 0;
+    if (addr == 0x00) return v->efx_msb;
+    if (addr == 0x01) return v->efx_lsb;
+    return addr >= 0x03 && addr <= 0x16 ? fa_midi_efx_param(v->efx, addr - 3) : 0;
 }
 
 void fa_midi_var_gs(fa_midi_var* v, int addr, int value)
@@ -509,6 +589,7 @@ void fa_midi_var_gs(fa_midi_var* v, int addr, int value)
     if (v->family != FAM_GS_DELAY) {
         fa_midi_var_reset(v);
         v->family = FAM_GS_DELAY;
+        v->ctl = 0.0f;
         if (addr != 0x50) fa_midi_var_gs(v, 0x50, 0);
     }
     if (addr == 0x50) {
@@ -682,6 +763,7 @@ int fa_midi_var_process(fa_midi_var* v, const float* in, float* wet, int frames,
     float loud;
     int quiet;
     if (!v || frames <= 0 || v->family == FAM_OFF) return 0;
+    if (v->family == FAM_EFX) return fa_midi_efx_process(v->efx, in, wet, frames, song_frame);
     if (v->family == FAM_REVERB || v->family == FAM_CHORUS) {
         /* The nested effect keeps its own silence. */
         memset(wet, 0, (size_t)frames * 2 * sizeof(float));
