@@ -742,7 +742,7 @@ FA_API fa_result FA_CALL fa_stream_open_url(fa_engine* engine, const char* url, 
             r = stream_open_decoder(s, parsed.path, &o);
         }
     }
-    if (r == FA_OK) fa_net_set_sample_rate(s->net, s->decoder.format.sample_rate);
+    if (r == FA_OK) fa_net_set_sample_rate(s->net, s->decoder.format.sample_rate, s->decoder.length);
     if (r != FA_OK) { stream_discard(s); return r; }
     stream_opened(s);
     *out_stream = s;
