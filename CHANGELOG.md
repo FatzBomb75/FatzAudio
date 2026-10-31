@@ -245,6 +245,8 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Containers (extras step 23, no change for well-formed files): Matroska's EBML elements and MP4's boxes are read by one walker each (`src/walk.c`), shared by the demuxers and the tag reader; the ADTS header and the AudioSpecificConfig each have one parser (`fa_adts_parse`, `fa_aac_parse_asc` in aac.c), and an Ogg link's comments are parsed once. The system AAC decoders (Media Foundation, AudioToolbox, MediaCodec) lose their ADTS handling, which nothing reached: ADTS always plays through the built-in decoder. Malformed files can come out differently; see docs/engineering-notes.md.
+
 - AC-3 and E-AC-3 with more than two channels are mixed down to stereo with the stream's own centre, surround (and
   E-AC-3 LFE) levels and its Lo/Ro or Lt/Rt preference, as ETSI TS 102 366 describes, scaled so the mix cannot clip.
   Without normalization Dolby 5.1 therefore plays about 7.7 dB quieter than with the engine's generic downmix

@@ -13,6 +13,7 @@
  * specifications on id3.org. */
 #include "fa_internal.h"
 #include "cdg.h"
+#include "walk.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -738,17 +739,11 @@ static int mp4_next(fa_source* src, int64_t pos, int64_t end, mp4_box* b)
 {
     uint8_t h[16];
     uint64_t size;
-    int64_t hl = 8;
+    int hl;
     if (pos + 8 > end || fa_source_seek(src, pos) != FA_OK || !read_exact(src, h, 8)) return 0;
-    size = fa_be32(h);
-    b->type = fa_be32(h + 4);
-    if (size == 1) {
-        if (!read_exact(src, h + 8, 8)) return 0;
-        size = ((uint64_t)fa_be32(h + 8) << 32) | fa_be32(h + 12);
-        hl = 16;
-    } else if (size == 0) {
-        size = (uint64_t)(end - pos);
-    }
+    if (fa_be32(h) == 1 && !read_exact(src, h + 8, 8)) return 0;
+    if (!fa_mp4_box_header(h, sizeof(h), &b->type, &size, &hl)) return 0;
+    if (size == 0) size = (uint64_t)(end - pos);
     if (size < (uint64_t)hl || size > (uint64_t)(end - pos)) return 0;
     b->pos = pos;
     b->data = pos + hl;
@@ -782,17 +777,15 @@ static void mp4_key(uint32_t type, char* out)
 static void mp4_item(uint32_t type, const uint8_t* p, size_t n, fa_tag_sink* sink)
 {
     char key[260];
-    size_t pos = 0;
+    const uint8_t* cur = p;
+    fa_mp4_box a;
     mp4_key(type, key);
-    while (pos + 8 <= n) {
-        uint32_t size = fa_be32(p + pos), atom = fa_be32(p + pos + 4);
-        const uint8_t* d = p + pos + 8;
-        size_t dl;
-        if (size < 8 || size > n - pos) return;
-        dl = size - 8;
-        if (atom == FA_FOURCC('n', 'a', 'm', 'e') && dl >= 4) {
+    while (fa_mp4_next_box(&cur, p + n, &a)) {
+        const uint8_t* d = a.p;
+        size_t dl = a.len;
+        if (a.type == FA_FOURCC('n', 'a', 'm', 'e') && dl >= 4) {
             snprintf(key, sizeof(key), "%.*s", (int)(dl - 4 < 255 ? dl - 4 : 255), (const char*)(d + 4));
-        } else if (atom == FA_FOURCC('d', 'a', 't', 'a') && dl >= 8) {
+        } else if (a.type == FA_FOURCC('d', 'a', 't', 'a') && dl >= 8) {
             uint32_t dt = fa_be32(d) & 0xFFFFFF;
             const uint8_t* v = d + 8;
             size_t vl = dl - 8;
@@ -827,7 +820,6 @@ static void mp4_item(uint32_t type, const uint8_t* p, size_t n, fa_tag_sink* sin
                 sink->text(sink, FA_TAG_FORMAT_MP4, key, num);
             }
         }
-        pos += size;
     }
 }
 
@@ -956,7 +948,6 @@ static void read_aiff(fa_source* src, fa_tag_sink* sink)
 
 /* ---- Matroska ---------------------------------------------------------------------- */
 
-#define EBML_UNKNOWN (-1)
 #define MKV_SEGMENT 0x18538067u
 #define MKV_SEEKHEAD 0x114D9B74u
 #define MKV_SEEK 0x4DBBu
@@ -979,86 +970,45 @@ static void read_aiff(fa_source* src, fa_tag_sink* sink)
 #define MKV_FILEDATA 0x465Cu
 #define MKV_CLUSTER 0x1F43B675u
 
-typedef struct ebml_el {
+/* An element in the file: its data offset and size (-1 when not given). */
+typedef struct ebml_at {
     uint32_t id;
-    int64_t data, size;      /* size EBML_UNKNOWN when not given */
-} ebml_el;
+    int64_t data, size;
+} ebml_at;
 
 /* An element header at `pos`. */
-static int ebml_read(fa_source* src, int64_t pos, ebml_el* e)
+static int ebml_read(fa_source* src, int64_t pos, ebml_at* e)
 {
     uint8_t b[12];
-    int n, i, len;
     int64_t got;
-    uint64_t v;
+    size_t hl;
     if (fa_source_seek(src, pos) != FA_OK) return 0;
     got = fa_source_read(src, b, sizeof(b));
     if (got < 2) return 0;
-    for (len = 1; len <= 4 && !(b[0] & (0x80 >> (len - 1))); len++) {}
-    if (len > 4 || len >= got) return 0;
-    e->id = 0;
-    for (i = 0; i < len; i++) e->id = (e->id << 8) | b[i];
-    for (n = 1; n <= 8 && !(b[len] & (0x80 >> (n - 1))); n++) {}
-    if (n > 8 || len + n > got) return 0;
-    v = b[len] & (0xFF >> n);
-    {
-        int all_ones = v == (uint64_t)(0xFF >> n);
-        for (i = 1; i < n; i++) { v = (v << 8) | b[len + i]; if (b[len + i] != 0xFF) all_ones = 0; }
-        e->size = all_ones ? EBML_UNKNOWN : (int64_t)v;
-    }
-    e->data = pos + len + n;
+    hl = fa_ebml_header(b, (size_t)got, &e->id, &e->size);
+    if (hl == 0) return 0;
+    e->data = pos + (int64_t)hl;
     return 1;
-}
-
-/* In-memory element walk, for the bodies of Tag and SimpleTag elements. */
-static int mem_el(const uint8_t** cur, const uint8_t* end, uint32_t* id, const uint8_t** body, size_t* size)
-{
-    const uint8_t* p = *cur;
-    int len, n, i;
-    uint64_t v;
-    if (end - p < 2) return 0;
-    for (len = 1; len <= 4 && !(p[0] & (0x80 >> (len - 1))); len++) {}
-    if (len > 4 || end - p < len + 1) return 0;
-    *id = 0;
-    for (i = 0; i < len; i++) *id = (*id << 8) | p[i];
-    for (n = 1; n <= 8 && !(p[len] & (0x80 >> (n - 1))); n++) {}
-    if (n > 8 || end - p < len + n) return 0;
-    v = p[len] & (0xFF >> n);
-    for (i = 1; i < n; i++) v = (v << 8) | p[len + i];
-    if (v > (uint64_t)(end - p - len - n)) return 0;
-    *body = p + len + n;
-    *size = (size_t)v;
-    *cur = *body + v;
-    return 1;
-}
-
-static uint64_t mem_uint(const uint8_t* p, size_t n)
-{
-    uint64_t v = 0;
-    size_t i;
-    for (i = 0; i < n && i < 8; i++) v = (v << 8) | p[i];
-    return v;
 }
 
 /* A SimpleTag and the ones nested in it ("ARTIST/SORT_WITH"). */
 static void mkv_simple(const uint8_t* p, size_t n, const char* prefix, int depth, fa_tag_sink* sink)
 {
-    const uint8_t *cur = p, *body;
-    size_t size;
-    uint32_t id;
+    const uint8_t* cur = p;
+    fa_ebml_el e;
     char key[256];
     char* name = NULL;
     key[0] = '\0';
-    while (mem_el(&cur, p + n, &id, &body, &size)) {
-        if (id == MKV_TAGNAME && !name) {
-            name = text_8bit(body, size, 0);
+    while (fa_ebml_next(&cur, p + n, &e)) {
+        if (e.id == MKV_TAGNAME && !name) {
+            name = text_8bit(e.p, e.len, 0);
             if (name) snprintf(key, sizeof(key), "%s%s%s", prefix, prefix[0] ? "/" : "", name);
-        } else if (id == MKV_TAGSTRING && name && size <= sink->max_text) {
-            char* s = text_8bit(body, size, 0);
+        } else if (e.id == MKV_TAGSTRING && name && e.len <= sink->max_text) {
+            char* s = text_8bit(e.p, e.len, 0);
             if (s && s[0]) sink->text(sink, FA_TAG_FORMAT_MATROSKA, key, s);
             free(s);
-        } else if (id == MKV_SIMPLETAG && name && depth < 4) {
-            mkv_simple(body, size, key, depth + 1, sink);
+        } else if (e.id == MKV_SIMPLETAG && name && depth < 4) {
+            mkv_simple(e.p, e.len, key, depth + 1, sink);
         }
     }
     free(name);
@@ -1073,34 +1023,31 @@ static void mkv_tags(const uint8_t* p, size_t n, fa_tag_sink* sink)
 {
     int pass, has_track_level = 0;
     for (pass = 0; pass < 2; pass++) {
-        const uint8_t *cur = p, *tag;
-        size_t tsize;
-        uint32_t id;
-        while (mem_el(&cur, p + n, &id, &tag, &tsize)) {
-            const uint8_t *c2 = tag, *b;
-            size_t bs;
-            uint32_t id2;
+        const uint8_t* cur = p;
+        fa_ebml_el tag;
+        while (fa_ebml_next(&cur, p + n, &tag)) {
+            const uint8_t* c2 = tag.p;
+            fa_ebml_el e2;
             uint64_t ttv = 50, uid = 0;
             const char* kind = NULL;
             int kind_rank = 4;
             char prefix[48] = "";
-            if (id != MKV_TAG) continue;
-            while (mem_el(&c2, tag + tsize, &id2, &b, &bs)) {
-                if (id2 == MKV_TARGETS) {
-                    const uint8_t *c3 = b, *b3;
-                    size_t s3;
-                    uint32_t id3;
-                    while (mem_el(&c3, b + bs, &id3, &b3, &s3)) {
-                        if (id3 == MKV_TTV) {
-                            ttv = mem_uint(b3, s3);
-                        } else if ((id3 == 0x63C5 || id3 == 0x63C4 || id3 == 0x63C9 || id3 == 0x63C6) && mem_uint(b3, s3) != 0) {
+            if (tag.id != MKV_TAG) continue;
+            while (fa_ebml_next(&c2, tag.p + tag.len, &e2)) {
+                if (e2.id == MKV_TARGETS) {
+                    const uint8_t* c3 = e2.p;
+                    fa_ebml_el e3;
+                    while (fa_ebml_next(&c3, e2.p + e2.len, &e3)) {
+                        if (e3.id == MKV_TTV) {
+                            ttv = fa_ebml_uint(&e3);
+                        } else if ((e3.id == 0x63C5 || e3.id == 0x63C4 || e3.id == 0x63C9 || e3.id == 0x63C6) && fa_ebml_uint(&e3) != 0) {
                             /* The first kind in the order track, chapter, edition, attachment names the tag. */
-                            const char* k = id3 == 0x63C5 ? "TRACK" : id3 == 0x63C4 ? "CHAPTER" : id3 == 0x63C9 ? "EDITION" : "ATTACHMENT";
-                            int rank = id3 == 0x63C5 ? 0 : id3 == 0x63C4 ? 1 : id3 == 0x63C9 ? 2 : 3;
+                            const char* k = e3.id == 0x63C5 ? "TRACK" : e3.id == 0x63C4 ? "CHAPTER" : e3.id == 0x63C9 ? "EDITION" : "ATTACHMENT";
+                            int rank = e3.id == 0x63C5 ? 0 : e3.id == 0x63C4 ? 1 : e3.id == 0x63C9 ? 2 : 3;
                             if (!kind || rank < kind_rank) {
                                 kind_rank = rank;
                                 kind = k;
-                                uid = mem_uint(b3, s3);
+                                uid = fa_ebml_uint(&e3);
                             }
                         }
                     }
@@ -1115,19 +1062,19 @@ static void mkv_tags(const uint8_t* p, size_t n, fa_tag_sink* sink)
             } else if (has_track_level && ttv >= 50) {
                 snprintf(prefix, sizeof(prefix), "ALBUM");
             }
-            c2 = tag;
-            while (mem_el(&c2, tag + tsize, &id2, &b, &bs))
-                if (id2 == MKV_SIMPLETAG) mkv_simple(b, bs, prefix, 0, sink);
+            c2 = tag.p;
+            while (fa_ebml_next(&c2, tag.p + tag.len, &e2))
+                if (e2.id == MKV_SIMPLETAG) mkv_simple(e2.p, e2.len, prefix, 0, sink);
         }
     }
 }
 
 /* One AttachedFile: an image becomes a picture (named "cover*": the front cover). */
-static void mkv_attachment(fa_source* src, const ebml_el* af, fa_tag_sink* sink)
+static void mkv_attachment(fa_source* src, const ebml_at* af, fa_tag_sink* sink)
 {
     int64_t pos = af->data, end = af->data + af->size, data_pos = -1, data_size = 0;
     char mime[64] = "", name[128] = "", desc[256] = "";
-    ebml_el e;
+    ebml_at e;
     while (pos < end && ebml_read(src, pos, &e) && e.size >= 0 && e.data + e.size <= end) {
         if ((e.id == MKV_FILEMIME || e.id == MKV_FILENAME || e.id == MKV_FILEDESC) && e.size < 256) {
             uint8_t* b = read_block(src, e.data, (size_t)e.size);
@@ -1156,7 +1103,7 @@ static void mkv_attachment(fa_source* src, const ebml_el* af, fa_tag_sink* sink)
     }
 }
 
-static void mkv_element(fa_source* src, const ebml_el* e, fa_tag_sink* sink, char* title, size_t title_cap)
+static void mkv_element(fa_source* src, const ebml_at* e, fa_tag_sink* sink, char* title, size_t title_cap)
 {
     if (e->size < 0) return;
     if (e->id == MKV_TAGS && e->size <= (int64_t)TAG_MAX_TEXT) {
@@ -1166,16 +1113,15 @@ static void mkv_element(fa_source* src, const ebml_el* e, fa_tag_sink* sink, cha
     } else if (e->id == MKV_INFO && e->size <= (1 << 20)) {
         uint8_t* b = read_block(src, e->data, (size_t)e->size);
         if (b) {
-            const uint8_t *cur = b, *body;
-            size_t size;
-            uint32_t id;
-            while (mem_el(&cur, b + e->size, &id, &body, &size))
-                if (id == MKV_TITLE) snprintf(title, title_cap, "%.*s", (int)(size < title_cap ? size : title_cap - 1), (const char*)body);
+            const uint8_t* cur = b;
+            fa_ebml_el t;
+            while (fa_ebml_next(&cur, b + e->size, &t))
+                if (t.id == MKV_TITLE) snprintf(title, title_cap, "%.*s", (int)(t.len < title_cap ? t.len : title_cap - 1), (const char*)t.p);
             free(b);
         }
     } else if (e->id == MKV_ATTACHMENTS && sink->picture) {
         int64_t pos = e->data, end = e->data + e->size;
-        ebml_el af;
+        ebml_at af;
         while (pos < end && ebml_read(src, pos, &af) && af.size >= 0) {
             if (af.id == MKV_ATTACHEDFILE) mkv_attachment(src, &af, sink);
             pos = af.data + af.size;
@@ -1188,7 +1134,7 @@ static void mkv_element(fa_source* src, const ebml_el* e, fa_tag_sink* sink, cha
  * clusters). Without a SeekHead entry, clusters of known size are skipped. */
 static void read_mkv(fa_source* src, fa_tag_sink* sink)
 {
-    ebml_el hdr, seg, e;
+    ebml_at hdr, seg, e;
     int64_t pos, seg_end, want[8];
     int nwant = 0, visited_tags = 0, visited_att = 0, visited_info = 0, have_seek_tags = 0, count = 0, i;
     char title[512] = "";
@@ -1201,18 +1147,17 @@ static void read_mkv(fa_source* src, fa_tag_sink* sink)
         if (e.id == MKV_SEEKHEAD && e.size >= 0 && e.size < (1 << 20)) {
             uint8_t* b = read_block(src, e.data, (size_t)e.size);
             if (b) {
-                const uint8_t *cur = b, *body;
-                size_t size;
-                uint32_t id;
-                while (mem_el(&cur, b + e.size, &id, &body, &size)) {
-                    const uint8_t *c2 = body, *b2;
-                    size_t s2;
-                    uint32_t id2, sid = 0;
+                const uint8_t* cur = b;
+                fa_ebml_el sk;
+                while (fa_ebml_next(&cur, b + e.size, &sk)) {
+                    const uint8_t* c2 = sk.p;
+                    fa_ebml_el e2;
+                    uint32_t sid = 0;
                     int64_t spos = -1;
-                    if (id != MKV_SEEK) continue;
-                    while (mem_el(&c2, body + size, &id2, &b2, &s2)) {
-                        if (id2 == MKV_SEEKID) sid = (uint32_t)mem_uint(b2, s2);
-                        else if (id2 == MKV_SEEKPOS) spos = (int64_t)mem_uint(b2, s2);
+                    if (sk.id != MKV_SEEK) continue;
+                    while (fa_ebml_next(&c2, sk.p + sk.len, &e2)) {
+                        if (e2.id == MKV_SEEKID) sid = (uint32_t)fa_ebml_uint(&e2);
+                        else if (e2.id == MKV_SEEKPOS) spos = (int64_t)fa_ebml_uint(&e2);
                     }
                     if ((sid == MKV_TAGS || sid == MKV_ATTACHMENTS || sid == MKV_INFO) && spos >= 0 && spos < src->length && nwant < 8) {
                         want[nwant++] = seg.data + spos;

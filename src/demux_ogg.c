@@ -485,32 +485,41 @@ static int kind_of(const uint8_t* p, size_t n)
     return OGG_NONE;
 }
 
-/* "ARTIST - TITLE" from a comment packet (after its magic), for web radio.
- * Field names are case-insensitive. */
-static void comment_title(const uint8_t* p, size_t n, char* out, size_t cap)
+/* The comment packet (after its magic) is parsed once, by fa_tags_parse_vorbis_comments:
+ * this sink keeps the first ARTIST and TITLE (field names are case-insensitive) for
+ * web radio's "ARTIST - TITLE", and hands everything on to the caller's sink. */
+typedef struct title_sink {
+    fa_tag_sink sink;
+    fa_tag_sink* inner;
+    char artist[256], title[512];
+} title_sink;
+
+static void title_text(fa_tag_sink* sink, int format, const char* key, const char* value)
 {
-    char artist[256] = "", title[512] = "";
-    size_t pos;
-    uint32_t count, i;
-    out[0] = '\0';
-    if (n < 8) return;
-    pos = 4 + (size_t)fa_le32(p);
-    if (pos < 4 || pos + 4 > n) return;
-    count = fa_le32(p + pos);
-    pos += 4;
-    for (i = 0; i < count && pos + 4 <= n; i++) {
-        uint32_t len = fa_le32(p + pos);
-        const char* f = (const char*)p + pos + 4;
-        pos += 4;
-        if (len > n - pos) return;
-        if (len > 7 && !artist[0] && fa_strncasecmp_ascii(f, "ARTIST=", 7) == 0)
-            snprintf(artist, sizeof(artist), "%.*s", (int)(len - 7), f + 7);
-        else if (len > 6 && !title[0] && fa_strncasecmp_ascii(f, "TITLE=", 6) == 0)
-            snprintf(title, sizeof(title), "%.*s", (int)(len - 6), f + 6);
-        pos += len;
-    }
-    if (artist[0] && title[0]) snprintf(out, cap, "%s - %s", artist, title);
-    else snprintf(out, cap, "%s", title[0] ? title : artist);
+    title_sink* t = (title_sink*)sink;
+    if (!t->artist[0] && fa_strncasecmp_ascii(key, "ARTIST", 7) == 0) snprintf(t->artist, sizeof(t->artist), "%s", value);
+    else if (!t->title[0] && fa_strncasecmp_ascii(key, "TITLE", 6) == 0) snprintf(t->title, sizeof(t->title), "%s", value);
+    if (t->inner && strlen(value) <= t->inner->max_text) t->inner->text(t->inner, format, key, value);
+}
+
+static void title_picture(fa_tag_sink* sink, int format, int type, const char* mime, const char* description,
+                          const uint8_t* data, size_t size)
+{
+    title_sink* t = (title_sink*)sink;
+    t->inner->picture(t->inner, format, type, mime, description, data, size);
+}
+
+static void read_comments(const uint8_t* p, size_t n, fa_tag_sink* tags, char* out, size_t cap)
+{
+    title_sink t;
+    memset(&t, 0, sizeof(t));
+    t.sink.text = title_text;
+    t.sink.picture = tags && tags->picture ? title_picture : NULL;
+    t.sink.max_text = (size_t)-1;
+    t.inner = tags;
+    fa_tags_parse_vorbis_comments(p, n, &t.sink);
+    if (t.artist[0] && t.title[0]) snprintf(out, cap, "%s - %s", t.artist, t.title);
+    else snprintf(out, cap, "%s", t.title[0] ? t.title : t.artist);
 }
 
 /* Reads a link's headers, starting at its BOS page group at the reader's
@@ -617,8 +626,7 @@ static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_ta
         l->extra_len = hlen[0];
         hdr[0] = NULL;
         if (hlen[1] >= 8 && memcmp(hdr[1], "OpusTags", 8) == 0) {
-            comment_title(hdr[1] + 8, hlen[1] - 8, title, sizeof(title));
-            if (tags) fa_tags_parse_vorbis_comments(hdr[1] + 8, hlen[1] - 8, tags);
+            read_comments(hdr[1] + 8, hlen[1] - 8, tags, title, sizeof(title));
         }
         l->params.codec = "opus";
     } else if (l->kind == OGG_FLAC) {
@@ -630,8 +638,7 @@ static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_ta
         memcpy(l->extra, si, 34);
         l->extra_len = 34;
         if (hlen[1] > 4) {
-            comment_title(hdr[1] + 4, hlen[1] - 4, title, sizeof(title));
-            if (tags) fa_tags_parse_vorbis_comments(hdr[1] + 4, hlen[1] - 4, tags);
+            read_comments(hdr[1] + 4, hlen[1] - 4, tags, title, sizeof(title));
         }
         l->params.codec = "flac";
     } else {
@@ -640,8 +647,7 @@ static fa_result read_link(ogg* o, oggs_link* l, int want, int* out_audio, fa_ta
         r = vorbis_setup(l, hdr, hlen);
         if (r != FA_OK) goto done;
         if (hlen[1] > 7) {
-            comment_title(hdr[1] + 7, hlen[1] - 7, title, sizeof(title));
-            if (tags) fa_tags_parse_vorbis_comments(hdr[1] + 7, hlen[1] - 7, tags);
+            read_comments(hdr[1] + 7, hlen[1] - 7, tags, title, sizeof(title));
         }
         /* Xiph lacing: 2, the sizes of the first two, then all three. */
         for (i = 0; i < 2; i++) n += hlen[i] / 255 + 1;

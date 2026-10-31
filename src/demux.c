@@ -675,6 +675,19 @@ static void put_rate(bitw* w, uint32_t rate)
     put_bits(w, rate, 24);
 }
 
+int fa_adts_parse(const uint8_t* p, size_t n, fa_adts_header* h)
+{
+    if (n < 7 || p[0] != 0xFF || (p[1] & 0xF6) != 0xF0) return 0;   /* syncword, layer 00 */
+    h->crc = !(p[1] & 1);
+    h->profile = p[2] >> 6;
+    h->rate_index = (p[2] >> 2) & 15;
+    h->config = ((p[2] & 1) << 2) | (p[3] >> 6);
+    h->len = ((size_t)(p[3] & 3) << 11) | ((size_t)p[4] << 3) | (p[5] >> 5);
+    h->blocks = (p[6] & 3) + 1;
+    h->header = h->crc ? 9 : 7;
+    return h->rate_index < 13 && h->len >= h->header;
+}
+
 /* ISO/IEC 14496-3 1.6.2.1 AudioSpecificConfig with a GASpecificConfig. */
 size_t fa_aac_build_asc(uint8_t out[FA_AAC_ASC_MAX], int object_type, uint32_t rate, uint32_t channels, uint32_t sbr_rate)
 {
