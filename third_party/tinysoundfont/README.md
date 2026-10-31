@@ -69,6 +69,8 @@ against untrusted files and add what the decoder needs:
   a soundfont of other fonts' presets (sharing their regions; `tsf_get_preset_bank_number` lists them), each preset
   with a gain of its own (`gainDB`). The Ogg Vorbis (`smpo`) path is disabled (`#error`): SF3 is converted to SF2
   before loading.
+- `tsf_has_endless_voice`: whether a looped voice is still held at its sustain level (it would never
+  die away), so the MIDI length measure can stop without rendering to its cap.
 - Sample data followed by zeroed padding samples; a short read is an error. Hydra arrays
   zeroed after allocation. `TSF_MAX_REGIONS` caps the region count.
 - No negative left shift (`GEN_UINT_ADD15`), keynum-scaled hold/decay clamped,

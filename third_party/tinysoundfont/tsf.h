@@ -200,6 +200,10 @@ TSFDEF void tsf_note_off_all(tsf* f);
 // Returns the number of active voices
 TSFDEF int tsf_active_voice_count(tsf* f);
 
+// FatzAudio: 1 when a voice will sound for ever at a gain of at least min_gain: it
+// loops, it has not been released (key or pedal held) and its sustain level is kept.
+TSFDEF int tsf_has_endless_voice(tsf* f, float min_gain);
+
 // Render output samples into a buffer
 // You can either render as signed 16-bit values (tsf_render_short) or
 // as 32-bit float values (tsf_render_float)
@@ -2417,6 +2421,19 @@ TSFDEF void tsf_note_off_all(tsf* f)
 	struct tsf_voice *v = f->voices, *vEnd = v + f->voiceNum;
 	for (; v != vEnd; v++) if (v->playingPreset != -1 && v->ampenv.segment < TSF_SEGMENT_RELEASE)
 		tsf_voice_end(f, v);
+}
+
+TSFDEF int tsf_has_endless_voice(tsf* f, float min_gain)
+{
+	struct tsf_voice *v = f->voices, *vEnd = v + f->voiceNum;
+	for (; v != vEnd; v++)
+	{
+		if (v->playingPreset == -1 || !v->region || v->region->loop_mode == TSF_LOOPMODE_NONE) continue;
+		if (v->ampenv.segment == TSF_SEGMENT_NONE || v->ampenv.segment >= TSF_SEGMENT_RELEASE) continue;
+		if (v->modLfoToVolume != 0) continue; // tremolo: let the render decide
+		if (tsf_decibelsToGain(v->noteGainDB) * v->ampenv.parameters.sustain >= min_gain) return 1;
+	}
+	return 0;
 }
 
 TSFDEF int tsf_active_voice_count(tsf* f)

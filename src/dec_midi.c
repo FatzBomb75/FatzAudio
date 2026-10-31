@@ -1440,6 +1440,10 @@ static fa_result measure_length(struct fa_midi* m)
     m->length = limit;
     r = seek_to(m, last);
     if (r != FA_OK) return r;
+    /* A note still held at the end (no note-off, or the pedal down) on a looped sound
+     * never dies away: the cap, without rendering 10 s to find that out. The margin
+     * over the floor allows for samples quieter than full scale. */
+    if (tsf_has_endless_voice(m->synth, FA_MIDI_TAIL_FLOOR * 10.0f)) return seek_to(m, 0);
     m->blk_off = 0;   /* the block with the last event is measured whole */
     for (;;) {
         float peak = 0.0f;
