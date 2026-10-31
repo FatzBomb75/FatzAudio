@@ -2684,6 +2684,7 @@ static int watch_list(struct fa_stream* s, int on)
         s->cdg_watch_link = e->cdg_watched;
         e->cdg_watched = s;
         s->cdg_watch_listed = 1;
+        fa_wake_signal(&e->event_wake);   /* it may be asleep for a second: start polling now */
     } else if (!on && s->cdg_watch_listed) {
         for (link = &e->cdg_watched; *link; link = &(*link)->cdg_watch_link)
             if (*link == s) { *link = s->cdg_watch_link; break; }

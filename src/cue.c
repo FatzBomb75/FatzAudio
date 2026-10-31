@@ -53,7 +53,7 @@ static void cue_flag_lost(fa_cue_dev* q)
     fa_device* dev = q->mixer->device;
     fa_store32(&q->lost, 1);
     fa_store32(&dev->mixer_events, 1);
-    fa_cond_broadcast(&dev->engine->event_cond);
+    fa_wake_signal(&dev->engine->event_wake);
 }
 
 /* The backend's thread: headphones that stop without being asked to have gone away.
@@ -69,7 +69,7 @@ static void cue_notification(const ma_device_notification* n)
         fa_device* dev = q->mixer->device;
         fa_store32(&q->lost, 0);
         fa_store32(&dev->mixer_events, 1);
-        fa_cond_broadcast(&dev->engine->event_cond);
+        fa_wake_signal(&dev->engine->event_wake);
     }
 }
 

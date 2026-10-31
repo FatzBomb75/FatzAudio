@@ -979,7 +979,7 @@ struct fa_engine {
 
     fa_mutex list_lock;          /* streams, devices, graveyard, pending events */
     fa_cond work_cond;           /* wakes decode workers */
-    fa_cond event_cond;          /* wakes the event thread */
+    fa_wake event_wake;          /* wakes the event thread (lock-free: audio and backend threads too) */
     struct fa_stream* streams;   /* attached streams the workers keep filled */
     struct fa_device* devices;
     struct fa_stream* graveyard; /* closed streams, freed by the event thread */
@@ -1114,7 +1114,8 @@ static inline int64_t fa_device_align_ns(struct fa_device* d)
 }
 
 /* Event thread: reopens devices that went away on the system default. */
-void fa_devices_service(fa_engine* e);
+int fa_devices_service(fa_engine* e);   /* 1: a device was busy (skipped) */
+int64_t fa_devices_next_due_locked(fa_engine* e);
 void fa_device_simulate(fa_device* d, int lost);   /* tests: a reroute (0) or a removal (1) */
 /* 1 when the engine's backend can open `mode`: exclusive mode is WASAPI only. */
 static inline int fa_device_mode_supported(const fa_engine* e, fa_latency_mode mode)

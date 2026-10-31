@@ -1,6 +1,7 @@
 /* Event delivery. The audio thread pushes into a per-device lock-free queue (or,
  * when that is full, a stream's spill slots); API threads add to the engine's
- * pending list under list_lock. Decode workers and the event thread both move
+ * pending list under list_lock. Both wake the event thread (fa_wake: lock-free,
+ * so it sleeps while nothing happens instead of polling). Decode workers also move
  * queued events into the pending list every few milliseconds, so a slow user
  * callback does not let the queues fill up. The event thread then calls the
  * user's callbacks in sequence order, so user code never runs on the audio
@@ -9,6 +10,9 @@
 #include "cdg.h"
 #include <stdlib.h>
 #include <string.h>
+
+#define FA_EVENT_CDG_POLL_MS 5     /* CD+G change events: how often the picture is checked */
+#define FA_EVENT_IDLE_MS 1000      /* a safety net only: everything else wakes the thread */
 
 /* Queue indices and sequence numbers wrap: do the arithmetic unsigned. */
 static int32_t wrap_diff(int32_t a, int32_t b) { return (int32_t)((uint32_t)a - (uint32_t)b); }
@@ -58,6 +62,7 @@ void fa_audio_post_event(struct fa_device* d, struct fa_stream* s, fa_event_type
          * between two collections. */
     }
     fa_fetch_add32(&d->publishing, -1);
+    fa_wake_signal(&d->engine->event_wake);   /* lock-free; a system call only if it sleeps */
 }
 
 /* Caller holds list_lock. */
@@ -80,7 +85,7 @@ void fa_engine_post_event_locked(fa_engine* e, const fa_event* ev, int32_t seq)
     q.ev = *ev;
     q.seq = seq;
     pending_add(e, &q);
-    fa_cond_broadcast(&e->event_cond);
+    fa_wake_signal(&e->event_wake);
 }
 
 void fa_engine_post_event(fa_engine* e, const fa_event* ev)
@@ -104,7 +109,7 @@ void fa_event_rescue_device(fa_engine* e, struct fa_device* d)
 {
     fa_qevent q;
     while (fa_event_queue_pop(&d->events, &q)) pending_add(e, &q);
-    fa_cond_broadcast(&e->event_cond);
+    fa_wake_signal(&e->event_wake);
 }
 
 uint32_t fa_event_collect_locked(fa_engine* e)
@@ -131,7 +136,7 @@ uint32_t fa_event_collect_locked(fa_engine* e)
     }
     if (spilled)
         for (s = e->streams; s; s = s->next) fa_event_rescue_stream(e, s);
-    if (e->pending_count != before) fa_cond_broadcast(&e->event_cond);
+    if (e->pending_count != before) fa_wake_signal(&e->event_wake);
     return e->pending_count - before;
 }
 
@@ -183,6 +188,7 @@ void fa_event_thread_main(void* arg)
         struct fa_stream* grave = NULL;
         struct fa_stream* s;
         uint32_t n = 0, i, nw = 0;
+        int busy = 0;
         int quit = fa_load32(&e->quit);
         /* CD+G change events: streams that asked for them are checked outside the
          * lock. Only this thread frees streams (below, after this round), so the
@@ -235,7 +241,7 @@ void fa_event_thread_main(void* arg)
 
         for (i = 0; i < n; i++) deliver(&batch[i].ev);
         /* After delivering: a reopen can take a while and should not hold events up. */
-        if (!quit) fa_devices_service(e);
+        if (!quit) busy = fa_devices_service(e);
         while (grave) {
             struct fa_stream* next = grave->next;
             fa_stream_free_memory(grave);
@@ -244,8 +250,26 @@ void fa_event_thread_main(void* arg)
 
         fa_mutex_lock(&e->list_lock);
         if (quit && e->pending_count == 0 && !e->graveyard) break;
-        if (e->pending_count == 0) fa_cond_wait_ms(&e->event_cond, &e->list_lock, 5);
-        else if (n == 0) fa_cond_wait_ms(&e->event_cond, &e->list_lock, 1); /* an audio thread is mid-publish */
+        if (e->pending_count == 0 || n == 0) {
+            /* Everything that gives this thread work signals event_wake, the audio
+             * thread too; only CD+G change events (the picture moves with the clock)
+             * and the devices' timed work (mixer ticks, reopen retries) need a timeout. */
+            uint32_t ms = 1;   /* events pending, but an audio thread is mid-publish */
+            if (e->pending_count == 0) {
+                int64_t due = fa_devices_next_due_locked(e), now;
+                ms = e->cdg_watched ? FA_EVENT_CDG_POLL_MS : FA_EVENT_IDLE_MS;
+                if (due != INT64_MAX) {
+                    now = fa_monotonic_ns();
+                    if (due <= now) ms = busy ? 1 : 0;   /* busy: its lock is held, do not spin */
+                    else if ((due - now) / 1000000 + 1 < ms) ms = (uint32_t)((due - now) / 1000000 + 1);
+                }
+            }
+            if (ms) {
+                fa_mutex_unlock(&e->list_lock);
+                fa_wake_wait_ms(&e->event_wake, ms);
+                fa_mutex_lock(&e->list_lock);
+            }
+        }
     }
     fa_mutex_unlock(&e->list_lock);
     free(batch);

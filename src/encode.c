@@ -25,8 +25,10 @@
 #define ENC_SINK_BUF 65536
 #define ENC_STREAM_SCRATCH 16384     /* largest audio callback a stream tap records */
 #define ENC_DEFAULT_QUEUE_MS 2000
-#define ENC_IDLE_WAIT_MS 5           /* the audio thread cannot wake the encoder: it polls */
+#define ENC_READ_WAIT_MS 5           /* fa_encoder_encode_stream: a push or web stream with nothing yet */
+#define ENC_TAP_WAIT_MS 500          /* taps signal `wake` (lock-free); this is only a safety net */
 #define ENC_APP_WAIT_MS 1000         /* fa_encoder_write signals; this is only a safety net */
+#define ENC_WRITER_WAIT_MS 5         /* fa_encoder_write with the queue full */
 
 enum { SRC_NONE = 0, SRC_DEVICE, SRC_STREAM, SRC_READ, SRC_APP, SRC_DEAD, SRC_MIXER };
 
@@ -40,7 +42,9 @@ struct fa_encoder {
     uint32_t queue_ms;
 
     fa_mutex lock;               /* error, state changes, waiting */
-    fa_cond cond;
+    fa_cond cond;                /* wakes fa_encoder_write and fa_encoder_wait */
+    fa_wake wake;                /* wakes the encoder thread (any thread, the audio thread too) */
+    int64_t wake_frames;         /* taps: queued frames that wake the thread (a chunk, at most a quarter of the queue) */
     fa_thread thread;
     int thread_running;
     int source;                  /* SRC_*: set once, under tap_lock */
@@ -244,6 +248,7 @@ static void encoder_free(fa_encoder* e)
     free(e->chunk);
     free(e->sink.buf);
     free_tags(&e->tags);
+    fa_wake_destroy(&e->wake);
     fa_cond_destroy(&e->cond);
     fa_mutex_destroy(&e->lock);
     fa_mutex_destroy(&e->read_lock);
@@ -275,6 +280,11 @@ static fa_result encoder_new(const fa_encoder_options* options, fa_encoder** out
         return FA_ERROR_GENERIC;
     }
     if (fa_cond_init(&e->cond) != 0) {
+        fa_mutex_destroy(&e->write_lock); fa_mutex_destroy(&e->read_lock); fa_mutex_destroy(&e->lock); free(e);
+        return FA_ERROR_GENERIC;
+    }
+    if (fa_wake_init(&e->wake) != 0) {
+        fa_cond_destroy(&e->cond);
         fa_mutex_destroy(&e->write_lock); fa_mutex_destroy(&e->read_lock); fa_mutex_destroy(&e->lock); free(e);
         return FA_ERROR_GENERIC;
     }
@@ -344,6 +354,7 @@ static void set_error(fa_encoder* e, fa_result r)
     fa_store32(&e->state, FA_ENCODER_FAILED);
     fa_cond_broadcast(&e->cond);
     fa_mutex_unlock(&e->lock);
+    fa_wake_signal(&e->wake);
 }
 
 static void set_finished(fa_encoder* e)
@@ -491,14 +502,11 @@ static void encoder_thread(void* arg)
             }
         }
         if (idle) {
-            /* fa_encoder_write wakes the thread (it writes, then signals under the lock,
-             * so the queue is checked again here); only the audio thread's taps and
-             * fa_stream_read's "not yet" need polling. */
-            int app = e->source == SRC_APP;
-            fa_mutex_lock(&e->lock);
-            if (!fa_load32(&e->stop) && !failed(e) && !(app && fa_ring_readable(&e->queue) > 0))
-                fa_cond_wait_ms(&e->cond, &e->lock, app ? ENC_APP_WAIT_MS : ENC_IDLE_WAIT_MS);
-            fa_mutex_unlock(&e->lock);
+            /* fa_encoder_write and the taps signal `wake` after writing (a signal given
+             * before this wait is kept, so nothing written meanwhile is slept over);
+             * only fa_stream_read's "not yet" needs polling. */
+            uint32_t ms = e->source == SRC_APP ? ENC_APP_WAIT_MS : e->source == SRC_READ ? ENC_READ_WAIT_MS : ENC_TAP_WAIT_MS;
+            if (!fa_load32(&e->stop) && !failed(e)) fa_wake_wait_ms(&e->wake, ms);
         }
     }
 }
@@ -510,6 +518,7 @@ static void encoder_thread(void* arg)
 static fa_result fail_start(fa_encoder* e, fa_result r)
 {
     fa_store32(&e->stop, 1);
+    fa_wake_signal(&e->wake);
     if (e->thread_running) {
         fa_thread_join(&e->thread);
         e->thread_running = 0;
@@ -537,6 +546,7 @@ static fa_result start_steps(fa_encoder* e, int source)
         if (qcap < ENC_CHUNK) qcap = ENC_CHUNK;
         r = fa_ring_init(&e->queue, e->in_channels, qcap);
         if (r != FA_OK) return r;
+        e->wake_frames = qcap / 4 < ENC_CHUNK ? qcap / 4 : ENC_CHUNK;
     }
     if (e->in_channels != f.channels) {
         ma_channel_converter_config cc = ma_channel_converter_config_init(ma_format_f32, e->in_channels, NULL, f.channels,
@@ -759,14 +769,12 @@ FA_API fa_result FA_CALL fa_encoder_write(fa_encoder* encoder, const float* inte
         if (room > 0) {
             fa_ring_write(&e->queue, interleaved + (size_t)done * channels, room);
             done += room;
-            fa_mutex_lock(&e->lock);
-            fa_cond_broadcast(&e->cond);
-            fa_mutex_unlock(&e->lock);
+            fa_wake_signal(&e->wake);
             continue;
         }
         fa_mutex_lock(&e->lock);
         err = e->error;
-        if (err == FA_OK) fa_cond_wait_ms(&e->cond, &e->lock, ENC_IDLE_WAIT_MS);
+        if (err == FA_OK) fa_cond_wait_ms(&e->cond, &e->lock, ENC_WRITER_WAIT_MS);
         fa_mutex_unlock(&e->lock);
     }
     fa_mutex_unlock(&e->write_lock);
@@ -784,6 +792,7 @@ FA_API fa_result FA_CALL fa_encoder_set_paused(fa_encoder* encoder, int32_t paus
 {
     if (!encoder) return FA_ERROR_INVALID_ARG;
     fa_store32(&encoder->paused, paused ? 1 : 0);
+    fa_wake_signal(&encoder->wake);   /* what a tap queued before the pause is encoded now */
     return FA_OK;
 }
 
@@ -798,6 +807,8 @@ void fa_encode_push(fa_encoder* e, const float* frames, int64_t count, uint32_t 
     if (room > count) room = count;
     if (room > 0) fa_ring_write(&e->queue, frames, room);
     if (room < count) fa_fetch_add64(&e->dropped, count - room);
+    /* A chunk's worth wakes the thread: a few wake-ups a second, not one per callback. */
+    if (fa_ring_readable(&e->queue) >= e->wake_frames) fa_wake_signal(&e->wake);
 }
 
 void fa_encode_mixer_push(struct fa_mixer* m, int tap, const float* frames, int64_t count, int64_t clock)
@@ -818,6 +829,8 @@ void fa_encode_drop(fa_encoder* e, int64_t count)
 {
     if (count > 0 && !fa_load32(&e->paused)) fa_fetch_add64(&e->dropped, count);
 }
+
+fa_wake* fa_encode_wake(fa_encoder* e) { return &e->wake; }
 
 /* ---- the source goes away ---------------------------------------------------------- */
 
@@ -964,6 +977,7 @@ FA_API fa_result FA_CALL fa_encoder_close(fa_encoder* encoder)
     fa_mutex_lock(&e->lock);
     fa_cond_broadcast(&e->cond);
     fa_mutex_unlock(&e->lock);
+    fa_wake_signal(&e->wake);
     fa_mutex_lock(&e->write_lock);
     fa_mutex_unlock(&e->write_lock);
     if (e->thread_running) {

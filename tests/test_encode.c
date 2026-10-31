@@ -731,6 +731,57 @@ static void test_device_closed_while_recording(void)
     remove("enc_gone.wav");
 }
 
+
+/* A device recording sleeps between chunks: the audio thread wakes it (lock-free)
+ * once a chunk is queued, not every callback, and a close wakes it at once. */
+static void test_device_recording_wakes(void)
+{
+    fa_encoder* e = NULL;
+    fa_encoder_options o;
+    fa_encoder_status st;
+    fa_wake* w;
+    int64_t t0, until, total = 0;
+    int k;
+    fa_encoder_options_init(&o);
+    CHECK_EQ(fa_encoder_create_path("enc_wake.wav", &o, &e), FA_OK);
+    CHECK_EQ(fa_encoder_attach_device(e, g_dev), FA_OK);
+    w = fa_encode_wake(e);
+    for (k = 0; k < 2; k++) {
+        until = fa_monotonic_ns() + 5000000000LL;
+        while (fa_load32(&w->state) != 2 && fa_monotonic_ns() < until) fa_sleep_ms(1);
+        CHECK_EQ(fa_load32(&w->state), 2);   /* asleep: nothing to do */
+        render(4096);                        /* a chunk (a 2 s queue's quarter is more) */
+        total += 4096;
+        t0 = fa_monotonic_ns();
+        do {
+            CHECK_EQ(fa_encoder_get_status(e, &st), FA_OK);
+            if (st.frames >= total) break;
+            fa_sleep_ms(1);
+        } while (fa_monotonic_ns() - t0 < 5000000000LL);
+        CHECK_EQ(st.frames, total);
+        CHECK(fa_monotonic_ns() - t0 < 300000000LL);   /* woken, not the 500 ms safety net */
+    }
+    until = fa_monotonic_ns() + 5000000000LL;
+    while (fa_load32(&w->state) != 2 && fa_monotonic_ns() < until) fa_sleep_ms(1);
+    render(512);                                     /* less than a chunk: it sleeps on */
+    total += 512;
+    fa_sleep_ms(20);
+    CHECK_EQ(fa_encoder_get_status(e, &st), FA_OK);
+    CHECK(st.frames < total);
+    t0 = fa_monotonic_ns();
+    CHECK_EQ(fa_encoder_close(e), FA_OK);            /* wakes it: drains and ends */
+    CHECK(fa_monotonic_ns() - t0 < 300000000LL);
+    {
+        fa_stream_info info;
+        int64_t got = 0;
+        float* y = decode_file("enc_wake.wav", &info, &got);
+        CHECK(y != NULL);
+        free(y);
+        CHECK_EQ(got, total);
+    }
+    remove("enc_wake.wav");
+}
+
 /* ---- outputs ------------------------------------------------------------------------------ */
 
 typedef struct mem_out { uint8_t* data; size_t n, cap; int closed; } mem_out;
@@ -981,6 +1032,7 @@ int main(void)
     RUN(test_resample_and_mix);
     RUN(test_encode_stream_offline);
     RUN(test_record_device_and_stream);
+    RUN(test_device_recording_wakes);
     RUN(test_device_closed_while_recording);
     RUN(test_forward_only_output);
     RUN(test_seekable_output);

@@ -68,7 +68,7 @@ static void capture_changed(fa_capture* c, int lost)
     if (lost) fa_store64(&c->lost_at, fa_monotonic_ns());
     fa_store32(&c->lost, lost);
     fa_store32(&dev->mixer_events, 1);
-    fa_cond_broadcast(&dev->engine->event_cond);
+    fa_wake_signal(&dev->engine->event_wake);
 }
 
 static void flag_lost(fa_capture* c) { capture_changed(c, 1); }

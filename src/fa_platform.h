@@ -1,7 +1,8 @@
 /* Minimal portable threading layer: sequentially consistent atomics, mutexes,
  * condition variables with timeouts, threads, and a monotonic clock.
- * Everything the audio thread touches is in the atomics section: those never
- * block and never make system calls. */
+ * Everything the audio thread touches is in the atomics section (those never
+ * block and never make system calls), plus fa_wake_signal, which never blocks and
+ * makes a system call only to wake a sleeping thread. */
 #ifndef FA_PLATFORM_H
 #define FA_PLATFORM_H
 
@@ -140,6 +141,18 @@ void fa_cond_destroy(fa_cond* c);
 void fa_cond_wait_ms(fa_cond* c, fa_mutex* m, uint32_t timeout_ms);   /* UINT32_MAX: no timeout */
 void fa_cond_broadcast(fa_cond* c);
 void fa_cond_signal(fa_cond* c);   /* wakes one waiter */
+
+/* A wake-up for one waiting thread that any thread can give, the audio thread
+ * included: fa_wake_signal is lock-free and makes a system call only when the
+ * waiter is asleep (a futex on Linux and Android, a dispatch semaphore on Apple,
+ * an auto-reset event on Windows). A signal given while nobody waits is kept for
+ * the next wait. Waits can return early (a signal kept from a wait that timed
+ * out): the waiter checks its condition again, as with a condition variable. */
+typedef struct fa_wake { fa_atomic32 state; void* impl; } fa_wake;   /* state: 0 idle, 1 signalled, 2 asleep */
+int fa_wake_init(fa_wake* w);       /* 0 on success */
+void fa_wake_destroy(fa_wake* w);   /* safe on a zeroed or destroyed fa_wake */
+void fa_wake_signal(fa_wake* w);
+void fa_wake_wait_ms(fa_wake* w, uint32_t timeout_ms);   /* one waiter at a time; UINT32_MAX: no timeout */
 
 int fa_thread_create(fa_thread* t, fa_thread_proc proc, void* arg);
 void fa_thread_join(fa_thread* t);
