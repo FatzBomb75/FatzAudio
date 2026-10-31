@@ -496,20 +496,20 @@ static void test_system_bank(void)
     fa_soundfont_info info;
     fa_soundfont_preset p;
     fa_soundfont_stack_entry e[2];
-    struct timespec t0, t1;
+    clock_t t0, t1;
     song s = { 0 };
     buf f;
     float* x;
     fa_result r;
     uint32_t i, drums = 0;
-    timespec_get(&t0, TIME_UTC);
+    t0 = clock();
     r = fa_soundfont_open_system(&sys);
-    timespec_get(&t1, TIME_UTC);
+    t1 = clock();
     if (r == FA_ERROR_NOT_FOUND) { printf("  no system bank here: skipped\n"); return; }
     CHECK_EQ(r, FA_OK);
     CHECK_EQ(fa_soundfont_get_info(sys, &info), FA_OK);
-    printf("  \"%s\": %u presets, %.1f MB of samples, loaded in %.0f ms\n", info.name, info.preset_count,
-           info.sample_memory / 1048576.0, (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+    printf("  \"%s\": %u presets, %.1f MB of samples, loaded in %.0f ms of CPU\n", info.name, info.preset_count,
+           info.sample_memory / 1048576.0, (double)(t1 - t0) * 1e3 / CLOCKS_PER_SEC);
     CHECK(info.preset_count >= 128);
     CHECK(info.sample_memory > 1000000);
     for (i = 0; i < info.preset_count; i++) {
