@@ -283,11 +283,60 @@ GS and XG files can set the effects with SysEx, and FatzAudio follows them (many
 | Reverb time | `34` | `02` (0.3 to 30 seconds) | GS: 64 is the type's own time, each 32 steps doubles or halves it. Delay types: the echo time, 3.3 ms a step (up to 0.42 s) |
 | Reverb level | `33` | Return `0C` | 64 is the default level, 0 is none, 127 about +6 dB |
 | Reverb pre-LPF, delay feedback | `32`, `35` | | Darkens what goes into the reverb; the delay types' repeats |
+| Reverb pre-delay | `37` | | 0 to 127 ms before the reverb starts (room, hall and plate types). The macro `30` sets it back to 0 |
 | Chorus type | Macro `38`: Chorus 1-4, Feedback Chorus, Flanger, Short Delay, Short Delay (FB) | Type `20`/`21`: Chorus, Celeste, Flanger (the later types play as a chorus), or no effect | Sets the delay, depth, rate and feedback below |
 | Chorus level | `3A` | Return `2C` | As the reverb level |
 | Chorus pre-LPF, feedback, delay, rate, depth | `39`, `3B`, `3C`, `3D`, `3E` | | Delay about 1 to 50 ms (80 is 13 ms), rate up to 10 Hz (3 is 0.4 Hz), depth up to 20 ms (19 is 3 ms) |
+| Chorus LFO frequency, depth, feedback, delay offset | | `22`, `23`, `24`, `25` | Frequency 0 to 39.7 Hz (64 is 2.7 Hz; above that the steps double every 12 values), depth up to 5 ms, feedback -63 to +63 (64 is none), delay offset 0 to 12.7 ms (0.1 ms a step: the shortest delay the LFO reaches). A new chorus type puts its own values back |
+| Chorus send to reverb | `3F` | `2E` | The chorus's output goes on into the reverb (0 is none, the default) |
+| Chorus send to delay | `40` | | The chorus's output goes on into the delay below |
 
-Messages that carry several data bytes set consecutive addresses, as on the hardware. Roland and Yamaha don't publish the exact curves, so times and ranges are close approximations rather than a copy of a particular module. Not followed: GS reverb pre-delay and chorus send to reverb, the XG chorus's own parameters (LFO, feedback, delay offset) and the XG variation and insertion effects.
+Messages that carry several data bytes set consecutive addresses, as on the hardware. Roland and Yamaha don't publish the exact curves, so times and ranges are close approximations rather than a copy of a particular module.
+
+### Delay (GS) and variation (XG)
+
+After a GS reset there is a third effect, the SC-88's delay; after an XG reset, the XG variation effect. A file without a reset (GM) or after a GM or GM2 reset has neither, unless it sends delay or variation SysEx itself, so CC94 does nothing there, as on a GM module.
+
+**GS delay.** CC94 (or the part's delay send `40 1x 2C`, the same value) sends a channel to it, 0 by default. The delay has a center tap, heard on both sides, and a left and a right tap at a ratio of the center time; the center tap repeats with the feedback.
+
+| Setting | GS (`40 01 xx`) | What it does here |
+|---|---|---|
+| Delay macro | `50` | Delay 1-4, Pan Delay 1-4, Delay to Reverb, Pan Repeat: sets the parameters below. Delay 1 (340 ms, one repeat at a quarter) after a GS reset |
+| Pre-LPF | `51` | Darkens what goes in (0-7) |
+| Time center | `52` | 0.1 ms to 1 s, in steps that grow with the time (0.1 ms below 2 ms, 20 ms between 200 and 500 ms) |
+| Time ratio left, right | `53`, `54` | 4% to 500% of the center time (24 is 100%), at most 1 s |
+| Level center, left, right | `55`, `56`, `57` | Each tap's level (127 is full) |
+| Level | `58` | The delay's return: 64 is unity, 0 is none |
+| Feedback | `59` | -64 to +63 (64 is none) of the center tap goes back in; negative inverts each repeat |
+| Send to reverb | `5A` | The delay's output goes on into the reverb |
+
+**XG variation.** In system mode (connection `5A` = 1) CC94 (or the part's variation send `08 nn 14`) sends to it, like reverb and chorus. In insertion mode (`5A` = 0, the default) it takes the whole sound of one part (`5B`: 0-15, 127 none, the default), which then goes on to the reverb and chorus at that part's sends; CC94 does nothing in that mode. After an XG reset the type is Delay L,C,R, in insertion mode with no part, so nothing changes until a file asks for it.
+
+| Setting | XG (`02 01 xx`) | What it does here |
+|---|---|---|
+| Type | `40` (MSB), `41` (LSB) | Below. A type sets its parameters to its defaults |
+| Parameters 1-10, 11-16 | `42`-`55` (two bytes each, MSB first), `70`-`75` | As Yamaha's tables number them for each type |
+| Return, pan | `56`, `57` | System mode: 64 is unity and the middle |
+| Send to reverb, chorus | `58`, `59` | System mode: its output goes on into the reverb and the chorus |
+| Connection, part | `5A`, `5B` | Insertion (0) or system (1); the part in insertion mode. Parameter 10 (dry/wet) mixes the part's own sound with the effect's: 64 is half each |
+
+| Types | How they are made |
+|---|---|
+| Hall 1-2, Room 1-3, Stage 1-2, Plate, White Room, Tunnel, Canyon, Basement | The reverb above with the type's decay time and brightness; parameter 1 is the reverb time |
+| Delay L,C,R; Delay L,R; Echo; Cross Delay | Two delay lines with up to four taps and a feedback path each, with the type's times (0.1 ms steps), feedback level, center level and high damp (the repeats darken) |
+| Karaoke 1-3 | One echo with feedback (about 3 ms a step of parameter 1), a high-pass and a low-pass |
+| Early Reflection 1-2, Gate Reverb, Reverse Gate | 12 or 16 taps after the initial delay, spread over a span the room size sets; the gate types stop dead, the reverse one swells |
+| Chorus 1-4, Celeste 1-3, Flanger 1-3, Symphonic | The chorus above with the type's LFO frequency, depth, feedback and delay offset |
+| Rotary Speaker, Tremolo, Auto Pan | An LFO (parameter 1) on level, on left against right, or (rotary) on level and a short swinging delay |
+| Phaser 1-2 | 6 or 8 allpass stages swept by the LFO over up to 4 octaves from the phase offset, with feedback |
+| Distortion, Overdrive, Amp Simulator | Drive into a clipper (the edge parameter sets how hard), a lowpass and EQ (amp simulator: the amp type's cabinet), output level |
+| 3-Band EQ, 2-Band EQ | Low and high shelves and a middle peak (Yamaha's frequency table, -12 to +12 dB) |
+| Auto Wah | A resonant bandpass swept by the LFO |
+| Thru | The sound unchanged |
+
+Types newer than that list (pitch change, aural exciter, compressor, noise gate, voice cancel, lo-fi and the other MU100 additions) are not built: the variation is off, and in insertion mode the part plays dry. The EQ bands of the modulation types and the MW/bend/aftertouch control of the variation (`5C`-`5F`) are ignored.
+
+The defaults and curves (LFO frequencies, delay offsets, room sizes, drive) are our reading of the published GS and XG parameter tables, not a copy of a module; how close each type sounds to a real SC-88 or MU module is still to be heard.
 
 `fa_stream_set_midi_effects` (`MidiEffects`) turns both off for a stream, which plays the dry synthesizer (BASSMIDI's `BASS_MIDI_NOFX`); the tails stop at once. It may be called from any thread.
 
@@ -316,8 +365,8 @@ The SysEx messages that change how a file sounds are applied; the rest are ignor
 | Bank select MSB 127 (and 126) after an XG reset, 120 after a GM2 reset | The channel plays drum kits from its next program change; other banks make it melodic, channel 10 included |
 | Master volume: universal (`7F 04 01`), GS (`40 00 04`), XG (`00 00 04`) | Scales the whole song, without a click |
 | Master fine and coarse tuning (`7F 04 03`, `7F 04 04`) | Retunes every channel, drums included |
-| GS and XG reverb and chorus (`40 01 30`-`3E`, `02 01 00`-`2C`) | Effect type, level and time ([reverb and chorus](#reverb-and-chorus)) |
-| GS part level, pan, chorus and reverb send (`40 1x 19`, `1C`, `21`, `22`); XG part volume, pan, chorus and reverb send (`08 nn 0B`, `0E`, `12`, `13`) | The same as CC7, CC10, CC93 and CC91 on that part's channel. Pan 0 ("random") is the middle |
+| GS reverb, chorus and delay (`40 01 30`-`5A`), XG reverb, chorus and variation (`02 01 00`-`5B`, `70`-`75`) | Effect type, level, time and the rest ([reverb and chorus](#reverb-and-chorus), [delay and variation](#delay-gs-and-variation-xg)) |
+| GS part level, pan, chorus, reverb and delay send (`40 1x 19`, `1C`, `21`, `22`, `2C`); XG part volume, pan, chorus, reverb and variation send (`08 nn 0B`, `0E`, `12`, `13`, `14`) | The same as CC7, CC10, CC93, CC91 and CC94 on that part's channel. Pan 0 ("random") is the middle |
 | GS part vibrato, filter and envelope offsets (`40 1x 30`-`37`); XG multi part (`08 nn 15`-`1C`) | The same as the sound controllers CC71-78 ([controllers](#controllers-and-modulators)) |
 | GS scale tuning (`40 1x 40`-`4B`), XG scale tuning (`08 nn 41`-`4C`) | Moves each note of the octave, C to B, by -64 to +63 cents (64 is in tune) on that part, notes already sounding included ([scale tuning and drum setup](#scale-tuning-and-drum-setup)) |
 | GS drum maps (`41 m1`-`m8 rr`), XG drum setups (`3n rr 00`-`0F`), XG drum setup reset (`00 00 7D`) | Per-key edits of a drum kit: pitch, level, pan, sends, exclusive group, note-off and note-on reception, and on XG filter and envelope ([below](#scale-tuning-and-drum-setup)) |
@@ -335,13 +384,13 @@ Drum setup edits a drum kit key by key. GS has two drum maps: channel 10 and the
 | Pitch | Play note number `p=1` (the key it sounds as) | Coarse `00`, fine `01` (64 = as is) | Coarse `18`, fine `19` (XG) | Semitones and cents |
 | Level | `2` | `02` | `1A` | 127 is the soundfont's level, lower is softer like velocity (64 is 11.9 dB down), 0 is silent |
 | Pan | `4` | `04` | `1C` | 1 to 127, left to right, in place of the soundfont's pan; 0 ("random") is the middle. The part's pan moves it as usual |
-| Reverb and chorus send | `5`, `6` | `05`, `06` | `1D`, `1E` | 127 is the key's full send, lower scales it down |
+| Reverb, chorus and delay/variation send | `5`, `6`, `9` | `05`, `06`, `07` | `1D`, `1E`, `1F` | 127 is the key's full send, lower scales it down |
 | Exclusive group | Assign group `3` | Alternate group `03` | | Keys of one group (1 to 127) cut each other, as open and closed hi-hats do; 0 takes the key out of any group. It replaces the soundfont's own exclusive class for that key |
 | Note-off and note-on reception | `7`, `8` | `09`, `0A` | | 0 ignores the key's note-offs (it rings until its sound ends) or its note-ons (it is silent) |
 | Filter | | Cutoff `0B`, resonance `0C` | `14`, `15` (XG) | 64 is as is; the same steps as CC74 and CC71 |
 | Envelope | | Attack rate `0D`, decay 1 rate `0E`, decay 2 rate `0F` | `16`, `17` (XG) | Rates: above 64 is faster, below slower, in the steps of CC73 and CC75; decay 2 acts as the release |
 
-GM, GS and XG resets clear scale tuning and every drum edit; the XG drum setup reset (`00 00 7D`, data = setup 0-3) clears one setup. A seek replays them all. Not followed: the variation and delay sends (no such effect yet) and XG key assign (single or multi).
+GM, GS and XG resets clear scale tuning and every drum edit; the XG drum setup reset (`00 00 7D`, data = setup 0-3) clears one setup. A seek replays them all. Not followed: XG key assign (single or multi).
 
 ## Seeking and length
 
@@ -366,5 +415,6 @@ Rendering runs on the engine's worker threads like decoding of any other format.
 - Each instrument's level (`initialAttenuation`) is applied as the SoundFont 2 spec states it, 0.1 dB per unit. FluidSynth applies 0.4 of that (an EMU hardware habit), so a bank tuned by ear in FluidSynth can sound with a wider gap between its quiet and loud instruments here.
 - SFZ soundfonts and MIDI input from devices aren't supported yet. See the [engineering notes](../engineering-notes.md).
 - Text in code pages other than UTF-8, Windows-1252 and Shift-JIS (Korean, Chinese, Cyrillic files) comes out as Windows-1252. Shift-JIS user-defined characters (lead bytes F0-F9) come out as U+FFFD.
-- SysEx other than the messages listed [above](#sysex) is ignored: insertion and variation effects and the part parameters not listed have no effect.
+- SysEx other than the messages listed [above](#sysex) is ignored: the XG insertion effects 1 and 2, the GS insertion effect (EFX) and the part parameters not listed have no effect.
+- A seek keeps the effects of the second before the target. A long GS delay (up to 1 s) or an XG echo with strong feedback can still ring past that second, and those repeats are missing after a seek.
 - The reverb's tail is cut at the end of the song (a second after the last event), so a long reverb time set by the file doesn't ring out fully at the very end.

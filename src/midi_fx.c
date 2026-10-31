@@ -15,13 +15,23 @@
  * and runs the reverb alone (fa_midi_fx_reverb).
  *
  * GS and XG effect SysEx (fa_midi_fx_gs, fa_midi_fx_xg) change the type, level and
- * time of both: a reverb type is a decay time and damping for the same reverb (the
+ * time of both (and the GS reverb's pre-delay, the XG chorus's LFO, feedback and
+ * delay offset): a reverb type is a decay time and damping for the same reverb (the
  * comb feedback is set so the tail falls 60 dB in that time), or, for GS Delay and
  * Panning Delay, a feedback echo instead; a chorus type sets the delay, depth, rate
  * and feedback of the same chorus (a flanger is a short delay with feedback). The
  * hardware's exact curves are not published, so the times and ranges are close
  * approximations. The defaults (and the state after any reset) are the tuning
  * above, which is GS Hall 2 and Chorus 3 at their default parameters here.
+ *
+ * The third effect (midi_var.c) is the SC-88's delay after a GS reset (or any GS
+ * delay SysEx) and the XG variation after an XG reset (or any XG variation SysEx);
+ * CC94 sends to it (fa_midi_fx_route: the GS delay, the XG variation in system
+ * mode), or, in XG insertion mode, one part's sound goes through it whole
+ * (fa_midi_fx_insert). Chorus can send on to the reverb and the delay, the delay
+ * and the variation to the reverb (and the variation to the chorus), as the
+ * hardware's effect blocks are wired. Without that SysEx, or after a GM reset,
+ * there is no third effect and CC94 does nothing.
  *
  * Both are deterministic: the output depends only on the input and the settings
  * since the last reset, and the chorus LFO only on the song frame, so reading in
@@ -59,11 +69,14 @@
 #define FX_CHORUS_MAX_RATE_HZ 10.0
 #define FX_CHORUS_TAPS 2
 #define FX_LFO_SEED 256                 /* frames between exact values of the chorus LFO */
+#define FX_PREDELAY_MAX_MS 127          /* GS reverb pre-delay 127 */
+#define FX_CHUNK 64                     /* frames processed at a time where effects feed each other */
 
 static const int comb_tuning[FX_COMBS] = { 1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617 };
 static const int allpass_tuning[FX_ALLPASSES] = { 556, 441, 341, 225 };
 
 enum { KIND_ROOM, KIND_DELAY, KIND_PAN_DELAY, KIND_OFF };
+enum { VAR_NONE, VAR_GS, VAR_XG };     /* the third effect: none, the GS delay, the XG variation */
 
 /* Reverb types: time to -60 dB (at GS time 64; XG: the type's default time) and
  * the damping in the comb feedback. GS characters 0-7, then XG types. */
@@ -111,6 +124,8 @@ struct fa_midi_fx {
     float room, damp, in_gain, wet;     /* the reverb's tuning */
     int kind;                           /* KIND_* */
     float pre_a, pre_z;                 /* the input's lowpass (GS pre-LPF; 0: none) */
+    float* pre;                         /* the pre-delay line (GS), made when first needed */
+    int pre_cap, pre_len, pre_pos;
     fx_line comb[2][FX_COMBS];
     fx_line allpass[2][FX_ALLPASSES];
     int reverb_idle;
@@ -138,6 +153,17 @@ struct fa_midi_fx {
     int rev_level, rev_pre, gs_time, gs_feedback;
     int cho_on, cho_level, cho_pre, cho_feedback, cho_delay, cho_rate, cho_depth;
     int xg_rev_msb, xg_cho_msb;
+    int rev_predelay;                   /* GS 37, ms */
+    int cho_to_rev, cho_to_del;         /* GS 3F and 40, XG 2E */
+    int xg_cho[4];                      /* XG chorus LFO frequency, depth, feedback, delay offset (22-25); -1: the type's */
+
+    /* The third effect. */
+    fa_midi_var* var;
+    int var_kind;                       /* VAR_* */
+    int var_on;                         /* XG: a type midi_var.c plays */
+    int var_msb, var_system, var_part, var_return, var_pan, var_to_rev, var_to_cho;
+    float sc_rin[FX_CHUNK * 2], sc_cin[FX_CHUNK * 2], sc_din[FX_CHUNK * 2];   /* inputs with what other effects send */
+    float sc_cwet[FX_CHUNK * 2], sc_vwet[FX_CHUNK * 2];                      /* chorus and third effect outputs */
 };
 
 static int scaled(int frames, uint32_t rate)
@@ -180,7 +206,7 @@ fa_midi_fx* fa_midi_fx_new(uint32_t rate)
     }
     fx->chorus_buf[0] = p;
     fx->chorus_buf[1] = p + fx->chorus_len;
-    fa_midi_fx_defaults(fx);
+    fa_midi_fx_defaults(fx, FA_MIDI_FX_GM);
     fa_midi_fx_reset(fx);
     return fx;
 }
@@ -188,6 +214,8 @@ fa_midi_fx* fa_midi_fx_new(uint32_t rate)
 void fa_midi_fx_free(fa_midi_fx* fx)
 {
     if (!fx) return;
+    fa_midi_var_free(fx->var);
+    free(fx->pre);
     free(fx->echo);
     free(fx->mem);
     free(fx);
@@ -208,6 +236,8 @@ static void reverb_clear(fa_midi_fx* fx)
         }
     }
     if (fx->echo) memset(fx->echo, 0, 2 * (size_t)fx->echo_cap * sizeof(float));
+    if (fx->pre) memset(fx->pre, 0, (size_t)fx->pre_cap * sizeof(float));
+    fx->pre_pos = 0;
     fx->echo_pos = 0;
     fx->echo_soft = 0;
     fx->pre_z = 0.0f;
@@ -232,6 +262,7 @@ void fa_midi_fx_reset(fa_midi_fx* fx)
     reverb_clear(fx);
     chorus_clear(fx);
     fx->lfo_next = -1;
+    fa_midi_var_reset(fx->var);
 }
 
 /* The one-pole lowpass of the GS pre-LPF (a: 0 is none). */
@@ -278,6 +309,12 @@ static void reverb_process(fa_midi_fx* fx, const float* in, float* out, int fram
     for (f = 0; f < frames; f++) {
         float x = (in[f * 2] + in[f * 2 + 1]) * fx->in_gain;
         x = lowpass(x, fx->pre_a, &fx->pre_z);
+        if (fx->pre_len) {
+            float d = fx->pre[fx->pre_pos];
+            fx->pre[fx->pre_pos] = x;
+            if (++fx->pre_pos >= fx->pre_len) fx->pre_pos = 0;
+            x = d;
+        }
         for (ch = 0; ch < 2; ch++) {
             float y = 0.0f;
             for (i = 0; i < FX_COMBS; i++) {
@@ -302,7 +339,7 @@ static void reverb_process(fa_midi_fx* fx, const float* in, float* out, int fram
     }
     /* Cleared only once the last input has gone all the way through the delay
      * lines (the output is still silent before the first comb echo comes back). */
-    if (fx->reverb_quiet > fx->reverb_span && peak < FX_QUIET) reverb_clear(fx);
+    if (fx->reverb_quiet > fx->reverb_span + fx->pre_len && peak < FX_QUIET) reverb_clear(fx);
 }
 
 static void chorus_process(fa_midi_fx* fx, const float* in, float* out, int frames, fa_frames song_frame)
@@ -400,11 +437,101 @@ void fa_midi_fx_reverb(fa_midi_fx* fx, const float* in, float* out, int frames)
     if (fx && frames > 0) reverb_process(fx, in, out, frames);
 }
 
-void fa_midi_fx_process(fa_midi_fx* fx, const float* reverb_in, const float* chorus_in, float* out, int frames, fa_frames song_frame)
+void fa_midi_fx_chorus(fa_midi_fx* fx, const float* in, float* out, int frames, fa_frames song_frame)
 {
+    if (fx && frames > 0) chorus_process(fx, in, out, frames, song_frame);
+}
+
+int fa_midi_fx_route(const fa_midi_fx* fx)
+{
+    if (!fx || !fx->var || fx->var_kind == VAR_NONE) return -2;
+    if (fx->var_kind == VAR_GS) return -1;
+    if (!fx->var_on) return -2;
+    if (fx->var_system) return -1;
+    return fx->var_part < 16 ? fx->var_part : -2;
+}
+
+/* `dst` = `src` (unless it is already a copy) + `add` * `g`; returns dst. */
+static const float* send_into(float* dst, const float* src, const float* add, float g, int n)
+{
+    int i;
+    if (src != dst) memcpy(dst, src, (size_t)n * sizeof(float));
+    for (i = 0; i < n; i++) dst[i] += add[i] * g;
+    return dst;
+}
+
+/* At most FX_CHUNK frames: the third effect and the chorus first when they send on,
+ * then the reverb. The outputs are added reverb, chorus, third effect, so without
+ * the sends the sum is made as it always was. */
+static void process_chunk(fa_midi_fx* fx, const float* rin, const float* cin, const float* vin, float* out, int n, fa_frames frame)
+{
+    int route = vin ? fa_midi_fx_route(fx) : -2, i, vout = 0, cwet = 0;
+    if (route == -1 && fx->var_kind == VAR_XG) {
+        vout = fa_midi_var_process(fx->var, vin, fx->sc_vwet, n, frame);
+        if (vout) {
+            /* Return and pan (64: the middle, full level both sides). */
+            float g = (float)fx->var_return / 64.0f, p = (float)(fx->var_pan < 1 ? 1 : fx->var_pan);
+            float gl = g * (p <= 64.0f ? 1.0f : (127.0f - p) / 63.0f), gr = g * (p >= 64.0f ? 1.0f : (p - 1.0f) / 63.0f);
+            for (i = 0; i < n; i++) { fx->sc_vwet[i * 2] *= gl; fx->sc_vwet[i * 2 + 1] *= gr; }
+            if (fx->var_to_cho) cin = send_into(fx->sc_cin, cin, fx->sc_vwet, (float)fx->var_to_cho / 127.0f, n * 2);
+            if (fx->var_to_rev) rin = send_into(fx->sc_rin, rin, fx->sc_vwet, (float)fx->var_to_rev / 127.0f, n * 2);
+        }
+    }
+    if (fx->cho_on && (fx->cho_to_rev || (route == -1 && fx->var_kind == VAR_GS && fx->cho_to_del))) {
+        memset(fx->sc_cwet, 0, (size_t)n * 2 * sizeof(float));
+        chorus_process(fx, cin, fx->sc_cwet, n, frame);
+        cwet = 1;
+        if (fx->cho_to_rev) rin = send_into(fx->sc_rin, rin, fx->sc_cwet, (float)fx->cho_to_rev / 127.0f, n * 2);
+    }
+    if (route == -1 && fx->var_kind == VAR_GS) {
+        const float* din = vin;
+        if (cwet && fx->cho_to_del) din = send_into(fx->sc_din, vin, fx->sc_cwet, (float)fx->cho_to_del / 127.0f, n * 2);
+        vout = fa_midi_var_process(fx->var, din, fx->sc_vwet, n, frame);
+        if (vout) {
+            float g = (float)fa_midi_var_gs_get(fx->var, 0x58) / 64.0f;
+            int to_rev = fa_midi_var_gs_get(fx->var, 0x5A);
+            for (i = 0; i < n * 2; i++) fx->sc_vwet[i] *= g;
+            if (to_rev) rin = send_into(fx->sc_rin, rin, fx->sc_vwet, (float)to_rev / 127.0f, n * 2);
+        }
+    }
+    reverb_process(fx, rin, out, n);
+    if (cwet) for (i = 0; i < n * 2; i++) out[i] += fx->sc_cwet[i];
+    else chorus_process(fx, cin, out, n, frame);
+    if (vout) for (i = 0; i < n * 2; i++) out[i] += fx->sc_vwet[i];
+}
+
+void fa_midi_fx_process(fa_midi_fx* fx, const float* reverb_in, const float* chorus_in, const float* var_in, float* out, int frames, fa_frames song_frame)
+{
+    int off, n;
     if (!fx || frames <= 0) return;
-    reverb_process(fx, reverb_in, out, frames);
-    chorus_process(fx, chorus_in, out, frames, song_frame);
+    for (off = 0; off < frames; off += n) {
+        n = frames - off < FX_CHUNK ? frames - off : FX_CHUNK;
+        process_chunk(fx, reverb_in + off * 2, chorus_in + off * 2, var_in ? var_in + off * 2 : NULL, out + off * 2, n, song_frame + off);
+    }
+}
+
+void fa_midi_fx_insert(fa_midi_fx* fx, const float* in, float* out, float* reverb, float* chorus, float rs, float cs, int frames, fa_frames song_frame)
+{
+    int off, n, i;
+    float w, dry;
+    if (!fx || frames <= 0) return;
+    /* Dry/wet 1..127: 64 is half each. A part rendered apart while the routing changed
+     * (SysEx in the block) is added back dry. */
+    w = fa_midi_fx_route(fx) < 0 ? 0.0f : (float)(fa_midi_var_dry_wet(fx->var) - 1) / 126.0f;
+    w = w < 0.0f ? 0.0f : w > 1.0f ? 1.0f : w;
+    dry = 1.0f - w;
+    for (off = 0; off < frames; off += n) {
+        const float* x = in + off * 2;
+        int vout;
+        n = frames - off < FX_CHUNK ? frames - off : FX_CHUNK;
+        vout = w > 0.0f ? fa_midi_var_process(fx->var, x, fx->sc_vwet, n, song_frame + off) : 0;
+        for (i = 0; i < n * 2; i++) {
+            float y = x[i] * dry + (vout ? fx->sc_vwet[i] * w : 0.0f);
+            out[off * 2 + i] += y;
+            reverb[off * 2 + i] += y * rs;
+            chorus[off * 2 + i] += y * cs;
+        }
+    }
 }
 
 /* ---- GS and XG settings ------------------------------------------------------ */
@@ -431,6 +558,18 @@ static void reverb_update(fa_midi_fx* fx)
     fx->in_gain = FX_INPUT_GAIN;
     fx->wet = FX_REVERB_WET * ((float)fx->rev_level / 64.0f);
     fx->pre_a = (float)fx->rev_pre * 0.1f;
+    if (fx->rev_predelay > 0 && !fx->pre) {
+        fx->pre_cap = (int)(FX_PREDELAY_MAX_MS * fx->rate / 1000.0) + 2;
+        fx->pre = (float*)calloc((size_t)fx->pre_cap, sizeof(float));
+    }
+    {
+        int len = fx->pre ? (int)(fx->rev_predelay * fx->rate / 1000.0 + 0.5) : 0;
+        if (fx->pre && len >= fx->pre_cap) len = fx->pre_cap - 1;
+        /* A longer line: what is past the old end was written long ago, so it starts silent. */
+        if (len > fx->pre_len) memset(fx->pre + fx->pre_len, 0, (size_t)(len - fx->pre_len) * sizeof(float));
+        fx->pre_len = len;
+    }
+    if (fx->pre_pos >= fx->pre_len) fx->pre_pos = 0;
     if (fx->echo) {
         int len = (int)((fx->gs_time + 1) * FX_ECHO_MS_PER_STEP * fx->rate / 1000.0);
         fx->echo_len = len < 1 ? 1 : len > fx->echo_cap ? fx->echo_cap : len;
@@ -443,9 +582,13 @@ static void chorus_update(fa_midi_fx* fx)
 {
     double rate = FX_CHORUS_RATE_HZ * (fx->cho_rate / 3.0);
     if (rate > FX_CHORUS_MAX_RATE_HZ) rate = FX_CHORUS_MAX_RATE_HZ;
+    if (fx->xg_cho[0] >= 0) rate = fa_xg_lfo_hz(fx->xg_cho[0]);
     fx->delay_ms = FX_CHORUS_DELAY_MS * pow(2.0, (fx->cho_delay - 80) / 24.0);
     /* Without an LFO the taps stand still: a plain delay. */
     fx->depth_ms = rate > 0.0 ? FX_CHORUS_DEPTH_MS * (fx->cho_depth / 19.0) : 0.0;
+    if (fx->xg_cho[1] >= 0) fx->depth_ms = rate > 0.0 ? fa_xg_mod_depth_ms(fx->xg_cho[1]) : 0.0;
+    /* XG's delay offset is the shortest delay the LFO reaches. */
+    if (fx->xg_cho[3] >= 0) fx->delay_ms = fa_xg_mod_delay_ms(fx->xg_cho[3]) + fx->depth_ms;
     if (fx->depth_ms > 0.9 * fx->delay_ms) fx->depth_ms = 0.9 * fx->delay_ms;
     if (rate != fx->rate_hz || fx->lfo_cos == 0.0) {
         fx->rate_hz = rate;
@@ -453,7 +596,7 @@ static void chorus_update(fa_midi_fx* fx)
         fx->lfo_sin = sin(2.0 * FA_PI * rate / fx->rate);
         fx->lfo_next = -1;
     }
-    fx->chorus_fb = (float)fx->cho_feedback / 127.0f * FX_FEEDBACK_MAX;
+    fx->chorus_fb = fx->xg_cho[2] >= 0 ? fa_xg_feedback(fx->xg_cho[2]) * FX_FEEDBACK_MAX : (float)fx->cho_feedback / 127.0f * FX_FEEDBACK_MAX;
     fx->chorus_wet = (float)fx->cho_level / 64.0f;
     fx->chorus_pre_a = (float)fx->cho_pre * 0.1f;
     if (!fx->cho_on) chorus_clear(fx);
@@ -471,9 +614,30 @@ static void chorus_macro(fa_midi_fx* fx, int macro)
     fx->cho_rate = chorus_macros[macro][2];
     fx->cho_depth = chorus_macros[macro][3];
     fx->cho_pre = 0;
+    fx->xg_cho[0] = fx->xg_cho[1] = fx->xg_cho[2] = fx->xg_cho[3] = -1;
 }
 
-void fa_midi_fx_defaults(fa_midi_fx* fx)
+/* The third effect as a GS delay or an XG variation, at its reset state when it
+ * becomes one. 0: no memory. */
+static int var_make(fa_midi_fx* fx, int kind)
+{
+    if (!fx->var && !(fx->var = fa_midi_var_new(fx->rate))) return 0;
+    if (fx->var_kind == kind) return 1;
+    fx->var_kind = kind;
+    if (kind == VAR_GS) {
+        fa_midi_var_gs(fx->var, 0x50, 0);   /* Delay 1 */
+    } else {
+        fx->var_msb = 0x05;                 /* Delay L,C,R, insertion, no part, as after an XG reset */
+        fx->var_on = fa_midi_var_set_type(fx->var, 0x05, 0);
+        fx->var_system = 0;
+        fx->var_part = 127;
+        fx->var_return = fx->var_pan = 64;
+        fx->var_to_rev = fx->var_to_cho = 0;
+    }
+    return 1;
+}
+
+void fa_midi_fx_defaults(fa_midi_fx* fx, int mode)
 {
     if (!fx) return;
     fx->rev_type = GS_HALL2;
@@ -484,24 +648,34 @@ void fa_midi_fx_defaults(fa_midi_fx* fx)
     fx->gs_feedback = 0;
     fx->xg_rev_msb = 1;
     fx->xg_cho_msb = 0x41;
+    fx->rev_predelay = 0;
+    fx->cho_to_rev = fx->cho_to_del = 0;
     fx->cho_on = 1;
     fx->cho_level = 64;
     chorus_macro(fx, 2);    /* Chorus 3 without its feedback: the chorus above */
     fx->cho_feedback = 0;
     reverb_update(fx);
     chorus_update(fx);
+    /* The third effect: the SC-88 delay, the XG variation, or none (GM, GM2). */
+    fx->var_kind = VAR_NONE;   /* back to the reset state */
+    if (mode != FA_MIDI_FX_GM) var_make(fx, mode == FA_MIDI_FX_GS ? VAR_GS : VAR_XG);
 }
 
-/* GS: 40 01 30 .. 40 01 3E (reverb 30-35, chorus 38-3E). */
+/* GS: 40 01 30 .. 40 01 5A (reverb 30-37, chorus 38-40, delay 50-5A). */
 void fa_midi_fx_gs(fa_midi_fx* fx, int addr, int v)
 {
     if (!fx) return;
     v &= 0x7F;
+    if (addr >= 0x50 && addr <= 0x5A) {
+        if (var_make(fx, VAR_GS)) fa_midi_var_gs(fx->var, addr, v);
+        return;
+    }
     switch (addr) {
     case 0x30:                  /* reverb macro */
         if (v > 7) return;
         fx->rev_type = v;
         fx->rev_pre = 0;
+        fx->rev_predelay = 0;
         fx->gs_time = 64;
         fx->gs_feedback = v >= GS_DELAY ? 32 : 0;
         gs_reverb_time(fx);
@@ -518,9 +692,11 @@ void fa_midi_fx_gs(fa_midi_fx* fx, int addr, int v)
         if (fx->rev_type >= 0 && fx->rev_type < XG_HALL1) gs_reverb_time(fx);
         break;
     case 0x35: fx->gs_feedback = v; break;
+    case 0x37: fx->rev_predelay = v; break;   /* pre-delay, ms */
     case 0x38:                  /* chorus macro */
         if (v > 7) return;
         chorus_macro(fx, v);
+        fx->cho_to_rev = fx->cho_to_del = 0;
         fx->cho_on = 1;
         break;
     case 0x39: fx->cho_pre = v > 7 ? 7 : v; break;
@@ -529,6 +705,8 @@ void fa_midi_fx_gs(fa_midi_fx* fx, int addr, int v)
     case 0x3C: fx->cho_delay = v; break;
     case 0x3D: fx->cho_rate = v; break;
     case 0x3E: fx->cho_depth = v; break;
+    case 0x3F: fx->cho_to_rev = v; return;
+    case 0x40: fx->cho_to_del = v; return;
     default: return;
     }
     if (addr < 0x38) reverb_update(fx);
@@ -567,7 +745,37 @@ static int xg_chorus_macro(int msb, int lsb)
     return 2;
 }
 
-/* XG: 02 01 00 .. 02 01 2C (reverb 00-0C, chorus 20-2C). */
+/* XG variation: type 40-41, parameters 1-10 (42-55, two bytes each) and 11-16
+ * (70-75), return, pan, sends to reverb and chorus, connection, part (56-5B). */
+static void xg_variation(fa_midi_fx* fx, int addr, int v)
+{
+    if (!var_make(fx, VAR_XG)) return;
+    if (addr == 0x40 || addr == 0x41) {
+        if (addr == 0x40) fx->var_msb = v;
+        fx->var_on = fa_midi_var_set_type(fx->var, fx->var_msb, addr == 0x41 ? v : 0);
+    } else if (addr <= 0x55) {
+        fa_midi_var_set_param(fx->var, (addr - 0x42) / 2, v, (addr - 0x42) % 2 ? 2 : 1);
+    } else if (addr >= 0x70) {
+        fa_midi_var_set_param(fx->var, 10 + addr - 0x70, v, 0);
+    } else {
+        switch (addr) {
+        case 0x56: fx->var_return = v; break;
+        case 0x57: fx->var_pan = v; break;
+        case 0x58: fx->var_to_rev = v; break;
+        case 0x59: fx->var_to_cho = v; break;
+        case 0x5A:
+            if ((v & 1) != fx->var_system) fa_midi_var_reset(fx->var);   /* rewired: from silence */
+            fx->var_system = v & 1;
+            break;
+        default:                            /* 5B: 0-15, 127 none */
+            if (v != fx->var_part) fa_midi_var_reset(fx->var);   /* another part: from silence */
+            fx->var_part = v;
+            break;
+        }
+    }
+}
+
+/* XG: 02 01 00 .. 02 01 75 (reverb 00-0C, chorus 20-2E, variation 40-5B, 70-75). */
 void fa_midi_fx_xg(fa_midi_fx* fx, int addr, int v)
 {
     if (!fx) return;
@@ -590,8 +798,14 @@ void fa_midi_fx_xg(fa_midi_fx* fx, int addr, int v)
         fx->cho_on = fx->xg_cho_msb != 0;
         if (fx->cho_on) chorus_macro(fx, xg_chorus_macro(fx->xg_cho_msb, addr == 0x21 ? v : 0));
         break;
+    case 0x22: case 0x23: case 0x24: case 0x25:   /* LFO frequency, depth, feedback, delay offset */
+        fx->xg_cho[addr - 0x22] = v;
+        break;
     case 0x2C: fx->cho_level = v; break;   /* chorus return */
-    default: return;
+    case 0x2E: fx->cho_to_rev = v; return;
+    default:
+        if ((addr >= 0x40 && addr <= 0x5B) || (addr >= 0x70 && addr <= 0x75)) xg_variation(fx, addr, v);
+        return;
     }
     if (addr < 0x20) reverb_update(fx);
     else chorus_update(fx);
