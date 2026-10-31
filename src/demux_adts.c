@@ -64,34 +64,24 @@ typedef struct adts {
     int64_t est_samples;
 } adts;
 
-static const uint32_t adts_rates[13] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000,
-                                         22050, 16000, 12000, 11025, 8000, 7350 };
-
 /* A frame's duration in the time base (frames at another rate after a change). */
 static int64_t frame_time(const adts* a, const adts_hdr* h)
 {
     return h->rate == a->base_rate ? (int64_t)h->samples : (int64_t)h->samples * a->base_rate / h->rate;
 }
 
-/* Parses the header at p (7 bytes). 0 if it is not one. */
+/* Parses the header at p (7 bytes). 0 if it is not one, or holds no data. */
 static int adts_parse(const uint8_t* p, adts_hdr* out)
 {
     static const uint32_t layout[8] = { 0, 1, 2, 3, 4, 5, 6, 8 };
-    uint32_t sfi, cfg, prot_absent;
-    size_t len;
-    if (p[0] != 0xFF || (p[1] & 0xF6) != 0xF0) return 0;   /* syncword, layer 00 */
-    prot_absent = p[1] & 1;
-    sfi = (p[2] >> 2) & 15;
-    if (sfi >= 13) return 0;
-    cfg = ((uint32_t)(p[2] & 1) << 2) | (p[3] >> 6);
-    len = ((size_t)(p[3] & 3) << 11) | ((size_t)p[4] << 3) | (p[5] >> 5);
-    if (len < (size_t)ADTS_HEADER + (prot_absent ? 0 : 2) + 1) return 0;
-    out->len = len;
-    out->rate = adts_rates[sfi];
-    out->channels = layout[cfg];
-    out->samples = 1024u * ((p[6] & 3) + 1u);
-    out->config = (uint8_t)((sfi << 3) | cfg);
-    out->profile = (uint8_t)(p[2] >> 6);
+    fa_adts_header h;
+    if (!fa_adts_parse(p, ADTS_HEADER, &h) || h.len <= h.header) return 0;
+    out->len = h.len;
+    out->rate = fa_aac_rates[h.rate_index];
+    out->channels = layout[h.config];
+    out->samples = 1024u * (uint32_t)h.blocks;
+    out->config = (uint8_t)((h.rate_index << 3) | h.config);
+    out->profile = (uint8_t)h.profile;
     return 1;
 }
 
