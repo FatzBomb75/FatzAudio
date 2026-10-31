@@ -686,6 +686,8 @@ static fa_result net_config(const char* url, const fa_open_options* options, fa_
     cfg->reconnect_ms = (o.flags & FA_NET_NO_RECONNECT) ? 0 : (o.reconnect_ms ? o.reconnect_ms : FA_NET_DEFAULT_RECONNECT_MS);
     cfg->flags = o.flags;
     cfg->hls_max_bandwidth = o.hls_max_bandwidth;
+    cfg->download_proc = o.download_proc;
+    cfg->download_user = o.download_user;
     if (cfg->prebuffer_ms > 30000) cfg->prebuffer_ms = 30000;
     if (r != FA_OK) { free(cfg->url); free(cfg->user_agent); free(cfg->headers); free(cfg->proxy); }
     return r;
@@ -878,6 +880,13 @@ FA_API fa_result FA_CALL fa_stream_get_http_header(fa_stream* stream, const char
     if (!stream || !name || !out_value || value_size == 0) return FA_ERROR_INVALID_ARG;
     if (!stream->net) return FA_ERROR_NOT_FOUND;
     return fa_net_get_header(stream->net, name, out_value, value_size);
+}
+
+FA_API fa_result FA_CALL fa_stream_set_download_callback(fa_stream* stream, fa_download_proc proc, void* user)
+{
+    if (!stream || !stream->net) return FA_ERROR_INVALID_ARG;
+    fa_net_set_tap(stream->net, proc, user);
+    return FA_OK;
 }
 
 /* ---- tempo, pitch and rate: the decode side (the chain is in tempo.c) ----------- */

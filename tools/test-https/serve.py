@@ -18,6 +18,12 @@ counted from 1 over both ports). Besides the files of DIR:
   /connections             how many connections have been opened so far
   /hls/master.m3u8         an HLS stream: a master playlist, a media playlist and
                            three byte-range segments of DIR/net/tone_cbr.mp3
+  /hls-cookie/master.m3u8  the same behind cookies: the master playlist sets two
+                           (one with an Expires date), the rest is refused (403)
+                           without both
+  /body?framing=F          20000 bytes framed by F: length (Content-Length), chunked,
+                           close (no framing, the connection closes after the body), or
+                           cut (chunked, closed before the last chunk)
 Every request's headers are also logged to stderr.
 Apple accepts a server certificate valid for at most 825 days, with the
 serverAuth usage and the names in subjectAltName, so this one is made that way.
@@ -63,16 +69,16 @@ def mp3_frames(data):
     return frames, rate
 
 
-def hls_media(root):
-    """A media playlist of three byte-range segments of net/tone_cbr.mp3 (cut at frames)."""
+def hls_media(root, segment="/net/tone_cbr.mp3"):
+    """A media playlist of three byte-range segments of net/tone_cbr.mp3 (cut at frames), served at `segment`."""
     with open(os.path.join(root, "net", "tone_cbr.mp3"), "rb") as f:
         frames, rate = mp3_frames(f.read())
     count = len(frames) - 1
     cuts = [0, count // 3, 2 * count // 3, count]
     text = "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n"
     for a, b in zip(cuts, cuts[1:]):
-        text += "#EXTINF:%.5f,\n#EXT-X-BYTERANGE:%d@%d\n/net/tone_cbr.mp3\n" % (
-            (b - a) * 1152 / rate, frames[b] - frames[a], frames[a])
+        text += "#EXTINF:%.5f,\n#EXT-X-BYTERANGE:%d@%d\n%s\n" % (
+            (b - a) * 1152 / rate, frames[b] - frames[a], frames[a], segment)
     return text + "#EXT-X-ENDLIST\n"
 
 
@@ -124,8 +130,54 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                            "application/vnd.apple.mpegurl")
         elif url.path == "/hls/media.m3u8":
             self.send_text(200, hls_media(self.directory), "application/vnd.apple.mpegurl")
+        elif url.path == "/hls-cookie/master.m3u8":
+            body = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=130000,CODECS=\"mp4a.40.34\"\nmedia.m3u8\n".encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Set-Cookie", "fa_hls=ok; Path=/hls-cookie")
+            self.send_header("Set-Cookie", "fa_two=2; Path=/hls-cookie; Expires=Wed, 21 Oct 2099 07:28:00 GMT")
+            self.end_headers()
+            self.wfile.write(body)
+        elif url.path.startswith("/hls-cookie/"):
+            cookie = self.headers.get("Cookie", "")
+            if "fa_hls=ok" not in cookie or "fa_two=2" not in cookie:
+                self.send_text(403, "no cookie\n")
+            elif url.path == "/hls-cookie/media.m3u8":
+                self.send_text(200, hls_media(self.directory, "/hls-cookie/tone_cbr.mp3"), "application/vnd.apple.mpegurl")
+            else:
+                self.send_file("/net/tone_cbr.mp3")
+        elif url.path == "/body":
+            self.send_body(urllib.parse.parse_qs(url.query).get("framing", ["length"])[0])
         else:
             self.send_file(url.path)
+
+    def send_body(self, framing):
+        """20000 bytes, framed as asked (see /body above)."""
+        body = bytes(range(250)) * 80
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        if framing == "length":
+            self.send_header("Content-Length", str(len(body)))
+        elif framing in ("chunked", "cut"):
+            self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        if framing in ("chunked", "cut"):
+            for i in range(0, len(body), 6000):
+                part = body[i:i + 6000]
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))
+            if framing == "chunked":
+                self.wfile.write(b"0\r\n\r\n")
+        else:
+            self.wfile.write(body)
+        if framing in ("close", "cut"):
+            # A clean close: TLS's close_notify, then the connection ends.
+            self.close_connection = True
+            self.wfile.flush()
+            try:
+                self.connection.unwrap()
+            except (OSError, ValueError):
+                pass
 
     def send_file(self, path):
         """A file of DIR, whole or one byte range (SimpleHTTPRequestHandler has no ranges)."""

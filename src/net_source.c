@@ -48,6 +48,7 @@ void fa_net_request(fa_net* n, fa_http_request* req, const char* url)
     req->cancel = &n->cancel;
     req->session = n->http;
     req->app_origin = n->cfg.url;   /* entries of a playlist on other servers get no app credentials */
+    req->cookies = n->cookies;
 }
 
 /* ---- the window ------------------------------------------------------------ */
@@ -122,9 +123,15 @@ static int window_write(fa_net* n, const uint8_t* data, size_t size)
         memcpy(n->buf, data + first, (size_t)(piece - first));
         n->win_end += piece;
         n->downloaded += piece;
+        fa_cond_broadcast(&n->cond);
+        /* The tap runs without the lock: the decoder can read on meanwhile. */
+        fa_mutex_unlock(&n->lock);
+        fa_mutex_lock(&n->tap_lock);
+        if (n->tap) n->tap(n->tap_user, data, (size_t)piece);
+        fa_mutex_unlock(&n->tap_lock);
+        fa_mutex_lock(&n->lock);
         data += piece;
         size -= (size_t)piece;
-        fa_cond_broadcast(&n->cond);
     }
     fa_mutex_unlock(&n->lock);
     return 0;
@@ -420,13 +427,16 @@ static void download_main(void* arg)
     int hops = 0;
     uint32_t backoff = 250;
     int64_t fail_start = 0;
-    n->http = fa_http_session_create();   /* only this thread uses it */
+    fa_store64(&n->download_tid, (int64_t)fa_thread_current_id());
+    n->http = fa_http_session_create();   /* only this thread uses them */
+    n->cookies = fa_http_cookies_create();
     fa_mutex_lock(&n->lock);
     while (!n->quit && url) {
         fa_http_request req;
         fetch_ctx c;
         fa_result r;
         int64_t pos;
+        int closed_end = 0, dropped;
         if (n->finished && !n->restart) {   /* complete: idle until a seek needs more */
             fa_cond_wait_ms(&n->cond, &n->lock, 200);
             continue;
@@ -445,6 +455,7 @@ static void download_main(void* arg)
         c.pos = pos;
         fa_net_request(n, &req, url);
         req.icy = !(n->cfg.flags & FA_NET_NO_ICY);
+        req.closed_end = &closed_end;
         /* The first request asks for "bytes=0-": a 206 answer proves ranges work. */
         if (n->connections == 0) req.range_start = 0;
         else if (!n->live && pos > 0) req.range_start = pos;
@@ -485,7 +496,11 @@ static void download_main(void* arg)
             }
         }
 
-        if (r == FA_OK && !n->icy && (n->length < 0 || n->win_end + n->skip >= n->length)) {
+        /* A body without a length or chunked framing that the server closed can't be
+         * told from a dropped connection: one that brought audio is a live stream
+         * cut off, and reconnects like radio (an empty one ends as before). */
+        dropped = r == FA_OK && closed_end && n->length < 0 && c.got_data;
+        if (r == FA_OK && !dropped && !n->icy && (n->length < 0 || n->win_end + n->skip >= n->length)) {
             n->finished = 1;                    /* the whole file is here */
             fail_start = 0;
             backoff = 250;
@@ -515,6 +530,8 @@ static void download_main(void* arg)
     fa_mutex_unlock(&n->lock);
     fa_http_session_destroy(n->http);    /* fa_net_close frees n only after joining this thread */
     n->http = NULL;
+    fa_http_cookies_destroy(n->cookies);
+    n->cookies = NULL;
     free(url);
 }
 
@@ -535,6 +552,15 @@ fa_result fa_net_open(const fa_net_config* cfg, fa_net** out)
     n->hls_duration = -1;
     if (fa_mutex_init(&n->lock) != 0) { free_config(&n->cfg); free(n); return FA_ERROR_OUT_OF_MEMORY; }
     if (fa_cond_init(&n->cond) != 0) { fa_mutex_destroy(&n->lock); free_config(&n->cfg); free(n); return FA_ERROR_OUT_OF_MEMORY; }
+    if (fa_mutex_init(&n->tap_lock) != 0) {
+        fa_cond_destroy(&n->cond);
+        fa_mutex_destroy(&n->lock);
+        free_config(&n->cfg);
+        free(n);
+        return FA_ERROR_OUT_OF_MEMORY;
+    }
+    n->tap = cfg->download_proc;
+    n->tap_user = cfg->download_user;
     if (fa_thread_create(&n->thread, download_main, n) != 0) { fa_net_close(n); return FA_ERROR_GENERIC; }
     n->thread_started = 1;
 
@@ -553,6 +579,19 @@ fa_result fa_net_open(const fa_net_config* cfg, fa_net** out)
     if (r != FA_OK) { fa_net_close(n); return r; }
     *out = n;
     return FA_OK;
+}
+
+void fa_net_set_tap(fa_net* n, fa_download_proc proc, void* user)
+{
+    if ((int64_t)fa_thread_current_id() == fa_load64(&n->download_tid)) {   /* from inside the tap: tap_lock is held already */
+        n->tap = proc;
+        n->tap_user = user;
+        return;
+    }
+    fa_mutex_lock(&n->tap_lock);
+    n->tap = proc;
+    n->tap_user = user;
+    fa_mutex_unlock(&n->tap_lock);
 }
 
 void fa_net_interrupt(fa_net* n)
@@ -582,6 +621,7 @@ void fa_net_close(fa_net* n)
     for (i = 0; i < n->meta_count; i++) meta_free_entry(&n->meta[i]);
     fa_cond_destroy(&n->cond);
     fa_mutex_destroy(&n->lock);
+    fa_mutex_destroy(&n->tap_lock);
     free(n->buf);
     free(n->headers);
     free(n->playlist);

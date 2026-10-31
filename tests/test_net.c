@@ -321,6 +321,10 @@ static fa_atomic32 g_requests;     /* requests served */
 static fa_atomic32 g_drop_served;  /* /drop.wav requests */
 static fa_atomic32 g_stall_served; /* /stall.wav requests */
 static fa_atomic32 g_seg_drop;     /* /hls/flaky*.ts: the next request of segment 1 breaks off */
+static fa_atomic32 g_live_served;  /* /live-close requests */
+static fa_atomic32 g_cookie_ok;    /* /hls/cseg*.ts requests with the expected cookies */
+static fa_atomic32 g_cookie_bad;   /* ... and without them (refused) */
+static char g_cookie_line[512];    /* the Cookie line of the last /hls/cseg*.ts request */
 static char g_last_agent[4096];    /* User-Agent of the last request */
 
 static int send_all(sock_t s, const void* p, size_t n)
@@ -492,7 +496,50 @@ static void serve_hls(sock_t s, const char* req, const char* path)
             return;
         }
     }
-    (void)req;
+    if (strcmp(path, "/hls/cookie-login") == 0) {
+        /* A login: a session cookie for /hls, and one for another path, then the playlist. */
+        send_str(s, "HTTP/1.1 302 Found\r\nLocation: /hls/cookie.m3u8\r\nSet-Cookie: sid=abc123; Path=/hls; HttpOnly\r\n"
+                    "Set-Cookie: other=x; Path=/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    }
+    if (strcmp(path, "/hls/cookie.m3u8") == 0) {
+        /* The playlist adds a cookie of its own (default path /hls). */
+        int n = snprintf(text, sizeof(text), "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n#EXT-X-MEDIA-SEQUENCE:0\n");
+        for (i = 0; i < HLS_SEGS; i++) n += snprintf(text + n, sizeof(text) - (size_t)n, "#EXTINF:%.5f,\ncseg%d.ts\n", g_seg_dur[i], i);
+        snprintf(text + n, sizeof(text) - (size_t)n, "#EXT-X-ENDLIST\n");
+        snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nSet-Cookie: seen=1\r\n"
+                 "Content-Length: %zu\r\nConnection: close\r\n\r\n", strlen(text));
+        if (!send_str(s, head)) send_str(s, text);
+        return;
+    }
+    if (strncmp(path, "/hls/cseg", 9) == 0) {
+        /* Only with both cookies, and never the one for another path. */
+        const char* ck = strstr(req, "\r\nCookie: ");
+        i = atoi(path + 9);
+        if (ck) snprintf(g_cookie_line, sizeof(g_cookie_line), "%.*s", (int)strcspn(ck + 10, "\r\n"), ck + 10);
+        if (i < 0 || i >= HLS_SEGS || !ck || !strstr(g_cookie_line, "sid=abc123") || !strstr(g_cookie_line, "seen=1") ||
+            strstr(g_cookie_line, "other=")) {
+            fa_fetch_add32(&g_cookie_bad, 1);
+            send_str(s, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            return;
+        }
+        fa_fetch_add32(&g_cookie_ok, 1);
+        snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", g_seg[i].n);
+        if (!send_str(s, head)) send_all(s, g_seg[i].p, g_seg[i].n);
+        return;
+    }
+    if (strcmp(path, "/hls/tiers.m3u8") == 0) {
+        /* Video variants with tiered audio groups: MP3 segments in the top tier's group,
+         * AAC in the lower one's. The video playlists don't exist. */
+        snprintf(text, sizeof(text), "#EXTM3U\n"
+                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"lo\",NAME=\"Main\",DEFAULT=YES,URI=\"aac.m3u8\"\n"
+                 "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"hi\",NAME=\"Main\",DEFAULT=YES,URI=\"audio.m3u8\"\n"
+                 "#EXT-X-STREAM-INF:BANDWIDTH=2500000,CODECS=\"avc1.64001f,mp4a.40.2\",AUDIO=\"hi\"\nnone-hi.m3u8\n"
+                 "#EXT-X-STREAM-INF:BANDWIDTH=500000,CODECS=\"avc1.64001f,mp4a.40.5\",AUDIO=\"lo\"\nnone-lo.m3u8\n");
+        snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(text));
+        if (!send_str(s, head)) send_str(s, text);
+        return;
+    }
     if (strcmp(path, "/hls/master.m3u8") == 0) {
         snprintf(text, sizeof(text), "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=900000,CODECS=\"avc1.4d401f,mp4a.40.2\"\n"
                  "video.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=130000,CODECS=\"mp4a.40.34\"\naudio.m3u8\n");
@@ -617,6 +664,15 @@ static int handle_request(sock_t s, int id)
             while (fa_monotonic_ns() < until && !fa_load32(&g_stop)) fa_sleep_ms(10);
             send_all(s, g_wav + first, g_wav_n - first);
         }
+    }
+    else if (strcmp(path, "/live-close") == 0) {
+        /* A live stream with no length and no chunked framing: the first connection
+         * sends half the MP3 and closes cleanly, the second all of it, then the
+         * stream is gone (404). */
+        int k = fa_fetch_add32(&g_live_served, 1);
+        if (k >= 2) send_str(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        else if (!send_str(s, "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nConnection: close\r\n\r\n"))
+            send_all(s, g_mp3, k == 0 ? g_mp3_n / 2 : g_mp3_n);
     }
     else if (strcmp(path, "/redirect") == 0)
         send_str(s, "HTTP/1.1 302 Found\r\nLocation: /tone.wav\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -845,11 +901,52 @@ static void test_hls_parse(void)
     CHECK_EQ(fa_hls_parse(master, strlen(master), "http://h.com/m/master.m3u8", &p), FA_OK);
     CHECK(p.is_master);
     CHECK_EQ(p.variant_count, 2);
-    CHECK(p.audio_group_uri != NULL);
-    CHECK_STR(p.audio_group_uri, "http://h.com/m/audio/en.m3u8");
+    CHECK_EQ(p.rendition_count, 1);
+    CHECK_STR(fa_hls_audio_uri(&p, 0), "http://h.com/m/audio/en.m3u8");
     CHECK_EQ(fa_hls_pick_variant(&p, 0), 0);
     CHECK_EQ(fa_hls_pick_variant(&p, 1000000), 1);
     fa_hls_playlist_free(&p);
+    /* Tiered audio groups: the rendition comes from the chosen variant's group (its
+     * DEFAULT, else AUTOSELECT, else the first); a rendition without a URI, or a
+     * variant without a group, plays the variant's own playlist. */
+    {
+        const char* tiered =
+            "#EXTM3U\n"
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"hi\",NAME=\"Stereo\",AUTOSELECT=YES,URI=\"hi/stereo.m3u8\"\n"
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"hi\",NAME=\"Main\",DEFAULT=YES,URI=\"hi/main.m3u8\"\n"
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"lo\",NAME=\"Talk\",URI=\"lo/talk.m3u8\"\n"
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"lo\",NAME=\"Main\",AUTOSELECT=YES,URI=\"lo/main.m3u8\"\n"
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"mux\",NAME=\"Main\",DEFAULT=YES\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=3000000,CODECS=\"avc1.64001f,mp4a.40.2\",AUDIO=\"hi\"\n"
+            "v/hi.m3u8\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=600000,CODECS=\"avc1.64001f,mp4a.40.5\",AUDIO=\"lo\"\n"
+            "v/lo.m3u8\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=300000,CODECS=\"avc1.64001f,mp4a.40.5\",AUDIO=\"mux\"\n"
+            "v/mux.m3u8\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=200000,CODECS=\"avc1.64001f,mp4a.40.5\"\n"
+            "v/plain.m3u8\n";
+        const char* only_media = "#EXTM3U\n"
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"One\",URI=\"one.m3u8\"\n"
+            "#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"b\",NAME=\"Two\",DEFAULT=YES,URI=\"two.m3u8\"\n";
+        int v;
+        CHECK_EQ(fa_hls_parse(tiered, strlen(tiered), "http://h.com/m/master.m3u8", &p), FA_OK);
+        CHECK_EQ(p.rendition_count, 5);
+        v = fa_hls_pick_variant(&p, 0);
+        CHECK_EQ(v, 0);
+        CHECK_STR(fa_hls_audio_uri(&p, v), "http://h.com/m/hi/main.m3u8");
+        v = fa_hls_pick_variant(&p, 1000000);
+        CHECK_EQ(v, 1);
+        CHECK_STR(fa_hls_audio_uri(&p, v), "http://h.com/m/lo/main.m3u8");
+        v = fa_hls_pick_variant(&p, 400000);
+        CHECK_EQ(v, 2);
+        CHECK(fa_hls_audio_uri(&p, v) == NULL);
+        CHECK(fa_hls_audio_uri(&p, 3) == NULL);
+        fa_hls_playlist_free(&p);
+        CHECK_EQ(fa_hls_parse(only_media, strlen(only_media), "http://h.com/m/master.m3u8", &p), FA_OK);
+        CHECK_EQ(p.variant_count, 0);
+        CHECK_STR(fa_hls_audio_uri(&p, fa_hls_pick_variant(&p, 0)), "http://h.com/m/two.m3u8");
+        fa_hls_playlist_free(&p);
+    }
 
     CHECK_EQ(fa_hls_parse(media, strlen(media), "http://h.com/m/a.m3u8", &p), FA_OK);
     CHECK(!p.is_master);
@@ -2355,6 +2452,78 @@ static void test_https_hls_optional(void)
     CHECK(after - before <= 1);
 }
 
+/* Through the system's TLS stack, against serve.py (FA_NET_HTTPS_ECHO_URL): how a
+ * body ended. One with a length or chunked framing is complete (never "closed"); one
+ * without either that the server closes is reported as such (or as a network error:
+ * a reconnect either way); a chunked one cut before its last chunk is an error (on
+ * Apple, where URLSession doesn't report that, every chunked body counts as closed). And
+ * an HLS stream behind cookies: the master playlist's two cookies (URLSession joins
+ * them into one header) come back on the media playlist and the segments. */
+static void test_https_framing_optional(void)
+{
+    static const char* const framing[] = { "length", "chunked", "close", "cut" };
+    char origin[300], url[400];
+    int port, i;
+    if (!https_origin(origin, sizeof(origin), &port)) { printf("  skipped (set FA_NET_HTTPS_ECHO_URL)\n"); return; }
+    for (i = 0; i < 4; i++) {
+        fa_http_request req;
+        conn_fetch c;
+        int closed = -1;
+        fa_result r;
+        snprintf(url, sizeof(url), "%s/body?framing=%s", origin, framing[i]);
+        memset(&c, 0, sizeof(c));
+        memset(&req, 0, sizeof(req));
+        req.url = url;
+        req.range_start = -1;
+        req.proxy = "";
+        req.timeout_ms = 5000;
+        req.closed_end = &closed;
+        r = fa_http_fetch(&req, cf_head, cf_data, &c);
+        printf("  %s: result %d, %zu bytes, closed_end %d\n", framing[i], (int)r, c.body.n, closed);
+        if (i == 0) {
+            CHECK_EQ(r, FA_OK);
+            CHECK_EQ(c.body.n, 20000);
+            CHECK_EQ(closed, 0);
+        } else if (i == 1) {
+            CHECK_EQ(r, FA_OK);
+            CHECK_EQ(c.body.n, 20000);
+#ifdef __APPLE__
+            CHECK_EQ(closed, 1);    /* URLSession can't tell a whole chunked body from a cut one */
+#else
+            CHECK_EQ(closed, 0);
+#endif
+        } else if (i == 2) {
+            CHECK((r == FA_OK && closed == 1 && c.body.n == 20000) || r == FA_ERROR_NETWORK);
+        } else {
+#ifdef __APPLE__
+            CHECK((r == FA_OK && closed == 1) || r == FA_ERROR_NETWORK);
+#else
+            CHECK_EQ(r, FA_ERROR_NETWORK);
+#endif
+        }
+        free(c.body.p);
+    }
+    {
+        fa_open_options o;
+        fa_net_options net;
+        fa_stream* s = NULL;
+        float buf[1152 * 2];
+        fa_frames got = 0, total = 0;
+        snprintf(url, sizeof(url), "%s/hls-cookie/master.m3u8", origin);
+        fa_open_options_init(&o);
+        fa_net_options_init(&net);
+        net.proxy = "";
+        net.timeout_ms = 5000;
+        o.flags = FA_OPEN_DECODE_ONLY;
+        o.net = &net;
+        CHECK_EQ(fa_stream_open_url(g_engine, url, &o, &s), FA_OK);
+        while (fa_stream_read(s, buf, 1152, &got) == FA_OK && got > 0) total += got;
+        fa_stream_close(s);
+        printf("  behind cookies: %lld frames\n", (long long)total);
+        CHECK(total > 44100 * 2);
+    }
+}
+
 /* A segment whose download breaks off is fetched again, and the audio already
  * delivered is not repeated; byte-range segments work on a server ignoring Range. */
 static void test_hls_retry_and_byteranges(void)
@@ -2597,6 +2766,347 @@ static void test_close_while_streaming(void)
     fa_device_close(dev);
 }
 
+/* ---- step 11: audio groups, resolver, clean closes, the tap, cookies ------------ */
+
+/* open_url with the caller's network settings (proxy and timeout as open_url's
+ * unless set). */
+static fa_stream* open_url_net(const char* path, uint32_t flags, fa_net_options* net, fa_result* out_r)
+{
+    char url[256];
+    fa_open_options o;
+    fa_stream* s = NULL;
+    url_of(url, sizeof(url), path);
+    fa_open_options_init(&o);
+    if (!net->proxy) net->proxy = "";
+    if (!net->timeout_ms) net->timeout_ms = 3000;
+    o.flags = flags;
+    o.net = net;
+    *out_r = fa_stream_open_url(g_engine, url, &o, &s);
+    return *out_r == FA_OK ? s : NULL;
+}
+
+/* Tiered audio groups: the rendition of the chosen variant's group plays, and
+ * hls_max_bandwidth picks the variant. */
+static void test_hls_audio_groups(void)
+{
+    fa_net_options net;
+    fa_stream* s;
+    fa_stream_info info;
+    fa_net_status st;
+    fa_result r;
+    fa_frames n = 0;
+    float* got;
+    fa_net_options_init(&net);
+    s = open_url_net("/hls/tiers.m3u8", FA_OPEN_DECODE_ONLY, &net, &r);
+    CHECK_EQ(r, FA_OK);
+    fa_stream_get_info(s, &info);
+    CHECK_STR(info.codec, "mp3");
+    CHECK_EQ(fa_stream_get_net_status(s, &st), FA_OK);
+    CHECK(strstr(st.url, "/hls/audio.m3u8") != NULL);
+    fa_stream_close(s);
+    fa_net_options_init(&net);
+    net.hls_max_bandwidth = 1000000;
+    s = open_url_net("/hls/tiers.m3u8", FA_OPEN_DECODE_ONLY, &net, &r);
+    CHECK_EQ(r, FA_OK);
+    fa_stream_get_info(s, &info);
+    CHECK_STR(info.codec, "aac");
+    CHECK_EQ(fa_stream_get_net_status(s, &st), FA_OK);
+    CHECK(strstr(st.url, "/hls/aac.m3u8") != NULL);
+    got = read_all(s, &n);
+    free(got);
+    CHECK(n > 44100);
+    fa_stream_close(s);
+}
+
+/* A resolver that never answers: the hook holds every lookup after the first. */
+static fa_atomic32 g_resolve_hold, g_resolve_calls, g_resolve_in, g_resolve_out;
+
+static void hold_resolve(const char* host)
+{
+    (void)host;
+    if (fa_fetch_add32(&g_resolve_calls, 1) == 0) return;
+    fa_fetch_add32(&g_resolve_in, 1);
+    while (fa_load32(&g_resolve_hold)) fa_sleep_ms(2);
+    fa_fetch_add32(&g_resolve_out, 1);
+}
+
+/* A reconnect that hangs in the plain-socket client's name lookup doesn't hold up
+ * the close: it returns in well under 50 ms and leaves the lookup behind. */
+static void test_close_during_resolve(void)
+{
+    fa_net_options net;
+    fa_stream* s;
+    fa_result r;
+    int64_t t0, took;
+    if (strcmp(g_scheme, "http") != 0) return;
+    fa_store32(&g_drop_served, 0);
+    fa_store32(&g_resolve_calls, 0);
+    fa_store32(&g_resolve_in, 0);
+    fa_store32(&g_resolve_out, 0);
+    fa_store32(&g_resolve_hold, 1);
+    fa_net_test_resolve_hook = hold_resolve;
+    fa_net_options_init(&net);
+    s = open_url_net("/drop.wav", FA_OPEN_DECODE_ONLY, &net, &r);   /* the first connection breaks off */
+    CHECK_EQ(r, FA_OK);
+    t0 = fa_monotonic_ns();
+    while (!fa_load32(&g_resolve_in) && fa_monotonic_ns() - t0 < 5000000000LL) fa_sleep_ms(2);
+    CHECK_EQ(fa_load32(&g_resolve_in), 1);
+    t0 = fa_monotonic_ns();
+    fa_stream_close(s);
+    took = fa_monotonic_ns() - t0;
+    printf("  close took %.1f ms\n", (double)took / 1e6);
+    CHECK(took < 50000000LL);
+    /* Let the abandoned lookup finish (it frees itself). */
+    fa_store32(&g_resolve_hold, 0);
+    t0 = fa_monotonic_ns();
+    while (!fa_load32(&g_resolve_out) && fa_monotonic_ns() - t0 < 5000000000LL) fa_sleep_ms(2);
+    fa_sleep_ms(50);
+    fa_net_test_resolve_hook = NULL;
+}
+
+/* A live stream without a length or chunked framing that the server closes cleanly
+ * is reconnected like a dropped one, not taken as the end of a file. */
+static void test_clean_close_reconnects(void)
+{
+    fa_net_options net;
+    fa_stream* s;
+    fa_result r;
+    fa_net_status st;
+    fa_frames n = 0, ref_n = 0;
+    float* got;
+    float* ref = read_all_memory(g_mp3, g_mp3_n, &ref_n);
+    free(ref);
+    fa_store32(&g_live_served, 0);
+    fa_net_options_init(&net);
+    net.reconnect_ms = 1500;
+    s = open_url_net("/live-close", FA_OPEN_DECODE_ONLY, &net, &r);
+    CHECK_EQ(r, FA_OK);
+    got = read_all(s, &n);
+    free(got);
+    CHECK_EQ(fa_stream_get_net_status(s, &st), FA_OK);
+    printf("  %lld frames (one body: %lld), %u reconnect(s)\n", (long long)n, (long long)ref_n, st.reconnects);
+    CHECK(st.reconnects >= 1);
+    CHECK(n > ref_n + ref_n / 4);    /* half the first time, all of it the second */
+    fa_stream_close(s);
+}
+
+typedef struct tap_buf {
+    fa_mutex lock;
+    uint8_t* p;
+    size_t n, cap;
+    int calls;
+    fa_atomic_ptr stream;     /* set once open returned */
+    size_t stop_after;        /* > 0: the callback turns itself off past this many bytes */
+    int off;                  /* it did */
+} tap_buf;
+
+static void FA_CALL tap_proc(void* user, const void* data, size_t size)
+{
+    tap_buf* t = (tap_buf*)user;
+    fa_stream* s;
+    fa_mutex_lock(&t->lock);
+    if (t->n + size > t->cap) {
+        size_t cap = (t->n + size) * 2;
+        uint8_t* p = (uint8_t*)realloc(t->p, cap);
+        if (p) { t->p = p; t->cap = cap; }
+    }
+    if (t->n + size <= t->cap) { memcpy(t->p + t->n, data, size); t->n += size; }
+    t->calls++;
+    fa_mutex_unlock(&t->lock);
+    s = (fa_stream*)fa_load_ptr(&t->stream);
+    if (t->stop_after && s && t->n > t->stop_after) {
+        fa_stream_set_download_callback(s, NULL, NULL);   /* from inside */
+        fa_mutex_lock(&t->lock);
+        t->off = 1;
+        fa_mutex_unlock(&t->lock);
+    }
+}
+
+/* The tap hands on the downloaded bytes: a file exactly as served, radio without
+ * its ICY title blocks. It can be turned off, also from inside the callback, and
+ * isn't called again after. */
+static void test_download_tap(void)
+{
+    fa_net_options net;
+    fa_stream* s;
+    fa_result r;
+    fa_net_status st;
+    tap_buf t;
+    fa_frames n = 0;
+    float* got;
+    size_t before;
+    memset(&t, 0, sizeof(t));
+    fa_mutex_init(&t.lock);
+    fa_net_options_init(&net);
+    net.download_proc = tap_proc;
+    net.download_user = &t;
+    s = open_url_net("/tone.mp3", FA_OPEN_DECODE_ONLY, &net, &r);
+    CHECK_EQ(r, FA_OK);
+    got = read_all(s, &n);
+    free(got);
+    {
+        int64_t until = fa_monotonic_ns() + 5000000000LL;
+        do { fa_stream_get_net_status(s, &st); if (st.finished) break; fa_sleep_ms(5); } while (fa_monotonic_ns() < until);
+    }
+    CHECK(st.finished);
+    fa_mutex_lock(&t.lock);
+    CHECK_EQ(t.n, g_mp3_n);
+    CHECK(t.n == g_mp3_n && memcmp(t.p, g_mp3, g_mp3_n) == 0);
+    fa_mutex_unlock(&t.lock);
+    CHECK_EQ(fa_stream_set_download_callback(s, NULL, NULL), FA_OK);
+    fa_stream_close(s);
+
+    /* Radio: the audio only; turned off from inside the callback past 64 KB. */
+    t.n = 0;
+    t.calls = 0;
+    t.stop_after = 65536;
+    s = open_url_net("/radio", FA_OPEN_DECODE_ONLY, &net, &r);
+    CHECK_EQ(r, FA_OK);
+    fa_exchange_ptr(&t.stream, s);
+    {
+        float buf[1152 * 2];
+        fa_frames rd = 0;
+        int64_t until = fa_monotonic_ns() + 5000000000LL;
+        for (;;) {
+            int off;
+            fa_mutex_lock(&t.lock);
+            before = t.n;
+            off = t.off;
+            fa_mutex_unlock(&t.lock);
+            if (off || fa_monotonic_ns() > until) break;
+            fa_stream_read(s, buf, 1152, &rd);   /* the window has room once the decoder reads */
+        }
+        CHECK(before > t.stop_after);
+        for (rd = 0; rd < 44100 * 3; ) { fa_frames k = 0; fa_stream_read(s, buf, 1152, &k); if (!k) break; rd += k; }
+    }
+    fa_mutex_lock(&t.lock);
+    CHECK_EQ(t.n, before);                 /* not called again */
+    CHECK(t.n >= RADIO_METAINT * 2 && memcmp(t.p, g_mp3, RADIO_METAINT) == 0);
+    CHECK(memcmp(t.p + RADIO_METAINT, g_mp3 + RADIO_METAINT, RADIO_METAINT) == 0);   /* the title block is cut out */
+    fa_mutex_unlock(&t.lock);
+    fa_stream_close(s);
+    {
+        fa_stream* m = NULL;
+        CHECK_EQ(fa_stream_open_memory(g_engine, g_wav, g_wav_n, NULL, &m), FA_OK);
+        CHECK_EQ(fa_stream_set_download_callback(m, tap_proc, &t), FA_ERROR_INVALID_ARG);
+        fa_stream_close(m);
+    }
+    free(t.p);
+    fa_mutex_destroy(&t.lock);
+}
+
+/* The cookie jar's rules: domain and host-only cookies, paths, Secure, expiry,
+ * replacement and deletion, the order of the Cookie header. */
+static void test_cookie_jar(void)
+{
+    fa_http_cookies* j = fa_http_cookies_create();
+    char* c;
+    CHECK(j != NULL);
+    fa_http_cookies_take(j, "https://a.example.com/radio/live.m3u8",
+                         "Content-Type: x\r\nSet-Cookie: host=1\r\nSet-Cookie: dom=2; Domain=.example.com; Path=/\r\n"
+                         "set-cookie: deep=3; Path=/radio/hi\r\nSet-Cookie: sec=4; Secure; Path=/\r\n"
+                         "Set-Cookie: gone=5; Max-Age=0\r\nSet-Cookie: old=6; Expires=Thu, 01 Jan 1998 00:00:00 GMT\r\n"
+                         "Set-Cookie: later=7; Path=/; expires=Wed, 21-Oct-2099 07:28:00 GMT\r\n"
+                         "Set-Cookie: tld=8; Domain=com\r\nSet-Cookie: other=9; Domain=other.org\r\n"
+                         "Set-Cookie: novalue\r\nSet-Cookie: =x\r\n");
+    c = fa_http_cookies_for(j, "https://a.example.com/radio/hi/seg1.ts?x=1");
+    CHECK(c != NULL);
+    CHECK_STR(c, "deep=3; host=1; dom=2; sec=4; later=7");   /* longest path first, then oldest */
+    free(c);
+    c = fa_http_cookies_for(j, "http://a.example.com/radio/seg.ts");   /* no Secure over http, not deep */
+    CHECK_STR(c, "host=1; dom=2; later=7");
+    free(c);
+    c = fa_http_cookies_for(j, "http://cdn.example.com/x");   /* the domain cookie only */
+    CHECK_STR(c, "dom=2");
+    free(c);
+    c = fa_http_cookies_for(j, "http://a.example.com/radiox");   /* "/radio" doesn't cover "/radiox" */
+    CHECK_STR(c, "dom=2; later=7");
+    free(c);
+    CHECK(fa_http_cookies_for(j, "http://example.org/") == NULL);
+    /* Replaced (same name, domain and path), then deleted by an expired one. */
+    fa_http_cookies_take(j, "https://a.example.com/radio/x", "Set-Cookie: host=new\r\n");
+    c = fa_http_cookies_for(j, "http://a.example.com/radio/x");
+    CHECK_STR(c, "host=new; dom=2; later=7");
+    free(c);
+    fa_http_cookies_take(j, "https://a.example.com/radio/x", "Set-Cookie: host=; Expires=Sun, 06 Nov 1994 08:49:37 GMT\r\n"
+                                                             "Set-Cookie: dom=; Domain=example.com; Path=/; Max-Age=-1\r\n");
+    c = fa_http_cookies_for(j, "http://a.example.com/radio/x");
+    CHECK_STR(c, "later=7");
+    free(c);
+    fa_http_cookies_destroy(j);
+    /* The jar's line joins the app's Cookie line on its origin, and goes alone elsewhere. */
+    {
+        fa_http_request req;
+        walk_text w;
+        j = fa_http_cookies_create();
+        fa_http_cookies_take(j, "http://h.com/a", "Set-Cookie: s=1; Domain=h.com\r\n");
+        memset(&req, 0, sizeof(req));
+        req.url = "http://h.com/a/b";
+        req.range_start = -1;
+        req.headers = "Cookie: app=1\r\nX-A: 1";
+        req.cookies = j;
+        memset(&w, 0, sizeof(w));
+        CHECK_EQ(fa_http_each_header(&req, NULL, walk_add, &w), FA_OK);
+        CHECK_STR(w.text, "Accept=*/*|Accept-Encoding=identity|Cookie=app=1; s=1|X-A=1|");
+        req.url = "http://cdn.h.com/seg.ts";
+        req.other_origin = 1;
+        memset(&w, 0, sizeof(w));
+        CHECK_EQ(fa_http_each_header(&req, NULL, walk_add, &w), FA_OK);
+        CHECK_STR(w.text, "Accept=*/*|Accept-Encoding=identity|X-A=1|Cookie=s=1|");
+        fa_http_cookies_destroy(j);
+    }
+    /* A long jar line still fits the plain-socket client's request (6 KB of cookies). */
+    {
+        char big[3100], line[3200], url[256];
+        fa_http_request req;
+        conn_fetch c;
+        memset(big, 'v', 3000);
+        big[3000] = 0;
+        j = fa_http_cookies_create();
+        snprintf(line, sizeof(line), "Set-Cookie: a=%s\r\n", big);
+        fa_http_cookies_take(j, "http://127.0.0.1/", line);
+        snprintf(line, sizeof(line), "Set-Cookie: b=%s\r\n", big);
+        fa_http_cookies_take(j, "http://127.0.0.1/", line);
+        snprintf(url, sizeof(url), "http://127.0.0.1:%d/echo-headers", g_port);
+        memset(&c, 0, sizeof(c));
+        memset(&req, 0, sizeof(req));
+        req.url = url;
+        req.range_start = -1;
+        req.proxy = "";
+        req.timeout_ms = 3000;
+        req.cookies = j;
+        CHECK_EQ(fa_http_fetch(&req, cf_head, cf_data, &c), FA_OK);
+        CHECK(c.body.p != NULL && strstr(c.body.p, "Cookie: a=vvv") != NULL && strstr(c.body.p, "; b=vvv") != NULL);
+        free(c.body.p);
+        fa_http_cookies_destroy(j);
+    }
+}
+
+/* An HLS stream behind a login redirect: the cookies the redirect and the playlist
+ * set go back on every segment, joined with the app's own Cookie line. */
+static void test_hls_cookies(void)
+{
+    fa_net_options net;
+    fa_stream* s;
+    fa_result r;
+    fa_frames n = 0;
+    float* got;
+    fa_store32(&g_cookie_ok, 0);
+    fa_store32(&g_cookie_bad, 0);
+    fa_net_options_init(&net);
+    net.headers = "Cookie: app=1";
+    s = open_url_net("/hls/cookie-login", FA_OPEN_DECODE_ONLY, &net, &r);
+    CHECK_EQ(r, FA_OK);
+    got = read_all(s, &n);
+    free(got);
+    fa_stream_close(s);
+    printf("  %d segment(s) let in, %d refused; last Cookie: %s\n", (int)fa_load32(&g_cookie_ok), (int)fa_load32(&g_cookie_bad), g_cookie_line);
+    CHECK_EQ(fa_load32(&g_cookie_ok), HLS_SEGS);
+    CHECK_EQ(fa_load32(&g_cookie_bad), 0);
+    CHECK_STR(g_cookie_line, "app=1; sid=abc123; seen=1");
+    CHECK(n > 44100);
+}
+
 #if defined(__ANDROID__)
 /* HTTPS through HttpURLConnection: the transport, then the URL stream tests again
  * over HTTPS. Needs a Java VM, which the test starts itself; skipped where none
@@ -2642,6 +3152,10 @@ static void test_android_https(void)
     test_seek_after_giving_up();
     test_long_user_agent();
     test_close_while_streaming();
+    test_hls_audio_groups();
+    test_clean_close_reconnects();
+    test_download_tap();
+    test_hls_cookies();
     g_scheme = "http";
     g_url_port = g_port;
     CHECK_EQ(g_failures, before);
@@ -2721,10 +3235,17 @@ int main(void)
     RUN(test_seek_after_giving_up);
     RUN(test_long_user_agent);
     RUN(test_close_while_streaming);
+    RUN(test_hls_audio_groups);
+    RUN(test_close_during_resolve);
+    RUN(test_clean_close_reconnects);
+    RUN(test_download_tap);
+    RUN(test_cookie_jar);
+    RUN(test_hls_cookies);
     RUN(test_https_optional);
     RUN(test_https_headers_optional);
     RUN(test_https_session_optional);
     RUN(test_https_hls_optional);
+    RUN(test_https_framing_optional);
 #if defined(__ANDROID__)
     RUN(test_android_https);
 #endif
