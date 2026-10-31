@@ -17,6 +17,7 @@
  * track decoder snaps them to the packet grid of constant-duration codecs. */
 #include "demux.h"
 #include "net.h"
+#include "walk.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -124,65 +125,15 @@ typedef struct mkv {
 
 /* ---- EBML in memory ------------------------------------------------------------------ */
 
-typedef struct ebml_el {
-    uint32_t id;
-    const uint8_t* p;
-    size_t len;
-} ebml_el;
-
-/* Variable-length integer (RFC 8794 4): length from the leading zero bits. */
-static int vint_len(uint8_t first)
+static int64_t el_sint(const fa_ebml_el* e)
 {
-    int n = 1;
-    while (n <= 8 && !(first & (0x80 >> (n - 1)))) n++;
-    return n;
-}
-
-static int mem_next(const uint8_t** cur, const uint8_t* end, ebml_el* e)
-{
-    const uint8_t* p = *cur;
-    size_t n = (size_t)(end - p), il, sl, i;
-    uint64_t size;
-    int unknown = 1;
-    if (n < 2) return 0;
-    il = (size_t)vint_len(p[0]);
-    if (il > 4 || il >= n) return 0;
-    e->id = 0;
-    for (i = 0; i < il; i++) e->id = (e->id << 8) | p[i];
-    sl = (size_t)vint_len(p[il]);
-    if (sl > 8 || il + sl > n) return 0;
-    size = p[il] & (0xFFu >> sl);
-    if (size != (0xFFu >> sl)) unknown = 0;
-    for (i = 1; i < sl; i++) {
-        if (p[il + i] != 0xFF) unknown = 0;
-        size = (size << 8) | p[il + i];
-    }
-    p += il + sl;
-    n -= il + sl;
-    if (unknown || size > n) size = n;   /* unknown or cut short: to the end of the parent */
-    e->p = p;
-    e->len = (size_t)size;
-    *cur = p + size;
-    return 1;
-}
-
-static uint64_t el_uint(const ebml_el* e)
-{
-    uint64_t v = 0;
-    size_t i;
-    for (i = 0; i < e->len && i < 8; i++) v = (v << 8) | e->p[i];
-    return v;
-}
-
-static int64_t el_sint(const ebml_el* e)
-{
-    uint64_t v = el_uint(e);
+    uint64_t v = fa_ebml_uint(e);
     size_t n = e->len < 8 ? e->len : 8;
     if (n > 0 && n < 8 && (e->p[0] & 0x80)) v |= ~(uint64_t)0 << (n * 8);
     return (int64_t)v;
 }
 
-static double el_float(const ebml_el* e)
+static double el_float(const fa_ebml_el* e)
 {
     if (e->len == 4) {
         union { uint32_t u; float f; } v;
@@ -197,14 +148,14 @@ static double el_float(const ebml_el* e)
     return 0.0;
 }
 
-static int el_is(const ebml_el* e, const char* s)
+static int el_is(const fa_ebml_el* e, const char* s)
 {
     size_t n = strlen(s), len = e->len;
     while (len > 0 && e->p[len - 1] == 0) len--;   /* strings may be zero-padded */
     return len == n && memcmp(e->p, s, n) == 0;
 }
 
-static int el_starts(const ebml_el* e, const char* s)
+static int el_starts(const fa_ebml_el* e, const char* s)
 {
     size_t n = strlen(s);
     return e->len >= n && memcmp(e->p, s, n) == 0;
@@ -216,25 +167,15 @@ static int el_starts(const ebml_el* e, const char* s)
 static int read_header(mkv* m, uint32_t* id, int64_t* size, int64_t* data)
 {
     uint8_t b[12];
-    int il, sl, i, unknown = 1;
-    uint64_t s;
+    size_t il, sl;
     if (fa_br_read(&m->br, b, 1) < 1) return 0;
-    il = vint_len(b[0]);
+    il = (size_t)fa_ebml_vint_len(b[0]);
     if (il > 4) return 0;
-    if (fa_br_read(&m->br, b + 1, (size_t)il) < (size_t)il) return 0;   /* rest of the ID + size's first byte */
-    *id = 0;
-    for (i = 0; i < il; i++) *id = (*id << 8) | b[i];
-    sl = vint_len(b[il]);
+    if (fa_br_read(&m->br, b + 1, il) < il) return 0;   /* rest of the ID + size's first byte */
+    sl = (size_t)fa_ebml_vint_len(b[il]);
     if (sl > 8) return 0;
-    if (sl > 1 && fa_br_read(&m->br, b + il + 1, (size_t)sl - 1) < (size_t)sl - 1) return 0;
-    s = b[il] & (0xFFu >> sl);
-    if (s != (0xFFu >> sl)) unknown = 0;
-    for (i = 1; i < sl; i++) {
-        if (b[il + i] != 0xFF) unknown = 0;
-        s = (s << 8) | b[il + i];
-    }
-    if (s > (uint64_t)INT64_MAX / 4) return 0;
-    *size = unknown ? -1 : (int64_t)s;
+    if (sl > 1 && fa_br_read(&m->br, b + il + 1, sl - 1) < sl - 1) return 0;
+    if (fa_ebml_header(b, il + sl, id, size) == 0) return 0;
     *data = fa_br_tell(&m->br);
     return 1;
 }
@@ -297,20 +238,20 @@ static int64_t ticks_ns(const mkv* m, int64_t t)
 static void parse_cues(mkv* m, const uint8_t* p, size_t len)
 {
     const uint8_t* cur = p;
-    ebml_el cp;
-    while (mem_next(&cur, p + len, &cp)) {
+    fa_ebml_el cp;
+    while (fa_ebml_next(&cur, p + len, &cp)) {
         const uint8_t* c2 = cp.p;
-        ebml_el e;
+        fa_ebml_el e;
         int64_t ts = -1;
         if (cp.id != ID_CUEPOINT) continue;
-        while (mem_next(&c2, cp.p + cp.len, &e)) {
-            if (e.id == ID_CUETIME) ts = (int64_t)el_uint(&e);
+        while (fa_ebml_next(&c2, cp.p + cp.len, &e)) {
+            if (e.id == ID_CUETIME) ts = (int64_t)fa_ebml_uint(&e);
             else if (e.id == ID_CUETRACKPOSITIONS && ts >= 0) {
                 const uint8_t* c3 = e.p;
-                ebml_el f;
-                while (mem_next(&c3, e.p + e.len, &f))
-                    if (f.id == ID_CUECLUSTERPOSITION && el_uint(&f) < (uint64_t)INT64_MAX / 4)
-                        index_add(m, m->seg_start + (int64_t)el_uint(&f), ticks_ns(m, ts));
+                fa_ebml_el f;
+                while (fa_ebml_next(&c3, e.p + e.len, &f))
+                    if (f.id == ID_CUECLUSTERPOSITION && fa_ebml_uint(&f) < (uint64_t)INT64_MAX / 4)
+                        index_add(m, m->seg_start + (int64_t)fa_ebml_uint(&f), ticks_ns(m, ts));
             }
         }
     }
@@ -321,43 +262,43 @@ static void parse_cues(mkv* m, const uint8_t* p, size_t len)
 typedef struct mkv_entry {
     uint64_t number, type;
     int enabled, is_default;
-    ebml_el codec_id, priv;
+    fa_ebml_el codec_id, priv;
     int has_priv;
     double rate, out_rate;
     uint64_t channels, bits;
     int64_t codec_delay, seek_preroll;
     int bad_encoding, encrypted;
-    ebml_el strip;
+    fa_ebml_el strip;
     int has_strip;
 } mkv_entry;
 
-static void parse_entry(const ebml_el* te, mkv_entry* t)
+static void parse_entry(const fa_ebml_el* te, mkv_entry* t)
 {
     const uint8_t* cur = te->p;
-    ebml_el e;
+    fa_ebml_el e;
     memset(t, 0, sizeof(*t));
     t->enabled = 1;
     t->is_default = 1;
     t->rate = 8000.0;
     t->channels = 1;
-    while (mem_next(&cur, te->p + te->len, &e)) {
+    while (fa_ebml_next(&cur, te->p + te->len, &e)) {
         switch (e.id) {
-        case ID_TRACKNUMBER: t->number = el_uint(&e); break;
-        case ID_TRACKTYPE: t->type = el_uint(&e); break;
-        case ID_FLAGENABLED: t->enabled = el_uint(&e) != 0; break;
-        case ID_FLAGDEFAULT: t->is_default = el_uint(&e) != 0; break;
+        case ID_TRACKNUMBER: t->number = fa_ebml_uint(&e); break;
+        case ID_TRACKTYPE: t->type = fa_ebml_uint(&e); break;
+        case ID_FLAGENABLED: t->enabled = fa_ebml_uint(&e) != 0; break;
+        case ID_FLAGDEFAULT: t->is_default = fa_ebml_uint(&e) != 0; break;
         case ID_CODECID: t->codec_id = e; break;
         case ID_CODECPRIVATE: t->priv = e; t->has_priv = e.len > 0; break;
-        case ID_CODECDELAY: t->codec_delay = (int64_t)(el_uint(&e) & 0x3FFFFFFFFFFFFFFFull); break;
-        case ID_SEEKPREROLL: t->seek_preroll = (int64_t)(el_uint(&e) & 0x3FFFFFFFFFFFFFFFull); break;
+        case ID_CODECDELAY: t->codec_delay = (int64_t)(fa_ebml_uint(&e) & 0x3FFFFFFFFFFFFFFFull); break;
+        case ID_SEEKPREROLL: t->seek_preroll = (int64_t)(fa_ebml_uint(&e) & 0x3FFFFFFFFFFFFFFFull); break;
         case ID_AUDIO: {
             const uint8_t* c2 = e.p;
-            ebml_el a;
-            while (mem_next(&c2, e.p + e.len, &a)) {
+            fa_ebml_el a;
+            while (fa_ebml_next(&c2, e.p + e.len, &a)) {
                 if (a.id == ID_SAMPLINGFREQ) t->rate = el_float(&a);
                 else if (a.id == ID_OUTSAMPLINGFREQ) t->out_rate = el_float(&a);
-                else if (a.id == ID_CHANNELS) t->channels = el_uint(&a);
-                else if (a.id == ID_BITDEPTH) t->bits = el_uint(&a);
+                else if (a.id == ID_CHANNELS) t->channels = fa_ebml_uint(&a);
+                else if (a.id == ID_BITDEPTH) t->bits = fa_ebml_uint(&a);
             }
             break;
         }
@@ -365,21 +306,21 @@ static void parse_entry(const ebml_el* te, mkv_entry* t)
             /* Only header stripping is understood; zlib, bzip2 or LZO is not, and
              * encrypted tracks are reported as protected content. */
             const uint8_t* c2 = e.p;
-            ebml_el enc;
-            while (mem_next(&c2, e.p + e.len, &enc)) {
+            fa_ebml_el enc;
+            while (fa_ebml_next(&c2, e.p + e.len, &enc)) {
                 const uint8_t* c3 = enc.p;
-                ebml_el f;
+                fa_ebml_el f;
                 if (enc.id != ID_CONTENTENCODING) continue;
-                while (mem_next(&c3, enc.p + enc.len, &f)) {
-                    if (f.id == ID_CONTENTENCODINGTYPE && el_uint(&f) == 1) t->encrypted = 1;
-                    else if (f.id == ID_CONTENTENCODINGTYPE && el_uint(&f) != 0) t->bad_encoding = 1;
+                while (fa_ebml_next(&c3, enc.p + enc.len, &f)) {
+                    if (f.id == ID_CONTENTENCODINGTYPE && fa_ebml_uint(&f) == 1) t->encrypted = 1;
+                    else if (f.id == ID_CONTENTENCODINGTYPE && fa_ebml_uint(&f) != 0) t->bad_encoding = 1;
                     else if (f.id == ID_CONTENTENCRYPTION) t->encrypted = 1;
                     else if (f.id == ID_CONTENTCOMPRESSION) {
                         const uint8_t* c4 = f.p;
-                        ebml_el g;
+                        fa_ebml_el g;
                         uint64_t algo = 0;
-                        while (mem_next(&c4, f.p + f.len, &g)) {
-                            if (g.id == ID_CONTENTCOMPALGO) algo = el_uint(&g);
+                        while (fa_ebml_next(&c4, f.p + f.len, &g)) {
+                            if (g.id == ID_CONTENTCOMPALGO) algo = fa_ebml_uint(&g);
                             else if (g.id == ID_CONTENTCOMPSETTINGS) { t->strip = g; t->has_strip = 1; }
                         }
                         if (algo != 3) t->bad_encoding = 1;
@@ -418,7 +359,7 @@ static const char* pcm_name(int is_float, int big, uint64_t bits)
 /* CodecID -> codec parameters. */
 static fa_result map_codec(mkv* m, const mkv_entry* t, fa_codec_params* cp)
 {
-    const ebml_el* id = &t->codec_id;
+    const fa_ebml_el* id = &t->codec_id;
     const char* name = NULL;
     uint32_t rate = t->rate > 0 && t->rate < 1e7 ? (uint32_t)(t->rate + 0.5) : 0;
     uint32_t channels = t->channels > 0 && t->channels <= 255 ? (uint32_t)t->channels : 0;
@@ -523,13 +464,13 @@ static fa_result map_codec(mkv* m, const mkv_entry* t, fa_codec_params* cp)
 static fa_result parse_tracks(mkv* m, const uint8_t* p, size_t len, int32_t want, int* count, fa_codec_params* cp)
 {
     const uint8_t* cur = p;
-    ebml_el te;
+    fa_ebml_el te;
     mkv_entry t, chosen, first, def;
     int n = 0, have = 0, have_first = 0, have_def = 0;
     memset(&chosen, 0, sizeof(chosen));
     memset(&first, 0, sizeof(first));
     memset(&def, 0, sizeof(def));
-    while (mem_next(&cur, p + len, &te)) {
+    while (fa_ebml_next(&cur, p + len, &te)) {
         if (te.id != ID_TRACKENTRY) continue;
         parse_entry(&te, &t);
         if (t.number != 0) m->all_tracks++;
@@ -595,7 +536,7 @@ static int split_lacing(mkv* m, size_t hlen, uint8_t flags)
             uint64_t v;
             int64_t s;
             if (p >= len) return 0;
-            l = vint_len(b[p]);
+            l = fa_ebml_vint_len(b[p]);
             if (l > 8 || p + (size_t)l > len) return 0;
             v = b[p] & (0xFFu >> l);
             for (k = 1; k < l; k++) v = (v << 8) | b[p + (size_t)k];
@@ -638,7 +579,7 @@ static int take_block(mkv* m, int64_t elem, int64_t size, int full, mkv_ref* ref
     }
     got = fa_br_read(&m->br, h, size < 12 ? (size_t)size : 12);
     if (got < 4) return -1;
-    l = vint_len(h[0]);
+    l = fa_ebml_vint_len(h[0]);
     if (l > 8 || (size_t)l + 3 > got) { fa_br_seek(&m->br, end); return 0; }
     track = h[0] & (0xFFu >> l);
     for (k = 1; k < l; k++) track = (track << 8) | h[k];
@@ -740,12 +681,12 @@ static fa_result step(mkv* m, int full, mkv_ref* ref)
                     if (!full) break;
                 } else if (cid == ID_BLOCKDURATION || cid == ID_DISCARDPADDING) {
                     uint8_t b[8];
-                    ebml_el e;
+                    fa_ebml_el e;
                     size_t n = cs > 8 ? 8 : (size_t)cs;
                     if (fa_br_read(&m->br, b, n) < n) return FA_ERROR_END_OF_STREAM;
                     e.p = b;
                     e.len = n;
-                    if (cid == ID_BLOCKDURATION) dur = ticks_ns(m, (int64_t)(el_uint(&e) & 0xFFFFFFFFFFFFull));
+                    if (cid == ID_BLOCKDURATION) dur = ticks_ns(m, (int64_t)(fa_ebml_uint(&e) & 0xFFFFFFFFFFFFull));
                     else discard = el_sint(&e);
                     fa_br_seek(&m->br, cd + cs);
                 } else {
@@ -972,10 +913,10 @@ static void mkv_free(mkv* m)
 static void parse_info(mkv* m, const uint8_t* p, size_t len)
 {
     const uint8_t* cur = p;
-    ebml_el e;
-    while (mem_next(&cur, p + len, &e)) {
+    fa_ebml_el e;
+    while (fa_ebml_next(&cur, p + len, &e)) {
         if (e.id == ID_TIMESTAMPSCALE) {
-            uint64_t s = el_uint(&e);
+            uint64_t s = fa_ebml_uint(&e);
             if (s > 0 && s <= 1000000000ull) m->scale = s;
         } else if (e.id == ID_DURATION) {
             double d = el_float(&e);
@@ -1014,9 +955,9 @@ static fa_result mkv_open(fa_decoder* dec)
     if (r != FA_OK) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
     {
         const uint8_t* cur = body;
-        ebml_el e;
+        fa_ebml_el e;
         int ok = 0;
-        while (mem_next(&cur, body + size, &e))
+        while (fa_ebml_next(&cur, body + size, &e))
             if (e.id == ID_DOCTYPE) {
                 if (el_is(&e, "webm")) ok = webm = 1;
                 else if (el_is(&e, "matroska")) ok = 1;
@@ -1053,16 +994,16 @@ static fa_result mkv_open(fa_decoder* dec)
                 if (r != FA_OK) goto fail;
             } else {
                 const uint8_t* cur = body;
-                ebml_el s;
-                while (mem_next(&cur, body + size, &s)) {
+                fa_ebml_el s;
+                while (fa_ebml_next(&cur, body + size, &s)) {
                     const uint8_t* c2 = s.p;
-                    ebml_el f;
+                    fa_ebml_el f;
                     uint32_t sid = 0;
                     int64_t spos = -1;
                     if (s.id != ID_SEEK) continue;
-                    while (mem_next(&c2, s.p + s.len, &f)) {
+                    while (fa_ebml_next(&c2, s.p + s.len, &f)) {
                         if (f.id == ID_SEEKID) { size_t i; sid = 0; for (i = 0; i < f.len && i < 4; i++) sid = (sid << 8) | f.p[i]; }
-                        else if (f.id == ID_SEEKPOSITION && el_uint(&f) < (uint64_t)INT64_MAX / 4) spos = m->seg_start + (int64_t)el_uint(&f);
+                        else if (f.id == ID_SEEKPOSITION && fa_ebml_uint(&f) < (uint64_t)INT64_MAX / 4) spos = m->seg_start + (int64_t)fa_ebml_uint(&f);
                     }
                     if (sid == ID_CUES) cues_pos = spos;
                     else if (sid == ID_TRACKS) tracks_pos = spos;
@@ -1167,13 +1108,13 @@ static void mkv_close(fa_decoder* dec)
 static int mkv_probe(const uint8_t* d, size_t n, size_t id3)
 {
     const uint8_t* cur;
-    ebml_el hdr, e;
+    fa_ebml_el hdr, e;
     (void)id3;
     if (n < 4 || fa_be32(d) != ID_EBML) return 0;
     cur = d;
-    if (!mem_next(&cur, d + n, &hdr)) return 0;
+    if (!fa_ebml_next(&cur, d + n, &hdr)) return 0;
     cur = hdr.p;
-    while (mem_next(&cur, hdr.p + hdr.len, &e))
+    while (fa_ebml_next(&cur, hdr.p + hdr.len, &e))
         if (e.id == ID_DOCTYPE && (el_is(&e, "matroska") || el_is(&e, "webm"))) return 100;
     return 0;
 }

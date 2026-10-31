@@ -16,6 +16,11 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ## Unreleased
 
+### Breaking
+
+- `fa_cdg_info` gained `disc_corrected` and `disc_dropped` at its end (it has no `struct_size`): rebuild against the new
+  header. .NET `CdgInfo` gained the two matching positional parameters.
+
 ### Added
 
 - DJ instant reverse and slip mode (extras step 9): `fa_stream_set_reverse` while playing or paused now turns at once,
@@ -23,6 +28,20 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   no re-buffer). Slip mode: `fa_deck_set_slip` / `fa_deck_get_slip`, `fa_deck_slip_return`, `fa_deck_get_slip_position`
   (.NET `DjDeck.Slip`, `SlipReturn`, `SlipPosition`): reverses, deck loops and beat jumps count on underneath and come
   back to where the deck would be, to the frame. See [docs/features/dj-mixer.md](docs/features/dj-mixer.md#slip-mode).
+
+- Disc and CD+G (extras step 19): `fa_disc_get_pregap` (.NET `Disc.GetPregap`, basscd's `BASS_CD_GetTrackPregap`)
+  gives a track's pregap in sectors, from the cue sheet (`INDEX 00`, `PREGAP`) or from a drive's Q subcode. CD+G packs
+  read from a disc with two damaged symbols are now repaired as well as those with one (three or more are still
+  dropped), and `fa_cdg_info.disc_corrected` / `disc_dropped` count them. A seek before a disc track's graphics were
+  found keeps the subcode read so far, and a part read again with different packs redoes the seek checkpoints after it
+  at once instead of 10 s per write. See [docs/features/disc.md](docs/features/disc.md#pregaps).
+
+- MIDI scale tuning and drum setup: GS (`40 1x 40`-`4B`) and XG (`08 nn 41`-`4C`) scale tuning, GS drum map edits
+  (`41 mp rr`), XG drum setups (`3n rr pp`, and the drum setup reset) and the GS/XG drum NRPNs (MSB 14-1E) set each drum
+  key's pitch, level, pan, effect sends, exclusive group, note-off and note-on reception, filter and envelope. GS drum
+  map 2 and XG drum setups 1-4 are kept apart. XG SFX kits (bank 126) come from the soundfont's bank 126, else the GS
+  SFX kit, else the standard kit. Files without these messages render bit for bit as before.
+  See [docs/features/midi.md](docs/features/midi.md#scale-tuning-and-drum-setup).
 
 - Dolby downmix (extras step 20): `fa_open_options.dolby_downmix` and `fa_stream_set_dolby_downmix` /
   `fa_stream_get_dolby_downmix` (.NET `StreamOptions.DolbyDownmix`, `AudioStream.DolbyDownmix`) choose Lo/Ro, Lt/Rt
@@ -250,6 +269,13 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Tags: a module's title, artist and song message (`FA_TAG_FORMAT_TRACKER`; .NET `TagFormat.Tracker`).
 
 ### Changed
+
+- CD+G presentation scaling with smooth-scroll offsets: the picture is smoothed, edge-blended and given its effects
+  as shown, with the picture area moved, so the seam where it meets the border is drawn against its real neighbours and
+  a transparent border stays transparent under the effects. The classic picture maps tiles drawn while the offsets are
+  set to the area they show in instead of redrawing the whole surface. Songs without the offsets draw the same pixels
+  as before.
+- Containers (extras step 23, no change for well-formed files): Matroska's EBML elements and MP4's boxes are read by one walker each (`src/walk.c`), shared by the demuxers and the tag reader; the ADTS header and the AudioSpecificConfig each have one parser (`fa_adts_parse`, `fa_aac_parse_asc` in aac.c), and an Ogg link's comments are parsed once. The system AAC decoders (Media Foundation, AudioToolbox, MediaCodec) lose their ADTS handling, which nothing reached: ADTS always plays through the built-in decoder. Malformed files can come out differently; see docs/engineering-notes.md.
 
 - Analysis: the key's chroma FFT carries two windows at once (as the onset side does), and the bars' chroma shares a bin wider than a semitone among the pitch classes it covers (low chord changes show). The accuracy report is unchanged (all 44 bar songs right, 48 of 48 keys).
 - Lyric surface: a line growing in during a page fade-in is drawn again at its size instead of upscaled, and a line or page that failed for lack of memory is tried again after about 90 frames.

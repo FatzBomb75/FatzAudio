@@ -1689,18 +1689,20 @@ fa_result fa_mc_codec_open(fa_codec* c, const fa_codec_params* p);
 typedef struct fa_aac_asc_info {
     int object_type;            /* of the core: 2 = LC (after explicit SBR/PS signalling) */
     uint32_t rate;              /* core sampling rate */
+    int rate_index;             /* its 4-bit index; 15: an explicit rate */
     uint32_t ext_rate;          /* SBR output rate, 0 if not signalled */
     uint32_t channel_config;    /* 0: a program config element says */
+    int short_frames;           /* GASpecificConfig's frameLengthFlag: 960-sample frames */
     int sbr, ps;                /* 1 signalled, 0 signalled absent, -1 not said (implicit) */
 } fa_aac_asc_info;
-int fa_aac_parse_asc(const uint8_t* p, size_t n, fa_aac_asc_info* out);   /* 1 if valid */
+/* The one AudioSpecificConfig parser (aac.c, which also sets its decoder up with it):
+ * 1 if valid. At most FA_AAC_ASC_PARSE_MAX bytes. */
+#define FA_AAC_ASC_PARSE_MAX 4096
+int fa_aac_parse_asc(const uint8_t* p, size_t n, fa_aac_asc_info* out);
 uint32_t fa_aac_config_channels(uint32_t config);
-/* The AudioSpecificConfig to hand an OS decoder (the extradata, else built for ADTS
- * frames); 0 if none can be had. */
+/* The AudioSpecificConfig to hand an OS decoder (from the extradata: only streams
+ * that have one reach them); 0 if none can be had. */
 size_t fa_aac_os_asc(const fa_codec_params* p, int he_guess, uint8_t* out, size_t cap);
-/* Takes the header off a packet that is one whole ADTS frame: 1; not ADTS: 0;
- * several raw data blocks in the frame: -1. */
-int fa_adts_strip(const uint8_t** data, size_t* size);
 /* An MPEG-4 ES descriptor holding the AudioSpecificConfig (an 'esds' box's contents). */
 size_t fa_aac_esds(const uint8_t* asc, size_t n, uint8_t* out, size_t cap);
 /* From Core Audio channel labels to the library's channel order: src_of_dst[i] is the

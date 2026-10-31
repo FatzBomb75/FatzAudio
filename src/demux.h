@@ -137,6 +137,22 @@ int64_t fa_demux_packet_samples(const char* codec, uint32_t channels, uint32_t r
 /* AAC's sampling frequency table (ISO/IEC 14496-3 1.6.3.4), by index. */
 extern const uint32_t fa_aac_rates[13];
 
+/* An ADTS frame header (ISO/IEC 13818-7 6.2, adts_fixed_header and
+ * adts_variable_header). */
+typedef struct fa_adts_header {
+    size_t len;          /* the whole frame, header included */
+    size_t header;       /* 7, or 9 with a CRC */
+    int profile;         /* 0 Main, 1 LC, 2 SSR, 3 LTP: the object type - 1 */
+    int rate_index;      /* into fa_aac_rates */
+    int config;          /* channel configuration (0: a program config element says) */
+    int blocks;          /* raw data blocks in the frame, 1..4 */
+    int crc;
+} fa_adts_header;
+
+/* 1 if p[0..n) starts with an ADTS header (n at least 7; the frame may run past n).
+ * In demux.c. */
+int fa_adts_parse(const uint8_t* p, size_t n, fa_adts_header* h);
+
 /* AudioSpecificConfig for AAC from the container's rate and channels, for files
  * that do not carry one. `sbr_rate` > rate signals HE-AAC. Returns its size. */
 /* At most 5 + 28 + 4 + 28 + 5 + 3 = 73 bits: two explicit 24-bit rates with SBR. */

@@ -6,8 +6,9 @@
  * rather than taken from the NDK's headers. When anything is missing (the
  * library, a decoder for the type, the configuration), opening returns
  * FA_ERROR_UNSUPPORTED_FORMAT.
- * AAC is "audio/mp4a-latm" with the AudioSpecificConfig as "csd-0"; ADTS frames
- * lose their header first (codec_os.c).
+ * AAC is "audio/mp4a-latm" with the AudioSpecificConfig as "csd-0": only
+ * configurations aac.c does not decode come here, as raw access units (ADTS frames
+ * never do).
  * Float output is asked for (Android 7.0 and later honour "pcm-encoding"); 16-bit
  * output is converted. MediaCodec's channel order is WAVE's, the library's.
  * MediaCodec works asynchronously: output can trail input by a packet or more,
@@ -90,7 +91,6 @@ static void mc_load(void)
 typedef struct mc_state {
     AMediaCodec* codec;
     int started;
-    int adts;
     int eos_sent, drained;
     int encoding;           /* MC_PCM_* of the output */
     uint32_t rate, channels;
@@ -188,7 +188,6 @@ static fa_result mc_decode(fa_codec* c, const uint8_t* data, size_t size)
         }
     }
     if (size == 0 || size > 0x7FFFFFF0 || st->eos_sent) return FA_OK;
-    if (st->adts && fa_adts_strip(&data, &size) < 0) return FA_ERROR_UNSUPPORTED_FORMAT;
     /* An input buffer, freeing output while none is free. */
     for (tries = 0;; tries++) {
         idx = mc.dequeue_input(st->codec, 10000);
@@ -269,7 +268,6 @@ fa_result fa_mc_codec_open(fa_codec* c, const fa_codec_params* p)
 
     st = (mc_state*)calloc(1, sizeof(*st));
     if (!st) return FA_ERROR_OUT_OF_MEMORY;
-    st->adts = aac;
     st->rate = rate;
     st->channels = ch;
     st->pkt_frames = frames;

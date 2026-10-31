@@ -248,6 +248,24 @@ public sealed class Disc : IDisposable
         return Marshal.PtrToStringUTF8((nint)buf);
     }
 
+    /// <summary>
+    /// The pregap of an audio track (its index 0: the pause, or a count-in, before it starts), in sectors (75 per
+    /// second); 0 when it starts right after the track before. It lies at the end of the track before, and the track's
+    /// own stream does not play it. The first track's counts from sector 0 (the 2 s before it on every disc are not
+    /// counted). Disc images take it from the cue sheet; drives from the subcode, which takes some 10-20 short reads
+    /// the first time for each track (then kept).
+    /// </summary>
+    /// <param name="track">The track number, as in <see cref="Toc"/>.</param>
+    /// <returns>The pregap in sectors.</returns>
+    /// <exception cref="FatzAudioException">No such track (<see cref="ErrorCode.NotFound"/>), a data track
+    /// (<see cref="ErrorCode.UnsupportedFormat"/>), a drive that returns no subcode (<see cref="ErrorCode.NotImplemented"/>),
+    /// or subcode that cannot be read there (<see cref="ErrorCode.Io"/>).</exception>
+    public long GetPregap(int track)
+    {
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_disc_get_pregap(Handle, track, out long sectors));
+        return sectors;
+    }
+
     /// <summary>Opens the tray (unlocking it first).</summary>
     /// <exception cref="FatzAudioException">The drive refused (<see cref="ErrorCode.Device"/>, or <see cref="ErrorCode.Busy"/> on macOS while Finder has the disc mounted).</exception>
     public void Eject() => FatzAudioException.ThrowIfFailed(NativeMethods.fa_disc_eject(Handle));

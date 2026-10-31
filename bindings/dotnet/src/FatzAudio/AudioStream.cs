@@ -651,7 +651,7 @@ public unsafe class AudioStream : IDisposable
         {
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_cdg_info(Handle, out var i));
             return new CdgInfo((CdgSource)i.Source, (long)i.PackCount, TimeConvert.FromNanoseconds(i.CheckpointInterval),
-                (int)i.CheckpointCount, i.DiscParity < 0 ? null : i.DiscParity != 0);
+                (int)i.CheckpointCount, i.DiscParity < 0 ? null : i.DiscParity != 0, (long)i.DiscCorrected, (long)i.DiscDropped);
         }
     }
 

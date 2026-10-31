@@ -66,6 +66,8 @@ set(FA_SOURCES
     src/loudness.c
     src/tags.c
     src/tags_read.c
+    src/walk.c
+    src/walk.h
     src/scan.c
     src/normalize.c
     src/limiter.c

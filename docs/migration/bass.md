@@ -483,7 +483,7 @@ BASS has no CD+G decoder: apps read the `.cdg` themselves, time it from `BASS_Ch
 | Redrawing the whole bitmap each tick | Upload only `frame.dirty_*`, only when `frame.changed` | `frame.Changed`, `frame.Dirty` | ✅ |
 | Drawing MIDI/.kar lyrics yourself (a text renderer, a timer, colouring syllables as they are sung) | `fa_lyric_surface_create` + `fa_surface_update_into`: lines, pages, wipes, countdown, five presets and effects, drawn for you ([lyrics](../features/lyrics.md)) | `song.CreateLyricSurface(...)` | ✅ |
 | Drawing a title and credits page before a karaoke song and an ending card after it yourself (BASS has no equivalent) | The [lyric surface](../features/lyrics.md#intro-and-ending-pages) draws them from `fa_stream_get_midi_credits`: bands or a card with the title, artist, year, length, key, tempo and copyright, and an ending card; on by default, styled and localised through `fa_lyric_style` | `LyricStyle.IntroPage`, `EndingPage`, `FallbackTitle`, `Labels` | ✅ |
-| CD+G from a disc via `BASS_CD_StreamCreate(..., BASS_CD_SUBCHANNEL)`, then de-interleaving the subchannel and decoding it yourself | `fa_stream_open_disc`: the graphics are read with the audio and drawn by the same surfaces ([disc playback](../features/disc.md#cdg-karaoke-discs)) | `engine.OpenDisc(disc, n)`, then `CreateCdgSurface()` | ✅ |
+| CD+G from a disc via `BASS_CD_StreamCreate(..., BASS_CD_SUBCHANNEL)`, then de-interleaving the subchannel and decoding it yourself | `fa_stream_open_disc`: the graphics are read with the audio, repaired from their parity where damaged (`fa_cdg_info.disc_corrected`, `disc_dropped`), and drawn by the same surfaces ([disc playback](../features/disc.md#cdg-karaoke-discs)) | `engine.OpenDisc(disc, n)`, then `CreateCdgSurface()` | ✅ |
 
 ### basscd (audio CDs)
 
@@ -497,7 +497,7 @@ basscd is an add-on DLL; FatzAudio reads CDs and `.cue` images itself, with one 
 | BASS_CD_Door (open / close / lock / unlock) | `fa_disc_eject`, `fa_disc_load`, `fa_disc_set_locked` | `Eject()`, `Load()`, `Locked` | ✅ |
 | BASS_CD_DoorIsOpen / DoorIsLocked / IsReady | `fa_disc_get_status`: state, locked, change counter (notices swaps between polls) | `disc.Status` | ✅ |
 | BASS_CD_GetTracks / GetTrackLength | `fa_disc_get_toc`: tracks with sectors, frames, duration and flags | `disc.Toc` | ✅ |
-| BASS_CD_GetTrackPregap | Not provided yet (track starts are INDEX 01) | | 🗓️ |
+| BASS_CD_GetTrackPregap (bytes) | `fa_disc_get_pregap(disc, track, &sectors)` in sectors (× 2352 for bytes); from the cue sheet or the Q subcode. Track 1 does not count the 2 s before sector 0 | `disc.GetPregap(track)` | ✅ |
 | BASS_CD_GetID(BASS_CDID_CDDB) | `toc.freedb_query` | `toc.FreedbQuery` | ✅ |
 | BASS_CD_GetID(BASS_CDID_CDDB2) | `toc.freedb_id` | `toc.FreedbId` | ✅ |
 | BASS_CD_GetID(BASS_CDID_MUSICBRAINZ) | `toc.musicbrainz_id` (Enhanced CDs handled) | `toc.MusicBrainzId` | ✅ |
@@ -566,6 +566,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | MIDI_EVENT_MODULATION, MIDI_EVENT_MOD_VIBRATO (RPN 5), MIDI_EVENT_CHANPRES, MIDI_EVENT_KEYPRES as played from the file | The file's mod wheel, RPN 5 and pressure messages: vibrato as in BASSMIDI (pressure: none after a GS, XG or GM2 reset); poly pressure feeds soundfont modulators ([controllers](../features/midi.md#controllers-and-modulators)); not settable from the app yet | automatic | ✅ (in the file) |
 | MIDI_EVENT_CUTOFF, RESONANCE, ATTACK, DECAY, RELEASE, VIBRATO_RATE, VIBRATO_DEPTH, VIBRATO_DELAY as played from the file | CC74, CC71, CC73, CC75, CC72, CC76-78, the GS/XG part NRPNs and part SysEx; 64 is normal, as in BASSMIDI (step sizes are our own approximation) | automatic | ✅ (in the file) |
 | MIDI_EVENT_PORTAMENTO, PORTATIME, PORTANOTE, SOSTENUTO, SOFT as played from the file | CC65, CC5, CC84, CC66, CC67 | automatic | ✅ (in the file) |
+| MIDI_EVENT_SCALETUNING, MIDI_EVENT_DRUM_PITCH, DRUM_FINETUNE, DRUM_LEVEL, DRUM_PAN, DRUM_REVERB, DRUM_CHORUS, DRUM_CUTOFF, DRUM_RESONANCE as played from the file | GS and XG scale tuning, GS drum map and XG drum setup SysEx and the drum NRPNs, also exclusive groups, note-off and note-on reception ([scale tuning and drum setup](../features/midi.md#scale-tuning-and-drum-setup)); not settable from the app yet | automatic | ✅ (in the file) |
 | SF2 modulators in the soundfont (BASSMIDI: velocity, key and CC21-24 only, no secondary sources) | Applied in full: any controller, curves, secondary sources; identical copies of the built-in defaults are skipped; the default velocity-to-filter modulator is left out, as in BASSMIDI ([modulators](../features/midi.md#soundfont-modulators)) | automatic | ✅ (more than BASSMIDI) |
 | MIDI_EVENT_MODE (mono, legato), GM2 controller destination SysEx, SF2 NRPNs (MSB 120) | Not followed: always polyphonic | — | ➖ |
 | BASS_ATTRIB_MIDI_SRC / BASS_MIDI_SINCINTER | Not configurable: the synthesizer's own interpolation | — | ➖ |

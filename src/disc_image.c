@@ -36,6 +36,8 @@ typedef struct img_seg {       /* a run of disc sectors: file data, or nothing *
 typedef struct img_track {
     int number, audio, pre, dcp, four, session;
     int64_t lba;               /* index 01 */
+    int64_t index0;            /* index 00 (the pregap's start), -1 = none given */
+    int64_t pregap;            /* sectors from index 00, or PREGAP, to index 01 */
     char isrc[13];
     char* text[IMG_TEXT_FIELDS];
 } img_track;
@@ -301,6 +303,7 @@ static fa_result parse_cue(image* m, const char* cue_path, char* text)
             cur->number = num;
             cur->audio = word_is(arg2, "AUDIO");
             cur->lba = -1;
+            cur->index0 = -1;
             if (st.new_session) { st.session++; st.new_session = 0; }
             cur->session = st.session;
             if (cur->session > m->sessions) m->sessions = cur->session;
@@ -327,11 +330,16 @@ static fa_result parse_cue(image* m, const char* cue_path, char* text)
                 if (r != FA_OK) return r;
             }
             st.track_has_index = 1;
+            /* Where the file's sector `at` lands (the file is laid out up to here). */
+            if (idx == 0 && at >= st.file_done) cur->index0 = st.lba + (at - st.file_done);
             if (idx == 1) {
+                int64_t gap = st.pregap;
                 r = lay_out(m, &st, at, st.pregap, cur_audio);
                 if (r != FA_OK) return r;
                 st.pregap = 0;
                 cur->lba = st.lba;
+                /* The first track's pregap is everything before it (a hidden track too). */
+                cur->pregap = m->ntracks == 1 ? cur->lba : cur->index0 >= 0 ? cur->lba - cur->index0 : gap;
             }
         } else if (word_is(word, "PREGAP") && cur) {
             next_token(p, arg, sizeof(arg));
@@ -623,11 +631,20 @@ static fa_result img_read_code(void* h, int which, int track, char* out, size_t 
     return out[0] ? FA_OK : FA_ERROR_NOT_FOUND;
 }
 
+static fa_result img_read_pregap(void* h, int track, int64_t* out_sectors)
+{
+    image* m = (image*)h;
+    int i;
+    for (i = 0; i < m->ntracks; i++)
+        if (m->tracks[i].number == track) { *out_sectors = m->tracks[i].pregap; return FA_OK; }
+    return FA_ERROR_NOT_FOUND;
+}
+
 static void img_close(void* h) { img_free((image*)h); }
 
 static const fa_disc_ops img_ops = {
     img_inquiry, img_test_ready, img_read_toc, img_read_cd, img_read_code,
-    NULL, NULL, NULL, NULL, img_close
+    NULL, NULL, NULL, NULL, img_close, img_read_pregap
 };
 
 fa_result fa_disc_image_open(const char* cue_path, const fa_disc_ops** out_ops, void** out_handle)

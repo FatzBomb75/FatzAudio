@@ -18,6 +18,7 @@
  * matching count use the next larger one with silent channels; elements beyond
  * 7.1 are mixed into their nearest channel. */
 #include "aac.h"
+#include "demux.h"
 #include "mdct.h"
 #include <math.h>
 #include <stdlib.h>
@@ -265,62 +266,106 @@ static int core_supported(int aot)
     return aot == AOT_MAIN || aot == AOT_LC || aot == AOT_LTP;
 }
 
-static fa_result read_config(fa_aac* d, fa_aac_bits* b)
+/* ISO/IEC 14496-3 1.6.2.1 AudioSpecificConfig: the object type, the rates, the
+ * channel configuration (with the program config element into `pce` when it is 0)
+ * and whether SBR and PS are signalled, explicitly or by the backward compatible
+ * sync extension. Past the end of the data it reads zeros. 0 when it has no object
+ * type or no rate. */
+static int parse_asc(fa_aac_bits* b, fa_aac_asc_info* out, aac_pce* pce)
 {
-    int aot, ri, sbr = -1, ps = -1;
-    uint32_t rate;
-    int config;
+    int aot;
+    memset(out, 0, sizeof(*out));
+    memset(pce, 0, sizeof(*pce));
+    out->sbr = -1;
+    out->ps = -1;
     aot = read_aot(b);
-    rate = read_rate(b, &ri);
-    config = (int)fa_aac_get(b, 4);
+    out->rate = read_rate(b, &out->rate_index);
+    out->channel_config = fa_aac_get(b, 4);
     if (aot == 5 || aot == 29) {
-        sbr = 1;
-        ps = aot == 29;
-        read_rate(b, NULL);
+        out->sbr = 1;
+        out->ps = aot == 29;
+        out->ext_rate = read_rate(b, NULL);
         aot = read_aot(b);
-        if (aot == 22) fa_aac_skip(b, 4);
+        if (aot == 22) fa_aac_skip(b, 4);   /* extensionChannelConfiguration */
     }
-    if (!core_supported(aot)) return FA_ERROR_UNSUPPORTED_FORMAT;
-    /* GASpecificConfig */
-    if (fa_aac_get(b, 1)) return FA_ERROR_UNSUPPORTED_FORMAT;   /* 960-sample frames */
-    if (fa_aac_get(b, 1)) fa_aac_skip(b, 14);                  /* core coder delay */
-    {
-        int ext = (int)fa_aac_get(b, 1);
-        memset(&d->pce, 0, sizeof(d->pce));
-        if (config == 0 && !read_pce(b, &d->pce, 0)) return FA_ERROR_UNSUPPORTED_FORMAT;
-        if (ext) fa_aac_skip(b, 1);                             /* extensionFlag3 */
+    out->object_type = aot;
+    if (out->rate == 0 || aot == 0) return 0;
+    switch (aot) {
+    case 1: case 2: case 3: case 4: case 6: case 7: case 17: case 19: case 20: case 21: case 22: case 23: {
+        /* GASpecificConfig */
+        int ext;
+        out->short_frames = (int)fa_aac_get(b, 1);    /* frameLengthFlag: 960 samples */
+        if (fa_aac_get(b, 1)) fa_aac_skip(b, 14);      /* dependsOnCoreCoder: coreCoderDelay */
+        ext = (int)fa_aac_get(b, 1);
+        if (out->channel_config == 0 && !read_pce(b, pce, 0)) return 0;
+        if (aot == 6 || aot == 20) fa_aac_skip(b, 3);  /* layerNr */
+        if (ext) {
+            if (aot == 22) fa_aac_skip(b, 16);
+            if (aot == 17 || aot == 19 || aot == 20 || aot == 23) fa_aac_skip(b, 3);
+            fa_aac_skip(b, 1);                         /* extensionFlag3 */
+        }
+        if (aot >= 17) fa_aac_skip(b, 2);              /* epConfig */
+        break;
     }
-    /* Backward compatible SBR / PS signalling after the core's config. */
-    if (sbr < 0 && fa_aac_left(b) >= 16 && fa_aac_peek(b, 11) == 0x2B7) {
-        int ext_aot;
+    default:
+        return 1;   /* USAC, ELD and the rest: their own configs follow */
+    }
+    if (out->sbr < 0 && fa_aac_left(b) >= 16 && fa_aac_peek(b, 11) == 0x2B7) {
         fa_aac_skip(b, 11);
-        ext_aot = read_aot(b);
-        if (ext_aot == 5) {
-            sbr = (int)fa_aac_get(b, 1);
-            if (sbr) {
-                read_rate(b, NULL);
+        if (read_aot(b) == 5) {
+            out->sbr = (int)fa_aac_get(b, 1);
+            if (out->sbr) {
+                out->ext_rate = read_rate(b, NULL);
                 if (fa_aac_left(b) >= 12 && fa_aac_peek(b, 11) == 0x548) {
                     fa_aac_skip(b, 11);
-                    ps = (int)fa_aac_get(b, 1);
+                    out->ps = (int)fa_aac_get(b, 1);
                 }
             }
         }
     }
+    return 1;
+}
+
+int fa_aac_parse_asc(const uint8_t* p, size_t n, fa_aac_asc_info* out)
+{
+    uint8_t tmp[FA_AAC_ASC_PARSE_MAX + 16];   /* the bit reader reads up to 12 bytes past the end */
+    aac_pce pce;
+    fa_aac_bits b;
+    memset(out, 0, sizeof(*out));
+    out->sbr = -1;
+    out->ps = -1;
+    if (!p || n < 2 || n > FA_AAC_ASC_PARSE_MAX) return 0;
+    memcpy(tmp, p, n);
+    memset(tmp + n, 0, 16);
+    b.p = tmp;
+    b.pos = 0;
+    b.end = n * 8;
+    return parse_asc(&b, out, &pce);
+}
+
+static fa_result read_config(fa_aac* d, fa_aac_bits* b)
+{
+    fa_aac_asc_info a;
+    int ri, sbr;
+    if (!parse_asc(b, &a, &d->pce)) return FA_ERROR_UNSUPPORTED_FORMAT;
+    if (!core_supported(a.object_type) || a.short_frames) return FA_ERROR_UNSUPPORTED_FORMAT;
+    ri = a.rate_index;
     if (ri >= 13) {
         /* An explicit rate: the nearest table's bands. */
         static const uint32_t bounds[12] = { 92017, 75132, 55426, 46009, 37566, 27713, 23004, 18783, 13856, 11502, 9391, 0 };
-        for (ri = 0; ri < 12 && rate < bounds[ri]; ri++) {}
+        for (ri = 0; ri < 12 && a.rate < bounds[ri]; ri++) {}
     }
-    if (rate == 0 || ri > 12 || config > 12 || (config > 7 && config < 11)) return FA_ERROR_UNSUPPORTED_FORMAT;
-    if (rate > FA_AAC_SBR_MAX_CORE) sbr = 0;   /* the standard has no SBR above it: the core plays alone */
+    if (ri > 12 || a.channel_config > 12 || (a.channel_config > 7 && a.channel_config < 11)) return FA_ERROR_UNSUPPORTED_FORMAT;
+    sbr = a.sbr;
+    if (a.rate > FA_AAC_SBR_MAX_CORE) sbr = 0;   /* the standard has no SBR above it: the core plays alone */
     d->configured = 1;
     d->from_asc = 1;
-    d->object_type = aot;
+    d->object_type = a.object_type;
     d->rate_index = ri;
-    d->rate = rate;
-    d->channel_config = config;
+    d->rate = a.rate;
+    d->channel_config = (int)a.channel_config;
     d->sbr_signalled = sbr;
-    d->ps_signalled = ps;
+    d->ps_signalled = a.ps;
     d->sbr_on = sbr == 1;
     return FA_OK;
 }
@@ -1490,25 +1535,6 @@ static int decode_block(fa_aac* d, fa_aac_bits* b, int* frames, int* nch, mix_la
 
 /* ---- packets ------------------------------------------------------------------------------- */
 
-typedef struct adts_header {
-    size_t len, header;      /* whole frame; header bytes (7, or 9 with a CRC) */
-    int profile, rate_index, config, blocks, crc;
-} adts_header;
-
-static int parse_adts(const uint8_t* p, size_t n, adts_header* h)
-{
-    if (n < 7 || p[0] != 0xFF || (p[1] & 0xF6) != 0xF0) return 0;
-    h->crc = !(p[1] & 1);
-    h->profile = p[2] >> 6;
-    h->rate_index = (p[2] >> 2) & 15;
-    h->config = ((p[2] & 1) << 2) | (p[3] >> 6);
-    h->len = ((size_t)(p[3] & 3) << 11) | ((size_t)p[4] << 3) | (p[5] >> 5);
-    h->blocks = (p[6] & 3) + 1;
-    h->header = h->crc ? 9 : 7;
-    if (h->rate_index >= 13 || h->len < h->header || h->len > n) return 0;
-    return 1;
-}
-
 fa_aac* fa_aac_create(void)
 {
     fa_aac* d = (fa_aac*)calloc(1, sizeof(*d));
@@ -1557,7 +1583,7 @@ void fa_aac_reset(fa_aac* d)
 }
 
 /* A new configuration from an ADTS header: drops the elements when it changes. */
-static void adts_configure(fa_aac* d, const adts_header* h)
+static void adts_configure(fa_aac* d, const fa_adts_header* h)
 {
     int i;
     if (d->configured && d->rate_index == h->rate_index && d->channel_config == h->config &&
@@ -1579,7 +1605,7 @@ static void adts_configure(fa_aac* d, const adts_header* h)
 fa_result fa_aac_decode(fa_aac* d, const uint8_t* data, size_t size, float** pcm, size_t* cap, int* frames,
                         int* channels, uint32_t* rate)
 {
-    adts_header h;
+    fa_adts_header h;
     fa_aac_bits b;
     int blocks = 1, blk, damaged = 0, unsupported = 0, total = 0, nch = 0;
     size_t payload = 0;
@@ -1591,7 +1617,7 @@ fa_result fa_aac_decode(fa_aac* d, const uint8_t* data, size_t size, float** pcm
 #endif
     /* ADTS frames, also after an AudioSpecificConfig if one exactly fills the packet
      * (FFmpeg hands MPEG-TS audio over with its headers). */
-    if (parse_adts(data, size, &h) && (!d->from_asc || h.len == size)) {
+    if (fa_adts_parse(data, size, &h) && h.len <= size && (!d->from_asc || h.len == size)) {
         adts_configure(d, &h);
         if (!core_supported(d->object_type)) return FA_ERROR_UNSUPPORTED_FORMAT;
         blocks = h.blocks;

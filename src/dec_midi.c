@@ -28,9 +28,10 @@
  * SysEx: GM, GM2, GS and XG resets, GS rhythm parts and XG drum parts, XG and GM2
  * drum banks (bank select MSB 127 and 120), master volume (universal, GS, XG),
  * master fine and coarse tuning, GS and XG reverb and chorus settings (type,
- * level, time and the GS chorus's parameters; midi_fx.c), and the GS and XG part
- * volume, pan, reverb send, chorus send and vibrato, filter and envelope offsets.
- * Other SysEx is ignored.
+ * level, time and the GS chorus's parameters; midi_fx.c), the GS and XG part
+ * volume, pan, reverb send, chorus send and vibrato, filter and envelope offsets,
+ * GS and XG scale tuning, GS drum maps and XG drum setups (per-key drum edits, kept
+ * in TinySoundFont: tsf_set_drum_param). Other SysEx is ignored.
  *
  * Reverb and chorus (src/midi_fx.c) are fed by each voice's send levels: CC91
  * and CC93 (40 and 0 after a reset, as on GS and GM2 devices) and the
@@ -487,6 +488,7 @@ struct fa_midi {
     uint8_t bank_msb[16];
     uint8_t gs_rhythm[16];      /* GS "use for rhythm part", XG part mode: 1 = a drum part */
     uint8_t drums[16];          /* the channel plays drum kits now */
+    uint8_t drum_kit[16];       /* the drum key edits a drum part plays with: GS drum map, XG drum setup (0..3) */
     /* Master volume SysEx: from `gain_from` at `gain_at` to `gain_to` over
      * FA_MIDI_GAIN_RAMP frames, then `gain_to`. */
     float gain_from, gain_to;
@@ -581,10 +583,19 @@ static int is_drum_channel(const struct fa_midi* m, int ch)
 
 /* The program in the channel's bank, else in bank 0 (drums: the standard kit).
  * A soundfont without it plays program 0 (drums: kit 0), else its first preset,
- * rather than whatever the channel played before. */
+ * rather than whatever the channel played before. XG SFX kits (bank 126) come from
+ * the soundfont's bank 126 (where XG soundfonts keep them), else its drum bank 126,
+ * else the GS SFX kit (drum kit 56), else as any other drum kit (the standard kit). */
 static void select_program(struct fa_midi* m, int ch)
 {
     m->drums[ch] = (uint8_t)is_drum_channel(m, ch);
+    tsf_channel_set_drum_kit(m->synth, ch, m->drums[ch] ? m->drum_kit[ch] : -1);
+    if (m->mode == MODE_XG && m->bank_msb[ch] == 126) {
+        int idx = tsf_get_presetindex(m->synth, 126, m->program[ch]);
+        if (idx < 0) idx = tsf_get_presetindex(m->synth, 128 | 126, m->program[ch]);   /* as tsf's drum lookup has it */
+        if (idx < 0) idx = tsf_get_presetindex(m->synth, 128, 56);
+        if (idx >= 0) { tsf_channel_set_presetindex(m->synth, ch, idx); return; }
+    }
     if (!tsf_channel_set_presetnumber(m->synth, ch, m->program[ch], m->drums[ch]) &&
         !tsf_channel_set_presetnumber(m->synth, ch, 0, m->drums[ch]))
         tsf_channel_set_presetindex(m->synth, ch, 0);
@@ -600,6 +611,7 @@ static void reset_channels(struct fa_midi* m, int mode, fa_frames frame)
     memset(m->gs_rhythm, 0, sizeof(m->gs_rhythm));
     memset(m->bank_msb, 0, sizeof(m->bank_msb));
     memset(m->program, 0, sizeof(m->program));
+    memset(m->drum_kit, 0, sizeof(m->drum_kit));
     memset(m->porta_ctrl, 0xFF, sizeof(m->porta_ctrl));   /* -1: none */
     m->gs_rhythm[FA_MIDI_DRUMS] = mode == MODE_GM || mode == MODE_GS;   /* XG and GM2: the bank decides */
     if (mode == MODE_XG) m->bank_msb[FA_MIDI_DRUMS] = 127;
@@ -612,7 +624,9 @@ static void reset_channels(struct fa_midi* m, int mode, fa_frames frame)
     fa_midi_fx_defaults(m->fx);
     if (!m->synth) return;
     tsf_set_tuning(m->synth, 0.0f);
+    tsf_reset_drum_kit(m->synth, -1);
     for (ch = 0; ch < 16; ch++) {
+        int note;
         /* Notes end, as on a GS or XG device (and a seek after it restarts none). */
         tsf_channel_note_off_all(m->synth, ch);
         forget_channel(m, ch);
@@ -628,6 +642,7 @@ static void reset_channels(struct fa_midi* m, int mode, fa_frames frame)
         for (cc = 71; cc <= 78; cc++) tsf_channel_midi_control(m->synth, ch, cc, 64);
         tsf_channel_midi_control(m->synth, ch, TML_PORTAMENTO_TIME_MSB, 0);
         tsf_channel_set_pressure_vibrato(m->synth, ch, mode == MODE_GM ? 50.0f : 0.0f);
+        for (note = 0; note < 12; note++) tsf_channel_set_scale_tuning(m->synth, ch, note, 0.0f);
         sync_bank(m, ch);
         m->pedal[ch] = 0;
         m->sost[ch] = 0;
@@ -641,10 +656,12 @@ static void sync_bank(struct fa_midi* m, int ch)
     tsf_channel_set_bank(m->synth, ch, m->bank_msb[ch] ? (0x8000 | m->bank_msb[ch]) : 0);
 }
 
-/* GS rhythm part or XG part mode. In XG and GM2 the bank decides (XG: bank select
- * 127 makes a drum part, as the part mode does), so there it sets the bank. */
-static void set_drum_part(struct fa_midi* m, int ch, int drum)
+/* GS rhythm part or XG part mode, and the drum map or setup a drum part uses. In XG
+ * and GM2 the bank decides (XG: bank select 127 makes a drum part, as the part mode
+ * does), so there it sets the bank. */
+static void set_drum_part(struct fa_midi* m, int ch, int drum, int kit)
 {
+    m->drum_kit[ch] = (uint8_t)kit;
     if (m->mode == MODE_XG || m->mode == MODE_GM2) {
         m->bank_msb[ch] = (uint8_t)(m->mode == MODE_XG ? (drum ? 127 : 0) : (drum ? 120 : 121));
         sync_bank(m, ch);
@@ -670,13 +687,14 @@ static void gs_part(struct fa_midi* m, int block, int a, int v)
     static const uint8_t sound_cc[8] = { 76, 77, 74, 71, 73, 75, 72, 78 };
     int ch = block == 0 ? 9 : block <= 9 ? block - 1 : block;
     switch (a) {
-    case 0x15: set_drum_part(m, ch, v != 0); break;   /* use for rhythm part */
+    case 0x15: set_drum_part(m, ch, v != 0, v == 2); break;   /* use for rhythm part: off, map 1, map 2 */
     case 0x19: part_control(m, ch, TML_VOLUME_MSB, v); break;
     case 0x1C: part_control(m, ch, TML_PAN_MSB, v); break;
     case 0x21: part_control(m, ch, 93, v); break;      /* chorus send */
     case 0x22: part_control(m, ch, 91, v); break;      /* reverb send */
     default:
         if (a >= 0x30 && a <= 0x37) part_control(m, ch, sound_cc[a - 0x30], v);
+        else if (a >= 0x40 && a <= 0x4B) tsf_channel_set_scale_tuning(m->synth, ch, a - 0x40, (float)(v - 64));   /* C .. B, cents */
         break;
     }
 }
@@ -686,15 +704,40 @@ static void xg_part(struct fa_midi* m, int ch, int a, int v)
 {
     static const uint8_t sound_cc[8] = { 76, 77, 78, 74, 71, 73, 75, 72 };
     switch (a) {
-    case 0x07: set_drum_part(m, ch, v != 0); break;   /* part mode */
+    case 0x07: set_drum_part(m, ch, v != 0, v >= 3 && v <= 5 ? v - 2 : 0); break;   /* part mode: normal, drum, drum setup 1..4 */
     case 0x0B: part_control(m, ch, TML_VOLUME_MSB, v); break;
     case 0x0E: part_control(m, ch, TML_PAN_MSB, v); break;
     case 0x12: part_control(m, ch, 93, v); break;      /* chorus send */
     case 0x13: part_control(m, ch, 91, v); break;      /* reverb send */
     default:
         if (a >= 0x15 && a <= 0x1C) part_control(m, ch, sound_cc[a - 0x15], v);
+        else if (a >= 0x41 && a <= 0x4C) tsf_channel_set_scale_tuning(m->synth, ch, a - 0x41, (float)(v - 64));   /* C .. B, cents */
         break;
     }
+}
+
+/* GS drum map parameters 41 `map``a` `key` (SC-88: two maps). The play note number is
+ * the pitch the key sounds at, kept as an offset; the rest are as tsf takes them. */
+static void gs_drum(struct fa_midi* m, int map, int a, int key, int v)
+{
+    static const int8_t param[9] = { -1, TSF_DRUM_PITCH_COARSE, TSF_DRUM_LEVEL, TSF_DRUM_GROUP, TSF_DRUM_PAN,
+                                     TSF_DRUM_REVERB, TSF_DRUM_CHORUS, TSF_DRUM_NOTE_OFF, TSF_DRUM_NOTE_ON };
+    if (a >= 9 || param[a] < 0 || key > 127) return;   /* 0: the map's name; 9: delay send */
+    if (a == 1) { v += 64 - key; v = v < 0 ? 0 : v > 127 ? 127 : v; }
+    tsf_set_drum_param(m->synth, map, key, param[a], v);
+}
+
+/* XG drum setup parameters 3`setup` `key` `a`. EG rates are turned into times (higher
+ * is faster); decay 2 is what the release does to a drum note. */
+static void xg_drum(struct fa_midi* m, int setup, int key, int a, int v)
+{
+    static const int8_t param[16] = { TSF_DRUM_PITCH_COARSE, TSF_DRUM_PITCH_FINE, TSF_DRUM_LEVEL, TSF_DRUM_GROUP,
+                                      TSF_DRUM_PAN, TSF_DRUM_REVERB, TSF_DRUM_CHORUS, -1, -1, TSF_DRUM_NOTE_OFF,
+                                      TSF_DRUM_NOTE_ON, TSF_DRUM_CUTOFF, TSF_DRUM_RESONANCE, TSF_DRUM_ATTACK,
+                                      TSF_DRUM_DECAY, TSF_DRUM_RELEASE };
+    if (a >= 16 || param[a] < 0 || key > 127) return;   /* 7: variation send, 8: key assign */
+    if (a >= 0x0D) v = v ? 128 - v : 127;
+    tsf_set_drum_param(m->synth, setup, key, param[a], v);
 }
 
 /* Sostenuto pressed or released (also while replaying before a seek): the keys down
@@ -752,6 +795,8 @@ static void apply_sysex(struct fa_midi* m, const uint8_t* d, size_t n, fa_frames
             for (i = 0; i < nd; i++) fa_midi_fx_gs(m->fx, a3 + i, d[7 + i]);
         } else if (a1 == 0x40 && (a2 & 0xF0) == 0x10) {
             for (i = 0; i < nd; i++) gs_part(m, a2 & 0x0F, a3 + i, d[7 + i]);
+        } else if (a1 == 0x41 && a2 < 0x20) {                          /* drum maps: consecutive keys */
+            for (i = 0; i < nd; i++) gs_drum(m, a2 >> 4, a2 & 0x0F, a3 + i, d[7 + i]);
         }
     } else if (n >= 7 && d[0] == 0x43 && (d[1] & 0xF0) == 0x10 && d[2] == 0x4C) {   /* Yamaha XG, parameter change */
         int a1 = d[3], a2 = d[4], a3 = d[5], v = d[6];
@@ -759,8 +804,10 @@ static void apply_sysex(struct fa_midi* m, const uint8_t* d, size_t n, fa_frames
         for (i = 0; i < nd; i++) if (d[6 + i] & 0x80) return;
         if (a1 == 0x00 && a2 == 0x00 && a3 == 0x7E) reset_channels(m, MODE_XG, frame);   /* XG System On */
         else if (a1 == 0x00 && a2 == 0x00 && a3 == 0x04) set_master_gain(m, (float)v / 127.0f, frame);
+        else if (a1 == 0x00 && a2 == 0x00 && a3 == 0x7D) tsf_reset_drum_kit(m->synth, v);   /* drum setup reset */
         else if (a1 == 0x02 && a2 == 0x01) for (i = 0; i < nd; i++) fa_midi_fx_xg(m->fx, a3 + i, d[6 + i]);   /* effects */
         else if (a1 == 0x08 && a2 < 16) for (i = 0; i < nd; i++) xg_part(m, a2, a3 + i, d[6 + i]);
+        else if ((a1 & 0xF0) == 0x30 && a1 < 0x34) for (i = 0; i < nd; i++) xg_drum(m, a1 & 0x0F, a2, a3 + i, d[6 + i]);   /* drum setups */
     }
 }
 

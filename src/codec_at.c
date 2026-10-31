@@ -3,9 +3,9 @@
  * The AudioSpecificConfig goes in an MPEG-4 ES descriptor, the magic
  *    cookie Core Audio reads from an 'esds' box. kAudioFormatProperty_FormatList
  *    reads that cookie and names the richest format the system decodes it as
- *    (xHE-AAC, HE-AAC v2, HE-AAC or LC), with its rate after SBR. ADTS frames lose
- *    their header first; ADTS cannot say HE-AAC, so at 24 kHz and below SBR (and PS
- *    for mono) is signalled for it, as an HE decoder plays plain LC too.
+ *    (xHE-AAC, HE-AAC v2, HE-AAC or LC), with its rate after SBR. Only streams the
+ *    built-in decoder (aac.c) does not take come here: they always have a config,
+ *    and their packets are raw access units (ADTS frames are always built-in).
  * Core Audio's channel order is the stream's (AAC: centre first); the output
  * channel layout's labels map it to the library's (codec_os.c).
  * Nothing is linked beyond the AudioToolbox system framework. */
@@ -27,7 +27,6 @@ typedef struct at_state {
     UInt32 pkt_size;
     int eof;                            /* the end: the converter drains */
     int drained;
-    int adts;
     AudioStreamPacketDescription desc;
     uint32_t map[32];                   /* decoder channel for each library channel */
     int remap;
@@ -109,7 +108,6 @@ static fa_result at_decode(fa_codec* c, const uint8_t* data, size_t size)
         return pull(c, st);
     }
     if (size == 0 || size > 0x7FFFFFF0 || st->drained) return FA_OK;
-    if (st->adts && fa_adts_strip(&data, &size) < 0) return FA_ERROR_UNSUPPORTED_FORMAT;
     st->pkt = data;
     st->pkt_size = (UInt32)size;
     r = pull(c, st);
@@ -241,7 +239,6 @@ fa_result fa_at_codec_open(fa_codec* c, const fa_codec_params* p)
     st = (at_state*)calloc(1, sizeof(*st));
     if (!st) return FA_ERROR_OUT_OF_MEMORY;
     st->in = in;
-    st->adts = aac;
     memset(&st->out, 0, sizeof(st->out));
     st->out.mSampleRate = in.mSampleRate;
     st->out.mFormatID = kAudioFormatLinearPCM;

@@ -1,115 +1,12 @@
 /* What the operating systems' AAC decoders (codec_mf.c on Windows,
  * codec_at.c on macOS and iOS, codec_mediacodec.c on Android) need from the
  * stream, kept here in plain C so that every platform builds it and the tests
- * check it everywhere: the AudioSpecificConfig read, ADTS headers taken off
- * packets, the MPEG-4 ES descriptor AudioToolbox wants as its magic cookie, and
+ * check it everywhere: the AudioSpecificConfig handed over (read by aac.c's
+ * parser), the MPEG-4 ES descriptor AudioToolbox wants as its magic cookie, and
  * the library's channel order from Core Audio's channel labels. */
 #include "fa_internal.h"
 #include "demux.h"
 #include <string.h>
-
-typedef struct bitr {
-    const uint8_t* p;
-    size_t n, bit;          /* n in bits */
-    int bad;                /* read past the end */
-} bitr;
-
-static uint32_t get_bits(bitr* r, int n)
-{
-    uint32_t v = 0;
-    while (n-- > 0) {
-        if (r->bit >= r->n) { r->bad = 1; return 0; }
-        v = (v << 1) | ((r->p[r->bit >> 3] >> (7 - (r->bit & 7))) & 1u);
-        r->bit++;
-    }
-    return v;
-}
-
-static size_t bits_left(const bitr* r)
-{
-    return r->bit < r->n ? r->n - r->bit : 0;
-}
-
-static int get_aot(bitr* r)
-{
-    int aot = (int)get_bits(r, 5);
-    if (aot == 31) aot = 32 + (int)get_bits(r, 6);
-    return aot;
-}
-
-static uint32_t get_rate(bitr* r)
-{
-    uint32_t i = get_bits(r, 4);
-    if (i == 15) return get_bits(r, 24);
-    return i < 13 ? fa_aac_rates[i] : 0;
-}
-
-/* ISO/IEC 14496-3 1.6.2.1 AudioSpecificConfig, as far as the decoders' setup needs:
- * the object type, the rates, the channel configuration and whether SBR and PS are
- * signalled (explicitly, or by the backward compatible sync extension). */
-int fa_aac_parse_asc(const uint8_t* p, size_t n, fa_aac_asc_info* out)
-{
-    bitr r;
-    int aot;
-    memset(out, 0, sizeof(*out));
-    out->sbr = -1;
-    out->ps = -1;
-    if (!p || n < 2 || n > 4096) return 0;
-    r.p = p;
-    r.n = n * 8;
-    r.bit = 0;
-    r.bad = 0;
-    aot = get_aot(&r);
-    out->rate = get_rate(&r);
-    out->channel_config = get_bits(&r, 4);
-    if (aot == 5 || aot == 29) {
-        out->sbr = 1;
-        out->ps = aot == 29;
-        out->ext_rate = get_rate(&r);
-        aot = get_aot(&r);
-        if (aot == 22) get_bits(&r, 4);   /* extensionChannelConfiguration */
-    }
-    out->object_type = aot;
-    if (r.bad || out->rate == 0 || aot == 0) return 0;
-    switch (aot) {
-    case 1: case 2: case 3: case 4: case 6: case 7: case 17: case 19: case 20: case 21: case 22: case 23:
-        /* GASpecificConfig */
-        get_bits(&r, 1);                         /* frameLengthFlag */
-        if (get_bits(&r, 1)) get_bits(&r, 14);   /* dependsOnCoreCoder: coreCoderDelay */
-        {
-            uint32_t ext = get_bits(&r, 1);
-            /* A program config element: its size takes parsing it; what follows
-             * (the sync extension) stays unknown. */
-            if (out->channel_config == 0) return !r.bad;
-            if (aot == 6 || aot == 20) get_bits(&r, 3);
-            if (ext) {
-                if (aot == 22) get_bits(&r, 16);
-                if (aot == 17 || aot == 19 || aot == 20 || aot == 23) get_bits(&r, 3);
-                get_bits(&r, 1);
-            }
-        }
-        if (aot >= 17 && aot <= 27) get_bits(&r, 2);   /* epConfig */
-        break;
-    default:
-        return !r.bad;   /* USAC, ELD and the rest: their own configs follow */
-    }
-    if (r.bad) return 0;
-    if (out->sbr != 1 && bits_left(&r) >= 16 && get_bits(&r, 11) == 0x2b7) {
-        int ext_aot = get_aot(&r);
-        if (ext_aot == 5) {
-            out->sbr = (int)get_bits(&r, 1);
-            if (out->sbr) {
-                out->ext_rate = get_rate(&r);
-                if (bits_left(&r) >= 12 && get_bits(&r, 11) == 0x548) out->ps = (int)get_bits(&r, 1);
-                else out->ps = 0;
-            } else {
-                out->ps = 0;
-            }
-        }
-        if (r.bad) { out->sbr = -1; out->ps = -1; out->ext_rate = 0; }
-    }
-    return 1;
-}
 
 /* Channels of an AAC channelConfiguration (0: a program config element says). */
 uint32_t fa_aac_config_channels(uint32_t config)
@@ -118,60 +15,32 @@ uint32_t fa_aac_config_channels(uint32_t config)
     return config < 16 ? ch[config] : 0;
 }
 
-/* The AudioSpecificConfig the OS decoders get: the stream's own (MP4, Matroska),
- * or, for ADTS frames (no extradata), LC from the stream's rate and channels. ADTS
- * cannot say HE-AAC, nor can an MP4 config that leaves SBR implicit (SBR and PS are
- * then only found in the audio), so `he_guess` asks for SBR to be signalled at low
- * rates (and PS for mono), for a decoder that does not find it by itself; an HE
- * decoder plays plain LC too. */
+/* The AudioSpecificConfig the OS decoders get: the stream's own (MP4, Matroska,
+ * CAF). Only configurations the built-in decoder (aac.c) does not take reach them,
+ * so there always is one: ADTS frames never come here. An MP4 config that leaves
+ * SBR implicit (SBR and PS are then only found in the audio) cannot say HE-AAC, so
+ * `he_guess` asks for SBR to be signalled at low rates (and PS for mono), for a
+ * decoder that does not find it by itself; an HE decoder plays plain LC too. */
 size_t fa_aac_os_asc(const fa_codec_params* p, int he_guess, uint8_t* out, size_t cap)
 {
     fa_aac_asc_info info;
     uint8_t asc[FA_AAC_ASC_MAX];
     size_t n;
-    if (p->extradata_size > 0) {
-        if (!p->extradata || p->extradata_size > cap || !fa_aac_parse_asc((const uint8_t*)p->extradata, p->extradata_size, &info))
-            return 0;
-        /* LC at a low rate with SBR not said either way (implicit signalling): the
-         * same guess as for ADTS, for a decoder whose output rate is fixed at open. */
-        if (!(he_guess && info.object_type == 2 && info.sbr == -1 && info.rate <= 24000 &&
-              (info.channel_config == 1 || info.channel_config == 2))) {
-            memcpy(out, p->extradata, p->extradata_size);
-            return p->extradata_size;
-        }
-        n = fa_aac_build_asc(asc, 2, info.rate, info.channel_config, info.rate * 2);
-        if (info.channel_config == 1) asc[0] = (uint8_t)((asc[0] & 0x07) | (29 << 3));
-        if (n == 0 || n > cap) return 0;
-        memcpy(out, asc, n);
-        return n;
+    if (p->extradata_size == 0 || !p->extradata || p->extradata_size > cap ||
+        !fa_aac_parse_asc((const uint8_t*)p->extradata, p->extradata_size, &info))
+        return 0;
+    /* LC at a low rate with SBR not said either way (implicit signalling): signalled
+     * for a decoder whose output rate is fixed at open. */
+    if (!(he_guess && info.object_type == 2 && info.sbr == -1 && info.rate <= 24000 &&
+          (info.channel_config == 1 || info.channel_config == 2))) {
+        memcpy(out, p->extradata, p->extradata_size);
+        return p->extradata_size;
     }
-    if (p->sample_rate == 0 || p->channels == 0) return 0;
-    if (he_guess && p->sample_rate <= 24000 && p->channels <= 2) {
-        n = fa_aac_build_asc(asc, 2, p->sample_rate, p->channels, p->sample_rate * 2);
-        if (p->channels == 1) asc[0] = (uint8_t)((asc[0] & 0x07) | (29 << 3));   /* object type 5 -> 29 (PS) */
-    } else {
-        n = fa_aac_build_asc(asc, 2, p->sample_rate, p->channels, 0);
-    }
+    n = fa_aac_build_asc(asc, 2, info.rate, info.channel_config, info.rate * 2);
+    if (info.channel_config == 1) asc[0] = (uint8_t)((asc[0] & 0x07) | (29 << 3));   /* object type 5 -> 29 (PS) */
     if (n == 0 || n > cap) return 0;
     memcpy(out, asc, n);
     return n;
-}
-
-/* An ADTS frame (ISO/IEC 13818-7 6.2) of exactly `*size` bytes loses its header:
- * 1. A packet that is not one is left as it is: 0. A frame of several raw data
- * blocks cannot be handed over as one access unit: -1. */
-int fa_adts_strip(const uint8_t** data, size_t* size)
-{
-    const uint8_t* d = *data;
-    size_t n = *size, len, hdr;
-    if (n < 7 || d[0] != 0xFF || (d[1] & 0xF6) != 0xF0) return 0;
-    len = ((size_t)(d[3] & 3) << 11) | ((size_t)d[4] << 3) | (d[5] >> 5);
-    hdr = (d[1] & 1) ? 7 : 9;
-    if (len != n || len <= hdr || ((d[2] >> 2) & 15) >= 13) return 0;
-    if ((d[6] & 3) != 0) return -1;
-    *data = d + hdr;
-    *size = n - hdr;
-    return 1;
 }
 
 static size_t put_desc(uint8_t* out, size_t at, uint8_t tag, size_t len)
