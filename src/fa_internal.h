@@ -278,6 +278,7 @@ int fa_probe_mp3_header(const uint8_t* data, size_t size, size_t start, uint32_t
 
 #define FA_MIDI_DEFAULT_RATE 44100
 #define FA_MIDI_BUFFER_MS 150       /* default decode-ahead of MIDI streams (live controls) */
+#define FA_MIDI_LIVE_MS 30          /* real-time MIDI streams: how far ahead of the device they render */
 #define FA_WORKER_POLL_MIN_MS 5     /* the polling worker's shortest and longest sleep (worker_main) */
 #define FA_WORKER_POLL_MAX_MS 50
 #define FA_WORKER_POLL_IDLE_MS 100  /* ... while no stream has anything to decode */
@@ -417,6 +418,10 @@ uint32_t fa_engine_midi_rate(const fa_engine* engine);
 
 /* The MIDI state of an open MIDI decoder, NULL for other decoders. */
 struct fa_midi* fa_midi_of(fa_decoder* dec);
+/* A MIDI decoder without a file (dec_midi.c): `realtime` for fa_stream_open_midi (endless,
+ * only sent events), else the `count` events (fa_stream_open_midi_events). */
+fa_result fa_midi_decoder_open_events(fa_decoder* dec, struct fa_soundfont* font, uint32_t rate, int realtime,
+                                      const fa_midi_event* events, uint32_t count);
 /* The decoder's tracker state, or NULL when it is not a tracker module. */
 struct fa_tracker* fa_tracker_of(fa_decoder* dec);
 /* The row log (dec_tracker.c), lock-free for any thread: the row playing at a
@@ -1407,7 +1412,8 @@ struct fa_stream {
     fa_clock clock;
     fa_push_times* ptimes;       /* push streams, set at open; NULL for the others */
     struct fa_push* push;        /* NULL for file, memory and I/O streams */
-    int live;                    /* a callback or capture stream (live source, set at open) */
+    int live;                    /* a callback, capture or real-time MIDI stream (live source, set at open) */
+    uint32_t live_ms;            /* real-time MIDI: decode-ahead kept to this (ms), and read in small pieces */
     fa_atomic64 played_audible;  /* frames played since the last flush (stall events) */
     int stalled;                 /* audio thread: FA_EVENT_STALLED raised, RESUMED owed */
     fa_atomic_ptr eq;            /* fa_stream_eq*, NULL until an EQ call (flat); kept until freed */

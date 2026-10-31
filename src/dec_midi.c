@@ -439,22 +439,32 @@ typedef struct midi_text {
 
 enum { EV_NOTE_OFF, EV_NOTE_ON, EV_CONTROL, EV_PROGRAM, EV_PITCH, EV_SYSEX, EV_CHANNEL_PRESSURE, EV_KEY_PRESSURE };
 
+#define FA_MIDI_NO_TRACK 0xFFFF   /* sent events: no track volume */
+
 typedef struct midi_event {
     fa_frames frame;
     uint16_t value;             /* velocity, controller value, program, pitch bend, pressure; SysEx: index in sysex */
+    uint16_t track;             /* MTrk chunk, FA_MIDI_NO_TRACK for sent events */
     uint8_t type, channel, key; /* key: note or controller number */
 } midi_event;
 
 typedef struct midi_sysex {
-    uint8_t len;
-    uint8_t d[FA_MIDI_SYSEX_MAX];   /* after the F0, up to and with the F7 */
+    uint8_t len;                    /* after the F0 */
+    uint8_t d[1 + FA_MIDI_SYSEX_MAX];   /* the F0, then up to and with the F7 */
 } midi_sysex;
+
+/* An event the app sent (fa_stream_send_midi_events): queued until the synth takes it. */
+typedef struct live_event {
+    midi_event e;               /* track FA_MIDI_NO_TRACK; frame FA_MIDI_NOW or a source frame */
+    uint8_t* sysex;             /* SysEx: the message after its F0 (malloc'd), `size` bytes */
+    uint32_t size;
+} live_event;
 
 /* What the file's resets made of the synth. */
 enum { MODE_GM, MODE_GM2, MODE_GS, MODE_XG };
 
 struct fa_midi {
-    int smpte;                  /* SMPTE time division: no tempo, so no beat grid */
+    int smpte;                  /* SMPTE time division, or no file: no tempo, so no beat grid */
     fa_soundfont* font;         /* a reference */
     tsf* synth;
     uint32_t rate;
@@ -520,9 +530,34 @@ struct fa_midi {
      * replaying before a seek and not yet used by a note there; -1 none. */
     int16_t porta_ctrl[16];
 
+    uint16_t held_track[16][128];   /* replaying: the track of the loudest strike (its volume) */
+
     fa_atomic32 transpose;      /* set by the API */
     fa_atomic32 mute;           /* bit n = channel n */
     fa_atomic32 effects;        /* reverb and chorus on (1, the default) or off */
+
+    /* Sent events. Senders take send_lock among themselves and write the queue (FA_MIDI_QUEUE
+     * entries, allocated by the first send) from qw on; the decode thread reads from qr up to
+     * qw without a lock and keeps what is not due yet in `pend`, in frame order (equal
+     * frames as sent), from pend_head on. */
+    int realtime;               /* fa_stream_open_midi: no file, endless */
+    fa_mutex send_lock;
+    int send_lock_ready;
+    fa_atomic_ptr queue;        /* live_event[FA_MIDI_QUEUE] */
+    fa_atomic32 qw, qr;
+    live_event* pend;
+    size_t npend, pend_head, pend_cap;
+    fa_frames sent_from;        /* a seek's target: sent events wait for it (not in the unheard pre-roll) */
+
+    /* Track volumes (float bits, 1 = normal), one per track. */
+    fa_atomic32* track_vol;
+    uint32_t ntrack_vol;
+
+    /* fa_stream_get_midi_value: each channel's controllers, program, bend and pressure as the
+     * synth has them after the last block; refreshed for the channels events touched. */
+    fa_atomic32 val_cc[16][128];
+    fa_atomic32 val_program[16], val_bend[16], val_pressure[16];
+    uint32_t dirty;             /* bit n: channel n changed since the last refresh */
 };
 
 struct fa_midi* fa_midi_of(fa_decoder* dec)
@@ -832,16 +867,40 @@ static void apply_sysex(struct fa_midi* m, const uint8_t* d, size_t n, fa_frames
     }
 }
 
+/* A track's volume now (1 for sent events and tracks past the file's). */
+static float track_volume(const struct fa_midi* m, unsigned track)
+{
+    return track < m->ntrack_vol ? fa_load_float(&m->track_vol[track]) : 1.0f;
+}
+
+/* Starts a note at the track's volume (dB added to the voices' level). 0 if the track is
+ * silent and nothing started. */
+static int track_note_on(struct fa_midi* m, int ch, int play, int vel, unsigned track)
+{
+    float g = track_volume(m, track);
+    if (!(g > 0.0f)) return 0;
+    if (g != 1.0f) tsf_set_note_gain(m->synth, 20.0f * log10f(g));
+    tsf_channel_note_on(m->synth, ch, play, (float)vel / 127.0f);
+    if (g != 1.0f) tsf_set_note_gain(m->synth, 0.0f);
+    return 1;
+}
+
 /* Applies one event. `silent`: replaying before a seek target, no notes start. */
 static void apply_event(struct fa_midi* m, const midi_event* e, int silent)
 {
     int ch = e->channel, key = e->key;
+    /* Notes and key pressure change none of the values fa_stream_get_midi_value reads. */
+    if (e->type == EV_SYSEX) m->dirty = 0xFFFFu;
+    else if (e->type != EV_NOTE_ON && e->type != EV_NOTE_OFF && e->type != EV_KEY_PRESSURE) m->dirty |= 1u << ch;
     switch (e->type) {
     case EV_NOTE_ON: {
         int play = key;
         if (silent) {
             /* Held at the target if no note-off comes before it (restart_held). */
-            if (m->depth[ch][key] == 0 || m->held_vel[ch][key] < e->value) m->held_vel[ch][key] = (uint8_t)e->value;
+            if (m->depth[ch][key] == 0 || m->held_vel[ch][key] < e->value) {
+                m->held_vel[ch][key] = (uint8_t)e->value;
+                m->held_track[ch][key] = e->track;
+            }
             if (m->depth[ch][key] < 255) m->depth[ch][key]++;
             m->pedal_held[ch][key] = 0;
             m->porta_ctrl[ch] = -1;     /* a CC84 before it was for this note */
@@ -855,7 +914,7 @@ static void apply_event(struct fa_midi* m, const midi_event* e, int silent)
          * end those first, so no note is left hanging. */
         if (m->depth[ch][key] > 0 && m->sounding[ch][key] != play) end_notes(m, ch, key);
         m->merged[ch][key] = 0;     /* a voice of its own: every note-off ends one again */
-        tsf_channel_note_on(m->synth, ch, play, (float)e->value / 127.0f);
+        if (!track_note_on(m, ch, play, e->value, e->track)) return;   /* a silent track: no voice, no count */
         m->sounding[ch][key] = (uint8_t)play;
         m->depth[ch][key]++;
         return;
@@ -904,7 +963,7 @@ static void apply_event(struct fa_midi* m, const midi_event* e, int silent)
         tsf_channel_set_pitchwheel(m->synth, ch, e->value);
         return;
     case EV_SYSEX:
-        if (e->value < m->nsysex) apply_sysex(m, m->sysex[e->value].d, m->sysex[e->value].len, e->frame);
+        if (e->value < m->nsysex) apply_sysex(m, m->sysex[e->value].d + 1, m->sysex[e->value].len, e->frame);
         return;
     default:
         return;
@@ -929,6 +988,91 @@ static void take_controls(struct fa_midi* m)
     m->effects_now = effects;
 }
 
+/* ---- Sent events (decode thread) ---------------------------------------------- */
+
+/* Moves what the senders queued into `pend`, in frame order. Events due before `now`
+ * (FA_MIDI_NOW, frames already rendered, or before a seek target) are given `now` (the
+ * seek target while the pre-roll before it renders), so they play at once in the order
+ * they were sent. */
+static void take_sent(struct fa_midi* m, fa_frames now)
+{
+    live_event* q = (live_event*)fa_load_ptr(&m->queue);
+    uint32_t r, w;
+    if (now < m->sent_from) now = m->sent_from;
+    if (!q) return;
+    r = (uint32_t)fa_load32(&m->qr);
+    w = (uint32_t)fa_load32(&m->qw);
+    if (r == w) return;
+    if (m->pend_head == m->npend) m->pend_head = m->npend = 0;
+    for (; r != w; r++) {
+        live_event ev = q[r & (FA_MIDI_QUEUE - 1)];
+        size_t i;
+        if (ev.e.frame < now) ev.e.frame = now;
+        if (m->npend == m->pend_cap) {
+            live_event* p;
+            size_t cap = m->pend_cap ? m->pend_cap * 2 : 256;
+            if (m->pend_head > 0) {   /* room at the front first */
+                memmove(m->pend, m->pend + m->pend_head, (m->npend - m->pend_head) * sizeof(*m->pend));
+                m->npend -= m->pend_head;
+                m->pend_head = 0;
+            }
+            if (m->npend == m->pend_cap) {
+                p = cap <= ((size_t)1 << 22) ? (live_event*)realloc(m->pend, cap * sizeof(*p)) : NULL;
+                if (!p) { free(ev.sysex); continue; }   /* out of memory: the event is lost */
+                m->pend = p;
+                m->pend_cap = cap;
+            }
+        }
+        /* Mostly sent in order: found from the end. */
+        for (i = m->npend; i > m->pend_head && m->pend[i - 1].e.frame > ev.e.frame; i--) {}
+        memmove(m->pend + i + 1, m->pend + i, (m->npend - i) * sizeof(*m->pend));
+        m->pend[i] = ev;
+        m->npend++;
+    }
+    fa_store32(&m->qr, (int32_t)w);
+}
+
+/* Applies the next pending event. */
+static void apply_sent(struct fa_midi* m)
+{
+    live_event* ev = &m->pend[m->pend_head++];
+    if (ev->e.type == EV_SYSEX) {
+        m->dirty = 0xFFFFu;
+        if (ev->sysex) apply_sysex(m, ev->sysex, ev->size, ev->e.frame);
+        free(ev->sysex);
+        ev->sysex = NULL;
+    } else {
+        apply_event(m, &ev->e, 0);
+    }
+}
+
+static void free_sent(struct fa_midi* m)
+{
+    live_event* q = (live_event*)fa_load_ptr(&m->queue);
+    size_t i;
+    if (q) {
+        uint32_t r, w = (uint32_t)fa_load32(&m->qw);
+        for (r = (uint32_t)fa_load32(&m->qr); r != w; r++) free(q[r & (FA_MIDI_QUEUE - 1)].sysex);
+        free(q);
+    }
+    for (i = m->pend_head; i < m->npend; i++) free(m->pend[i].sysex);
+    free(m->pend);
+}
+
+/* The values fa_stream_get_midi_value reads, for the channels events changed. */
+static void refresh_values(struct fa_midi* m)
+{
+    int ch, cc;
+    for (ch = 0; ch < 16; ch++) {
+        if (!(m->dirty >> ch & 1u)) continue;
+        for (cc = 0; cc < 128; cc++) fa_store32(&m->val_cc[ch][cc], tsf_channel_get_midi_control(m->synth, ch, cc));
+        fa_store32(&m->val_program[ch], m->program[ch]);
+        fa_store32(&m->val_bend[ch], tsf_channel_get_pitchwheel(m->synth, ch));
+        fa_store32(&m->val_pressure[ch], tsf_channel_get_pressure(m->synth, ch));
+    }
+    m->dirty = 0;
+}
+
 /* A channel's controller for the insertion effects' controls (fa_midi_fx_controls). */
 static float control_of(void* user, int ch, int src)
 {
@@ -947,6 +1091,7 @@ static void render_block(struct fa_midi* m)
     unsigned used = 0;          /* the insertion chains rendered into ins this block */
     int chain_part[FA_MIDI_CHAINS];   /* a part rendered into each (its sends are the chain's) */
     take_controls(m);
+    take_sent(m, start);
     if (m->effects_now) {
         memset(m->rev, 0, sizeof(m->rev));
         memset(m->cho, 0, sizeof(m->cho));
@@ -954,8 +1099,14 @@ static void render_block(struct fa_midi* m)
     }
     while (done < n) {
         fa_frames upto = n;
-        while (m->next < m->nev && m->ev[m->next].frame <= start + done) apply_event(m, &m->ev[m->next++], 0);
+        /* The file's events first, then those sent for the same frame. */
+        for (;;) {
+            if (m->next < m->nev && m->ev[m->next].frame <= start + done) apply_event(m, &m->ev[m->next++], 0);
+            else if (m->pend_head < m->npend && m->pend[m->pend_head].e.frame <= start + done) apply_sent(m);
+            else break;
+        }
         if (m->next < m->nev && m->ev[m->next].frame < start + n) upto = m->ev[m->next].frame - start;
+        if (m->pend_head < m->npend && m->pend[m->pend_head].e.frame < start + upto) upto = m->pend[m->pend_head].e.frame - start;
         if (m->effects_now) {
             int route = fa_midi_fx_route(m->fx), ch, any = 0;   /* SysEx in the block may change it */
             signed char slot[16];
@@ -1018,6 +1169,7 @@ static void render_block(struct fa_midi* m)
     m->blk_len = (int)n;
     m->blk_off = 0;
     m->rpos = start + n;
+    if (m->dirty) refresh_values(m);
 }
 
 static fa_result midi_read(fa_decoder* dec, float* out, fa_frames frames, fa_frames* got)
@@ -1068,7 +1220,11 @@ static void restart_held(struct fa_midi* m)
                 if (play < 0 || play > 127) { m->depth[ch][key] = 0; continue; }
                 /* One voice, at the loudest of the strikes still held; it ends with the
                  * last of their note-offs. */
-                tsf_channel_note_on(m->synth, ch, play, (float)m->held_vel[ch][key] / 127.0f);
+                if (!track_note_on(m, ch, play, m->held_vel[ch][key], m->held_track[ch][key])) {
+                    m->depth[ch][key] = 0;   /* a silent track: no voice to end */
+                    m->pedal_held[ch][key] = 0;
+                    continue;
+                }
                 m->sounding[ch][key] = (uint8_t)play;
                 m->merged[ch][key] = (uint8_t)(held > 1 ? held - 1 : 0);
                 if (!held && pass == 1) tsf_channel_note_off(m->synth, ch, play);
@@ -1092,12 +1248,15 @@ static fa_result midi_seek(fa_decoder* dec, fa_frames frame)
 {
     struct fa_midi* m = (struct fa_midi*)dec->impl;
     fa_frames block = frame - frame % FA_MIDI_BLOCK, from = block;
-    tsf* fresh = synth_new(m->font, m->rate);
+    tsf* fresh;
+    if (m->realtime) return FA_ERROR_NOT_SEEKABLE;
+    fresh = synth_new(m->font, m->rate);
     if (!fresh) return FA_ERROR_OUT_OF_MEMORY;
     synth_free(m->font, m->synth);
     m->synth = fresh;
     fa_midi_fx_reset(m->fx);
     start_song(m);   /* also forgets every held note */
+    m->dirty = 0xFFFFu;
     /* The controls the API has set now, for the replay (transposed keys) and restart_held. */
     m->transpose_now = fa_load32(&m->transpose);
     m->mute_now = (uint32_t)fa_load32(&m->mute);
@@ -1112,6 +1271,13 @@ static fa_result midi_seek(fa_decoder* dec, fa_frames frame)
      * applied by render_block, as when playing through. */
     for (m->next = 0; m->next < m->nev && m->ev[m->next].frame < from; m->next++) apply_event(m, &m->ev[m->next], 1);
     restart_held(m);
+    /* Sent events wait for the target: the pre-roll before it is rendered unheard. Pending
+     * ones before it move to it (in order: they are sorted by frame). */
+    m->sent_from = frame < m->length ? frame : m->length;
+    {
+        size_t i;
+        for (i = m->pend_head; i < m->npend && m->pend[i].e.frame < m->sent_from; i++) m->pend[i].e.frame = m->sent_from;
+    }
     m->rpos = from;
     m->blk_len = m->blk_off = 0;
     if (frame < m->length) {
@@ -1131,6 +1297,9 @@ static void midi_free(struct fa_midi* m)
     if (m->synth) synth_free(m->font, m->synth);
     fa_midi_fx_free(m->fx);
     fa_soundfont_release(m->font);
+    free_sent(m);
+    free(m->track_vol);
+    if (m->send_lock_ready) fa_mutex_destroy(&m->send_lock);
     for (i = 0; i < m->ntexts; i++) free(m->texts[i].text);
     free(m->texts);
     free(m->text_frames);
@@ -1506,6 +1675,7 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
         case TML_CHANNEL_PRESSURE: case TML_KEY_PRESSURE: {
             midi_event* e = &m->ev[k++];
             e->frame = frame;
+            e->track = msg->track;
             e->channel = msg->channel & 15;
             e->key = (uint8_t)(msg->key & 0x7F);
             e->value = (uint16_t)(msg->velocity & 0x7F);
@@ -1565,8 +1735,10 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
                 midi_event* e = &m->ev[k++];
                 midi_sysex* x = &m->sysex[m->nsysex];
                 x->len = (uint8_t)(msg->text_length < FA_MIDI_SYSEX_MAX ? msg->text_length : FA_MIDI_SYSEX_MAX);
-                memcpy(x->d, msg->text, x->len);
+                x->d[0] = 0xF0;
+                memcpy(x->d + 1, msg->text, x->len);
                 e->frame = frame;
+                e->track = msg->track;
                 e->type = EV_SYSEX;
                 e->channel = e->key = 0;
                 e->value = (uint16_t)m->nsysex++;
@@ -1647,6 +1819,41 @@ static fa_result midi_parse(fa_source* src, uint32_t rate, int32_t code_page, in
     return FA_OK;
 }
 
+/* The synth, effects and controls of a parsed song (or of none: a real-time stream). */
+static fa_result midi_start(struct fa_midi* m, fa_soundfont* font)
+{
+    uint32_t i;
+    m->font = fa_soundfont_retain(font);
+    m->synth = synth_new(m->font, m->rate);
+    m->fx = fa_midi_fx_new(m->rate);
+    fa_store32(&m->effects, 1);
+    m->effects_now = 1;
+    if (fa_mutex_init(&m->send_lock) != 0) return FA_ERROR_GENERIC;
+    m->send_lock_ready = 1;
+    m->ntrack_vol = m->info.tracks;
+    if (m->ntrack_vol) {
+        m->track_vol = (fa_atomic32*)malloc(m->ntrack_vol * sizeof(fa_atomic32));
+        if (!m->track_vol) return FA_ERROR_OUT_OF_MEMORY;
+        for (i = 0; i < m->ntrack_vol; i++) fa_store_float(&m->track_vol[i], 1.0f);
+    }
+    if (!m->synth || !m->fx) return FA_ERROR_OUT_OF_MEMORY;
+    start_song(m);
+    m->dirty = 0xFFFFu;
+    refresh_values(m);
+    return FA_OK;
+}
+
+static void midi_publish(fa_decoder* dec, struct fa_midi* m, const char* container)
+{
+    dec->impl = m;
+    dec->format.sample_rate = m->rate;
+    dec->format.channels = 2;
+    dec->length = m->realtime ? -1 : m->length;
+    dec->seekable = !m->realtime;
+    snprintf(dec->codec, sizeof(dec->codec), "midi");
+    snprintf(dec->container, sizeof(dec->container), "%s", container);
+}
+
 static fa_result midi_open(fa_decoder* dec)
 {
     struct fa_midi* m;
@@ -1654,22 +1861,9 @@ static fa_result midi_open(fa_decoder* dec)
     fa_result r;
     r = midi_parse(dec->src, dec->midi_rate ? dec->midi_rate : FA_MIDI_DEFAULT_RATE, dec->text_code_page, !dec->soundfont, &m, &rmid);
     if (r != FA_OK) return r;
-    m->font = fa_soundfont_retain(dec->soundfont);
-    m->synth = synth_new(m->font, m->rate);
-    m->fx = fa_midi_fx_new(m->rate);
-    fa_store32(&m->effects, 1);
-    m->effects_now = 1;
-    if (!m->synth || !m->fx) r = FA_ERROR_OUT_OF_MEMORY;
-    else start_song(m);
+    r = midi_start(m, dec->soundfont);
     if (r != FA_OK) { midi_free(m); return r; }
-
-    dec->impl = m;
-    dec->format.sample_rate = m->rate;
-    dec->format.channels = 2;
-    dec->length = m->length;
-    dec->seekable = 1;
-    snprintf(dec->codec, sizeof(dec->codec), "midi");
-    snprintf(dec->container, sizeof(dec->container), "%s", rmid ? "rmid" : "smf");
+    midi_publish(dec, m, rmid ? "rmid" : "smf");
     return FA_OK;
 }
 
@@ -1711,6 +1905,134 @@ const fa_decoder_vtable fa_decoder_midi = {
     "audio/midi;audio/x-midi;audio/mid;audio/sp-midi",
     fa_probe_midi, midi_open, midi_read, midi_seek, midi_close, 0, NULL, NULL
 };
+
+/* ---- Real-time MIDI streams and lists of events --------------------------------- */
+
+#define FA_MIDI_SENT_SYSEX_MAX 65536   /* bytes of one sent SysEx message */
+
+static int midi_ready(fa_decoder* dec) { (void)dec; return 1; }   /* always has audio to give */
+
+/* Checks an app's event and turns it into ours (SysEx not copied). */
+static fa_result event_of(const fa_midi_event* in, midi_event* out)
+{
+    int32_t t = in->type, v = in->value, p = in->param;
+    if (in->frame < 0 && in->frame != FA_MIDI_NOW) return FA_ERROR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    out->frame = in->frame;
+    out->track = FA_MIDI_NO_TRACK;
+    if (t == FA_MIDI_EVENT_SYSEX) {
+        if (!in->data || in->size < 2 || in->size > FA_MIDI_SENT_SYSEX_MAX || in->data[0] != 0xF0) return FA_ERROR_INVALID_ARG;
+        out->type = EV_SYSEX;
+        return FA_OK;
+    }
+    if (in->channel < 0 || in->channel > 15 || t < FA_MIDI_EVENT_NOTE_OFF || t > FA_MIDI_EVENT_PITCH_BEND) return FA_ERROR_INVALID_ARG;
+    if (t == FA_MIDI_EVENT_NOTE_OFF || t == FA_MIDI_EVENT_NOTE_ON || t == FA_MIDI_EVENT_KEY_PRESSURE || t == FA_MIDI_EVENT_CONTROL) {
+        if (p < 0 || p > 127) return FA_ERROR_INVALID_ARG;
+    }
+    if (t == FA_MIDI_EVENT_NOTE_OFF) v = 0;
+    if (v < 0 || v > (t == FA_MIDI_EVENT_PITCH_BEND ? 16383 : 127)) return FA_ERROR_INVALID_ARG;
+    out->channel = (uint8_t)in->channel;
+    out->key = (uint8_t)(t == FA_MIDI_EVENT_PROGRAM || t == FA_MIDI_EVENT_CHANNEL_PRESSURE || t == FA_MIDI_EVENT_PITCH_BEND ? 0 : p);
+    out->value = (uint16_t)v;
+    switch (t) {
+    case FA_MIDI_EVENT_NOTE_OFF: out->type = EV_NOTE_OFF; break;
+    case FA_MIDI_EVENT_NOTE_ON: out->type = v ? EV_NOTE_ON : EV_NOTE_OFF; break;
+    case FA_MIDI_EVENT_KEY_PRESSURE: out->type = EV_KEY_PRESSURE; break;
+    case FA_MIDI_EVENT_CONTROL: out->type = EV_CONTROL; break;
+    case FA_MIDI_EVENT_PROGRAM: out->type = EV_PROGRAM; break;
+    case FA_MIDI_EVENT_CHANNEL_PRESSURE: out->type = EV_CHANNEL_PRESSURE; break;
+    default: out->type = EV_PITCH; break;
+    }
+    return FA_OK;
+}
+
+/* Sorts events by frame, equal frames kept in their order (a bottom-up merge sort). */
+static fa_result sort_events(midi_event* ev, size_t n)
+{
+    size_t width, i;
+    midi_event *a = ev, *b, *t;
+    for (i = 1; i < n && ev[i - 1].frame <= ev[i].frame; i++) {}
+    if (i >= n) return FA_OK;   /* in order already, as lists mostly are */
+    b = (midi_event*)malloc(n * sizeof(*b));
+    if (!b) return FA_ERROR_OUT_OF_MEMORY;
+    for (width = 1; width < n; width *= 2) {
+        for (i = 0; i < n; i += 2 * width) {
+            size_t lo = i, mid = i + width < n ? i + width : n, hi = i + 2 * width < n ? i + 2 * width : n;
+            size_t x = lo, y = mid, k = lo;
+            while (x < mid && y < hi) b[k++] = a[y].frame < a[x].frame ? a[y++] : a[x++];
+            while (x < mid) b[k++] = a[x++];
+            while (y < hi) b[k++] = a[y++];
+        }
+        t = a; a = b; b = t;
+    }
+    if (a != ev) { memcpy(ev, a, n * sizeof(*ev)); free(a); }
+    else free(b);
+    return FA_OK;
+}
+
+/* A list of events as a song: like a parsed file without texts. */
+static fa_result build_events(struct fa_midi* m, const fa_midi_event* events, uint32_t count)
+{
+    uint32_t i, k = 0, nsysex = 0, tracks = 0;
+    fa_frames last = 0;
+    for (i = 0; i < count; i++) if (events[i].type == FA_MIDI_EVENT_SYSEX) nsysex++;
+    if (nsysex > 65535) return FA_ERROR_INVALID_ARG;
+    m->ev = (midi_event*)malloc((count ? count : 1) * sizeof(midi_event));
+    if (nsysex) m->sysex = (midi_sysex*)malloc(nsysex * sizeof(midi_sysex));
+    if (!m->ev || (nsysex && !m->sysex)) return FA_ERROR_OUT_OF_MEMORY;
+    for (i = 0; i < count; i++) {
+        midi_event* e = &m->ev[k];
+        fa_result r = event_of(&events[i], e);
+        if (r == FA_OK && (events[i].track < 0 || events[i].track >= FA_MIDI_NO_TRACK)) r = FA_ERROR_INVALID_ARG;
+        if (r != FA_OK) return r;
+        if (e->frame < 0) e->frame = 0;
+        e->track = (uint16_t)events[i].track;
+        if ((uint32_t)e->track + 1 > tracks) tracks = (uint32_t)e->track + 1;
+        if (e->type == EV_SYSEX) {
+            midi_sysex* x = &m->sysex[m->nsysex];
+            uint32_t n = events[i].size - 1;
+            if (n > FA_MIDI_SYSEX_MAX) continue;   /* bulk data: dropped, as files' is */
+            x->len = (uint8_t)n;
+            memcpy(x->d, events[i].data, n + 1);
+            e->value = (uint16_t)m->nsysex++;
+        }
+        if (e->frame > last) last = e->frame;
+        k++;
+    }
+    m->nev = k;
+    if (sort_events(m->ev, k) != FA_OK) return FA_ERROR_OUT_OF_MEMORY;
+    m->info.tracks = tracks;
+    m->length = last + (fa_frames)(FA_MIDI_TAIL_S * m->rate);
+    return FA_OK;
+}
+
+fa_result fa_midi_decoder_open_events(fa_decoder* dec, fa_soundfont* font, uint32_t rate, int realtime,
+                                      const fa_midi_event* events, uint32_t count)
+{
+    struct fa_midi* m;
+    fa_result r;
+    if (!font) return FA_ERROR_NO_SOUNDFONT;
+    m = (struct fa_midi*)calloc(1, sizeof(*m));
+    if (!m) return FA_ERROR_OUT_OF_MEMORY;
+    m->rate = rate;
+    m->realtime = realtime;
+    m->smpte = 1;   /* no tempo events: no beat grid from the events */
+    m->credits.code_page = FA_CODE_PAGE_UTF8;
+    if (realtime) {
+        m->length = INT64_MAX / 4;   /* endless */
+        r = FA_OK;
+    } else {
+        r = build_events(m, events, count);
+    }
+    if (r == FA_OK) r = midi_start(m, font);
+    if (r != FA_OK) { midi_free(m); return r; }
+    memset(dec, 0, sizeof(*dec));
+    dec->vt = &fa_decoder_midi;
+    dec->anchor_pts = FA_PTS_NONE;
+    if (realtime) dec->ready = midi_ready;
+    midi_publish(dec, m, realtime ? "realtime" : "events");
+    return FA_OK;
+}
 
 /* ---- MIDI stream API ---------------------------------------------------------- */
 
@@ -1861,5 +2183,209 @@ fa_result fa_midi_exact_grid(const struct fa_midi* m, fa_grid_data* out)
         out->grid.flags |= FA_GRID_BARS;
     }
     fa_grid_data_finish(out, m->length);
+    return FA_OK;
+}
+
+/* ---- Sent events, the file's events, values and track volume -------------------- */
+
+FA_API fa_result FA_CALL fa_stream_send_midi_events(fa_stream* stream, const fa_midi_event* events, uint32_t count)
+{
+    struct fa_midi* m;
+    live_event* q;
+    uint32_t i, w, r;
+    fa_result res = FA_OK;
+    if (!stream || !stream->midi || (count && !events) || count > FA_MIDI_QUEUE) return FA_ERROR_INVALID_ARG;
+    for (i = 0; i < count; i++) {
+        midi_event e;
+        if (event_of(&events[i], &e) != FA_OK) return FA_ERROR_INVALID_ARG;
+    }
+    if (!count) return FA_OK;
+    m = stream->midi;
+    fa_mutex_lock(&m->send_lock);
+    q = (live_event*)fa_load_ptr(&m->queue);
+    if (!q) {
+        q = (live_event*)calloc(FA_MIDI_QUEUE, sizeof(live_event));
+        if (q) fa_exchange_ptr(&m->queue, q);
+    }
+    w = (uint32_t)fa_load32(&m->qw);
+    r = (uint32_t)fa_load32(&m->qr);
+    if (!q) res = FA_ERROR_OUT_OF_MEMORY;
+    else if (w - r + count > FA_MIDI_QUEUE) res = FA_ERROR_BUSY;
+    for (i = 0; res == FA_OK && i < count; i++) {
+        live_event* x = &q[(w + i) & (FA_MIDI_QUEUE - 1)];
+        event_of(&events[i], &x->e);
+        x->sysex = NULL;
+        x->size = 0;
+        if (x->e.type == EV_SYSEX) {
+            x->sysex = (uint8_t*)malloc(events[i].size - 1);
+            if (!x->sysex) {
+                while (i-- > 0) { free(q[(w + i) & (FA_MIDI_QUEUE - 1)].sysex); q[(w + i) & (FA_MIDI_QUEUE - 1)].sysex = NULL; }
+                res = FA_ERROR_OUT_OF_MEMORY;
+                break;
+            }
+            memcpy(x->sysex, events[i].data + 1, events[i].size - 1);
+            x->size = events[i].size - 1;
+        }
+    }
+    if (res == FA_OK) fa_store32(&m->qw, (int32_t)(w + count));
+    fa_mutex_unlock(&m->send_lock);
+    return res;
+}
+
+/* Data bytes of a channel message (status 0x80..0xEF). */
+static int data_bytes(int status) { int k = status >> 4; return k == 0xC || k == 0xD ? 1 : 2; }
+
+FA_API fa_result FA_CALL fa_stream_send_midi(fa_stream* stream, fa_frames frame, const void* bytes, size_t size)
+{
+    const uint8_t* b = (const uint8_t*)bytes;
+    fa_midi_event* ev;
+    size_t i = 0, n = 0;
+    int status = 0;
+    fa_result r;
+    if (!stream || !stream->midi || (size && !bytes) || (frame < 0 && frame != FA_MIDI_NOW)) return FA_ERROR_INVALID_ARG;
+    if (!size) return FA_OK;
+    ev = (fa_midi_event*)calloc(size < FA_MIDI_QUEUE ? size : FA_MIDI_QUEUE, sizeof(*ev));
+    if (!ev) return FA_ERROR_OUT_OF_MEMORY;
+    while (i < size) {
+        uint8_t c = b[i];
+        fa_midi_event* e;
+        if (c >= 0xF8) { i++; continue; }                     /* real-time: anywhere, ignored */
+        if (c == 0xF0) {                                      /* SysEx up to its F7 */
+            size_t j = i + 1;
+            while (j < size && (b[j] < 0x80 || b[j] >= 0xF8)) j++;
+            status = 0;
+            if (j >= size || b[j] != 0xF7) { i = j; continue; }   /* cut short: dropped */
+            if (n == FA_MIDI_QUEUE) { free(ev); return FA_ERROR_INVALID_ARG; }
+            e = &ev[n++];
+            e->frame = frame;
+            e->type = FA_MIDI_EVENT_SYSEX;
+            e->data = b + i;
+            e->size = (uint32_t)(j + 1 - i);
+            /* Real-time bytes inside it stay in it (the synth then ignores the message). */
+            i = j + 1;
+            continue;
+        }
+        if (c >= 0xF1) {                                      /* system common: skipped with its data */
+            status = 0;
+            i++;
+            while (i < size && b[i] < 0x80) i++;
+            continue;
+        }
+        if (c >= 0x80) { status = c; i++; }
+        else if (!status) { i++; continue; }                  /* data with no status */
+        {
+            int k = data_bytes(status);
+            uint8_t d[2] = { 0, 0 };
+            int got = 0;
+            while (got < k && i < size) {
+                if (b[i] >= 0xF8) { i++; continue; }
+                if (b[i] >= 0x80) break;
+                d[got++] = b[i++];
+            }
+            if (got < k) continue;                            /* incomplete: dropped */
+            if (n == FA_MIDI_QUEUE) { free(ev); return FA_ERROR_INVALID_ARG; }
+            e = &ev[n++];
+            e->frame = frame;
+            e->channel = status & 15;
+            switch (status >> 4) {
+            case 0x8: e->type = FA_MIDI_EVENT_NOTE_OFF; e->param = d[0]; break;
+            case 0x9: e->type = FA_MIDI_EVENT_NOTE_ON; e->param = d[0]; e->value = d[1]; break;
+            case 0xA: e->type = FA_MIDI_EVENT_KEY_PRESSURE; e->param = d[0]; e->value = d[1]; break;
+            case 0xB: e->type = FA_MIDI_EVENT_CONTROL; e->param = d[0]; e->value = d[1]; break;
+            case 0xC: e->type = FA_MIDI_EVENT_PROGRAM; e->value = d[0]; break;
+            case 0xD: e->type = FA_MIDI_EVENT_CHANNEL_PRESSURE; e->value = d[0]; break;
+            default: e->type = FA_MIDI_EVENT_PITCH_BEND; e->value = d[0] | (d[1] << 7); break;
+            }
+        }
+    }
+    r = fa_stream_send_midi_events(stream, ev, (uint32_t)n);
+    free(ev);
+    return r;
+}
+
+static int public_type(int t)
+{
+    switch (t) {
+    case EV_NOTE_OFF: return FA_MIDI_EVENT_NOTE_OFF;
+    case EV_NOTE_ON: return FA_MIDI_EVENT_NOTE_ON;
+    case EV_KEY_PRESSURE: return FA_MIDI_EVENT_KEY_PRESSURE;
+    case EV_CONTROL: return FA_MIDI_EVENT_CONTROL;
+    case EV_PROGRAM: return FA_MIDI_EVENT_PROGRAM;
+    case EV_CHANNEL_PRESSURE: return FA_MIDI_EVENT_CHANNEL_PRESSURE;
+    case EV_PITCH: return FA_MIDI_EVENT_PITCH_BEND;
+    default: return FA_MIDI_EVENT_SYSEX;
+    }
+}
+
+FA_API fa_result FA_CALL fa_stream_get_midi_events(fa_stream* stream, int32_t track, int32_t type,
+                                                   fa_midi_event* out_events, uint32_t capacity, uint32_t* out_count)
+{
+    const struct fa_midi* m;
+    size_t i;
+    uint32_t n = 0;
+    if (out_count) *out_count = 0;
+    if (!stream || !out_count || !stream->midi || (capacity && !out_events) || track < -1 ||
+        type < -1 || type > FA_MIDI_EVENT_SYSEX)
+        return FA_ERROR_INVALID_ARG;
+    m = stream->midi;
+    for (i = 0; i < m->nev; i++) {
+        const midi_event* e = &m->ev[i];
+        int t = public_type(e->type);
+        if ((track >= 0 && e->track != track) || (type >= 0 && t != type)) continue;
+        if (n < capacity) {
+            fa_midi_event* o = &out_events[n];
+            memset(o, 0, sizeof(*o));
+            o->frame = e->frame;
+            o->time = (fa_time)((double)e->frame * 1e9 / (double)m->rate + 0.5);
+            o->type = t;
+            o->track = e->track;
+            if (t == FA_MIDI_EVENT_SYSEX) {
+                const midi_sysex* x = &m->sysex[e->value];
+                o->data = x->d;
+                o->size = x->len + 1u;
+            } else {
+                o->channel = e->channel;
+                o->param = t == FA_MIDI_EVENT_PROGRAM || t == FA_MIDI_EVENT_CHANNEL_PRESSURE || t == FA_MIDI_EVENT_PITCH_BEND ? 0 : e->key;
+                o->value = e->value;
+            }
+        }
+        if (n < UINT32_MAX) n++;
+    }
+    *out_count = n;
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_midi_value(fa_stream* stream, uint32_t channel, int32_t type, int32_t param,
+                                                  int32_t* out_value)
+{
+    struct fa_midi* m;
+    if (out_value) *out_value = 0;
+    if (!stream || !out_value || !stream->midi || channel > 15) return FA_ERROR_INVALID_ARG;
+    m = stream->midi;
+    switch (type) {
+    case FA_MIDI_EVENT_CONTROL:
+        if (param < 0 || param > 127) return FA_ERROR_INVALID_ARG;
+        *out_value = fa_load32(&m->val_cc[channel][param]);
+        return FA_OK;
+    case FA_MIDI_EVENT_PROGRAM: *out_value = fa_load32(&m->val_program[channel]); return FA_OK;
+    case FA_MIDI_EVENT_PITCH_BEND: *out_value = fa_load32(&m->val_bend[channel]); return FA_OK;
+    case FA_MIDI_EVENT_CHANNEL_PRESSURE: *out_value = fa_load32(&m->val_pressure[channel]); return FA_OK;
+    default: return FA_ERROR_INVALID_ARG;
+    }
+}
+
+FA_API fa_result FA_CALL fa_stream_set_midi_track_volume(fa_stream* stream, uint32_t track, float volume)
+{
+    if (!stream || !stream->midi || track >= stream->midi->ntrack_vol || !(volume >= 0.0f && volume <= 4.0f))
+        return FA_ERROR_INVALID_ARG;
+    fa_store_float(&stream->midi->track_vol[track], volume);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_midi_track_volume(fa_stream* stream, uint32_t track, float* out_volume)
+{
+    if (out_volume) *out_volume = 0.0f;
+    if (!stream || !out_volume || !stream->midi || track >= stream->midi->ntrack_vol) return FA_ERROR_INVALID_ARG;
+    *out_volume = fa_load_float(&stream->midi->track_vol[track]);
     return FA_OK;
 }

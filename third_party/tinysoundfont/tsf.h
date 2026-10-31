@@ -234,6 +234,7 @@ TSFDEF int tsf_channel_set_pitchwheel(tsf* f, int channel, int pitch_wheel);
 TSFDEF int tsf_channel_set_pitchrange(tsf* f, int channel, float pitch_range);
 TSFDEF int tsf_channel_set_tuning(tsf* f, int channel, float tuning);
 TSFDEF void tsf_set_tuning(tsf* f, float tuning); // FatzAudio: master tuning in semitones, for every channel
+TSFDEF void tsf_set_note_gain(tsf* f, float db); // FatzAudio: added to the level of the notes started from now on (MIDI track volume)
 TSFDEF int tsf_channel_set_sustain(tsf* f, int channel, int flag_sustain);
 // FatzAudio: sostenuto (CC66: holds the notes whose keys are down when it is pressed),
 // channel and polyphonic key pressure (0..127), and the vibrato depth in cents that full
@@ -399,6 +400,7 @@ struct tsf
 	tsf_u32 modCC[4];   // FatzAudio: controllers some modulator reads (bit n = CC n)
 	tsf_u32 modGC;      // FatzAudio: general controllers some modulator reads (bit n = source n)
 	struct tsf_drumkey* drumKeys; // FatzAudio: TSF_DRUM_KITS * 128 drum key edits, of this synth only (NULL: none yet)
+	float noteGainDB;   // FatzAudio: tsf_set_note_gain
 };
 
 #ifndef TSF_NO_STDIO
@@ -2044,6 +2046,7 @@ TSFDEF tsf* tsf_copy(tsf* f)
 	res->voiceNum = 0;
 	res->channels = TSF_NULL;
 	res->drumKeys = TSF_NULL; // FatzAudio
+	res->noteGainDB = 0.0f; // FatzAudio
 	(*res->refCount)++;
 	return res;
 }
@@ -2425,7 +2428,7 @@ static void tsf_channel_setup_voice(tsf* f, struct tsf_voice* v)
 {
 	struct tsf_channel* c = &f->channels->channels[f->channels->activeChannel];
 	v->playingChannel = f->channels->activeChannel;
-	v->noteGainDB += c->gainDB;
+	v->noteGainDB += c->gainDB + f->noteGainDB; // FatzAudio: + note gain
 	v->scalePitch = c->scaleTune[v->playingKey % 12]; // FatzAudio
 	tsf_voice_calcpitchratio(v, tsf_channel_pitchshift(f, c), f->outSampleRate);
 	tsf_voice_setpan(v, v->basePan + c->panOffset); // FatzAudio: drum pan
@@ -2602,6 +2605,11 @@ TSFDEF int tsf_channel_set_tuning(tsf* f, int channel, float tuning)
 	c->tuning = tuning;
 	tsf_channel_applypitch(f, channel, c);
 	return 1;
+}
+
+TSFDEF void tsf_set_note_gain(tsf* f, float db) // FatzAudio
+{
+	f->noteGainDB = db;
 }
 
 TSFDEF void tsf_set_tuning(tsf* f, float tuning) // FatzAudio
