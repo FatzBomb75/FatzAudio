@@ -334,7 +334,57 @@ After a GS reset there is a third effect, the SC-88's delay; after an XG reset, 
 | Auto Wah | A resonant bandpass swept by the LFO |
 | Thru | The sound unchanged |
 
-Types newer than that list (pitch change, aural exciter, compressor, noise gate, voice cancel, lo-fi and the other MU100 additions) are not built: the variation is off, and in insertion mode the part plays dry. The EQ bands of the modulation types and the MW/bend/aftertouch control of the variation (`5C`-`5F`) are ignored.
+The MU100's additions (pitch change, aural exciter, touch wah, compressor, noise gate, voice cancel, lo-fi and the others in the [insertion effects](#insertion-effects-xg-insertion-and-gs-efx) list) play in the variation block too, and so do Celeste 4 and the MU100's second Phaser number (`48 08`). The variation's MW, bend, aftertouch and AC1 depths (`5C`-`5F`, 64 is none) move the type's controlled parameter by up to its whole range: the LFO frequency of the modulation types, the drive of the distortions, the wah's cutoff, otherwise dry/wet. The EQ bands of the MU80 modulation types are ignored.
+
+### Insertion effects (XG insertion and GS EFX)
+
+An insertion effect takes the whole sound of the parts assigned to it, as the variation does in insertion mode. FatzAudio has the MU100's two XG insertion blocks and the SC-88 Pro's EFX. Which ones play follows the standard of the last reset or insertion SysEx: after an XG reset the XG insertions, after a GS reset the EFX, after a GM reset neither. After an XG reset both insertion blocks are Distortion with no part; after a GS reset the EFX is Thru and no part is switched to it. So nothing changes until a file assigns a part.
+
+A part can go through several blocks, always in this order: XG insertion 1, insertion 2, the XG variation (insertion mode), the GS EFX. Several parts on one block are summed into it. After the last block the sound goes on to the reverb and chorus: XG at the part's own sends (CC91, CC93, and CC94 when the variation is in system mode); GS at the EFX's own send levels (`17`-`19`), which stand in for those of the parts on it, as on the SC-88 Pro.
+
+| Setting | XG insertion 1, 2 (`03 00 xx`, `03 01 xx`) | GS EFX (`40 03 xx`) |
+|---|---|---|
+| Type | `00` (MSB), `01` (LSB). A type sets its parameters to its defaults | `00` (MSB), `01` (LSB). The same |
+| Parameters | 1-10 at `02`-`0B` (one byte) or `30`-`43` (two bytes, MSB first), 11-16 at `20`-`25`, as Yamaha numbers them for each type | 1-20 at `03`-`16`, as Roland numbers them for each type; most types end with low and high gain (`13`, `14`: 200 Hz and 4 kHz shelves, ±12 dB), pan (`15`, mono types) and level (`16`) |
+| Part | `0C`: 0-15, 127 (none, the default) | Each part's EFX switch, `40 4x 22` (1 on; x numbers the parts as in the other part addresses); several parts can be on |
+| Sends | The part's own | Reverb, chorus, delay `17`, `18`, `19` (40, 0, 0 after a reset); the delay send reaches the SC-88 delay |
+| Controls | MW, bend, aftertouch, AC1, AC2 depths `0D`-`11` (64 is none): each moves the type's controlled parameter by up to its whole range | Control 1 and 2 source (`1B`, `1D`: 0 off, 1-95 that controller, 96 channel aftertouch, 97 bend) and depth (`1C`, `1E`: 64 is none). They move the parameters marked + and # in Roland's table. The source is read on the lowest part switched to the EFX |
+| Dry/wet | Parameter 10 for the types that have one (64 is half each); 127 is the effect alone | Each type mixes its own (its balance parameter) |
+
+| GS EFX types (SC-88 Pro) | How they are made |
+|---|---|
+| Thru | The sound unchanged (the EFX send levels still apply) |
+| Stereo-EQ, Spectrum | Two shelves and two peaks; eight fixed peaks (250 Hz to 8 kHz) of one width |
+| Enhancer, Humanizer | High harmonics added above about 2.5 kHz; a drive into two formant filters gliding between five vowels |
+| Overdrive, Distortion | Drive into a soft or harder clipper and one of four amp tones |
+| Phaser, Auto Wah, Rotary | 6 allpass stages swept by an LFO with resonance; a resonant filter swept by the LFO and the input level; a horn and a low rotor turning at their own slow and fast speeds and accelerations, with a speed switch |
+| Stereo Flanger, Step Flanger, Hexa Chorus, Tremolo Chorus, Stereo Chorus, Space D, 3D Chorus | Modulated delay lines: one or two with feedback, a stepped LFO, six voices spread across the stereo field, a chorus with a level LFO, two voices in opposite phase |
+| Tremolo, Auto Pan | An LFO (five waves) on level, or on left against right |
+| Compressor, Limiter | Level detection with attack and release; a sustain/threshold, ratio and make-up level |
+| Stereo Delay, Mod Delay, 3 Tap Delay, 4 Tap Delay, Tm Ctrl Delay, 3D Delay | Delay taps with feedback and high damp; modulated; three or four taps placed across the field; a time that glides when it is changed; taps placed outside the speakers |
+| Reverb, Gate Reverb | The reverb with its own time, pre-delay and damping; 16 reflections that stop dead (normal, reverse, or sweeping across the field) |
+| 2 Pitch Shifter, Fb Pitch Shifter | Two windowed pitch shifters (-24 to +12 semitones, fine ±100 cents) with pre-delay and pan; one with feedback |
+| 3D Auto, 3D Manual | A sound placed and turned around the listener with level, delay and filtering per side |
+| Lo-Fi 1, Lo-Fi 2 | Fewer bits and a lower sample rate, a filter; noise, hum, crackle and a radio-like band, mono or stereo |
+| OD, DS or EH into Chorus, Flanger or Delay; Chorus into Delay; Flanger into Delay; Chorus into Flanger; Rotary Multi | Two or more of the blocks above in series |
+| Guitar Multi 1-3, Clean Guitar Multi 1-2, Bass Multi, Rhodes Multi, Keyboard Multi | Compressor or wah, drive or enhancer, EQ, a modulation (chorus, flanger, phaser, tremolo, pan) and a delay in series |
+| Cho/Delay, FL/Delay, Cho/Flanger, OD1/OD2, OD/Rotary, OD/Phaser, OD/AutoWah, PH/Rotary, PH/AutoWah | Two blocks side by side, each with its own pan and level |
+
+| XG insertion types (MU100 additions) | How they are made |
+|---|---|
+| Comp+Distortion; Wah+Distortion, Wah+Overdrive; Touch Wah, Touch Wah 2, Touch Wah+Distortion, +Overdrive | A compressor or a wah swept by the input level (touch) or an LFO, into the drive, with the XG EQ |
+| Pitch Change 1-2 | Two pitch shifters (±24 semitones, ±50 cents each) with an initial delay, feedback, pan and level per voice |
+| Aural Exciter | High harmonics added above a set frequency |
+| Compressor, Noise Gate | Attack, release, threshold, ratio and output level; a gate that closes below its threshold |
+| Voice Cancel | Takes out what is the same on both sides between a low and a high frequency (a centred voice) |
+| 2-way Rotary Speaker, Ensemble Detune, Ambience | A horn and a rotor; two slightly detuned copies, one on each side; a short room reverb with its own filters |
+| Talking Modulation | Two formant filters gliding between the vowels a, i, u, e, o |
+| Lo-Fi | Fewer bits and a lower sample rate, a resonant filter, mono or stereo |
+| Dist+Delay, OD+Delay, Comp+Dist+Delay, Comp+OD+Delay, Wah+Dist+Delay, Wah+OD+Delay | The blocks above in series, into a two-tap delay |
+
+The XG insertion blocks also play every variation type above (they are the same effect). A type that is not in these lists is dry: on XG an unknown LSB plays the MSB's first type (LSB 0, as the variation does) and an unknown MSB leaves the part dry; on GS an unknown type leaves the parts as if they were not switched to the EFX (their own sends included).
+
+The output is deterministic (the LFOs follow the song position, not the read size), silence stays silent (the lo-fi noise and hum follow the input), and an idle block costs nothing. A seek renders the second before the new position, effects included, as for the other effects (about 5-10 ms with an insertion effect playing, against about 4 ms without).
 
 The defaults and curves (LFO frequencies, delay offsets, room sizes, drive) are our reading of the published GS and XG parameter tables, not a copy of a module; how close each type sounds to a real SC-88 or MU module is still to be heard.
 
@@ -365,7 +415,8 @@ The SysEx messages that change how a file sounds are applied; the rest are ignor
 | Bank select MSB 127 (and 126) after an XG reset, 120 after a GM2 reset | The channel plays drum kits from its next program change; other banks make it melodic, channel 10 included |
 | Master volume: universal (`7F 04 01`), GS (`40 00 04`), XG (`00 00 04`) | Scales the whole song, without a click |
 | Master fine and coarse tuning (`7F 04 03`, `7F 04 04`) | Retunes every channel, drums included |
-| GS reverb, chorus and delay (`40 01 30`-`5A`), XG reverb, chorus and variation (`02 01 00`-`5B`, `70`-`75`) | Effect type, level, time and the rest ([reverb and chorus](#reverb-and-chorus), [delay and variation](#delay-gs-and-variation-xg)) |
+| GS reverb, chorus and delay (`40 01 30`-`5A`), XG reverb, chorus and variation (`02 01 00`-`5F`, `70`-`75`) | Effect type, level, time and the rest ([reverb and chorus](#reverb-and-chorus), [delay and variation](#delay-gs-and-variation-xg)) |
+| GS EFX (`40 03 00`-`1E`) and part EFX switch (`40 4x 22`); XG insertion 1 and 2 (`03 00 xx`, `03 01 xx`) | Insertion effects on chosen parts ([insertion effects](#insertion-effects-xg-insertion-and-gs-efx)) |
 | GS part level, pan, chorus, reverb and delay send (`40 1x 19`, `1C`, `21`, `22`, `2C`); XG part volume, pan, chorus, reverb and variation send (`08 nn 0B`, `0E`, `12`, `13`, `14`) | The same as CC7, CC10, CC93, CC91 and CC94 on that part's channel. Pan 0 ("random") is the middle |
 | GS part vibrato, filter and envelope offsets (`40 1x 30`-`37`); XG multi part (`08 nn 15`-`1C`) | The same as the sound controllers CC71-78 ([controllers](#controllers-and-modulators)) |
 | GS scale tuning (`40 1x 40`-`4B`), XG scale tuning (`08 nn 41`-`4C`) | Moves each note of the octave, C to B, by -64 to +63 cents (64 is in tune) on that part, notes already sounding included ([scale tuning and drum setup](#scale-tuning-and-drum-setup)) |
@@ -415,6 +466,7 @@ Rendering runs on the engine's worker threads like decoding of any other format.
 - Each instrument's level (`initialAttenuation`) is applied as the SoundFont 2 spec states it, 0.1 dB per unit. FluidSynth applies 0.4 of that (an EMU hardware habit), so a bank tuned by ear in FluidSynth can sound with a wider gap between its quiet and loud instruments here.
 - SFZ soundfonts and MIDI input from devices aren't supported yet. See the [engineering notes](../engineering-notes.md).
 - Text in code pages other than UTF-8, Windows-1252 and Shift-JIS (Korean, Chinese, Cyrillic files) comes out as Windows-1252. Shift-JIS user-defined characters (lead bytes F0-F9) come out as U+FFFD.
-- SysEx other than the messages listed [above](#sysex) is ignored: the XG insertion effects 1 and 2, the GS insertion effect (EFX) and the part parameters not listed have no effect.
+- SysEx other than the messages listed [above](#sysex) is ignored: the part parameters not listed have no effect.
+- The insertion effect types' curves and defaults (drive and amp tones, formants, lo-fi, the multi-effects' blocks, where the manuals give no default) are our reading of the published SC-88 Pro and MU100 tables, not a copy of a module; nobody has compared them with real hardware yet.
 - A seek keeps the effects of the second before the target. A long GS delay (up to 1 s) or an XG echo with strong feedback can still ring past that second, and those repeats are missing after a seek.
 - The reverb's tail is cut at the end of the song (a second after the last event), so a long reverb time set by the file doesn't ring out fully at the very end.

@@ -56,9 +56,10 @@ against untrusted files and add what the decoder needs:
   channel's kit. Voices carry the resulting pitch, base pan, send factors and offsets.
 - `tsf_render_float_fx`: like `tsf_render_float`, and also adds each voice to the reverb and chorus
   send buses (the soundfont's sends plus CC91/CC93) and, when asked, a third bus (CC94, the GS delay
-  and XG variation send, times the drum key's send); the voices of one channel can go to a buffer of
-  their own instead (an insertion effect's input). The effects themselves are in `src/midi_fx.c` and
-  `src/midi_var.c`.
+  and XG variation send, times the drum key's send); the voices of chosen channels can go to buffers of
+  their own instead (insertion effects' inputs, one buffer per slot a channel is mapped to). The effects
+  themselves are in `src/midi_fx.c`, `src/midi_var.c` and `src/midi_efx.c`. `tsf_channel_get_pressure` reads
+  a channel's pressure back (the insertion effects' aftertouch control).
 - `tsf_hydra_valid`: minimum record counts, and every bag/generator/instrument/sample
   index checked monotonic and in range; out-of-range sample IDs and instrument indices
   skipped; sample offsets and loop points clamped inside the sample.

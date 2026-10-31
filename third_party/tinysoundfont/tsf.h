@@ -205,9 +205,10 @@ TSFDEF void tsf_render_float(tsf* f, float* buffer, int samples, int flag_mixing
 // unweaved renders dry, like tsf_render_float). The buses are always added to.
 // variation (may be NULL): a third bus, fed by CC94 * 200 / 127 (the GS delay and XG
 // variation send) times the drum key's TSF_DRUM_VARIATION. insert (may be NULL): the
-// voices of channel insertChannel go there, without sends, instead of to the others
-// (an insertion effect's input; the caller sends its output on).
-TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* chorus, float* variation, float* insert, int insertChannel, int samples, int flag_mixing);
+// voices of each channel ch with insertSlot[ch] >= 0 go to insert[insertSlot[ch]]
+// (same layout as buffer), without sends, instead of to the others (insertion effects'
+// inputs; the caller sends their output on).
+TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* chorus, float* variation, float* const* insert, const signed char* insertSlot, int samples, int flag_mixing);
 
 // Higher level channel based functions, set up channel parameters
 //   channel: channel number
@@ -289,6 +290,7 @@ TSFDEF int tsf_channel_get_pitchwheel(tsf* f, int channel);
 TSFDEF float tsf_channel_get_pitchrange(tsf* f, int channel);
 TSFDEF float tsf_channel_get_tuning(tsf* f, int channel);
 TSFDEF int tsf_channel_get_midi_control(tsf* f, int channel, int controller); // FatzAudio: last value (0..127)
+TSFDEF int tsf_channel_get_pressure(tsf* f, int channel); // FatzAudio: channel pressure (0..127)
 
 #ifdef __cplusplus
 #  undef CPP_DEFAULT0
@@ -2379,10 +2381,10 @@ static float tsf_voice_send(float region_send, int cc)
 	return (s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s));
 }
 
-TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* chorus, float* variation, float* insert, int insertChannel, int samples, int flag_mixing)
+TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* chorus, float* variation, float* const* insert, const signed char* insertSlot, int samples, int flag_mixing)
 {
 	float tmp[TSF_RENDER_EFFECTSAMPLEBLOCK * 2];
-	int chans = (f->outputmode == TSF_MONO ? 1 : 2);
+	int chans = (f->outputmode == TSF_MONO ? 1 : 2), done = 0;
 	struct tsf_voice *v, *vEnd = f->voices + f->voiceNum;
 	if (f->outputmode == TSF_STEREO_UNWEAVED) { tsf_render_float(f, buffer, samples, flag_mixing); return; }
 	if (!flag_mixing) TSF_MEMSET(buffer, 0, chans * sizeof(float) * samples);
@@ -2393,7 +2395,8 @@ TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* cho
 		{
 			float rs = 0.0f, cs = 0.0f, vs = 0.0f;
 			if (v->playingPreset == -1) continue;
-			if (insert && v->playingChannel == insertChannel) { tsf_voice_render(f, v, insert, k); continue; }
+			if (insert && v->playingChannel >= 0 && v->playingChannel < 16 && insertSlot[v->playingChannel] >= 0)
+				{ tsf_voice_render(f, v, insert[insertSlot[v->playingChannel]] + done, k); continue; }
 			if (f->channels && v->playingChannel >= 0 && v->playingChannel < f->channels->channelNum)
 			{
 				struct tsf_channel* c = &f->channels->channels[v->playingChannel];
@@ -2414,7 +2417,7 @@ TSFDEF void tsf_render_float_fx(tsf* f, float* buffer, float* reverb, float* cho
 		}
 		buffer += n; reverb += n; chorus += n; samples -= k;
 		if (variation) variation += n;
-		if (insert) insert += n;
+		done += n;
 	}
 }
 
@@ -2969,6 +2972,11 @@ TSFDEF float tsf_channel_get_tuning(tsf* f, int channel)
 TSFDEF int tsf_channel_get_midi_control(tsf* f, int channel, int controller) // FatzAudio
 {
 	return (f->channels && channel < f->channels->channelNum ? f->channels->channels[channel].cc[controller & 0x7F] : 0);
+}
+
+TSFDEF int tsf_channel_get_pressure(tsf* f, int channel) // FatzAudio
+{
+	return (f->channels && channel < f->channels->channelNum ? f->channels->channels[channel].chanPressure : 0);
 }
 
 #ifdef __cplusplus
