@@ -304,6 +304,217 @@ static void make_hls_map(void)
     memcpy(g_pad + MAP_PAD, g_mp3, g_mp3_n);
 }
 
+/* ---- MP4 and Matroska files for the demuxers over the network ---------------- */
+
+static uint8_t* g_av[2];        /* tests/data/av_tracks.mp4 and .mkv: video and three audio tracks */
+static size_t g_av_n[2];
+static uint8_t* g_frag;         /* tests/data/net/frag.m4a: AAC in 6 fragments, sidx in front, mfra at the end */
+static size_t g_frag_n;
+/* g_frag with FRAG_PAD zero bytes after the audio in every mdat but the last (as
+ * video would sit there), more than the download reads ahead: every fragment is
+ * out of the download's reach from the one before. sidx and mfra point at the
+ * moved fragments; frag_index() turns them off. */
+#define FRAG_PAD (2560 * 1024)
+static uint8_t* g_fragpad;
+static size_t g_fragpad_n;
+static size_t g_fragpad_sidx, g_fragpad_mfra, g_fragpad_mfro;   /* offsets of their types */
+static int64_t g_fragpad_moof[16];                              /* moofs in g_fragpad */
+static int g_frag_count;
+
+static uint32_t be32(const uint8_t* p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
+static void put_be32(uint8_t* p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
+static uint64_t be64(const uint8_t* p) { return ((uint64_t)be32(p) << 32) | be32(p + 4); }
+static void put_be64(uint8_t* p, uint64_t v) { put_be32(p, (uint32_t)(v >> 32)); put_be32(p + 4, (uint32_t)v); }
+
+static void make_fragpad(void)
+{
+    size_t p = 0, o = 0, mdats = 0, total_mdats = 0, q;
+    int64_t old_moof[16];
+    for (q = 0; q + 8 <= g_frag_n; q += be32(g_frag + q)) if (memcmp(g_frag + q + 4, "mdat", 4) == 0) total_mdats++;
+    g_fragpad = (uint8_t*)calloc(1, g_frag_n + total_mdats * FRAG_PAD);
+    while (p + 8 <= g_frag_n) {
+        uint32_t size = be32(g_frag + p);
+        int pad = memcmp(g_frag + p + 4, "mdat", 4) == 0 && ++mdats < total_mdats;
+        if (memcmp(g_frag + p + 4, "sidx", 4) == 0) g_fragpad_sidx = o + 4;
+        if (memcmp(g_frag + p + 4, "mfra", 4) == 0) { g_fragpad_mfra = o + 4; g_fragpad_mfro = o + size - 12; }
+        if (memcmp(g_frag + p + 4, "moof", 4) == 0 && g_frag_count < 16) {
+            old_moof[g_frag_count] = (int64_t)p;
+            g_fragpad_moof[g_frag_count++] = (int64_t)o;
+        }
+        memcpy(g_fragpad + o, g_frag + p, size);
+        if (pad) put_be32(g_fragpad + o, size + FRAG_PAD);
+        o += size + (pad ? FRAG_PAD : 0);
+        p += size;
+    }
+    g_fragpad_n = o;
+    {
+        /* sidx (version 1): every subsegment but the last is FRAG_PAD longer. */
+        uint8_t* x = g_fragpad + g_fragpad_sidx + 4;
+        uint32_t count = (uint32_t)(x[4 + 4 + 4 + 16 + 2] << 8 | x[4 + 4 + 4 + 16 + 3]), i;
+        uint8_t* ref = x + 4 + 4 + 4 + 16 + 4;
+        for (i = 0; i + 1 < count; i++) put_be32(ref + i * 12, be32(ref + i * 12) + FRAG_PAD);
+    }
+    {
+        /* tfra (version 1): each entry's moof where it went. */
+        uint8_t* x = g_fragpad + g_fragpad_mfra + 4 + 8;
+        uint32_t sizes = be32(x + 8), count = be32(x + 12), i;
+        size_t rec = 16 + ((sizes >> 4) & 3) + ((sizes >> 2) & 3) + (sizes & 3) + 3;
+        int k;
+        for (i = 0; i < count; i++) {
+            uint8_t* e = x + 16 + i * rec + 8;
+            for (k = 0; k < g_frag_count; k++)
+                if ((int64_t)be64(e) == old_moof[k]) { put_be64(e, (uint64_t)g_fragpad_moof[k]); break; }
+        }
+    }
+}
+
+/* Which indexes the padded file keeps (the other boxes become 'free'). */
+static void frag_index(int sidx, int mfra)
+{
+    memcpy(g_fragpad + g_fragpad_sidx, sidx ? "sidx" : "free", 4);
+    memcpy(g_fragpad + g_fragpad_mfra, mfra ? "mfra" : "free", 4);
+    memcpy(g_fragpad + g_fragpad_mfro, mfra ? "mfro" : "free", 4);
+}
+
+/* A Matroska file of 8 clusters of 0.5 s: 8 kHz mono PCM (a ramp the test knows) and
+ * a "video" track of MKV_VIDEO bytes after each 0.25 s of audio, Cues after the
+ * clusters (found through the SeekHead), and Info's Duration. */
+#define MKV_CLUSTERS 8
+#define MKV_VIDEO (200 * 1024)
+#define MKV_FRAMES (MKV_CLUSTERS * 4000)
+static uint8_t* g_mkv;
+static size_t g_mkv_n;
+
+typedef struct ebuf { uint8_t* p; size_t n, cap; } ebuf;
+
+static void eput(ebuf* b, const void* d, size_t n)
+{
+    if (b->n + n > b->cap) {
+        b->cap = (b->n + n) * 2 + 256;
+        b->p = (uint8_t*)realloc(b->p, b->cap);
+    }
+    if (d) memcpy(b->p + b->n, d, n);
+    else memset(b->p + b->n, 0, n);
+    b->n += n;
+}
+
+/* An element with an 8-byte size (unknown for size < 0). */
+static void eput_el(ebuf* b, uint32_t id, const void* d, int64_t size)
+{
+    uint8_t t[12];
+    int n = id > 0xFFFFFF ? 4 : id > 0xFFFF ? 3 : id > 0xFF ? 2 : 1, i;
+    for (i = 0; i < n; i++) t[i] = (uint8_t)(id >> (8 * (n - 1 - i)));
+    t[n] = 0x01;
+    for (i = 1; i < 8; i++) t[n + i] = size < 0 ? 0xFF : (uint8_t)((uint64_t)size >> (8 * (7 - i)));
+    eput(b, t, (size_t)n + 8);
+    if (size > 0) eput(b, d, (size_t)size);
+}
+
+static void eput_uint(ebuf* b, uint32_t id, uint64_t v)
+{
+    uint8_t t[8];
+    put_be64(t, v);
+    eput_el(b, id, t, 8);
+}
+
+static int16_t mkv_sample(int64_t k) { return (int16_t)((k * 37) % 20000 - 10000); }
+
+static void make_big_mkv(void)
+{
+    ebuf f = { 0 }, hdr = { 0 }, seek = { 0 }, info = { 0 }, tracks = { 0 }, te = { 0 }, audio = { 0 }, cues = { 0 };
+    size_t seg_start, seekpos_at;
+    int64_t k = 0;
+    int c, h, i;
+    union { double d; uint64_t u; } v;
+    eput_el(&hdr, 0x4282, "matroska", 8);
+    eput_el(&f, 0x1A45DFA3, hdr.p, (int64_t)hdr.n);
+    eput_el(&f, 0x18538067, NULL, -1);
+    seg_start = f.n;
+    eput_el(&seek, 0x53AB, "\x1C\x53\xBB\x6B", 4);
+    eput_uint(&seek, 0x53AC, 0);                              /* the Cues' position, set below */
+    seekpos_at = f.n + 12 + 10 + seek.n - 8;
+    {
+        ebuf sh = { 0 };
+        eput_el(&sh, 0x4DBB, seek.p, (int64_t)seek.n);
+        eput_el(&f, 0x114D9B74, sh.p, (int64_t)sh.n);
+        free(sh.p);
+    }
+    eput_uint(&info, 0x2AD7B1, 1000000);
+    v.d = MKV_CLUSTERS * 500.0;
+    eput_uint(&info, 0x4489, v.u);
+    eput_el(&f, 0x1549A966, info.p, (int64_t)info.n);
+    v.d = 8000.0;
+    eput_uint(&audio, 0xB5, v.u);
+    eput_uint(&audio, 0x9F, 1);
+    eput_uint(&audio, 0x6264, 16);
+    eput_uint(&te, 0xD7, 1);
+    eput_uint(&te, 0x83, 2);
+    eput_el(&te, 0x86, "A_PCM/INT/LIT", 13);
+    eput_el(&te, 0xE1, audio.p, (int64_t)audio.n);
+    eput_el(&tracks, 0xAE, te.p, (int64_t)te.n);
+    te.n = 0;
+    eput_uint(&te, 0xD7, 2);
+    eput_uint(&te, 0x83, 1);
+    eput_el(&te, 0x86, "V_TEST", 6);
+    eput_el(&tracks, 0xAE, te.p, (int64_t)te.n);
+    eput_el(&f, 0x1654AE6B, tracks.p, (int64_t)tracks.n);
+    for (c = 0; c < MKV_CLUSTERS; c++) {
+        ebuf cl = { 0 }, cp = { 0 }, tp = { 0 };
+        eput_uint(&tp, 0xF7, 1);
+        eput_uint(&tp, 0xF1, (uint64_t)(f.n - seg_start));
+        eput_uint(&cp, 0xB3, (uint64_t)c * 500);
+        eput_el(&cp, 0xB7, tp.p, (int64_t)tp.n);
+        eput_el(&cues, 0xBB, cp.p, (int64_t)cp.n);
+        eput_uint(&cl, 0xE7, (uint64_t)c * 500);
+        for (h = 0; h < 2; h++) {
+            ebuf b = { 0 };
+            uint8_t head[4] = { 0x81, 0, 0, 0x80 };
+            head[2] = (uint8_t)(h * 250);
+            eput(&b, head, 4);
+            for (i = 0; i < 2000; i++) {
+                int16_t x = mkv_sample(k++);
+                uint8_t le[2];
+                le[0] = (uint8_t)x;
+                le[1] = (uint8_t)((uint16_t)x >> 8);
+                eput(&b, le, 2);
+            }
+            eput_el(&cl, 0xA3, b.p, (int64_t)b.n);
+            b.n = 0;
+            head[0] = 0x82;
+            eput(&b, head, 4);
+            eput(&b, NULL, MKV_VIDEO);
+            eput_el(&cl, 0xA3, b.p, (int64_t)b.n);
+            free(b.p);
+        }
+        eput_el(&f, 0x1F43B675, cl.p, (int64_t)cl.n);
+        free(cl.p); free(cp.p); free(tp.p);
+    }
+    put_be64(f.p + seekpos_at, (uint64_t)(f.n - seg_start));
+    eput_el(&f, 0x1C53BB6B, cues.p, (int64_t)cues.n);
+    free(hdr.p); free(seek.p); free(info.p); free(tracks.p); free(te.p); free(audio.p); free(cues.p);
+    g_mkv = f.p;
+    g_mkv_n = f.n;
+}
+
+/* fMP4 HLS: g_frag's ftyp and moov as the init section, each moof and mdat a segment. */
+static size_t g_fseg_off[16], g_fseg_n[16], g_init_n;
+static int g_fseg_count;
+
+static void make_hls_fmp4(void)
+{
+    size_t p = 0;
+    while (p + 8 <= g_frag_n) {
+        uint32_t size = be32(g_frag + p);
+        if (memcmp(g_frag + p + 4, "moov", 4) == 0) g_init_n = p + size;
+        if (memcmp(g_frag + p + 4, "moof", 4) == 0 && g_fseg_count < 16) {
+            g_fseg_off[g_fseg_count] = p;
+            g_fseg_n[g_fseg_count++] = size;
+        }
+        if (memcmp(g_frag + p + 4, "mdat", 4) == 0 && g_fseg_count > 0) g_fseg_n[g_fseg_count - 1] += size;
+        p += size;
+    }
+}
+
 static char g_cred_playlist[2048];   /* /hls/cred.m3u8: segments on another origin (set by the test) */
 static fa_atomic32 g_cred_home;      /* requests to 127.0.0.1 with a Cookie or Authorization */
 static fa_atomic32 g_cred_foreign;   /* ... and to "localhost" */
@@ -341,30 +552,56 @@ static int send_all(sock_t s, const void* p, size_t n)
 
 static int send_str(sock_t s, const char* text) { return send_all(s, text, strlen(text)); }
 
-/* Serves `body` honouring "Range: bytes=N-" when `ranges`; `cut` > 0 closes the
- * connection after that many body bytes (a dropped connection). */
-static void serve_bytes(sock_t s, const char* req, const uint8_t* body, size_t n, const char* type, int ranges, size_t cut)
+/* Serves `body` honouring "Range: bytes=N-[M]" when `ranges`; `cut` > 0 closes the
+ * connection after that many body bytes (a dropped connection); `rate` > 0 sends
+ * that many bytes a second (a slow server). */
+static void serve_bytes_rate(sock_t s, const char* req, const uint8_t* body, size_t n, const char* type, int ranges, size_t cut,
+                             size_t rate)
 {
     char head[512];
     const char* r = strstr(req, "\r\nRange: bytes=");
-    size_t from = 0, len;
-    if (ranges && r) from = (size_t)strtoull(r + 15, NULL, 10);
-    if (from > n) {
+    size_t from = 0, len, last = n - 1;
+    if (ranges && r) {
+        char* e;
+        from = (size_t)strtoull(r + 15, &e, 10);
+        if (*e == '-' && e[1] >= '0' && e[1] <= '9') last = (size_t)strtoull(e + 1, NULL, 10);
+        if (last >= n) last = n - 1;
+    }
+    if (from > n || (ranges && r && from > last)) {
         snprintf(head, sizeof(head), "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         send_str(s, head);
         return;
     }
-    len = n - from;
+    len = ranges && r ? last + 1 - from : n - from;
     if (ranges && r)
         snprintf(head, sizeof(head), "HTTP/1.1 206 Partial Content\r\nContent-Type: %s\r\nAccept-Ranges: bytes\r\n"
                  "Content-Length: %zu\r\nContent-Range: bytes %zu-%zu/%zu\r\nConnection: close\r\n\r\n",
-                 type, len, from, n - 1, n);
+                 type, len, from, last, n);
     else
         snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n%sContent-Length: %zu\r\nConnection: close\r\n\r\n",
                  type, ranges ? "Accept-Ranges: bytes\r\n" : "", len);
     if (send_str(s, head)) return;
     if (cut && len > cut) len = cut;
-    send_all(s, body + from, len);
+    if (!rate || from > 0) {               /* only the download from the start is slow */
+        send_all(s, body + from, len);
+        return;
+    }
+    {
+        int64_t t0 = fa_monotonic_ns();
+        size_t sent = 0;
+        while (sent < len && !fa_load32(&g_stop)) {
+            size_t k = len - sent < 16384 ? len - sent : 16384;
+            int64_t due = t0 + (int64_t)((double)(sent + k) / (double)rate * 1e9);
+            while (fa_monotonic_ns() < due && !fa_load32(&g_stop)) fa_sleep_ms(2);
+            if (send_all(s, body + from + sent, k)) return;
+            sent += k;
+        }
+    }
+}
+
+static void serve_bytes(sock_t s, const char* req, const uint8_t* body, size_t n, const char* type, int ranges, size_t cut)
+{
+    serve_bytes_rate(s, req, body, n, type, ranges, cut, 0);
 }
 
 static void serve_chunked(sock_t s, const uint8_t* body, size_t n)
@@ -527,6 +764,25 @@ static void serve_hls(sock_t s, const char* req, const char* path)
         snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", g_seg[i].n);
         if (!send_str(s, head)) send_all(s, g_seg[i].p, g_seg[i].n);
         return;
+    }
+    if (strcmp(path, "/hls/fmp4.m3u8") == 0) {
+        int n = snprintf(text, sizeof(text), "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:1\n#EXT-X-MAP:URI=\"init.mp4\"\n");
+        for (i = 0; i < g_fseg_count; i++) n += snprintf(text + n, sizeof(text) - (size_t)n, "#EXTINF:0.5,\nfseg%d.m4s\n", i);
+        snprintf(text + n, sizeof(text) - (size_t)n, "#EXT-X-ENDLIST\n");
+        snprintf(head, sizeof(head), "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", strlen(text));
+        if (!send_str(s, head)) send_str(s, text);
+        return;
+    }
+    if (strcmp(path, "/hls/init.mp4") == 0) {
+        serve_bytes(s, req, g_frag, g_init_n, "video/mp4", 1, 0);
+        return;
+    }
+    if (strncmp(path, "/hls/fseg", 9) == 0) {
+        i = atoi(path + 9);
+        if (i >= 0 && i < g_fseg_count) {
+            serve_bytes(s, req, g_frag + g_fseg_off[i], g_fseg_n[i], "video/iso.segment", 1, 0);
+            return;
+        }
     }
     if (strcmp(path, "/hls/tiers.m3u8") == 0) {
         /* Video variants with tiered audio groups: MP3 segments in the top tier's group,
@@ -691,6 +947,11 @@ static int handle_request(sock_t s, int id)
     else if (strcmp(path, "/noranges.wma") == 0) serve_bytes(s, req, g_wma, g_wma_n, "audio/x-ms-wma", 0, 0);
     else if (strcmp(path, "/pcm.asf") == 0) serve_bytes(s, req, g_asf_pcm, g_asf_pcm_n, "video/x-ms-asf", 1, 0);
     else if (strcmp(path, "/chunked.asf") == 0) serve_chunked(s, g_asf_pcm, g_asf_pcm_n);
+    else if (strcmp(path, "/frag.m4a") == 0) serve_bytes(s, req, g_fragpad, g_fragpad_n, "audio/mp4", 1, 0);
+    else if (strcmp(path, "/big.mkv") == 0) serve_bytes(s, req, g_mkv, g_mkv_n, "video/x-matroska", 1, 0);
+    else if (strcmp(path, "/slow.mkv") == 0) serve_bytes_rate(s, req, g_mkv, g_mkv_n, "video/x-matroska", 1, 0, 860 * 1024);
+    else if (strcmp(path, "/av.mp4") == 0) serve_bytes(s, req, g_av[0], g_av_n[0], "video/mp4", 1, 0);
+    else if (strcmp(path, "/av.mkv") == 0) serve_bytes(s, req, g_av[1], g_av_n[1], "video/x-matroska", 1, 0);
     else if (strncmp(path, "/hls/", 5) == 0) serve_hls(s, req, path);
     else send_str(s, "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found");
     return 0;
@@ -3165,6 +3426,246 @@ static void test_android_https(void)
 }
 #endif
 
+/* ---- MP4 and Matroska over the network -------------------------------------- */
+
+/* Opens `path` (decode-only) and counts the requests the open made. */
+static fa_stream* open_counted(const char* path, int* requests, fa_result* r)
+{
+    int before = fa_load32(&g_requests);
+    fa_stream* s = open_url(path, FA_OPEN_DECODE_ONLY, r);
+    *requests = fa_load32(&g_requests) - before;
+    return s;
+}
+
+/* `got` is exactly the decode of the same file from memory: frame count, length
+ * and every sample. */
+static void check_same_as_memory(fa_stream* s, const uint8_t* file, size_t file_n)
+{
+    fa_stream_info info, ref_info;
+    fa_stream* m = NULL;
+    fa_open_options o;
+    fa_frames n = 0, ref_n = 0, i;
+    float *got, *ref;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    CHECK_EQ(fa_stream_open_memory(g_engine, file, file_n, &o, &m), FA_OK);
+    fa_stream_get_info(s, &info);
+    fa_stream_get_info(m, &ref_info);
+    CHECK_EQ(info.length_frames, ref_info.length_frames);
+    CHECK_EQ(info.format.channels, ref_info.format.channels);
+    got = read_all(s, &n);
+    ref = read_all(m, &ref_n);
+    fa_stream_close(m);
+    CHECK_EQ(n, ref_n);
+    for (i = 0; i < n * (fa_frames)info.format.channels; i++) if (got[i] != ref[i]) { CHECK_EQ(i, -1); }
+    free(got);
+    free(ref);
+}
+
+/* A fragmented MP4 whose fragments lie far apart: with a sidx (in front) or an mfra
+ * (at the end) the open reads neither all fragments nor all the file; without
+ * either it walks every fragment, a request each. */
+static void test_fmp4_indexed_open(void)
+{
+    static const struct { int sidx, mfra, most; } cases[] = { { 1, 1, 1 }, { 0, 1, 2 }, { 0, 0, 100 } };
+    size_t c;
+    for (c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        fa_result r;
+        fa_stream* s;
+        fa_stream_info info;
+        int requests = 0;
+        frag_index(cases[c].sidx, cases[c].mfra);
+        s = open_counted("/frag.m4a", &requests, &r);
+        CHECK_EQ(r, FA_OK);
+        if (!s) return;
+        fa_stream_get_info(s, &info);
+        printf("  sidx %d mfra %d: %d request(s) to open, length %lld\n", cases[c].sidx, cases[c].mfra, requests,
+               (long long)info.length_frames);
+        CHECK(info.seekable);
+        if (cases[c].most < 100) CHECK(requests <= cases[c].most);
+        else CHECK(requests >= g_frag_count);    /* the old walk: what the indexes save */
+        check_same_as_memory(s, g_fragpad, g_fragpad_n);
+        fa_stream_close(s);
+    }
+    frag_index(1, 1);
+}
+
+/* Seeks in an indexed fragmented MP4 read the fragment holding the target (from the
+ * one before when the target is near its start), a request each, and give the
+ * audio a seek in the file from memory gives. */
+static void test_fmp4_indexed_seek(void)
+{
+    static const fa_frames targets[] = { 83790, 120000, 23000, 44100 * 3 - 3000, 22100, 0 };
+    fa_result r;
+    fa_stream *s, *m = NULL;
+    fa_open_options o;
+    int requests = 0;
+    size_t t;
+    frag_index(1, 1);
+    s = open_counted("/frag.m4a", &requests, &r);
+    CHECK_EQ(r, FA_OK);
+    if (!s) return;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    CHECK_EQ(fa_stream_open_memory(g_engine, g_fragpad, g_fragpad_n, &o, &m), FA_OK);
+    for (t = 0; t < sizeof(targets) / sizeof(targets[0]); t++) {
+        float a[1024 * 2], b[1024 * 2];
+        fa_frames ra = 0, rb = 0, i;
+        int before = fa_load32(&g_requests), cost;
+        CHECK_EQ(fa_stream_seek(s, targets[t]), FA_OK);
+        CHECK_EQ(fa_stream_read(s, a, 1024, &ra), FA_OK);
+        cost = fa_load32(&g_requests) - before;
+        CHECK_EQ(fa_stream_seek(m, targets[t]), FA_OK);
+        CHECK_EQ(fa_stream_read(m, b, 1024, &rb), FA_OK);
+        printf("  seek to %lld: %d request(s)\n", (long long)targets[t], cost);
+        CHECK(cost <= 2);
+        CHECK_EQ(ra, rb);
+        /* Within rounding: a target near a fragment's start is decoded from further
+         * back (the encoder's noise substitution then draws other numbers). */
+        for (i = 0; i < ra * 2; i++) if (fabs(a[i] - b[i]) > 1e-4) { CHECK_EQ(i, -1); }
+    }
+    fa_stream_close(m);
+    fa_stream_close(s);
+}
+
+/* Plays `path` in real time on a device of its own until it ends; returns the reads
+ * that waited for the download meanwhile (a worker holding the decode lock). */
+static int play_counting_waits(const char* path, fa_frames* out_pos, fa_stream_state* out_state)
+{
+    fa_result r;
+    fa_device* dev = NULL;
+    fa_stream* s;
+    float out[512 * 2];
+    int64_t t0;
+    int waits;
+    *out_state = FA_STATE_STOPPED;
+    *out_pos = 0;
+    if (fa_device_open(g_engine, NULL, &dev) != FA_OK) return -1;
+    s = open_url(path, 0, &r);
+    if (!s) { fa_device_close(dev); return -1; }
+    fa_store32(&fa_net_test_read_waits, 0);
+    fa_stream_attach(s, dev, NULL);
+    fa_stream_play(s);
+    t0 = fa_monotonic_ns();
+    while (fa_monotonic_ns() - t0 < 20000000000LL) {
+        int64_t due = (fa_monotonic_ns() - t0) * dev->rate / 1000000000LL;
+        while (fa_load64(&dev->clock) < due) {
+            fa_fetch_add64(&dev->epoch, 1);
+            fa_device_render(dev, out, 512);
+            fa_fetch_add64(&dev->epoch, 1);
+        }
+        fa_stream_get_state(s, out_state);
+        if (*out_state == FA_STATE_ENDED) break;
+        fa_sleep_ms(5);
+    }
+    waits = fa_load32(&fa_net_test_read_waits);
+    fa_stream_get_position(s, out_pos);
+    fa_stream_close(s);
+    fa_device_close(dev);
+    return waits;
+}
+
+/* Every fragment of the padded file is beyond the download's reach from the one
+ * before: the download moves to it when the demuxer announces it, so the decode
+ * worker never waits for it in a read. */
+static void test_fmp4_no_reader_waits(void)
+{
+    fa_frames pos = 0, ref_n = 0;
+    fa_stream_state st;
+    float* ref = read_all_memory(g_fragpad, g_fragpad_n, &ref_n);
+    int waits;
+    free(ref);
+    frag_index(1, 1);
+    waits = play_counting_waits("/frag.m4a", &pos, &st);
+    printf("  reads that waited: %d\n", waits);
+    CHECK_EQ(st, FA_STATE_ENDED);
+    CHECK_EQ(pos, ref_n);
+    CHECK_EQ(waits, 0);
+}
+
+/* Matroska with its Cues after the clusters: the Cues and the last cluster come in
+ * one request of their own (the length is exact, as from the file), the download
+ * stays at the first cluster. */
+static void test_mkv_cues_at_end(void)
+{
+    fa_result r;
+    int requests = 0;
+    fa_stream* s = open_counted("/big.mkv", &requests, &r);
+    fa_stream_info info;
+    CHECK_EQ(r, FA_OK);
+    if (!s) return;
+    fa_stream_get_info(s, &info);
+    printf("  %d request(s) to open\n", requests);
+    CHECK(requests <= 2);
+    CHECK(info.seekable);
+    CHECK_EQ(info.length_frames, MKV_FRAMES);
+    check_same_as_memory(s, g_mkv, g_mkv_n);
+    {
+        /* A seek lands exactly. */
+        float buf[512];
+        fa_frames rd = 0, i;
+        CHECK_EQ(fa_stream_seek(s, 21037), FA_OK);
+        CHECK_EQ(fa_stream_read(s, buf, 512, &rd), FA_OK);
+        CHECK_EQ(rd, 512);
+        for (i = 0; i < rd; i++) if (buf[i] != (float)mkv_sample(21037 + i) / 32768.0f) { CHECK_EQ(i, -1); }
+    }
+    fa_stream_close(s);
+}
+
+/* Matroska with large video blocks between the audio, from a server just ahead of
+ * playback: the decode gate counts the whole file's bytes per second, so a worker
+ * starts only once the video in front of the next audio is in. */
+static void test_mkv_slow_no_reader_waits(void)
+{
+    fa_frames pos = 0;
+    fa_stream_state st;
+    int waits = play_counting_waits("/slow.mkv", &pos, &st);
+    printf("  reads that waited: %d\n", waits);
+    CHECK_EQ(st, FA_STATE_ENDED);
+    CHECK_EQ(pos, MKV_FRAMES);
+    CHECK_EQ(waits, 0);
+}
+
+/* MP4 and Matroska with video and several audio tracks decode over HTTP exactly as
+ * from memory. */
+static void test_av_files_over_http(void)
+{
+    fa_result r;
+    int requests = 0;
+    fa_stream* s = open_counted("/av.mp4", &requests, &r);
+    CHECK_EQ(r, FA_OK);
+    if (!s) return;
+    check_same_as_memory(s, g_av[0], g_av_n[0]);
+    fa_stream_close(s);
+    s = open_counted("/av.mkv", &requests, &r);
+    CHECK_EQ(r, FA_OK);
+    if (!s) return;
+    check_same_as_memory(s, g_av[1], g_av_n[1]);
+    fa_stream_close(s);
+}
+
+/* HLS with fMP4 segments: the init section, then the fragments, decode as the file. */
+static void test_hls_fmp4(void)
+{
+    fa_result r;
+    fa_stream* s = open_url("/hls/fmp4.m3u8", FA_OPEN_DECODE_ONLY, &r);
+    fa_stream_info info;
+    fa_frames n = 0, ref_n = 0, i;
+    float *got, *ref;
+    CHECK_EQ(r, FA_OK);
+    if (!s) return;
+    fa_stream_get_info(s, &info);
+    CHECK_STR(info.codec, "aac");
+    got = read_all(s, &n);
+    ref = read_all_memory(g_frag, g_frag_n, &ref_n);
+    printf("  %lld frames (file %lld)\n", (long long)n, (long long)ref_n);
+    CHECK_EQ(n, ref_n);
+    for (i = 0; i < n * 2; i++) if (got[i] != ref[i]) { CHECK_EQ(i, -1); }
+    free(got);
+    free(ref);
+    fa_stream_close(s);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -3182,12 +3683,18 @@ int main(void)
     g_oggradio = read_file(FA_TEST_DATA_DIR "/ogg/radio.opus", &g_oggradio_n);
     g_wma = read_file(FA_TEST_DATA_DIR "/asf/tone.wma", &g_wma_n);
     g_asf_pcm = read_file(FA_TEST_DATA_DIR "/asf/pcm.asf", &g_asf_pcm_n);
-    if (!g_mp3 || !g_mp3x || !g_aac || !g_ac3 || !g_oggradio || !g_wma || !g_asf_pcm) { fprintf(stderr, "missing test data in %s\n", FA_TEST_DATA_DIR "/net"); return 1; }
+    g_frag = read_file(FA_TEST_DATA_DIR "/net/frag.m4a", &g_frag_n);
+    g_av[0] = read_file(FA_TEST_DATA_DIR "/av_tracks.mp4", &g_av_n[0]);
+    g_av[1] = read_file(FA_TEST_DATA_DIR "/av_tracks.mkv", &g_av_n[1]);
+    if (!g_mp3 || !g_mp3x || !g_aac || !g_ac3 || !g_oggradio || !g_wma || !g_asf_pcm || !g_frag || !g_av[0] || !g_av[1]) { fprintf(stderr, "missing test data in %s\n", FA_TEST_DATA_DIR "/net"); return 1; }
     make_wav();
     make_hls();
     make_hls_aac();
     make_hls_ac3();
     make_hls_map();
+    make_fragpad();
+    make_big_mkv();
+    make_hls_fmp4();
     g_aac_tagged_n = 30000 + g_aac_n;
     g_aac_tagged = (uint8_t*)calloc(1, g_aac_tagged_n);
     memcpy(g_aac_tagged, "ID3\x04\x00\x00", 6);   /* size 29990 (syncsafe), all padding */
@@ -3244,6 +3751,13 @@ int main(void)
     RUN(test_download_tap);
     RUN(test_cookie_jar);
     RUN(test_hls_cookies);
+    RUN(test_fmp4_indexed_open);
+    RUN(test_fmp4_indexed_seek);
+    RUN(test_fmp4_no_reader_waits);
+    RUN(test_mkv_cues_at_end);
+    RUN(test_mkv_slow_no_reader_waits);
+    RUN(test_av_files_over_http);
+    RUN(test_hls_fmp4);
     RUN(test_https_optional);
     RUN(test_https_headers_optional);
     RUN(test_https_session_optional);
@@ -3271,6 +3785,11 @@ int main(void)
     free(g_wma);
     free(g_asf_pcm);
     free(g_wav);
+    free(g_frag);
+    free(g_fragpad);
+    free(g_mkv);
+    free(g_av[0]);
+    free(g_av[1]);
     printf("%d request(s) served\n", fa_load32(&g_requests));
     if (g_failures) { printf("%d failure(s)\n", g_failures); return 1; }
     printf("PASS\n");

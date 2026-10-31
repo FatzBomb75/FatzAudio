@@ -143,6 +143,9 @@ struct fa_decoder {
     /* The stream's fa_dynamic_range, for codecs that apply one (Dolby); given to
      * fa_decoder_open. NULL = full range. */
     fa_atomic32* dynamic_range;
+    /* Where Dolby codecs leave the stream's downmix levels and dialogue level
+     * (fa_ac3_mix_pack) after each unit; given to fa_decoder_open. NULL = nowhere. */
+    fa_atomic64* dolby_mix;
     /* MIDI, from fa_decoder_open's env (wrapping decoders such as HLS pass both on). */
     struct fa_soundfont* soundfont;   /* borrowed, NULL = none */
     uint32_t midi_rate;               /* MIDI and tracker modules: output rate */
@@ -161,6 +164,8 @@ struct fa_decoder {
 typedef struct fa_decoder_env {
     fa_atomic32* dynamic_range;       /* the stream's fa_dynamic_range (read while decoding),
                                          NULL = full range */
+    fa_atomic64* dolby_mix;           /* Dolby downmix information written while decoding
+                                         (fa_ac3_mix_pack), NULL = not wanted */
     struct fa_soundfont* soundfont;   /* MIDI: the instruments (the caller keeps it alive
                                          while the decoder is open), NULL = none */
     uint32_t midi_rate;               /* MIDI and tracker modules: output rate, 0 = FA_MIDI_DEFAULT_RATE */
@@ -272,6 +277,8 @@ int fa_probe_mp3_header(const uint8_t* data, size_t size, size_t start, uint32_t
 #define FA_WORKER_POLL_MIN_MS 5     /* the polling worker's shortest and longest sleep (worker_main) */
 #define FA_WORKER_POLL_MAX_MS 50
 #define FA_WORKER_POLL_IDLE_MS 100  /* ... while no stream has anything to decode */
+#define FA_REVERSE_BLOCK_MS 500     /* reversed: source decoded per seek (reverse_read) */
+#define FA_REVERSE_OVERLAP_MS 10    /* ... each block this far past its end, cross-faded with the one above */
 
 /* Soundfont references: retain returns `f` (NULL-safe); the last release frees it. */
 /* DLS banks (dls.c), turned into a SoundFont 2 image the synthesizer loads. */
@@ -890,6 +897,7 @@ struct fa_engine {
     /* Normalization and limiter settings, read by the audio thread. */
     fa_atomic32 norm_mode;       /* fa_normalize_mode */
     fa_atomic32 norm_target;     /* float LUFS */
+    fa_atomic32 use_dialnorm;    /* fa_engine_set_dialnorm */
     fa_atomic32 limiter_mode;    /* fa_limiter_mode */
     fa_atomic32 limiter_ceiling; /* float dBTP */
 
@@ -1207,6 +1215,8 @@ struct fa_stream {
     fa_decoder decoder;
     int decoder_ready;
     fa_atomic32 dynamic_range;   /* fa_dynamic_range, read by the codec on every packet */
+    fa_atomic64 dolby_mix;       /* Dolby downmix information (fa_ac3_mix_pack), written by the codec */
+    fa_atomic32 dolby_downmix;   /* fa_dolby_downmix */
 
     fa_atomic32 state;           /* fa_stream_state */
     fa_atomic64 position;        /* source frames, when not attached */
@@ -1256,6 +1266,15 @@ struct fa_stream {
     float* mat_buf;              /* matrix output, 2 channels */
     float* matrix;               /* in x FA_DEVICE_CHANNELS weights, NULL = default; under
                                     api_lock + decode_lock */
+    /* Without `matrix`: the chain mixes Dolby audio down with the stream's own levels
+     * (dolby_w, made from dolby_key = the dolby_mix and mode they were made for).
+     * Set with the chain; dolby_w and dolby_key are the worker's (decode_lock).
+     * dolby_makeup: the dB the downmix's overload scaling took off, which normalization
+     * gives back (float, read by the mixer; 0 without the downmix). */
+    int dolby;
+    uint64_t dolby_key;
+    fa_atomic32 dolby_makeup;
+    float dolby_w[8 * FA_DEVICE_CHANNELS];
     fa_frames src_pos;           /* source frame of the next decoder read (worker) */
     fa_atomic32 eof;             /* the worker has written the last frame */
     fa_atomic32 flushing;        /* 1 = the audio thread must not touch the ring */
@@ -1376,11 +1395,13 @@ struct fa_stream {
      * chain and the tmap count) run up while the source position runs down: linear
      * frame L is source position 2 * seek_base - L. The source is decoded forward in
      * blocks into rev_buf and handed out last frame first: rev_n frames are left,
-     * ending at source frame rev_pos (decode side, under decode_lock). */
+     * ending at source frame rev_pos, the first rev_hold of them held back for the
+     * cross-fade with the block below (see reverse_read; decode side, under decode_lock). */
     fa_atomic32 reverse_want;
     fa_atomic32 reverse;
     float* rev_buf;
-    fa_frames rev_cap, rev_n, rev_pos;
+    float* rev_ov;               /* inside rev_buf: the held frames while the block below decodes */
+    fa_frames rev_cap, rev_n, rev_pos, rev_hold;
 
     /* CD+G graphics (cdg.c): the packs, the surfaces drawing them, and a generation
      * count that tells surfaces the graphics were replaced. Never touched by the
@@ -1562,6 +1583,9 @@ struct fa_codec {
     /* fa_dynamic_range of the stream, read on every packet (NULL = full range).
      * Set by the owner after fa_codec_open. */
     fa_atomic32* dynamic_range;
+    /* Dolby codecs write the downmix information of each unit here (NULL = nowhere).
+     * Set by the owner after fa_codec_open. */
+    fa_atomic64* dolby_mix;
     /* Its audio can come out a packet or more after the packet that holds it (the
      * systems' decoders): the track decoder anchors the audio on the first packet. */
     int trails;

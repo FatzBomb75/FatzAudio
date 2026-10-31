@@ -22,6 +22,7 @@ typedef struct fa_br {
     size_t len;     /* valid bytes in buf */
     size_t off;     /* read cursor in buf */
     int64_t base;   /* file offset of buf[0]; the source sits at base + len */
+    int fixed;      /* fa_br_init_block: only the bytes in buf */
 } fa_br;
 
 fa_result fa_br_init(fa_br* b, fa_source* src);
@@ -34,6 +35,11 @@ size_t fa_br_read(fa_br* b, void* out, size_t n);
 /* Reads n bytes into *buf (grown as needed, at most `max`). FA_ERROR_END_OF_STREAM
  * if the data ends first. */
 fa_result fa_br_read_alloc(fa_br* b, size_t n, size_t max, uint8_t** buf, size_t* cap);
+/* A reader over just the `n` bytes in memory that sit at file offset `base` (a range
+ * read on its own, fa_net_read_range): it takes over `data` (malloc'ed). Reads end
+ * at the end of the bytes and seeks outside them fail. `src` is only there for
+ * its fields (length, seekable); it is never read. */
+void fa_br_init_block(fa_br* b, fa_source* src, uint8_t* data, size_t n, int64_t base);
 
 /* ---- Track decoder -------------------------------------------------------------- */
 

@@ -6,6 +6,7 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include "fa_internal.h"
+#include "reverse_check.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -258,6 +259,33 @@ static void test_render_and_seek(void)
     free(mod.d);
 }
 
+/* Reversed: half-second blocks, each after a seek (exact to within 0.01, see
+ * above), cross-faded where they meet: the song backwards, with no step at the
+ * joins beyond the steps around them. */
+static void test_reverse_joins(void)
+{
+    buf mod = make_mod();
+    float *full, *rev;
+    int64_t n = 0, nr = 0;
+    uint32_t ch = 0, rate = 0;
+    double worst = 0, excess = 0;
+    fa_stream* s = open_mod(&mod, NULL);
+    CHECK(s);
+    full = rc_read_all(s, -1, &n, &ch, &rate);
+    s = open_mod(&mod, NULL);
+    CHECK(s);
+    rev = rc_read_all(s, n, &nr, &ch, &rate);
+    CHECK(full && rev);
+    CHECK_EQ(nr, n);
+    rc_compare(full, rev, n, ch, rate, &worst, &excess);
+    printf("  reversed vs straight %g, steps at the joins beyond those around %g\n", worst, excess);
+    CHECK(worst < 0.01);
+    CHECK(excess < 0.002);
+    free(full);
+    free(rev);
+    free(mod.d);
+}
+
 static void test_live_settings(void)
 {
     buf mod = make_mod();
@@ -471,8 +499,9 @@ static void FA_CALL on_event(const fa_event* ev, void* user)
 }
 
 /* Plays the song through the device (rendered here, not by a device thread)
- * for 2.5 s, from `seek` (looping, if asked), and collects the row events. */
-static void play_rows(const buf* mod, int32_t mode, int loop, fa_frames seek, row_rec* rec)
+ * for 2.5 s, from `seek` (looping, or reversed from the end, if asked), and collects
+ * the row events. */
+static void play_rows(const buf* mod, int32_t mode, int loop, fa_frames seek, int reverse, row_rec* rec)
 {
     fa_device* dev = NULL;
     fa_stream* s = NULL;
@@ -488,6 +517,7 @@ static void play_rows(const buf* mod, int32_t mode, int loop, fa_frames seek, ro
     fa_stream_set_tracker_param(s, FA_TRACKER_ROW_EVENTS, mode);
     fa_stream_set_loop(s, loop);
     if (seek > 0) fa_stream_seek(s, seek);
+    if (reverse) fa_stream_set_reverse(s, 1);
     fa_stream_set_event_callback(s, on_event, rec);
     fa_stream_attach(s, dev, NULL);
     fa_stream_play(s);
@@ -523,7 +553,7 @@ static void test_row_events_on_device(void)
     int i;
     fa_frames row = (fa_frames)llround(ROW_S * RATE);
     /* Every row, once, in order, within a step of its start. */
-    play_rows(&mod, 1, 0, 0, &rec);
+    play_rows(&mod, 1, 0, 0, 0, &rec);
     CHECK(rec.ended);
     CHECK_EQ(rec.count, 32);
     for (i = 0; i < rec.count; i++) {
@@ -533,26 +563,38 @@ static void test_row_events_on_device(void)
     }
     fa_mutex_destroy(&rec.lock);
     /* Orders only. */
-    play_rows(&mod, 2, 0, 0, &rec);
+    play_rows(&mod, 2, 0, 0, 0, &rec);
     CHECK(rec.ended);
     CHECK_EQ(rec.count, 2);
     CHECK_EQ(rec.values[0], 0);
     CHECK_EQ(rec.values[1], 1 << 16);
     fa_mutex_destroy(&rec.lock);
     /* Off (the default): none. */
-    play_rows(&mod, 0, 0, 0, &rec);
+    play_rows(&mod, 0, 0, 0, 0, &rec);
     CHECK(rec.ended);
     CHECK_EQ(rec.count, 0);
     fa_mutex_destroy(&rec.lock);
     /* From a seek into row 8 (0.5 s): the rows after it. */
-    play_rows(&mod, 1, 0, RATE / 2, &rec);
+    play_rows(&mod, 1, 0, RATE / 2, 0, &rec);
     CHECK(rec.ended);
     CHECK_EQ(rec.count, 32 - 9);
     CHECK_EQ(rec.values[0], 9);
     CHECK(rec.frames[0] >= 9 * row && rec.frames[0] <= 9 * row + FA_TRACKER_STEP_TEST);
     fa_mutex_destroy(&rec.lock);
+    /* Reversed (from the end): every row once, last first, as its first frame is heard.
+     * The half-second blocks reverse decodes after a seek each don't add rows where
+     * they start. */
+    play_rows(&mod, 1, 0, 0, 1, &rec);
+    CHECK(rec.ended);
+    CHECK_EQ(rec.count, 32);
+    for (i = 0; i < rec.count; i++) {
+        CHECK_EQ(rec.values[i] >> 16, (31 - i) / 16);
+        CHECK_EQ(rec.values[i] & 0xFFFF, (31 - i) % 16);
+        CHECK(rec.frames[i] >= (31 - i) * row && rec.frames[i] <= (31 - i) * row + FA_TRACKER_STEP_TEST);
+    }
+    fa_mutex_destroy(&rec.lock);
     /* Looping: the song's rows, then the first ones again from frame 0. */
-    play_rows(&mod, 1, 1, 0, &rec);
+    play_rows(&mod, 1, 1, 0, 0, &rec);
     CHECK(rec.count >= LOOP_ROWS);
     for (i = 0; i < rec.count; i++) {
         CHECK_EQ(rec.values[i] >> 16, (i % 32) / 16);
@@ -639,6 +681,7 @@ int main(void)
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) { fprintf(stderr, "engine create failed\n"); return 1; }
     RUN(test_detect_and_info);
     RUN(test_render_and_seek);
+    RUN(test_reverse_joins);
     RUN(test_live_settings);
     RUN(test_mp3_like_samples);
     RUN(test_subsongs);

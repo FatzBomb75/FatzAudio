@@ -1,8 +1,8 @@
 /* A web stream's cookie jar (RFC 6265, the parts a media player needs): cookies a
  * server sets with Set-Cookie on a playlist, a redirect or a segment go back to it
  * on the stream's later requests, as a browser would send them. The jar lives as
- * long as the stream and is never written anywhere. Only the stream's download
- * thread uses it.
+ * long as the stream and is never written anywhere. The stream's download thread
+ * uses it, and a demuxer's own range requests (fa_net_read_range), under its lock.
  *
  * Kept: Domain (the host and its subdomains; without it, the host only), Path,
  * Secure (https only), Max-Age and Expires (an expired cookie deletes the one it
@@ -30,12 +30,18 @@ typedef struct fa_cookie {
 } fa_cookie;
 
 struct fa_http_cookies {
+    fa_mutex lock;
     fa_cookie c[FA_COOKIE_MAX];
     int count;
     uint64_t next;
 };
 
-fa_http_cookies* fa_http_cookies_create(void) { return (fa_http_cookies*)calloc(1, sizeof(fa_http_cookies)); }
+fa_http_cookies* fa_http_cookies_create(void)
+{
+    fa_http_cookies* j = (fa_http_cookies*)calloc(1, sizeof(fa_http_cookies));
+    if (j && fa_mutex_init(&j->lock) != 0) { free(j); j = NULL; }
+    return j;
+}
 
 static void cookie_free(fa_cookie* k)
 {
@@ -48,6 +54,7 @@ void fa_http_cookies_destroy(fa_http_cookies* j)
     int i;
     if (!j) return;
     for (i = 0; i < j->count; i++) cookie_free(&j->c[i]);
+    fa_mutex_destroy(&j->lock);
     free(j);
 }
 
@@ -249,6 +256,7 @@ void fa_http_cookies_take(fa_http_cookies* j, const char* url, const char* heade
     int64_t now = (int64_t)time(NULL);
     const char* line = headers;
     if (!j || !headers || fa_url_parse(url, &u) != FA_OK) return;
+    fa_mutex_lock(&j->lock);
     while (*line) {
         size_t len = strcspn(line, "\r\n");
         if (len > 11 && fa_strncasecmp_ascii(line, "Set-Cookie:", 11) == 0) {
@@ -261,9 +269,11 @@ void fa_http_cookies_take(fa_http_cookies* j, const char* url, const char* heade
         line += len;
         while (*line == '\r' || *line == '\n') line++;
     }
+    fa_mutex_unlock(&j->lock);
 }
 
-char* fa_http_cookies_for(fa_http_cookies* j, const char* url)
+/* Caller holds the jar's lock. */
+static char* cookies_for_locked(fa_http_cookies* j, const char* url)
 {
     fa_url u;
     int64_t now = (int64_t)time(NULL);
@@ -310,5 +320,15 @@ char* fa_http_cookies_for(fa_http_cookies* j, const char* url)
         len += ln + 1 + lv;
     }
     out[len] = 0;
+    return out;
+}
+
+char* fa_http_cookies_for(fa_http_cookies* j, const char* url)
+{
+    char* out;
+    if (!j) return NULL;
+    fa_mutex_lock(&j->lock);
+    out = cookies_for_locked(j, url);
+    fa_mutex_unlock(&j->lock);
     return out;
 }
