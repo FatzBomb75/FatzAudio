@@ -16,7 +16,19 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ## Unreleased
 
+### Breaking
+
+- `fa_cdg_info` gained `disc_corrected` and `disc_dropped` at its end (it has no `struct_size`): rebuild against the new
+  header. .NET `CdgInfo` gained the two matching positional parameters.
+
 ### Added
+
+- Disc and CD+G (extras step 19): `fa_disc_get_pregap` (.NET `Disc.GetPregap`, basscd's `BASS_CD_GetTrackPregap`)
+  gives a track's pregap in sectors, from the cue sheet (`INDEX 00`, `PREGAP`) or from a drive's Q subcode. CD+G packs
+  read from a disc with two damaged symbols are now repaired as well as those with one (three or more are still
+  dropped), and `fa_cdg_info.disc_corrected` / `disc_dropped` count them. A seek before a disc track's graphics were
+  found keeps the subcode read so far, and a part read again with different packs redoes the seek checkpoints after it
+  at once instead of 10 s per write. See [docs/features/disc.md](docs/features/disc.md#pregaps).
 
 - MIDI scale tuning and drum setup: GS (`40 1x 40`-`4B`) and XG (`08 nn 41`-`4C`) scale tuning, GS drum map edits
   (`41 mp rr`), XG drum setups (`3n rr pp`, and the drum setup reset) and the GS/XG drum NRPNs (MSB 14-1E) set each drum
@@ -252,6 +264,11 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- CD+G presentation scaling with smooth-scroll offsets: the picture is smoothed, edge-blended and given its effects
+  as shown, with the picture area moved, so the seam where it meets the border is drawn against its real neighbours and
+  a transparent border stays transparent under the effects. The classic picture maps tiles drawn while the offsets are
+  set to the area they show in instead of redrawing the whole surface. Songs without the offsets draw the same pixels
+  as before.
 - Containers (extras step 23, no change for well-formed files): Matroska's EBML elements and MP4's boxes are read by one walker each (`src/walk.c`), shared by the demuxers and the tag reader; the ADTS header and the AudioSpecificConfig each have one parser (`fa_adts_parse`, `fa_aac_parse_asc` in aac.c), and an Ogg link's comments are parsed once. The system AAC decoders (Media Foundation, AudioToolbox, MediaCodec) lose their ADTS handling, which nothing reached: ADTS always plays through the built-in decoder. Malformed files can come out differently; see docs/engineering-notes.md.
 
 - Analysis: the key's chroma FFT carries two windows at once (as the onset side does), and the bars' chroma shares a bin wider than a semitone among the pitch classes it covers (low chord changes show). The accuracy report is unchanged (all 44 bar songs right, 48 of 48 keys).

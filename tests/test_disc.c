@@ -149,6 +149,24 @@ static void test_image_toc(void)
     fa_disc_close(d);
 }
 
+/* Pregaps from the cue sheet: INDEX 00 before INDEX 01, PREGAP (silence), none. */
+static void test_image_pregap(void)
+{
+    fa_disc* d = NULL;
+    int64_t n = -1;
+    CHECK_EQ(fa_disc_open(k_cue, NULL, &d), FA_OK);
+    CHECK_EQ(fa_disc_get_pregap(d, 1, &n), FA_OK);
+    CHECK_EQ(n, 0);
+    CHECK_EQ(fa_disc_get_pregap(d, 2, &n), FA_OK);
+    CHECK_EQ(n, 75);                                   /* INDEX 00 00:04:00, INDEX 01 00:05:00 */
+    CHECK_EQ(fa_disc_get_pregap(d, 3, &n), FA_OK);
+    CHECK_EQ(n, 50);                                   /* PREGAP 00:00:50 */
+    CHECK_EQ(fa_disc_get_pregap(d, 4, &n), FA_ERROR_UNSUPPORTED_FORMAT);   /* data */
+    CHECK_EQ(fa_disc_get_pregap(d, 5, &n), FA_ERROR_NOT_FOUND);
+    CHECK_EQ(fa_disc_get_pregap(d, 1, NULL), FA_ERROR_INVALID_ARG);
+    fa_disc_close(d);
+}
+
 static void test_image_text(void)
 {
     fa_disc* d = NULL;
@@ -769,6 +787,103 @@ static void test_mmc_reads(void)
     free(buf);
 }
 
+static uint8_t to_bcd(int v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
+
+/* The Q subcode of sector `lba` (position, ADR 1, or `adr`) as a drive returns it in
+ * the raw P-W bytes: bit 6 of each. `bad` spoils its CRC. */
+static void put_q(uint8_t* sub, int64_t lba, int track, int index, int adr, int bad)
+{
+    uint8_t q[12] = { 0 };
+    uint16_t crc = 0;
+    int64_t abs_ = lba + 150;
+    int i, b;
+    q[0] = (uint8_t)adr;
+    q[1] = to_bcd(track);
+    q[2] = (uint8_t)index;
+    q[7] = to_bcd((int)(abs_ / 4500));
+    q[8] = to_bcd((int)(abs_ / 75 % 60));
+    q[9] = to_bcd((int)(abs_ % 75));
+    for (i = 0; i < 10; i++) {
+        crc ^= (uint16_t)(q[i] << 8);
+        for (b = 0; b < 8; b++) crc = (uint16_t)((crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1);
+    }
+    crc = (uint16_t)~crc;
+    q[10] = (uint8_t)(crc >> 8);
+    q[11] = (uint8_t)(crc ^ (bad ? 1 : 0));
+    for (i = 0; i < 96; i++) sub[i] = (uint8_t)(((q[i / 8] >> (7 - i % 8)) & 1) << 6);
+}
+
+/* Pregaps from the Q subcode of a drive: a 2 s gap, a short one found by bisection
+ * past unreadable Q (bad CRC, a catalog-number sector, a dead sector), none; kept
+ * once found; a drive whose subcode is a sector off either way; a drive without
+ * subcode. */
+static void test_mmc_pregap(void)
+{
+    static const int64_t lbas[4] = { 0, 1000, 2500, 4000 };
+    uint8_t toc[4 + 8 * 5];
+    uint8_t* sub = (uint8_t*)malloc((size_t)5002 * FA_CD_SUB_BYTES);
+    fake_drive fd;
+    fa_disc* d;
+    int64_t n = -1, i;
+    int reads, shift;
+    CHECK(sub);
+    for (i = 0; i < 5002; i++) {
+        int t = i < 850 ? 1 : i < 2463 ? 2 : i < 4000 ? 3 : 4;
+        int idx = (i >= 850 && i < 1000) || (i >= 2463 && i < 2500) ? 0 : 1;
+        put_q(sub + i * FA_CD_SUB_BYTES, i, t, idx, 1, i == 2480);
+    }
+    put_q(sub + 2466 * FA_CD_SUB_BYTES, 2466, 0, 0, 2, 0);   /* ADR 2: the catalog number */
+    memset(&fd, 0, sizeof(fd));
+    fd.toc0 = toc;
+    fd.toc0_len = make_toc(toc, 1, 4, lbas, 5000);
+    fd.flaky_lba = -1;
+    fd.dead_lba = 999;
+    fd.sub = sub;
+    fd.sub_sectors = 5000;
+    d = open_fake(&fd, NULL);
+    CHECK(d);
+    reads = fd.reads;
+    CHECK_EQ(fa_disc_get_pregap(d, 1, &n), FA_OK);
+    CHECK_EQ(n, 0);
+    CHECK_EQ(fd.reads, reads);                          /* the first track: no reads */
+    CHECK_EQ(fa_disc_get_pregap(d, 2, &n), FA_OK);
+    CHECK_EQ(n, 150);
+    CHECK(fd.reads - reads <= 5);                       /* the usual 2 s: checked at once */
+    CHECK_EQ(fa_disc_get_pregap(d, 3, &n), FA_OK);
+    CHECK_EQ(n, 37);
+    CHECK_EQ(fa_disc_get_pregap(d, 4, &n), FA_OK);
+    CHECK_EQ(n, 0);
+    reads = fd.reads;
+    CHECK_EQ(fa_disc_get_pregap(d, 3, &n), FA_OK);
+    CHECK_EQ(n, 37);
+    CHECK_EQ(fd.reads, reads);                          /* kept */
+    CHECK_EQ(fa_disc_get_pregap(d, 5, &n), FA_ERROR_NOT_FOUND);
+    fa_disc_close(d);
+
+    for (shift = 1; shift >= -1; shift -= 2) {   /* each read returns the next (previous) sector's Q */
+        fd.sub = shift > 0 ? sub + FA_CD_SUB_BYTES : sub;
+        fd.sub_sectors = 5000;
+        if (shift < 0) memmove(sub + FA_CD_SUB_BYTES, sub, (size_t)5001 * FA_CD_SUB_BYTES);
+        d = open_fake(&fd, NULL);
+        CHECK(d);
+        CHECK_EQ(fa_disc_get_pregap(d, 2, &n), FA_OK);
+        CHECK_EQ(n, 150);
+        CHECK_EQ(fa_disc_get_pregap(d, 3, &n), FA_OK);
+        CHECK_EQ(n, 37);
+        CHECK_EQ(fa_disc_get_pregap(d, 4, &n), FA_OK);
+        CHECK_EQ(n, 0);
+        fa_disc_close(d);
+    }
+    fd.sub = sub;
+
+    fd.no_sub = 1;
+    d = open_fake(&fd, NULL);
+    CHECK(d);
+    CHECK_EQ(fa_disc_get_pregap(d, 2, &n), FA_ERROR_NOT_IMPLEMENTED);
+    fa_disc_close(d);
+    free(sub);
+}
+
 static fa_atomic32 g_decode_errors;
 static void FA_CALL on_event(const fa_event* ev, void* user)
 {
@@ -1003,9 +1118,10 @@ static uint8_t gf64_inv(uint8_t a)
 }
 
 static int g_with_parity = 1;
+static int g_backward = 0;   /* weigh the symbols the other way round */
 
 /* Fills the last `k` of the first `n` symbols so that sum c[i] a^(j(n-1-i)) = 0 for
- * j < k (Gaussian elimination over GF(64)). */
+ * j < k (a^(ji) with g_backward; Gaussian elimination over GF(64)). */
 static void rs_parity(uint8_t* c, int n, int k)
 {
     uint8_t m[4][5];
@@ -1013,7 +1129,7 @@ static void rs_parity(uint8_t* c, int n, int k)
     for (j = 0; j < k; j++) {
         uint8_t root = (uint8_t)(1u << j), w = 1, rhs = 0;
         uint8_t pw[24];
-        for (i = n - 1; i >= 0; i--) { pw[i] = w; w = gf64_mul(w, root); }
+        for (i = n - 1; i >= 0; i--) { pw[g_backward ? n - 1 - i : i] = w; w = gf64_mul(w, root); }
         for (i = 0; i < n - k; i++) rhs ^= gf64_mul(c[i], pw[i]);
         for (i = 0; i < k; i++) m[j][i] = pw[n - k + i];
         m[j][k] = rhs;
@@ -1235,9 +1351,9 @@ static void test_cdg_image(void)
     free(sub);
 }
 
-/* A scratched disc: a pack with one wrong symbol is repaired from its parity, packs
- * with two are dropped instead of drawing garbage. Without parity from the drive
- * the packs are used as read. */
+/* A scratched disc: packs with one or two wrong symbols are repaired from their
+ * parity, packs with three are dropped instead of drawing garbage, and both are
+ * counted. Without parity from the drive the packs are used as read. */
 static void test_cdg_damage(void)
 {
     uint8_t* packs = (uint8_t*)malloc((size_t)SONG_PACKS * 24);
@@ -1249,24 +1365,32 @@ static void test_cdg_damage(void)
         fa_disc* d;
         fa_stream* s;
         fa_cdg_surface* f;
+        fa_cdg_info ci;
         uint8_t dd[16];
         g_with_parity = pass == 0;
         make_song(packs);
-        for (i = 0; i < 16; i++) {         /* at 4 s: a clear to red, every copy damaged */
+        for (i = 0; i < 16; i++) {         /* at 4 s: a clear to red, every copy with two wrong symbols */
             memset(dd, 0, sizeof(dd));
             dd[0] = 1; dd[1] = (uint8_t)i;
             put_pack(packs + (1200 + i) * 24, 1, dd);
+            dd[0] = 2;                     /* at 5 s: a clear to green, every copy with three */
+            put_pack(packs + (1500 + i) * 24, 1, dd);
         }
         memcpy(want, packs, (size_t)SONG_PACKS * 24);
         if (pass == 0) {
             packs[16 * 24 + 6] ^= 0x15;    /* colour load: one wrong symbol */
             packs[600 * 24 + 21] ^= 0x2A;  /* a clear's copy: one wrong parity symbol */
+            packs[601 * 24 + 0] ^= 0x01;   /* two in the command and the Q parity */
+            packs[601 * 24 + 3] ^= 0x30;
         }
         for (i = 0; i < 16; i++) {
             packs[(1200 + i) * 24 + 4] ^= 0x02;   /* colour 1 becomes 3 */
             packs[(1200 + i) * 24 + 9] ^= 0x11;
+            packs[(1500 + i) * 24 + 5] ^= 0x07;   /* the colour stays */
+            packs[(1500 + i) * 24 + 10] ^= 0x21;
+            packs[(1500 + i) * 24 + 22] ^= 0x0C;
         }
-        if (pass == 0) memset(want + 1200 * 24, 0, 16 * 24);
+        if (pass == 0) memset(want + 1500 * 24, 0, 16 * 24);
         else memcpy(want, packs, (size_t)SONG_PACKS * 24);
         interleave(1, packs, sub);
         CHECK(write_cdg_image("disc_cdg_dmg", sub));
@@ -1276,10 +1400,21 @@ static void test_cdg_damage(void)
         CHECK_EQ(fa_cdg_surface_create(s, NULL, &f), FA_OK);
         CHECK_EQ(play_through(s), FA_OK);
         CHECK(same_packs(s, want));
+        CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
+        CHECK_EQ(ci.disc_corrected, pass == 0 ? 19u : 0u);
+        CHECK_EQ(ci.disc_dropped, pass == 0 ? 16u : 0u);
         CHECK_EQ(pixel_at(f, 1000000000LL), 0xFF0000u);
         CHECK_EQ(pixel_at(f, 3000000000LL), 0x00FF00u);
-        /* With parity the damaged clear is gone; without, colour 3 (black) shows. */
-        CHECK_EQ(pixel_at(f, 5000000000LL), pass == 0 ? 0x00FF00u : 0x000000u);
+        /* With parity the clear to red is repaired and the clear to green is gone;
+         * without, colour 3 (black) shows, then green. */
+        CHECK_EQ(pixel_at(f, 4500000000LL), pass == 0 ? 0xFF0000u : 0x000000u);
+        CHECK_EQ(pixel_at(f, 5500000000LL), pass == 0 ? 0xFF0000u : 0x00FF00u);
+        /* Playing it again counts each pack once. */
+        CHECK_EQ(fa_stream_seek(s, 0), FA_OK);
+        CHECK_EQ(play_through(s), FA_OK);
+        CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
+        CHECK_EQ(ci.disc_corrected, pass == 0 ? 19u : 0u);
+        CHECK_EQ(ci.disc_dropped, pass == 0 ? 16u : 0u);
         fa_cdg_surface_destroy(f);
         fa_stream_close(s);
         fa_disc_close(d);
@@ -1289,6 +1424,110 @@ static void test_cdg_damage(void)
     free(packs);
     free(want);
     free(sub);
+}
+
+/* Single errors at every position and double errors across the pack are all
+ * repaired, in both symbol orders. */
+static void test_cdg_parity_limits(void)
+{
+    uint8_t* packs = (uint8_t*)calloc((size_t)SONG_PACKS, 24);
+    uint8_t* want = (uint8_t*)malloc((size_t)SONG_PACKS * 24);
+    uint8_t* sub = (uint8_t*)malloc((size_t)SONG_PACKS * 24);
+    fa_disc* d;
+    fa_stream* s;
+    fa_cdg_info ci;
+    uint8_t dd[16];
+    int i, a, b, k, singles, doubles, pass;
+    CHECK(packs && want && sub);
+    for (pass = 0; pass < 2; pass++) {
+        g_backward = pass;
+        k = singles = doubles = 0;
+        memset(packs, 0, (size_t)SONG_PACKS * 24);
+        make_song(packs);
+        /* From 3 s: damaged copies of one tile pack in every few packs, all positions. */
+        memset(dd, 0, sizeof(dd));
+        dd[0] = 1; dd[1] = 2; dd[2] = 5; dd[3] = 7;
+        for (i = 4; i < 16; i++) dd[i] = (uint8_t)((0x15 + i * 3) & 0x3F);
+        for (a = 0; a < 24; a++) {
+            uint8_t* p = packs + (900 + 8 * k++) * 24;
+            put_pack(p, 6, dd);
+            p[a] ^= (uint8_t)(1 + a % 63);
+            singles++;
+        }
+        for (a = 0; a < 24; a++)
+            for (b = a + 1; b < 24; b += 5) {
+                uint8_t* p = packs + (900 + 8 * k++) * 24;
+                put_pack(p, 6, dd);
+                p[a] ^= (uint8_t)(1 + (a * 7 + b) % 63);
+                p[b] ^= (uint8_t)(63 - (a + b) % 62);
+                doubles++;
+            }
+        CHECK(900 + 8 * k < SONG_PACKS);
+        memcpy(want, packs, (size_t)SONG_PACKS * 24);
+        for (i = 0; i < k; i++) put_pack(want + (900 + 8 * i) * 24, 6, dd);
+        interleave(1, packs, sub);
+        CHECK(write_cdg_image("disc_cdg_lim", sub));
+        CHECK_EQ(fa_disc_open("disc_cdg_lim.cue", NULL, &d), FA_OK);
+        s = open_track(d, 1);
+        CHECK(s);
+        CHECK_EQ(play_through(s), FA_OK);
+        CHECK(same_packs(s, want));
+        CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
+        CHECK_EQ(ci.disc_corrected, (uint64_t)(singles + doubles));
+        CHECK_EQ(ci.disc_dropped, 0u);
+        fa_stream_close(s);
+        fa_disc_close(d);
+        remove_cdg_image("disc_cdg_lim");
+    }
+    g_backward = 0;
+    free(packs);
+    free(want);
+    free(sub);
+}
+
+/* A seek before the graphics are found keeps the subcode read so far: once they are
+ * found, the part played before the seek has its packs without being read again. */
+static void test_cdg_early_seek(void)
+{
+    uint8_t* packs = (uint8_t*)calloc((size_t)SONG_PACKS, 24);
+    uint8_t* sub = (uint8_t*)malloc((size_t)SONG_PACKS * 24);
+    float* buf = (float*)malloc(sizeof(float) * 2 * 588 * 75);
+    fa_disc* d;
+    fa_stream* s;
+    uint8_t dd[16];
+    int64_t got;
+    int i, same;
+    CHECK(packs && sub && buf);
+    memset(dd, 0, sizeof(dd));
+    for (i = 0; i < 8; i++) {          /* too few in the first second to decide */
+        dd[0] = 1; dd[1] = (uint8_t)i;
+        put_pack(packs + (40 + 20 * i) * 24, 1, dd);
+    }
+    for (i = 0; i < 16; i++) {         /* enough at 4 s */
+        dd[0] = 2; dd[1] = (uint8_t)i;
+        put_pack(packs + (1200 + i) * 24, 1, dd);
+    }
+    interleave(1, packs, sub);
+    CHECK(write_cdg_image("disc_cdg_seek", sub));
+    CHECK_EQ(fa_disc_open("disc_cdg_seek.cue", NULL, &d), FA_OK);
+    s = open_track(d, 1);
+    CHECK(s);
+    CHECK_EQ(read_all(s, buf, 588 * 75, &got), FA_OK);          /* the first second */
+    CHECK_EQ(has_cdg(s), 0);
+    CHECK_EQ(fa_stream_seek(s, (fa_frames)588 * 300), FA_OK);   /* 4 s */
+    CHECK_EQ(read_all(s, buf, 588 * 75, &got), FA_OK);
+    CHECK_EQ(has_cdg(s), 1);
+    fa_mutex_lock(&s->cdg_lock);
+    same = s->cdg && memcmp(s->cdg->packs, packs, 300 * 24) == 0 &&
+           memcmp(s->cdg->packs + 1200 * 24, packs + 1200 * 24, 16 * 24) == 0;
+    fa_mutex_unlock(&s->cdg_lock);
+    CHECK(same);
+    fa_stream_close(s);
+    fa_disc_close(d);
+    remove_cdg_image("disc_cdg_seek");
+    free(packs);
+    free(sub);
+    free(buf);
 }
 
 /* Tracks without graphics get none: no .sub at all, or a subcode of zeros. */
@@ -1499,6 +1738,7 @@ int main(void)
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) { fprintf(stderr, "engine\n"); return 1; }
     if (!write_image()) { fprintf(stderr, "cannot write the test image\n"); return 1; }
     RUN(test_image_toc);
+    RUN(test_image_pregap);
     RUN(test_image_text);
     RUN(test_image_stream);
     RUN(test_image_offset);
@@ -1510,12 +1750,15 @@ int main(void)
     RUN(test_image_playback);
     RUN(test_mmc_ids);
     RUN(test_mmc_reads);
+    RUN(test_mmc_pregap);
     RUN(test_mmc_damage_and_removal);
     RUN(test_mmc_audio_edge);
     RUN(test_mmc_os_no_medium);
     RUN(test_mmc_cdtext);
     RUN(test_cdg_image);
     RUN(test_cdg_damage);
+    RUN(test_cdg_parity_limits);
+    RUN(test_cdg_early_seek);
     RUN(test_cdg_absent);
     RUN(test_cdg_mmc);
     RUN(test_cdg_rules);

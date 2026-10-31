@@ -65,6 +65,8 @@ typedef struct fa_cdg_data {
     struct fa_cdg_index* index; /* NULL until built (or out of memory: seeks replay from the start) */
     int from_disc;           /* read from a disc's subcode while it plays */
     int disc_parity;         /* from_disc: the subcode layout was chosen by the packs' parity */
+    uint64_t disc_corrected; /* from_disc: packs repaired from their parity, and dropped */
+    uint64_t disc_dropped;
 } fa_cdg_data;
 
 /* Takes ownership of `bytes` (malloc'ed) on success and on failure. */
@@ -89,6 +91,8 @@ void fa_stream_cdg_attach(struct fa_stream* s, fa_cdg_data* data);
 fa_result fa_cdg_data_blank(size_t count, fa_cdg_data** out);
 int fa_stream_cdg_attach_if_none(struct fa_stream* s, fa_cdg_data* data, uint32_t* out_token);
 int fa_stream_cdg_write(struct fa_stream* s, uint32_t token, size_t first, const uint8_t* packs, size_t n);
+/* The disc reader's damage counts so far (fa_cdg_info), for the graphics of `token`. */
+void fa_stream_cdg_disc_counts(struct fa_stream* s, uint32_t token, uint64_t corrected, uint64_t dropped);
 /* Cuts the stream's surfaces loose and waits for surface calls running on other
  * threads; first thing in fa_stream_close, before anything they read is torn down. */
 void fa_stream_cdg_detach(struct fa_stream* s);

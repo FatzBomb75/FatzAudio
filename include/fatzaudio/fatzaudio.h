@@ -728,6 +728,18 @@ typedef enum fa_disc_text {
  * FA_ERROR_NOT_FOUND when the disc has no such text; truncated to fit. */
 FA_API fa_result FA_CALL fa_disc_get_text(fa_disc* disc, int32_t track, fa_disc_text field, char* out_text, size_t text_size);
 
+/* The pregap of an audio track (its index 0: the pause, or a count-in, before the
+ * track starts), in sectors; 0 when it starts right after the track before. It lies
+ * at the end of the track before (fa_disc_track.start_sector - pregap up to
+ * start_sector), and its stream does not play it. The first track's counts from sector
+ * 0 (a hidden track before it, too); the 2 s before sector 0 on every disc are not
+ * counted, as no drive reads them. Disc images take it from the cue sheet (INDEX 00,
+ * PREGAP); drives from the Q subcode, which takes some 10-20 one-sector reads the first
+ * time for each track (then kept). FA_ERROR_NOT_FOUND when there is no such track,
+ * FA_ERROR_UNSUPPORTED_FORMAT for a data track, FA_ERROR_NOT_IMPLEMENTED for a drive
+ * that returns no subcode, FA_ERROR_IO when the Q subcode cannot be read there. */
+FA_API fa_result FA_CALL fa_disc_get_pregap(fa_disc* disc, int32_t track, int64_t* out_sectors);
+
 /* Opens the tray (unlocking it first) and closes it. Closing is not possible on
  * slot-loading and laptop drives (FA_ERROR_NOT_IMPLEMENTED or FA_ERROR_DEVICE). */
 FA_API fa_result FA_CALL fa_disc_eject(fa_disc* disc);
@@ -1980,9 +1992,14 @@ typedef struct fa_cdg_info {
     int32_t disc_parity;               /* discs: 1 = the subcode layout was chosen by the
                                           packs' P/Q parity, 0 = by counting instructions
                                           (drives that zero the parity). With 1, a pack with
-                                          one damaged symbol is corrected and one with more
-                                          is dropped; with 0 packs are applied as read. -1
-                                          for other sources */
+                                          up to two damaged symbols is corrected and one with
+                                          more is dropped; with 0 packs are applied as read.
+                                          -1 for other sources */
+    uint64_t disc_corrected;           /* discs with parity: packs read so far that were
+                                          repaired, and that were dropped as beyond repair
+                                          (a part read again counts its latest read). 0 for
+                                          other sources */
+    uint64_t disc_dropped;
 } fa_cdg_info;
 
 /* Attaches graphics to any stream, replacing what it had. The file or block is read
