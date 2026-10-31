@@ -77,6 +77,7 @@ against untrusted files and add what the decoder needs:
 - Channels keep every controller's value, pressure (channel and per key), the NRPN select,
   RPN 5 (modulation depth range), sostenuto, portamento (CC5, CC65, CC84) and the soft pedal;
   the GS/XG sound controllers CC71-78 and their part NRPNs offset cutoff, resonance, envelope
-  times and vibrato. `tsf_channel_set_sostenuto`, `_set_pressure`, `_set_key_pressure`,
+  times and vibrato. `tsf_set_note_gain` adds a level (dB) to the notes started after it (MIDI
+  track volume). `tsf_channel_set_sostenuto`, `_set_pressure`, `_set_key_pressure`,
   `_set_pressure_vibrato` and `tsf_channel_get_midi_control` are new. CC121 also resets what
   RP-015 lists (except the sustain pedal, as before).

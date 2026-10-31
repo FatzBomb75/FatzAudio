@@ -98,6 +98,20 @@ song.PlayOn(output);
 
 To draw the lyrics as a ready-made karaoke page, use `CreateLyricSurface()` ([lyrics](features/lyrics.md)). More: [MIDI](features/midi.md).
 
+## Play notes from your app (a MIDI keyboard, a sequencer)
+
+A real-time MIDI stream is a synthesizer that plays what you send it, about 30 ms after you send it:
+
+```csharp
+using var synth = engine.OpenMidi();
+synth.PlayOn(output);
+synth.SendMidi(MidiEvent.NoteOn(0, 60, 100));   // middle C
+synth.SendMidi(MidiEvent.NoteOff(0, 60));
+synth.SendMidiBytes(bytesFromYourMidiDevice);  // raw MIDI, running status and SysEx
+```
+
+The same calls add notes to a playing MIDI file. More: [sending events](features/midi.md#sending-events-and-the-real-time-synthesizer).
+
 ## Where to go next
 
 | You want | Read |

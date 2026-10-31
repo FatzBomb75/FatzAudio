@@ -20,7 +20,7 @@ namespace FatzAudio;
 /// song.PlayOn(output);
 /// </code>
 /// </example>
-public sealed class AudioEngine : IDisposable
+public sealed partial class AudioEngine : IDisposable
 {
     private readonly EngineHandle _handle;
 
