@@ -4,16 +4,17 @@ FatzAudio reads the title, artist, album and the rest of a file's tags, its embe
 
 | Tag format | Files | Items | Pictures |
 |---|---|---|---|
-| ID3v2.2, 2.3, 2.4 | MP3, AAC (ADTS), AC-3, E-AC-3, FLAC (leading), WAV and AIFF (`id3 ` chunk) | Every text frame, `TXXX` (keyed by its description), `COMM`, `USLT`, URL frames | `APIC`, `PIC` |
+| ID3v2.2, 2.3, 2.4 | MP3, AAC (ADTS), AC-3, E-AC-3, FLAC (leading), WAV and AIFF (`id3 ` chunk) | Every text frame, `TXXX` (keyed by its description), `COMM`, `USLT`, `SYLT` (as timed lines, see below), URL frames; frames stored with the zlib flag are unpacked | `APIC`, `PIC` |
 | ID3v1 / 1.1 | End of MP3, AAC, AC-3, FLAC, WAV, AIFF | Title, artist, album, year, comment, track, genre | - |
+| Lyrics3 v1.00 and v2.00 | End of MP3 (before ID3v1 or APEv2, or after the APEv2 tag) | `LYR` (lyrics), `INF`, `AUT`, `EAL`, `EAR`, `ETT`, `IND`; v1.00's text is `LYR` | - |
 | APEv2 | End of MP3, AAC, FLAC, WAV, AIFF (also with a header) | Every text item; lists joined with "; " | Binary `Cover Art (Front)` and the other cover items |
-| Vorbis comments | FLAC, Ogg Vorbis, Opus, Ogg FLAC | Every comment | FLAC `PICTURE` blocks, `METADATA_BLOCK_PICTURE` |
+| Vorbis comments | FLAC, Ogg Vorbis, Opus, Ogg FLAC | Every comment, the encoder's vendor string as `VENDOR`; a FLAC `CUESHEET` block as `CUESHEET/...` items | FLAC `PICTURE` blocks, `METADATA_BLOCK_PICTURE` |
 | MP4 / iTunes | M4A, MP4, M4B, MOV | Every `ilst` atom: `©nam`, `trkn`, `disk`, `gnre`, `tmpo`, freeform `----` atoms (keyed by their name) | `covr` |
 | ASF | WMA, WMV | Content Description (Title, Author, Copyright, Description, Rating) and every extended attribute (`WM/AlbumTitle`, ...) of every type | `WM/Picture` |
 | RIFF INFO | WAV, RF64, BW64 | `INAM`, `IART`, `IPRD`, `ICMT`, ... | - |
 | AIFF text chunks | AIFF, AIFF-C | `NAME`, `AUTH`, `(c) `, `ANNO` | - |
-| Matroska tags | MKV, MKA, WebM | Global and album-level `SimpleTag`s; the segment title as a fallback | Image attachments (`cover.*` is the front cover) |
-| MIDI | MID, KAR, RMI (from a stream: see below) | Title, artist, copyright | - |
+| Matroska tags | MKV, MKA, WebM | Global and album-level `SimpleTag`s; the segment title as a fallback; tags aimed at one track, chapter, edition or attachment as `TRACK:<uid>/NAME` and so on | Image attachments (`cover.*` is the front cover) |
+| MIDI | MID, KAR, RMI | Title, artist, copyright | - |
 
 A ZIP (MP3+G) is read through the audio file inside it: the one named like the `.cdg`, else the first audio file. Text in any encoding the format allows (Latin-1, UTF-16 with or without BOM, UTF-8) comes out as UTF-8; a file that claims UTF-8 but isn't is read as Latin-1, so nothing is lost. "Isn't UTF-8" is strict: overlong forms, UTF-16 surrogates and code points above U+10FFFF count as not UTF-8, the same check MIDI text, stream titles and HTTP headers use.
 
@@ -42,11 +43,22 @@ When a file has several tag formats, the richest wins for each field: ID3v2 befo
 
 Everything else, ReplayGain values and MusicBrainz IDs included, is in the item list exactly as the file stores it: `fa_tags_get_item` (.NET: `tags.Items`, or the indexer `tags["REPLAYGAIN_TRACK_GAIN"]`, which ignores case). The key is the format's own name: an ID3v2 frame ID (`TIT2`; a `TXXX` uses its description, a `COMM` with a description is `COMM:desc`), a Vorbis or APE key, an MP4 atom (`©nam` in UTF-8; freeform atoms by their name), an ASF attribute, a RIFF or AIFF chunk ID, or a Matroska tag name (`ALBUM/TITLE` for album-level tags when the file has track-level ones too).
 
+## Timed lyrics, cue sheets and the rest
+
+These come out as ordinary items (`fa_tags_get_item`, .NET `tags.Items` or `tags["KEY"]`), with the formats' own names, so nothing in the API changes.
+
+- **`SYLT`** (ID3v2 synchronised lyrics or text) is one item per frame, keyed `SYLT` or `SYLT:description`. The value has one entry per line, `[mm:ss.mmm]text`: `[00:01.000]Hello`. A line break inside an entry's text is dropped, and one at its start or end shows as an empty line (the usual way a SYLT file marks a new verse line). Only frames with times in milliseconds are read; times in MPEG frames cannot be turned into time without the audio and the frame is skipped. The text is not offered to the lyric surface ([lyrics](lyrics.md)); your app can parse these lines itself.
+- **ID3v2 compressed frames** (the zlib flag: v2.3 bit `0x80`, v2.4 bit `0x08` with the data length indicator) are unpacked and read like any other frame. Encrypted frames are skipped: the key is the app's, not the library's.
+- **Lyrics3** at the end of an MP3 (`LYRICSBEGIN` ... `LYRICSEND`, v2.00's `LYRICS200`) is read in either order with APEv2, before the ID3v1 tag. `LYR` fills `FA_TAG_LYRICS`, `ETT`, `EAR` and `EAL` the title, artist and album, `INF` the comment, all after every other tag format. `audio_bytes` and the bitrate leave the tag out.
+- **FLAC cue sheets** (`CUESHEET` block) come as `CUESHEET/CATALOG` and, for each track, `CUESHEET/TRACKnn` (where it starts, `mm:ss.mmm`, at its first index point 1) and `CUESHEET/TRACKnn/ISRC`. The lead-out track is left out. Only native FLAC files are read for them, not Ogg FLAC.
+- **The Vorbis vendor string** (the encoder library, such as `libvorbis` or `Lavf`) is the item `VENDOR` of every Vorbis comment block: FLAC, Ogg Vorbis, Opus, Ogg FLAC.
+- **Matroska tags aimed at something** (a `TagTrackUID`, `TagChapterUID`, `TagEditionUID` or `TagAttachmentUID` in their `Targets`) come out as `TRACK:<uid>/NAME`, `CHAPTER:<uid>/NAME`, `EDITION:<uid>/NAME` and `ATTACHMENT:<uid>/NAME`, with the UID as a decimal number. They never fill the common fields: they describe one track of a video, or are muxer statistics (`BPS`, `DURATION`).
+
 ## Properties
 
 Unless `FA_TAGS_NO_INFO` is set, the reader also opens a decoder on the file (headers only, nothing is decoded) and keeps its `fa_stream_info`: `fa_tags_get_info` (.NET: `tags.Info`, plus the shortcuts `Duration`, `Bitrate`, `Channels`, `SampleRate`, `BitsPerSample`, `Codec`, `FileSize`, `AudioSize` and `HasCdg`). The fields are the same as `fa_stream_get_info` gives for a stream of that file; [streams.md](streams.md#stream-info) describes them. `audio_bytes` is the coded audio alone, without tags, cover art, headers or other tracks, which is what a bitrate needs.
 
-`fa_tags_get_info` returns `FA_ERROR_NOT_FOUND` when no decoder recognised the file (an unsupported codec still gives its tags), and for MIDI files read by path, which need a soundfont to open.
+`fa_tags_get_info` returns `FA_ERROR_NOT_FOUND` when no decoder recognised the file (an unsupported codec still gives its tags). A MIDI file is read without a soundfont, whole (the length comes from its events): codec `midi`, container `smf` or `rmid`, 44.1 kHz stereo, the duration, and the title, artist and copyright as `FA_TAG_FORMAT_MIDI` items. `FA_TAGS_NO_INFO` skips that, as it skips the decoder for other files.
 
 ## C
 
@@ -146,6 +158,6 @@ Reading is synchronous and does file I/O on the calling thread, so a media libra
 - An empty result is not an error. A file without tags, or of a format that has none (raw AAC without ID3, a bare WAV), gives `FA_OK` and an empty tag object.
 - Fields are text as written. A date may be a year or a full date, a track may have leading zeros, and a genre may be any text. .NET's `Year`, `Track`, `Disc` and `Bpm` give `null` when the text isn't a number.
 - MP4 atom keys start with the copyright sign, which is two bytes in UTF-8 (`"\xC2\xA9nam"`). Use `fa_tags_get` for the common fields instead of matching keys.
-- ID3v2 frames stored compressed (the rare zlib flag) are skipped. Lyrics3 tags are not read. Matroska tags aimed at one track or chapter are left out; global and album tags are read.
+- Encrypted ID3v2 frames are skipped. `SYLT` frames with times in MPEG frames are skipped.
 - Bitrate and `audio_bytes` for MP3, AAC, AC-3 and FLAC are measured between the tags (an MP3's Xing/LAME header frame is left out). MP4, WAV, AIFF and CD are exact.
 - The BASS `TAGS_Read` format strings (`%ARTI - %TITL`) have no equivalent: build the text from the fields.

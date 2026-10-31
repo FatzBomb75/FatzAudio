@@ -44,3 +44,4 @@ GCC ASan+UBSan in a 4-core cloud container, `FUZZ_SEED=1`, 128 KiB inputs.
 |---|---|---|---|
 | 1 (PR 141) | AAC/HE-AAC, MP3, FLAC, MKV, MP4, CAF, tags, ZIP, HLS | 1M | dr_flac null reads after a bad frame and a seek (2), HLS BYTERANGE and MEDIA-SEQUENCE overflows |
 | 2a (extras step 2) | `stream_ogg`, `stream_asf`, `stream_dolby`, `stream_wav`, `stream_midi` 1M (MIDI as 941k + 100k from its corpus); `stream_tracker` 200k | see left | NaN/infinity passed through from float PCM; AC-3 codec `memmove` from a null buffer; a 2 GHz PCM sample rate asked for gigabytes of gap silence; WAV frame count times frame size overflowed |
+| Tags (extras step 14) | `tags` with zlib ID3 frames, SYLT, Lyrics3, Matroska targeted tags, FLAC cue sheets, MIDI without a soundfont | 1M (+150k after review fixes) | nothing |

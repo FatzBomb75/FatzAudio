@@ -27,6 +27,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   the server closes cleanly now reconnects instead of ending. `fa_stream_close` returns at once while a host name lookup
   hangs. See [docs/features/web-streams.md](docs/features/web-streams.md#saving-a-station-as-it-plays).
 
+- Tags (extras step 14): ID3v2 frames stored with the zlib flag are read (encrypted ones are still skipped); `SYLT`
+  synced lyrics come as timed `[mm:ss.mmm]text` lines; Lyrics3 v1.00 and v2.00 are read (new `FA_TAG_FORMAT_LYRICS3`,
+  .NET `TagFormat.Lyrics3`) and left out of `audio_bytes` and the bitrate; Matroska tags aimed at a track, chapter, edition or attachment
+  come as `TRACK:<uid>/NAME` and so on; FLAC cue sheets as `CUESHEET/...` items; the Vorbis vendor string as `VENDOR`;
+  `fa_tags_read_path` / `fa_tags_read_memory` read a MIDI file's title, artist, copyright and length without a
+  soundfont (`fa_tags_get_info` no longer returns `FA_ERROR_NOT_FOUND` for it).
+  See [docs/features/tags.md](docs/features/tags.md#timed-lyrics-cue-sheets-and-the-rest).
+
 - ZIP leftovers: other entries of a karaoke archive (a bundled video or PDF) are probed from a 64 KB prefix instead of
   being unpacked first, in `fa_stream_open_*` and in tag reads; `fa_open_options.cancel` (new last field; .NET
   `StreamOptions.CancellationToken`) stops a long unpack with the new `FA_ERROR_CANCELLED` (.NET `ErrorCode.Cancelled`);

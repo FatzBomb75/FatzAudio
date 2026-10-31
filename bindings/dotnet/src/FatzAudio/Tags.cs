@@ -40,6 +40,8 @@ public enum TagFormat
     Midi = 10,
     /// <summary>A tracker module's title, artist and song message (from <see cref="AudioStream.GetTags"/>).</summary>
     Tracker = 11,
+    /// <summary>Lyrics3 v1.00 and v2.00 at the end of an MP3.</summary>
+    Lyrics3 = 12,
 }
 
 /// <summary>What a picture shows: the ID3v2 / FLAC picture types.</summary>
