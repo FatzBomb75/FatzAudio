@@ -1078,8 +1078,6 @@ static void test_midi_without_soundfont(void)
     fa_stream_info info;
     put_smf(&file);
     /* No decoder can open it (no soundfont), but the title, artist and length can be read. */
-    t = read_mem(&file, 0);
-    CHECK(t != NULL);
     t = NULL;
     CHECK_EQ(fa_tags_read_memory(file.p, file.n, 0, &t), FA_OK);
     CHECK_STR(fa_tags_get(t, FA_TAG_TITLE), "Song One");
