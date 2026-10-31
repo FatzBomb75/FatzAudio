@@ -2,7 +2,8 @@
 # Runs the fuzz targets built in a FA_FUZZ tree (see CMakeLists.txt).
 #   tests/fuzz/run.sh BUILD_DIR OUT_DIR [EXECS] [target...]
 # Targets: stream_<fmt> (aac mp3 flac mkv mp4 caf ogg asf dolby, seeded from tests/data; wav midi
-# tracker, seeded from seeds/), tags, zip, hls. Needs python3 for make_seeds.py.
+# tracker, seeded from seeds/), tags, zip, hls, soundfont, cue, cdg (seeds/), font (tests/data/fonts).
+# Needs python3 for make_seeds.py.
 set -e
 B=${1:?build dir}; OUT=${2:?out dir}; N=${3:-1000000}; shift 3 2>/dev/null || shift $#
 D=$(cd "$(dirname "$0")" && pwd); DATA=$D/../data
@@ -10,7 +11,7 @@ python3 "$D/make_seeds.py"
 export ASAN_OPTIONS=detect_leaks=1:max_allocation_size_mb=1024:abort_on_error=1:handle_abort=0
 export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1:abort_on_error=1
 [ $# -gt 0 ] || set -- stream_aac stream_mp3 stream_flac stream_mkv stream_mp4 stream_caf stream_ogg stream_asf \
-  stream_dolby stream_wav stream_midi stream_tracker tags zip hls
+  stream_dolby stream_wav stream_midi stream_tracker tags zip hls soundfont cue cdg font
 for t in "$@"; do
   case $t in
     stream_aac) bin=fuzz_stream; seeds="$DATA/aac $DATA/net/tone.aac $DATA/tone.aac $DATA/aac.m4a $DATA/aac51.m4a $DATA/aac_switch.aac" ;;
@@ -28,6 +29,10 @@ for t in "$@"; do
     tags) bin=fuzz_tags; seeds="$DATA/tags $D/seeds/tags $D/seeds/midi $DATA/mp3 $DATA/flac $DATA/caf" ;;
     zip) bin=fuzz_zip; seeds="$D/seeds/zip" ;;
     hls) bin=fuzz_hls; seeds="$D/seeds/hls" ;;
+    soundfont) bin=fuzz_soundfont; seeds="$D/seeds/soundfont" ;;
+    cue) bin=fuzz_cue; seeds="$D/seeds/cue" ;;
+    cdg) bin=fuzz_cdg; seeds="$D/seeds/cdg" ;;
+    font) bin=fuzz_font; seeds="$DATA/fonts/*.ttf $DATA/fonts/*.otf $DATA/fonts/*.ttc" ;;
     *) echo "unknown target $t"; exit 2 ;;
   esac
   echo "== $t"

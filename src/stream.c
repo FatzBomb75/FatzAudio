@@ -13,6 +13,7 @@
 #include "cdg.h"
 #include "disc.h"
 #include "encode.h"
+#include "ac3.h"
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -188,6 +189,9 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
     if (options && options->struct_size >= offsetof(fa_open_options, dynamic_range) + sizeof(options->dynamic_range) &&
         options->dynamic_range >= FA_DYNAMIC_RANGE_FULL && options->dynamic_range <= FA_DYNAMIC_RANGE_NIGHT)
         fa_store32(&s->dynamic_range, options->dynamic_range);
+    if (options && options->struct_size >= offsetof(fa_open_options, dolby_downmix) + sizeof(options->dolby_downmix) &&
+        options->dolby_downmix >= FA_DOLBY_DOWNMIX_AUTO && options->dolby_downmix <= FA_DOLBY_DOWNMIX_ENGINE)
+        fa_store32(&s->dolby_downmix, options->dolby_downmix);
     /* MIDI files are played with the stream's soundfont, else the engine's. */
     if (options && options->struct_size >= offsetof(fa_open_options, soundfont) + sizeof(options->soundfont) &&
         options->soundfont)
@@ -224,6 +228,7 @@ static fa_result stream_open_decoder(struct fa_stream* s, const char* name_hint,
     fa_decoder_env env;
     fa_result r;
     env.dynamic_range = &s->dynamic_range;
+    env.dolby_mix = &s->dolby_mix;
     if (!s->soundfont) {
         /* A MIDI file and no soundfont from the app: the OS's own instruments. */
         const uint8_t* head;
@@ -1434,15 +1439,50 @@ static fa_result source_read(struct fa_stream* s, float* out, fa_frames want, fa
     return fa_decoder_read(&s->decoder, out, want, got);
 }
 
-/* The custom channel matrix: in_buf (source channels) -> mat_buf (device channels). */
+/* Is the stream Dolby audio with more than two channels, which `mode` mixes down
+ * with the stream's own levels? */
+static int dolby_mixes_down(const struct fa_stream* s, int32_t mode)
+{
+    return mode != FA_DOLBY_DOWNMIX_ENGINE && s->decoder.format.channels > 2 && s->decoder.format.channels <= 8 &&
+           fa_ac3_is_codec(s->decoder.codec);
+}
+
+/* The Dolby downmix for the levels the codec reported last, made again when they
+ * or the mode change. Caller holds decode_lock. */
+static const float* dolby_weights(struct fa_stream* s)
+{
+    uint64_t mix = (uint64_t)fa_load64(&s->dolby_mix), key;
+    int32_t mode = fa_load32(&s->dolby_downmix);
+    int ch = (int)s->decoder.format.channels;
+    float scale = 1.0f;
+    fa_ac3_mix m;
+    /* fa_ac3_mix_pack leaves bits 29 and 30 free; the dialogue level does not change
+     * the weights. */
+    key = (mix & ~FA_AC3_MIX_DIALNORM_BITS) | (uint64_t)mode << 29 | 1u << 31;
+    if (key == s->dolby_key) return s->dolby_w;
+    if (!fa_ac3_mix_unpack(mix, &m)) {
+        /* Nothing decoded yet: default levels, every channel. */
+        fa_ac3_mix_defaults(&m, 7, 0);
+        m.used = (1u << ch) - 1;
+    }
+    fa_ac3_downmix(&m, ch, mode == FA_DOLBY_DOWNMIX_LTRT || (mode == FA_DOLBY_DOWNMIX_AUTO && m.dmixmod == 1),
+                   s->dolby_w, &scale);
+    fa_store_float(&s->dolby_makeup, -20.0f * log10f(scale));
+    s->dolby_key = key;
+    return s->dolby_w;
+}
+
+/* The custom channel matrix or the Dolby downmix: in_buf (source channels) ->
+ * mat_buf (device channels). */
 static void apply_matrix(struct fa_stream* s, const float* in, fa_frames n)
 {
     uint32_t ch = s->decoder.format.channels, i, o;
+    const float* w = s->matrix ? s->matrix : dolby_weights(s);
     fa_frames f;
     for (f = 0; f < n; f++) {
         for (o = 0; o < FA_DEVICE_CHANNELS; o++) {
             float acc = 0.0f;
-            for (i = 0; i < ch; i++) acc += in[(size_t)f * ch + i] * s->matrix[i * FA_DEVICE_CHANNELS + o];
+            for (i = 0; i < ch; i++) acc += in[(size_t)f * ch + i] * w[i * FA_DEVICE_CHANNELS + o];
             s->mat_buf[(size_t)f * FA_DEVICE_CHANNELS + o] = acc;
         }
     }
@@ -1492,7 +1532,8 @@ static int keep_unheard(struct fa_stream* s, fa_frames unheard)
 void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
 {
     uint32_t ch = s->decoder.format.channels;
-    uint32_t conv_ch = s->matrix ? FA_DEVICE_CHANNELS : ch;
+    int mixdown = s->matrix || s->dolby;
+    uint32_t conv_ch = mixdown ? FA_DEVICE_CHANNELS : ch;
     int64_t produced = 0;
     int just_looped = 0;
     if (!s->ring.data || fa_load32(&s->eof)) return;
@@ -1590,7 +1631,7 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 if (latency > 0) {
                     if (latency > (ma_uint64)s->in_cap) latency = (ma_uint64)s->in_cap;
                     memset(s->in_buf, 0, (size_t)latency * ch * sizeof(float));
-                    if (s->matrix) memset(s->mat_buf, 0, (size_t)latency * conv_ch * sizeof(float));
+                    if (mixdown) memset(s->mat_buf, 0, (size_t)latency * conv_ch * sizeof(float));
                     s->in_count = (fa_frames)latency;
                     s->draining = 1;
                     continue;
@@ -1600,17 +1641,17 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
             }
             just_looped = 0;
             if (!from_carry) update_estimate(s, s->in_buf, got); /* carried audio was measured */
-            if (s->matrix) apply_matrix(s, s->in_buf, got);
-            chunk = s->matrix ? s->mat_buf : s->in_buf;
+            if (mixdown) apply_matrix(s, s->in_buf, got);
+            chunk = mixdown ? s->mat_buf : s->in_buf;
             tempo_chunk(s, &chunk, &got, conv_ch);
-            s->chain_buf = chunk != (s->matrix ? s->mat_buf : s->in_buf) ? chunk : NULL;
+            s->chain_buf = chunk != (mixdown ? s->mat_buf : s->in_buf) ? chunk : NULL;
             s->in_count = got;
             if (got == 0) continue;               /* the stretcher is gathering its start */
         }
         /* Converted straight into the ring, up to its wrap; published once the DSPs ran. */
         dst = fa_ring_write_region(&s->ring, &contig);
         if (contig < room) room = contig;
-        conv_in = s->chain_buf ? s->chain_buf : s->matrix ? s->mat_buf : s->in_buf;
+        conv_in = s->chain_buf ? s->chain_buf : mixdown ? s->mat_buf : s->in_buf;
         in_n = (ma_uint64)s->in_count;
         out_n = (ma_uint64)(room < FA_CONVERT_CHUNK ? room : FA_CONVERT_CHUNK);
         ma_data_converter_process_pcm_frames(&s->converter, conv_in + (size_t)s->in_offset * conv_ch, &in_n,
@@ -1757,7 +1798,10 @@ static fa_result build_chain_locked(struct fa_stream* s, fa_device* dev)
     if (capacity < 2048) capacity = 2048;
 
     release_chain(s);
-    cc = ma_data_converter_config_init(ma_format_f32, ma_format_f32, s->matrix ? FA_DEVICE_CHANNELS : ch,
+    s->dolby = !s->matrix && dolby_mixes_down(s, fa_load32(&s->dolby_downmix));
+    s->dolby_key = 0;
+    if (!s->dolby) fa_store_float(&s->dolby_makeup, 0.0f);
+    cc = ma_data_converter_config_init(ma_format_f32, ma_format_f32, s->matrix || s->dolby ? FA_DEVICE_CHANNELS : ch,
                                        FA_DEVICE_CHANNELS, s->decoder.format.sample_rate, dev->rate);
     cc.resampling.algorithm = ma_resample_algorithm_custom;   /* the sinc resampler (resample_device.c) */
     cc.resampling.pBackendVTable = &fa_sinc_resampler;
@@ -1770,14 +1814,14 @@ static fa_result build_chain_locked(struct fa_stream* s, fa_device* dev)
     s->converter_ready = 1;
     s->in_cap = FA_DECODE_CHUNK;
     s->in_buf = (float*)malloc((size_t)s->in_cap * ch * sizeof(float));
-    if (s->matrix) s->mat_buf = (float*)malloc((size_t)s->in_cap * FA_DEVICE_CHANNELS * sizeof(float));
+    if (s->matrix || s->dolby) s->mat_buf = (float*)malloc((size_t)s->in_cap * FA_DEVICE_CHANNELS * sizeof(float));
     if (!s->decoder.seekable) {
         /* Everything not yet heard: the ring, the input chunk and the resampler's delay
          * (and what the tempo chain holds, added when the chain is made). */
         s->hist_cap = (fa_frames)((double)capacity * s->decoder.format.sample_rate / dev->rate) + 2 * s->in_cap + 256;
         s->hist = (float*)malloc((size_t)s->hist_cap * ch * sizeof(float));
     }
-    if (!s->in_buf || (s->matrix && !s->mat_buf) || (!s->decoder.seekable && !s->hist) ||
+    if (!s->in_buf || ((s->matrix || s->dolby) && !s->mat_buf) || (!s->decoder.seekable && !s->hist) ||
         fa_ring_init(&s->ring, FA_DEVICE_CHANNELS, capacity) != FA_OK) {
         release_chain(s);
         return FA_ERROR_OUT_OF_MEMORY;
@@ -3117,10 +3161,12 @@ FA_API fa_result FA_CALL fa_stream_get_next(fa_stream* stream, fa_stream** out_n
 
 /* ---- channel matrix ----------------------------------------------------- */
 
+static fa_result remix_locked(struct fa_stream* stream, float* m, int32_t mode);
+
 FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* weights, uint32_t in_channels, uint32_t out_channels)
 {
     float* m = NULL;
-    fa_result r = FA_OK;
+    fa_result r;
     uint32_t i;
     if (!stream) return FA_ERROR_INVALID_ARG;
     if (weights) {
@@ -3132,6 +3178,18 @@ FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* we
         memcpy(m, weights, (size_t)in_channels * out_channels * sizeof(float));
     }
     fa_mutex_lock(&stream->api_lock);
+    r = remix_locked(stream, m, fa_load32(&stream->dolby_downmix));
+    fa_mutex_unlock(&stream->api_lock);
+    return r;
+}
+
+/* Sets the custom matrix (NULL = none; taken over, freed on failure; never the current
+ * one) and the Dolby
+ * downmix mode. An attached stream gets a new chain and carries on from where it
+ * plays. Caller holds api_lock. */
+static fa_result remix_locked(struct fa_stream* stream, float* m, int32_t mode)
+{
+    fa_result r = FA_OK;
     if (is_attached(stream) && !stream->decoder.seekable) {
         r = FA_ERROR_NOT_SEEKABLE;  /* the new chain would have to decode from where playback is */
         free(m);
@@ -3144,6 +3202,7 @@ FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* we
         fa_mutex_lock(&stream->decode_lock);
         free(stream->matrix);
         stream->matrix = m;
+        fa_store32(&stream->dolby_downmix, mode);
         r = build_chain_locked(stream, stream->device);
         if (r == FA_OK) {
             /* restart_at_locked only seeks the decoder when needed: force it, the
@@ -3161,10 +3220,31 @@ FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* we
         fa_mutex_lock(&stream->decode_lock);
         free(stream->matrix);
         stream->matrix = m;
+        fa_store32(&stream->dolby_downmix, mode);
         fa_mutex_unlock(&stream->decode_lock);
     }
+    return r;
+}
+
+FA_API fa_result FA_CALL fa_stream_set_dolby_downmix(fa_stream* stream, fa_dolby_downmix mode)
+{
+    fa_result r = FA_OK;
+    if (!stream || (int)mode < FA_DOLBY_DOWNMIX_AUTO || mode > FA_DOLBY_DOWNMIX_ENGINE) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&stream->api_lock);
+    /* Only to or from the engine's downmix does the chain change. */
+    if (is_attached(stream) && !stream->matrix && dolby_mixes_down(stream, (int32_t)mode) != stream->dolby)
+        r = remix_locked(stream, NULL, (int32_t)mode);   /* no matrix: stays none */
+    else
+        fa_store32(&stream->dolby_downmix, (int32_t)mode);
     fa_mutex_unlock(&stream->api_lock);
     return r;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_dolby_downmix(fa_stream* stream, fa_dolby_downmix* out_mode)
+{
+    if (!stream || !out_mode) return FA_ERROR_INVALID_ARG;
+    *out_mode = (fa_dolby_downmix)fa_load32(&stream->dolby_downmix);
+    return FA_OK;
 }
 
 /* ---- events ------------------------------------------------------------- */
