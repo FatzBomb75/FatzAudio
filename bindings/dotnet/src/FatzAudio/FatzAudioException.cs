@@ -57,6 +57,8 @@ public enum ErrorCode
     /// <summary><see cref="DjDeck.SyncTo"/>: the tempo it needs is outside the deck's <see cref="DjDeck.SyncRange"/>,
     /// also at half or double time.</summary>
     OutOfRange = -21,
+    /// <summary>An open was stopped by <see cref="StreamOptions.CancellationToken"/> (unpacking a ZIP song).</summary>
+    Cancelled = -22,
 }
 
 /// <summary>

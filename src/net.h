@@ -51,6 +51,17 @@ typedef struct fa_http_session fa_http_session;
 fa_http_session* fa_http_session_create(void);       /* NULL when out of memory */
 void fa_http_session_destroy(fa_http_session* s);    /* closes its connections; NULL ok */
 
+/* A stream's cookies (net_cookie.c): what its servers set with Set-Cookie goes back
+ * to them on its later requests (an HLS playlist's session cookie on the segments).
+ * Only the stream's download thread uses it. */
+typedef struct fa_http_cookies fa_http_cookies;
+fa_http_cookies* fa_http_cookies_create(void);       /* NULL when out of memory */
+void fa_http_cookies_destroy(fa_http_cookies* c);    /* NULL ok */
+/* Takes the Set-Cookie lines of a response from `url` ("Name: value\r\n" lines). */
+void fa_http_cookies_take(fa_http_cookies* c, const char* url, const char* headers);
+/* The Cookie header value for a request of `url` (malloc'd), NULL when none applies. */
+char* fa_http_cookies_for(fa_http_cookies* c, const char* url);
+
 typedef struct fa_http_request {
     const char* url;
     int64_t range_start;     /* -1 = no Range header */
@@ -65,6 +76,10 @@ typedef struct fa_http_request {
     const char* app_origin;  /* the app's Authorization and Cookie lines go only to this URL's
                               * origin (the stream's URL); NULL = url's */
     int other_origin;        /* set by fa_http_fetch: this hop is not on app_origin's origin */
+    int* closed_end;         /* out, NULL = not wanted: 1 when FA_OK came from the server closing an
+                              * HTTP/1 body that had neither a length nor a transfer coding (it can't
+                              * be told from a dropped connection), else 0 */
+    fa_http_cookies* cookies;   /* the stream's cookie jar, NULL = none */
 } fa_http_request;
 
 typedef struct fa_http_response {
@@ -100,15 +115,22 @@ int64_t fa_http_range_skip(const fa_http_response* resp, int64_t offset, int any
  * sockets, for http:// URLs: */
 fa_result fa_http_fetch_socket(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data,
                                void* user, char** out_redirect);
+/* Tests only: called on the plain-socket client's resolver thread before each
+ * lookup (a resolver that never answers). NULL in the library. */
+extern void (*fa_net_test_resolve_hook)(const char* host);
 /* ... and the platform's HTTPS stack (WinHTTP, URLSession, HttpURLConnection,
  * libcurl loaded at runtime). */
 fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user,
                             char** out_redirect);
 
-/* For the transports: 1 when a response with `status` and `headers` is a redirect
- * (*out = the target, malloc'd, absolute), 0 when it is not (or has no Location),
- * -1 when its Location can't be resolved or memory ran out. */
-int fa_http_redirect_target(const char* url, int status, const char* headers, char** out);
+/* For the transports: 1 when a response to `req` with `status` and `headers` is a
+ * redirect (*out = the target, malloc'd, absolute), 0 when it is not (or has no
+ * Location), -1 when its Location can't be resolved or memory ran out. A redirect's
+ * cookies go into req->cookies. */
+int fa_http_redirect_target(const fa_http_request* req, int status, const char* headers, char** out);
+/* For the transports: 1 when an HTTP/1 response with these headers ends only when the
+ * server closes the connection (no Content-Length, no Transfer-Encoding). */
+int fa_http_unframed(const char* headers);
 /* A redirect's body is read to its end (up to this much) rather than cut off, so a
  * kept connection stays usable. */
 #define FA_HTTP_DRAIN_MAX 65536
@@ -125,7 +147,8 @@ typedef int (*fa_http_header_proc)(void* user, const char* name, const char* val
 /* Every request header a GET of `url` (NULL = no credentials) sends, once each, in
  * the same order on every transport: User-Agent, Accept, Accept-Encoding: identity,
  * Icy-MetaData, Range, Authorization (Basic, from the URL's user info), then the
- * app's lines from req->headers. An app line replaces the header of ours with the
+ * app's lines from req->headers, then Cookie from req->cookies (joined to the app's
+ * Cookie line when there is one). An app line replaces the header of ours with the
  * same name. Dropped: the app's Authorization and Cookie lines when
  * req->other_origin is set, app lines without a colon, with an invalid name or a
  * value that is not printable ASCII, or longer than FA_HTTP_LINE_MAX, and Host,
@@ -159,6 +182,8 @@ typedef struct fa_net_config {
     uint32_t timeout_ms, prebuffer_ms, reconnect_ms;
     uint32_t flags;          /* fa_net_flags */
     uint32_t hls_max_bandwidth;
+    fa_download_proc download_proc;
+    void* download_user;
 } fa_net_config;
 
 struct fa_net {
@@ -210,10 +235,22 @@ struct fa_net {
     uint32_t reconnects;
     char* headers;           /* of the last response */
     fa_http_session* http;   /* the download thread's connections (NULL: one per request) */
+    fa_http_cookies* cookies;   /* the stream's cookie jar (fa_net_open to fa_net_close; locked) */
+    /* The raw-bytes tap: called on the download thread under tap_lock, which
+     * fa_net_set_tap takes to change it, so a replaced callback is never called again. */
+    fa_mutex tap_lock;
+    fa_download_proc tap;
+    void* tap_user;
+    fa_atomic64 download_tid;   /* the download thread, which may change the tap from inside it */
     char final_url[FA_NET_URL_MAX];
     char content_type[128];
     uint32_t icy_br;
     uint32_t sample_rate;    /* of the decoded audio, set once the decoder is open */
+    double file_rate;        /* bytes per second of the whole file (with any video), 0 = unknown */
+    /* The demuxer's next reads (fa_net_will_read): bytes [want_start, want_end), which
+     * may lie ahead of read_pos (MP4 audio after a stretch of video). -1 = none. */
+    int64_t want_start, want_end;
+    fa_atomic32 side_cancel; /* stops fa_net_read_range requests (close) */
 
     /* HLS (net_hls.c) */
     char* playlist;          /* the first response, collected while hls is set */
@@ -252,6 +289,8 @@ void fa_net_close(fa_net* n);    /* stops the download thread, frees everything 
  * once fa_net_can_decode said enough is here. */
 void fa_net_io(fa_net* n, fa_io_callbacks* out);
 int fa_net_is_hls(const fa_net* n);
+/* fa_stream_set_download_callback. */
+void fa_net_set_tap(fa_net* n, fa_download_proc proc, void* user);
 
 /* Decode workers: 1 when a decoder read will not wait for the network (enough is
  * buffered, or the download is over). While the stream is starving it waits for
@@ -259,6 +298,20 @@ int fa_net_is_hls(const fa_net* n);
 int fa_net_can_decode(fa_net* n, int* out_starving);
 /* The decoder produced `frames` more source frames: refines the byte rate. */
 void fa_net_note_decoded(fa_net* n, int64_t frames);
+/* Decoder side: its next reads are bytes [start, end) of the file (the next MP4
+ * packets, a fragment's header). Decode workers then wait until those are here
+ * (fa_net_can_decode), and when `start` is beyond the download's reach the download
+ * moves there now, so the worker doesn't wait for it in a read. Seekable files only. */
+void fa_net_will_read(fa_net* n, int64_t start, int64_t end);
+/* Decoder side: bytes [offset, offset + length) of the file over a request of its
+ * own (an index at the end of the file), leaving the download where it is. At most
+ * 2 MiB; malloc'ed into *out. Not on the download thread. */
+fa_result fa_net_read_range(fa_net* n, int64_t offset, int64_t length, uint8_t** out, size_t* out_len);
+/* The fa_net behind a source the stream opened on a URL (fa_net_io callbacks), else NULL. */
+fa_net* fa_net_of(const fa_source* src);
+/* Tests: reads that waited for the download once the stream was open (the decoder
+ * ran ahead of the bytes; a decode worker would wait holding the decode lock). */
+extern fa_atomic32 fa_net_test_read_waits;
 
 /* ICY metadata: a title change heard at source frame `frame`. */
 typedef struct fa_net_meta {
@@ -276,8 +329,9 @@ int64_t fa_net_meta_update(fa_net* n, int64_t frame_at_cursor, int64_t lag_bytes
 /* A title change at source frame `frame` that the audio itself announces (the
  * comments of a chained Ogg stream's next song). */
 void fa_net_meta_add_frame(fa_net* n, int64_t frame, const char* title);
-/* The decoder is open: its sample rate turns bytes per frame into a byte rate. */
-void fa_net_set_sample_rate(fa_net* n, uint32_t rate);
+/* The decoder is open: its sample rate turns bytes per frame into a byte rate, and
+ * its length (frames, -1 = unknown) gives the file's bytes per second. */
+void fa_net_set_sample_rate(fa_net* n, uint32_t rate, int64_t length_frames);
 /* The metadata in effect at source frame `heard` (seq 0 = none yet). */
 void fa_net_meta_at(fa_net* n, int64_t heard, fa_net_meta* out);
 /* Seq of the metadata in effect at `heard`. */
@@ -311,6 +365,13 @@ typedef struct fa_hls_segment {
     int64_t byte_offset, byte_length;   /* EXT-X-BYTERANGE, length -1 = whole */
 } fa_hls_segment;
 
+/* An EXT-X-MEDIA TYPE=AUDIO entry of a master playlist. */
+typedef struct fa_hls_rendition {
+    char* group;             /* GROUP-ID, "" when it has none */
+    char* uri;               /* absolute; NULL = the audio is in the variant's own segments */
+    int is_default, autoselect;
+} fa_hls_rendition;
+
 typedef struct fa_hls_playlist {
     int is_master;
     /* master */
@@ -318,7 +379,9 @@ typedef struct fa_hls_playlist {
     char** variant_uri;
     uint32_t* variant_bandwidth;
     char** variant_codecs;
-    char* audio_group_uri;   /* first EXT-X-MEDIA TYPE=AUDIO with a URI (DEFAULT=YES preferred) */
+    char** variant_audio;    /* the variant's AUDIO= group, NULL = none */
+    int rendition_count;
+    fa_hls_rendition* renditions;
     /* media */
     int segment_count;
     fa_hls_segment* segments;
@@ -333,6 +396,12 @@ void fa_hls_playlist_free(fa_hls_playlist* p);
 /* Index of the variant to play: the highest bandwidth not above max_bandwidth
  * (0 = no limit), audio-only variants preferred when they exist. */
 int fa_hls_pick_variant(const fa_hls_playlist* p, uint32_t max_bandwidth);
+/* The media playlist to play for variant `v` (-1 = none picked): the rendition of
+ * the variant's AUDIO= group (DEFAULT=YES first, then AUTOSELECT=YES, then the
+ * first), NULL when that rendition has no URI or the variant names no group (its
+ * own playlist carries the audio). A master without variants plays the first
+ * rendition with a URI, DEFAULT=YES preferred. */
+const char* fa_hls_audio_uri(const fa_hls_playlist* p, int v);
 
 /* MPEG-TS to audio elementary stream (first audio PID of the first program). */
 typedef struct fa_ts_demux {

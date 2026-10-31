@@ -20,8 +20,8 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     fa_hls_playlist p;
     memset(&p, 0, sizeof(p));
     if (fa_hls_parse((const char*)data, plen, "http://h.com/m/master.m3u8", &p) == FA_OK) {
-        (void)fa_hls_pick_variant(&p, 0);
-        (void)fa_hls_pick_variant(&p, 128000);
+        (void)fa_hls_audio_uri(&p, fa_hls_pick_variant(&p, 0));
+        (void)fa_hls_audio_uri(&p, fa_hls_pick_variant(&p, 128000));
         fa_hls_playlist_free(&p);
     }
     if (nul) {

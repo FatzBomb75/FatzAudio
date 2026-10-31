@@ -56,6 +56,7 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t* data, size_t size)
 }
 
 uint32_t fa_crc32(const uint8_t* data, size_t size) { return crc32_update(0, data, size); }
+uint32_t fa_crc32_update(uint32_t crc, const uint8_t* data, size_t size) { return crc32_update(crc, data, size); }
 
 /* ---- DEFLATE ------------------------------------------------------------------ */
 
@@ -115,13 +116,21 @@ typedef struct inf_state {
     uint32_t crc;                       /* of the flushed bytes */
     int error;                          /* ran past the input */
     int io_error;                       /* the source or the file failed */
+    const volatile int32_t* cancel;              /* the app's flag: non-zero stops at the next chunk (NULL: never) */
+    int cancelled;                      /* ... and it did */
 } inf_state;
+
+static int inf_cancelled(inf_state* s)
+{
+    if (s->cancel && *s->cancel) s->cancelled = 1;
+    return s->cancelled;
+}
 
 static int inf_refill(inf_state* s)
 {
     int64_t got;
     size_t want;
-    if (!s->src || s->src_left == 0) return 0;
+    if (!s->src || s->src_left == 0 || inf_cancelled(s)) return 0;
     want = s->src_left < INF_IN_CHUNK ? (size_t)s->src_left : INF_IN_CHUNK;
     got = fa_source_read(s->src, s->in_buf, want);
     if (got <= 0) { s->io_error = got < 0; return 0; }
@@ -137,7 +146,7 @@ static int inf_room(inf_state* s)
 {
     size_t keep, n;
     if (s->out_pos < s->out_cap) return 0;
-    if (!s->sink) return -1;
+    if (!s->sink || inf_cancelled(s)) return -1;
     keep = INF_WINDOW;
     n = s->out_pos - keep;
     if (fwrite(s->out, 1, n, s->sink) != n) { s->io_error = 1; return -1; }
@@ -345,6 +354,7 @@ static int inf_copy(inf_state* s, uint64_t len)
 {
     while (len) {
         size_t n;
+        if (inf_cancelled(s)) return -1;
         if (s->in_pos >= s->in_size && !inf_refill(s)) return -1;
         if (inf_room(s)) return -1;
         n = s->in_size - s->in_pos;
@@ -453,6 +463,7 @@ static fa_result inf_run(inf_state* s)
     int last;
     do {
         int type, r;
+        if (inf_cancelled(s)) break;   /* every block, also when all the data is in memory */
         last = (int)inf_bits(s, 1);
         type = (int)inf_bits(s, 2);
         if (s->error) break;
@@ -462,6 +473,7 @@ static fa_result inf_run(inf_state* s)
         else r = -1;
         if (r != 0 || s->error) { s->error = 1; break; }
     } while (!last);
+    if (s->cancelled) return FA_ERROR_CANCELLED;
     if (s->io_error) return FA_ERROR_IO;
     return !s->error && inf_left(s) == 0 ? FA_OK : FA_ERROR_UNSUPPORTED_FORMAT;
 }
@@ -671,19 +683,25 @@ fa_result fa_zip_entry_offset(fa_source* src, const fa_zip_entry* e, int64_t* ou
 }
 
 /* Unpacks entry `e` into `out` (out_cap bytes; the whole entry, or INF_OUT_CHUNK
- * when writing to `sink`), CRC checked. */
-static fa_result unpack(fa_source* src, const fa_zip_entry* e, uint8_t* out, size_t out_cap, FILE* sink)
+ * when writing to `sink`), CRC checked. With *prefix set, only the first out_cap
+ * bytes (at most the entry's size) are unpacked, unchecked, and *prefix gets how many. */
+static fa_result unpack(fa_source* src, const fa_zip_entry* e, uint8_t* out, size_t out_cap, FILE* sink,
+                        const volatile int32_t* cancel, size_t* prefix)
 {
     inf_state s;
     int64_t data_pos;
+    uint64_t want = e->size;
     fa_result r = fa_zip_entry_offset(src, e, &data_pos);
     if (r != FA_OK) return r;
     if (fa_source_seek(src, data_pos) != FA_OK) return FA_ERROR_IO;
+    if (prefix && want > out_cap) want = out_cap;
     memset(&s, 0, sizeof(s));
     s.out = out;
     s.out_cap = out_cap;
-    s.total = e->size;
+    s.total = want;
     s.sink = sink;
+    s.cancel = cancel;
+    if (inf_cancelled(&s)) return FA_ERROR_CANCELLED;
     if (src->kind == FA_SOURCE_MEMORY) {
         s.in = src->mem + data_pos;   /* no copy of a block already in memory */
         s.in_size = (size_t)e->compressed_size;
@@ -695,10 +713,17 @@ static fa_result unpack(fa_source* src, const fa_zip_entry* e, uint8_t* out, siz
     }
     if (e->method == 8) {
         r = inf_run(&s);
+        /* The prefix ends where the output buffer is full: the stream goes on, which
+         * inf_run counts as a failure. */
+        if (prefix && r == FA_ERROR_UNSUPPORTED_FORMAT && s.out_pos > 0) r = FA_OK;
     } else {
-        r = inf_copy(&s, e->size) == 0 ? FA_OK : s.io_error ? FA_ERROR_IO : FA_ERROR_UNSUPPORTED_FORMAT;
+        r = inf_copy(&s, want) == 0 ? FA_OK : s.cancelled ? FA_ERROR_CANCELLED : s.io_error ? FA_ERROR_IO : FA_ERROR_UNSUPPORTED_FORMAT;
     }
     free(s.in_buf);
+    if (prefix) {
+        *prefix = r == FA_OK ? s.out_pos : 0;
+        return r;
+    }
     if (r == FA_OK && sink) {
         if (fwrite(s.out, 1, s.out_pos, sink) != s.out_pos || fflush(sink) != 0) r = FA_ERROR_IO;
     }
@@ -706,7 +731,7 @@ static fa_result unpack(fa_source* src, const fa_zip_entry* e, uint8_t* out, siz
     return r;
 }
 
-fa_result fa_zip_extract(fa_source* src, const fa_zip_entry* e, uint64_t max_size, uint8_t** out_data)
+fa_result fa_zip_extract(fa_source* src, const fa_zip_entry* e, uint64_t max_size, const volatile int32_t* cancel, uint8_t** out_data)
 {
     uint8_t* out;
     fa_result r;
@@ -714,20 +739,27 @@ fa_result fa_zip_extract(fa_source* src, const fa_zip_entry* e, uint64_t max_siz
     if (e->size > max_size || e->size > (uint64_t)(SIZE_MAX - 1)) return FA_ERROR_TOO_LARGE;
     out = (uint8_t*)malloc(e->size ? (size_t)e->size : 1);
     if (!out) return FA_ERROR_OUT_OF_MEMORY;
-    r = unpack(src, e, out, (size_t)e->size, NULL);
+    r = unpack(src, e, out, (size_t)e->size, NULL, cancel, NULL);
     if (r != FA_OK) { free(out); return r; }
     *out_data = out;
     return FA_OK;
 }
 
-fa_result fa_zip_extract_file(fa_source* src, const fa_zip_entry* e, FILE* f)
+fa_result fa_zip_extract_file(fa_source* src, const fa_zip_entry* e, const volatile int32_t* cancel, FILE* f)
 {
     uint8_t* out;
     fa_result r;
     if (e->size > FA_ZIP_TEMP_LIMIT) return FA_ERROR_TOO_LARGE;
     out = (uint8_t*)malloc(INF_OUT_CHUNK);
     if (!out) return FA_ERROR_OUT_OF_MEMORY;
-    r = unpack(src, e, out, INF_OUT_CHUNK, f);
+    r = unpack(src, e, out, INF_OUT_CHUNK, f, cancel, NULL);
     free(out);
     return r;
+}
+
+fa_result fa_zip_extract_prefix(fa_source* src, const fa_zip_entry* e, uint8_t* buf, size_t cap, size_t* got)
+{
+    *got = 0;
+    if (cap == 0) return FA_OK;
+    return unpack(src, e, buf, cap, NULL, NULL, got);
 }

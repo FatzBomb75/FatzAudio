@@ -90,8 +90,9 @@ enum {
     FA_ERROR_PERMISSION_DENIED = -20 /* the OS refused the microphone: the app has no
                                         permission (Android RECORD_AUDIO, the macOS and iOS
                                         microphone prompt, Windows privacy settings) */,
-    FA_ERROR_OUT_OF_RANGE = -21      /* fa_deck_sync: the tempo it needs is outside the deck's
+    FA_ERROR_OUT_OF_RANGE = -21,     /* fa_deck_sync: the tempo it needs is outside the deck's
                                         FA_DECK_SYNC_RANGE, also at half or double time */
+    FA_ERROR_CANCELLED = -22         /* the app's fa_open_options.cancel flag stopped an open */
 };
 
 typedef struct fa_engine fa_engine;   /* one per process is typical */
@@ -273,6 +274,25 @@ typedef enum fa_dynamic_range {
                                    mode"); streams without heavy gains use NORMAL's */
 } fa_dynamic_range;
 
+/* How Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3) audio with more than two
+ * channels is mixed down for the (stereo) output. These streams carry their own
+ * centre and surround mix levels and say which kind of stereo they prefer; the
+ * downmix uses them as ETSI TS 102 366 describes, turned down so it cannot clip
+ * (normalization, when on, gives that back). A custom channel matrix
+ * (fa_stream_set_matrix) always wins. Other formats are not affected. */
+typedef enum fa_dolby_downmix {
+    FA_DOLBY_DOWNMIX_AUTO = 0,  /* default: the kind the stream prefers, Lo/Ro when it
+                                   names none */
+    FA_DOLBY_DOWNMIX_LORO,      /* Lo/Ro: plain stereo with the stream's centre and
+                                   surround levels */
+    FA_DOLBY_DOWNMIX_LTRT,      /* Lt/Rt: matrix surround (Dolby Surround, Pro Logic):
+                                   the surrounds go in out of phase, so a surround
+                                   decoder downstream can bring them back */
+    FA_DOLBY_DOWNMIX_ENGINE     /* the engine's own downmix, as for every other format;
+                                   the stream's levels are ignored (the downmix of
+                                   FatzAudio before this setting) */
+} fa_dolby_downmix;
+
 typedef struct fa_open_options {
     uint32_t struct_size;
     uint32_t flags;          /* fa_open_flags */
@@ -297,6 +317,15 @@ typedef struct fa_open_options {
                                 valid UTF-8 stays UTF-8 and the others are read as
                                 Windows-1252; forced Windows-1252 and Shift-JIS read
                                 every event that way */
+    const volatile int32_t* cancel; /* NULL = none. A flag the app sets to non-zero (from
+                                another thread) to stop the open: unpacking a ZIP
+                                song (the one long step of an open from a file or
+                                memory) then returns FA_ERROR_CANCELLED within about
+                                a block of the compressed data, and the song is not opened.
+                                Read only during the call, so it may be freed
+                                after. Other opens ignore it */
+    int32_t dolby_downmix;   /* fa_dolby_downmix (default AUTO); can be changed later
+                                with fa_stream_set_dolby_downmix */
 } fa_open_options;
 
 /* fa_open_options.text_code_page, and fa_midi_credits.code_page. */
@@ -465,13 +494,23 @@ typedef enum fa_net_flags {
     FA_NET_NO_ICY       = 1 << 1   /* do not ask radio servers for song titles */
 } fa_net_flags;
 
+/* Receives a web stream's raw bytes as they are downloaded, to save a station while
+ * it plays (fa_net_options.download_proc, fa_stream_set_download_callback). The bytes
+ * are the ones the decoder reads: a file as the server sends it, radio without its
+ * ICY title blocks, HLS the audio of the segments (decrypted; from MPEG-TS segments
+ * the audio stream inside). Called on the stream's download thread, in order; the
+ * download waits while it runs, so return quickly. */
+typedef void (FA_CALL *fa_download_proc)(void* user, const void* data, size_t size);
+
 struct fa_net_options {
     uint32_t struct_size;          /* sizeof(fa_net_options) */
     const char* user_agent;        /* NULL = "FatzAudio/<version>" */
     const char* headers;           /* extra request headers, "Name: value" lines separated
                                       by "\r\n" or "\n" (cookies, authorization, ...); NULL = none.
                                       Authorization and Cookie go only to the URL's own origin
-                                      (not to other servers a redirect or playlist leads to) */
+                                      (not to other servers a redirect or playlist leads to).
+                                      Cookies the servers set are kept for the stream and sent
+                                      back to them, after this Cookie line */
     const char* proxy;             /* NULL = the system's setting (environment http_proxy /
                                       https_proxy, Windows and macOS proxy settings);
                                       "" = connect directly; "host:port" or
@@ -484,7 +523,12 @@ struct fa_net_options {
                                       drops; 0 = 30000 (FA_NET_NO_RECONNECT: never) */
     uint32_t flags;                /* fa_net_flags */
     uint32_t hls_max_bandwidth;    /* HLS: plays the best variant up to this many bits per
-                                      second; 0 = the best one */
+                                      second (the audio rendition of that variant's AUDIO
+                                      group when it names one); 0 = the best one */
+    fa_download_proc download_proc; /* the stream's raw bytes from the first one on (what
+                                      the open reads to detect the format included);
+                                      NULL = none. fa_stream_set_download_callback changes it */
+    void* download_user;           /* download_proc's `user` */
 };
 
 FA_API void FA_CALL fa_net_options_init(fa_net_options* options);
@@ -540,6 +584,13 @@ FA_API fa_result FA_CALL fa_stream_get_net_status(fa_stream* stream, fa_net_stat
 /* A header of the last HTTP response, e.g. "Content-Type" or "icy-name" (any case).
  * FA_ERROR_NOT_FOUND when the response had no such header; truncated to fit. */
 FA_API fa_result FA_CALL fa_stream_get_http_header(fa_stream* stream, const char* name, char* out_value, size_t value_size);
+/* Starts (or, with NULL, stops) handing a web stream's raw bytes to `proc` from the
+ * next downloaded byte on (fa_download_proc). Once it returns, the previous callback
+ * is not called again (a call in progress has finished), so its `user` can be freed;
+ * it can also be called from inside the callback. A seek that restarts the download
+ * elsewhere continues with the bytes from there. FA_ERROR_INVALID_ARG for streams
+ * that are not web streams. */
+FA_API fa_result FA_CALL fa_stream_set_download_callback(fa_stream* stream, fa_download_proc proc, void* user);
 
 /* ---- Audio CDs ------------------------------------------------------------
  *
@@ -736,6 +787,14 @@ FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* o
 FA_API fa_result FA_CALL fa_stream_set_dynamic_range(fa_stream* stream, fa_dynamic_range mode);
 FA_API fa_result FA_CALL fa_stream_get_dynamic_range(fa_stream* stream, fa_dynamic_range* out_mode);
 
+/* Dolby downmix (see fa_dolby_downmix). Between AUTO, LORO and LTRT the change
+ * applies like the dynamic range, to audio decoded from now on. To or from ENGINE
+ * an attached stream rebuilds its chain and carries on from where it plays, as
+ * fa_stream_set_matrix does (FA_ERROR_NOT_SEEKABLE on a live stream: change it
+ * while detached). Streams of other formats accept and ignore it. */
+FA_API fa_result FA_CALL fa_stream_set_dolby_downmix(fa_stream* stream, fa_dolby_downmix mode);
+FA_API fa_result FA_CALL fa_stream_get_dolby_downmix(fa_stream* stream, fa_dolby_downmix* out_mode);
+
 /* ---- Tags and cover art ------------------------------------------------
  *
  * Title, artist, album and the rest, plus embedded pictures, from every tag
@@ -787,7 +846,8 @@ typedef enum fa_tag_format {
     FA_TAG_FORMAT_AIFF,      /* NAME, AUTH, (c), ANNO */
     FA_TAG_FORMAT_MATROSKA,
     FA_TAG_FORMAT_MIDI,
-    FA_TAG_FORMAT_TRACKER    /* a tracker module's title, artist and song message */
+    FA_TAG_FORMAT_TRACKER,   /* a tracker module's title, artist and song message */
+    FA_TAG_FORMAT_LYRICS3    /* Lyrics3 v1.00 and v2.00 at the end of an MP3 */
 } fa_tag_format;
 
 typedef enum fa_tags_flags {
@@ -932,13 +992,14 @@ FA_API fa_result FA_CALL fa_stream_get_loop(fa_stream* stream, int32_t* out_on);
  * at CUE_IN or the start. Playing from stopped or ended starts at CUE_OUT or the end.
  * A loop (fa_stream_set_loop, a deck loop) wraps from its start to its end. Tempo,
  * pitch, rate, volume, effects and the fade markers work as forward. Changing the
- * direction restarts at the position heard, as fa_stream_seek does. While reversed,
- * marker, loop, MIDI text and tracker row events are not raised (position events
- * are), CUE_OUT does not end the stream, a queued stream starts when this one ends
- * (no crossfade), deck sync does not pull the deck into phase, and fa_deck_beat_jump
- * and deck loop changes take effect at once rather than on a beat. The source is
- * decoded forward in half-second blocks, one seek each. Push, packet and
- * forward-only streams return FA_ERROR_NOT_SEEKABLE, web streams
+ * direction restarts at the position heard, as fa_stream_seek does. Events are raised
+ * as the position counts down past their frames: markers, loop turns, MIDI texts,
+ * tracker rows and position events, last first. Deck loops, beat jumps and deck sync
+ * work as forward, mirrored: a loop turns at its in point, a jump joins without a gap,
+ * and the deck's beats count down. CUE_OUT does not end a reversed stream and a queued
+ * stream starts when it ends (no crossfade). The source is decoded forward in
+ * half-second blocks, one seek each, cross-faded over 10 ms where they meet. Push,
+ * packet and forward-only streams return FA_ERROR_NOT_SEEKABLE, web streams
  * FA_ERROR_NOT_IMPLEMENTED. */
 FA_API fa_result FA_CALL fa_stream_set_reverse(fa_stream* stream, int32_t reverse);
 FA_API fa_result FA_CALL fa_stream_get_reverse(fa_stream* stream, int32_t* out_reverse);
@@ -1095,7 +1156,8 @@ FA_API fa_result FA_CALL fa_stream_get_tempo_options(fa_stream* stream, fa_tempo
  *
  * Marker fades depend only on the position, so seeking into a fade plays it at the
  * right level, and they multiply with volume, crossfades, normalization and buses.
- * FA_EVENT_MARKER (value = the fa_marker) is raised when playback passes a marker.
+ * FA_EVENT_MARKER (value = the fa_marker) is raised when playback passes a marker
+ * (reversed too, as the position counts down past it).
  * Changing CUE_OUT while playing takes effect at once (the stream re-buffers from
  * the current position when audio past the new CUE_OUT was already decoded). */
 typedef enum fa_marker {
@@ -1379,7 +1441,9 @@ FA_API fa_result FA_CALL fa_deck_cue(fa_deck* deck);
  * heard. Setting an out point the deck has just passed (up to 0.5 s ago, as a
  * "loop out" button does) loops back at once, keeping the loop's phase; one further
  * behind jumps to the in point. out <= in turns the loop off (playback carries on
- * from where it is); a seek past the out point also leaves the loop. The deck loop
+ * from where it is); a seek past the out point also leaves the loop. Playing reversed,
+ * all of this is mirrored: the loop turns at its in point back up to its out point,
+ * and an in point just passed going down loops at once. The deck loop
  * replaces the CUE_IN..CUE_OUT loop of fa_stream_set_loop while it is on. Only
  * seekable streams loop (FA_ERROR_NOT_SEEKABLE). */
 FA_API fa_result FA_CALL fa_deck_set_loop(fa_deck* deck, fa_frames loop_in, fa_frames loop_out);
@@ -1410,7 +1474,9 @@ typedef enum fa_sync_flags {
  * kept: that is the stretcher). BEAT on a playing deck pulls a small phase error (under
  * 30 ms) in by bending the tempo by up to 2% for about two beats, and jumps a larger
  * one away on the deck's next beat (a seamless join, like a loop); on a deck that is not
- * playing it applies once it plays (or start it with fa_deck_play_synced). Without LOCK
+ * playing it applies once it plays (or start it with fa_deck_play_synced). A deck playing
+ * reversed (fa_stream_set_reverse) hears its beats counting down: it is pulled onto the
+ * leader's beat the same way, its next beat being the one below. Without LOCK
  * the sync is done once; with LOCK the engine's event thread keeps the deck on the
  * leader's beat (about 20 times a second), so the deck's FA_PARAM_TEMPO moves by itself.
  * leader NULL or flags 0 ends a sync (the tempo stays where it is). Loading a stream on
@@ -1425,9 +1491,11 @@ FA_API fa_result FA_CALL fa_deck_sync(fa_deck* deck, fa_deck* leader, uint32_t f
 FA_API fa_result FA_CALL fa_deck_play_synced(fa_deck* deck, fa_deck* leader, uint32_t flags);
 /* A loop of `beats` beats (1/16..32, e.g. 1, 2, 4, 8, 16) on the grid: from the beat
  * heard now (for loops shorter than a beat, the last whole part of it), or, while a deck
- * loop is on, from its in point (so halving and doubling keep the loop's start). 0 turns
- * the loop off (fa_deck_set_loop with 0, 0). The deck must be playing or paused with a
- * stream on it (FA_ERROR_NOT_FOUND when empty or without a grid). */
+ * loop is on, from its in point (so halving and doubling keep the loop's start). Playing
+ * reversed, the loop ends at the beat heard now and lies below it, and halving and
+ * doubling keep its end. 0 turns the loop off (fa_deck_set_loop with 0, 0). The deck must
+ * be playing or paused with a stream on it (FA_ERROR_NOT_FOUND when empty or without a
+ * grid). */
 FA_API fa_result FA_CALL fa_deck_set_loop_beats(fa_deck* deck, double beats);
 /* Beat jump: moves the deck `beats` beats on its grid (negative = back; 1/16..1024 either
  * way, e.g. 1, 4, 16, 32), at once and seamlessly (a join like a loop's). The distance is
@@ -1552,7 +1620,8 @@ typedef enum fa_loudness_source {
     FA_LOUDNESS_TAGS,      /* ReplayGain / R128 tags */
     FA_LOUDNESS_CACHE,     /* an earlier scan of the same content */
     FA_LOUDNESS_SCAN,      /* a full scan */
-    FA_LOUDNESS_APP        /* fa_stream_set_loudness */
+    FA_LOUDNESS_APP,       /* fa_stream_set_loudness */
+    FA_LOUDNESS_DIALNORM   /* a Dolby stream's dialogue level (fa_engine_set_dialnorm) */
 } fa_loudness_source;
 
 typedef struct fa_loudness {
@@ -1570,6 +1639,15 @@ typedef struct fa_loudness {
  * EBU broadcast. Valid range -60..0. Takes effect on playing streams at once,
  * with the same glide. Starts the analysis of streams that are attached. */
 FA_API fa_result FA_CALL fa_engine_set_normalization(fa_engine* engine, fa_normalize_mode mode, double target_lufs);
+
+/* Dolby streams (AC-3, E-AC-3) state their dialogue level ("dialnorm", -1 to -31
+ * dBFS), which broadcasters set to the programme's loudness (ATSC A/85). With this
+ * on (default off), a file's dialnorm counts as its loudness when there is no
+ * value from the app, no ReplayGain / R128 tag and no earlier scan in the cache:
+ * final at once, so a two-hour film needs no scan. -31, the value encoders write
+ * when nobody set it, is not used. Applies to streams whose analysis starts afterwards; live and
+ * app-I/O streams keep the running estimate. Off measures every file. */
+FA_API fa_result FA_CALL fa_engine_set_dialnorm(fa_engine* engine, int32_t enabled);
 
 typedef enum fa_limiter_mode {
     FA_LIMITER_AUTO = 0,   /* default: on while normalization is on */
@@ -2694,7 +2772,8 @@ FA_API fa_result FA_CALL fa_stream_get_tracker_channel_mute(fa_stream* stream, u
  * FA_EVENT_RAMP_DONE       position               fa_ramp.tag of the finished ramp
  * FA_EVENT_STARTED         position               0
  * FA_EVENT_MIDI_TEXT       the text's frame       index for fa_stream_get_midi_text
- * FA_EVENT_LOOPED          loop end it left       loop start it went to (CUE_IN or 0)
+ * FA_EVENT_LOOPED          loop end it left       loop start it went to (CUE_IN or 0);
+ *                                                 reversed, the start it left and the end it went to
  * FA_EVENT_CDG_CHANGED     CD+G packs now shown   what changed: FA_CDG_CHANGE_* (CD+G above)
  * FA_EVENT_SEEK_FAILED     the target not reached the fa_result (fa_stream_seek_async)
  * FA_EVENT_TRACKER_ROW     the row's first frame  order << 16 | row (FA_TRACKER_ROW_EVENTS)
@@ -2703,7 +2782,8 @@ FA_API fa_result FA_CALL fa_stream_get_tracker_channel_mute(fa_stream* stream, u
  * streams played on a device (decode-only streams list them with fa_stream_get_midi_text); TRACKER_ROW from
  * tracker modules played on a device (when asked for); METADATA from web
  * streams; STALLED and RESUMED from push, packet and web streams; DECODE_ERROR from packet
- * and disc streams. The others are raised by the features that produce them as those land (see docs/features). */
+ * and disc streams, and once for a stored ZIP song that does not match its archive's CRC (value
+ * FA_ERROR_UNSUPPORTED_FORMAT). The others are raised by the features that produce them as those land (see docs/features). */
 typedef enum fa_event_type {
     FA_EVENT_ENDED = 0,
     FA_EVENT_POSITION,        /* reached a requested frame */
@@ -2753,7 +2833,7 @@ FA_API fa_result FA_CALL fa_stream_set_event_callback(fa_stream* stream, fa_even
  * again from the callback to hear about the next pass (a loop's next turn, or after
  * seeking back). Frame-exact like markers: it follows tempo, rate and loops, and is
  * raised as that audio is mixed, about one device latency before it is heard.
- * Unlike markers it is raised playing reversed too, when the position counts down
+ * Like markers it is raised playing reversed too, when the position counts down
  * past the frame. A seek over the frame doesn't raise it: it stays armed. Streams
  * played on a device only (decode-only streams raise none).
  * Up to 64 frames are armed at once per stream; adding one that is already armed

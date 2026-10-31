@@ -18,9 +18,16 @@
 
 enum { FA_SOURCE_FILE = 1, FA_SOURCE_MEMORY, FA_SOURCE_IO };
 
+/* A file read through several sources at once, each at positions of its own
+ * (the temp file of an unpacked ZIP song: the stream plays it while scans and
+ * tag reads open it again, which the delete-on-close file allows no other way).
+ * Reference counted; the last release closes the file. */
+typedef struct fa_shared_file fa_shared_file;
+
 typedef struct fa_source {
     int kind;
     FILE* file;
+    fa_shared_file* shared;  /* FA_SOURCE_FILE: `file` belongs to it (reads take its lock), else NULL */
     const uint8_t* mem;
     size_t mem_size;
     uint8_t* owned;
@@ -44,6 +51,13 @@ typedef struct fa_source {
 
 fa_result fa_source_open_path(fa_source* src, const char* path);
 fa_result fa_source_open_memory(fa_source* src, const void* data, size_t size);
+/* Takes over the open `file` (rewound or not: sources seek before every read) of
+ * `length` bytes; FA_OK, or FA_ERROR_OUT_OF_MEMORY with `file` closed. */
+fa_result fa_shared_file_new(FILE* file, int64_t length, fa_shared_file** out);
+fa_shared_file* fa_shared_file_retain(fa_shared_file* sf);
+void fa_shared_file_release(fa_shared_file* sf);
+/* A source of its own on the shared file (retains it), reading all of it. */
+fa_result fa_source_open_shared(fa_source* src, fa_shared_file* sf);
 /* Like fa_source_open_memory but without a copy: `data` must outlive the source. */
 fa_result fa_source_open_memory_ref(fa_source* src, const void* data, size_t size);
 fa_result fa_source_open_io(fa_source* src, const fa_io_callbacks* io, void* user);
@@ -129,6 +143,9 @@ struct fa_decoder {
     /* The stream's fa_dynamic_range, for codecs that apply one (Dolby); given to
      * fa_decoder_open. NULL = full range. */
     fa_atomic32* dynamic_range;
+    /* Where Dolby codecs leave the stream's downmix levels and dialogue level
+     * (fa_ac3_mix_pack) after each unit; given to fa_decoder_open. NULL = nowhere. */
+    fa_atomic64* dolby_mix;
     /* MIDI, from fa_decoder_open's env (wrapping decoders such as HLS pass both on). */
     struct fa_soundfont* soundfont;   /* borrowed, NULL = none */
     uint32_t midi_rate;               /* MIDI and tracker modules: output rate */
@@ -147,11 +164,18 @@ struct fa_decoder {
 typedef struct fa_decoder_env {
     fa_atomic32* dynamic_range;       /* the stream's fa_dynamic_range (read while decoding),
                                          NULL = full range */
+    fa_atomic64* dolby_mix;           /* Dolby downmix information written while decoding
+                                         (fa_ac3_mix_pack), NULL = not wanted */
     struct fa_soundfont* soundfont;   /* MIDI: the instruments (the caller keeps it alive
                                          while the decoder is open), NULL = none */
     uint32_t midi_rate;               /* MIDI and tracker modules: output rate, 0 = FA_MIDI_DEFAULT_RATE */
     int32_t text_code_page;           /* MIDI: fa_open_options.text_code_page, 0 = detect */
 } fa_decoder_env;
+
+/* Could `data` (the start of a file, any length) be audio some decoder opens? The same
+ * content probes as fa_decoder_open: 0 only when none of them claims the bytes (a text
+ * file, a picture); 1 when one does or the bytes cannot tell (a tag that fills them). */
+int fa_decoder_recognizes(const uint8_t* data, size_t size);
 
 /* Detects the format of `src` and opens the matching decoder. `name_hint` (a path
  * or NULL) and `mime_hint` only break ties when the content is ambiguous.
@@ -253,6 +277,8 @@ int fa_probe_mp3_header(const uint8_t* data, size_t size, size_t start, uint32_t
 #define FA_WORKER_POLL_MIN_MS 5     /* the polling worker's shortest and longest sleep (worker_main) */
 #define FA_WORKER_POLL_MAX_MS 50
 #define FA_WORKER_POLL_IDLE_MS 100  /* ... while no stream has anything to decode */
+#define FA_REVERSE_BLOCK_MS 500     /* reversed: source decoded per seek (reverse_read) */
+#define FA_REVERSE_OVERLAP_MS 10    /* ... each block this far past its end, cross-faded with the one above */
 
 /* Soundfont references: retain returns `f` (NULL-safe); the last release frees it. */
 /* DLS banks (dls.c), turned into a SoundFont 2 image the synthesizer loads. */
@@ -676,6 +702,9 @@ struct fa_tag_sink {
 /* Reads every tag of the source into `sink`, in priority order (see fa_tags_get).
  * Moves the read position; needs a seekable source. */
 void fa_tags_collect(fa_source* src, fa_tag_sink* sink);
+/* A MIDI file's properties (if `info`) and title, artist and copyright (if `sink`),
+ * read without a soundfont (dec_midi.c). An error when `src` is not MIDI. */
+fa_result fa_midi_read_tags(fa_source* src, fa_stream_info* info, fa_tag_sink* sink);
 /* Where the audio of an MP3, AAC, AC-3 or FLAC file lies: after an ID3v2 tag and
  * FLAC's metadata blocks, before APEv2 and ID3v1 tags. *out_bits = FLAC's bits
  * per sample, else 0. Moves the read position. */
@@ -868,6 +897,7 @@ struct fa_engine {
     /* Normalization and limiter settings, read by the audio thread. */
     fa_atomic32 norm_mode;       /* fa_normalize_mode */
     fa_atomic32 norm_target;     /* float LUFS */
+    fa_atomic32 use_dialnorm;    /* fa_engine_set_dialnorm */
     fa_atomic32 limiter_mode;    /* fa_limiter_mode */
     fa_atomic32 limiter_ceiling; /* float dBTP */
 
@@ -1185,6 +1215,8 @@ struct fa_stream {
     fa_decoder decoder;
     int decoder_ready;
     fa_atomic32 dynamic_range;   /* fa_dynamic_range, read by the codec on every packet */
+    fa_atomic64 dolby_mix;       /* Dolby downmix information (fa_ac3_mix_pack), written by the codec */
+    fa_atomic32 dolby_downmix;   /* fa_dolby_downmix */
 
     fa_atomic32 state;           /* fa_stream_state */
     fa_atomic64 position;        /* source frames, when not attached */
@@ -1234,6 +1266,15 @@ struct fa_stream {
     float* mat_buf;              /* matrix output, 2 channels */
     float* matrix;               /* in x FA_DEVICE_CHANNELS weights, NULL = default; under
                                     api_lock + decode_lock */
+    /* Without `matrix`: the chain mixes Dolby audio down with the stream's own levels
+     * (dolby_w, made from dolby_key = the dolby_mix and mode they were made for).
+     * Set with the chain; dolby_w and dolby_key are the worker's (decode_lock).
+     * dolby_makeup: the dB the downmix's overload scaling took off, which normalization
+     * gives back (float, read by the mixer; 0 without the downmix). */
+    int dolby;
+    uint64_t dolby_key;
+    fa_atomic32 dolby_makeup;
+    float dolby_w[8 * FA_DEVICE_CHANNELS];
     fa_frames src_pos;           /* source frame of the next decoder read (worker) */
     fa_atomic32 eof;             /* the worker has written the last frame */
     fa_atomic32 flushing;        /* 1 = the audio thread must not touch the ring */
@@ -1273,6 +1314,15 @@ struct fa_stream {
     int64_t path_length;         /* (a stored ZIP entry); 0 = all of it */
     char path_name[260];         /* that entry's name, the decoder's hint; "" = none */
     int64_t zip_size;            /* bytes of the ZIP the audio came from, 0 = not a ZIP */
+    /* A stored ZIP entry played in place is checked against its CRC by the worker, a chunk
+     * at a time while the stream is attached (zip_crc_step in stream.c). */
+    fa_atomic32 zcrc_pending;    /* 1 from open until the check ended (or was given up) */
+    uint32_t zcrc_expect;        /* the CRC the archive lists for the entry */
+    uint32_t zcrc_acc;           /* of the bytes read so far; the fields from here are the worker's */
+    int64_t zcrc_done;
+    fa_source zcrc_src;          /* path streams read the entry again through a source of their own */
+    int zcrc_open;
+    uint8_t* zcrc_buf;
     int32_t audio_track;
     int32_t text_code_page;      /* fa_open_options.text_code_page (MIDI), 0 = detect */
     fa_mutex norm_lock;          /* scan_job, loud, loud_source */
@@ -1345,11 +1395,13 @@ struct fa_stream {
      * chain and the tmap count) run up while the source position runs down: linear
      * frame L is source position 2 * seek_base - L. The source is decoded forward in
      * blocks into rev_buf and handed out last frame first: rev_n frames are left,
-     * ending at source frame rev_pos (decode side, under decode_lock). */
+     * ending at source frame rev_pos, the first rev_hold of them held back for the
+     * cross-fade with the block below (see reverse_read; decode side, under decode_lock). */
     fa_atomic32 reverse_want;
     fa_atomic32 reverse;
     float* rev_buf;
-    fa_frames rev_cap, rev_n, rev_pos;
+    float* rev_ov;               /* inside rev_buf: the held frames while the block below decodes */
+    fa_frames rev_cap, rev_n, rev_pos, rev_hold;
 
     /* CD+G graphics (cdg.c): the packs, the surfaces drawing them, and a generation
      * count that tells surfaces the graphics were replaced. Never touched by the
@@ -1531,6 +1583,9 @@ struct fa_codec {
     /* fa_dynamic_range of the stream, read on every packet (NULL = full range).
      * Set by the owner after fa_codec_open. */
     fa_atomic32* dynamic_range;
+    /* Dolby codecs write the downmix information of each unit here (NULL = nowhere).
+     * Set by the owner after fa_codec_open. */
+    fa_atomic64* dolby_mix;
     /* Its audio can come out a packet or more after the packet that holds it (the
      * systems' decoders): the track decoder anchors the audio on the first packet. */
     int trails;

@@ -9,9 +9,14 @@
  * closest earlier cluster known from Cues or from clusters seen while reading,
  * then scan block headers to the packet holding the target.
  *
+ * On a web stream, Cues stored after the clusters and the last cluster in front of
+ * them (which gives the exact length) come in one range request of their own, so
+ * the download carries on from the first cluster.
+ *
  * Matroska timestamps are rounded to the TimestampScale (1 ms by default); the
  * track decoder snaps them to the packet grid of constant-duration codecs. */
 #include "demux.h"
+#include "net.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,6 +75,12 @@
 #define MKV_MAX_LACE 256
 #define MKV_SCAN_RING 64
 #define MKV_MAX_INDEX (1u << 20)
+/* Web streams: the bytes in front of the Cues read with them, for the last cluster:
+ * this many seconds of the file's bytes (from Info's Duration), within the bounds. */
+#define MKV_TAIL_S 8.0
+#define MKV_TAIL_MIN (64 * 1024)
+#define MKV_TAIL_MAX (1024 * 1024)
+#define MKV_RANGE_MAX (2 * 1024 * 1024)   /* fa_net_read_range's limit */
 
 typedef struct mkv_ref {          /* where a block of the track is, for seeking */
     int64_t elem;                 /* SimpleBlock or BlockGroup element */
@@ -889,6 +900,64 @@ static int find_last_block(mkv* m, const fa_codec_params* cp, fa_track_params* t
     return 1;
 }
 
+/* find_last_block over bytes [base, base + n) of the file read on their own (taken
+ * over), instead of the stream's reader. */
+static int find_last_block_in(mkv* m, uint8_t* data, size_t n, int64_t base, const fa_codec_params* cp, fa_track_params* tp)
+{
+    fa_br saved = m->br;
+    int ok;
+    fa_br_init_block(&m->br, saved.src, data, n, base);
+    ok = find_last_block(m, cp, tp);
+    fa_br_free(&m->br);
+    m->br = saved;
+    return ok;
+}
+
+/* A web stream: the Cues at cues_pos (when not read yet: *have_cues) and the track's
+ * last block, from requests of their own: one for both when the last cluster the
+ * Cues list lies in the MKV_TAIL_S in front of them, else a second one for it.
+ * 1 = the last block was found (tp). */
+static int read_tail_remote(mkv* m, fa_net* net, int64_t cues_pos, int* have_cues, const fa_codec_params* cp, fa_track_params* tp)
+{
+    int64_t end = m->seg_end >= 0 ? m->seg_end : m->br.src->length, from = -1, last, stop;
+    uint8_t* buf = NULL;
+    size_t n = 0;
+    if (end <= 0 || m->first_cluster < 0) return 0;
+    if (!*have_cues && cues_pos > m->first_cluster && cues_pos < end) {
+        int64_t guess = MKV_TAIL_MIN, len;
+        fa_br saved = m->br;
+        uint32_t id;
+        int64_t size, data;
+        if (m->duration > 0) {
+            double secs = m->duration * (double)m->scale / 1e9;
+            if (secs > 0) guess = (int64_t)((double)(cues_pos - m->first_cluster) / secs * MKV_TAIL_S);
+        }
+        if (guess < MKV_TAIL_MIN) guess = MKV_TAIL_MIN;
+        if (guess > MKV_TAIL_MAX) guess = MKV_TAIL_MAX;
+        from = cues_pos - guess > m->first_cluster ? cues_pos - guess : m->first_cluster;
+        len = end - from > MKV_RANGE_MAX ? MKV_RANGE_MAX : end - from;
+        if (fa_net_read_range(net, from, len, &buf, &n) != FA_OK) return 0;
+        /* The Cues element, whole, from these bytes. */
+        fa_br_init_block(&m->br, saved.src, buf, n, from);
+        if (fa_br_seek(&m->br, cues_pos) == FA_OK && read_header(m, &id, &size, &data) && id == ID_CUES && size >= 0 &&
+            data + size <= from + (int64_t)n) {
+            parse_cues(m, buf + (data - from), (size_t)size);
+            *have_cues = 1;
+        }
+        m->br = saved;                    /* buf stays ours */
+        if (!*have_cues) { free(buf); return 0; }
+    }
+    if (m->nindex == 0) { free(buf); return 0; }
+    last = m->index[m->nindex - 1].pos;
+    if (buf && last >= from) return find_last_block_in(m, buf, n, from, cp, tp);
+    free(buf);
+    /* The last cluster up to the Cues (or the end), on a request of its own. */
+    stop = cues_pos > last && cues_pos < end ? cues_pos : end;
+    if (last < m->first_cluster || stop - last <= 0 || stop - last > MKV_RANGE_MAX) return 0;
+    if (fa_net_read_range(net, last, stop - last, &buf, &n) != FA_OK) return 0;
+    return find_last_block_in(m, buf, n, last, cp, tp);
+}
+
 static void mkv_free(mkv* m)
 {
     fa_br_free(&m->br);
@@ -926,6 +995,8 @@ static fa_result mkv_open(fa_decoder* dec)
     int webm = 0, have_tracks = 0, have_cues = 0, count = 0;
     fa_track_params tp;
     uint8_t* body = NULL;
+    fa_net* net = src->seekable ? fa_net_of(src) : NULL;
+    int tail_done = 0;
     fa_result r;
 
     if (!m) return FA_ERROR_OUT_OF_MEMORY;
@@ -1005,6 +1076,8 @@ static fa_result mkv_open(fa_decoder* dec)
             break;
         }
     }
+    tp.last_pts = FA_DEMUX_NO_PTS;
+    if (net && have_tracks) tail_done = read_tail_remote(m, net, cues_pos, &have_cues, &tp.codec, &tp);
     /* Tracks or Cues stored after the clusters: only reachable by seeking. */
     if (src->seekable && ((!have_tracks && tracks_pos >= 0) || (!have_cues && cues_pos >= 0))) {
         int64_t want[2];
@@ -1032,8 +1105,7 @@ static fa_result mkv_open(fa_decoder* dec)
     dec->track_count = count;
     if (!have_tracks) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto fail; }
 
-    tp.last_pts = FA_DEMUX_NO_PTS;
-    if (!find_last_block(m, &tp.codec, &tp)) tp.last_pts = FA_DEMUX_NO_PTS;
+    if (!tail_done && !find_last_block(m, &tp.codec, &tp)) tp.last_pts = FA_DEMUX_NO_PTS;
 
     /* Back to the first cluster. */
     m->in_cluster = 0;

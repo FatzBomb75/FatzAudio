@@ -277,8 +277,8 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
         WinHttpSetTimeouts(request, (int)req->timeout_ms, (int)req->timeout_ms, (int)req->timeout_ms, (int)req->timeout_ms);
         /* Redirects come back to fa_http_fetch, which follows them for every transport
          * (WinHTTP's own would keep the Authorization header on another server). No
-         * cookie store either, as on the other transports: a kept session would replay
-         * a server's cookies on the stream's later requests. */
+         * cookie store either: the stream's own jar (fa_http_request.cookies) keeps
+         * them, the same on every transport. */
         WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &features, sizeof(features));
         slot = slot_add(req->cancel, request);
         if (req->cancel && fa_load32(req->cancel)) { r = FA_ERROR_BUSY; goto done; }
@@ -323,7 +323,7 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
         resp.status = (int)status;
         resp.headers = lines ? lines : (char*)"";
         resp.final_url = req->url;
-        switch (fa_http_redirect_target(req->url, (int)status, resp.headers, out_redirect)) {
+        switch (fa_http_redirect_target(req, (int)status, resp.headers, out_redirect)) {
         case 1: {
             /* Its body is read to the end, so the connection goes back to the pool. */
             DWORD got = 0, total = 0;
@@ -342,7 +342,13 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
         DWORD got = 0;
         if (req->cancel && fa_load32(req->cancel)) { r = FA_ERROR_BUSY; goto done; }
         if (!WinHttpReadData(request, buf, 65536, &got)) { r = FA_ERROR_NETWORK; break; }
-        if (got == 0) { r = FA_OK; break; }    /* WinHTTP checks Content-Length: a short body is an error above */
+        if (got == 0) {
+            /* WinHTTP checks Content-Length and the chunked terminator: a short body
+             * is an error above. It speaks HTTP/1 here (HTTP/2 is never turned on). */
+            r = FA_OK;
+            if (req->closed_end && fa_http_unframed(headers ? headers : "")) *req->closed_end = 1;
+            break;
+        }
         if (on_data(user, buf, got)) { r = FA_OK; break; }
     }
 done:

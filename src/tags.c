@@ -131,6 +131,11 @@ void fa_tags_parse_vorbis_comments(const uint8_t* p, size_t n, fa_tag_sink* sink
     if (n < 8) return;
     pos = 4 + (size_t)fa_le32(p);            /* vendor string */
     if (pos + 4 > n || pos < 4) return;
+    if (pos > 4 && pos - 4 <= sink->max_text && fa_utf8_valid(p + 4, pos - 4)) {
+        char* vendor = fa_strndup((const char*)p + 4, pos - 4);
+        if (vendor) sink->text(sink, FA_TAG_FORMAT_VORBIS, "VENDOR", vendor);
+        free(vendor);
+    }
     count = fa_le32(p + pos);
     pos += 4;
     for (i = 0; i < count && pos + 4 <= n; i++) {
@@ -374,7 +379,11 @@ static const field_map field_maps[] = {
     { FA_TAG_FORMAT_MIDI, "TITLE", FA_TAG_TITLE }, { FA_TAG_FORMAT_MIDI, "ARTIST", FA_TAG_ARTIST },
     { FA_TAG_FORMAT_MIDI, "COPYRIGHT", FA_TAG_COPYRIGHT },
     { FA_TAG_FORMAT_TRACKER, "TITLE", FA_TAG_TITLE }, { FA_TAG_FORMAT_TRACKER, "ARTIST", FA_TAG_ARTIST },
-    { FA_TAG_FORMAT_TRACKER, "COMMENT", FA_TAG_COMMENT }
+    { FA_TAG_FORMAT_TRACKER, "COMMENT", FA_TAG_COMMENT },
+
+    { FA_TAG_FORMAT_LYRICS3, "LYR", FA_TAG_LYRICS }, { FA_TAG_FORMAT_LYRICS3, "ETT", FA_TAG_TITLE },
+    { FA_TAG_FORMAT_LYRICS3, "EAR", FA_TAG_ARTIST }, { FA_TAG_FORMAT_LYRICS3, "EAL", FA_TAG_ALBUM },
+    { FA_TAG_FORMAT_LYRICS3, "INF", FA_TAG_COMMENT }
 };
 
 /* Limits for hostile tags: items and pictures kept, and the length of a field
@@ -526,6 +535,13 @@ FA_API void FA_CALL fa_tags_close(fa_tags* t)
     free(t);
 }
 
+static int tags_have_format(const fa_tags* t, int format)
+{
+    uint32_t i;
+    for (i = 0; i < t->nitems; i++) if (t->items[i].format == format) return 1;
+    return 0;
+}
+
 /* Tags and (unless FA_TAGS_NO_INFO) the properties of the file in `src`. With
  * `audio_only`, a file no decoder recognises is skipped (returns 0) before any of
  * its tags are taken. */
@@ -534,12 +550,18 @@ static int read_source(fa_tags* t, fa_source* src, const char* name, uint32_t fl
     if (audio_only || !(flags & FA_TAGS_NO_INFO)) {
         fa_decoder dec;
         fa_source_seek(src, 0);
-        if (fa_decoder_open(&dec, src, name, NULL, -1, NULL) == FA_OK) {
+        fa_result r = fa_decoder_open(&dec, src, name, NULL, -1, NULL);
+        if (r == FA_OK) {
             if (!(flags & FA_TAGS_NO_INFO)) {
                 fa_decoder_get_info(&dec, &t->info);
                 t->have_info = 1;
             }
             fa_decoder_close(&dec);
+        } else if (r == FA_ERROR_NO_SOUNDFONT) {
+            /* A MIDI file: no soundfont to play it with, but its tags and length can be read. */
+            fa_source_seek(src, 0);
+            if (fa_midi_read_tags(src, (flags & FA_TAGS_NO_INFO) ? NULL : &t->info, &t->sink) == FA_OK && !(flags & FA_TAGS_NO_INFO))
+                t->have_info = 1;
         } else if (audio_only) {
             return 0;
         }
@@ -576,7 +598,18 @@ static fa_result read_zip(fa_tags* t, fa_source* src, uint32_t flags)
             } else {
                 uint8_t* audio;
                 fa_source mem;
-                if (fa_zip_extract(src, &e[i], FA_ZIP_DEFAULT_MEMORY_LIMIT, &audio) != FA_OK) continue;
+                /* Not audio (a video, a PDF): told from a 64 KB prefix, not by unpacking it. */
+                if (e[i].size > FA_ZIP_PROBE_BYTES) {
+                    uint8_t* head = (uint8_t*)malloc(FA_ZIP_PROBE_BYTES);
+                    size_t got = 0;
+                    fa_result pr;
+                    if (!head) continue;
+                    pr = fa_zip_extract_prefix(src, &e[i], head, FA_ZIP_PROBE_BYTES, &got);
+                    ok = pr != FA_OK || fa_decoder_recognizes(head, got);
+                    free(head);
+                    if (!ok) continue;
+                }
+                if (fa_zip_extract(src, &e[i], FA_ZIP_DEFAULT_MEMORY_LIMIT, NULL, &audio) != FA_OK) continue;
                 fa_source_open_memory_ref(&mem, audio, (size_t)e[i].size);
                 ok = read_source(t, &mem, e[i].name, flags, 1);
                 fa_source_close(&mem);
@@ -652,18 +685,20 @@ FA_API fa_result FA_CALL fa_stream_get_tags(fa_stream* stream, uint32_t flags, f
     if (!t) return FA_ERROR_OUT_OF_MEMORY;
     /* The file is read again through a source of its own: the stream's source
      * belongs to its decode thread. Memory blocks stay fixed while the stream is open. */
-    if (stream->path || stream->source.kind == FA_SOURCE_MEMORY) {
+    if (stream->path || stream->source.kind == FA_SOURCE_MEMORY || stream->source.shared) {
         fa_source src;
-        /* A stored ZIP entry is reopened as its bytes in the archive. */
-        r = stream->path ? fa_source_open_path_window(&src, stream->path, stream->path_offset, stream->path_length)
-                         : fa_source_open_memory_ref(&src, stream->source.mem, stream->source.mem_size);
+        /* A stored ZIP entry is reopened as its bytes in the archive, an unpacked
+         * one (temp file) through the stream's shared file. */
+        if (stream->source.shared) r = fa_source_open_shared(&src, stream->source.shared);
+        else if (stream->path) r = fa_source_open_path_window(&src, stream->path, stream->path_offset, stream->path_length);
+        else r = fa_source_open_memory_ref(&src, stream->source.mem, stream->source.mem_size);
         if (r == FA_OK) {
             /* A ZIP (MP3+G) gives the tags of the audio file inside it. */
             r = read_any(t, &src, stream->path_name[0] ? stream->path_name : NULL, flags | FA_TAGS_NO_INFO);
             fa_source_close(&src);
         }
     }
-    if (stream->midi) {
+    if (stream->midi && !tags_have_format(t, FA_TAG_FORMAT_MIDI)) {
         fa_midi_info mi;
         if (fa_stream_get_midi_info(stream, &mi) == FA_OK) {
             collect_text(&t->sink, FA_TAG_FORMAT_MIDI, "TITLE", mi.title);

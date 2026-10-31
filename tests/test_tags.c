@@ -376,6 +376,245 @@ static void test_v1_ape_priority(void)
     buf_free(&file);
 }
 
+
+/* ---- ID3v2 compressed frames, SYLT ------------------------------------------------------ */
+
+/* zlib streams (RFC 1950) made with Python's zlib: "\0Compressed Title", "\3Zlib Artist \xC3\xA9"
+ * and "\3" + "abcdefghij" x 50. */
+static const uint8_t g_zlib_title[] = { 0x78, 0xDA, 0x63, 0x70, 0xCE, 0xCF, 0x2D, 0x28, 0x4A, 0x2D, 0x2E, 0x4E, 0x4D, 0x51, 0x08, 0xC9, 0x2C, 0xC9, 0x49, 0x05, 0x00, 0x35, 0x25, 0x06, 0x38 };
+static const uint8_t g_zlib_artist[] = { 0x78, 0xDA, 0x63, 0x8E, 0xCA, 0xC9, 0x4C, 0x52, 0x70, 0x2C, 0x2A, 0xC9, 0x2C, 0x2E, 0x51, 0x38, 0xBC, 0x12, 0x00, 0x27, 0x1F, 0x05, 0xB8 };
+static const uint8_t g_zlib_long[] = { 0x78, 0xDA, 0x63, 0x4E, 0x4C, 0x4A, 0x4E, 0x49, 0x4D, 0x4B, 0xCF, 0xC8, 0xCC, 0x1A, 0x65, 0x8D, 0x14, 0x16, 0x00, 0xFE, 0xB1, 0xC6, 0x42 };
+
+static void test_id3_compressed(void)
+{
+    buf file = { 0 }, frames = { 0 }, body = { 0 };
+    fa_tags* t;
+    /* ID3v2.3: TIT2 with the compression flag (0x80): decompressed size, then the zlib stream. */
+    put_be32(&body, 17); put(&body, g_zlib_title, sizeof(g_zlib_title));
+    put_str(&frames, "TIT2"); put_be32(&frames, (uint32_t)body.n); put_be16(&frames, 0x0080); put_buf(&frames, &body);
+    buf_free(&body);
+    /* The same with a group ID byte too (0xA0), after the size. */
+    put_be32(&body, 501); put_u8(&body, 7); put(&body, g_zlib_long, sizeof(g_zlib_long));
+    put_str(&frames, "TCOM"); put_be32(&frames, (uint32_t)body.n); put_be16(&frames, 0x00A0); put_buf(&frames, &body);
+    buf_free(&body);
+    /* A wrong decompressed size, and an encrypted frame: both skipped. */
+    put_be32(&body, 99); put(&body, g_zlib_title, sizeof(g_zlib_title));
+    put_str(&frames, "TALB"); put_be32(&frames, (uint32_t)body.n); put_be16(&frames, 0x0080); put_buf(&frames, &body);
+    buf_free(&body);
+    put_be32(&body, 17); put_u8(&body, 1); put(&body, g_zlib_title, sizeof(g_zlib_title));
+    put_str(&frames, "TCOP"); put_be32(&frames, (uint32_t)body.n); put_be16(&frames, 0x00C0); put_buf(&frames, &body);
+    buf_free(&body);
+    put_u8(&body, 0); put_str(&body, "Plain");
+    put_str(&frames, "TPE1"); put_be32(&frames, (uint32_t)body.n); put_be16(&frames, 0); put_buf(&frames, &body);
+    buf_free(&body);
+    id3_header(&file, 3, 0, (uint32_t)frames.n);
+    put_buf(&file, &frames);
+    t = read_mem(&file, 0);
+    CHECK(t != NULL);
+    CHECK_STR(fa_tags_get(t, FA_TAG_TITLE), "Compressed Title");
+    CHECK_EQ(strlen(fa_tags_get(t, FA_TAG_COMPOSER)), 500);
+    CHECK_STR(fa_tags_get(t, FA_TAG_ALBUM), "");
+    CHECK_STR(fa_tags_get(t, FA_TAG_COPYRIGHT), "");
+    CHECK_STR(fa_tags_get(t, FA_TAG_ARTIST), "Plain");       /* the frames after the bad ones are read */
+    fa_tags_close(t);
+    buf_free(&frames);
+    buf_free(&file);
+
+    /* ID3v2.4: compression (0x08) needs the data length indicator (0x01, synchsafe), and
+     * unsynchronisation (0x02) is undone before inflating. */
+    put_synchsafe(&body, 15); put(&body, g_zlib_artist, sizeof(g_zlib_artist));
+    put_str(&frames, "TPE1"); put_synchsafe(&frames, (uint32_t)body.n); put_be16(&frames, 0x0009); put_buf(&frames, &body);
+    buf_free(&body);
+    put(&body, g_zlib_artist, sizeof(g_zlib_artist));      /* no data length: skipped */
+    put_str(&frames, "TALB"); put_synchsafe(&frames, (uint32_t)body.n); put_be16(&frames, 0x0008); put_buf(&frames, &body);
+    buf_free(&body);
+    put_synchsafe(&body, 4); put(&body, g_zlib_artist, sizeof(g_zlib_artist));    /* encrypted (0x04): skipped */
+    put_str(&frames, "TCOM"); put_synchsafe(&frames, (uint32_t)body.n); put_be16(&frames, 0x000D); put_buf(&frames, &body);
+    buf_free(&body);
+    id3_header(&file, 4, 0, (uint32_t)frames.n);
+    put_buf(&file, &frames);
+    t = read_mem(&file, 0);
+    CHECK(t != NULL);
+    CHECK_STR(fa_tags_get(t, FA_TAG_ARTIST), "Zlib Artist \xc3\xa9");
+    CHECK_STR(fa_tags_get(t, FA_TAG_ALBUM), "");
+    CHECK_STR(fa_tags_get(t, FA_TAG_COMPOSER), "");
+    fa_tags_close(t);
+    buf_free(&frames);
+    buf_free(&file);
+}
+
+static void put_sylt(buf* frames, int ver, int enc, int format, const char* desc, int count, const char* const* text, const uint32_t* time)
+{
+    buf body = { 0 };
+    int i;
+    put_u8(&body, enc); put_str(&body, "eng"); put_u8(&body, format); put_u8(&body, 1);
+    if (enc == 1) { put_u8(&body, 0xFF); put_u8(&body, 0xFE); }
+    put_strz(&body, desc);
+    for (i = 0; i < count; i++) { put_strz(&body, text[i]); put_be32(&body, time[i]); }
+    put_str(frames, "SYLT");
+    if (ver == 4) put_synchsafe(frames, (uint32_t)body.n); else put_be32(frames, (uint32_t)body.n);
+    put_be16(frames, 0);
+    put_buf(frames, &body);
+    buf_free(&body);
+}
+
+static void test_sylt(void)
+{
+    buf file = { 0 }, frames = { 0 };
+    {
+        fa_tags* t = NULL;
+        char path[512];
+        snprintf(path, sizeof(path), "%s/tags/sylt.mp3", FA_TEST_DATA_DIR);
+        CHECK_EQ(fa_tags_read_path(path, FA_TAGS_NO_INFO, &t), FA_OK);
+        /* mutagen's SYLT (ID3v2.4, UTF-8, milliseconds): a line per entry; a line break at the start of
+         * an entry's text is an empty line. */
+        CHECK_STR(item_value(t, "SYLT:Karaoke"), "[00:01.000]Hello\n[00:01.500] world\n\n[01:02.340]Second line");
+        CHECK_STR(fa_tags_get(t, FA_TAG_TITLE), "Sung");
+        fa_tags_close(t);
+    }
+    {
+        /* Built here: no description, UTF-16, a trailing line break, and times in MPEG frames (not read). */
+        static const char* const text[] = { "A", "B\n" };
+        static const uint32_t time[] = { 90, 3723004 };
+        fa_tags* t;
+        put_sylt(&frames, 3, 0, 2, "", 2, text, time);
+        put_sylt(&frames, 3, 0, 1, "frames", 2, text, time);
+        id3_header(&file, 3, 0, (uint32_t)frames.n);
+        put_buf(&file, &frames);
+        t = read_mem(&file, 0);
+        CHECK(t != NULL);
+        CHECK_STR(item_value(t, "SYLT"), "[00:00.090]A\n[62:03.004]B");
+        CHECK_STR(item_value(t, "SYLT:frames"), "(missing)");
+        fa_tags_close(t);
+    }
+    buf_free(&frames);
+    buf_free(&file);
+}
+
+/* ---- Lyrics3 ---------------------------------------------------------------------------- */
+
+static void put_l3_field(buf* b, const char* id, const char* data)
+{
+    char size[8];
+    snprintf(size, sizeof(size), "%05d", (int)strlen(data));
+    put_str(b, id); put_str(b, size); put_str(b, data);
+}
+
+/* "LYRICSBEGIN", fields, a 6-digit size and "LYRICS200". `counts_begin`: the size includes "LYRICSBEGIN". */
+static void put_lyrics3_v2(buf* b, int counts_begin)
+{
+    buf f = { 0 };
+    char size[8];
+    put_l3_field(&f, "IND", "10");
+    put_l3_field(&f, "LYR", "Line one\r\nLine two");
+    put_l3_field(&f, "ETT", "Lyric Title");
+    put_l3_field(&f, "EAR", "Lyric Artist");
+    put_l3_field(&f, "EAL", "Lyric Album");
+    put_l3_field(&f, "AUT", "Writer");
+    put_str(b, "LYRICSBEGIN");
+    put_buf(b, &f);
+    snprintf(size, sizeof(size), "%06d", (int)f.n + (counts_begin ? 11 : 0));
+    put_str(b, size);
+    put_str(b, "LYRICS200");
+    buf_free(&f);
+}
+
+static void test_lyrics3(void)
+{
+    static const char audio[] = "\xFF\xFB\x90\x00 audio bytes here";
+    buf file = { 0 };
+    {
+        fa_tags* t;
+        fa_source src;
+        int64_t start, end;
+        uint32_t bits;
+        /* v2.00 before an ID3v1 tag: v1 wins the fields it has, Lyrics3 fills the rest. */
+        put_str(&file, audio);
+        put_lyrics3_v2(&file, 1);
+        put_v1(&file, "V1 Title", 4, 9);
+        t = read_mem(&file, 0);
+        CHECK(t != NULL);
+        CHECK_STR(fa_tags_get(t, FA_TAG_TITLE), "V1 Title");
+        CHECK_STR(fa_tags_get(t, FA_TAG_LYRICS), "Line one\r\nLine two");
+        CHECK_STR(item_value(t, "LYR"), "Line one\r\nLine two");
+        CHECK_STR(item_value(t, "ETT"), "Lyric Title");
+        CHECK_STR(item_value(t, "AUT"), "Writer");
+        CHECK_STR(item_value(t, "IND"), "10");
+        fa_tags_close(t);
+        CHECK_EQ(fa_source_open_memory_ref(&src, file.p, file.n), FA_OK);
+        fa_tags_audio_span(&src, &start, &end, &bits);
+        CHECK_EQ(start, 0);
+        CHECK_EQ(end, (int64_t)strlen(audio));
+        fa_source_close(&src);
+        buf_free(&file);
+
+        /* Without an ID3v1 tag, and with a size that leaves out "LYRICSBEGIN". */
+        put_str(&file, audio);
+        put_lyrics3_v2(&file, 0);
+        t = read_mem(&file, 0);
+        CHECK(t != NULL);
+        CHECK_STR(fa_tags_get(t, FA_TAG_TITLE), "Lyric Title");
+        CHECK_STR(fa_tags_get(t, FA_TAG_ARTIST), "Lyric Artist");
+        CHECK_STR(fa_tags_get(t, FA_TAG_ALBUM), "Lyric Album");
+        fa_tags_close(t);
+        buf_free(&file);
+
+        /* v1.00: the text between LYRICSBEGIN and LYRICSEND. */
+        put_str(&file, audio);
+        put_str(&file, "LYRICSBEGIN" "Just the words");
+        put_str(&file, "LYRICSEND");
+        put_v1(&file, "V1 Title", 4, 9);
+        t = read_mem(&file, 0);
+        CHECK(t != NULL);
+        CHECK_STR(fa_tags_get(t, FA_TAG_LYRICS), "Just the words");
+        fa_tags_close(t);
+        CHECK_EQ(fa_source_open_memory_ref(&src, file.p, file.n), FA_OK);
+        fa_tags_audio_span(&src, &start, &end, &bits);
+        CHECK_EQ(end, (int64_t)strlen(audio));
+        fa_source_close(&src);
+        buf_free(&file);
+
+        /* APEv2 after the Lyrics3 tag, and before it. */
+        put_str(&file, audio);
+        put_lyrics3_v2(&file, 1);
+        put_ape(&file, 0);
+        put_v1(&file, "V1 Title", 4, 9);
+        t = read_mem(&file, 0);
+        CHECK(t != NULL);
+        CHECK_STR(fa_tags_get(t, FA_TAG_ARTIST), "X; Y");
+        CHECK_STR(fa_tags_get(t, FA_TAG_LYRICS), "Line one\r\nLine two");
+        fa_tags_close(t);
+        CHECK_EQ(fa_source_open_memory_ref(&src, file.p, file.n), FA_OK);
+        fa_tags_audio_span(&src, &start, &end, &bits);
+        CHECK_EQ(end, (int64_t)strlen(audio));
+        fa_source_close(&src);
+        buf_free(&file);
+        put_str(&file, audio);
+        put_ape(&file, 0);
+        put_lyrics3_v2(&file, 1);
+        put_v1(&file, "V1 Title", 4, 9);
+        t = read_mem(&file, 0);
+        CHECK(t != NULL);
+        CHECK_STR(fa_tags_get(t, FA_TAG_ARTIST), "X; Y");
+        CHECK_STR(fa_tags_get(t, FA_TAG_LYRICS), "Line one\r\nLine two");
+        fa_tags_close(t);
+        CHECK_EQ(fa_source_open_memory_ref(&src, file.p, file.n), FA_OK);
+        fa_tags_audio_span(&src, &start, &end, &bits);
+        CHECK_EQ(end, (int64_t)strlen(audio));
+        fa_source_close(&src);
+        buf_free(&file);
+
+        /* A damaged tag (a size that leads nowhere) gives nothing. */
+        put_str(&file, audio);
+        put_str(&file, "LYRICSBEGIN" "IND0000210" "999999" "LYRICS200");
+        t = read_mem(&file, 0);
+        CHECK(t != NULL);
+        CHECK_STR(fa_tags_get(t, FA_TAG_LYRICS), "");
+        fa_tags_close(t);
+        buf_free(&file);
+    }
+}
+
 /* ---- FLAC: Vorbis comments and pictures -------------------------------------------- */
 
 static void vc_item(buf* b, const char* s) { put_le32(b, (uint32_t)strlen(s)); put_str(b, s); }
@@ -747,6 +986,118 @@ static void test_matroska_tags(void)
     buf_free(&hdr);
 }
 
+
+static void test_matroska_targeted_tags(void)
+{
+    buf file = { 0 }, seg = { 0 }, tags = { 0 }, hdr = { 0 };
+    fa_tags* t;
+    ebml_el(&hdr, 0x4282, "matroska", 8);
+    ebml_buf(&file, 0x1A45DFA3, &hdr);
+    tag(&tags, 30, 0, "TITLE", "Global");
+    tag(&tags, 30, 77, "BPS", "123456");
+    tag(&tags, 30, 77, "TITLE", "Track Title");             /* aimed at a track: never the common field */
+    {
+        /* A chapter's tag, and a tag aimed at both a track and an edition (named after the track). */
+        buf st = { 0 }, tg = { 0 }, targets = { 0 }, one = { 0 };
+        ebml_el(&st, 0x45A3, "TITLE", 5);
+        ebml_el(&st, 0x4487, "Verse", 5);
+        ebml_buf(&one, 0x67C8, &st);
+        ebml_el(&targets, 0x68CA, "\x1E", 1);
+        ebml_el(&targets, 0x63C4, "\x05", 1);
+        ebml_buf(&tg, 0x63C0, &targets);
+        put_buf(&tg, &one);
+        ebml_buf(&tags, 0x7373, &tg);
+        buf_free(&st); buf_free(&tg); buf_free(&targets); buf_free(&one);
+        ebml_el(&st, 0x45A3, "ARTIST", 6);
+        ebml_el(&st, 0x4487, "Singer", 6);
+        ebml_buf(&one, 0x67C8, &st);
+        ebml_el(&targets, 0x63C9, "\x09", 1);
+        ebml_el(&targets, 0x63C5, "\x2A", 1);
+        ebml_buf(&tg, 0x63C0, &targets);
+        put_buf(&tg, &one);
+        ebml_buf(&tags, 0x7373, &tg);
+        buf_free(&st); buf_free(&tg); buf_free(&targets); buf_free(&one);
+    }
+    ebml_buf(&seg, 0x1254C367, &tags);
+    ebml_buf(&file, 0x18538067, &seg);
+    t = read_mem(&file, 0);
+    CHECK(t != NULL);
+    CHECK_STR(fa_tags_get(t, FA_TAG_TITLE), "Global");
+    CHECK_STR(fa_tags_get(t, FA_TAG_ARTIST), "");
+    CHECK_STR(item_value(t, "TRACK:77/BPS"), "123456");
+    CHECK_STR(item_value(t, "TRACK:77/TITLE"), "Track Title");
+    CHECK_STR(item_value(t, "CHAPTER:5/TITLE"), "Verse");
+    CHECK_STR(item_value(t, "TRACK:42/ARTIST"), "Singer");
+    fa_tags_close(t);
+    buf_free(&file);
+    buf_free(&seg);
+    buf_free(&tags);
+    buf_free(&hdr);
+}
+
+static void test_flac_cuesheet_and_vendor(void)
+{
+    fa_tags* t = NULL;
+    char path[512];
+    snprintf(path, sizeof(path), "%s/tags/cue.flac", FA_TEST_DATA_DIR);
+    CHECK_EQ(fa_tags_read_path(path, FA_TAGS_NO_INFO, &t), FA_OK);
+    /* mutagen's cue sheet: two tracks and the lead-out (170, left out). */
+    CHECK_STR(item_value(t, "CUESHEET/CATALOG"), "0123456789012");
+    CHECK_STR(item_value(t, "CUESHEET/TRACK01"), "00:00.000");
+    CHECK_STR(item_value(t, "CUESHEET/TRACK01/ISRC"), "USRC17607839");
+    CHECK_STR(item_value(t, "CUESHEET/TRACK02"), "00:00.510");           /* at index point 1: (22050 + 441) / 44100 s */
+    CHECK_STR(item_value(t, "CUESHEET/TRACK02/ISRC"), "(missing)");
+    CHECK_STR(item_value(t, "CUESHEET/TRACK170"), "(missing)");
+    CHECK_STR(item_value(t, "VENDOR"), "ffmpeg");                          /* the vendor string (-fflags +bitexact) */
+    fa_tags_close(t);
+
+    snprintf(path, sizeof(path), "%s/tags/tags.opus", FA_TEST_DATA_DIR);
+    CHECK_EQ(fa_tags_read_path(path, FA_TAGS_NO_INFO, &t), FA_OK);
+    CHECK_STR(item_value(t, "VENDOR"), "ffmpeg");                          /* OpusTags carries one too */
+    fa_tags_close(t);
+}
+
+/* A Standard MIDI File of one track: a track name, a copyright and one note. */
+static void put_smf(buf* b)
+{
+    buf trk = { 0 };
+    put_u8(&trk, 0); put_u8(&trk, 0xFF); put_u8(&trk, 0x03); put_u8(&trk, 8); put_str(&trk, "Song One");
+    put_u8(&trk, 0); put_u8(&trk, 0xFF); put_u8(&trk, 0x02); put_u8(&trk, 9); put_str(&trk, "(c) Mine!");
+    put_u8(&trk, 0); put_u8(&trk, 0x90); put_u8(&trk, 60); put_u8(&trk, 100);
+    put_u8(&trk, 0x83); put_u8(&trk, 0x60); put_u8(&trk, 0x80); put_u8(&trk, 60); put_u8(&trk, 0);   /* 480 ticks: 0.5 s at 120 bpm / 480 */
+    put_u8(&trk, 0); put_u8(&trk, 0xFF); put_u8(&trk, 0x2F); put_u8(&trk, 0);
+    put_str(b, "MThd"); put_be32(b, 6); put_be16(b, 0); put_be16(b, 1); put_be16(b, 480);
+    put_str(b, "MTrk"); put_be32(b, (uint32_t)trk.n); put_buf(b, &trk);
+    buf_free(&trk);
+}
+
+static void test_midi_without_soundfont(void)
+{
+    buf file = { 0 };
+    fa_tags* t;
+    fa_stream_info info;
+    put_smf(&file);
+    /* No decoder can open it (no soundfont), but the title, artist and length can be read. */
+    t = NULL;
+    CHECK_EQ(fa_tags_read_memory(file.p, file.n, 0, &t), FA_OK);
+    CHECK_STR(fa_tags_get(t, FA_TAG_TITLE), "Song One");
+    CHECK_STR(fa_tags_get(t, FA_TAG_COPYRIGHT), "(c) Mine!");
+    CHECK_EQ(fa_tags_get_info(t, &info), FA_OK);
+    CHECK_STR(info.codec, "midi");
+    CHECK_STR(info.container, "smf");
+    CHECK_EQ(info.format.sample_rate, 44100);
+    CHECK_EQ(info.format.channels, 2);
+    CHECK(info.duration > 400000000LL && info.duration < 4000000000LL);
+    CHECK_EQ(info.file_size, (int64_t)file.n);
+    fa_tags_close(t);
+    /* With NO_INFO nothing is parsed. */
+    t = read_mem(&file, 0);
+    CHECK(t != NULL);
+    CHECK_EQ(fa_tags_get_info(t, &info), FA_ERROR_NOT_FOUND);
+    fa_tags_close(t);
+    buf_free(&file);
+}
+
 /* ---- ZIP (MP3+G) -------------------------------------------------------------------- */
 
 static void zip_add(buf* z, buf* cd, const char* name, const buf* data, uint32_t* count)
@@ -1073,6 +1424,12 @@ int main(void)
     RUN(test_mp4_ilst);
     RUN(test_wav_aiff);
     RUN(test_matroska_tags);
+    RUN(test_matroska_targeted_tags);
+    RUN(test_flac_cuesheet_and_vendor);
+    RUN(test_midi_without_soundfont);
+    RUN(test_id3_compressed);
+    RUN(test_sylt);
+    RUN(test_lyrics3);
     RUN(test_zip);
     RUN(test_ffmpeg_files);
     RUN(test_errors_and_empty);

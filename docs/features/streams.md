@@ -316,3 +316,4 @@ Console.WriteLine(s.Info.AudioTrackCount);
 - Forward-only sources work when the MP4 has its index in front (faststart or fragmented); otherwise `FA_ERROR_NOT_SEEKABLE`. Matroska always works.
 - Not supported: encrypted tracks (CENC), compressed Matroska tracks (zlib, bzip2, LZO), chained Matroska segments, and MP4 edit lists beyond a leading gap and one edit.
 - When your app demuxes the video itself with FFmpeg, you can still open the file a second time for the audio, or hand FatzAudio the packets you already read ([FFmpeg hand-off](ffmpeg.md)).
+- Over the network (`fa_stream_open_url`) the same files play and seek while they download, reading only what is needed: a fragmented MP4 reads its fragments as playback reaches them, and Matroska reads Cues stored at the end in one extra request ([MP4 and Matroska files](web-streams.md#mp4-and-matroska-files)).

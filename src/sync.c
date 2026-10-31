@@ -8,7 +8,9 @@
  * aligning their mixed frames aligns what is heard, master delay included.
  *
  * A playing deck is pulled into phase by bending its tempo (small errors) or by a
- * jump on its next beat (fa_stream_jump, seamless like a loop). The lock runs on the
+ * jump on its next beat (fa_stream_jump, seamless like a loop). A deck playing
+ * backwards hears its beats counting down: its phase is measured on that count, and
+ * its next beat is the one below. The lock runs on the
  * engine's event thread, about 20 times a second (fa_mixer_tick), under the mixer
  * lock, like the deck API. Nothing here runs on the audio thread. */
 #include "mixer.h"
@@ -157,6 +159,9 @@ double fa_sync_tempo_for(double bpm, double grid_bpm, double rate, double range,
     return 0.0;
 }
 
+/* Beats heard since `off` (the bar offset, or 0): counting down when reversed. */
+static double heard_beats(const fa_deck_now* n, double off) { return n->reversed ? off - n->beat : n->beat - off; }
+
 /* The phase error of `dn` against `ln`, in the leader's beats (+ = the deck is ahead),
  * wrapped to the nearest beat (BAR: the nearest bar). */
 static double phase_error(const fa_deck_now* dn, const fa_deck_now* ln, double factor, uint32_t flags)
@@ -164,13 +169,21 @@ static double phase_error(const fa_deck_now* dn, const fa_deck_now* ln, double f
     double x, p;
     if (flags & FA_SYNC_BAR) {
         double lb = (double)ln->v.g.beats_per_bar, db = (double)dn->v.g.beats_per_bar * factor;
-        x = (dn->beat - (double)dn->v.g.bar_offset) * factor - (ln->beat - (double)ln->v.g.bar_offset);
+        x = heard_beats(dn, (double)dn->v.g.bar_offset) * factor - heard_beats(ln, (double)ln->v.g.bar_offset);
         p = lb < db ? lb : db;
     } else {
-        x = dn->beat * factor - ln->beat;
+        x = heard_beats(dn, 0.0) * factor - heard_beats(ln, 0.0);
         p = factor < 1.0 ? factor : 1.0;
     }
     return x - p * floor(x / p + 0.5);
+}
+
+/* The next beat (BAR: downbeat) heard from `beat` on, in the direction played. */
+static double next_beat(const fa_grid_view* v, double beat, int reversed, int bar)
+{
+    double bpb = (double)v->g.beats_per_bar, off = (double)v->g.bar_offset;
+    if (!reversed) return bar ? fa_grid_next_downbeat(v, beat) : ceil(beat - 1e-6);
+    return bar ? off + bpb * floor((beat - off) / bpb + 1e-6) : floor(beat + 1e-6);
 }
 
 static double error_ms(double leader_beats, const fa_deck_now* ln) { return leader_beats * 60000.0 / ln->bpm; }
@@ -248,17 +261,16 @@ static int sync_tick(struct fa_deck* d, int64_t now)
     }
     if (d->settling && !(playing(&dn) && playing(&ln)))   /* the pull's time starts once both play */
         d->settle_end = now + (int64_t)(8.0 * 60e9 / ln.bpm) + 1000000000;
-    /* Reversed, no phase jump is made: drop a pending one, so fa_deck_beat_jump isn't
-     * kept busy, and measure anew once both play forward. */
-    if (d->jumping && (dn.reversed || ln.reversed)) d->jumping = 0;
-    if ((f & FA_SYNC_BEAT) && playing(&dn) && playing(&ln) && !dn.reversed && !ln.reversed && now >= d->hold_until) {
+    /* A jump worked out for the other direction (of either deck) is dropped: measured anew. */
+    if (d->jumping && (dn.reversed != d->jump_rev || ln.reversed != d->jump_lrev)) d->jumping = 0;
+    if ((f & FA_SYNC_BEAT) && playing(&dn) && playing(&ln) && now >= d->hold_until) {
         if (d->jumping) {
             fa_result r = fa_stream_jump(dn.s, d->jump_at, d->jump_by);
-            if (r == FA_OK || (r == FA_ERROR_BUSY && dn.src > (double)d->jump_at + dn.sr)) {
+            double ahead = dn.reversed ? dn.src - (double)d->jump_at : (double)d->jump_at - dn.src;
+            if (r == FA_OK || (r == FA_ERROR_BUSY && ahead < -dn.sr)) {
                 /* Done (or missed by a second: measured anew). Measure again once heard. */
                 d->jumping = 0;
-                d->hold_until = now + (int64_t)(((double)d->jump_at - dn.src) / (dn.sr * dn.tempo * dn.rate) * 1e9) +
-                                150000000;
+                d->hold_until = now + (int64_t)(ahead / (dn.sr * dn.tempo * dn.rate) * 1e9) + 150000000;
             } else if (r != FA_ERROR_BUSY) {
                 d->jumping = 0;
             }
@@ -266,10 +278,13 @@ static int sync_tick(struct fa_deck* d, int64_t now)
         } else {
             double x = phase_error(&dn, &ln, d->sync_factor, f), ms = error_ms(x, &ln), xd = x / d->sync_factor;
             if (fabs(ms) >= SYNC_PULL_MS) {
-                /* Too far to bend: jump on the deck's next beat by the error. */
-                double nb = ceil(dn.beat + 1e-6), fpb = 60.0 * dn.sr / dn.grid_bpm;
+                /* Too far to bend: jump on the deck's next beat by the error (reversed, the
+                 * beat below, and back up the song to fall behind). */
+                double nb = dn.reversed ? floor(dn.beat - 1e-6) : ceil(dn.beat + 1e-6), fpb = 60.0 * dn.sr / dn.grid_bpm;
                 d->jump_at = (fa_frames)floor(src_of_beat(&dn.v, nb) + 0.5);
-                d->jump_by = (fa_frames)floor(-xd * fpb + 0.5);
+                d->jump_by = (fa_frames)floor((dn.reversed ? xd : -xd) * fpb + 0.5);
+                d->jump_rev = dn.reversed;
+                d->jump_lrev = ln.reversed;
                 d->jumping = 1;
                 d->settled = 0;
                 set_tempo(d, dn.s, base);
@@ -401,17 +416,16 @@ FA_API fa_result FA_CALL fa_deck_play_synced(fa_deck* deck, fa_deck* leader, uin
     /* Where it starts, and the beat it lands with. */
     if (dn.state == FA_STATE_PAUSED) { fa_frames p = 0; fa_stream_get_position(dn.s, &p); c = (double)p; }
     else c = (double)fa_deck_cue_point_now(deck);
-    {
-        double b = fa_grid_beat_at(&dn.v, c * dn.v.scale);
-        nb = (flags & FA_SYNC_BAR) ? fa_grid_next_downbeat(&dn.v, b) : ceil(b - 1e-6);
-    }
-    pre = (src_of_beat(&dn.v, nb) - c) / (dn.sr * tempo * dn.rate);   /* seconds from the start to that beat */
+    /* Seconds from the start to the beat it lands with (reversed: the beats count down). */
+    nb = next_beat(&dn.v, fa_grid_beat_at(&dn.v, c * dn.v.scale), dn.reversed, (flags & FA_SYNC_BAR) != 0);
+    pre = (dn.reversed ? c - src_of_beat(&dn.v, nb) : src_of_beat(&dn.v, nb) - c) / (dn.sr * tempo * dn.rate);
     /* The leader's beats (BAR: downbeats) as device frames; the first one far enough ahead. */
-    k = (flags & FA_SYNC_BAR) ? fa_grid_next_downbeat(&ln.v, ln.beat) : ceil(ln.beat - 1e-6);
-    step = (flags & FA_SYNC_BAR) ? (double)ln.v.g.beats_per_bar : 1.0;
+    k = next_beat(&ln.v, ln.beat, ln.reversed, (flags & FA_SYNC_BAR) != 0);
+    step = ((flags & FA_SYNC_BAR) ? (double)ln.v.g.beats_per_bar : 1.0) * (ln.reversed ? -1.0 : 1.0);
     lead = (double)fa_load64(&dev->clock) + (double)SYNC_START_LEAD_NS * dev->rate / 1e9;
     for (i = 0; i < 100000; i++, k += step) {
-        double at = speaker + (src_of_beat(&ln.v, k) - ln.src) / (ln.sr * ln.tempo * ln.rate) * dev->rate;
+        double d = src_of_beat(&ln.v, k) - ln.src;
+        double at = speaker + (ln.reversed ? -d : d) / (ln.sr * ln.tempo * ln.rate) * dev->rate;
         fs = at - pre * dev->rate;
         if (fs >= lead) break;
     }
@@ -445,10 +459,13 @@ FA_API fa_result FA_CALL fa_deck_set_loop_beats(fa_deck* deck, double beats)
     if ((r = fa_deck_look(deck, fa_mixer_now(m), &dn)) != FA_OK) { fa_mutex_unlock(&m->lock); return r; }
     fa_stream_get_loop_region(dn.s, &in, &out);
     if (out > in) {
-        start = fa_grid_beat_at(&dn.v, (double)in * dn.v.scale);   /* halving and doubling keep the start */
+        /* Halving and doubling keep the start (reversed: the end, where it is entered). */
+        start = dn.reversed ? fa_grid_beat_at(&dn.v, (double)out * dn.v.scale) - beats
+                            : fa_grid_beat_at(&dn.v, (double)in * dn.v.scale);
     } else {
         double q = beats < 1.0 ? beats : 1.0;
-        start = floor((dn.beat + 1e-6) / q) * q;
+        /* From the beat heard now on: reversed, the loop ends there and lies below. */
+        start = dn.reversed ? ceil((dn.beat - 1e-6) / q) * q - beats : floor((dn.beat + 1e-6) / q) * q;
     }
     while (src_of_beat(&dn.v, start) < -0.5) start += 1.0;   /* before the song: its first beat in it */
     in = (fa_frames)floor(src_of_beat(&dn.v, start) + 0.5);

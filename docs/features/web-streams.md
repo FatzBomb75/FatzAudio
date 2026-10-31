@@ -9,7 +9,7 @@
 | An HLS playlist (`.m3u8`), on demand or live | The best audio variant, MPEG-TS, fMP4 or plain audio segments, AES-128 encryption. On-demand HLS is seekable to the frame |
 | A `.pls` or `.m3u` playlist (what radio sites usually link to) | Its first entry is played |
 
-The format is detected from the content, as for files ([streams](streams.md#how-detection-works)): WAV, FLAC, MP3, Ogg Opus, Ogg Vorbis, Ogg FLAC, AAC, AC-3 and E-AC-3, also inside HLS segments (MPEG-TS, fMP4 or packed audio). AAC, which most HLS and many radio stations use, including HE-AAC and HE-AAC v2, decodes with FatzAudio's own decoder on every platform, with no FFmpeg ([AAC](streams.md#aac)).
+The format is detected from the content, as for files ([streams](streams.md#how-detection-works)): WAV, FLAC, MP3, Ogg Opus, Ogg Vorbis, Ogg FLAC, AAC, AC-3 and E-AC-3, MP4/M4A/MOV and Matroska/WebM files (also with video, [below](#mp4-and-matroska-files)), and inside HLS segments (MPEG-TS, fMP4 or packed audio). AAC, which most HLS and many radio stations use, including HE-AAC and HE-AAC v2, decodes with FatzAudio's own decoder on every platform, with no FFmpeg ([AAC](streams.md#aac)).
 
 ## C
 
@@ -68,7 +68,8 @@ fa_stream_open_url(engine, "https://cdn.example.com/show/master.m3u8", &opts, &s
 | `prebuffer_ms` | 1000 | Audio buffered before playback starts, and again before it resumes after a stall |
 | `reconnect_ms` | 30000 | How long to keep reconnecting after the connection drops |
 | `flags` | 0 | `FA_NET_NO_RECONNECT`: end the stream when the connection drops. `FA_NET_NO_ICY`: don't ask radio servers for song titles |
-| `hls_max_bandwidth` | 0 (best) | HLS: the best variant up to this many bits per second. Audio-only variants are preferred when the playlist has them |
+| `hls_max_bandwidth` | 0 (best) | HLS: the best variant up to this many bits per second. Audio-only variants are preferred when the playlist has them; a variant with an audio group plays that group's rendition ([HLS](#hls)) |
+| `download_proc`, `download_user` | none | Receives the stream's raw bytes from the first one on ([saving a station](#saving-a-station-as-it-plays)) |
 
 ### Status and headers
 
@@ -124,6 +125,7 @@ using var show = engine.OpenUrl("https://cdn.example.com/show/master.m3u8", opts
 | `stream.NetworkStatus` (null for other streams) | `fa_stream_get_net_status` |
 | `stream.GetHttpHeader(name)` (null when absent) | `fa_stream_get_http_header` |
 | `stream.Stalled`, `stream.Resumed` | `FA_EVENT_STALLED`, `FA_EVENT_RESUMED` |
+| `NetworkOptions.Downloaded`, `stream.SetDownloadHandler(handler)` | `fa_net_options.download_proc`, `fa_stream_set_download_callback` ([saving a station](#saving-a-station-as-it-plays)) |
 
 A URL that isn't an absolute http or https URL throws `ArgumentException`. Other failures throw `FatzAudioException` with the codes below.
 
@@ -147,6 +149,8 @@ A URL that isn't an absolute http or https URL throws `ArgumentException`. Other
 - After `fa_stream_play` the stream stays silent, in `FA_STATE_BUFFERING`, until `prebuffer_ms` of audio are in, then plays. No event is raised for that first fill.
 - When the network can't keep up and the buffer runs dry, the stream goes to `FA_STATE_BUFFERING` and raises `FA_EVENT_STALLED`. Once `prebuffer_ms` are buffered again it plays on from where it stopped and raises `FA_EVENT_RESUMED`. Pause, stop and seek work in either state.
 - A dropped connection is re-established by itself, with waits growing from 250 ms to 4 s, for up to `reconnect_ms`. A file continues at the byte where it stopped (with a Range request; if the server ignores ranges, the bytes already played are skipped). Radio picks up the live stream. If reconnecting fails for that long, the stream plays what it has and ends with `FA_EVENT_ENDED`.
+- A live stream without radio headers, length or chunked encoding that the server closes in an orderly way is reconnected too: such a close can't be told from a dropped connection, so it isn't taken as the end of a file. A body with a `Content-Length` or chunked encoding (or over HTTP/2) ends when it says it does, except on macOS and iOS: URLSession doesn't report a chunked body closed before its last chunk, so there a live chunked stream that ends is reconnected too.
+- `fa_stream_close` (.NET `Dispose`) returns at once, also while a connection is being made or a host name looked up: a lookup that hangs is left to finish on its own.
 
 ## Seeking
 
@@ -159,7 +163,23 @@ A URL that isn't an absolute http or https URL throws `ArgumentException`. Other
 
 A seek outside what's downloaded waits for a network round trip. From a UI thread or a seek bar, use `fa_stream_seek_async` (.NET `RequestSeek`), which returns at once and lets a decode worker wait for the server instead ([what a seek costs](playback.md#what-a-seek-costs)).
 
-MP3 and AAC files over the network seek by estimated byte position, as most players do for files without an index, and land within a few frames of the target. The reported position is the one you asked for. WAV and FLAC seek exactly.
+MP3 and AAC files over the network seek by estimated byte position, as most players do for files without an index, and land within a few frames of the target. The reported position is the one you asked for. WAV, FLAC, MP4 and Matroska seek exactly.
+
+## MP4 and Matroska files
+
+MP4, M4A, MOV, Matroska and WebM files, also with video, play over the network as from disk, with the same length and samples. Only the audio track's own bytes are waited for, and the download is told where the next audio packets are, so video between them is downloaded but never waited for by a decode worker.
+
+| File | Opening | Seeking |
+|---|---|---|
+| MP4 with its index (`moov`) in front ("faststart", what web servers usually get) | Reads the index from the first bytes | Exact; outside what's downloaded, one reconnect at the audio's byte |
+| MP4 with its index at the end | Two reconnects: to the index at the end, and back to the start | As above |
+| Fragmented MP4 (DASH, `frag_keyframe`) with a `sidx` in front | Reads the `sidx`: fragments are read as playback reaches them | Exact: one reconnect at the fragment holding the target, two when it is within a few packets of a fragment's start (decoding starts in the fragment before) |
+| Fragmented MP4 with an `mfra` at the end and no `sidx` | One request of its own for the last 256 KB (the `mfra`, and the last fragment for the exact length); the download stays at the start | As above |
+| Fragmented MP4 with neither | Every fragment's header is read at open: a reconnect for each when they lie further apart than the download reads ahead | Exact |
+| Matroska / WebM with Cues in front | Reads them from the first bytes; the last cluster (for the exact length) costs one request of its own | Exact; outside what's downloaded, one reconnect at the cluster |
+| Matroska / WebM with Cues after the clusters (most muxers write them there) | One request of its own for the Cues and the last cluster in front of them; the download stays at the first cluster | As above |
+
+A file whose audio is spread over a lot of video (a 1080p film's soundtrack) needs the video between the packets downloaded too, so it needs the film's bitrate from the server, not the soundtrack's. Decode workers wait for 0.3 s of the whole file's bytes (from its size and length), so they never wait in a read for video that is still on its way.
 
 ## Song titles (ICY metadata)
 
@@ -169,9 +189,50 @@ Ogg radio (Opus or Vorbis) has no ICY titles: every song starts a new Ogg link w
 
 `stream_title` is the title exactly as the station sends it; `artist` and `title` split it at the first `" - "`. Titles in Latin-1, which older servers send, are converted to UTF-8 (anything that is not well-formed UTF-8 is taken as Latin-1). Station details (`station`, `genre`, `description`, `station_url`, `bitrate_kbps`) come from the `icy-*` response headers.
 
+## Saving a station as it plays
+
+The bytes a stream downloads can go to your code as they arrive (BASS's `DOWNLOADPROC`), to record a station to a
+file while it plays. They are the bytes the decoder reads, so written to a file they play as one:
+
+| Stream | What the callback gets |
+|---|---|
+| A file | The file, byte for byte as the server sends it |
+| Radio | The audio, without the ICY title blocks the server puts in between |
+| HLS | The audio of the segments, decrypted; MPEG-TS segments as the audio stream inside (ADTS AAC, MP3, AC-3) |
+
+```c
+static void FA_CALL save(void* user, const void* data, size_t size)
+{
+    fwrite(data, 1, size, (FILE*)user);    /* the download waits while this runs: keep it quick */
+}
+
+FILE* f = fopen("recording.mp3", "wb");
+fa_net_options net;
+fa_net_options_init(&net);
+net.download_proc = save;                  /* from the first byte on */
+net.download_user = f;
+/* ... open with opts.net = &net, play ... */
+
+fa_stream_set_download_callback(radio, NULL, NULL);   /* stop: not called again after this returns */
+fclose(f);
+```
+
+`fa_stream_set_download_callback` starts, changes or stops it while the stream plays (from the next downloaded byte;
+the first bytes only arrive through `download_proc`). It may also be called from inside the callback. The callback
+runs on the stream's download thread, one call at a time, in order. After a seek that restarts the download
+elsewhere in a file, the bytes go on from there.
+
+```csharp
+var file = File.Create("recording.mp3");
+var radio = engine.OpenUrl(url, new StreamOptions { Network = new NetworkOptions { Downloaded = data => file.Write(data) } });
+// ... later, while it plays:
+radio.SetDownloadHandler(null);   // or SetDownloadHandler(handler) to start recording mid-stream
+file.Dispose();
+```
+
 ## HLS
 
-- **Variant choice:** the highest bandwidth up to `hls_max_bandwidth`, audio-only variants first. A playlist with a separate audio rendition (`EXT-X-MEDIA TYPE=AUDIO`) plays that rendition, the default one first.
+- **Variant choice:** the highest bandwidth up to `hls_max_bandwidth`, audio-only variants first. When the chosen variant names an audio group (`AUDIO=` and `EXT-X-MEDIA TYPE=AUDIO`), the group's rendition plays: its `DEFAULT=YES` one, else its `AUTOSELECT=YES` one, else its first. So a playlist with a 64 kbit/s audio group for its low tiers and a 192 kbit/s one for its high tiers plays the low one under a `hls_max_bandwidth` that picks a low tier. A rendition without a URI (the audio is muxed into the variant) plays the variant itself.
 - **Live:** starts three segments from the end, as players usually do, and reloads the playlist every half target duration.
 - **Segments:** MPEG-TS (the audio track is taken out of the transport stream), fMP4 with `EXT-X-MAP` (also a `BYTERANGE` of it, as single-file fMP4 playlists use; only that range is fetched), and packed audio (ID3 timestamps skipped). `EXT-X-BYTERANGE` and `EXT-X-KEY METHOD=AES-128` (keys fetched once and cached) are supported; SAMPLE-AES (DRM) isn't and returns `FA_ERROR_PROTECTED_CONTENT`.
 - `fa_stream_get_info` reports container `hls` and the codec of the segments. On-demand playlists have an exact length from the `EXTINF` durations.
@@ -216,7 +277,17 @@ FatzAudio follows redirects itself, up to 8, the same way on every platform and 
   redirect to another server, and not to entries, HLS playlists, segments or keys a playlist names on another
   server. Every other line of yours goes to every request. If a CDN host behind your playlist needs a token, put it
   in the segment URLs (as signed URLs do) or in a header line of another name.
-- Cookies a server sets are not kept, on any platform: if a server needs one back, send it in `headers`.
+- Cookies a server sets go back to it on the stream's later requests ([cookies](#cookies)).
+
+### Cookies
+
+Each stream keeps the cookies its servers set (`Set-Cookie` on a playlist, a login redirect, a segment) and sends them
+back on its later requests, as a browser would: to the host that set them (or, with `Domain=`, its subdomains), under
+their `Path`, `Secure` ones over `https://` only, until they expire (`Max-Age`, `Expires`). That is what HLS services
+that hand out a session cookie with the playlist and check it on every segment need. They are joined with your own
+`Cookie` line, which goes first, into one `Cookie` header. The cookies live as long as the stream and are never
+stored; streams don't share them. The system stacks' own cookie stores stay off, so this works the same on every
+platform.
 
 ### Request headers
 
@@ -231,6 +302,7 @@ Every request sends the same headers on every platform and stack, in this order:
 | `Range: bytes=N-` | seeks and resumed downloads; `bytes=N-M` for an HLS segment that is a byte range |
 | `Authorization: Basic ...` | the URL has credentials (`https://user:password@host/...`); sent up front, without waiting for a challenge, and only to that URL's origin ([redirects](#redirects)) |
 | your `headers` lines | as given, after the ones above |
+| `Cookie` | the [cookies](#cookies) servers set, joined to your own `Cookie` line when you send one |
 
 A line of yours replaces the header above with the same name (any case), so `"User-Agent: MyApp"` or
 `"Accept: audio/*"` works. Spaces and tabs around the name and the value are trimmed. Lines are dropped when they
@@ -270,5 +342,4 @@ What else to know on Android:
 
 ## Not provided yet
 
-- A callback that receives the raw downloaded bytes (BASS's `DOWNLOADPROC`), for recording a station to a file.
 - Opening asynchronously with a cancel call (`BASS_StreamCancel`).

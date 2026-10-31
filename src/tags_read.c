@@ -1,5 +1,5 @@
-/* Tag readers: ID3v2.2/2.3/2.4, ID3v1, APEv2, FLAC metadata blocks, MP4 (iTunes
- * ilst atoms), RIFF INFO, AIFF text chunks and Matroska tags and attachments.
+/* Tag readers: ID3v2.2/2.3/2.4, ID3v1, Lyrics3, APEv2, FLAC metadata blocks, MP4
+ * (iTunes ilst atoms), RIFF INFO, AIFF text chunks and Matroska tags and attachments.
  * Vorbis comments and FLAC pictures are parsed in tags.c, Ogg headers in
  * demux_ogg.c and ASF objects in demux_asf.c. Every reader delivers to a
  * fa_tag_sink (fa_internal.h) and reads only the parts the sink wants: with no
@@ -9,8 +9,10 @@
  * ID3v2.4.0 structure and frame documents, the APEv2 specification on
  * wiki.hydrogenaud.io, the FLAC format (RFC 9639), Apple's QuickTime File Format
  * metadata atoms, the RIFF INFO list (Multimedia Programming Interface and Data
- * Specifications 1.0), the AIFF 1.3 specification and Matroska (RFC 9559). */
+ * Specifications 1.0), the AIFF 1.3 specification, Matroska (RFC 9559) and the Lyrics3 v1.00 and v2.00
+ * specifications on id3.org. */
 #include "fa_internal.h"
+#include "cdg.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -132,6 +134,76 @@ static const char* const id3v22_ids[][2] = {
     { "WPB", "WPUB" }
 };
 
+/* Appends to a malloc'ed, NUL-terminated string that grows as needed. */
+static int str_add(char** s, size_t* n, size_t* cap, const char* add, size_t m)
+{
+    if (*n + m + 1 > *cap) {
+        size_t c = (*n + m + 1) * 2;
+        char* q = (char*)realloc(*s, c);
+        if (!q) return 0;
+        *s = q;
+        *cap = c;
+    }
+    memcpy(*s + *n, add, m);
+    *n += m;
+    (*s)[*n] = '\0';
+    return 1;
+}
+
+/* A line "[mm:ss.mmm]" and the time of `ms` milliseconds in it. */
+static void lrc_stamp(char* out, size_t cap, uint32_t ms)
+{
+    snprintf(out, cap, "[%02u:%02u.%03u]", (unsigned)(ms / 60000), (unsigned)(ms / 1000 % 60), (unsigned)(ms % 1000));
+}
+
+/* SYLT (synchronised lyrics or text) as "[mm:ss.mmm]text" lines, one per entry.
+ * A line break inside an entry's text is left out; one at its start or end shows
+ * as an empty line before or after it. Times in MPEG frames cannot be turned into
+ * time without the audio: such a frame is not read. */
+static void id3_sylt(const uint8_t* p, size_t n, fa_tag_sink* sink)
+{
+    size_t pos, dl, len = 0, cap = 0;
+    char *desc, *out = NULL;
+    int enc;
+    if (n < 6 || p[4] != 2) return;
+    enc = p[0];
+    dl = id3_strlen(enc, p + 6, n - 6);
+    desc = id3_string(enc, p + 6, dl);
+    pos = 6 + dl;
+    while (pos < n && desc) {
+        size_t tl = id3_strlen(enc, p + pos, n - pos);
+        char *text, *q, *w;
+        char stamp[24];
+        size_t tlen;
+        int lead, trail;
+        if (pos + tl + 4 > n) break;
+        text = id3_string(enc, p + pos, tl);
+        pos += tl;
+        if (!text) break;
+        lrc_stamp(stamp, sizeof(stamp), fa_be32(p + pos));
+        pos += 4;
+        tlen = strlen(text);
+        lead = tlen > 0 && (text[0] == '\n' || text[0] == '\r');
+        trail = tlen > 1 && (text[tlen - 1] == '\n' || text[tlen - 1] == '\r');
+        for (q = w = text; *q; q++) if (*q != '\n' && *q != '\r') *w++ = *q;
+        *w = '\0';
+        if (lead && len && !str_add(&out, &len, &cap, "\n", 1)) { free(text); break; }
+        if (text[0] && (!str_add(&out, &len, &cap, stamp, strlen(stamp)) || !str_add(&out, &len, &cap, text, strlen(text)) ||
+                        !str_add(&out, &len, &cap, "\n", 1) || (trail && !str_add(&out, &len, &cap, "\n", 1)))) { free(text); break; }
+        free(text);
+        if (len > sink->max_text) break;
+    }
+    while (len && out[len - 1] == '\n') out[--len] = '\0';
+    if (desc && out && len && len <= sink->max_text) {
+        char key[300];
+        if (desc[0]) snprintf(key, sizeof(key), "SYLT:%s", desc);
+        else snprintf(key, sizeof(key), "SYLT");
+        sink->text(sink, FA_TAG_FORMAT_ID3V2, key, out);
+    }
+    free(desc);
+    free(out);
+}
+
 static void id3_frame(int ver, const char* id, const uint8_t* p, size_t n, fa_tag_sink* sink)
 {
     int enc;
@@ -178,6 +250,8 @@ static void id3_frame(int ver, const char* id, const uint8_t* p, size_t n, fa_ta
         }
         free(desc);
         free(val);
+    } else if (strcmp(id, "SYLT") == 0) {
+        id3_sylt(p, n, sink);
     } else if (strcmp(id, "APIC") == 0 && sink->picture) {
         char mime[64];
         size_t pos = 1, dl;
@@ -226,7 +300,7 @@ static void id3_frames(fa_source* src, int64_t pos, int64_t end, int ver, int un
         uint8_t fh[10];
         char id[5];
         int64_t fsize;
-        int flags = 0, is_pic, wanted;
+        int flags = 0, is_pic, wanted, compressed;
         if (fa_source_seek(src, pos) != FA_OK || !read_exact(src, fh, (size_t)hl)) return;
         if (fh[0] == 0) return;                          /* padding */
         if (ver == 2) {
@@ -260,23 +334,38 @@ static void id3_frames(fa_source* src, int64_t pos, int64_t end, int ver, int un
         }
         is_pic = strcmp(id, "APIC") == 0;
         wanted = is_pic ? sink->picture != NULL && fsize <= (int64_t)TAG_MAX_FRAME
-                        : (id[0] == 'T' || id[0] == 'W' || !strcmp(id, "COMM") || !strcmp(id, "USLT")) &&
+                        : (id[0] == 'T' || id[0] == 'W' || !strcmp(id, "COMM") || !strcmp(id, "USLT") || !strcmp(id, "SYLT")) &&
                           (uint64_t)fsize <= (uint64_t)sink->max_text + 64;
-        /* Compressed or encrypted frames are not read. */
-        if (ver == 3 && (flags & 0xC0)) wanted = 0;
-        if (ver == 4 && (flags & 0x0C)) wanted = 0;
+        /* Encrypted frames are not read (the key is the app's, not ours). */
+        if (ver == 3 && (flags & 0x40)) wanted = 0;
+        if (ver == 4 && (flags & 0x04)) wanted = 0;
+        compressed = (ver == 3 && (flags & 0x80)) || (ver == 4 && (flags & 0x08));
         if (wanted) {
             uint8_t* body = read_block(src, pos + hl, (size_t)fsize);
             if (body) {
                 uint8_t* p = body;
-                size_t n = (size_t)fsize;
-                if (ver == 3 && (flags & 0x20) && n > 0) { p++; n--; }               /* group ID */
+                uint8_t* inflated = NULL;
+                size_t n = (size_t)fsize, dsize = 0;
+                if (ver == 3) {
+                    if (compressed && n >= 4) { dsize = fa_be32(p); p += 4; n -= 4; }  /* decompressed size */
+                    if ((flags & 0x20) && n > 0) { p++; n--; }                       /* group ID */
+                }
                 if (ver == 4) {
                     if ((flags & 0x40) && n > 0) { p++; n--; }                     /* group ID */
-                    if ((flags & 0x01) && n >= 4) { p += 4; n -= 4; }              /* data length */
+                    if ((flags & 0x01) && n >= 4) { dsize = synchsafe(p); p += 4; n -= 4; }   /* data length */
                     if ((flags & 0x02) || unsync_all) n = id3_unsync(p, n);
                 }
-                id3_frame(ver, id, p, n, sink);
+                if (compressed) {
+                    /* A zlib stream (RFC 1950); its size is in the frame header. */
+                    size_t limit = is_pic ? TAG_MAX_FRAME : sink->max_text + 64;
+                    int ok = dsize > 0 && dsize <= limit && n > 6 && (p[0] & 0x0f) == 8 &&
+                             ((p[0] << 8) | p[1]) % 31 == 0 && !(p[1] & 0x20);
+                    inflated = ok ? (uint8_t*)malloc(dsize) : NULL;
+                    if (inflated && fa_inflate(p + 2, n - 2, inflated, dsize) == FA_OK) { p = inflated; n = dsize; }
+                    else n = 0;
+                }
+                if (n > 0) id3_frame(ver, id, p, n, sink);
+                free(inflated);
                 free(body);
             }
         }
@@ -364,6 +453,84 @@ static int64_t read_id3v1(fa_source* src, fa_tag_sink* sink)
         sink->text(sink, FA_TAG_FORMAT_ID3V1, "GENRE", num);
     }
     return 128;
+}
+
+/* ---- Lyrics3 ----------------------------------------------------------------------- */
+
+/* Digits of a Lyrics3 size field; -1 if one is not a digit. */
+static int64_t l3_number(const uint8_t* p, size_t n)
+{
+    int64_t v = 0;
+    size_t i;
+    for (i = 0; i < n; i++) {
+        if (p[i] < '0' || p[i] > '9') return -1;
+        v = v * 10 + (p[i] - '0');
+    }
+    return v;
+}
+
+static void l3_item(fa_tag_sink* sink, const char* key, const uint8_t* p, size_t n)
+{
+    char* v;
+    if (n == 0 || n > sink->max_text) return;
+    v = text_8bit(p, n, 0);
+    if (v) sink->text(sink, FA_TAG_FORMAT_LYRICS3, key, v);
+    free(v);
+}
+
+/* The Lyrics3 tag that ends at `end` (right before an ID3v1 or APEv2 tag, or the
+ * end of the file). v1.00 is "LYRICSBEGIN", the lyrics and "LYRICSEND" (5100 bytes
+ * at most); v2.00 is "LYRICSBEGIN", fields of a 3-letter ID, a 5-digit size and
+ * their data, a 6-digit size and "LYRICS200". Returns the tag's whole size, 0 if
+ * there is none. Items: the field IDs (LYR lyrics, INF information, AUT author,
+ * EAL album, EAR artist, ETT title, IND indications); v1.00's text is LYR. */
+static int64_t read_lyrics3(fa_source* src, int64_t end, fa_tag_sink* sink)
+{
+    uint8_t foot[15];
+    if (end < 20 || fa_source_seek(src, end - 9) != FA_OK || !read_exact(src, foot, 9)) return 0;
+    if (memcmp(foot, "LYRICSEND", 9) == 0) {
+        enum { L1_MAX = 5100 + 20 };
+        int64_t n = end < L1_MAX ? end : L1_MAX, i;
+        uint8_t* b = read_block(src, end - n, (size_t)n);
+        int64_t size = 0;
+        if (!b) return 0;
+        for (i = n - 9 - 11; i >= 0; i--)
+            if (memcmp(b + i, "LYRICSBEGIN", 11) == 0) { size = n - i; break; }
+        if (size && sink) l3_item(sink, "LYR", b + i + 11, (size_t)(size - 11 - 9));
+        free(b);
+        return size;
+    }
+    if (end >= 26 && fa_source_seek(src, end - 15) == FA_OK && read_exact(src, foot, 15) && memcmp(foot + 6, "LYRICS200", 9) == 0) {
+        int64_t size = l3_number(foot, 6), start;
+        uint8_t* b;
+        uint8_t begin[11];
+        if (size < 0 || size + 15 > end) return 0;
+        /* The size counts "LYRICSBEGIN" in the tags seen; a writer that left it out is read too. */
+        start = end - 15 - size;
+        if (fa_source_seek(src, start) != FA_OK || !read_exact(src, begin, 11) || memcmp(begin, "LYRICSBEGIN", 11) != 0) {
+            start -= 11;
+            if (start < 0 || fa_source_seek(src, start) != FA_OK || !read_exact(src, begin, 11) || memcmp(begin, "LYRICSBEGIN", 11) != 0)
+                return 0;
+        }
+        if (sink) {
+            size_t pos = 11, total = (size_t)(end - 15 - start);
+            b = read_block(src, start, total);
+            if (b) {
+                while (pos + 8 <= total) {
+                    int64_t fl = l3_number(b + pos + 3, 5);
+                    char key[4];
+                    if (fl < 0 || (uint64_t)fl > total - pos - 8) break;
+                    memcpy(key, b + pos, 3);
+                    key[3] = '\0';
+                    l3_item(sink, key, b + pos + 8, (size_t)fl);
+                    pos += 8 + (size_t)fl;
+                }
+                free(b);
+            }
+        }
+        return end - start;
+    }
+    return 0;
 }
 
 /* ---- APEv2 ------------------------------------------------------------------------- */
@@ -454,7 +621,72 @@ static int64_t read_ape(fa_source* src, int64_t v1, fa_tag_sink* sink)
     return read_ape_at(src, src->length - v1 - 32, sink);
 }
 
+/* The tags at the end of a file: ID3v1, and APEv2 and Lyrics3 before it in either
+ * order. *l3_end is where the Lyrics3 tag ends. */
+static void tail_sizes(fa_source* src, int64_t* v1, int64_t* ape, int64_t* l3, int64_t* l3_end)
+{
+    *v1 = read_id3v1(src, NULL);
+    *l3_end = src->length - *v1;
+    *l3 = read_lyrics3(src, *l3_end, NULL);
+    *ape = read_ape(src, *v1 + *l3, NULL);
+    if (!*l3 && *ape) {
+        *l3_end = src->length - *v1 - *ape;
+        *l3 = read_lyrics3(src, *l3_end, NULL);
+    }
+}
+
 /* ---- FLAC -------------------------------------------------------------------------- */
+
+#define FLAC_CUE_HEAD 396     /* catalog 128, lead-in 8, flags 1, reserved 258, track count 1 */
+
+/* Printable ASCII only: these fields are 7-bit by the format, and a damaged one is dropped. */
+static int cue_text_ok(const char* s)
+{
+    for (; *s; s++) if ((unsigned char)*s < 0x20 || (unsigned char)*s > 0x7e) return 0;
+    return 1;
+}
+
+/* "mm:ss.mmm" of `samples` at `rate`. */
+static void cue_time(char* out, size_t cap, uint64_t samples, uint32_t rate)
+{
+    uint64_t ms = rate ? samples * 1000u / rate : 0;
+    snprintf(out, cap, "%02u:%02u.%03u", (unsigned)(ms / 60000 % 1000000), (unsigned)(ms / 1000 % 60), (unsigned)(ms % 1000));
+}
+
+/* A CUESHEET block (RFC 9639 section 8.7) as items: CUESHEET/CATALOG, and for each
+ * track CUESHEET/TRACKnn (where it starts, "mm:ss.mmm", at its first index point
+ * 1; without a sample rate in STREAMINFO, no times) and CUESHEET/TRACKnn/ISRC.
+ * The lead-out is left out. */
+static void flac_cuesheet(const uint8_t* p, size_t n, uint32_t rate, fa_tag_sink* sink)
+{
+    size_t pos = FLAC_CUE_HEAD, i, ntracks = p[FLAC_CUE_HEAD - 1];
+    char catalog[129];
+    if (!rate) return;
+    memcpy(catalog, p, 128);
+    catalog[128] = '\0';
+    if (catalog[0] && cue_text_ok(catalog)) sink->text(sink, FA_TAG_FORMAT_VORBIS, "CUESHEET/CATALOG", catalog);
+    for (i = 0; i < ntracks && pos + 36 <= n; i++) {
+        uint64_t off = fa_be64(p + pos), first = off;
+        unsigned number = p[pos + 8], nidx = p[pos + 35], k;
+        char key[40], value[32], isrc[13];
+        size_t at = pos + 36;
+        if (at + (size_t)nidx * 12 > n) return;
+        for (k = 0; k < nidx; k++, at += 12)
+            if (p[at + 8] == 1) { first = off + fa_be64(p + at); break; }
+        if (number == 170 || number == 255) { pos = pos + 36 + (size_t)nidx * 12; continue; }
+        if (first / rate > 100000000u) { pos += 36 + (size_t)nidx * 12; continue; }     /* damaged: more than 3 years */
+        cue_time(value, sizeof(value), first, rate);
+        snprintf(key, sizeof(key), "CUESHEET/TRACK%02u", number);
+        sink->text(sink, FA_TAG_FORMAT_VORBIS, key, value);
+        memcpy(isrc, p + pos + 9, 12);
+        isrc[12] = '\0';
+        if (isrc[0] && cue_text_ok(isrc)) {
+            snprintf(key, sizeof(key), "CUESHEET/TRACK%02u/ISRC", number);
+            sink->text(sink, FA_TAG_FORMAT_VORBIS, key, isrc);
+        }
+        pos += 36 + (size_t)nidx * 12;
+    }
+}
 
 /* The metadata blocks of a FLAC file at `start`. Returns the offset of the first
  * frame (0 if not FLAC); *bits = bits per sample from STREAMINFO. */
@@ -462,6 +694,7 @@ static int64_t read_flac(fa_source* src, int64_t start, fa_tag_sink* sink, uint3
 {
     uint8_t h[4];
     int64_t pos = start + 4;
+    uint32_t rate = 0;
     if (fa_source_seek(src, start) != FA_OK || !read_exact(src, h, 4) || memcmp(h, "fLaC", 4) != 0) return 0;
     for (;;) {
         int last, type;
@@ -470,12 +703,19 @@ static int64_t read_flac(fa_source* src, int64_t start, fa_tag_sink* sink, uint3
         last = h[0] & 0x80;
         type = h[0] & 0x7f;
         len = fa_be24(h + 1);
-        if (type == 0 && len >= 34 && bits) {
+        if (type == 0 && len >= 34 && (bits || sink)) {
             uint8_t si[34];
-            if (read_exact(src, si, 34)) *bits = (uint32_t)(((si[12] & 1) << 4) | (si[13] >> 4)) + 1;
+            if (read_exact(src, si, 34)) {
+                if (bits) *bits = (uint32_t)(((si[12] & 1) << 4) | (si[13] >> 4)) + 1;
+                rate = ((uint32_t)si[10] << 12) | ((uint32_t)si[11] << 4) | (si[12] >> 4);
+            }
         } else if (type == 4 && sink && len <= TAG_MAX_TEXT) {
             uint8_t* buf = read_block(src, pos + 4, len);
             if (buf) fa_tags_parse_vorbis_comments(buf, len, sink);
+            free(buf);
+        } else if (type == 5 && sink && len >= FLAC_CUE_HEAD && len <= TAG_MAX_TEXT) {
+            uint8_t* buf = read_block(src, pos + 4, len);
+            if (buf) flac_cuesheet(buf, len, rate, sink);
             free(buf);
         } else if (type == 6 && sink && sink->picture && len <= TAG_MAX_FRAME) {
             uint8_t* buf = read_block(src, pos + 4, len);
@@ -824,10 +1064,11 @@ static void mkv_simple(const uint8_t* p, size_t n, const char* prefix, int depth
     free(name);
 }
 
-/* Tags: global tags only (Targets without track, edition, chapter or attachment
- * UIDs; those describe one track of a video or are muxer statistics). Album-level
- * tags (TargetTypeValue 50 and up, when the file also has track-level ones) get
- * the prefix "ALBUM/". */
+/* Tags: global tags with no prefix. Album-level tags (TargetTypeValue 50 and up,
+ * when the file also has track-level ones) get the prefix "ALBUM/". Tags aimed at
+ * one track, edition, chapter or attachment (their UIDs) come out as
+ * "TRACK:<uid>/NAME" (also "EDITION:", "CHAPTER:", "ATTACHMENT:"): they describe one
+ * track of a video, or are muxer statistics, so they never fill the common fields. */
 static void mkv_tags(const uint8_t* p, size_t n, fa_tag_sink* sink)
 {
     int pass, has_track_level = 0;
@@ -839,8 +1080,10 @@ static void mkv_tags(const uint8_t* p, size_t n, fa_tag_sink* sink)
             const uint8_t *c2 = tag, *b;
             size_t bs;
             uint32_t id2;
-            uint64_t ttv = 50;
-            int targeted = 0;
+            uint64_t ttv = 50, uid = 0;
+            const char* kind = NULL;
+            int kind_rank = 4;
+            char prefix[48] = "";
             if (id != MKV_TAG) continue;
             while (mem_el(&c2, tag + tsize, &id2, &b, &bs)) {
                 if (id2 == MKV_TARGETS) {
@@ -848,18 +1091,33 @@ static void mkv_tags(const uint8_t* p, size_t n, fa_tag_sink* sink)
                     size_t s3;
                     uint32_t id3;
                     while (mem_el(&c3, b + bs, &id3, &b3, &s3)) {
-                        if (id3 == MKV_TTV) ttv = mem_uint(b3, s3);
-                        else if (id3 == 0x63C5 || id3 == 0x63C9 || id3 == 0x63C4 || id3 == 0x63C6) {
-                            if (mem_uint(b3, s3) != 0) targeted = 1;
+                        if (id3 == MKV_TTV) {
+                            ttv = mem_uint(b3, s3);
+                        } else if ((id3 == 0x63C5 || id3 == 0x63C4 || id3 == 0x63C9 || id3 == 0x63C6) && mem_uint(b3, s3) != 0) {
+                            /* The first kind in the order track, chapter, edition, attachment names the tag. */
+                            const char* k = id3 == 0x63C5 ? "TRACK" : id3 == 0x63C4 ? "CHAPTER" : id3 == 0x63C9 ? "EDITION" : "ATTACHMENT";
+                            int rank = id3 == 0x63C5 ? 0 : id3 == 0x63C4 ? 1 : id3 == 0x63C9 ? 2 : 3;
+                            if (!kind || rank < kind_rank) {
+                                kind_rank = rank;
+                                kind = k;
+                                uid = mem_uint(b3, s3);
+                            }
                         }
                     }
                 }
             }
-            if (targeted) continue;
-            if (pass == 0) { if (ttv < 50) has_track_level = 1; continue; }
+            if (kind) {
+                if (pass == 0) continue;
+                snprintf(prefix, sizeof(prefix), "%s:%llu", kind, (unsigned long long)uid);
+            } else if (pass == 0) {
+                if (ttv < 50) has_track_level = 1;
+                continue;
+            } else if (has_track_level && ttv >= 50) {
+                snprintf(prefix, sizeof(prefix), "ALBUM");
+            }
             c2 = tag;
             while (mem_el(&c2, tag + tsize, &id2, &b, &bs))
-                if (id2 == MKV_SIMPLETAG) mkv_simple(b, bs, has_track_level && ttv >= 50 ? "ALBUM" : "", 0, sink);
+                if (id2 == MKV_SIMPLETAG) mkv_simple(b, bs, prefix, 0, sink);
         }
     }
 }
@@ -1005,7 +1263,7 @@ void fa_tags_collect(fa_source* src, fa_tag_sink* sink)
 {
     const uint8_t* head;
     size_t n;
-    int64_t id3, v1;
+    int64_t id3, v1, ape, l3, l3_end;
     if (!src->seekable || src->length <= 0) return;
     if (fa_asf_read_tags(src, sink)) return;
     n = fa_source_peek(src, &head);
@@ -1025,15 +1283,16 @@ void fa_tags_collect(fa_source* src, fa_tag_sink* sink)
         read_flac(src, id3, sink, NULL);
         if (id3 > 0) read_id3v2(src, 0, sink);
     }
-    /* APEv2 and ID3v1 at the end of any of these (some tools tag WAV that way too). */
-    v1 = read_id3v1(src, NULL);
-    read_ape(src, v1, sink);
+    /* APEv2, Lyrics3 and ID3v1 at the end of any of these (some tools tag WAV that way too). */
+    tail_sizes(src, &v1, &ape, &l3, &l3_end);
+    read_ape(src, v1 + (l3_end == src->length - v1 ? l3 : 0), sink);
     read_id3v1(src, sink);
+    read_lyrics3(src, l3_end, sink);
 }
 
 void fa_tags_audio_span(fa_source* src, int64_t* out_start, int64_t* out_end, uint32_t* out_bits)
 {
-    int64_t id3, flac, v1, ape;
+    int64_t id3, flac, v1, ape, l3, l3_end;
     *out_start = 0;
     *out_end = src->length;
     *out_bits = 0;
@@ -1041,8 +1300,7 @@ void fa_tags_audio_span(fa_source* src, int64_t* out_start, int64_t* out_end, ui
     id3 = read_id3v2(src, 0, NULL);
     flac = read_flac(src, id3, NULL, out_bits);
     *out_start = flac > 0 ? flac : id3;
-    v1 = read_id3v1(src, NULL);
-    ape = read_ape(src, v1, NULL);
-    *out_end = src->length - v1 - ape;
+    tail_sizes(src, &v1, &ape, &l3, &l3_end);
+    *out_end = src->length - v1 - ape - l3;
     if (*out_end < *out_start) *out_end = *out_start;
 }

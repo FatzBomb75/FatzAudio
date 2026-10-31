@@ -367,9 +367,21 @@ public sealed class AudioEngine : IDisposable
         ArgumentNullException.ThrowIfNull(url);
         var h = Handle;
         using var opts = NativeOptions.Create(options);
+        GCHandle? download = null;
+        if (options?.Network?.Downloaded is { } handler)
+        {
+            // Lives as long as the native stream (adopted by it below), freed here if the open fails.
+            var gc = GCHandle.Alloc(new AudioStream.DownloadState(handler, null));
+            download = gc;
+            opts.Pointer->Net->DownloadProc = &AudioStream.OnDownload;
+            opts.Pointer->Net->DownloadUser = (void*)GCHandle.ToIntPtr(gc);
+        }
         int rc = NativeMethods.fa_stream_open_url(h, url, opts.Pointer, out nint s);
+        if (rc < 0) download?.Free();
         if (rc == (int)ErrorCode.InvalidArgument) throw new ArgumentException("Not an absolute http or https URL.", nameof(url));
-        return AudioStream.Wrap(this, rc, s, null);
+        var stream = AudioStream.Wrap(this, rc, s, download);
+        stream.InitDownloadHandle(download);
+        return stream;
     }
 
     /// <summary>
@@ -500,6 +512,17 @@ public sealed class AudioEngine : IDisposable
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_engine_set_normalization(Handle, (int)mode, targetLufs));
 
     /// <summary>
+    /// Lets the dialogue level that Dolby streams (AC-3, E-AC-3) state ("dialnorm") count as their loudness
+    /// (default off). Broadcasters set it to the programme's loudness, so a film needs no scan: when there is no
+    /// value from <see cref="AudioStream.SetLoudness"/>, no ReplayGain/R128 tag and no cached scan, the dialnorm is
+    /// final at once (<see cref="LoudnessSource.Dialnorm"/>). -31, what encoders write when nobody set it, is not
+    /// used. Applies to streams whose analysis starts afterwards; live streams keep the running estimate.
+    /// </summary>
+    /// <param name="enabled">True to use dialnorm, false to measure every file.</param>
+    public void SetDialnorm(bool enabled) =>
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_engine_set_dialnorm(Handle, enabled ? 1 : 0));
+
+    /// <summary>
     /// Configures the true-peak limiter on every output device. It catches peaks a normalization boost
     /// or a crossfade would push over the ceiling, and never touches audio below it. Its 1.5 ms
     /// look-ahead is always in the signal path (also while off), so switching never clicks.
@@ -620,6 +643,8 @@ internal unsafe ref struct NativeOptions
     private FaNetOptions* _net;
     private byte* _userAgent, _headers, _proxy;
     private SoundFontHandle? _font;
+    private int* _cancel;
+    private CancellationTokenRegistration _cancelRegistration;
 
     public readonly FaOpenOptions* Pointer => _ptr;
 
@@ -638,7 +663,16 @@ internal unsafe ref struct NativeOptions
         o._ptr->Flags = flags;
         o._ptr->AudioTrack = options.AudioTrack;
         o._ptr->DynamicRange = (int)options.DynamicRange;
+        o._ptr->DolbyDownmix = (int)options.DolbyDownmix;
         o._ptr->TextCodePage = (int)options.TextCodePage;
+        if (options.CancellationToken.CanBeCanceled)
+        {
+            // The native open reads this flag while it unpacks; the token sets it from any thread.
+            o._cancel = (int*)NativeMemory.AllocZeroed(sizeof(int));
+            o._ptr->Cancel = o._cancel;
+            o._cancelRegistration = options.CancellationToken.Register(
+                static state => Volatile.Write(ref *(int*)(nint)state!, 1), (nint)o._cancel);
+        }
         if (options.SoundFont is { } font)
         {
             // Held until the open call returns; the native stream takes its own reference.
@@ -683,6 +717,10 @@ internal unsafe ref struct NativeOptions
 
     public void Dispose()
     {
+        // Disposing the registration waits for a callback that is running, so the flag is not written after it is freed.
+        _cancelRegistration.Dispose();
+        if (_cancel != null) NativeMemory.Free(_cancel);
+        _cancel = null;
         if (_mime != null) Marshal.FreeCoTaskMem((nint)_mime);
         if (_userAgent != null) Marshal.FreeCoTaskMem((nint)_userAgent);
         if (_headers != null) Marshal.FreeCoTaskMem((nint)_headers);

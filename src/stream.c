@@ -13,6 +13,7 @@
 #include "cdg.h"
 #include "disc.h"
 #include "encode.h"
+#include "ac3.h"
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -29,7 +30,6 @@
 #define FA_NORM_GLIDE_UP_DB_S 6.0f
 #define FA_TEMPO_LATENCY_MS 150  /* decode-ahead while tempo, pitch or rate is in use */
 #define FA_TEMPO_CHUNK 512       /* output frames per chain run, about: how finely ramps step */
-#define FA_REVERSE_BLOCK_MS 500  /* reversed: source decoded per seek */
 #define FA_STR_(x) #x
 #define FA_STR(x) FA_STR_(x)
 #define FA_NET_USER_AGENT "FatzAudio/" FA_STR(FA_VERSION_MAJOR) "." FA_STR(FA_VERSION_MINOR) "." FA_STR(FA_VERSION_PATCH)
@@ -126,6 +126,8 @@ static void stream_discard(struct fa_stream* s)
 {
     if (s->run_meter_ready) fa_meter_free(&s->run_meter);
     fa_stream_cdg_close(s);
+    if (s->zcrc_open) fa_source_close(&s->zcrc_src);
+    free(s->zcrc_buf);
     free(s->path);
     free(s->matrix);
     s->midi = NULL;
@@ -187,6 +189,9 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
     if (options && options->struct_size >= offsetof(fa_open_options, dynamic_range) + sizeof(options->dynamic_range) &&
         options->dynamic_range >= FA_DYNAMIC_RANGE_FULL && options->dynamic_range <= FA_DYNAMIC_RANGE_NIGHT)
         fa_store32(&s->dynamic_range, options->dynamic_range);
+    if (options && options->struct_size >= offsetof(fa_open_options, dolby_downmix) + sizeof(options->dolby_downmix) &&
+        options->dolby_downmix >= FA_DOLBY_DOWNMIX_AUTO && options->dolby_downmix <= FA_DOLBY_DOWNMIX_ENGINE)
+        fa_store32(&s->dolby_downmix, options->dolby_downmix);
     /* MIDI files are played with the stream's soundfont, else the engine's. */
     if (options && options->struct_size >= offsetof(fa_open_options, soundfont) + sizeof(options->soundfont) &&
         options->soundfont)
@@ -223,6 +228,7 @@ static fa_result stream_open_decoder(struct fa_stream* s, const char* name_hint,
     fa_decoder_env env;
     fa_result r;
     env.dynamic_range = &s->dynamic_range;
+    env.dolby_mix = &s->dolby_mix;
     if (!s->soundfont) {
         /* A MIDI file and no soundfont from the app: the OS's own instruments. */
         const uint8_t* head;
@@ -294,10 +300,20 @@ static uint64_t zip_memory_limit(const fa_engine* engine)
                                               : FA_ZIP_DEFAULT_MEMORY_LIMIT;
 }
 
-/* Entry `e`, unpacked into a temp file in the engine's folder (deleted when closed). */
-static fa_result unpack_to_temp(struct fa_stream* s, fa_source* arc, const fa_zip_entry* e)
+/* The app's cancel flag, when this build of its struct has one. */
+static const volatile int32_t* open_cancel(const fa_open_options* options)
+{
+    return options && options->struct_size >= offsetof(fa_open_options, cancel) + sizeof(options->cancel)
+        ? options->cancel : NULL;
+}
+
+/* Entry `e`, unpacked into a temp file in the engine's folder (deleted when closed).
+ * Scans and tag reads open it again through the shared file (fa_source_open_shared). */
+static fa_result unpack_to_temp(struct fa_stream* s, fa_source* arc, const fa_zip_entry* e,
+                                const volatile int32_t* cancel)
 {
     fa_engine* engine = s->engine;
+    fa_shared_file* shared;
     FILE* f;
     fa_result r;
     if (!engine->temp_folder || e->size > FA_ZIP_TEMP_LIMIT) return FA_ERROR_TOO_LARGE;
@@ -306,13 +322,13 @@ static fa_result unpack_to_temp(struct fa_stream* s, fa_source* arc, const fa_zi
     fa_mkdir_utf8(engine->temp_folder);
     f = fa_temp_file_create(engine->temp_folder);
     if (!f) return FA_ERROR_IO;
-    r = fa_zip_extract_file(arc, e, f);
-    if (r != FA_OK || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return r != FA_OK ? r : FA_ERROR_IO; }
+    r = fa_zip_extract_file(arc, e, cancel, f);
+    if (r != FA_OK) { fclose(f); return r; }
+    r = fa_shared_file_new(f, (int64_t)e->size, &shared);   /* closes f when it fails */
+    if (r != FA_OK) return r;
     memset(&s->source, 0, sizeof(s->source));
-    s->source.kind = FA_SOURCE_FILE;
-    s->source.file = f;
-    s->source.seekable = 1;
-    s->source.length = (int64_t)e->size;
+    fa_source_open_shared(&s->source, shared);
+    fa_shared_file_release(shared);   /* the source holds it */
     return FA_OK;
 }
 
@@ -320,7 +336,8 @@ static fa_result unpack_to_temp(struct fa_stream* s, fa_source* arc, const fa_zi
  * archive itself, which moves into s->source (*moved = 1); a compressed one is
  * unpacked into memory, or into a temp file past the memory limit (or when memory
  * runs out). */
-static fa_result open_zip_entry(struct fa_stream* s, fa_source* arc, const fa_zip_entry* e, int* moved)
+static fa_result open_zip_entry(struct fa_stream* s, fa_source* arc, const fa_zip_entry* e,
+                                const volatile int32_t* cancel, int* moved)
 {
     int64_t offset;
     uint8_t* data;
@@ -335,7 +352,17 @@ static fa_result open_zip_entry(struct fa_stream* s, fa_source* arc, const fa_zi
         *moved = 1;
         return FA_OK;
     }
-    r = fa_zip_extract(arc, e, zip_memory_limit(s->engine), &data);
+    /* Not audio (a bundled video, a PDF) is told from the first 64 KB, not a full unpack. */
+    if (e->size > FA_ZIP_PROBE_BYTES) {
+        uint8_t* head = (uint8_t*)malloc(FA_ZIP_PROBE_BYTES);
+        size_t got = 0;
+        if (!head) return FA_ERROR_OUT_OF_MEMORY;
+        r = fa_zip_extract_prefix(arc, e, head, FA_ZIP_PROBE_BYTES, &got);
+        got = r == FA_OK && !fa_decoder_recognizes(head, got) ? 0 : 1;
+        free(head);
+        if (!got) return FA_ERROR_UNSUPPORTED_FORMAT;
+    }
+    r = fa_zip_extract(arc, e, zip_memory_limit(s->engine), cancel, &data);
     if (r == FA_OK) {
         fa_source_open_memory_ref(&s->source, data, (size_t)e->size);
         s->source.owned = data;
@@ -343,7 +370,7 @@ static fa_result open_zip_entry(struct fa_stream* s, fa_source* arc, const fa_zi
     }
     if (r != FA_ERROR_TOO_LARGE && r != FA_ERROR_OUT_OF_MEMORY) return r;
     if (r == FA_ERROR_OUT_OF_MEMORY && !s->engine->temp_folder) return r;
-    return unpack_to_temp(s, arc, e);
+    return unpack_to_temp(s, arc, e, cancel);
 }
 
 /* Undoes open_zip_entry after the decoder refused the entry. FA_ERROR_IO when the
@@ -370,8 +397,9 @@ static fa_result open_zip(struct fa_stream* s, const fa_open_options* options, i
     fa_source arc;
     fa_zip_entry* entries;
     fa_cdg_data* graphics = NULL;
-    uint32_t count, i, pass;
+    uint32_t count, i, pass, chosen_crc = 0;
     int cdg = -1, moved = 0;
+    const volatile int32_t* cancel = open_cancel(options);
     fa_result r, skipped = FA_ERROR_UNSUPPORTED_FORMAT;
     *in_place = 0;
     r = fa_zip_list(&s->source, &entries, &count);
@@ -384,17 +412,19 @@ static fa_result open_zip(struct fa_stream* s, const fa_open_options* options, i
         uint8_t* bytes;
         /* Read first: a stored audio entry takes the archive's source with it.
          * Damaged graphics leave a playable song: the stream simply has none. */
-        if (fa_zip_extract(&arc, &entries[cdg], zip_memory_limit(s->engine), &bytes) == FA_OK &&
-            fa_cdg_data_adopt(bytes, (size_t)entries[cdg].size, &graphics) != FA_OK)
+        fa_result gr = fa_zip_extract(&arc, &entries[cdg], zip_memory_limit(s->engine), cancel, &bytes);
+        if (gr == FA_ERROR_CANCELLED) skipped = gr;
+        else if (gr == FA_OK && fa_cdg_data_adopt(bytes, (size_t)entries[cdg].size, &graphics) != FA_OK)
             graphics = NULL;
     }
-    r = FA_ERROR_UNSUPPORTED_FORMAT;
-    for (pass = 0; pass < 2 && r != FA_OK && r != FA_ERROR_NOT_FOUND && r != FA_ERROR_IO; pass++) {
+    r = skipped == FA_ERROR_CANCELLED ? skipped : FA_ERROR_UNSUPPORTED_FORMAT;
+    for (pass = 0; pass < 2 && r != FA_OK && r != FA_ERROR_NOT_FOUND && r != FA_ERROR_IO && r != FA_ERROR_CANCELLED; pass++) {
         for (i = 0; i < count && r != FA_OK; i++) {
             fa_result opened;
             int preferred = cdg >= 0 && same_stem(entries[i].name, entries[cdg].name);
             if ((int)i == cdg || fa_cdg_is_cdg_name(entries[i].name) || preferred != (pass == 0)) continue;
-            opened = open_zip_entry(s, &arc, &entries[i], &moved);
+            opened = open_zip_entry(s, &arc, &entries[i], cancel, &moved);
+            if (opened == FA_ERROR_CANCELLED) { r = opened; break; }
             if (opened != FA_OK) {
                 /* Too big to unpack, out of memory or a temp file that failed is worth
                  * telling the app, unless another entry plays. */
@@ -403,7 +433,11 @@ static fa_result open_zip(struct fa_stream* s, const fa_open_options* options, i
                 continue;
             }
             r = stream_open_decoder(s, entries[i].name, options);
-            if (r == FA_OK) { snprintf(s->path_name, sizeof(s->path_name), "%s", entries[i].name); break; }
+            if (r == FA_OK) {
+                snprintf(s->path_name, sizeof(s->path_name), "%s", entries[i].name);
+                chosen_crc = entries[i].crc32;
+                break;
+            }
             if (close_zip_entry(s, &arc, moved) != FA_OK) { r = FA_ERROR_IO; moved = 0; break; }
             moved = 0;
             /* The audio_track asked for is missing: no other entry is tried. */
@@ -428,6 +462,12 @@ static fa_result open_zip(struct fa_stream* s, const fa_open_options* options, i
         fa_source_close(&arc);
     }
     *in_place = moved;
+    /* A stored entry is played from the archive unchecked: the worker checks it
+     * while the stream plays (zip_crc_step), if it can read the bytes again. */
+    if (moved && s->source.kind != FA_SOURCE_IO && !(s->flags & FA_OPEN_DECODE_ONLY)) {
+        s->zcrc_expect = chosen_crc;
+        fa_store32(&s->zcrc_pending, 1);
+    }
     if (graphics) fa_stream_cdg_attach(s, graphics);
     return FA_OK;
 }
@@ -651,6 +691,8 @@ static fa_result net_config(const char* url, const fa_open_options* options, fa_
     cfg->reconnect_ms = (o.flags & FA_NET_NO_RECONNECT) ? 0 : (o.reconnect_ms ? o.reconnect_ms : FA_NET_DEFAULT_RECONNECT_MS);
     cfg->flags = o.flags;
     cfg->hls_max_bandwidth = o.hls_max_bandwidth;
+    cfg->download_proc = o.download_proc;
+    cfg->download_user = o.download_user;
     if (cfg->prebuffer_ms > 30000) cfg->prebuffer_ms = 30000;
     if (r != FA_OK) { free(cfg->url); free(cfg->user_agent); free(cfg->headers); free(cfg->proxy); }
     return r;
@@ -705,7 +747,7 @@ FA_API fa_result FA_CALL fa_stream_open_url(fa_engine* engine, const char* url, 
             r = stream_open_decoder(s, parsed.path, &o);
         }
     }
-    if (r == FA_OK) fa_net_set_sample_rate(s->net, s->decoder.format.sample_rate);
+    if (r == FA_OK) fa_net_set_sample_rate(s->net, s->decoder.format.sample_rate, s->decoder.length);
     if (r != FA_OK) { stream_discard(s); return r; }
     stream_opened(s);
     *out_stream = s;
@@ -843,6 +885,13 @@ FA_API fa_result FA_CALL fa_stream_get_http_header(fa_stream* stream, const char
     if (!stream || !name || !out_value || value_size == 0) return FA_ERROR_INVALID_ARG;
     if (!stream->net) return FA_ERROR_NOT_FOUND;
     return fa_net_get_header(stream->net, name, out_value, value_size);
+}
+
+FA_API fa_result FA_CALL fa_stream_set_download_callback(fa_stream* stream, fa_download_proc proc, void* user)
+{
+    if (!stream || !stream->net) return FA_ERROR_INVALID_ARG;
+    fa_net_set_tap(stream->net, proc, user);
+    return FA_OK;
 }
 
 /* ---- tempo, pitch and rate: the decode side (the chain is in tempo.c) ----------- */
@@ -1037,7 +1086,7 @@ static void timeline_reset(struct fa_stream* s, fa_frames pos)
     fa_store64(&s->played, 0);
     fa_store64(&s->seek_base, pos);
     fa_store32(&s->reverse, fa_load32(&s->reverse_want));
-    s->rev_n = 0;
+    s->rev_n = s->rev_hold = 0;
     s->rev_pos = pos;
     fa_tmap_reset(tmap_of(s));
     s->tempo_frames = 0;
@@ -1139,6 +1188,7 @@ static int push_waiting(struct fa_stream* s)
 
 int fa_stream_needs_work(struct fa_stream* s)
 {
+    if (s->ring.data && fa_load32(&s->zcrc_pending)) return 1;   /* a stored ZIP entry still to check */
     if (s->ring.data && fa_load64(&s->seek_pending) >= 0) return 1;
     if (!s->ring.data || fa_load32(&s->eof) || fa_load32(&s->flushing)) return 0;
     if (push_waiting(s)) return 0;   /* nothing pushed yet */
@@ -1310,7 +1360,15 @@ static double mirror(struct fa_stream* s, double x)
 /* Reversed: hands out up to `want` source frames going back from rev_pos, last
  * first. Each block of FA_REVERSE_BLOCK_MS is decoded forward after a seek to its
  * start. The source ends (got 0) at the loop start, else CUE_IN or 0 (as forward
- * it ends at the loop end, else CUE_OUT or the length). Caller holds decode_lock. */
+ * it ends at the loop end, else CUE_OUT or the length). Caller holds decode_lock.
+ *
+ * A block's first frames come right after its seek, which not every decoder makes
+ * exact (AAC's noise generators and prediction, tracker row seeks, MIDI replaying
+ * its events): the frames the block below decoded straight on are the right ones.
+ * So the block's first FA_REVERSE_OVERLAP_MS (rev_hold frames, at the front of
+ * rev_buf) are held back, the block below is decoded that far past its end, and
+ * the two are cross-faded there: from this block's audio to the one below's, which
+ * then carries on. Where both decoded the same audio, the fade leaves it as it is. */
 static fa_result reverse_read(struct fa_stream* s, float* out, fa_frames want, fa_frames* got)
 {
     uint32_t ch = s->decoder.format.channels;
@@ -1318,32 +1376,53 @@ static fa_result reverse_read(struct fa_stream* s, float* out, fa_frames want, f
     *got = 0;
     /* Checked on every call: CUE_IN may have moved up into the block decoded already. */
     if (s->rev_pos <= stop) {
-        s->rev_n = 0;
+        s->rev_n = s->rev_hold = 0;
         return FA_ERROR_END_OF_STREAM;
     }
-    if (s->rev_n == 0) {
-        fa_frames lo, n = 0;
+    if (s->rev_hold > 0 && stop >= s->rev_pos - s->rev_n) s->rev_hold = 0;   /* no block below any more */
+    if (s->rev_n <= s->rev_hold) {
+        fa_frames lo, n = 0, hold = s->rev_hold;
+        fa_frames block = (fa_frames)s->decoder.format.sample_rate * FA_REVERSE_BLOCK_MS / 1000;
+        fa_frames ov = (fa_frames)s->decoder.format.sample_rate * FA_REVERSE_OVERLAP_MS / 1000;
         fa_result r;
         if (!s->rev_buf) {
-            fa_frames cap = (fa_frames)s->decoder.format.sample_rate * FA_REVERSE_BLOCK_MS / 1000;
-            s->rev_buf = (float*)malloc((size_t)cap * ch * sizeof(float));
+            s->rev_buf = (float*)malloc((size_t)(block + 2 * ov) * ch * sizeof(float));
             if (!s->rev_buf) return FA_ERROR_OUT_OF_MEMORY;
-            s->rev_cap = cap;
+            s->rev_cap = block + ov;
+            s->rev_ov = s->rev_buf + (size_t)s->rev_cap * ch;   /* the held frames, while decoding */
         }
         lo = s->rev_pos - s->rev_cap > stop ? s->rev_pos - s->rev_cap : stop;
         r = fa_decoder_seek(&s->decoder, lo);
         if (r != FA_OK) return r;
+        if (hold > 0) memcpy(s->rev_ov, s->rev_buf, (size_t)hold * ch * sizeof(float));
         while (n < s->rev_pos - lo) {
             fa_frames m = 0;
             r = fa_decoder_read(&s->decoder, s->rev_buf + (size_t)n * ch, s->rev_pos - lo - n, &m);
             if (m <= 0) break;
             n += m;
         }
-        if (n == 0) return r == FA_OK ? FA_ERROR_END_OF_STREAM : r;
+        if (n == 0) {
+            s->rev_n = s->rev_hold = 0;
+            return r == FA_OK ? FA_ERROR_END_OF_STREAM : r;
+        }
+        if (n == s->rev_pos - lo && hold > 0) {
+            /* Frame j of the overlap is mostly the held block's near its top, mostly this one's at its bottom. */
+            float* a = s->rev_buf + (size_t)(n - hold) * ch;
+            fa_frames j;
+            uint32_t c;
+            for (j = 0; j < hold; j++) {
+                float w = (float)(j + 1) / (float)(hold + 1);
+                for (c = 0; c < ch; c++) {
+                    float x = a[(size_t)j * ch + c];
+                    a[(size_t)j * ch + c] = x + (s->rev_ov[(size_t)j * ch + c] - x) * w;
+                }
+            }
+        }
         s->rev_n = n;
         s->rev_pos = lo + n;   /* a source shorter than it said: from where it ends */
+        s->rev_hold = lo > stop && n > ov ? ov : 0;
     }
-    k = want < s->rev_n ? want : s->rev_n;
+    k = want < s->rev_n - s->rev_hold ? want : s->rev_n - s->rev_hold;
     if (k > s->rev_pos - stop) k = s->rev_pos - stop;
     for (i = 0; i < k; i++)
         memcpy(out + (size_t)i * ch, s->rev_buf + (size_t)(s->rev_n - 1 - i) * ch, ch * sizeof(float));
@@ -1360,15 +1439,50 @@ static fa_result source_read(struct fa_stream* s, float* out, fa_frames want, fa
     return fa_decoder_read(&s->decoder, out, want, got);
 }
 
-/* The custom channel matrix: in_buf (source channels) -> mat_buf (device channels). */
+/* Is the stream Dolby audio with more than two channels, which `mode` mixes down
+ * with the stream's own levels? */
+static int dolby_mixes_down(const struct fa_stream* s, int32_t mode)
+{
+    return mode != FA_DOLBY_DOWNMIX_ENGINE && s->decoder.format.channels > 2 && s->decoder.format.channels <= 8 &&
+           fa_ac3_is_codec(s->decoder.codec);
+}
+
+/* The Dolby downmix for the levels the codec reported last, made again when they
+ * or the mode change. Caller holds decode_lock. */
+static const float* dolby_weights(struct fa_stream* s)
+{
+    uint64_t mix = (uint64_t)fa_load64(&s->dolby_mix), key;
+    int32_t mode = fa_load32(&s->dolby_downmix);
+    int ch = (int)s->decoder.format.channels;
+    float scale = 1.0f;
+    fa_ac3_mix m;
+    /* fa_ac3_mix_pack leaves bits 29 and 30 free; the dialogue level does not change
+     * the weights. */
+    key = (mix & ~FA_AC3_MIX_DIALNORM_BITS) | (uint64_t)mode << 29 | 1u << 31;
+    if (key == s->dolby_key) return s->dolby_w;
+    if (!fa_ac3_mix_unpack(mix, &m)) {
+        /* Nothing decoded yet: default levels, every channel. */
+        fa_ac3_mix_defaults(&m, 7, 0);
+        m.used = (1u << ch) - 1;
+    }
+    fa_ac3_downmix(&m, ch, mode == FA_DOLBY_DOWNMIX_LTRT || (mode == FA_DOLBY_DOWNMIX_AUTO && m.dmixmod == 1),
+                   s->dolby_w, &scale);
+    fa_store_float(&s->dolby_makeup, -20.0f * log10f(scale));
+    s->dolby_key = key;
+    return s->dolby_w;
+}
+
+/* The custom channel matrix or the Dolby downmix: in_buf (source channels) ->
+ * mat_buf (device channels). */
 static void apply_matrix(struct fa_stream* s, const float* in, fa_frames n)
 {
     uint32_t ch = s->decoder.format.channels, i, o;
+    const float* w = s->matrix ? s->matrix : dolby_weights(s);
     fa_frames f;
     for (f = 0; f < n; f++) {
         for (o = 0; o < FA_DEVICE_CHANNELS; o++) {
             float acc = 0.0f;
-            for (i = 0; i < ch; i++) acc += in[(size_t)f * ch + i] * s->matrix[i * FA_DEVICE_CHANNELS + o];
+            for (i = 0; i < ch; i++) acc += in[(size_t)f * ch + i] * w[i * FA_DEVICE_CHANNELS + o];
             s->mat_buf[(size_t)f * FA_DEVICE_CHANNELS + o] = acc;
         }
     }
@@ -1418,7 +1532,8 @@ static int keep_unheard(struct fa_stream* s, fa_frames unheard)
 void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
 {
     uint32_t ch = s->decoder.format.channels;
-    uint32_t conv_ch = s->matrix ? FA_DEVICE_CHANNELS : ch;
+    int mixdown = s->matrix || s->dolby;
+    uint32_t conv_ch = mixdown ? FA_DEVICE_CHANNELS : ch;
     int64_t produced = 0;
     int just_looped = 0;
     if (!s->ring.data || fa_load32(&s->eof)) return;
@@ -1484,7 +1599,7 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 fa_frames back = reversed(s) ? end_frame(s) : loop_start(s);
                 ma_uint64 latency;
                 /* Reversed, the loop goes from its start back to its end. */
-                if (loops(s) && !just_looped && (reversed(s) ? back > loop_start(s) && (s->rev_pos = back, s->rev_n = 0, 1)
+                if (loops(s) && !just_looped && (reversed(s) ? back > loop_start(s) && (s->rev_pos = back, s->rev_n = s->rev_hold = 0, 1)
                                                              : fa_decoder_seek(&s->decoder, back) == FA_OK)) {
                     /* No length known: the end is here, so the position wraps and
                      * LOOPED is raised from now on. */
@@ -1516,7 +1631,7 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 if (latency > 0) {
                     if (latency > (ma_uint64)s->in_cap) latency = (ma_uint64)s->in_cap;
                     memset(s->in_buf, 0, (size_t)latency * ch * sizeof(float));
-                    if (s->matrix) memset(s->mat_buf, 0, (size_t)latency * conv_ch * sizeof(float));
+                    if (mixdown) memset(s->mat_buf, 0, (size_t)latency * conv_ch * sizeof(float));
                     s->in_count = (fa_frames)latency;
                     s->draining = 1;
                     continue;
@@ -1526,17 +1641,17 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
             }
             just_looped = 0;
             if (!from_carry) update_estimate(s, s->in_buf, got); /* carried audio was measured */
-            if (s->matrix) apply_matrix(s, s->in_buf, got);
-            chunk = s->matrix ? s->mat_buf : s->in_buf;
+            if (mixdown) apply_matrix(s, s->in_buf, got);
+            chunk = mixdown ? s->mat_buf : s->in_buf;
             tempo_chunk(s, &chunk, &got, conv_ch);
-            s->chain_buf = chunk != (s->matrix ? s->mat_buf : s->in_buf) ? chunk : NULL;
+            s->chain_buf = chunk != (mixdown ? s->mat_buf : s->in_buf) ? chunk : NULL;
             s->in_count = got;
             if (got == 0) continue;               /* the stretcher is gathering its start */
         }
         /* Converted straight into the ring, up to its wrap; published once the DSPs ran. */
         dst = fa_ring_write_region(&s->ring, &contig);
         if (contig < room) room = contig;
-        conv_in = s->chain_buf ? s->chain_buf : s->matrix ? s->mat_buf : s->in_buf;
+        conv_in = s->chain_buf ? s->chain_buf : mixdown ? s->mat_buf : s->in_buf;
         in_n = (ma_uint64)s->in_count;
         out_n = (ma_uint64)(room < FA_CONVERT_CHUNK ? room : FA_CONVERT_CHUNK);
         ma_data_converter_process_pcm_frames(&s->converter, conv_in + (size_t)s->in_offset * conv_ch, &in_n,
@@ -1683,7 +1798,10 @@ static fa_result build_chain_locked(struct fa_stream* s, fa_device* dev)
     if (capacity < 2048) capacity = 2048;
 
     release_chain(s);
-    cc = ma_data_converter_config_init(ma_format_f32, ma_format_f32, s->matrix ? FA_DEVICE_CHANNELS : ch,
+    s->dolby = !s->matrix && dolby_mixes_down(s, fa_load32(&s->dolby_downmix));
+    s->dolby_key = 0;
+    if (!s->dolby) fa_store_float(&s->dolby_makeup, 0.0f);
+    cc = ma_data_converter_config_init(ma_format_f32, ma_format_f32, s->matrix || s->dolby ? FA_DEVICE_CHANNELS : ch,
                                        FA_DEVICE_CHANNELS, s->decoder.format.sample_rate, dev->rate);
     cc.resampling.algorithm = ma_resample_algorithm_custom;   /* the sinc resampler (resample_device.c) */
     cc.resampling.pBackendVTable = &fa_sinc_resampler;
@@ -1696,14 +1814,14 @@ static fa_result build_chain_locked(struct fa_stream* s, fa_device* dev)
     s->converter_ready = 1;
     s->in_cap = FA_DECODE_CHUNK;
     s->in_buf = (float*)malloc((size_t)s->in_cap * ch * sizeof(float));
-    if (s->matrix) s->mat_buf = (float*)malloc((size_t)s->in_cap * FA_DEVICE_CHANNELS * sizeof(float));
+    if (s->matrix || s->dolby) s->mat_buf = (float*)malloc((size_t)s->in_cap * FA_DEVICE_CHANNELS * sizeof(float));
     if (!s->decoder.seekable) {
         /* Everything not yet heard: the ring, the input chunk and the resampler's delay
          * (and what the tempo chain holds, added when the chain is made). */
         s->hist_cap = (fa_frames)((double)capacity * s->decoder.format.sample_rate / dev->rate) + 2 * s->in_cap + 256;
         s->hist = (float*)malloc((size_t)s->hist_cap * ch * sizeof(float));
     }
-    if (!s->in_buf || (s->matrix && !s->mat_buf) || (!s->decoder.seekable && !s->hist) ||
+    if (!s->in_buf || ((s->matrix || s->dolby) && !s->mat_buf) || (!s->decoder.seekable && !s->hist) ||
         fa_ring_init(&s->ring, FA_DEVICE_CHANNELS, capacity) != FA_OK) {
         release_chain(s);
         return FA_ERROR_OUT_OF_MEMORY;
@@ -2123,9 +2241,9 @@ FA_API fa_result FA_CALL fa_stream_seek(fa_stream* stream, fa_frames frame)
 }
 
 /* The audio decoded ahead was made for the old setting. It stays valid while the
- * decoder has not reached the loop end yet (turning on) or not jumped back yet
- * (turning off); otherwise the stream restarts at the position heard, the way a seek
- * does, with the new setting. */
+ * decoder has not reached the loop end yet (reversed: its start; turning on) or not
+ * jumped back yet (turning off); otherwise the stream restarts at the position heard,
+ * the way a seek does, with the new setting. */
 FA_API fa_result FA_CALL fa_stream_set_loop(fa_stream* stream, int32_t on)
 {
     fa_result r = FA_OK;
@@ -2138,11 +2256,12 @@ FA_API fa_result FA_CALL fa_stream_set_loop(fa_stream* stream, int32_t on)
     if (fa_load32(&stream->loop) != on) {
         fa_mutex_lock(&stream->decode_lock);
         if (stream->ring.data && fa_load32(&stream->state) != FA_STATE_ENDED && region_out(stream) == 0) {
+            int rev = reversed(stream);
             end = end_frame(stream);
-            head = fa_load64(&stream->seek_base) + stream->decoded;
-            restart = on ? (fa_load32(&stream->eof) || stream->draining || stream->tempo_drained || (end >= 0 && head >= end))
+            head = fa_load64(&stream->seek_base) + (rev ? -stream->decoded : stream->decoded);   /* as a source position */
+            restart = on ? (fa_load32(&stream->eof) || stream->draining || stream->tempo_drained ||
+                            (rev ? head <= loop_start(stream) : end >= 0 && head >= end))
                          : stream->jumped_back;
-            if (reversed(stream)) restart = 1;   /* the decode-ahead may be past either setting's turn */
         }
         if (!restart) fa_store32(&stream->loop, on);
         fa_mutex_unlock(&stream->decode_lock);
@@ -2193,25 +2312,33 @@ FA_API fa_result FA_CALL fa_stream_get_reverse(fa_stream* stream, int32_t* out_r
  * the chain restarts at the new source frame, and the decode continues from there.
  * The mixer is kept out only while the ring and the map are cut (microseconds), not
  * while decoding, unlike a seek. Positions stay linear across the join when the
- * new setting allows it, so the loop raises FA_EVENT_LOOPED and markers as usual. */
+ * new setting allows it, so the loop raises FA_EVENT_LOOPED and markers as usual.
+ * Reversed, all of it is mirrored: the loop turns at its in point, back up to its
+ * out point, and positions count down across the join. */
 #define FA_LOOP_MARGIN_MS 15
 /* An out point the mix passed less than this ago still loops back as if it had
  * jumped there (keeping the loop's phase); one further behind jumps to the in point. */
 #define FA_LOOP_LATE_MS 500
 
-/* Restarts the decode side at source frame `x`, its output entering the ring at
- * ring frame `j` with linear position `lin`. Caller holds api_lock and decode_lock;
- * the ring has been cut at `j`. */
+/* Restarts the decode side at source frame `x` (reversed: going down from it), its
+ * output entering the ring at ring frame `j` with position `lin` (as linear_position
+ * gives it). Caller holds api_lock and decode_lock; the ring has been cut at `j`. */
 static fa_result rejoin_chain_locked(struct fa_stream* s, int64_t j, double lin, fa_frames x)
 {
-    double sr = (double)s->decoder.format.sample_rate, dr = (double)s->dev_rate;
-    fa_result r = fa_decoder_seek(&s->decoder, x);
+    double sr = (double)s->decoder.format.sample_rate, dr = (double)s->dev_rate, run = mirror(s, lin);
+    fa_result r = FA_OK;
+    if (reversed(s)) {
+        s->rev_pos = x;   /* reverse_read decodes from there */
+        s->rev_n = s->rev_hold = 0;
+    } else {
+        r = fa_decoder_seek(&s->decoder, x);
+    }
     s->in_count = s->in_offset = 0;
     s->chain_buf = NULL;
     s->draining = 0;
     s->tempo_drained = 0;
     s->src_pos = x;
-    s->decoded = (fa_frames)(lin + 0.5) - fa_load64(&s->seek_base);
+    s->decoded = (fa_frames)(run + 0.5) - fa_load64(&s->seek_base);
     s->jumped_back = (fa_frames)(lin + 0.5) != x;
     if (s->converter_ready) ma_data_converter_reset(&s->converter);
     /* Tempo ramps go by chain frames: the chain carries on from the frame heard at j. */
@@ -2223,7 +2350,7 @@ static fa_result rejoin_chain_locked(struct fa_stream* s, int64_t j, double lin,
         formants = s->tempo_formants;
         transients = s->tempo_transients;
         fa_mutex_unlock(&s->tempo_lock);
-        fa_tempo_reset(s->tempo, lin);
+        fa_tempo_reset(s->tempo, run);
         fa_tempo_configure(s->tempo, fast, formants, transients);
     }
     if (r != FA_OK) {
@@ -2235,7 +2362,7 @@ static fa_result rejoin_chain_locked(struct fa_stream* s, int64_t j, double lin,
     return FA_OK;
 }
 
-/* Cuts the ring at `j` (the stream is flushing) and carries on from source frame `x`, linear position `lin`: the
+/* Cuts the ring at `j` (the stream is flushing) and carries on from source frame `x`, position `lin`: the
  * position map gets the new run, the mixer takes the stream back, the decode side restarts. Caller holds api_lock
  * and decode_lock. */
 static fa_result join_at_locked(struct fa_stream* s, fa_tmap* m, int64_t j, double lin, fa_frames x)
@@ -2243,7 +2370,7 @@ static fa_result join_at_locked(struct fa_stream* s, fa_tmap* m, int64_t j, doub
     double sr = (double)s->decoder.format.sample_rate, dr = (double)s->dev_rate;
     fa_store64(&s->ring.write, j);
     fa_tmap_truncate(m, j);
-    fa_tmap_add(m, j, lin, sr / dr * speed_now(s, (int64_t)((double)j * sr / dr + 0.5), s->tempo && fa_tempo_engaged(s->tempo)));
+    fa_tmap_add(m, j, mirror(s, lin), sr / dr * speed_now(s, (int64_t)((double)j * sr / dr + 0.5), s->tempo && fa_tempo_engaged(s->tempo)));
     unflush(s);
     return rejoin_chain_locked(s, j, lin, x);
 }
@@ -2261,30 +2388,29 @@ fa_result fa_stream_set_loop_region(struct fa_stream* s, fa_frames in, fa_frames
     region_read(s, cur);
     if (cur[0] == in && cur[1] == out) { fa_mutex_unlock(&s->api_lock); return FA_OK; }
     if (!is_attached(s) || !s->ring.data || fa_load32(&s->state) == FA_STATE_ENDED ||
-        fa_load64(&s->seek_pending) >= 0 || reversed(s)) {
-        /* Nothing decoded ahead for the old setting (an async seek will start over).
-         * Reversed, what is decoded ahead is dropped: the stream restarts where it is
-         * heard, or at the out point when that is before the loop. */
+        fa_load64(&s->seek_pending) >= 0) {
+        /* Nothing decoded ahead for the old setting (an async seek will start over). */
         fa_frames pos = fa_stream_position_now(s);
-        int restart = reversed(s) && is_attached(s) && s->ring.data && fa_load32(&s->state) != FA_STATE_ENDED;
         fa_mutex_lock(&s->decode_lock);
         region_store(s, in, out);
         fa_mutex_unlock(&s->decode_lock);
-        if (restart) r = seek_locked(s, on && pos <= in ? out : pos);
-        else if (on && (reversed(s) ? pos <= in : pos >= out) && fa_load32(&s->state) != FA_STATE_ENDED)
+        if (on && (reversed(s) ? pos <= in : pos >= out) && fa_load32(&s->state) != FA_STATE_ENDED)
             r = seek_locked(s, reversed(s) ? out : in);   /* outside the loop on the side already passed */
         fa_mutex_unlock(&s->api_lock);
         return r;
     }
     fa_mutex_lock(&s->decode_lock);   /* no worker decodes meanwhile */
     {
-        double sr = (double)s->decoder.format.sample_rate;
-        double head = (double)(fa_load64(&s->seek_base) + s->decoded), lj, lin;
-        fa_frames old_end = end_frame(s), a, x, len = out - in;
-        int old_loops = loops(s) && old_end > 0;
+        double sr = (double)s->decoder.format.sample_rate, lj, lin;
+        double head = mirror(s, (double)(fa_load64(&s->seek_base) + s->decoded));   /* as a source position */
+        loop_view old = loop_view_of(s);
+        fa_frames a, x, len = out - in, late = (fa_frames)(sr * FA_LOOP_LATE_MS / 1000.0);
+        int rev = reversed(s), old_loops = old.loops && old.end > 0;
         int64_t played, write, j, margin = (int64_t)s->dev_rate * FA_LOOP_MARGIN_MS / 1000;
         fa_tmap* m = tmap_of(s);
-        if (!s->jumped_back && (!old_loops || head < (double)old_end) && (!on || head < (double)out)) {
+        /* Reversed, the turns are the in points, reached from above. */
+        if (!s->jumped_back && (rev ? (!old_loops || head > (double)old.back) && (!on || head > (double)in)
+                                    : (!old_loops || head < (double)old.end) && (!on || head < (double)out))) {
             /* The decoder has not reached either setting's turn yet: it takes the new one there. */
             region_store(s, in, out);
             fa_mutex_unlock(&s->decode_lock);
@@ -2304,19 +2430,20 @@ fa_result fa_stream_set_loop_region(struct fa_stream* s, fa_frames in, fa_frames
         j = played + margin < write ? played + margin : write;
         lj = linear_position(s, j);
         a = wrap_position(s, (fa_frames)(lj + 0.5));   /* where the old setting plays at j */
-        if (on && (fa_frames)(lj + 0.5) == a && lj < (double)out && linear_position(s, write) > (double)out) {
-            /* The new out point is ahead in the ring: join exactly there. */
-            int64_t jo = played + frames_until(s, played, (double)out);
+        if (on && (fa_frames)(lj + 0.5) == a && (rev ? lj > (double)in && linear_position(s, write) < (double)in
+                                                     : lj < (double)out && linear_position(s, write) > (double)out)) {
+            /* The new turn is ahead in the ring: join exactly there. */
+            int64_t jo = played + frames_until(s, played, (double)(rev ? in : out));
             if (jo > j && jo <= write) { j = jo; lj = linear_position(s, j); a = (fa_frames)(lj + 0.5); }
         }
         region_store(s, in, out);   /* cur is restored if the join fails */
-        if (on && a >= out && a - out < (fa_frames)(sr * FA_LOOP_LATE_MS / 1000.0)) {
-            /* Just past the out point: continue as if it had looped there. */
+        if (on && (rev ? a <= in && in - a < late : a >= out && a - out < late)) {
+            /* Just past the turn: continue as if it had looped there. */
             lin = (fa_frames)(lj + 0.5) == a ? lj : (double)a;
-            x = in + (a - out) % len;
-        } else if (on && a >= out) {
-            lin = (double)in;   /* far past it: to the in point */
-            x = in;
+            x = rev ? out - (in - a) % len : in + (a - out) % len;
+        } else if (on && (rev ? a <= in : a >= out)) {
+            lin = (double)(rev ? out : in);   /* far past it: to the other end */
+            x = rev ? out : in;
         } else {
             lin = (fa_frames)(lj + 0.5) == a ? lj : (double)a;
             x = a;
@@ -2346,10 +2473,10 @@ static int64_t jump_point(struct fa_stream* s, fa_frames at, int64_t played, int
 {
     int64_t j = played + (int64_t)s->dev_rate * FA_LOOP_MARGIN_MS / 1000;
     if (j <= write && at >= 0) {
-        double lp = linear_position(s, played);
+        double lp = linear_position(s, played), dir = reversed(s) ? -1.0 : 1.0;   /* ahead: further down reversed */
         double target = lp + (double)(at - wrap_position(s, (fa_frames)(lp + 0.5)));
-        if (target > linear_position(s, write)) j = write + 1;   /* not decoded yet */
-        else if (target > linear_position(s, j)) j = played + frames_until(s, played, target);
+        if (dir * target > dir * linear_position(s, write)) j = write + 1;   /* not decoded yet */
+        else if (dir * target > dir * linear_position(s, j)) j = played + frames_until(s, played, target);
     }
     return j;
 }
@@ -2361,33 +2488,13 @@ static int64_t jump_point(struct fa_stream* s, fa_frames at, int64_t played, int
  * already that close joins a margin ahead of the mix. FA_ERROR_BUSY while `at` (or
  * the margin) is not decoded yet, or the stream is not playing from its ring: try
  * again later. `region` (in, out) also sets the deck loop at the join, so a loop
- * moves with the jump in one step; NULL keeps it. */
+ * moves with the jump in one step; NULL keeps it. Reversed, `at` is reached going
+ * down and playback goes on down from `at` + `delta`. */
 static fa_result jump(struct fa_stream* s, fa_frames at, fa_frames delta, const fa_frames* region)
 {
     fa_result r = FA_ERROR_BUSY;
     if (s->push || !s->decoder.seekable) return FA_ERROR_NOT_SEEKABLE;
     fa_mutex_lock(&s->api_lock);
-    if (reversed(s) && is_attached(s) && fa_load32(&s->state) == FA_STATE_PLAYING) {
-        /* Reversed: at once, as a seek (the join is made for forward playback). */
-        fa_frames x = target_position(s) + delta, last = s->decoder.length > 0 ? s->decoder.length - 1 : -1;
-        fa_frames old[2];
-        if (x < 0) x = 0;
-        if (last >= 0 && x > last) x = last;
-        region_read(s, old);
-        if (region) {
-            fa_mutex_lock(&s->decode_lock);
-            region_store(s, region[0], region[1]);
-            fa_mutex_unlock(&s->decode_lock);
-        }
-        r = seek_locked(s, x);
-        if (r != FA_OK && region) {   /* not moved: the loop stays where it was */
-            fa_mutex_lock(&s->decode_lock);
-            region_store(s, old[0], old[1]);
-            fa_mutex_unlock(&s->decode_lock);
-        }
-        fa_mutex_unlock(&s->api_lock);
-        return r;
-    }
     if (!is_attached(s) || !s->ring.data || fa_load32(&s->state) != FA_STATE_PLAYING || fa_load64(&s->seek_pending) >= 0) {
         fa_mutex_unlock(&s->api_lock);
         return FA_ERROR_BUSY;
@@ -2396,7 +2503,8 @@ static fa_result jump(struct fa_stream* s, fa_frames at, fa_frames delta, const 
     {
         double lj, lin;
         int64_t played, write = fa_load64(&s->ring.write), j;
-        fa_frames a, x, old[2], last = s->decoder.length > 0 ? s->decoder.length - 1 : -1;
+        /* Reversed, x is where it goes down from (rev_pos): up to the length itself. */
+        fa_frames a, x, old[2], last = s->decoder.length > 0 ? s->decoder.length - !reversed(s) : -1;
         fa_tmap* m = tmap_of(s);
         if (jump_point(s, at, fa_load64(&s->played), write) > write) {
             /* Not decoded yet: asked again until it is (sync.c every few ms), so leave
@@ -3053,10 +3161,12 @@ FA_API fa_result FA_CALL fa_stream_get_next(fa_stream* stream, fa_stream** out_n
 
 /* ---- channel matrix ----------------------------------------------------- */
 
+static fa_result remix_locked(struct fa_stream* stream, float* m, int32_t mode);
+
 FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* weights, uint32_t in_channels, uint32_t out_channels)
 {
     float* m = NULL;
-    fa_result r = FA_OK;
+    fa_result r;
     uint32_t i;
     if (!stream) return FA_ERROR_INVALID_ARG;
     if (weights) {
@@ -3068,6 +3178,18 @@ FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* we
         memcpy(m, weights, (size_t)in_channels * out_channels * sizeof(float));
     }
     fa_mutex_lock(&stream->api_lock);
+    r = remix_locked(stream, m, fa_load32(&stream->dolby_downmix));
+    fa_mutex_unlock(&stream->api_lock);
+    return r;
+}
+
+/* Sets the custom matrix (NULL = none; taken over, freed on failure; never the current
+ * one) and the Dolby
+ * downmix mode. An attached stream gets a new chain and carries on from where it
+ * plays. Caller holds api_lock. */
+static fa_result remix_locked(struct fa_stream* stream, float* m, int32_t mode)
+{
+    fa_result r = FA_OK;
     if (is_attached(stream) && !stream->decoder.seekable) {
         r = FA_ERROR_NOT_SEEKABLE;  /* the new chain would have to decode from where playback is */
         free(m);
@@ -3080,6 +3202,7 @@ FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* we
         fa_mutex_lock(&stream->decode_lock);
         free(stream->matrix);
         stream->matrix = m;
+        fa_store32(&stream->dolby_downmix, mode);
         r = build_chain_locked(stream, stream->device);
         if (r == FA_OK) {
             /* restart_at_locked only seeks the decoder when needed: force it, the
@@ -3097,10 +3220,31 @@ FA_API fa_result FA_CALL fa_stream_set_matrix(fa_stream* stream, const float* we
         fa_mutex_lock(&stream->decode_lock);
         free(stream->matrix);
         stream->matrix = m;
+        fa_store32(&stream->dolby_downmix, mode);
         fa_mutex_unlock(&stream->decode_lock);
     }
+    return r;
+}
+
+FA_API fa_result FA_CALL fa_stream_set_dolby_downmix(fa_stream* stream, fa_dolby_downmix mode)
+{
+    fa_result r = FA_OK;
+    if (!stream || (int)mode < FA_DOLBY_DOWNMIX_AUTO || mode > FA_DOLBY_DOWNMIX_ENGINE) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&stream->api_lock);
+    /* Only to or from the engine's downmix does the chain change. */
+    if (is_attached(stream) && !stream->matrix && dolby_mixes_down(stream, (int32_t)mode) != stream->dolby)
+        r = remix_locked(stream, NULL, (int32_t)mode);   /* no matrix: stays none */
+    else
+        fa_store32(&stream->dolby_downmix, (int32_t)mode);
     fa_mutex_unlock(&stream->api_lock);
     return r;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_dolby_downmix(fa_stream* stream, fa_dolby_downmix* out_mode)
+{
+    if (!stream || !out_mode) return FA_ERROR_INVALID_ARG;
+    *out_mode = (fa_dolby_downmix)fa_load32(&stream->dolby_downmix);
+    return FA_OK;
 }
 
 /* ---- events ------------------------------------------------------------- */
@@ -3332,36 +3476,53 @@ static double fade_position(struct fa_stream* s, const loop_view* v, int64_t pla
     return fade_position_of(s, v, linear_position(s, played));
 }
 
-/* FA_EVENT_MARKER for every marker passed between `played0` and `played1`. */
+/* Whether frame `m` was passed between two positions, wrapped into the loop as w0
+ * and w1 (see position_events for the ranges). `whole`: a whole turn or more. */
+static int passed(int rev, int looping, int whole, fa_frames back, fa_frames end, fa_frames w0, fa_frames w1,
+                  int ended, fa_frames m)
+{
+    if (whole) return m >= back && m <= end;
+    if (rev) {
+        /* The end itself is reached where playback starts from it or wraps to it. */
+        if (looping && w1 > w0) return (m >= back && m < w0) || (m >= w1 && m <= end);
+        return m >= w1 && (m < w0 || (m == w0 && w0 == end));
+    }
+    if (looping && w1 < w0) return (m >= w0 && m <= end) || (m >= back && m < w1);
+    return m >= w0 && (m < w1 || (ended && m == w1));
+}
+
+/* FA_EVENT_MARKER for every marker passed between `played0` and `played1`, and
+ * FA_EVENT_LOOPED for every turn of the loop. */
 static void marker_events(struct fa_stream* s, fa_device* dev, const mix_markers* mk, int64_t played0, int64_t played1, int ended)
 {
     fa_frames p0 = (fa_frames)(linear_position(s, played0) + 0.5);
     fa_frames p1 = (fa_frames)(linear_position(s, played1) + 0.5);
     loop_view v = loop_view_of(s);
-    fa_frames end = v.end, back = v.back, w0, w1;
-    int looping = v.loops && end > 0 && end > back;
+    fa_frames end = v.end, back = v.back, len = end - back, w0, w1;
+    int looping = v.loops && end > 0 && end > back, rev = reversed(s), whole;
     /* A source without a length learns its end when the decoder first reaches it,
      * which can be after the block that ended exactly there was mixed: that jump
      * is then counted with the next block. */
     int late_end = s->mix_end_unknown && p0 == end;
     int i;
-    if ((p1 <= p0 && !ended) || reversed(s)) return;
+    if (rev ? p1 >= p0 : (p1 <= p0 && !ended)) return;
     s->mix_end_unknown = end <= 0;
+    whole = looping && (rev ? p0 - p1 : p1 - p0) >= len;
     w0 = wrap_in(s, &v, p0);
     w1 = wrap_in(s, &v, p1);
     for (i = 0; i < FA_MARKER_COUNT; i++) {
         fa_frames m = mk->m[i];
-        int hit;
-        if (m == FA_FRAMES_UNSET) continue;
         /* The loop end (CUE_OUT) is passed each time playback wraps. */
-        if (looping && p1 - p0 >= end - back) hit = m >= back && m <= end;
-        else if (looping && w1 < w0) hit = (m >= w0 && m <= end) || (m >= back && m < w1);
-        else hit = m >= w0 && (m < w1 || (ended && m == w1));
-        if (hit) fa_audio_post_event(dev, s, FA_EVENT_MARKER, m, i);
+        if (m != FA_FRAMES_UNSET && passed(rev, looping, whole, back, end, w0, w1, ended, m))
+            fa_audio_post_event(dev, s, FA_EVENT_MARKER, m, i);
     }
-    if (looping && p1 >= end) {
+    if (looping && rev && p1 <= back) {
+        /* Every turn between p0 and p1: once back, back - len, ... in linear frames is heard. */
+        fa_frames k0 = p0 > back ? 0 : (back - p0) / len + 1, k;
+        for (k = k0; k <= (back - p1) / len; k++) fa_audio_post_event(dev, s, FA_EVENT_LOOPED, back, end);
+    } else if (looping && !rev && p1 >= end) {
         /* Every jump between p0 and p1: at end, end + len, ... in linear frames. */
-        fa_frames len = end - back, k0 = p0 < end || late_end ? 0 : (p0 - end) / len + 1, k;
+        fa_frames k0 = p0 < end || late_end ? 0 : (p0 - end) / len + 1, k;
         for (k = k0; k <= (p1 - end) / len; k++) fa_audio_post_event(dev, s, FA_EVENT_LOOPED, end, back);
     }
 }
@@ -3369,31 +3530,52 @@ static void marker_events(struct fa_stream* s, fa_device* dev, const mix_markers
 /* MIDI streams: FA_EVENT_MIDI_TEXT (value = the text's index) for every text event
  * whose frame playback passed between `played0` and `played1`. The frames are
  * fixed and sorted, so a binary search finds the first one; wrapping into a loop
- * gives two ranges. Best effort, like markers. */
-static void post_texts(struct fa_stream* s, fa_device* dev, const fa_frames* at, uint32_t n, fa_frames from, fa_frames to)
+ * gives two ranges. Best effort, like markers. `down`: reversed, last first. */
+static void post_texts(struct fa_stream* s, fa_device* dev, const fa_frames* at, uint32_t n, fa_frames from, fa_frames to,
+                       int down)
 {
     uint32_t lo = 0, hi = n;
+    fa_frames key = down ? to : from;
     while (lo < hi) {
         uint32_t mid = lo + (hi - lo) / 2;
-        if (at[mid] < from) lo = mid + 1; else hi = mid;
+        if (at[mid] < key) lo = mid + 1; else hi = mid;
+    }
+    if (down) {
+        for (; lo > 0 && at[lo - 1] >= from; lo--) fa_audio_post_event(dev, s, FA_EVENT_MIDI_TEXT, at[lo - 1], (int64_t)(lo - 1));
+        return;
     }
     for (; lo < n && at[lo] < to; lo++) fa_audio_post_event(dev, s, FA_EVENT_MIDI_TEXT, at[lo], (int64_t)lo);
 }
 
-static void post_midi_texts(struct fa_stream* s, fa_device* dev, fa_frames from, fa_frames to)
+static void post_midi_texts(struct fa_stream* s, fa_device* dev, fa_frames from, fa_frames to, int down)
 {
     uint32_t n;
     const fa_frames* at = fa_midi_text_frames(s->midi, &n);
-    if (n > 0) post_texts(s, dev, at, n, from, to);
+    if (n > 0) post_texts(s, dev, at, n, from, to, down);
 }
 
 /* Tracker modules: FA_EVENT_TRACKER_ROW (value = order << 16 | row) for the rows
- * starting between `from` and `to` that FA_TRACKER_ROW_EVENTS asks for. */
-static void post_tracker_rows(struct fa_stream* s, fa_device* dev, fa_frames from, fa_frames to)
+ * starting between `from` and `to` that FA_TRACKER_ROW_EVENTS asks for. `down`:
+ * reversed, last first: the last batch of the range is found and posted first,
+ * then the range ends where it began (no recursion on the audio thread). */
+static void post_tracker_rows(struct fa_stream* s, fa_device* dev, fa_frames from, fa_frames to, int down)
 {
-    fa_frames at[32];
-    int64_t v[32];
+    fa_frames at[32], probe;
+    int64_t v[32], pv;
     uint32_t n, i;
+    if (down) {
+        for (;;) {
+            fa_frames lo = from;
+            n = fa_tracker_rows_in(s->tracker, lo, to, at, v, 32);
+            while (n == 32 && fa_tracker_rows_in(s->tracker, at[31] + 1, to, &probe, &pv, 1) > 0) {
+                lo = at[31] + 1;
+                n = fa_tracker_rows_in(s->tracker, lo, to, at, v, 32);
+            }
+            for (i = n; i > 0; i--) fa_audio_post_event(dev, s, FA_EVENT_TRACKER_ROW, at[i - 1], v[i - 1]);
+            if (lo == from) return;
+            to = lo;
+        }
+    }
     do {
         n = fa_tracker_rows_in(s->tracker, from, to, at, v, 32);
         for (i = 0; i < n; i++) fa_audio_post_event(dev, s, FA_EVENT_TRACKER_ROW, at[i], v[i]);
@@ -3402,28 +3584,38 @@ static void post_tracker_rows(struct fa_stream* s, fa_device* dev, fa_frames fro
 }
 
 /* Events tied to fixed source frames (MIDI texts, tracker rows): `post` for each
- * range of source frames playback passed between `played0` and `played1`;
- * wrapping into a loop gives two ranges. */
+ * range of source frames playback passed between `played0` and `played1`, in the
+ * order heard; wrapping into a loop gives two ranges. Reversed, the ranges are
+ * walked downwards, as position_events does. */
 static void frame_events(struct fa_stream* s, fa_device* dev, int64_t played0, int64_t played1, int ended,
-                         void (*post)(struct fa_stream*, fa_device*, fa_frames, fa_frames))
+                         void (*post)(struct fa_stream*, fa_device*, fa_frames, fa_frames, int))
 {
     fa_frames p0, p1, end, back, w0, w1;
     loop_view v;
+    int rev = reversed(s), looping;
     p0 = (fa_frames)(linear_position(s, played0) + 0.5);
     p1 = (fa_frames)(linear_position(s, played1) + 0.5);
-    if (p1 <= p0 && !ended) return;
+    if (rev ? p1 >= p0 : (p1 <= p0 && !ended)) return;
     v = loop_view_of(s);
     end = v.end;
     back = v.back;
+    looping = v.loops && end > back;
     w0 = wrap_in(s, &v, p0);
     w1 = wrap_in(s, &v, p1);
-    if (v.loops && end > back && p1 - p0 >= end - back) {
-        post(s, dev, back, end);
-    } else if (v.loops && end > back && w1 < w0) {
-        post(s, dev, w0, end);
-        post(s, dev, back, w1);
+    if (looping && (rev ? p0 - p1 : p1 - p0) >= end - back) {
+        post(s, dev, back, end, rev);
+    } else if (rev) {
+        if (looping && w1 > w0) {
+            post(s, dev, back, w0, 1);
+            post(s, dev, w1, end, 1);
+        } else {
+            post(s, dev, w1, w0, 1);
+        }
+    } else if (looping && w1 < w0) {
+        post(s, dev, w0, end, 0);
+        post(s, dev, back, w1, 0);
     } else {
-        post(s, dev, w0, ended ? w1 + 1 : w1);
+        post(s, dev, w0, ended ? w1 + 1 : w1, 0);
     }
 }
 
@@ -3457,18 +3649,9 @@ static void position_events(struct fa_stream* s, fa_device* dev, int64_t played0
         int64_t d;
         int hit;
         if (m == FA_FRAMES_UNSET) continue;
-        if (rev) {
-            /* The end itself is reached where playback starts from it or wraps to it. */
-            if (whole) hit = m >= back && m <= end;
-            else if (looping && w1 > w0) hit = (m >= back && m < w0) || (m >= w1 && m <= end);
-            else hit = m >= w1 && (m < w0 || (m == w0 && w0 == end));
-            d = m < w0 ? w0 - 1 - m : m == w0 ? -1 : (w0 - back) + (end - m);
-        } else {
-            if (whole) hit = m >= back && m <= end;
-            else if (looping && w1 < w0) hit = (m >= w0 && m <= end) || (m >= back && m < w1);
-            else hit = m >= w0 && (m < w1 || (ended && m == w1));
-            d = m >= w0 ? m - w0 : (end + 1 - w0) + (m - back);
-        }
+        hit = passed(rev, looping, whole, back, end, w0, w1, ended, m);
+        if (rev) d = m < w0 ? w0 - 1 - m : m == w0 ? -1 : (w0 - back) + (end - m);
+        else d = m >= w0 ? m - w0 : (end + 1 - w0) + (m - back);
         if (!hit || !fa_cas64(&s->pos_events[i], m, FA_FRAMES_UNSET)) continue;
         fa_fetch_add32(&s->pos_armed, -1);
         for (j = n++; j > 0 && dist[j - 1] > d; j--) { at[j] = at[j - 1]; dist[j] = dist[j - 1]; }
@@ -3482,7 +3665,6 @@ static void heard_events(struct fa_stream* s, fa_device* dev, int64_t played0, i
 {
     heard_ramps_due(s, dev, played1, ended);
     position_events(s, dev, played0, played1, ended);
-    if (reversed(s)) return;   /* texts and rows are raised playing forward only */
     if (s->midi) frame_events(s, dev, played0, played1, ended, post_midi_texts);
     if (s->tracker && fa_tracker_row_events_on(s->tracker)) frame_events(s, dev, played0, played1, ended, post_tracker_rows);
 }
@@ -4123,6 +4305,58 @@ FA_API fa_result FA_CALL fa_stream_seek_async(fa_stream* stream, fa_frames frame
     return r;
 }
 
+#define FA_ZIP_CRC_CHUNK (256 * 1024)
+
+/* Ends the check of a stored ZIP entry. A mismatch is reported once and playback goes on. */
+static void zip_crc_end(struct fa_stream* s, int ok)
+{
+    if (s->zcrc_open) fa_source_close(&s->zcrc_src);
+    s->zcrc_open = 0;
+    free(s->zcrc_buf);
+    s->zcrc_buf = NULL;
+    fa_store32(&s->zcrc_pending, 0);
+    if (!ok) {
+        fa_event ev;
+        ev.type = FA_EVENT_DECODE_ERROR;
+        ev.stream = s;
+        ev.frame = 0;
+        if (fa_mutex_trylock(&s->api_lock)) {   /* taken first by API threads: only tried */
+            ev.frame = fa_stream_position_now(s);
+            fa_mutex_unlock(&s->api_lock);
+        }
+        ev.value = FA_ERROR_UNSUPPORTED_FORMAT;
+        fa_engine_post_event(s->engine, &ev);
+    }
+}
+
+/* One chunk of the CRC check of a stored ZIP entry (the entry is the stream's whole
+ * source). A file is read again through a source of its own; one that cannot be
+ * read is not worth a report. Under decode_lock. */
+static void zip_crc_step(struct fa_stream* s)
+{
+    int64_t len = s->source.length, left = len - s->zcrc_done;
+    size_t n = left < FA_ZIP_CRC_CHUNK ? (size_t)left : FA_ZIP_CRC_CHUNK;
+    if (left > 0 && s->source.kind == FA_SOURCE_MEMORY) {
+        s->zcrc_acc = fa_crc32_update(s->zcrc_acc, s->source.mem + s->zcrc_done, n);
+        s->zcrc_done += (int64_t)n;
+    } else if (left > 0) {
+        int64_t got;
+        if (!s->zcrc_open) {
+            if (!s->path || fa_source_open_path_window(&s->zcrc_src, s->path, s->path_offset, s->path_length) != FA_OK) {
+                zip_crc_end(s, 1);
+                return;
+            }
+            s->zcrc_open = 1;
+            s->zcrc_buf = (uint8_t*)malloc(FA_ZIP_CRC_CHUNK);
+        }
+        got = s->zcrc_buf ? fa_source_read(&s->zcrc_src, s->zcrc_buf, n) : -1;
+        if (got <= 0) { zip_crc_end(s, 1); return; }
+        s->zcrc_acc = fa_crc32_update(s->zcrc_acc, s->zcrc_buf, (size_t)got);
+        s->zcrc_done += got;
+    }
+    if (s->zcrc_done >= len) zip_crc_end(s, s->zcrc_acc == s->zcrc_expect);
+}
+
 /* api_lock is taken second here (API threads take it first), so only tried: an API
  * call in progress finishes, and the seek runs on a later pass. */
 int fa_stream_work(struct fa_stream* s, int64_t max_frames)
@@ -4152,5 +4386,10 @@ int fa_stream_work(struct fa_stream* s, int64_t max_frames)
         return 1;
     }
     fa_stream_fill(s, max_frames);
+    /* The check is the worker's spare time: only with the ring at least half full (or the
+     * stream ended), so a slow disk never makes playback run dry. */
+    if (fa_load32(&s->zcrc_pending) &&
+        (fa_load32(&s->eof) || fa_ring_readable(&s->ring) >= fill_target(s) / 2))
+        zip_crc_step(s);
     return 1;
 }

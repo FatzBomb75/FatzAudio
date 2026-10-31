@@ -14,6 +14,7 @@
  * Jobs run in the order they were queued; all chunks of a file are in flight at
  * once before the next file starts, so the file asked for first is done first. */
 #include "fa_internal.h"
+#include "ac3.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,10 +41,13 @@ struct fa_scan_job {
     int64_t path_offset, path_length; /* ... or these bytes of it (a stored ZIP entry) ... */
     const char* name_hint;         /* path, or the ZIP entry's name; NULL for memory */
     char entry_name[260];
-    const uint8_t* mem;            /* ... or the memory of a memory stream */
+    const uint8_t* mem;            /* ... or the memory of a memory stream ... */
     size_t mem_size;
+    fa_shared_file* shared;        /* ... or the temp file of an unpacked ZIP song (a reference) */
     int32_t audio_track;
     int use_tags;
+    int use_dialnorm;              /* fa_engine_set_dialnorm when the job started */
+    fa_atomic64 dolby_mix;         /* env.dolby_mix: the dialogue level of a Dolby stream */
     fa_atomic32 cancel;
     fa_decoder_env env;            /* MIDI: the soundfont (a reference) and rate; no dynamic
                                       range compression: scans measure the full range */
@@ -214,6 +218,7 @@ static void cache_write(const fa_scan_job* j, const fa_loudness* l)
 
 static fa_result open_source(const fa_scan_job* j, fa_source* src)
 {
+    if (j->shared) return fa_source_open_shared(src, j->shared);
     if (!j->path) return fa_source_open_memory_ref(src, j->mem, j->mem_size);
     return fa_source_open_path_window(src, j->path, j->path_offset, j->path_length);
 }
@@ -228,7 +233,23 @@ static void set_result(fa_scan_job* j, double lufs, double range, double peak, f
     j->status = FA_OK;
 }
 
-/* Returns 1 when the job is decided (tags, cache or error), 0 when chunks are planned. */
+/* A Dolby stream's dialogue level as its loudness: read from the first unit. -31
+ * (what encoders write when nobody set it) and the reserved 0 are not used. */
+static int dialnorm_loudness(fa_scan_job* j, fa_decoder* dec)
+{
+    fa_ac3_mix m;
+    if (!fa_ac3_is_codec(dec->codec)) return 0;
+    if (!fa_load64(&j->dolby_mix)) {
+        float buf[256 * 8];
+        fa_frames got = 0;
+        fa_decoder_read(dec, buf, 256, &got);
+    }
+    if (!fa_ac3_mix_unpack((uint64_t)fa_load64(&j->dolby_mix), &m) || m.dialnorm == 0 || m.dialnorm == 31) return 0;
+    set_result(j, -(double)m.dialnorm, NAN, NAN, FA_LOUDNESS_DIALNORM);
+    return 1;
+}
+
+/* Returns 1 when the job is decided (tags, cache, dialnorm or error), 0 when chunks are planned. */
 static int run_prepare(fa_scan_job* j)
 {
     fa_source src;
@@ -265,6 +286,11 @@ static int run_prepare(fa_scan_job* j)
     fa_source_seek(&src, 0);
     r = fa_decoder_open(&dec, &src, j->name_hint, NULL, j->audio_track, &j->env);
     if (r != FA_OK) { j->status = r; fa_source_close(&src); return 1; }
+    if (j->use_dialnorm && dialnorm_loudness(j, &dec)) {
+        fa_decoder_close(&dec);
+        fa_source_close(&src);
+        return 1;
+    }
     j->rate = dec.format.sample_rate;
     j->channels = dec.format.channels;
     length = dec.length;
@@ -484,6 +510,7 @@ static void job_free(fa_scan_job* j)
     if (j->chunks) for (k = 0; k < j->nchunks; k++) free(j->chunks[k].subs);
     free(j->chunks);
     free(j->path);
+    fa_shared_file_release(j->shared);
     fa_soundfont_release(j->env.soundfont);
     free(j);
 }
@@ -491,11 +518,13 @@ static void job_free(fa_scan_job* j)
 fa_scan_job* fa_scan_start_stream(struct fa_stream* s, int use_tags)
 {
     fa_scan_job* j;
-    if (!s->path && s->source.kind != FA_SOURCE_MEMORY) return NULL; /* app I/O: cannot read it twice */
+    if (!s->path && s->source.kind != FA_SOURCE_MEMORY && !s->source.shared) return NULL; /* app I/O: cannot read it twice */
     j = job_new(s->engine);
     if (!j) return NULL;
     j->stream = s;
     j->use_tags = use_tags;
+    j->use_dialnorm = use_tags && fa_load32(&s->engine->use_dialnorm);
+    j->env.dolby_mix = &j->dolby_mix;
     j->audio_track = s->audio_track;
     j->env.soundfont = fa_soundfont_retain(s->soundfont);
     if (s->path) {
@@ -505,6 +534,10 @@ fa_scan_job* fa_scan_start_stream(struct fa_stream* s, int use_tags)
         j->path_length = s->path_length;
         memcpy(j->entry_name, s->path_name, sizeof(j->entry_name));
         j->name_hint = s->path_length > 0 ? j->entry_name : j->path;
+    } else if (s->source.shared) {
+        j->shared = fa_shared_file_retain(s->source.shared);
+        memcpy(j->entry_name, s->path_name, sizeof(j->entry_name));
+        j->name_hint = j->entry_name[0] ? j->entry_name : NULL;
     } else {
         j->mem = s->source.mem;
         j->mem_size = s->source.mem_size;

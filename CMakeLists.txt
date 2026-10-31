@@ -107,6 +107,7 @@ set(FA_SOURCES
     src/stubs.c
     src/miniaudio_impl.c
     src/net_url.c
+    src/net_cookie.c
     src/net_http.c
     src/net_source.c
     src/net_hls.c

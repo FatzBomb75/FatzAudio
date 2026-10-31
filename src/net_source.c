@@ -48,6 +48,7 @@ void fa_net_request(fa_net* n, fa_http_request* req, const char* url)
     req->cancel = &n->cancel;
     req->session = n->http;
     req->app_origin = n->cfg.url;   /* entries of a playlist on other servers get no app credentials */
+    req->cookies = n->cookies;
 }
 
 /* ---- the window ------------------------------------------------------------ */
@@ -58,6 +59,22 @@ void fa_net_request(fa_net* n, fa_http_request* req, const char* url)
 static int seekable_locked(const fa_net* n)
 {
     return n->ranges && n->length >= 0 && !n->live && !n->hls;
+}
+
+/* Where the decoder reads next: read_pos, or further on where the demuxer said it
+ * will read (fa_net_will_read). Bytes behind it are not needed. Caller holds the lock. */
+static int64_t reader_locked(const fa_net* n)
+{
+    return n->want_start > n->read_pos ? n->want_start : n->read_pos;
+}
+
+/* Reading at `offset` needs a new connection: it is behind the window, too far
+ * ahead of the download, or past where a finished download gave up. Caller holds
+ * the lock. */
+static int out_of_reach_locked(const fa_net* n, int64_t offset)
+{
+    return offset < n->win_start || offset > n->win_end + FA_NET_RESTART_GAP ||
+           (offset > n->win_end && n->finished && (n->length < 0 || offset < n->length));
 }
 
 /* Radio with a stated bitrate (icy-br): twice prebuffer_ms plus 5 s ahead, which
@@ -108,7 +125,7 @@ static int window_write(fa_net* n, const uint8_t* data, size_t size)
             size -= (size_t)k;
             continue;
         }
-        while (!n->quit && !n->restart && !n->hls_seek && n->win_end - n->read_pos >= n->ahead_limit)
+        while (!n->quit && !n->restart && !n->hls_seek && n->win_end - reader_locked(n) >= n->ahead_limit)
             fa_cond_wait_ms(&n->cond, &n->lock, 100);
         if (n->quit || n->restart || n->hls_seek) { fa_mutex_unlock(&n->lock); return 1; }
         /* Never more than the window can take without overwriting unread bytes. */
@@ -122,9 +139,15 @@ static int window_write(fa_net* n, const uint8_t* data, size_t size)
         memcpy(n->buf, data + first, (size_t)(piece - first));
         n->win_end += piece;
         n->downloaded += piece;
+        fa_cond_broadcast(&n->cond);
+        /* The tap runs without the lock: the decoder can read on meanwhile. */
+        fa_mutex_unlock(&n->lock);
+        fa_mutex_lock(&n->tap_lock);
+        if (n->tap) n->tap(n->tap_user, data, (size_t)piece);
+        fa_mutex_unlock(&n->tap_lock);
+        fa_mutex_lock(&n->lock);
         data += piece;
         size -= (size_t)piece;
-        fa_cond_broadcast(&n->cond);
     }
     fa_mutex_unlock(&n->lock);
     return 0;
@@ -420,6 +443,7 @@ static void download_main(void* arg)
     int hops = 0;
     uint32_t backoff = 250;
     int64_t fail_start = 0;
+    fa_store64(&n->download_tid, (int64_t)fa_thread_current_id());
     n->http = fa_http_session_create();   /* only this thread uses it */
     fa_mutex_lock(&n->lock);
     while (!n->quit && url) {
@@ -427,6 +451,7 @@ static void download_main(void* arg)
         fetch_ctx c;
         fa_result r;
         int64_t pos;
+        int closed_end = 0, dropped;
         if (n->finished && !n->restart) {   /* complete: idle until a seek needs more */
             fa_cond_wait_ms(&n->cond, &n->lock, 200);
             continue;
@@ -445,6 +470,7 @@ static void download_main(void* arg)
         c.pos = pos;
         fa_net_request(n, &req, url);
         req.icy = !(n->cfg.flags & FA_NET_NO_ICY);
+        req.closed_end = &closed_end;
         /* The first request asks for "bytes=0-": a 206 answer proves ranges work. */
         if (n->connections == 0) req.range_start = 0;
         else if (!n->live && pos > 0) req.range_start = pos;
@@ -485,7 +511,11 @@ static void download_main(void* arg)
             }
         }
 
-        if (r == FA_OK && !n->icy && (n->length < 0 || n->win_end + n->skip >= n->length)) {
+        /* A body without a length or chunked framing that the server closed can't be
+         * told from a dropped connection: one that brought audio is a live stream
+         * cut off, and reconnects like radio (an empty one ends as before). */
+        dropped = r == FA_OK && closed_end && n->length < 0 && c.got_data;
+        if (r == FA_OK && !dropped && !n->icy && (n->length < 0 || n->win_end + n->skip >= n->length)) {
             n->finished = 1;                    /* the whole file is here */
             fail_start = 0;
             backoff = 250;
@@ -533,8 +563,21 @@ fa_result fa_net_open(const fa_net_config* cfg, fa_net** out)
     n->meta_len = -1;
     n->starving = 1;
     n->hls_duration = -1;
+    n->want_start = n->want_end = -1;
     if (fa_mutex_init(&n->lock) != 0) { free_config(&n->cfg); free(n); return FA_ERROR_OUT_OF_MEMORY; }
     if (fa_cond_init(&n->cond) != 0) { fa_mutex_destroy(&n->lock); free_config(&n->cfg); free(n); return FA_ERROR_OUT_OF_MEMORY; }
+    if (fa_mutex_init(&n->tap_lock) != 0) {
+        fa_cond_destroy(&n->cond);
+        fa_mutex_destroy(&n->lock);
+        free_config(&n->cfg);
+        free(n);
+        return FA_ERROR_OUT_OF_MEMORY;
+    }
+    n->tap = cfg->download_proc;
+    n->tap_user = cfg->download_user;
+    /* Lives as long as n: fa_net_read_range uses it too, also while the download
+     * thread winds down (NULL when out of memory: requests go without cookies). */
+    n->cookies = fa_http_cookies_create();
     if (fa_thread_create(&n->thread, download_main, n) != 0) { fa_net_close(n); return FA_ERROR_GENERIC; }
     n->thread_started = 1;
 
@@ -555,15 +598,30 @@ fa_result fa_net_open(const fa_net_config* cfg, fa_net** out)
     return FA_OK;
 }
 
+void fa_net_set_tap(fa_net* n, fa_download_proc proc, void* user)
+{
+    if ((int64_t)fa_thread_current_id() == fa_load64(&n->download_tid)) {   /* from inside the tap: tap_lock is held already */
+        n->tap = proc;
+        n->tap_user = user;
+        return;
+    }
+    fa_mutex_lock(&n->tap_lock);
+    n->tap = proc;
+    n->tap_user = user;
+    fa_mutex_unlock(&n->tap_lock);
+}
+
 void fa_net_interrupt(fa_net* n)
 {
     if (!n) return;
     fa_mutex_lock(&n->lock);
     n->quit = 1;
     fa_store32(&n->cancel, 1);
+    fa_store32(&n->side_cancel, 1);
     fa_cond_broadcast(&n->cond);
     fa_mutex_unlock(&n->lock);
     fa_http_abort(&n->cancel);
+    fa_http_abort(&n->side_cancel);
 }
 
 void fa_net_close(fa_net* n)
@@ -574,14 +632,18 @@ void fa_net_close(fa_net* n)
         fa_mutex_lock(&n->lock);
         n->quit = 1;
         fa_store32(&n->cancel, 1);
+        fa_store32(&n->side_cancel, 1);
         fa_cond_broadcast(&n->cond);
         fa_mutex_unlock(&n->lock);
         fa_http_abort(&n->cancel);
+        fa_http_abort(&n->side_cancel);
         fa_thread_join(&n->thread);
     }
+    fa_http_cookies_destroy(n->cookies);
     for (i = 0; i < n->meta_count; i++) meta_free_entry(&n->meta[i]);
     fa_cond_destroy(&n->cond);
     fa_mutex_destroy(&n->lock);
+    fa_mutex_destroy(&n->tap_lock);
     free(n->buf);
     free(n->headers);
     free(n->playlist);
@@ -591,10 +653,13 @@ void fa_net_close(fa_net* n)
 
 /* ---- reading (decoder side) ----------------------------------------------------- */
 
+fa_atomic32 fa_net_test_read_waits;
+
 static int64_t FA_CALL io_read(void* user, void* buffer, size_t bytes)
 {
     fa_net* n = (fa_net*)user;
     int64_t got = 0;
+    int waited = 0;
     fa_mutex_lock(&n->lock);
     for (;;) {
         if (n->read_pos >= n->win_start && n->read_pos < n->win_end && !n->restart) {
@@ -616,6 +681,8 @@ static int64_t FA_CALL io_read(void* user, void* buffer, size_t bytes)
             fa_store32(&n->cancel, 1);
             fa_cond_broadcast(&n->cond);
         }
+        if (!waited && n->sample_rate) fa_fetch_add32(&fa_net_test_read_waits, 1);
+        waited = 1;
         fa_cond_wait_ms(&n->cond, &n->lock, 100);
     }
     fa_mutex_unlock(&n->lock);
@@ -633,8 +700,8 @@ static fa_result FA_CALL io_seek(void* user, int64_t offset)
         return FA_ERROR_IO;                       /* nobody left to download it */
     }
     n->read_pos = offset;
-    if (offset < n->win_start || offset > n->win_end + FA_NET_RESTART_GAP ||
-        (offset > n->win_end && n->finished && (n->length < 0 || offset < n->length))) {
+    if (offset < n->want_start) n->want_start = n->want_end = -1;   /* read elsewhere: the hint is old */
+    if (out_of_reach_locked(n, offset)) {
         n->restart = 1;
         n->restart_pos = offset;
         abort = 1;
@@ -679,21 +746,31 @@ static double byte_rate_locked(fa_net* n)
 int fa_net_can_decode(fa_net* n, int* out_starving)
 {
     int ok;
-    int64_t avail, gate;
-    double rate;
+    int64_t from, avail, gate, most;
+    double rate, file_gate;
     fa_mutex_lock(&n->lock);
-    avail = (n->read_pos >= n->win_start && n->read_pos <= n->win_end) ? n->win_end - n->read_pos : 0;
+    from = reader_locked(n);
+    avail = (from >= n->win_start && from <= n->win_end) ? n->win_end - from : 0;
     rate = byte_rate_locked(n);
     /* Enough for any decoder read of one chunk (a few compressed frames). */
     gate = rate > 0 ? (int64_t)(rate * 0.3) : 16384;
     if (gate < 6144) gate = 6144;
     if (gate > 32768) gate = 32768;
+    /* With video in the file, 0.3 s of audio is spread over 0.3 s of the whole file. */
+    file_gate = n->file_rate * 0.3;
+    if (file_gate > (double)(n->ahead_limit / 4)) file_gate = (double)(n->ahead_limit / 4);
+    if ((int64_t)file_gate > gate) gate = (int64_t)file_gate;
+    /* And all of the packets the demuxer said it reads next, as far as the window
+     * can hold them ahead (the download stops at ahead_limit). */
+    most = n->ahead_limit * 3 / 4;
+    if (n->want_end - from > gate) gate = n->want_end - from;
+    if (gate > most) gate = most;
     if (n->restart || n->hls_seek) ok = 0;
     else if (n->finished) ok = 1;                  /* reads return what is left, then the end */
     else if (n->starving) {
         int64_t need = rate > 0 ? (int64_t)(rate * n->cfg.prebuffer_ms / 1000.0) : 65536;
         if (need < gate) need = gate;
-        if (need > n->ahead_limit * 3 / 4) need = n->ahead_limit * 3 / 4;
+        if (need > most) need = most;
         ok = avail >= need;
     } else {
         ok = avail >= gate;
@@ -845,11 +922,42 @@ void fa_net_meta_reset_frames(fa_net* n, int64_t frames)
     fa_mutex_unlock(&n->lock);
 }
 
-void fa_net_set_sample_rate(fa_net* n, uint32_t rate)
+void fa_net_set_sample_rate(fa_net* n, uint32_t rate, int64_t length_frames)
 {
     fa_mutex_lock(&n->lock);
     n->sample_rate = rate;
+    if (rate > 0 && length_frames > 0 && n->length > 0 && !n->hls)
+        n->file_rate = (double)n->length * rate / (double)length_frames;
     fa_mutex_unlock(&n->lock);
+}
+
+void fa_net_will_read(fa_net* n, int64_t start, int64_t end)
+{
+    int abort = 0;
+    fa_mutex_lock(&n->lock);
+    if (seekable_locked(n) && start >= 0) {
+        if (n->length >= 0 && end > n->length) end = n->length;
+        n->want_start = start;
+        n->want_end = end > start ? end : start;
+        /* Out of reach ahead (audio after a long stretch of video, the next fragment):
+         * reconnect there now. A pending restart, or one to a place behind the reader,
+         * is left to the read itself. */
+        if (!n->thread_done && !n->restart && start > n->read_pos && out_of_reach_locked(n, start)) {
+            n->restart = 1;
+            n->restart_pos = start;
+            fa_store32(&n->cancel, 1);
+            abort = 1;
+        }
+        fa_cond_broadcast(&n->cond);
+    }
+    fa_mutex_unlock(&n->lock);
+    if (abort) fa_http_abort(&n->cancel);
+}
+
+fa_net* fa_net_of(const fa_source* src)
+{
+    if (src->kind != FA_SOURCE_IO || !src->remote || src->io.read != io_read) return NULL;
+    return (fa_net*)src->io_user;
 }
 
 /* ---- small downloads (playlists, keys) ------------------------------------------- */
@@ -904,10 +1012,10 @@ static int small_data(void* user, const uint8_t* data, size_t size)
     return done;
 }
 
-fa_result fa_net_get_small(fa_net* n, const char* url, int64_t offset, int64_t length, char** out, size_t* out_len,
-                           char* final_url, size_t final_cap)
+/* Runs `req` for `length` bytes from `offset` (all of it when length is -1). */
+static fa_result small_fetch(fa_http_request* req, int64_t offset, int64_t length, char** out, size_t* out_len,
+                             char* final_url, size_t final_cap)
 {
-    fa_http_request req;
     small_ctx c;
     fa_result r;
     memset(&c, 0, sizeof(c));
@@ -915,12 +1023,11 @@ fa_result fa_net_get_small(fa_net* n, const char* url, int64_t offset, int64_t l
     c.final_cap = final_cap;
     c.offset = offset > 0 ? offset : 0;
     c.left = length >= 0 ? length : -1;
-    fa_net_request(n, &req, url);
     if (c.offset > 0 || length > 0) {
-        req.range_start = c.offset;
-        req.range_length = length > 0 ? length : 0;
+        req->range_start = c.offset;
+        req->range_length = length > 0 ? length : 0;
     }
-    r = fa_http_fetch(&req, small_head, small_data, &c);
+    r = fa_http_fetch(req, small_head, small_data, &c);
     /* Never hand on a truncated playlist, key or init section. */
     if (r == FA_OK && (c.cut || c.bad || c.left > 0)) r = FA_ERROR_UNSUPPORTED_FORMAT;
     if (r == FA_OK && !c.data) {
@@ -930,5 +1037,35 @@ fa_result fa_net_get_small(fa_net* n, const char* url, int64_t offset, int64_t l
     if (r != FA_OK) { free(c.data); c.data = NULL; c.len = 0; }
     *out = c.data;
     *out_len = c.len;
+    return r;
+}
+
+fa_result fa_net_get_small(fa_net* n, const char* url, int64_t offset, int64_t length, char** out, size_t* out_len,
+                           char* final_url, size_t final_cap)
+{
+    fa_http_request req;
+    fa_net_request(n, &req, url);
+    return small_fetch(&req, offset, length, out, out_len, final_url, final_cap);
+}
+
+fa_result fa_net_read_range(fa_net* n, int64_t offset, int64_t length, uint8_t** out, size_t* out_len)
+{
+    char url[FA_NET_URL_MAX];
+    fa_http_request req;
+    char* data = NULL;
+    fa_result r;
+    *out = NULL;
+    *out_len = 0;
+    if (offset < 0 || length <= 0 || length > FA_NET_PLAYLIST_MAX) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&n->lock);
+    snprintf(url, sizeof(url), "%s", n->final_url[0] ? n->final_url : n->cfg.url);
+    r = n->quit ? FA_ERROR_IO : FA_OK;
+    fa_mutex_unlock(&n->lock);
+    if (r != FA_OK) return r;
+    fa_net_request(n, &req, url);
+    req.session = NULL;                    /* the download thread's connections are its own */
+    req.cancel = &n->side_cancel;
+    r = small_fetch(&req, offset, length, &data, out_len, NULL, 0);
+    *out = (uint8_t*)data;
     return r;
 }

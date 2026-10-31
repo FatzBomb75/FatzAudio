@@ -1,6 +1,7 @@
 /* Musical key from audio (clean room, from published methods), and key names.
  *
- * Every half window (an FFT of about 0.17 s) the spectral peaks from 55 Hz to
+ * Every half window (an FFT of about 0.17 s; two such frames share one complex
+ * FFT, as the second one's input is the imaginary part) the spectral peaks from 55 Hz to
  * 5 kHz are placed on a pitch circle of 120 steps (10 cents each), weighted by
  * their magnitude; each frame counts equally (its weights sum to 1), so loud
  * passages do not outvote quiet ones. At the end the circle gives the tuning (the
@@ -28,6 +29,8 @@ struct fa_chroma {
     float* ring;
     uint32_t ring_pos, until_hop;
     float *re, *im, *mag;
+    float* pending;              /* a windowed frame waiting for its pair */
+    int have_pending;
     uint32_t kmin, kmax;
     double fine[FINE];
     int64_t frames;
@@ -57,11 +60,12 @@ fa_chroma* fa_chroma_new(uint32_t rate)
     c->re = (float*)malloc((size_t)n * sizeof(float));
     c->im = (float*)malloc((size_t)n * sizeof(float));
     c->mag = (float*)malloc((size_t)(n / 2 + 1) * sizeof(float));
+    c->pending = (float*)malloc((size_t)n * sizeof(float));
     c->kmin = (uint32_t)(KEY_MIN_HZ * n / rate);
     c->kmax = (uint32_t)(KEY_MAX_HZ * n / rate);
     if (c->kmin < 2) c->kmin = 2;
     if (c->kmax > n / 2 - 2) c->kmax = n / 2 - 2;
-    if (!c->tb || !c->ring || !c->re || !c->im || !c->mag) { fa_chroma_free(c); return NULL; }
+    if (!c->tb || !c->ring || !c->re || !c->im || !c->mag || !c->pending) { fa_chroma_free(c); return NULL; }
     return c;
 }
 
@@ -72,23 +76,18 @@ void fa_chroma_free(fa_chroma* c)
     free(c->re);
     free(c->im);
     free(c->mag);
+    free(c->pending);
     free(c);
 }
 
-static void chroma_frame(fa_chroma* c)
+/* One frame's peaks, from the magnitudes in c->mag, onto the pitch circle. */
+static void chroma_peaks(fa_chroma* c)
 {
-    uint32_t i, k, n = c->n;
+    uint32_t i, k;
     double fr[FINE], total = 0.0;
     float top = 0.0f;
-    for (i = 0; i < n; i++) {
-        c->re[i] = c->ring[(c->ring_pos + i) % n] * c->tb->hann[i];
-        c->im[i] = 0.0f;
-    }
-    fa_fft(c->re, c->im, c->tb, n);
-    for (k = c->kmin - 1; k <= c->kmax + 1; k++) {
-        c->mag[k] = sqrtf(c->re[k] * c->re[k] + c->im[k] * c->im[k]);
+    for (k = c->kmin - 1; k <= c->kmax + 1; k++)
         if (c->mag[k] > top) top = c->mag[k];
-    }
     /* Below about -80 dBFS the frame is silence. */
     if (top < 1e-4f * (float)c->tb->hann_sum) return;
     memset(fr, 0, sizeof(fr));
@@ -101,7 +100,7 @@ static void chroma_frame(fa_chroma* c)
         b = log(c->mag[k + 1] + 1e-12);
         d = a - 2.0 * log(m) + b;
         if (d < 0.0) delta = 0.5 * (a - b) / d;
-        f = ((double)k + delta) * c->rate / n;
+        f = ((double)k + delta) * c->rate / c->n;
         p = 12.0 * log2(f / 440.0) + 69.0;          /* MIDI note number */
         j = (int)floor(p * 10.0 + 0.5) % FINE;
         if (j < 0) j += FINE;
@@ -111,6 +110,57 @@ static void chroma_frame(fa_chroma* c)
     if (total <= 0.0) return;
     for (i = 0; i < FINE; i++) c->fine[i] += fr[i] / total;
     c->frames++;
+}
+
+/* The frame in the ring windowed into `win`. */
+static void chroma_window(const fa_chroma* c, float* win)
+{
+    uint32_t i, n = c->n;
+    for (i = 0; i < n; i++) win[i] = c->ring[(c->ring_pos + i) % n] * c->tb->hann[i];
+}
+
+/* The magnitudes of bins kmin-1 .. kmax+1 of one real frame out of the complex FFT of
+ * (frame A) + i (frame B): bin k of A = (Z[k] + conj Z[n-k]) / 2, of B = (Z[k] - conj
+ * Z[n-k]) / 2i. */
+static void chroma_mags(fa_chroma* c, int which)
+{
+    uint32_t k, n = c->n;
+    for (k = c->kmin - 1; k <= c->kmax + 1; k++) {
+        float zr = c->re[k], zi = c->im[k], cr = c->re[n - k], ci = -c->im[n - k], xr, xi;
+        if (which == 0) { xr = 0.5f * (zr + cr); xi = 0.5f * (zi + ci); }
+        else { xr = 0.5f * (zi - ci); xi = -0.5f * (zr - cr); }
+        c->mag[k] = sqrtf(xr * xr + xi * xi);
+    }
+}
+
+/* A frame is ready: the first of a pair waits, the second makes the FFT. */
+static void chroma_frame(fa_chroma* c)
+{
+    if (!c->have_pending) {
+        chroma_window(c, c->pending);
+        c->have_pending = 1;
+        return;
+    }
+    memcpy(c->re, c->pending, (size_t)c->n * sizeof(float));
+    chroma_window(c, c->im);
+    fa_fft(c->re, c->im, c->tb, c->n);
+    chroma_mags(c, 0);
+    chroma_peaks(c);
+    chroma_mags(c, 1);
+    chroma_peaks(c);
+    c->have_pending = 0;
+}
+
+/* The frame left waiting at the end, alone. */
+static void chroma_flush(fa_chroma* c)
+{
+    if (!c->have_pending) return;
+    memcpy(c->re, c->pending, (size_t)c->n * sizeof(float));
+    memset(c->im, 0, (size_t)c->n * sizeof(float));
+    fa_fft(c->re, c->im, c->tb, c->n);
+    chroma_mags(c, 0);
+    chroma_peaks(c);
+    c->have_pending = 0;
 }
 
 void fa_chroma_process(fa_chroma* c, const float* mono, int64_t frames)
@@ -145,6 +195,7 @@ int fa_chroma_key(fa_chroma* c, fa_key_info* out)
     double sr = 0.0, si = 0.0, offset, chroma[12], best = -2.0, second = -2.0, conf;
     int i, pc, tonic = 0, minor = 0;
     memset(out, 0, sizeof(*out));
+    chroma_flush(c);
     if (c->frames < KEY_MIN_FRAMES) return 0;
     /* Tuning: the mean position of the peaks within their semitone. */
     for (i = 0; i < FINE; i++) {

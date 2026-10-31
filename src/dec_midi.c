@@ -1542,40 +1542,50 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
     return FA_OK;
 }
 
-static fa_result midi_open(fa_decoder* dec)
+/* Reads and parses the whole file: the song's events, texts and length, no synth.
+ * `no_font`: a MIDI file it is, but it cannot be played (FA_ERROR_NO_SOUNDFONT). */
+static fa_result midi_parse(fa_source* src, uint32_t rate, int32_t code_page, int no_font, struct fa_midi** out, int* out_rmid)
 {
     struct fa_midi* m;
     uint8_t* bytes;
     size_t size, smf_size = 0;
     const uint8_t* smf;
     tml_message* first;
-    int rmid;
-    fa_result r = read_source(dec->src, &bytes, &size);
+    fa_result r = read_source(src, &bytes, &size);
+    *out = NULL;
     if (r != FA_OK) return r;
     smf = find_smf(bytes, size, &smf_size);
     if (!smf || smf_size > (size_t)0x7FFFFFFF) { free(bytes); return FA_ERROR_UNSUPPORTED_FORMAT; }
-    rmid = smf != bytes;
-    /* A MIDI file it is: without instruments it cannot be played. */
-    if (!dec->soundfont) { free(bytes); return FA_ERROR_NO_SOUNDFONT; }
+    *out_rmid = smf != bytes;
+    if (no_font) { free(bytes); return FA_ERROR_NO_SOUNDFONT; }
     first = tml_load_memory(smf, (int)smf_size);
     if (!first) { free(bytes); return FA_ERROR_UNSUPPORTED_FORMAT; }
-
     m = (struct fa_midi*)calloc(1, sizeof(*m));
     if (!m) { tml_free(first); free(bytes); return FA_ERROR_OUT_OF_MEMORY; }
-    m->rate = dec->midi_rate ? dec->midi_rate : FA_MIDI_DEFAULT_RATE;
-    m->font = fa_soundfont_retain(dec->soundfont);
-    m->text_code_page = dec->text_code_page;
+    m->rate = rate;
+    m->text_code_page = code_page;
     r = build(m, first, smf);
     tml_free(first);
     free(bytes);
-    if (r == FA_OK) {
-        m->synth = synth_new(m->font, m->rate);
-        m->fx = fa_midi_fx_new(m->rate);
-        fa_store32(&m->effects, 1);
-        m->effects_now = 1;
-        if (!m->synth || !m->fx) r = FA_ERROR_OUT_OF_MEMORY;
-        else start_song(m);
-    }
+    if (r != FA_OK) { midi_free(m); return r; }
+    *out = m;
+    return FA_OK;
+}
+
+static fa_result midi_open(fa_decoder* dec)
+{
+    struct fa_midi* m;
+    int rmid = 0;
+    fa_result r;
+    r = midi_parse(dec->src, dec->midi_rate ? dec->midi_rate : FA_MIDI_DEFAULT_RATE, dec->text_code_page, !dec->soundfont, &m, &rmid);
+    if (r != FA_OK) return r;
+    m->font = fa_soundfont_retain(dec->soundfont);
+    m->synth = synth_new(m->font, m->rate);
+    m->fx = fa_midi_fx_new(m->rate);
+    fa_store32(&m->effects, 1);
+    m->effects_now = 1;
+    if (!m->synth || !m->fx) r = FA_ERROR_OUT_OF_MEMORY;
+    else start_song(m);
     if (r != FA_OK) { midi_free(m); return r; }
 
     dec->impl = m;
@@ -1585,6 +1595,39 @@ static fa_result midi_open(fa_decoder* dec)
     dec->seekable = 1;
     snprintf(dec->codec, sizeof(dec->codec), "midi");
     snprintf(dec->container, sizeof(dec->container), "%s", rmid ? "rmid" : "smf");
+    return FA_OK;
+}
+
+/* The properties and title, artist and copyright of a MIDI file, read without a
+ * soundfont (the decoder needs one to open). FA_OK, `info` filled (if given) and the
+ * items delivered; an error if `src` is not a MIDI file. */
+fa_result fa_midi_read_tags(fa_source* src, fa_stream_info* info, fa_tag_sink* sink)
+{
+    struct fa_midi* m;
+    int rmid = 0;
+    fa_result r = midi_parse(src, FA_MIDI_DEFAULT_RATE, 0, 0, &m, &rmid);
+    if (r != FA_OK) return r;
+    if (info) {
+        fa_decoder dec;
+        memset(&dec, 0, sizeof(dec));
+        dec.format.sample_rate = m->rate;
+        dec.format.channels = 2;
+        dec.format.sample_format = FA_FORMAT_F32;
+        dec.length = m->length;
+        dec.seekable = 1;
+        dec.track_count = 1;
+        dec.audio_bytes = -1;
+        dec.file_size = src->length;
+        snprintf(dec.codec, sizeof(dec.codec), "midi");
+        snprintf(dec.container, sizeof(dec.container), "%s", rmid ? "rmid" : "smf");
+        fa_decoder_get_info(&dec, info);
+    }
+    if (sink) {
+        if (m->info.title[0]) sink->text(sink, FA_TAG_FORMAT_MIDI, "TITLE", m->info.title);
+        if (m->info.artist[0]) sink->text(sink, FA_TAG_FORMAT_MIDI, "ARTIST", m->info.artist);
+        if (m->info.copyright[0]) sink->text(sink, FA_TAG_FORMAT_MIDI, "COPYRIGHT", m->info.copyright);
+    }
+    midi_free(m);
     return FA_OK;
 }
 

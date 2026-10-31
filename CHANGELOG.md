@@ -25,6 +25,46 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   SFX kit, else the standard kit. Files without these messages render bit for bit as before.
   See [docs/features/midi.md](docs/features/midi.md#scale-tuning-and-drum-setup).
 
+- Dolby downmix (extras step 20): `fa_open_options.dolby_downmix` and `fa_stream_set_dolby_downmix` /
+  `fa_stream_get_dolby_downmix` (.NET `StreamOptions.DolbyDownmix`, `AudioStream.DolbyDownmix`) choose Lo/Ro, Lt/Rt
+  (Pro Logic matrix surround) or the stream's own preference; `fa_engine_set_dialnorm` (.NET `AudioEngine.SetDialnorm`)
+  lets a Dolby file's dialogue level stand in for a loudness scan (`FA_LOUDNESS_DIALNORM`, .NET
+  `LoudnessSource.Dialnorm`). See [docs/features/dolby.md](docs/features/dolby.md#stereo-downmix).
+
+- Web streams: MP4 and Matroska files over the network read only what they need. A fragmented MP4 with a `sidx` (or an
+  `mfra` at the end) reads its fragments as playback or a seek reaches them instead of every fragment at open, and
+  Matroska reads Cues stored after the clusters, with the last cluster for the exact length, in one range request of
+  its own while the download stays at the start. The download is told where the next audio packets are, and decode
+  workers wait for 0.3 s of the whole file's bytes, so a worker never waits in a read for video between the audio.
+  Tested over HTTP: fragmented MP4 with `sidx`, with `mfra` and with neither, Matroska with Cues at the end, video
+  files with several audio tracks, fMP4 HLS. See
+  [docs/features/web-streams.md](docs/features/web-streams.md#mp4-and-matroska-files).
+
+- Web streams: a raw-bytes tap for saving a station as it plays (BASS's `DOWNLOADPROC`): `fa_net_options.download_proc`
+  from the first byte, `fa_stream_set_download_callback` to start or stop it while playing (.NET
+  `NetworkOptions.Downloaded`, `AudioStream.SetDownloadHandler`); radio comes without its ICY title blocks, HLS as the
+  segments' audio. Each stream keeps the cookies its servers set (a playlist's or a login redirect's session cookie)
+  and sends them back on its later requests, on every platform. HLS plays the audio rendition of the chosen variant's
+  `AUDIO=` group, so `hls_max_bandwidth` also picks the audio tier. A live stream without length or chunked framing that
+  the server closes cleanly now reconnects instead of ending. `fa_stream_close` returns at once while a host name lookup
+  hangs. See [docs/features/web-streams.md](docs/features/web-streams.md#saving-a-station-as-it-plays).
+
+- Tags (extras step 14): ID3v2 frames stored with the zlib flag are read (encrypted ones are still skipped); `SYLT`
+  synced lyrics come as timed `[mm:ss.mmm]text` lines; Lyrics3 v1.00 and v2.00 are read (new `FA_TAG_FORMAT_LYRICS3`,
+  .NET `TagFormat.Lyrics3`) and left out of `audio_bytes` and the bitrate; Matroska tags aimed at a track, chapter, edition or attachment
+  come as `TRACK:<uid>/NAME` and so on; FLAC cue sheets as `CUESHEET/...` items; the Vorbis vendor string as `VENDOR`;
+  `fa_tags_read_path` / `fa_tags_read_memory` read a MIDI file's title, artist, copyright and length without a
+  soundfont (`fa_tags_get_info` no longer returns `FA_ERROR_NOT_FOUND` for it).
+  See [docs/features/tags.md](docs/features/tags.md#timed-lyrics-cue-sheets-and-the-rest).
+
+- ZIP leftovers: other entries of a karaoke archive (a bundled video or PDF) are probed from a 64 KB prefix instead of
+  being unpacked first, in `fa_stream_open_*` and in tag reads; `fa_open_options.cancel` (new last field; .NET
+  `StreamOptions.CancellationToken`) stops a long unpack with the new `FA_ERROR_CANCELLED` (.NET `ErrorCode.Cancelled`);
+  a song unpacked into a temp file now gets its loudness scan, `fa_stream_get_tags` and `fa_analyze_stream` like any
+  file; a stored entry played in place is CRC checked by the worker while it plays, and a mismatch raises one
+  `FA_EVENT_DECODE_ERROR` (.NET `DecodeError`) without stopping playback.
+  See [docs/features/cdg.md](docs/features/cdg.md#zip-archives).
+
 - MIDI controllers and SoundFont modulators: the mod wheel and channel pressure add vibrato (RPN 5 sets its depth),
   CC74/CC71 move the filter cutoff and resonance, CC73/CC75/CC72 the attack, decay and release, CC76-78 the vibrato rate,
   depth and delay, with the GS/XG part NRPNs and part SysEx that set the same values; portamento (CC65, CC5, CC84),
@@ -212,6 +252,22 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Analysis: the key's chroma FFT carries two windows at once (as the onset side does), and the bars' chroma shares a bin wider than a semitone among the pitch classes it covers (low chord changes show). The accuracy report is unchanged (all 44 bar songs right, 48 of 48 keys).
+- Lyric surface: a line growing in during a page fade-in is drawn again at its size instead of upscaled, and a line or page that failed for lack of memory is tried again after about 90 frames.
+- Reverse playback: the half-second blocks the source is decoded in are each decoded 10 ms past their end and
+  cross-faded with the block above, so where a seek is not exact (AAC noise and prediction, MIDI notes struck again) the
+  joins no longer click; exact decoders give the same audio as before. Markers, `FA_EVENT_LOOPED` (reversed: from the
+  loop start to its end), MIDI texts and tracker rows are now raised while reversed, last first. Deck loops, loop changes
+  and beat jumps join without a gap while reversed instead of restarting like a seek, deck sync pulls a reversed deck
+  into phase (its beats counting down), `fa_deck_play_synced` starts a reversed deck on the beat, and a beat loop set
+  while reversed lies below the beat heard. Forward playback is unchanged. See
+  [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md#reverse-playback).
+- AC-3 and E-AC-3 with more than two channels are mixed down to stereo with the stream's own centre, surround (and
+  E-AC-3 LFE) levels and its Lo/Ro or Lt/Rt preference, as ETSI TS 102 366 describes, scaled so the mix cannot clip.
+  Without normalization Dolby 5.1 therefore plays about 7.7 dB quieter than with the engine's generic downmix
+  before; with normalization on, the gain gives that scaling back (the limiter catches the peaks).
+  `FA_DOLBY_DOWNMIX_ENGINE` (.NET `DolbyDownmix.Engine`) keeps the old downmix. Decode-only reads still hand out every
+  channel. Only channels that carry audio count, so stereo plus LFE still plays at full level.
 - Chained Ogg files (several songs one after another) find where each song ends by bisection on the serial numbers,
   as vorbisfile does, instead of reading every page: an hour of 20 songs opens in about 6 ms instead of 41 ms. Links,
   lengths, decoded audio and seeks are the same as before. A file whose songs reuse a serial number (against the Ogg

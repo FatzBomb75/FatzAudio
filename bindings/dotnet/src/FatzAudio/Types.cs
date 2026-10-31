@@ -180,6 +180,8 @@ public enum LoudnessSource
     Scan = 4,
     /// <summary>A value the app supplied with <see cref="AudioStream.SetLoudness"/>.</summary>
     App = 5,
+    /// <summary>A Dolby stream's dialogue level (<see cref="AudioEngine.SetDialnorm"/>).</summary>
+    Dialnorm = 6,
 }
 
 /// <summary>When the output limiter runs (see <see cref="AudioEngine.SetLimiter"/>).</summary>
@@ -307,6 +309,12 @@ public sealed record StreamOptions
     /// </summary>
     public DynamicRange DynamicRange { get; init; } = DynamicRange.Full;
     /// <summary>
+    /// How Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3) audio with more than two channels is mixed down
+    /// for the output (default <see cref="FatzAudio.DolbyDownmix.Auto"/>, the stream's own levels and preference).
+    /// Other formats ignore it. Can be changed later with <see cref="AudioStream.DolbyDownmix"/>.
+    /// </summary>
+    public DolbyDownmix DolbyDownmix { get; init; } = DolbyDownmix.Auto;
+    /// <summary>
     /// MIDI files: the instruments to play them with; null uses <see cref="AudioEngine.DefaultSoundFont"/>.
     /// The stream keeps its own reference, so the soundfont may be disposed after the open call. Other formats ignore it.
     /// </summary>
@@ -317,6 +325,13 @@ public sealed record StreamOptions
     /// says which was used. Other formats ignore it.
     /// </summary>
     public TextCodePage TextCodePage { get; init; } = TextCodePage.Detect;
+    /// <summary>
+    /// Stops an open that is unpacking a compressed song from a ZIP archive (the one long step of opening a file or
+    /// memory block): the call then throws a <see cref="FatzAudioException"/> with <see cref="ErrorCode.Cancelled"/>,
+    /// within about a megabyte of work, and no stream is created. A token that is already cancelled stops it at once.
+    /// Other opens ignore it.
+    /// </summary>
+    public CancellationToken CancellationToken { get; init; }
 }
 
 /// <summary>Text encodings of MIDI files (<see cref="StreamOptions.TextCodePage"/>).</summary>
@@ -346,6 +361,24 @@ public enum DynamicRange
     Night = 2,
 }
 
+/// <summary>
+/// How Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3) audio with more than two channels is mixed down for
+/// the output. These streams carry their own centre and surround mix levels and say which kind of stereo they
+/// prefer; the downmix uses them as ETSI TS 102 366 describes. A custom matrix
+/// (<see cref="AudioStream.SetMatrix"/>) always wins.
+/// </summary>
+public enum DolbyDownmix
+{
+    /// <summary>The kind of stereo the stream prefers, Lo/Ro when it names none (the default).</summary>
+    Auto = 0,
+    /// <summary>Lo/Ro: plain stereo with the stream's centre and surround levels.</summary>
+    LoRo = 1,
+    /// <summary>Lt/Rt: matrix surround (Dolby Surround, Pro Logic). The surrounds go in out of phase, so a surround decoder downstream can bring them back.</summary>
+    LtRt = 2,
+    /// <summary>The engine's own downmix, as for every other format; the stream's levels are ignored (FatzAudio's downmix before this setting).</summary>
+    Engine = 3,
+}
+
 /// <summary>Connection settings for web streams (<see cref="AudioEngine.OpenUrl(string, StreamOptions?)"/>). All properties are optional.</summary>
 /// <example>
 /// <code>
@@ -365,7 +398,8 @@ public sealed record NetworkOptions
     /// <summary>The User-Agent header; null sends <c>FatzAudio/&lt;version&gt;</c>.</summary>
     public string? UserAgent { get; init; }
     /// <summary>Extra request headers (cookies, authorization, ...), sent with every request including HLS segments;
-    /// <c>Authorization</c> and <c>Cookie</c> only to the stream URL's own server (scheme, host and port).</summary>
+    /// <c>Authorization</c> and <c>Cookie</c> only to the stream URL's own server (scheme, host and port). Cookies the
+    /// servers set are kept for the stream and sent back to them, after your own.</summary>
     public IReadOnlyDictionary<string, string>? Headers { get; init; }
     /// <summary>
     /// Null uses the system's proxy setting (the http_proxy / https_proxy environment variables, and the
@@ -383,9 +417,24 @@ public sealed record NetworkOptions
     public bool Reconnect { get; init; } = true;
     /// <summary>Ask radio servers for song titles (ICY metadata; default true).</summary>
     public bool SongTitles { get; init; } = true;
-    /// <summary>HLS: play the best variant up to this many bits per second; 0 = the best one.</summary>
+    /// <summary>HLS: play the best variant up to this many bits per second (the audio rendition of that variant's
+    /// audio group when it names one); 0 = the best one.</summary>
     public int HlsMaxBandwidth { get; init; }
+    /// <summary>Receives the stream's raw bytes as they are downloaded, from the very first one, for saving a station
+    /// while it plays; null = none. <see cref="AudioStream.SetDownloadHandler"/> changes it later.</summary>
+    public DownloadHandler? Downloaded { get; init; }
 }
+
+/// <summary>
+/// Receives a web stream's raw bytes as they are downloaded (<see cref="NetworkOptions.Downloaded"/>,
+/// <see cref="AudioStream.SetDownloadHandler"/>): the bytes the decoder reads, so a file as the server sends it,
+/// radio without its song-title blocks, HLS the audio of the segments (decrypted; from MPEG-TS segments the audio
+/// stream inside). Written to a file they make a recording of what plays.
+/// </summary>
+/// <param name="data">The next bytes; valid only during the call.</param>
+/// <remarks>Called on the stream's download thread, in order. The download waits while it runs, so return quickly;
+/// exceptions are swallowed.</remarks>
+public delegate void DownloadHandler(ReadOnlySpan<byte> data);
 
 /// <summary>What a web stream is playing (<see cref="AudioStream.Metadata"/>). Strings are empty when unknown.</summary>
 /// <param name="StreamTitle">The song heard now as the station sends it (ICY StreamTitle), usually "Artist - Title".</param>
