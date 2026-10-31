@@ -180,6 +180,8 @@ public enum LoudnessSource
     Scan = 4,
     /// <summary>A value the app supplied with <see cref="AudioStream.SetLoudness"/>.</summary>
     App = 5,
+    /// <summary>A Dolby stream's dialogue level (<see cref="AudioEngine.SetDialnorm"/>).</summary>
+    Dialnorm = 6,
 }
 
 /// <summary>When the output limiter runs (see <see cref="AudioEngine.SetLimiter"/>).</summary>
@@ -307,6 +309,12 @@ public sealed record StreamOptions
     /// </summary>
     public DynamicRange DynamicRange { get; init; } = DynamicRange.Full;
     /// <summary>
+    /// How Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3) audio with more than two channels is mixed down
+    /// for the output (default <see cref="FatzAudio.DolbyDownmix.Auto"/>, the stream's own levels and preference).
+    /// Other formats ignore it. Can be changed later with <see cref="AudioStream.DolbyDownmix"/>.
+    /// </summary>
+    public DolbyDownmix DolbyDownmix { get; init; } = DolbyDownmix.Auto;
+    /// <summary>
     /// MIDI files: the instruments to play them with; null uses <see cref="AudioEngine.DefaultSoundFont"/>.
     /// The stream keeps its own reference, so the soundfont may be disposed after the open call. Other formats ignore it.
     /// </summary>
@@ -353,6 +361,24 @@ public enum DynamicRange
     Normal = 1,
     /// <summary>Heavy compression for listening at low volume ("RF mode"); streams without heavy gains use <see cref="Normal"/>'s.</summary>
     Night = 2,
+}
+
+/// <summary>
+/// How Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3) audio with more than two channels is mixed down for
+/// the output. These streams carry their own centre and surround mix levels and say which kind of stereo they
+/// prefer; the downmix uses them as ETSI TS 102 366 describes. A custom matrix
+/// (<see cref="AudioStream.SetMatrix"/>) always wins.
+/// </summary>
+public enum DolbyDownmix
+{
+    /// <summary>The kind of stereo the stream prefers, Lo/Ro when it names none (the default).</summary>
+    Auto = 0,
+    /// <summary>Lo/Ro: plain stereo with the stream's centre and surround levels.</summary>
+    LoRo = 1,
+    /// <summary>Lt/Rt: matrix surround (Dolby Surround, Pro Logic). The surrounds go in out of phase, so a surround decoder downstream can bring them back.</summary>
+    LtRt = 2,
+    /// <summary>The engine's own downmix, as for every other format; the stream's levels are ignored (FatzAudio's downmix before this setting).</summary>
+    Engine = 3,
 }
 
 /// <summary>Connection settings for web streams (<see cref="AudioEngine.OpenUrl(string, StreamOptions?)"/>). All properties are optional.</summary>

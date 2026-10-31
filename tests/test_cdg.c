@@ -2046,7 +2046,11 @@ static void test_checkpoints_streamed(void)
     CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
     CHECK_EQ(ci.checkpoint_count, 4);           /* taken over the blank gap for now */
     CHECK_EQ(fa_cdg_surface_update_at(surf, 35000000000LL, &fr), FA_OK);
-    for (i = n / 2; i < 300 * 30; i += 64)
+    /* The first write into the gap redoes every checkpoint after it at once */
+    CHECK(fa_stream_cdg_write(s, token, n / 2, c.p + (n / 2) * FA_CDG_PACK_BYTES, 64));
+    CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
+    CHECK_EQ(ci.checkpoint_count, 4);
+    for (i = n / 2 + 64; i < 300 * 30; i += 64)
         CHECK(fa_stream_cdg_write(s, token, i, c.p + i * FA_CDG_PACK_BYTES, 64));
     CHECK_EQ(fa_stream_get_cdg_info(s, &ci), FA_OK);
     CHECK_EQ(ci.checkpoint_count, 4);           /* redone with the real packs */
@@ -2974,6 +2978,113 @@ static buf fade_cdg(void)
         if (k == 45) preset(&c, 5, 0);
     }
     return c;
+}
+
+/* A tile whose 12 rows each have their own 6 bits. */
+static void tile_rows(buf* b, int xor_mode, int c0, int c1, int row, int col, const uint8_t bits[12])
+{
+    uint8_t d[16];
+    d[0] = (uint8_t)c0; d[1] = (uint8_t)c1; d[2] = (uint8_t)row; d[3] = (uint8_t)col;
+    memcpy(d + 4, bits, 12);
+    pack(b, xor_mode ? 38 : 6, d);
+}
+
+/* With smooth-scroll offsets set, the picture is smoothed, edge-blended and given its
+ * effects as it is shown: the same pixels as a song that draws that picture without
+ * offsets (the seam between the border and the moved picture area, and a transparent
+ * border, included). */
+static void test_offsets_as_shown(void)
+{
+    static const struct { int smooth, blend, fx; uint32_t flags; } cfgs[] = {
+        { 4, 1, 0, 0 }, { 10, 0, 1, 0 }, { 2, 1, 2, FA_CDG_TRANSPARENT }, { 4, 1, 3, FA_CDG_TRANSPARENT },
+    };
+    buf a = { 0 }, b = { 0 };
+    fa_stream *sa = open_wav_stream(1, FA_OPEN_DECODE_ONLY), *sb = open_wav_stream(1, FA_OPEN_DECODE_ONLY);
+    fa_cdg_surface* ix = NULL;
+    fa_cdg_frame fi;
+    uint32_t seed = 11, x, y;
+    int r, col, plane, k;
+    unsigned ci;
+    CHECK(sa && sb);
+    colors(&a, 0, k_low);
+    colors(&a, 1, k_low);
+    preset(&a, 0, 0);
+    border(&a, 5);
+    for (r = 0; r < 18; r++)       /* shapes everywhere, the border too */
+        for (col = 0; col < 50; col++) {
+            seed = seed * 1103515245u + 12345u;
+            if ((seed >> 20) % 3 == 0) continue;
+            tile(&a, 0, (int)(seed >> 9) & 15, (int)(seed >> 13) & 15, r, col, (uint8_t)((seed >> 22) & 0x3f));
+        }
+    scroll(&a, 0, 0, 0, 3, 0, 7);
+    CHECK_EQ(fa_stream_load_cdg_memory(sa, a.p, a.n), FA_OK);
+    /* What it shows, as colour indices, drawn by tiles of 4 XOR planes without offsets. */
+    CHECK_EQ(fa_cdg_surface_create(sa, NULL, &ix), FA_OK);
+    {
+        fa_cdg_surface_config cfg;
+        fa_cdg_surface_config_init(&cfg);
+        cfg.pixel_format = FA_CDG_PIXELS_INDEXED8;
+        fa_cdg_surface_destroy(ix);
+        CHECK_EQ(fa_cdg_surface_create(sa, &cfg, &ix), FA_OK);
+    }
+    CHECK_EQ(fa_cdg_surface_update_at(ix, t_packs((int64_t)(a.n / FA_CDG_PACK_BYTES)), &fi), FA_OK);
+    CHECK(fi.width == FA_CDG_WIDTH && fi.height == FA_CDG_HEIGHT);
+    colors(&b, 0, k_low);
+    colors(&b, 1, k_low);
+    preset(&b, 0, 0);
+    border(&b, 5);
+    for (r = 0; r < 18; r++)
+        for (col = 0; col < 50; col++)
+            for (plane = 0; plane < 4; plane++) {
+                uint8_t bits[12];
+                for (y = 0; y < 12; y++) {
+                    bits[y] = 0;
+                    for (x = 0; x < 6; x++)
+                        if ((*px(&fi, (uint32_t)col * 6 + x, (uint32_t)r * 12 + y) >> plane) & 1) bits[y] |= (uint8_t)(0x20 >> x);
+                }
+                tile_rows(&b, plane > 0, 0, 1 << plane, r, col, bits);
+            }
+    CHECK_EQ(fa_stream_load_cdg_memory(sb, b.p, b.n), FA_OK);
+    fa_cdg_surface_destroy(ix);
+    for (ci = 0; ci < sizeof(cfgs) / sizeof(cfgs[0]); ci++)
+        for (k = 0; k < 2; k++) {   /* 2x (the 2N pass with effects) and 3x */
+            fa_cdg_surface *fa = NULL, *fb = NULL;
+            fa_cdg_surface_config cfg;
+            fa_cdg_presentation p = pres(1, FA_SAFETY_SHOW);
+            fa_surface_layout la, lb;
+            uint8_t *wa, *wb;
+            fa_cdg_surface_config_init(&cfg);
+            cfg.flags = cfgs[ci].flags;
+            CHECK_EQ(fa_cdg_surface_create(sa, &cfg, &fa), FA_OK);
+            CHECK_EQ(fa_cdg_surface_create(sb, &cfg, &fb), FA_OK);
+            p.smoothness = cfgs[ci].smooth;
+            p.edge_blend = cfgs[ci].blend;
+            CHECK_EQ(fa_cdg_surface_set_presentation(fa, &p), FA_OK);
+            CHECK_EQ(fa_cdg_surface_set_presentation(fb, &p), FA_OK);
+            CHECK_EQ(fa_surface_set_presentation_size(fa, 600 + 300 * (uint32_t)k, 432 + 216 * (uint32_t)k), FA_OK);
+            CHECK_EQ(fa_surface_set_presentation_size(fb, 600 + 300 * (uint32_t)k, 432 + 216 * (uint32_t)k), FA_OK);
+            if (cfgs[ci].fx) {
+                fa_surface_effects fx = fx_set(cfgs[ci].fx);
+                CHECK_EQ(fa_surface_set_effects(fa, &fx), FA_OK);
+                CHECK_EQ(fa_surface_set_effects(fb, &fx), FA_OK);
+            }
+            wa = full_draw(fa, (int64_t)(a.n / FA_CDG_PACK_BYTES), 4, &la);
+            wb = full_draw(fb, (int64_t)(b.n / FA_CDG_PACK_BYTES), 4, &lb);
+            CHECK(wa && wb && la.width == lb.width && la.height == lb.height);
+            for (y = 0; y < la.height; y++)
+                if (memcmp(wa + (size_t)y * la.width * 4, wb + (size_t)y * la.width * 4, (size_t)la.width * 4) != 0) {
+                    printf("    config %u, %ux, row %u\n", ci, 2 + (unsigned)k, y);
+                    CHECK(!"offsets differ from the picture drawn as shown");
+                }
+            free(wa);
+            free(wb);
+            fa_surface_destroy(fa);
+            fa_surface_destroy(fb);
+        }
+    fa_stream_close(sa);
+    fa_stream_close(sb);
+    free(a.p);
+    free(b.p);
 }
 
 /* With effects, a frame whose colours changed but not its shapes blends the new
@@ -4228,6 +4339,7 @@ int main(void)
     RUN(test_bevel_half_stroke);
     RUN(test_effects_small_sizes);
     RUN(test_effects_recolor);
+    RUN(test_offsets_as_shown);
     RUN(test_colour_change_partial);
     RUN(test_presentation_incremental);
     RUN(test_render_ahead);

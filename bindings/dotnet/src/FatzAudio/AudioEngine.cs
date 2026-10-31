@@ -704,6 +704,17 @@ public sealed class AudioEngine : IDisposable
         FatzAudioException.ThrowIfFailed(NativeMethods.fa_engine_set_normalization(Handle, (int)mode, targetLufs));
 
     /// <summary>
+    /// Lets the dialogue level that Dolby streams (AC-3, E-AC-3) state ("dialnorm") count as their loudness
+    /// (default off). Broadcasters set it to the programme's loudness, so a film needs no scan: when there is no
+    /// value from <see cref="AudioStream.SetLoudness"/>, no ReplayGain/R128 tag and no cached scan, the dialnorm is
+    /// final at once (<see cref="LoudnessSource.Dialnorm"/>). -31, what encoders write when nobody set it, is not
+    /// used. Applies to streams whose analysis starts afterwards; live streams keep the running estimate.
+    /// </summary>
+    /// <param name="enabled">True to use dialnorm, false to measure every file.</param>
+    public void SetDialnorm(bool enabled) =>
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_engine_set_dialnorm(Handle, enabled ? 1 : 0));
+
+    /// <summary>
     /// Configures the true-peak limiter on every output device. It catches peaks a normalization boost
     /// or a crossfade would push over the ceiling, and never touches audio below it. Its 1.5 ms
     /// look-ahead is always in the signal path (also while off), so switching never clicks.
@@ -844,6 +855,7 @@ internal unsafe ref struct NativeOptions
         o._ptr->Flags = flags;
         o._ptr->AudioTrack = options.AudioTrack;
         o._ptr->DynamicRange = (int)options.DynamicRange;
+        o._ptr->DolbyDownmix = (int)options.DolbyDownmix;
         o._ptr->TextCodePage = (int)options.TextCodePage;
         if (options.CancellationToken.CanBeCanceled)
         {

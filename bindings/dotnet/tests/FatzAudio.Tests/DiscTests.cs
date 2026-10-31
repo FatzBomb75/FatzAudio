@@ -29,7 +29,7 @@ public sealed class DiscTests : IDisposable
         File.WriteAllText(_cue,
             "PERFORMER \"Band\"\nTITLE \"Album\"\nFILE \"disc.bin\" BINARY\n" +
             "  TRACK 01 AUDIO\n    TITLE \"First\"\n    INDEX 01 00:00:00\n" +
-            "  TRACK 02 AUDIO\n    TITLE \"Second\"\n    ISRC USXYZ2600002\n    INDEX 01 00:00:20\n");
+            "  TRACK 02 AUDIO\n    TITLE \"Second\"\n    ISRC USXYZ2600002\n    INDEX 00 00:00:15\n    INDEX 01 00:00:20\n");
     }
 
     public void Dispose()
@@ -58,6 +58,16 @@ public sealed class DiscTests : IDisposable
         Assert.Equal("Second", disc.GetText(2, DiscTextField.Title));
         Assert.Equal("USXYZ2600002", disc.GetText(2, DiscTextField.Code));
         Assert.Null(disc.GetText(1, DiscTextField.Composer));
+    }
+
+    [Fact]
+    public void Image_Pregap()
+    {
+        using var disc = Disc.Open(_cue);
+        Assert.Equal(0, disc.GetPregap(1));
+        Assert.Equal(5, disc.GetPregap(2));
+        var e = Assert.Throws<FatzAudioException>(() => disc.GetPregap(3));
+        Assert.Equal(ErrorCode.NotFound, e.ErrorCode);
     }
 
     [Fact]

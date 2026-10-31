@@ -30,6 +30,7 @@ static int g_failures = 0;
 #define RUN(t) do { int before_ = g_failures; printf("%s\n", #t); t(); if (g_failures == before_) printf("  ok\n"); } while (0)
 
 static fa_engine* g_engine;
+static fa_device* g_dev;
 
 static uint8_t* load_file(const char* name, size_t* size)
 {
@@ -627,6 +628,305 @@ static void test_garbage_does_not_crash(void)
     free(data);
 }
 
+/* ---- downmix ------------------------------------------------------------------ */
+
+static const float* weights_of(const fa_ac3_mix* m, int channels, int ltrt, float* w)
+{
+    return fa_ac3_downmix(m, channels, ltrt, w, NULL) ? w : NULL;
+}
+
+/* used: the channels with audio, a bit each. */
+static fa_ac3_mix mix_codes(int acmod, int c, int s, uint32_t used)
+{
+    fa_ac3_mix m;
+    memset(&m, 0, sizeof(m));
+    m.acmod = acmod;
+    m.lfeon = 1;
+    m.ltrtcmix = m.lorocmix = c;
+    m.ltrtsurmix = m.lorosurmix = s;
+    m.lfemix = -1;
+    m.used = used;
+    return m;
+}
+
+/* The weights against TS 102 366 6.8.2, Tables 6.31 and 6.32 (scaled, worst case). */
+static void test_downmix_coefficients(void)
+{
+    float w[16], scale = 0;
+    fa_ac3_mix m = mix_codes(7, 4, 4, 0x3f);   /* 3/2, clev = slev = 0.707 */
+    /* Lo/Ro: 1 / 2.414 = 0.414 and 0.707 / 2.414 = 0.293. Order L R C LFE SL SR. */
+    CHECK(fa_ac3_downmix(&m, 6, 0, w, &scale));
+    CHECK_NEAR(scale, 0.4142, 1e-4);
+    CHECK_NEAR(w[0 * 2 + 0], 0.4142, 1e-4); CHECK_NEAR(w[0 * 2 + 1], 0.0, 0);
+    CHECK_NEAR(w[1 * 2 + 1], 0.4142, 1e-4); CHECK_NEAR(w[1 * 2 + 0], 0.0, 0);
+    CHECK_NEAR(w[2 * 2 + 0], 0.2929, 1e-4); CHECK_NEAR(w[2 * 2 + 1], 0.2929, 1e-4);
+    CHECK_NEAR(w[3 * 2 + 0], 0.0, 0);                     /* no LFE in an AC-3 downmix */
+    CHECK_NEAR(w[4 * 2 + 0], 0.2929, 1e-4); CHECK_NEAR(w[4 * 2 + 1], 0.0, 0);
+    CHECK_NEAR(w[5 * 2 + 1], 0.2929, 1e-4); CHECK_NEAR(w[5 * 2 + 0], 0.0, 0);
+    /* Lt/Rt: 1 / 3.121 = 0.3204 and 0.707 / 3.121 = 0.2265; both surrounds go to
+     * the left output inverted and to the right as they are. */
+    CHECK(weights_of(&m, 6, 1, w));
+    CHECK_NEAR(w[0 * 2 + 0], 0.3204, 1e-4);
+    CHECK_NEAR(w[2 * 2 + 0], 0.2265, 1e-4); CHECK_NEAR(w[2 * 2 + 1], 0.2265, 1e-4);
+    CHECK_NEAR(w[4 * 2 + 0], -0.2265, 1e-4); CHECK_NEAR(w[5 * 2 + 0], -0.2265, 1e-4);
+    CHECK_NEAR(w[4 * 2 + 1], 0.2265, 1e-4); CHECK_NEAR(w[5 * 2 + 1], 0.2265, 1e-4);
+    /* Other levels: clev 0.5, slev 0 (cmixlev 10, surmixlev 10) scale by 1 / 1.5. */
+    m = mix_codes(7, 6, 7, 0x3f);
+    CHECK(weights_of(&m, 6, 0, w));
+    CHECK_NEAR(w[0], 1.0 / 1.5, 1e-6); CHECK_NEAR(w[2 * 2 + 0], 0.5 / 1.5, 1e-6); CHECK_NEAR(w[4 * 2 + 0], 0.0, 0);
+    /* 3/1: the single surround at 0.7 x slev in both outputs (L R C S). */
+    m = mix_codes(5, 4, 6, 0xf);
+    CHECK(weights_of(&m, 4, 0, w));
+    {
+        double sum = 1.0 + 0.70710678 + 0.7 * 0.5;
+        CHECK_NEAR(w[3 * 2 + 0], 0.35 / sum, 1e-5); CHECK_NEAR(w[3 * 2 + 1], 0.35 / sum, 1e-5);
+    }
+    /* Lt/Rt mono surround: -slev left, +slev right. */
+    CHECK(weights_of(&m, 4, 1, w));
+    CHECK(w[3 * 2 + 0] < 0 && w[3 * 2 + 1] > 0);
+    /* The reserved surround codes read as 0.841 (D.1.3.4); 2/2 has no centre. */
+    m = mix_codes(6, 4, 0, 0x1b);
+    CHECK(weights_of(&m, 5, 0, w));                     /* L R C BL BR */
+    CHECK_NEAR(w[2 * 2 + 0], 0.0, 0);
+    CHECK_NEAR(w[3 * 2 + 0] / w[0], 0.8408964, 1e-5);
+    /* Silent channels take no headroom: stereo plus LFE plays L and R at full scale. */
+    m = mix_codes(2, 4, 4, 0x0b);
+    CHECK(weights_of(&m, 6, 0, w));
+    CHECK_NEAR(w[0], 1.0, 0); CHECK_NEAR(w[1 * 2 + 1], 1.0, 0); CHECK_NEAR(w[2 * 2 + 0], 0.0, 0);
+    /* A 3/1 bed whose dependent substream adds a surround pair: the pair is mixed in. */
+    m = mix_codes(5, 4, 4, 0x37);
+    CHECK(weights_of(&m, 6, 0, w));
+    CHECK(w[4 * 2 + 0] > 0.2f && w[5 * 2 + 1] > 0.2f);
+    /* E-AC-3's LFE mix level: 10 - lfemixlevcod dB, mixed in 4.5 dB lower (E.2.9). */
+    m = mix_codes(7, 2, 7, 0x3f);
+    m.lfemix = 10;
+    CHECK(weights_of(&m, 6, 0, w));
+    CHECK_NEAR(w[3 * 2 + 0] / w[0], pow(10.0, -4.5 / 20), 1e-5);
+    /* A mono programme with LFE (C and LFE have audio): the centre at -3 dB in both. */
+    m = mix_codes(1, 4, 4, 0x0c);
+    CHECK(weights_of(&m, 6, 0, w));
+    CHECK_NEAR(w[2 * 2 + 0], 0.70710678, 1e-6);
+    CHECK_NEAR(w[2 * 2 + 1], 0.70710678, 1e-6);
+    CHECK_NEAR(w[0], 0.0, 0);
+    /* 7.1 (L R C LFE BL BR SL SR): back and side pairs both at slev. */
+    m = mix_codes(7, 4, 4, 0xff);
+    CHECK(weights_of(&m, 8, 0, w));
+    CHECK_NEAR(w[4 * 2 + 0], w[6 * 2 + 0], 1e-7); CHECK(w[4 * 2 + 0] > 0); CHECK_NEAR(w[5 * 2 + 0], 0, 0);
+    CHECK_NEAR(w[5 * 2 + 1], w[7 * 2 + 1], 1e-7);
+    /* Mono and stereo need no downmix. */
+    CHECK(!weights_of(&m, 2, 0, w));
+    CHECK(!weights_of(&m, 1, 0, w));
+}
+
+/* The levels as the streams carry them: AC-3 (cmixlev / surmixlev), AC-3's
+ * alternate syntax (Annex D) and E-AC-3's mixing metadata, written by FFmpeg. */
+static void test_downmix_levels_in_streams(void)
+{
+    static const struct { const char* name; int dmixmod, ltrtc, ltrts, loroc, loros, dialnorm; } k[] = {
+        { "dolby/mix_std.ac3", 0, 4, 4, 6, 7, 24 },    /* clev 0.5, slev 0 */
+        { "dolby/mix_alt.ac3", 1, 0, 3, 2, 6, 20 },    /* Lt/Rt: 1.414, 0.841; Lo/Ro: 1.0, 0.5 */
+        { "dolby/mix.ec3", 2, 5, 6, 3, 4, 27 },        /* Lt/Rt: 0.595, 0.5; Lo/Ro: 0.841, 0.707 */
+    };
+    size_t i;
+    for (i = 0; i < sizeof(k) / sizeof(k[0]); i++) {
+        fa_stream* s = NULL;
+        fa_ac3_mix m;
+        float buf[1536 * 6];
+        fa_frames got = 0;
+        CHECK_EQ(open_file(k[i].name, 0, &s), FA_OK);
+        CHECK_EQ(fa_stream_read(s, buf, 1536, &got), FA_OK);
+        CHECK(fa_ac3_mix_unpack((uint64_t)fa_load64(&s->dolby_mix), &m));
+        CHECK_EQ(m.acmod, 7);
+        CHECK_EQ(m.lfeon, 1);
+        CHECK_EQ(m.dmixmod, k[i].dmixmod);
+        CHECK_EQ(m.ltrtcmix, k[i].ltrtc);
+        CHECK_EQ(m.ltrtsurmix, k[i].ltrts);
+        CHECK_EQ(m.lorocmix, k[i].loroc);
+        CHECK_EQ(m.lorosurmix, k[i].loros);
+        CHECK_EQ(m.dialnorm, k[i].dialnorm);
+        CHECK_EQ(m.used, 0x3f);                        /* every channel of 5.1 has audio */
+        fa_stream_close(s);
+    }
+}
+
+/* Plays a file on the (not started) null device, this thread being the audio
+ * thread: `frames` stereo frames into out. */
+static fa_result play_stereo(const char* name, int32_t mode, int32_t switch_to, float* out, int64_t frames)
+{
+    char path[512];
+    fa_open_options o;
+    fa_stream* s = NULL;
+    int64_t done = 0, d;
+    fa_result r;
+    float* tmp;
+    fa_open_options_init(&o);
+    o.dolby_downmix = mode;
+    snprintf(path, sizeof(path), "%s/%s", FA_TEST_DATA_DIR, name);
+    if ((r = fa_stream_open_path(g_engine, path, &o, &s)) != FA_OK) return r;
+    if ((r = fa_stream_attach(s, g_dev, NULL)) != FA_OK || (r = fa_stream_play(s)) != FA_OK) { fa_stream_close(s); return r; }
+    if (switch_to >= 0 && (r = fa_stream_set_dolby_downmix(s, (fa_dolby_downmix)switch_to)) != FA_OK) {
+        fa_stream_close(s);
+        return r;
+    }
+    d = g_dev->limiter.delay;
+    tmp = (float*)malloc((size_t)(frames + d) * 2 * sizeof(float));
+    while (done < frames + d) {
+        uint32_t n = frames + d - done < 512 ? (uint32_t)(frames + d - done) : 512;
+        int64_t deadline = fa_monotonic_ns() + 10000000000LL;   /* a bound for a hang, not a wait */
+        while (fa_ring_readable(&s->ring) < (int64_t)n && !fa_load32(&s->eof) && fa_monotonic_ns() < deadline)
+            fa_sleep_ms(1);
+        fa_fetch_add64(&g_dev->epoch, 1);
+        fa_device_render(g_dev, tmp + done * 2, n);
+        fa_fetch_add64(&g_dev->epoch, 1);
+        done += n;
+    }
+    memcpy(out, tmp + d * 2, (size_t)frames * 2 * sizeof(float));
+    free(tmp);
+    fa_stream_close(s);
+    return FA_OK;
+}
+
+/* Complex amplitude of a `hz` tone in channel c of interleaved pcm (Hann window). */
+static void tone(const float* pcm, int channels, int c, int64_t from, int64_t n, double rate, double hz,
+                 double* re, double* im)
+{
+    int64_t i;
+    double a = 0, b = 0;
+    for (i = 0; i < n; i++) {
+        double win = 0.5 - 0.5 * cos(2 * 3.141592653589793 * (double)i / (double)n), t = (double)(from + i) / rate;
+        double x = pcm[(from + i) * channels + c] * win;
+        a += x * cos(2 * 3.141592653589793 * hz * t);
+        b += x * sin(2 * 3.141592653589793 * hz * t);
+    }
+    *re = a * 4 / (double)n;
+    *im = b * 4 / (double)n;
+}
+
+static double tone_amp(const float* pcm, int channels, int c, int64_t from, int64_t n, double rate, double hz)
+{
+    double re, im;
+    tone(pcm, channels, c, from, n, rate, hz, &re, &im);
+    return sqrt(re * re + im * im);
+}
+
+/* What reaches the speakers: each channel's tone (L 500 Hz, R 700, C 900, LFE 60,
+ * SL 1100, SR 1300 Hz) at the weight of the stream's levels, against the decoded
+ * channels; Lt/Rt has the surrounds out of phase. */
+static void test_downmix_on_the_device(void)
+{
+    static const double hz[6] = { 500, 700, 900, 60, 1100, 1300 };
+    enum { N = 9000 };
+    float* out = (float*)malloc((size_t)N * 2 * sizeof(float));
+    double rate = (double)g_dev->rate, src[6];
+    decoded dec;
+    fa_ac3_mix m;
+    float w[12];
+    int c, k;
+    struct { const char* name; int32_t mode, switch_to; int ltrt; } runs[] = {
+        { "dolby/mix_std.ac3", FA_DOLBY_DOWNMIX_AUTO, -1, 0 },
+        { "dolby/mix_alt.ac3", FA_DOLBY_DOWNMIX_AUTO, -1, 1 },     /* prefers Lt/Rt */
+        { "dolby/mix_alt.ac3", FA_DOLBY_DOWNMIX_LORO, -1, 0 },
+        { "dolby/mix.ec3", FA_DOLBY_DOWNMIX_LTRT, -1, 1 },
+        { "dolby/mix.ec3", FA_DOLBY_DOWNMIX_ENGINE, FA_DOLBY_DOWNMIX_AUTO, 0 },   /* rebuilt while attached */
+    };
+    CHECK(out != NULL);
+    for (k = 0; k < (int)(sizeof(runs) / sizeof(runs[0])); k++) {
+        CHECK(decode(runs[k].name, 0, &dec));
+        CHECK_EQ(dec.info.format.channels, 6);
+        for (c = 0; c < 6; c++) src[c] = tone_amp(dec.pcm, 6, c, 3000, 6000, 48000, hz[c]);
+        free(dec.pcm);
+        {
+            fa_stream* s = NULL;
+            float buf[1536 * 6];
+            fa_frames got = 0;
+            CHECK_EQ(open_file(runs[k].name, 0, &s), FA_OK);
+            fa_stream_read(s, buf, 1536, &got);
+            CHECK(fa_ac3_mix_unpack((uint64_t)fa_load64(&s->dolby_mix), &m));
+            fa_stream_close(s);
+        }
+        CHECK(fa_ac3_downmix(&m, 6, runs[k].ltrt, w, NULL));
+        CHECK_EQ(play_stereo(runs[k].name, runs[k].mode, runs[k].switch_to, out, N), FA_OK);
+        for (c = 0; c < 6; c++) {
+            int64_t from = (int64_t)(3000 * rate / 48000);
+            double l = tone_amp(out, 2, 0, from, (int64_t)(6000 * rate / 48000), rate, hz[c]);
+            double r = tone_amp(out, 2, 1, from, (int64_t)(6000 * rate / 48000), rate, hz[c]);
+            CHECK_NEAR(l, fabs(w[c * 2 + 0]) * src[c], 0.01 * src[c] + 1e-3);
+            CHECK_NEAR(r, fabs(w[c * 2 + 1]) * src[c], 0.01 * src[c] + 1e-3);
+        }
+        if (runs[k].ltrt) {
+            /* The surrounds' tone in Lt is the negative of the one in Rt. */
+            double lre, lim, rre, rim;
+            int64_t from = (int64_t)(3000 * rate / 48000), n = (int64_t)(6000 * rate / 48000);
+            tone(out, 2, 0, from, n, rate, 1100, &lre, &lim);
+            tone(out, 2, 1, from, n, rate, 1100, &rre, &rim);
+            CHECK(lre * rre + lim * rim < 0);
+        }
+        printf("  %s mode %d: weights C %.3f, SL %.3f / %.3f\n", runs[k].name, runs[k].mode, w[4], w[8], w[9]);
+    }
+    /* ENGINE keeps the engine's downmix, which ignores the stream's levels: the
+     * surrounds that mix_std.ac3 leaves out (slev 0) are heard. */
+    CHECK_EQ(play_stereo("dolby/mix_std.ac3", FA_DOLBY_DOWNMIX_ENGINE, -1, out, N), FA_OK);
+    CHECK(tone_amp(out, 2, 0, (int64_t)(3000 * rate / 48000), (int64_t)(6000 * rate / 48000), rate, 1100) > 0.05);
+    free(out);
+}
+
+/* Normalization gives back what the downmix took off to stay below full scale. */
+static void test_downmix_normalization_makeup(void)
+{
+    char path[512];
+    int pass;
+    snprintf(path, sizeof(path), "%s/dolby/mix_std.ac3", FA_TEST_DATA_DIR);   /* L 1, C 0.5: scaled 1 / 1.5 */
+    CHECK_EQ(fa_engine_set_normalization(g_engine, FA_NORMALIZE_TRACK, -16), FA_OK);
+    for (pass = 0; pass < 2; pass++) {
+        fa_open_options o;
+        fa_stream* s = NULL;
+        fa_loudness l;
+        int64_t deadline = fa_monotonic_ns() + 10000000000LL;
+        fa_open_options_init(&o);
+        o.dolby_downmix = pass == 0 ? FA_DOLBY_DOWNMIX_AUTO : FA_DOLBY_DOWNMIX_ENGINE;
+        CHECK_EQ(fa_stream_open_path(g_engine, path, &o, &s), FA_OK);
+        memset(&l, 0, sizeof(l));
+        l.integrated_lufs = -20;
+        l.range_lu = l.true_peak_dbtp = NAN;
+        CHECK_EQ(fa_stream_set_loudness(s, &l), FA_OK);
+        CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+        while (fa_ring_readable(&s->ring) == 0 && fa_monotonic_ns() < deadline) fa_sleep_ms(1);
+        CHECK_EQ(fa_stream_get_loudness(s, &l), FA_OK);
+        if (pass == 0) CHECK_NEAR(l.gain_db, 4.0 + 20 * log10(1.5), 1e-3);
+        else CHECK_NEAR(l.gain_db, 4.0, 1e-6);
+        fa_stream_close(s);
+    }
+    fa_engine_set_normalization(g_engine, FA_NORMALIZE_OFF, -16);
+}
+
+/* fa_engine_set_dialnorm: the dialogue level stands in for a scan. */
+static void test_dialnorm_loudness(void)
+{
+    char path[512];
+    fa_stream* s = NULL;
+    fa_loudness l;
+    int64_t deadline;
+    int pass;
+    for (pass = 0; pass < 2; pass++) {
+        CHECK_EQ(fa_engine_set_dialnorm(g_engine, pass == 0), FA_OK);
+        snprintf(path, sizeof(path), "%s/dolby/mix_alt.ac3", FA_TEST_DATA_DIR);
+        CHECK_EQ(fa_stream_open_path(g_engine, path, NULL, &s), FA_OK);
+        deadline = fa_monotonic_ns() + 20000000000LL;
+        do {
+            CHECK_EQ(fa_stream_get_loudness(s, &l), FA_OK);
+            if (!l.is_final) fa_sleep_ms(2);
+        } while (!l.is_final && fa_monotonic_ns() < deadline);
+        fa_stream_close(s);
+        CHECK(l.is_final);
+        if (pass == 0) {
+            CHECK_EQ(l.source, FA_LOUDNESS_DIALNORM);
+            CHECK_NEAR(l.integrated_lufs, -20.0, 0);
+        } else {
+            CHECK_EQ(l.source, FA_LOUDNESS_SCAN);    /* off: measured */
+        }
+    }
+}
+
 static void test_registry_lists_dolby(void)
 {
     uint32_t i, n = fa_format_count();
@@ -649,6 +949,7 @@ int main(void)
     cfg.flags = FA_ENGINE_NULL_OUTPUT;
     cfg.worker_threads = 2;
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) { fprintf(stderr, "engine create failed\n"); return 1; }
+    if (fa_device_open(g_engine, NULL, &g_dev) != FA_OK) { fprintf(stderr, "device open failed\n"); return 1; }
 
     RUN(test_registry_lists_dolby);
     RUN(test_matches_ffmpeg);
@@ -662,6 +963,11 @@ int main(void)
     RUN(test_dependent_frames_in_separate_packets);
     RUN(test_layout_change_inside_a_packet);
     RUN(test_garbage_does_not_crash);
+    RUN(test_downmix_coefficients);
+    RUN(test_downmix_levels_in_streams);
+    RUN(test_downmix_on_the_device);
+    RUN(test_downmix_normalization_makeup);
+    RUN(test_dialnorm_loudness);
 
     fa_engine_destroy(g_engine);
     if (g_failures) { printf("%d failure(s)\n", g_failures); return 1; }

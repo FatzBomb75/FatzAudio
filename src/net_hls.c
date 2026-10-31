@@ -1007,6 +1007,7 @@ static fa_result hls_open(fa_decoder* dec)
     if (!h) return FA_ERROR_OUT_OF_MEMORY;
     h->net = (fa_net*)dec->src->io_user;
     h->env.dynamic_range = dec->dynamic_range;
+    h->env.dolby_mix = dec->dolby_mix;
     h->env.soundfont = NULL;              /* MIDI is never an HLS segment format */
     h->env.midi_rate = dec->midi_rate;
     h->env.text_code_page = dec->text_code_page;

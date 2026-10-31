@@ -340,6 +340,14 @@ if(UNIX)
 endif()
 add_test(NAME midi_controls COMMAND fa_test_midi_controls)
 
+add_executable(fa_test_midi_drums test_midi_drums.c)
+target_compile_options(fa_test_midi_drums PRIVATE ${FA_WARNINGS})
+target_link_libraries(fa_test_midi_drums PRIVATE fatzaudio)
+if(UNIX)
+    target_link_libraries(fa_test_midi_drums PRIVATE m)
+endif()
+add_test(NAME midi_drums COMMAND fa_test_midi_drums)
+
 # White-box: it plays the audio thread itself for FA_EVENT_TRACKER_ROW.
 add_executable(fa_test_tracker test_tracker.c)
 target_include_directories(fa_test_tracker PRIVATE

@@ -14,6 +14,7 @@
 #endif
 #include "fa_internal.h"
 #include "aac.h"
+#include "reverse_check.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -252,6 +253,62 @@ static void test_seek_matches_straight_decode(void)
         free(p);
         free(full);
         fa_stream_close(s);
+    }
+}
+
+/* An ADTS stream in memory, decode-only, read whole: see rc_read_all. */
+static float* read_adts(const uint8_t* data, size_t size, int64_t from, int64_t* out_n, uint32_t* out_ch,
+                        uint32_t* out_rate)
+{
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    if (fa_stream_open_memory(g_engine, data, size, &o, &s) != FA_OK) return NULL;
+    return rc_read_all(s, from, out_n, out_ch, out_rate);
+}
+
+/* Reverse playback decodes half-second blocks, each after a seek, and cross-fades
+ * them where they meet. The streams are each played 12 times over (ADTS frames
+ * simply follow on), so the noise generators and prediction run on past the
+ * seeks. Where seeks are exact (he_stereo), the reversed decode is the straight
+ * decode last frame first, to a rounding. Where they are not (PNS and SBR noise,
+ * AAC Main and LTP prediction), the reversed audio differs from it by about as
+ * much as a seek does, and the joins have no step beyond the steps of the audio
+ * around them (both decodes, within 600 frames). */
+static void test_reverse_joins(void)
+{
+    static const struct { const char* name; double tol; } files[] = {
+        { "aac/he_stereo.aac", 1e-6 }, { "aac/he_v2.aac", 0.25 }, { "aac/he_51.aac", 0.25 },
+        { "aac/lc_pce_quad.aac", 0.3 }, { "tone.aac", 0.02 }, { "aac/main.aac", 0.35 }, { "aac/ltp.aac", 0.35 },
+    };
+    size_t f;
+    for (f = 0; f < sizeof(files) / sizeof(files[0]); f++) {
+        size_t size = 0, k;
+        uint8_t* one = load_file(files[f].name, &size);
+        uint8_t* data;
+        int64_t n = 0, nr = 0;
+        uint32_t ch = 0, chr = 0, rate = 0;
+        float* full;
+        float* rev;
+        double worst = 0, excess = 0;
+        CHECK(one != NULL);
+        data = (uint8_t*)malloc(size * 12);
+        for (k = 0; k < 12; k++) memcpy(data + k * size, one, size);
+        full = read_adts(data, size * 12, -1, &n, &ch, &rate);
+        rev = full ? read_adts(data, size * 12, n, &nr, &chr, &rate) : NULL;
+        CHECK(full != NULL && rev != NULL);
+        CHECK_EQ(nr, n);
+        CHECK_EQ(chr, ch);
+        rc_compare(full, rev, n, ch, rate, &worst, &excess);
+        printf("  %s x12: %lld frames, reversed vs straight %g, steps at the joins beyond those around %g\n",
+               files[f].name, (long long)n, worst, excess);
+        CHECK(worst <= files[f].tol);
+        CHECK(excess < 0.02);
+        free(full);
+        free(rev);
+        free(data);
+        free(one);
     }
 }
 
@@ -927,6 +984,7 @@ int main(void)
 
     RUN(test_matches_ffmpeg);
     RUN(test_seek_matches_straight_decode);
+    RUN(test_reverse_joins);
     RUN(test_raw_access_units);
     RUN(test_several_blocks_and_crc);
     RUN(test_damaged_frames);

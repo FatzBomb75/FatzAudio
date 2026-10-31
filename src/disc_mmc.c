@@ -216,7 +216,7 @@ static void mmc_close(void* h)
 
 static const fa_disc_ops mmc_ops = {
     mmc_inquiry, mmc_test_ready, mmc_read_toc, mmc_read_cd, mmc_read_code,
-    mmc_set_speed, mmc_get_speed, mmc_tray, mmc_lock, mmc_close
+    mmc_set_speed, mmc_get_speed, mmc_tray, mmc_lock, mmc_close, NULL
 };
 
 fa_result fa_mmc_open(fa_mmc_exec_fn exec, void (*close)(void*), void* h, uint32_t max_sectors,

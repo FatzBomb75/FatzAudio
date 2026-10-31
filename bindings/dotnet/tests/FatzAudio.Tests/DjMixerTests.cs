@@ -187,6 +187,41 @@ public class DjMixerTests
         Assert.Equal(before + 2 * rate, sb.PositionFrames);
     }
 
+    private static async Task WaitFor(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (!condition() && DateTime.UtcNow < deadline) await Task.Delay(10);
+        Assert.True(condition());
+    }
+
+    [Fact]
+    public async Task Slip_ReverseCountsOnAndReturns()
+    {
+        using var engine = CreateHeadless();
+        using var mixer = engine.CreateDjMixer(new DjMixerOptions { Latency = LatencyMode.Normal });
+        using var s = engine.OpenMemory(TestAudio.SineWav(seconds: 4));
+        const int rate = 44100;   // TestAudio.SineWav
+        DjDeck a = mixer.Decks[0];
+        a.Load(s);
+        Assert.False(a.Slip);
+        a.Slip = true;
+        Assert.True(a.Slip);
+        Assert.Null(a.SlipPosition);
+        a.SlipReturn();                                             // none runs: nothing happens
+        s.Play();
+        await WaitFor(() => s.PositionFrames > rate / 2);
+        s.Reverse = true;
+        long from = a.SlipPosition!.Value;
+        await WaitFor(() => a.SlipPosition > from + rate / 5);      // counts on while playing backwards
+        Assert.True(s.PositionFrames < from);
+        a.SlipReturn();
+        Assert.Null(a.SlipPosition);
+        Assert.False(s.Reverse);
+        await WaitFor(() => s.PositionFrames > from + rate / 5);    // back where it would be
+        a.Slip = false;
+        Assert.False(a.Slip);
+    }
+
     [Fact]
     public async Task AutoMix_StartSkipStop()
     {

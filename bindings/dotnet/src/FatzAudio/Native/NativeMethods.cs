@@ -231,6 +231,12 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_stream_get_dynamic_range(StreamHandle stream, out int mode);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_dolby_downmix(StreamHandle stream, int mode);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_dolby_downmix(StreamHandle stream, out int mode);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial void fa_cdg_surface_config_init(FaCdgSurfaceConfig* config);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
@@ -348,6 +354,9 @@ internal static unsafe partial class NativeMethods
     // ---- Normalization -----------------------------------------------------
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_engine_set_normalization(EngineHandle engine, int mode, double targetLufs);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_engine_set_dialnorm(EngineHandle engine, int enabled);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_engine_set_limiter(EngineHandle engine, int mode, double ceilingDbtp);
@@ -591,6 +600,9 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_disc_get_text(DiscHandle disc, int track, int field, byte* text, nuint size);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_disc_get_pregap(DiscHandle disc, int track, out long sectors);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_disc_eject(DiscHandle disc);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
@@ -713,6 +725,18 @@ internal static unsafe partial class NativeMethods
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_deck_get_loop(nint deck, out long loopIn, out long loopOut);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_deck_set_slip(nint deck, int on);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_deck_get_slip(nint deck, out int on);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_deck_get_slip_position(nint deck, out long frame);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_deck_slip_return(nint deck);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_deck_get_levels(nint deck, long window, float* peak, float* rms, uint channels);

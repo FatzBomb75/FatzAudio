@@ -147,6 +147,9 @@ struct fa_decoder {
     /* The stream's fa_dynamic_range, for codecs that apply one (Dolby); given to
      * fa_decoder_open. NULL = full range. */
     fa_atomic32* dynamic_range;
+    /* Where Dolby codecs leave the stream's downmix levels and dialogue level
+     * (fa_ac3_mix_pack) after each unit; given to fa_decoder_open. NULL = nowhere. */
+    fa_atomic64* dolby_mix;
     /* MIDI, from fa_decoder_open's env (wrapping decoders such as HLS pass both on). */
     struct fa_soundfont* soundfont;   /* borrowed, NULL = none */
     uint32_t midi_rate;               /* MIDI and tracker modules: output rate */
@@ -165,6 +168,8 @@ struct fa_decoder {
 typedef struct fa_decoder_env {
     fa_atomic32* dynamic_range;       /* the stream's fa_dynamic_range (read while decoding),
                                          NULL = full range */
+    fa_atomic64* dolby_mix;           /* Dolby downmix information written while decoding
+                                         (fa_ac3_mix_pack), NULL = not wanted */
     struct fa_soundfont* soundfont;   /* MIDI: the instruments (the caller keeps it alive
                                          while the decoder is open), NULL = none */
     uint32_t midi_rate;               /* MIDI and tracker modules: output rate, 0 = FA_MIDI_DEFAULT_RATE */
@@ -276,6 +281,8 @@ int fa_probe_mp3_header(const uint8_t* data, size_t size, size_t start, uint32_t
 #define FA_WORKER_POLL_MIN_MS 5     /* the polling worker's shortest and longest sleep (worker_main) */
 #define FA_WORKER_POLL_MAX_MS 50
 #define FA_WORKER_POLL_IDLE_MS 100  /* ... while no stream has anything to decode */
+#define FA_REVERSE_BLOCK_MS 500     /* reversed: source decoded per seek (reverse_read) */
+#define FA_REVERSE_OVERLAP_MS 10    /* ... each block this far past its end, cross-faded with the one above */
 
 /* Soundfont references: retain returns `f` (NULL-safe); the last release frees it. */
 /* DLS banks (dls.c), turned into a SoundFont 2 image the synthesizer loads. */
@@ -418,12 +425,15 @@ int fa_chroma_key(fa_chroma* c, fa_key_info* out);
 typedef struct fa_ring {
     float* data;
     uint32_t channels;
-    int64_t capacity;     /* frames */
+    int64_t capacity;     /* frames readable at most */
+    int64_t size;         /* frames held: capacity + the kept ones (fa_ring_init_kept) */
     fa_atomic64 write;    /* total frames written (producer) */
     fa_atomic64 read;     /* total frames read (consumer) */
 } fa_ring;
 
 fa_result fa_ring_init(fa_ring* r, uint32_t channels, int64_t capacity);
+/* The same, also keeping the last `keep` frames read: the writer never reaches them. */
+fa_result fa_ring_init_kept(fa_ring* r, uint32_t channels, int64_t capacity, int64_t keep);
 void fa_ring_free(fa_ring* r);
 int64_t fa_ring_readable(fa_ring* r);
 int64_t fa_ring_writable(fa_ring* r);
@@ -435,6 +445,8 @@ void fa_ring_commit(fa_ring* r, int64_t frames);
 /* Consumer: up to two contiguous regions holding `frames` readable frames. */
 void fa_ring_regions(fa_ring* r, int64_t frames, const float** p1, int64_t* n1, const float** p2, int64_t* n2);
 void fa_ring_advance_read(fa_ring* r, int64_t frames);
+/* Frame `idx` (a total count), read or not: valid back to `keep` before the read count. */
+const float* fa_ring_frame(fa_ring* r, int64_t idx);
 /* Only while neither side can run (stream flushing and decode lock held). */
 void fa_ring_reset(fa_ring* r);
 
@@ -585,6 +597,10 @@ void fa_tmap_add(fa_tmap* m, int64_t at, double src, double slope);
 /* Source position at ring frame `at`; *out_slope and *out_next (where the segment
  * ends, INT64_MAX = open) may be NULL. */
 double fa_tmap_pos(fa_tmap* m, int64_t at, double base_src, double base_slope, double* out_slope, int64_t* out_next);
+/* The segment holding ring frame `at`: where it starts (0 for the base), its source
+ * position there and its slope. */
+void fa_tmap_segment_at(fa_tmap* m, int64_t at, double base_src, double base_slope, int64_t* out_start,
+                        double* out_src, double* out_slope);
 /* Ring frames from `at` until the source position reaches `target` (0 if it has). */
 int64_t fa_tmap_frames_to(fa_tmap* m, int64_t at, double target, double base_src, double base_slope);
 void fa_tmap_release(fa_tmap* m, int64_t at);   /* audio thread */
@@ -898,6 +914,7 @@ struct fa_engine {
     /* Normalization and limiter settings, read by the audio thread. */
     fa_atomic32 norm_mode;       /* fa_normalize_mode */
     fa_atomic32 norm_target;     /* float LUFS */
+    fa_atomic32 use_dialnorm;    /* fa_engine_set_dialnorm */
     fa_atomic32 limiter_mode;    /* fa_limiter_mode */
     fa_atomic32 limiter_ceiling; /* float dBTP */
 
@@ -1221,6 +1238,8 @@ struct fa_stream {
     fa_decoder decoder;
     int decoder_ready;
     fa_atomic32 dynamic_range;   /* fa_dynamic_range, read by the codec on every packet */
+    fa_atomic64 dolby_mix;       /* Dolby downmix information (fa_ac3_mix_pack), written by the codec */
+    fa_atomic32 dolby_downmix;   /* fa_dolby_downmix */
 
     fa_atomic32 state;           /* fa_stream_state */
     fa_atomic64 position;        /* source frames, when not attached */
@@ -1270,6 +1289,15 @@ struct fa_stream {
     float* mat_buf;              /* matrix output, 2 channels */
     float* matrix;               /* in x FA_DEVICE_CHANNELS weights, NULL = default; under
                                     api_lock + decode_lock */
+    /* Without `matrix`: the chain mixes Dolby audio down with the stream's own levels
+     * (dolby_w, made from dolby_key = the dolby_mix and mode they were made for).
+     * Set with the chain; dolby_w and dolby_key are the worker's (decode_lock).
+     * dolby_makeup: the dB the downmix's overload scaling took off, which normalization
+     * gives back (float, read by the mixer; 0 without the downmix). */
+    int dolby;
+    uint64_t dolby_key;
+    fa_atomic32 dolby_makeup;
+    float dolby_w[8 * FA_DEVICE_CHANNELS];
     fa_frames src_pos;           /* source frame of the next decoder read (worker) */
     fa_atomic32 eof;             /* the worker has written the last frame */
     fa_atomic32 flushing;        /* 1 = the audio thread must not touch the ring */
@@ -1391,11 +1419,22 @@ struct fa_stream {
      * chain and the tmap count) run up while the source position runs down: linear
      * frame L is source position 2 * seek_base - L. The source is decoded forward in
      * blocks into rev_buf and handed out last frame first: rev_n frames are left,
-     * ending at source frame rev_pos (decode side, under decode_lock). */
+     * ending at source frame rev_pos, the first rev_hold of them held back for the
+     * cross-fade with the block below (see reverse_read; decode side, under decode_lock). */
     fa_atomic32 reverse_want;
     fa_atomic32 reverse;
     float* rev_buf;
-    fa_frames rev_cap, rev_n, rev_pos;
+    float* rev_ov;               /* inside rev_buf: the held frames while the block below decodes */
+    fa_frames rev_cap, rev_n, rev_pos, rev_hold;
+    /* Slip (fa_deck_set_slip): while a reverse, a deck loop or a beat jump takes the deck
+     * elsewhere, where it would be playing is slip_from (the source frame heard when the
+     * slip began, going on the way slip_rev says) plus slip_run timeline frames (counted
+     * as linear frames run, see above) up to where that count stood at the run value
+     * slip_mark, plus what the timeline ran since. slip_active is cleared by any restart,
+     * a worker's too; the rest is under api_lock. */
+    fa_atomic32 slip_active;
+    int slip_rev;
+    double slip_from, slip_run, slip_mark;
 
     /* CD+G graphics (cdg.c): the packs, the surfaces drawing them, and a generation
      * count that tells surfaces the graphics were replaced. Never touched by the
@@ -1499,6 +1538,15 @@ fa_result fa_stream_jump(struct fa_stream* s, fa_frames at, fa_frames delta);
 /* Moves a playing deck loop: a jump of `delta` a margin ahead of the mix that sets the
  * loop to `in`..`out` at the same join (out > in), so either both happen or neither. */
 fa_result fa_stream_jump_loop(struct fa_stream* s, fa_frames delta, fa_frames in, fa_frames out);
+/* Slip (fa_deck_set_slip, mixer.c): a beat jump begins one (a no-op when one runs or the
+ * stream is not playing); the return joins where playback would be; cancel forgets it. */
+int fa_stream_slip_begin(struct fa_stream* s);   /* 1 = began one */
+fa_result fa_stream_slip_return(struct fa_stream* s);
+void fa_stream_slip_cancel(struct fa_stream* s);
+/* FA_FRAMES_UNSET when no slip runs. */
+fa_frames fa_stream_slip_position(struct fa_stream* s);
+/* Whether a stream on this bus slips: its deck has slip mode on (mixer.c). */
+int fa_mixer_bus_slips(fa_bus* bus);
 /* A TEMPO ramp from where it is that raises no FA_EVENT_RAMP_DONE (auto-mix's glide back). */
 fa_result fa_stream_ramp_tempo_quiet(struct fa_stream* s, float target, fa_time duration);
 /* Device frame at the speaker at monotonic time `now_ns` (latency included). */
@@ -1577,6 +1625,9 @@ struct fa_codec {
     /* fa_dynamic_range of the stream, read on every packet (NULL = full range).
      * Set by the owner after fa_codec_open. */
     fa_atomic32* dynamic_range;
+    /* Dolby codecs write the downmix information of each unit here (NULL = nowhere).
+     * Set by the owner after fa_codec_open. */
+    fa_atomic64* dolby_mix;
     /* Its audio can come out a packet or more after the packet that holds it (the
      * systems' decoders): the track decoder anchors the audio on the first packet. */
     int trails;
@@ -1655,18 +1706,20 @@ fa_result fa_mc_codec_open(fa_codec* c, const fa_codec_params* p);
 typedef struct fa_aac_asc_info {
     int object_type;            /* of the core: 2 = LC (after explicit SBR/PS signalling) */
     uint32_t rate;              /* core sampling rate */
+    int rate_index;             /* its 4-bit index; 15: an explicit rate */
     uint32_t ext_rate;          /* SBR output rate, 0 if not signalled */
     uint32_t channel_config;    /* 0: a program config element says */
+    int short_frames;           /* GASpecificConfig's frameLengthFlag: 960-sample frames */
     int sbr, ps;                /* 1 signalled, 0 signalled absent, -1 not said (implicit) */
 } fa_aac_asc_info;
-int fa_aac_parse_asc(const uint8_t* p, size_t n, fa_aac_asc_info* out);   /* 1 if valid */
+/* The one AudioSpecificConfig parser (aac.c, which also sets its decoder up with it):
+ * 1 if valid. At most FA_AAC_ASC_PARSE_MAX bytes. */
+#define FA_AAC_ASC_PARSE_MAX 4096
+int fa_aac_parse_asc(const uint8_t* p, size_t n, fa_aac_asc_info* out);
 uint32_t fa_aac_config_channels(uint32_t config);
-/* The AudioSpecificConfig to hand an OS decoder (the extradata, else built for ADTS
- * frames); 0 if none can be had. */
+/* The AudioSpecificConfig to hand an OS decoder (from the extradata: only streams
+ * that have one reach them); 0 if none can be had. */
 size_t fa_aac_os_asc(const fa_codec_params* p, int he_guess, uint8_t* out, size_t cap);
-/* Takes the header off a packet that is one whole ADTS frame: 1; not ADTS: 0;
- * several raw data blocks in the frame: -1. */
-int fa_adts_strip(const uint8_t** data, size_t* size);
 /* An MPEG-4 ES descriptor holding the AudioSpecificConfig (an 'esds' box's contents). */
 size_t fa_aac_esds(const uint8_t* asc, size_t n, uint8_t* out, size_t cap);
 /* From Core Audio channel labels to the library's channel order: src_of_dst[i] is the

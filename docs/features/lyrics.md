@@ -336,4 +336,4 @@ surface.RenderAhead = true;   // check SurfaceUpdate.Behind on each frame
 - Set `fa_surface_set_presentation_size` to the real size of the area, in physical pixels, before the first layout. Without it the surface draws for 1920x1080.
 - Use a `dst_revision` of 0 for a buffer you have cleared or drawn into yourself.
 - The pixels are premultiplied BGRA. Blend with "one, one minus source alpha".
-- A scaled-up line during a page fade-in is slightly soft until it settles: see the [engineering notes](../engineering-notes.md).
+- A line growing in during a page fade-in (`page_in_scale` above 1) is drawn again at that size while it is bigger than its normal drawing, so it is sharp; the bigger drawings are let go when the page has grown in. A line that could not be drawn for lack of memory is tried again after about 90 frames in which it is shown, and left out until then.

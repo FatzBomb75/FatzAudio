@@ -43,6 +43,7 @@ struct fa_deck {
     fa_atomic32 side;            /* FA_DECK_XFADER_SIDE */
     fa_atomic_ptr tap;           /* fa_tap*, the channel meter (post fader) */
     fa_atomic32 sync_range;      /* FA_DECK_SYNC_RANGE, float bits */
+    fa_atomic32 slip;            /* fa_deck_set_slip; read by its stream under its api_lock */
     /* Sync (sync.c), mixer lock: leader NULL = not synced. */
     struct fa_deck* leader;
     uint32_t sync_flags;         /* fa_sync_flags */
@@ -56,6 +57,7 @@ struct fa_deck {
     int64_t settle_end;          /* monotonic ns: the pull gives up */
     int64_t hold_until;          /* monotonic ns: not measured before a jump is heard */
     int jumping;                 /* a jump waits for its beat to be decoded */
+    int jump_rev, jump_lrev;     /* ... worked out for the deck, the leader playing backwards */
     fa_frames jump_at, jump_by;
     fa_tempo_segment* segs;      /* the grid's tempo map, read into here (sync.c) */
     uint32_t segs_cap;
@@ -392,7 +394,7 @@ typedef struct fa_deck_now {
     double grid_bpm;             /* the grid's tempo there */
     double bpm;                  /* heard: grid_bpm x tempo x rate */
     int32_t state;               /* fa_stream_state */
-    int32_t reversed;            /* playing backwards (fa_stream_set_reverse): not pulled into phase */
+    int32_t reversed;            /* playing backwards (fa_stream_set_reverse): its beats count down */
 } fa_deck_now;
 int64_t fa_mixer_now(struct fa_mixer* m);
 /* The event thread looks at the mixer again at monotonic `at` (the sooner one wins). */

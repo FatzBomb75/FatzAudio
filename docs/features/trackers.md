@@ -135,7 +135,7 @@ if (song.TrackerPosition is { } pos)               // null while not known
 
 ### Row events
 
-Set `FA_TRACKER_ROW_EVENTS` to have `FA_EVENT_TRACKER_ROW` raised as rows are heard: 1 for every row, 2 for the first row of each order, 0 (the default) for none. The event's `frame` is the row's first frame and `value` is `order << 16 | row`. Like markers, the events are raised as the audio is mixed and are best effort (see [events](events.md)): a display that must follow every row should read the position above each frame instead. This is the `BASS_SYNC_MUSICPOS` equivalent; BASS lets you pick one position, here you filter in the handler.
+Set `FA_TRACKER_ROW_EVENTS` to have `FA_EVENT_TRACKER_ROW` raised as rows are heard: 1 for every row, 2 for the first row of each order, 0 (the default) for none. The event's `frame` is the row's first frame and `value` is `order << 16 | row`. Like markers, the events are raised as the audio is mixed and are best effort (see [events](events.md)): a display that must follow every row should read the position above each frame instead. This is the `BASS_SYNC_MUSICPOS` equivalent; BASS lets you pick one position, here you filter in the handler. In [reverse playback](tempo-pitch.md#reverse-playback) the rows come last first, each as playback reaches its first frame going down.
 
 A row counts as the first of its order when the order changes or the song jumps back to row 0 of the same order. A row that repeats itself in place (a pattern loop on a single row, such as `E6x` on that row) raises one event, not one per pass.
 

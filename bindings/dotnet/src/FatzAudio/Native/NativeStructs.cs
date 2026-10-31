@@ -69,6 +69,7 @@ internal unsafe struct FaOpenOptions
     public nint SoundFont;
     public int TextCodePage;
     public int* Cancel;
+    public int DolbyDownmix;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -448,6 +449,8 @@ internal struct FaCdgInfo
     public long CheckpointInterval;
     public uint CheckpointCount;
     public int DiscParity;
+    public ulong DiscCorrected;
+    public ulong DiscDropped;
 }
 
 [StructLayout(LayoutKind.Sequential)]

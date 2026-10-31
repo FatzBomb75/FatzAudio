@@ -11,9 +11,11 @@
  * on the packs as they arrive and keeping the one that turns up CD+G instructions
  * whose parity checks out (the P parity covers all 24 symbols, the swapped ones too,
  * so only the right reading passes where packs differ). A track with no graphics
- * never does, and its subcode stops being read. Once a reading is chosen by its
- * parity, each pack is checked: one wrong symbol is corrected, a pack with more is
- * dropped (a scratch would otherwise draw garbage tiles). A drive that returns no
+ * never does, and its subcode stops being read. Subcode read before a seek is kept
+ * until the reading is chosen, then written too. Once a reading is chosen by its
+ * parity, each pack is checked: up to two wrong symbols are corrected (the P
+ * parity's limit), a pack with more is dropped (a scratch would otherwise draw
+ * garbage tiles), and both are counted for fa_cdg_info. A drive that returns no
  * parity gets every pack as read. */
 #include "disc.h"
 #include "cdg.h"
@@ -28,6 +30,7 @@
 #define NO_PARITY_AFTER (75 * 4 * PACKS_PER_SECTOR)  /* decide without parity after 4 s */
 #define PARITY_LOST 300                  /* this many bad packs in a row: the parity stopped
                                             coming (another read mode), not a scratch */
+#define KEEP_MAX UNDECIDED_MAX           /* packs of earlier runs kept while undecided */
 
 /* Readings: a byte layout times an interleave order. */
 enum { LAYOUT_BYTES, LAYOUT_CHANNELS, LAYOUTS };
@@ -36,23 +39,36 @@ enum { ORDER_SORTED, ORDER_SWAP_DELAY, ORDER_DELAY_SWAP, ORDERS };
 #define USUAL (LAYOUT_BYTES * ORDERS + ORDER_SWAP_DELAY)   /* raw from a drive */
 enum { MODE_UNDECIDED = -1, MODE_OFF = -2 };
 
+/* A contiguous run of sectors read. */
+typedef struct cdg_run {
+    int64_t lba, end;                    /* its sectors [lba, end) */
+    /* Its symbols in each layout (only the chosen one once decided), from run pack
+     * `raw_base`. */
+    uint8_t* raw[LAYOUTS];
+    size_t raw_base, raw_n, raw_cap;     /* in packs */
+    size_t done;                         /* packs written (or judged, while undecided) */
+} cdg_run;
+
+/* What became of a pack the last time it was written (fate[]). */
+enum { FATE_NONE, FATE_SOUND, FATE_CORRECTED, FATE_DROPPED };
+
 struct fa_disc_cdg {
     struct fa_stream* stream;
     int64_t track_lba, track_sectors;
     int mode;                            /* a reading, or MODE_* */
-    int64_t run_lba;                     /* the contiguous run of sectors being read */
-    int64_t run_end;                     /* -1 = no run */
-    /* Symbols of the run in each layout (only the chosen one once decided), from run
-     * pack `raw_base`. */
-    uint8_t* raw[LAYOUTS];
-    size_t raw_base, raw_n, raw_cap;     /* in packs */
-    size_t done;                         /* run packs written (or judged, while undecided) */
+    cdg_run run;                         /* the one being read; run.end -1 = none yet */
+    cdg_run* kept;                       /* earlier runs, while undecided */
+    size_t nkept, kept_packs;
+    uint8_t* fate;                       /* FATE_* per track pack, once checked */
+    uint64_t corrected, dropped;         /* packs whose fate is that */
     uint32_t seen[READINGS];             /* CD+G instructions found by each reading */
     uint32_t sound[READINGS];            /* ... of them with correct parity */
+    uint32_t backward[READINGS];         /* ... that with the symbols weighed backward */
     size_t looked;                       /* packs judged while undecided */
     uint32_t token;                      /* the stream's CD+G generation of our packs */
     int checked;                         /* the chosen reading has parity: packs that fail
                                             it and cannot be corrected are dropped */
+    int sym_backward;                    /* ... with the symbols in that order */
     uint32_t failing;                    /* packs dropped in a row */
 };
 
@@ -69,7 +85,7 @@ static int swap_pos(int n)
 /* Pack `p` of the run in reading `v`. Symbols past what was read count as 0.
  *   swapped, then delayed on the disc:  pack[n] = raw[p + swap(n) % 8][swap(n)]
  *   delayed, then swapped on the disc:  pack[n] = raw[p + n % 8][swap(n)] */
-static void decode_pack(const fa_disc_cdg* c, int v, size_t p, uint8_t out[PACK])
+static void decode_pack(const cdg_run* c, int v, size_t p, uint8_t out[PACK])
 {
     const uint8_t* raw = c->raw[v / ORDERS];
     int order = v % ORDERS, n;
@@ -95,51 +111,79 @@ static uint8_t gf_mul(uint8_t a, uint8_t b)
     return r;
 }
 
-/* Syndromes of a Reed-Solomon codeword over GF(64): sum of c[i] * a^(j * (n-1-i))
- * for j < nsyn (Horner), all zero for a sound one. The opposite symbol order is
- * accepted as well. */
-static int rs_ok(const uint8_t* c, int n, int nsyn)
+/* Syndrome j of a Reed-Solomon codeword over GF(64): sum of c[i] * a^(j * (n-1-i))
+ * (Horner), 0 for every j < nsyn in a sound one. Discs may weigh the symbols in the
+ * opposite order (`backward`): which one is found with the subcode layout. */
+static uint8_t syndrome(const uint8_t* c, int n, int j, int backward)
 {
-    int order, j, i;
-    for (order = 0; order < 2; order++) {
-        int ok = 1;
-        for (j = 0; j < nsyn && ok; j++) {
-            uint8_t root = (uint8_t)(1u << j), syn = 0;   /* a^j, a = x */
-            for (i = 0; i < n; i++) syn = (uint8_t)(gf_mul(syn, root) ^ c[order ? n - 1 - i : i]);
-            ok = syn == 0;
-        }
-        if (ok) return 1;
-    }
-    return 0;
+    uint8_t root = (uint8_t)(1u << j), syn = 0;   /* a^j, a = x */
+    int i;
+    for (i = 0; i < n; i++) syn = (uint8_t)(gf_mul(syn, root) ^ c[backward ? n - 1 - i : i]);
+    return syn;
 }
 
 /* Q parity (symbols 2-3 over the command and instruction) and P parity (symbols
- * 20-23 over the whole pack). */
-static int parity_ok(const uint8_t* p) { return rs_ok(p, 4, 2) && rs_ok(p, PACK, 4); }
-
-/* Repairs a pack with one wrong symbol from its P parity (4 syndromes: one error
- * located and checked by the other two), in either symbol order; 1 if the pack then
- * passes both parities. Two wrong symbols are not attempted: the pack is dropped. */
-static int parity_correct(uint8_t* p)
+ * 20-23 over the whole pack), with the symbols in order `backward`. */
+static int parity_in(const uint8_t* p, int backward)
 {
-    int order;
-    for (order = 0; order < 2; order++) {
-        uint8_t syn[4], loc = 1;
-        int j, i, e;
-        for (j = 0; j < 4; j++) {
-            uint8_t root = (uint8_t)(1u << j);
-            syn[j] = 0;
-            for (i = 0; i < PACK; i++) syn[j] = (uint8_t)(gf_mul(syn[j], root) ^ p[order ? PACK - 1 - i : i]);
+    int j;
+    for (j = 0; j < 2; j++) if (syndrome(p, 4, j, backward)) return 0;
+    for (j = 0; j < 4; j++) if (syndrome(p, PACK, j, backward)) return 0;
+    return 1;
+}
+
+static uint8_t gf_inv(uint8_t a)
+{
+    uint8_t x;
+    for (x = 1; x < 64; x++) if (gf_mul(a, x) == 1) return x;
+    return 0;
+}
+
+/* Repairs a pack with up to two wrong symbols from its P parity (4 syndromes, a
+ * distance of 5), one first; 1 if the pack then passes both parities. A symbol at
+ * power e (weighed a^(j*e) in syndrome j) is index 23 - e, or e backward. Three or
+ * more wrong symbols cannot be told from fewer in another codeword: such a pack is
+ * dropped, unless it lies within two symbols of another codeword (about 1 in 15 of
+ * them), which then passes as that. */
+static int parity_correct(uint8_t* p, int backward)
+{
+    uint8_t S[4], loc[PACK];
+    int errs, j, e;
+    for (e = 0, loc[0] = 1; e + 1 < PACK; e++) loc[e + 1] = gf_mul(loc[e], 2);
+    for (j = 0; j < 4; j++) S[j] = syndrome(p, PACK, j, backward);
+    if (!(S[0] | S[1] | S[2] | S[3])) return 0;   /* P holds: only Q fails */
+    for (errs = 1; errs <= 2; errs++) {
+        int at[2], k;
+        uint8_t val[2];
+        if (errs == 1) {
+            /* One error of value S0 at X: S[j] = S0 * X^j. */
+            if (!S[0]) continue;
+            for (e = 0; e < PACK; e++)
+                if (gf_mul(S[0], loc[e]) == S[1]) break;
+            if (e == PACK || gf_mul(S[1], loc[e]) != S[2] || gf_mul(S[2], loc[e]) != S[3]) continue;
+            at[0] = e;
+            val[0] = S[0];
+        } else {
+            /* Locator x^2 + s1 x + s2 with roots X1, X2 (Peterson):
+             *   S2 + s1 S1 + s2 S0 = 0,  S3 + s1 S2 + s2 S1 = 0. */
+            uint8_t det = (uint8_t)(gf_mul(S[1], S[1]) ^ gf_mul(S[0], S[2])), inv, s1, s2, d;
+            int found = 0;
+            if (!det) continue;
+            inv = gf_inv(det);
+            s1 = gf_mul((uint8_t)(gf_mul(S[1], S[2]) ^ gf_mul(S[0], S[3])), inv);
+            s2 = gf_mul((uint8_t)(gf_mul(S[1], S[3]) ^ gf_mul(S[2], S[2])), inv);
+            for (e = 0; e < PACK && found < 2; e++)
+                if ((gf_mul(loc[e], loc[e]) ^ gf_mul(s1, loc[e]) ^ s2) == 0) at[found++] = e;
+            if (found < 2) continue;   /* a root outside the pack: more errors */
+            /* S0 = e1 + e2, S1 = e1 X1 + e2 X2. */
+            d = gf_inv((uint8_t)(loc[at[0]] ^ loc[at[1]]));
+            val[0] = gf_mul((uint8_t)(S[1] ^ gf_mul(S[0], loc[at[1]])), d);
+            val[1] = (uint8_t)(S[0] ^ val[0]);
+            if (!val[0] || !val[1]) continue;
         }
-        if (!syn[0]) continue;
-        /* One error of value syn[0] at power e: syn[j] = syn[0] * a^(j*e). */
-        for (e = 0; e < PACK; e++, loc = gf_mul(loc, 2))
-            if (gf_mul(syn[0], loc) == syn[1]) break;
-        if (e == PACK || gf_mul(syn[1], loc) != syn[2] || gf_mul(syn[2], loc) != syn[3]) continue;
-        i = order ? e : PACK - 1 - e;
-        p[i] ^= syn[0];
-        if (parity_ok(p)) return 1;
-        p[i] ^= syn[0];
+        for (k = 0; k < errs; k++) p[backward ? at[k] : PACK - 1 - at[k]] ^= val[k];
+        if (parity_in(p, backward)) return 1;
+        for (k = 0; k < errs; k++) p[backward ? at[k] : PACK - 1 - at[k]] ^= val[k];
     }
     return 0;
 }
@@ -164,21 +208,32 @@ fa_disc_cdg* fa_disc_cdg_create(struct fa_stream* stream, int64_t track_lba, int
     c->track_lba = track_lba;
     c->track_sectors = track_sectors;
     c->mode = MODE_UNDECIDED;
-    c->run_end = -1;
+    c->run.end = -1;
     return c;
 }
 
-static void free_raw(fa_disc_cdg* c, int keep)
+static void run_free(cdg_run* r, int keep)
 {
     int l;
     for (l = 0; l < LAYOUTS; l++)
-        if (l != keep) { free(c->raw[l]); c->raw[l] = NULL; }
+        if (l != keep) { free(r->raw[l]); r->raw[l] = NULL; }
+}
+
+static void kept_free(fa_disc_cdg* c)
+{
+    size_t i;
+    for (i = 0; i < c->nkept; i++) run_free(&c->kept[i], -1);
+    free(c->kept);
+    c->kept = NULL;
+    c->nkept = c->kept_packs = 0;
 }
 
 void fa_disc_cdg_free(fa_disc_cdg* c)
 {
     if (!c) return;
-    free_raw(c, -1);
+    run_free(&c->run, -1);
+    kept_free(c);
+    free(c->fate);
     free(c);
 }
 
@@ -187,30 +242,46 @@ int fa_disc_cdg_wanted(const fa_disc_cdg* c) { return c && c->mode != MODE_OFF; 
 static void stop(fa_disc_cdg* c)
 {
     c->mode = MODE_OFF;
-    free_raw(c, -1);
-    c->raw_n = c->raw_cap = 0;
+    run_free(&c->run, -1);
+    c->run.raw_n = c->run.raw_cap = 0;
+    kept_free(c);
 }
 
-/* Writes run packs [done, upto) to the stream in the chosen reading. */
-static void emit(fa_disc_cdg* c, size_t upto)
+/* Writes packs [done, upto) of run `r` to the stream in the chosen reading. */
+static void emit(fa_disc_cdg* c, cdg_run* r, size_t upto)
 {
     uint8_t buf[64 * PACK];
-    size_t first = (size_t)(c->run_lba - c->track_lba) * PACKS_PER_SECTOR;
-    while (c->done < upto) {
-        size_t n = upto - c->done, i;
+    size_t first = (size_t)(r->lba - c->track_lba) * PACKS_PER_SECTOR;
+    uint64_t corrected = c->corrected, dropped = c->dropped;
+    while (r->done < upto) {
+        size_t n = upto - r->done, i;
         if (n > 64) n = 64;
         for (i = 0; i < n; i++) {
             uint8_t* pk = buf + i * PACK;
-            decode_pack(c, c->mode, c->done + i, pk);
+            uint8_t* fate = c->fate ? &c->fate[first + r->done + i] : NULL;
+            int now;
+            decode_pack(r, c->mode, r->done + i, pk);
             /* A damaged pack would draw garbage: an all-zero pack does nothing. */
             if (!c->checked) continue;
-            if (parity_ok(pk) || parity_correct(pk)) { c->failing = 0; continue; }
-            if (++c->failing >= PARITY_LOST) { c->checked = 0; continue; }
-            memset(pk, 0, PACK);
+            if (parity_in(pk, c->sym_backward)) now = FATE_SOUND;
+            else if (parity_correct(pk, c->sym_backward)) now = FATE_CORRECTED;
+            else if (++c->failing >= PARITY_LOST) { c->checked = 0; continue; }
+            else { now = FATE_DROPPED; memset(pk, 0, PACK); }
+            if (now != FATE_DROPPED) c->failing = 0;
+            if (fate && *fate != now) {
+                /* The latest read of each pack counts: a part read again replaces it. */
+                if (*fate == FATE_CORRECTED) c->corrected--;
+                if (*fate == FATE_DROPPED) c->dropped--;
+                if (now == FATE_CORRECTED) c->corrected++;
+                if (now == FATE_DROPPED) c->dropped++;
+                *fate = (uint8_t)now;
+            }
         }
-        if (!fa_stream_cdg_write(c->stream, c->token, first + c->done, buf, n)) { stop(c); return; }
-        c->done += n;
+        if (!fa_stream_cdg_write(c->stream, c->token, first + r->done, buf, n)) { stop(c); return; }
+        r->done += n;
     }
+    if (c->corrected != corrected || c->dropped != dropped)
+        fa_stream_cdg_disc_counts(c->stream, c->token, c->corrected, c->dropped);
 }
 
 static int best_of(const uint32_t* score, int* out_second)
@@ -222,18 +293,28 @@ static int best_of(const uint32_t* score, int* out_second)
     return best;
 }
 
+/* Packs of run `r` whose whole look-ahead was read; at the track's end all are. */
+static size_t run_final(const fa_disc_cdg* c, const cdg_run* r)
+{
+    size_t final = r->raw_base + r->raw_n;
+    if (r->end < c->track_lba + c->track_sectors) final = final > LOOKAHEAD ? final - LOOKAHEAD : 0;
+    return final;
+}
+
 /* Counts CD+G instructions per reading in run packs [done, upto) and decides when
  * one reading clearly finds them. */
 static void judge(fa_disc_cdg* c, size_t upto)
 {
+    cdg_run* r = &c->run;
     uint8_t pk[PACK];
     int v, best, second, chosen = -1;
-    for (; c->done < upto; c->done++, c->looked++)
+    for (; r->done < upto; r->done++, c->looked++)
         for (v = 0; v < READINGS; v++) {
-            decode_pack(c, v, c->done, pk);
+            decode_pack(r, v, r->done, pk);
             if (is_cdg(pk)) {
                 c->seen[v]++;
-                if (parity_ok(pk)) c->sound[v]++;
+                if (parity_in(pk, 0)) c->sound[v]++;
+                else if (parity_in(pk, 1)) c->sound[v]++, c->backward[v]++;
             }
         }
     best = best_of(c->sound, &second);
@@ -250,20 +331,49 @@ static void judge(fa_disc_cdg* c, size_t upto)
     }
     if (chosen >= 0) {
         fa_cdg_data* data;
-        if (fa_cdg_data_blank((size_t)c->track_sectors * PACKS_PER_SECTOR, &data) != FA_OK) { stop(c); return; }
+        size_t count = (size_t)c->track_sectors * PACKS_PER_SECTOR, i;
+        if (fa_cdg_data_blank(count, &data) != FA_OK) { stop(c); return; }
         data->from_disc = 1;
         data->disc_parity = c->sound[chosen] > 0;   /* fa_cdg_info.disc_parity */
         c->checked = data->disc_parity;
+        c->sym_backward = 2 * c->backward[chosen] > c->sound[chosen];
+        /* Without memory for it the counts stay 0; the packs are checked all the same. */
+        if (c->checked) c->fate = (uint8_t*)calloc(count, 1);
         if (!fa_stream_cdg_attach_if_none(c->stream, data, &c->token)) {
             stop(c);   /* out of memory, or the app gave the stream graphics of its own */
             return;
         }
         c->mode = chosen;
-        free_raw(c, chosen / ORDERS);
-        c->done = c->raw_base;                   /* write what this run holds so far */
-        emit(c, upto);
+        /* What earlier runs read first (the run being read is newer), then this run. */
+        for (i = 0; i < c->nkept && c->mode >= 0; i++) {
+            cdg_run* k = &c->kept[i];
+            k->done = k->raw_base;
+            emit(c, k, run_final(c, k));
+        }
+        if (c->mode < 0) return;
+        kept_free(c);
+        run_free(r, chosen / ORDERS);
+        r->done = r->raw_base;                   /* write what this run holds so far */
+        emit(c, r, upto);
     } else if (c->looked >= UNDECIDED_MAX) {
         stop(c);
+    }
+}
+
+/* A seek while undecided: the run read so far is kept for when a reading is chosen
+ * (up to KEEP_MAX packs in all; past that it is read again when that part plays). */
+static void keep_run(fa_disc_cdg* c)
+{
+    cdg_run* r = &c->run;
+    if (r->raw_n > 0 && c->kept_packs + r->raw_n <= KEEP_MAX) {
+        cdg_run* grown = (cdg_run*)realloc(c->kept, (c->nkept + 1) * sizeof(*grown));
+        if (grown) {
+            c->kept = grown;
+            c->kept[c->nkept++] = *r;
+            c->kept_packs += r->raw_n;
+            memset(r->raw, 0, sizeof(r->raw));
+            r->raw_cap = 0;
+        }
     }
 }
 
@@ -284,55 +394,55 @@ static void unpack_sector(const uint8_t* in, uint8_t* bytes, uint8_t* channels)
 void fa_disc_cdg_feed(fa_disc_cdg* c, int64_t lba, uint32_t count, const uint8_t* sub)
 {
     int64_t end = lba + count, track_end, k;
-    size_t add, final;
+    cdg_run* r;
+    size_t add;
     int l;
     if (!c || c->mode == MODE_OFF) return;
+    r = &c->run;
     track_end = c->track_lba + c->track_sectors;
     /* Only this track's sectors (offset reads reach into the neighbours). */
     if (lba < c->track_lba) { sub += (size_t)(c->track_lba - lba) * FA_CD_SUB_BYTES; lba = c->track_lba; }
     if (end > track_end) end = track_end;
     if (lba >= end) return;
 
-    if (lba != c->run_end) {
-        /* A seek. The old run's last packs lack the look-ahead they need and stay
-         * unwritten; they are read again when that part plays. */
-        c->run_lba = lba;
-        c->raw_base = c->raw_n = c->done = 0;
+    if (lba != r->end) {
+        /* A seek. Once decided, the old run's last packs lack the look-ahead they need
+         * and stay unwritten; they are read again when that part plays. */
+        if (c->mode == MODE_UNDECIDED) keep_run(c);
+        r->lba = lba;
+        r->raw_base = r->raw_n = r->done = 0;
     }
-    c->run_end = end;
+    r->end = end;
 
     add = (size_t)(end - lba) * PACKS_PER_SECTOR;
-    if (c->raw_n + add > c->raw_cap) {
-        size_t cap = c->raw_cap ? c->raw_cap : 256;
-        while (cap < c->raw_n + add) cap *= 2;
+    if (r->raw_n + add > r->raw_cap) {
+        size_t cap = r->raw_cap ? r->raw_cap : 256;
+        while (cap < r->raw_n + add) cap *= 2;
         for (l = 0; l < LAYOUTS; l++) {
             uint8_t* grown;
             if (c->mode >= 0 && l != c->mode / ORDERS) continue;
-            grown = (uint8_t*)realloc(c->raw[l], cap * PACK);
+            grown = (uint8_t*)realloc(r->raw[l], cap * PACK);
             if (!grown) { stop(c); return; }
-            c->raw[l] = grown;
+            r->raw[l] = grown;
         }
-        c->raw_cap = cap;
+        r->raw_cap = cap;
     }
     for (k = 0; k < end - lba; k++) {
-        size_t at = (c->raw_n + (size_t)k * PACKS_PER_SECTOR) * PACK;
-        unpack_sector(sub + (size_t)k * FA_CD_SUB_BYTES, c->raw[LAYOUT_BYTES] ? c->raw[LAYOUT_BYTES] + at : NULL,
-                      c->raw[LAYOUT_CHANNELS] ? c->raw[LAYOUT_CHANNELS] + at : NULL);
+        size_t at = (r->raw_n + (size_t)k * PACKS_PER_SECTOR) * PACK;
+        unpack_sector(sub + (size_t)k * FA_CD_SUB_BYTES, r->raw[LAYOUT_BYTES] ? r->raw[LAYOUT_BYTES] + at : NULL,
+                      r->raw[LAYOUT_CHANNELS] ? r->raw[LAYOUT_CHANNELS] + at : NULL);
     }
-    c->raw_n += add;
+    r->raw_n += add;
 
-    /* Packs with their whole look-ahead read are final; at the track's end all are. */
-    final = c->raw_base + c->raw_n;
-    if (end < track_end) final = final > LOOKAHEAD ? final - LOOKAHEAD : 0;
-    if (c->mode == MODE_UNDECIDED) judge(c, final);
-    else emit(c, final);
+    if (c->mode == MODE_UNDECIDED) judge(c, run_final(c, r));
+    else emit(c, r, run_final(c, r));
 
     /* Keep only what later packs still need (everything until a reading is chosen). */
-    if (c->mode >= 0 && c->done > c->raw_base) {
-        size_t drop = c->done - c->raw_base;
-        uint8_t* raw = c->raw[c->mode / ORDERS];
-        memmove(raw, raw + drop * PACK, (c->raw_n - drop) * PACK);
-        c->raw_base += drop;
-        c->raw_n -= drop;
+    if (c->mode >= 0 && r->done > r->raw_base) {
+        size_t drop = r->done - r->raw_base;
+        uint8_t* raw = r->raw[c->mode / ORDERS];
+        memmove(raw, raw + drop * PACK, (r->raw_n - drop) * PACK);
+        r->raw_base += drop;
+        r->raw_n -= drop;
     }
 }

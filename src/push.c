@@ -130,6 +130,7 @@ fa_result fa_push_init_packets(struct fa_stream* s, const fa_codec_params* param
     if (r != FA_OK) return r;    /* the caller frees the push with the stream */
     p->codec_ready = 1;
     p->codec.dynamic_range = &s->dynamic_range;
+    p->codec.dolby_mix = &s->dolby_mix;
     decoder_setup(s, params->sample_rate, params->channels, params->codec, "packets");
     return FA_OK;
 }

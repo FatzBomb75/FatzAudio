@@ -742,6 +742,8 @@ static fa_stream* deck_stream(struct fa_deck* d) { return (fa_stream*)fa_load_pt
 
 void fa_mixer_bus_left(fa_bus* bus, struct fa_stream* s) { fa_cas_ptr(&bus->deck->stream, s, NULL); }
 
+int fa_mixer_bus_slips(fa_bus* bus) { return bus && bus->deck && fa_load32(&bus->deck->slip); }
+
 void fa_mixer_stream_leaving(struct fa_stream* s, fa_bus* to)
 {
     struct fa_deck* d = NULL;
@@ -1035,6 +1037,46 @@ FA_API fa_result FA_CALL fa_deck_get_loop(fa_deck* deck, fa_frames* out_loop_in,
     *out_loop_in = in;
     *out_loop_out = out;
     return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_deck_set_slip(fa_deck* deck, int32_t on)
+{
+    fa_stream* s;
+    if (!deck) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&deck->mixer->lock);
+    fa_store32(&deck->slip, on ? 1 : 0);
+    if (!on && (s = deck_stream(deck))) fa_stream_slip_cancel(s);   /* playback carries on from where it is */
+    fa_mutex_unlock(&deck->mixer->lock);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_deck_get_slip(fa_deck* deck, int32_t* out_on)
+{
+    if (!deck || !out_on) return FA_ERROR_INVALID_ARG;
+    *out_on = fa_load32(&deck->slip);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_deck_get_slip_position(fa_deck* deck, fa_frames* out_frame)
+{
+    fa_stream* s;
+    if (!deck || !out_frame) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&deck->mixer->lock);
+    s = deck_stream(deck);
+    *out_frame = s ? fa_stream_slip_position(s) : FA_FRAMES_UNSET;
+    fa_mutex_unlock(&deck->mixer->lock);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_deck_slip_return(fa_deck* deck)
+{
+    fa_stream* s;
+    fa_result r = FA_OK;
+    if (!deck) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&deck->mixer->lock);
+    if ((s = deck_stream(deck))) r = fa_stream_slip_return(s);
+    fa_mutex_unlock(&deck->mixer->lock);
+    return r;
 }
 
 FA_API fa_result FA_CALL fa_deck_get_levels(fa_deck* deck, fa_time window, float* out_peak, float* out_rms, uint32_t channels)

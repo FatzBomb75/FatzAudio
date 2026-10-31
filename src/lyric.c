@@ -40,6 +40,9 @@
  * does not draw again the line it just let go of. */
 #define LY_CACHE (LY_MAX_SHOW + 2)
 #define LY_MS 1000000LL
+/* A line or page that could not be drawn (memory) is asked for every frame it shows: it is
+ * tried again after this many asks, about a second or two of frames, not on each. */
+#define LY_RETRY 90
 /* The intro's top and bottom bands, its card, the ending card. */
 #define LY_PAGES 4
 enum { PG_TOP = 0, PG_BOTTOM, PG_CARD, PG_END };
@@ -222,7 +225,8 @@ typedef struct ly_layer {
     uint8_t* px;                  /* w x h premultiplied BGRA: the masks coloured */
     ly_wipe pw;                   /* the wipe px is coloured for */
     int pw_valid;
-    int failed;                   /* `line` could not be drawn: not tried again while cached */
+    int failed;                   /* `line` could not be drawn: tried again after LY_RETRY asks */
+    int wait;                     /* asks left before that */
 } ly_layer;
 
 /* A line or a page placed in one frame. */
@@ -231,6 +235,7 @@ typedef struct ly_inst {
     int page;                     /* PG_*, or -1 for a line */
     int outgoing;
     float cx, cy, sc, op;         /* its centre in bitmap pixels */
+    float lsc;                    /* the scale its layer is placed at: sc / the layer's zoom */
     ly_wipe wipe;
     ly_count cd;
     int box[4];                   /* bitmap pixels it may touch */
@@ -299,8 +304,10 @@ struct fa_lyric {
     ly_layer cache[LY_CACHE];
     uint64_t stamp;
     ly_layer arrow;
+    ly_layer big[LY_MAX_SHOW];    /* lines drawn at page_in_scale while a new page grows in (else empty) */
     ly_layer pg[LY_PAGES];        /* drawn when first shown; placed with (cx, cy) = (0, 0) */
-    int pg_failed[LY_PAGES];      /* could not be drawn (memory): left out until the next layout */
+    int pg_wait[LY_PAGES];
+    int pg_failed[LY_PAGES];      /* could not be drawn (memory): left out, tried again after LY_RETRY asks */
     float pg_x[LY_PAGES], pg_y[LY_PAGES];
     fa_path gpath;
     fa_raster ras;
@@ -326,9 +333,11 @@ static void cache_clear(fa_lyric* l)
     int i;
     for (i = 0; i < LY_CACHE; i++) layer_clear(&l->cache[i]);
     layer_clear(&l->arrow);
+    for (i = 0; i < LY_MAX_SHOW; i++) layer_clear(&l->big[i]);
     for (i = 0; i < LY_PAGES; i++) {
         layer_clear(&l->pg[i]);
         l->pg_failed[i] = 0;
+        l->pg_wait[i] = 0;
     }
     l->nprev = 0;
 }
@@ -614,11 +623,33 @@ static float stable_scale(const fa_lyric_style* s, int rel)
     return d == 0 ? 1.0f : d == 1 ? s->near_scale : d == 2 ? s->far_scale : s->far_scale * (2.0f / 3.0f);
 }
 
+/* The effects' plan, the padding they and the bold need, and the scratch for them, at
+ * the size l->em. 0 when out of memory. */
+static int fx_metrics(fa_lyric* l)
+{
+    const fa_lyric_style* s = &l->st;
+    float reach;
+    l->fx_on = fa_fx_plan_make(&l->plan, &s->effects, 0.12f * l->em, 0.20f * l->em, 0.15f * l->em, 0.08f * l->em, 0);
+    reach = (l->fx_on ? (float)l->plan.reach : 0.0f) + l->bold * l->em;
+    if (s->panel && s->panel_padding * l->em + 1.0f > reach) reach = s->panel_padding * l->em + 1.0f;
+    l->pad = (int)ceilf(reach) + 2;
+    if (l->fx_on) {
+        size_t need = fa_fx_scratch_bytes(&l->plan);
+        if (need > l->scratch_size) {
+            void* n = realloc(l->scratch, need);
+            if (!n) return 0;
+            l->scratch = n;
+            l->scratch_size = need;
+        }
+    }
+    return 1;
+}
+
 static fa_result layout(fa_lyric* l, uint32_t aw, uint32_t ah, double tempo)
 {
     const fa_lyric_style* s = &l->st;
     const fa_font_info* fi = fa_font_get_info(l->font);
-    float W, H, k, half, row, top = 1e30f, bottom = -1e30f, boxw, x0, x1, reach;
+    float W, H, k, half, row, top = 1e30f, bottom = -1e30f, boxw, x0, x1;
     int rel, cd;
     fa_result r;
     if (!aw || !ah) {
@@ -640,19 +671,7 @@ static fa_result layout(fa_lyric* l, uint32_t aw, uint32_t ah, double tempo)
         l->asc = 0.9f * l->em;
         l->line_h = 1.2f * l->em;
     }
-    l->fx_on = fa_fx_plan_make(&l->plan, &s->effects, 0.12f * l->em, 0.20f * l->em, 0.15f * l->em, 0.08f * l->em, 0);
-    reach = (l->fx_on ? (float)l->plan.reach : 0.0f) + l->bold * l->em;
-    if (s->panel && s->panel_padding * l->em + 1.0f > reach) reach = s->panel_padding * l->em + 1.0f;
-    l->pad = (int)ceilf(reach) + 2;
-    if (l->fx_on) {
-        size_t need = fa_fx_scratch_bytes(&l->plan);
-        if (need > l->scratch_size) {
-            void* n = realloc(l->scratch, need);
-            if (!n) return FA_ERROR_OUT_OF_MEMORY;
-            l->scratch = n;
-            l->scratch_size = need;
-        }
-    }
+    if (!fx_metrics(l)) return FA_ERROR_OUT_OF_MEMORY;
     cd = l->prm.countdown != FA_COUNTDOWN_OFF;
     l->tri = 0.6f * s->countdown_size * l->em;
     l->tri_w = 0.866f * l->tri;
@@ -818,7 +837,7 @@ static int spans_make(ly_layer* L)
     return 1;
 }
 
-static int layer_make(fa_lyric* l, uint32_t index, ly_layer* L)
+static int layer_draw(fa_lyric* l, uint32_t index, ly_layer* L)
 {
     const ly_line* line = &l->tl.line[index];
     const fa_font_info* fi = fa_font_get_info(l->font);
@@ -877,6 +896,34 @@ fail:
     return 0;
 }
 
+/* The line at z times its size (z > 1: the sizes the layout worked out, em, padding and
+ * effects, are scaled for the drawing and put back). */
+static int layer_make(fa_lyric* l, uint32_t index, ly_layer* L, float z)
+{
+    float em = l->em, asc = l->asc, line_h = l->line_h;
+    int pad = l->pad, fx_on = l->fx_on, ok;
+    fa_fx_plan plan = l->plan;
+    if (z != 1.0f) {
+        l->em *= z;
+        l->asc *= z;
+        l->line_h *= z;
+        if (!fx_metrics(l)) {
+            layer_clear(L);
+            ok = 0;
+            goto back;
+        }
+    }
+    ok = layer_draw(l, index, L);
+back:
+    l->em = em;
+    l->asc = asc;
+    l->line_h = line_h;
+    l->pad = pad;
+    l->fx_on = fx_on;
+    l->plan = plan;
+    return ok;
+}
+
 static int arrow_make(fa_lyric* l)
 {
     ly_layer* L = &l->arrow;
@@ -908,26 +955,42 @@ static int arrow_make(fa_lyric* l)
     return 1;
 }
 
-static ly_layer* layer_get(fa_lyric* l, uint32_t index)
+/* Line `index` at zoom z in the cache arr[n]. */
+static ly_layer* layer_get_in(fa_lyric* l, ly_layer* arr, int n, uint32_t index, float z)
 {
     int i, best = 0;
-    for (i = 0; i < LY_CACHE; i++)
-        if (l->cache[i].line == (int)index && (l->cache[i].m || l->cache[i].failed)) {
-            l->cache[i].used = ++l->stamp;
-            return l->cache[i].failed ? NULL : &l->cache[i];
+    for (i = 0; i < n; i++)
+        if (arr[i].line == (int)index && (arr[i].m || arr[i].failed)) {
+            ly_layer* L = &arr[i];
+            L->used = ++l->stamp;
+            if (!L->failed) return L;
+            /* A failed line holds its entry like a drawn one, so it is not tried again
+             * every frame (as pg_failed); after LY_RETRY asks it is. */
+            if (--L->wait > 0) return NULL;
+            L->failed = 0;
+            if (layer_make(l, index, L, z)) return L;
+            L->line = (int)index;
+            L->failed = 1;
+            L->wait = LY_RETRY;
+            return NULL;
         }
-    /* The least recently used; a line that failed holds its entry like a drawn one, so
-     * it is not tried again every frame (as pg_failed). */
+    /* The least recently used. */
 #define LY_HELD(L) ((L)->m || (L)->failed)
-    for (i = 1; i < LY_CACHE; i++)
-        if (!LY_HELD(&l->cache[i]) || (LY_HELD(&l->cache[best]) && l->cache[i].used < l->cache[best].used)) best = i;
+    for (i = 1; i < n; i++)
+        if (!LY_HELD(&arr[i]) || (LY_HELD(&arr[best]) && arr[i].used < arr[best].used)) best = i;
 #undef LY_HELD
-    if (!layer_make(l, index, &l->cache[best])) {
-        l->cache[best].line = (int)index;
-        l->cache[best].failed = 1;
+    if (!layer_make(l, index, &arr[best], z)) {
+        arr[best].line = (int)index;
+        arr[best].failed = 1;
+        arr[best].wait = LY_RETRY;
     }
-    l->cache[best].used = ++l->stamp;
-    return l->cache[best].failed ? NULL : &l->cache[best];
+    arr[best].used = ++l->stamp;
+    return arr[best].failed ? NULL : &arr[best];
+}
+
+static ly_layer* layer_get(fa_lyric* l, uint32_t index)
+{
+    return layer_get_in(l, l->cache, LY_CACHE, index, 1.0f);
 }
 
 /* ---- colours -------------------------------------------------------------------- */
@@ -1825,13 +1888,15 @@ static ly_layer* page_get(fa_lyric* l, int k)
     ly_layer* L = &l->pg[k];
     int ok;
     if (L->px) return L;
-    if (l->pg_failed[k]) return NULL;
+    if (l->pg_failed[k] && --l->pg_wait[k] > 0) return NULL;
+    l->pg_failed[k] = 0;
     layer_clear(L);
     ok = k == PG_TOP || k == PG_BOTTOM ? band_build(l, L, k == PG_BOTTOM, &l->pg_x[k], &l->pg_y[k])
                                        : card_build(l, L, k == PG_END, &l->pg_x[k], &l->pg_y[k]);
     if (!ok) {
         layer_clear(L);
         l->pg_failed[k] = 1;
+        l->pg_wait[k] = LY_RETRY;
         return NULL;
     }
     L->line = k;
@@ -1856,10 +1921,9 @@ static void box_of(const fa_lyric* l, const ly_layer* L, float cx, float cy, flo
 static void arrow_at(const fa_lyric* l, const ly_inst* in, int i, float* x, float* y)
 {
     const ly_layer* L = in->layer;
-    float ax = L->text_x + (float)i * (l->tri_w + l->arrow_gap) + l->tri_w / 2.0f;
-    float ay = L->text_y - l->arrow_lift - l->tri / 2.0f;
-    *x = in->cx + (ax - L->cx) * in->sc;
-    *y = in->cy + (ay - L->cy) * in->sc;
+    /* The text box's corner moves with the layer's picture; the arrows are drawn at the line's scale. */
+    *x = in->cx + (L->text_x - L->cx) * in->lsc + ((float)i * (l->tri_w + l->arrow_gap) + l->tri_w / 2.0f) * in->sc;
+    *y = in->cy + (L->text_y - L->cy) * in->lsc - (l->arrow_lift + l->tri / 2.0f) * in->sc;
 }
 
 /* Page k at opacity op into *in: 1, or 0 when it could not be drawn (the lyrics go
@@ -1872,7 +1936,7 @@ static int page_inst(fa_lyric* l, int k, float op, ly_inst* in)
     in->line = LY_PAGE_LINE + (uint32_t)k;
     in->page = k;
     in->layer = L;
-    in->sc = 1.0f;
+    in->sc = in->lsc = 1.0f;
     in->op = op;
     in->cx = l->pg_x[k];
     in->cy = l->pg_y[k];
@@ -1887,28 +1951,37 @@ static int frame_list(fa_lyric* l, fa_time t, ly_inst* out)
     ly_show sh[LY_MAX_SHOW];
     uint32_t n = ly_frame(&l->tl, &l->prm, t, sh), i, m = 0;
     float intro = ly_intro_at(&l->tl, &l->prm, t), ending = ly_ending_at(&l->tl, &l->prm, t);
+    int big = 0;
     if (intro > 0.0f && l->tl.intro_bands) {
         m += (uint32_t)page_inst(l, PG_TOP, intro, &out[m]);
         m += (uint32_t)page_inst(l, PG_BOTTOM, intro, &out[m]);
     }
     for (i = 0; i < n; i++) {
         ly_inst* in = &out[m];
-        ly_layer* L = layer_get(l, sh[i].line);
-        float maxw = (float)l->block_w;
+        ly_layer* L = NULL;
+        float maxw = (float)l->block_w, zoom = 1.0f;
+        /* A line bigger than its drawing (a new page growing in) is drawn bigger, so it is sharp. */
+        if (sh[i].scale > 1.0f && l->st.page_in_scale > 1.0f) {
+            big = 1;   /* even if it failed: the failed entry must stay for its LY_RETRY wait */
+            L = layer_get_in(l, l->big, LY_MAX_SHOW, sh[i].line, l->st.page_in_scale);
+            if (L) zoom = l->st.page_in_scale;
+        }
+        if (!L) L = layer_get(l, sh[i].line);
         if (!L) continue;   /* could not be drawn (failed): left out, as a page is */
         memset(in, 0, sizeof(*in));
         in->page = -1;
         in->line = sh[i].line;
         in->outgoing = sh[i].outgoing;
         in->layer = L;
-        in->sc = sh[i].scale;
-        if ((float)L->w * in->sc > maxw) in->sc = maxw / (float)L->w;   /* a big page-in still fits */
+        in->lsc = sh[i].scale / zoom;
+        if ((float)L->w * in->lsc > maxw) in->lsc = maxw / (float)L->w;   /* a big page-in still fits */
+        in->sc = in->lsc * zoom;
         in->op = sh[i].opacity;
         in->cx = (float)l->area_w / 2.0f - (float)l->bx;
         in->cy = l->anchor + sh[i].slot * l->pitch - (float)l->by;
         ly_wipe_at(&l->tl.line[in->line], &l->prm, t, &in->wipe);
         ly_countdown_at(&l->tl.line[in->line], &l->prm, t, &in->cd);
-        box_of(l, L, in->cx, in->cy, in->sc, in->box);
+        box_of(l, L, in->cx, in->cy, in->lsc, in->box);
         if (in->cd.shown) {
             int a;
             float ax, ay, hw = ((float)l->tri_w / 2.0f + (float)l->pad) * in->sc + 2.0f;
@@ -1929,6 +2002,11 @@ static int frame_list(fa_lyric* l, fa_time t, ly_inst* out)
             if (in->abox[3] > l->bh) in->abox[3] = l->bh;
         }
         m++;
+    }
+    if (!big) {   /* the page has grown in: its big drawings are let go */
+        int b;
+        for (b = 0; b < LY_MAX_SHOW; b++)
+            if (l->big[b].m || l->big[b].failed) layer_clear(&l->big[b]);
     }
     if (intro > 0.0f && !l->tl.intro_bands) m += (uint32_t)page_inst(l, PG_CARD, intro, &out[m]);
     if (ending > 0.0f) m += (uint32_t)page_inst(l, PG_END, ending, &out[m]);
@@ -1962,9 +2040,9 @@ static void diff(const fa_lyric* l, const ly_inst* a, int na, const ly_inst* b, 
                 /* The columns whose colour changed, and the output pixels whose filter
                  * taps reach them (rad source columns either side). */
                 const ly_layer* L = n->layer;
-                float rad = n->sc < 1.0f ? 1.0f / n->sc : 1.0f;
-                int x0 = (int)floorf(n->cx + ((float)c0 - rad - L->cx) * n->sc) - 2;
-                int x1 = (int)ceilf(n->cx + ((float)c1 + rad - L->cx) * n->sc) + 2;
+                float rad = n->lsc < 1.0f ? 1.0f / n->lsc : 1.0f;
+                int x0 = (int)floorf(n->cx + ((float)c0 - rad - L->cx) * n->lsc) - 2;
+                int x1 = (int)ceilf(n->cx + ((float)c1 + rad - L->cx) * n->lsc) + 2;
                 if (x0 < n->box[0]) x0 = n->box[0];
                 if (x1 > n->box[2]) x1 = n->box[2];
                 if (x0 < x1) fa_rects_add(out, x0, n->box[1], x1, n->box[3]);
@@ -1998,7 +2076,7 @@ static void draw_rect(fa_lyric* l, const ly_inst* list, int n, const int r[4])
         }
         if (in->box[0] < r[2] && r[0] < in->box[2] && in->box[1] < r[3] && r[1] < in->box[3] &&
             color_line(l, in->layer, &l->tl.line[in->line], &in->wipe))
-            draw_place(l, in->layer, in->cx, in->cy, in->sc, in->op, r[0], r[1], r[2], r[3]);
+            draw_place(l, in->layer, in->cx, in->cy, in->lsc, in->op, r[0], r[1], r[2], r[3]);
         if (in->cd.shown && in->abox[0] < r[2] && r[0] < in->abox[2] && in->abox[1] < r[3] && r[1] < in->abox[3] &&
             arrow_make(l)) {
             for (a = 0; a < l->st.countdown_count; a++) {

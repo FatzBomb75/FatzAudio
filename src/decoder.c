@@ -165,6 +165,7 @@ fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint
         memset(dec, 0, sizeof(*dec));
         if (env) {
             dec->dynamic_range = env->dynamic_range;
+            dec->dolby_mix = env->dolby_mix;
             dec->soundfont = env->soundfont;
             dec->midi_rate = env->midi_rate ? env->midi_rate : FA_MIDI_DEFAULT_RATE;
             dec->text_code_page = env->text_code_page;

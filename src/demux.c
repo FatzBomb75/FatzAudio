@@ -475,6 +475,7 @@ static fa_result reopen_codec(fa_track* t, const fa_codec_params* p)
     if (r != FA_OK) return r;
     t->codec_ready = 1;
     t->codec.dynamic_range = t->dec->dynamic_range;
+    t->codec.dolby_mix = t->dec->dolby_mix;
     codec_settings(t, p);
     return FA_OK;
 }
@@ -556,6 +557,7 @@ fa_result fa_track_open(fa_track* t, fa_decoder* dec, const fa_demux_ops* ops, v
     if (r != FA_OK) return r;
     t->codec_ready = 1;
     t->codec.dynamic_range = dec->dynamic_range;
+    t->codec.dolby_mix = dec->dolby_mix;
     codec_settings(t, &p->codec);
     t->place = 1;
 
@@ -671,6 +673,19 @@ static void put_rate(bitw* w, uint32_t rate)
         if (fa_aac_rates[i] == rate) { put_bits(w, (uint32_t)i, 4); return; }
     put_bits(w, 15, 4);
     put_bits(w, rate, 24);
+}
+
+int fa_adts_parse(const uint8_t* p, size_t n, fa_adts_header* h)
+{
+    if (n < 7 || p[0] != 0xFF || (p[1] & 0xF6) != 0xF0) return 0;   /* syncword, layer 00 */
+    h->crc = !(p[1] & 1);
+    h->profile = p[2] >> 6;
+    h->rate_index = (p[2] >> 2) & 15;
+    h->config = ((p[2] & 1) << 2) | (p[3] >> 6);
+    h->len = ((size_t)(p[3] & 3) << 11) | ((size_t)p[4] << 3) | (p[5] >> 5);
+    h->blocks = (p[6] & 3) + 1;
+    h->header = h->crc ? 9 : 7;
+    return h->rate_index < 13 && h->len >= h->header;
 }
 
 /* ISO/IEC 14496-3 1.6.2.1 AudioSpecificConfig with a GASpecificConfig. */

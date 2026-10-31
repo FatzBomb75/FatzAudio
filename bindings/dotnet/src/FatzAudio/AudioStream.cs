@@ -651,7 +651,7 @@ public unsafe class AudioStream : IDisposable
         {
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_cdg_info(Handle, out var i));
             return new CdgInfo((CdgSource)i.Source, (long)i.PackCount, TimeConvert.FromNanoseconds(i.CheckpointInterval),
-                (int)i.CheckpointCount, i.DiscParity < 0 ? null : i.DiscParity != 0);
+                (int)i.CheckpointCount, i.DiscParity < 0 ? null : i.DiscParity != 0, (long)i.DiscCorrected, (long)i.DiscDropped);
         }
     }
 
@@ -693,6 +693,32 @@ public unsafe class AudioStream : IDisposable
             int rc = NativeMethods.fa_stream_set_dynamic_range(Handle, (int)value);
             if (rc == (int)ErrorCode.InvalidArgument)
                 throw new ArgumentException("Unknown dynamic range.", nameof(value));
+            FatzAudioException.ThrowIfFailed(rc);
+        }
+    }
+
+    /// <summary>
+    /// How Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3) audio with more than two channels is mixed down:
+    /// with the stream's own levels (<see cref="FatzAudio.DolbyDownmix.Auto"/>, LoRo, LtRt) or the engine's
+    /// downmix. Between Auto, LoRo and LtRt the change applies to audio decoded from now on, like
+    /// <see cref="DynamicRange"/>. To or from Engine a playing stream rebuilds its chain and carries on where it
+    /// plays, as <see cref="SetMatrix"/> does. Other formats ignore it.
+    /// </summary>
+    /// <exception cref="ArgumentException">An unknown <see cref="FatzAudio.DolbyDownmix"/>.</exception>
+    /// <exception cref="FatzAudioException">To or from Engine on a playing live stream (<see cref="ErrorCode.NotSeekable"/>): change it while detached.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public DolbyDownmix DolbyDownmix
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_dolby_downmix(Handle, out int mode));
+            return (DolbyDownmix)mode;
+        }
+        set
+        {
+            int rc = NativeMethods.fa_stream_set_dolby_downmix(Handle, (int)value);
+            if (rc == (int)ErrorCode.InvalidArgument)
+                throw new ArgumentException("Unknown Dolby downmix.", nameof(value));
             FatzAudioException.ThrowIfFailed(rc);
         }
     }
@@ -1205,11 +1231,15 @@ public unsafe class AudioStream : IDisposable
 
     /// <summary>
     /// Plays backwards (bass_fx's <c>BASS_FX_ReverseCreate</c> and <c>BASS_ATTRIB_REVERSE_DIR</c>). Can be changed at any
-    /// time, also while playing: the stream restarts at the position heard, as a seek does. Reversed, the position and
+    /// time, also while playing: playing or paused, it turns at once (the last 200 ms heard play back the other way while
+    /// the decoder catches up, so there is no gap); stopped or ended, it starts over at the position. Reversed, the position and
     /// the clock count down and the stream ends at the cue-in marker (or the start); playing from stopped or ended
     /// starts at the cue-out marker (or the end), and a loop wraps from its start to its end. Tempo, pitch, rate and
-    /// fades work as forward. Marker, loop, MIDI text and tracker row events are not raised while reversed, and deck sync
-    /// does not pull a reversed deck into phase.
+    /// fades work as forward. Events tied to a frame (markers, <see cref="Looped"/>, positions, MIDI texts, tracker rows)
+    /// are raised as the position counts down past it, last first. On a DJ deck, sync, deck loops and beat jumps work
+    /// mirrored: the deck is pulled onto the leader's beat with its beats counting down, and loops turn at their in
+    /// point; with <see cref="DjDeck.Slip"/> on, turning back returns to where the deck would be. The blocks the source
+    /// is decoded in are cross-faded where they meet.
     /// </summary>
     /// <exception cref="FatzAudioException">Turning it on for a stream that cannot seek (push and packet streams):
     /// <see cref="ErrorCode.NotSeekable"/>; for a web stream: <see cref="ErrorCode.NotImplemented"/>.</exception>
@@ -1744,7 +1774,7 @@ public unsafe class AudioStream : IDisposable
     /// Raises <see cref="PositionReached"/> once, the first time playback passes <paramref name="position"/>; the
     /// request is then gone. Add it again from the handler to hear about the next pass (a loop's next turn, or after
     /// seeking back). Frame-exact like markers: it follows tempo, rate and loops, and is raised as that audio is
-    /// mixed, about one device latency before it is heard. Unlike markers it is raised playing in
+    /// mixed, about one device latency before it is heard. Like markers it is raised playing in
     /// <see cref="Reverse"/> too. A seek over the position doesn't raise it: it stays armed. Streams playing on a
     /// device only. Up to 64 positions are armed at once; adding one that is already armed does nothing.
     /// </summary>
@@ -1852,7 +1882,7 @@ public unsafe class AudioStream : IDisposable
     /// as the audio is mixed, about one device latency before the jump is heard; follow <see cref="Clock"/> for
     /// frame-exact timing.
     /// <see cref="StreamEventArgs.Frame"/> is the loop end it left and <see cref="StreamEventArgs.Value"/> the frame it
-    /// went to. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method
+    /// went to (in <see cref="Reverse"/>, the loop start it left and the loop end it went to). Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method
     /// but should return quickly, since they delay later events.
     /// </summary>
     public event EventHandler<StreamEventArgs>? Looped;

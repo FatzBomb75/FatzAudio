@@ -392,10 +392,43 @@ b.Unsync();
 - **`fa_deck_play_synced`** (`PlaySynced`) starts a stopped deck from its cue point (a paused one from where it is) so that its next beat (BAR: downbeat) lands exactly on one of the leader's, at least 50 ms ahead. It is scheduled on the device clock, so it is exact to the frame. The leader must be playing (`FA_ERROR_INVALID_ARG`); a deck that plays already is synced as `fa_deck_sync` does.
 - **Lock** (`FA_SYNC_LOCK`): the engine's event thread looks about 20 times a second and keeps the deck on the leader's beat: it follows the leader's tempo moves and tempo-mapped songs, with a target error under 1 ms. The deck's `FA_PARAM_TEMPO` then moves by itself; set it by hand only after unlocking. Without LOCK a sync is done once (a phase pull ends within 1 ms, or after about eight beats).
 - **Ending it**: `fa_deck_sync(deck, NULL, 0)` (`Unsync`), or loading a stream on either deck. The tempo stays where it is.
-- **Beat loops** (`fa_deck_set_loop_beats`, `LoopBeats`): 1/16..32 beats on the grid, from the beat heard now (a loop shorter than a beat starts on the last whole part of the beat). While a deck loop is on the new one keeps its in point, so halving and doubling work like a DJ's loop buttons. 0 turns the loop off. It is an ordinary [deck loop](#deck-loops), read back with `fa_deck_get_loop` (`Loop`) in frames.
+- **Beat loops** (`fa_deck_set_loop_beats`, `LoopBeats`): 1/16..32 beats on the grid, from the beat heard now (a loop shorter than a beat starts on the last whole part of the beat). While a deck loop is on the new one keeps its in point, so halving and doubling work like a DJ's loop buttons. On a deck playing reversed it is mirrored: the loop ends at the beat heard and lies below it, and halving and doubling keep its end. 0 turns the loop off. It is an ordinary [deck loop](#deck-loops), read back with `fa_deck_get_loop` (`Loop`) in frames.
 - **Beat jumps** (`fa_deck_beat_jump`, `BeatJump`): moves the deck by whole grid beats (negative is back; 1/16..1024 either way, e.g. 1, 4, 16, 32) at once, joined seamlessly like a loop. The distance is counted on the grid from the beat heard now, so a jump of whole beats keeps the beat exactly where it was (also on a tempo map) and a synced deck stays on the leader's beat. While a deck loop is on the loop moves along by the same beats, as a CDJ's loop move does (kept inside the song). On a paused or stopped deck the position moves. A jump past the end ends the song; one before the start lands on frame 0. A locked deck is pulled back on its next beat unless the jump keeps what the lock aligns: whole beats with `FA_SYNC_BEAT | FA_SYNC_LOCK`, whole bars with `FA_SYNC_BAR | FA_SYNC_LOCK`. `FA_ERROR_BUSY` while sync's own jump or the previous jump still waits to be decoded (try again a moment later); `FA_ERROR_NOT_SEEKABLE` for live streams.
-- **Reverse**: `fa_stream_set_reverse` on the deck's stream (`AudioStream.Reverse`) plays it backwards from where it is, and switching it off plays on forward from where it got to. While reversed, sync keeps the tempo match but doesn't pull the deck into phase, and beat jumps and loop changes take effect at once. See [reverse playback](tempo-pitch.md#reverse-playback).
+- **Reverse**: `fa_stream_set_reverse` on the deck's stream (`AudioStream.Reverse`) plays it backwards from where it is, at once (the audio just heard goes back out of the stream's buffer, so there is no gap), and switching it off plays on forward from where it got to. While reversed, everything works mirrored: sync pulls the deck onto the leader's beat with its beats counting down, deck loops turn at their in point, beat loops lie below the beat heard, and loop changes and beat jumps join without a gap. See [reverse playback](tempo-pitch.md#reverse-playback).
 - **Beat info** (`fa_deck_get_beat_info`, `BeatInfo`): the heard BPM, the position in beats and bars, and while synced the phase error against the leader in ms (positive: this deck is ahead). `FA_ERROR_NOT_FOUND` (null in .NET) for an empty deck or one without a grid.
+
+## Slip mode
+
+Slip mode is a CDJ's SLIP button: while it is on, reversing, looping and beat jumping are excursions, and the track keeps running underneath. The deck counts where it would be playing from where it was heard when the excursion began, at the speed it plays (TEMPO × RATE, ramps and sync moves included), and when the excursion ends it joins there, 15 ms ahead of the mix and without a gap. It lands exactly on the beat it would have been on, so a synced deck is still on the leader's beat.
+
+```c
+fa_deck_set_slip(deck, 1);
+fa_stream_set_reverse(song, 1);          /* a "censor" or a spinback ... */
+fa_stream_set_reverse(song, 0);          /* ... and back to where the song got to */
+fa_deck_set_loop_beats(deck, 1.0);       /* a one-beat roll ... */
+fa_deck_set_loop_beats(deck, 0.0);       /* ... and out where the track would be */
+fa_deck_beat_jump(deck, -4.0);           /* a jump back ... */
+fa_deck_slip_return(deck);               /* ... and the button released */
+fa_frames shadow;
+fa_deck_get_slip_position(deck, &shadow);   /* FA_FRAMES_UNSET while no slip runs */
+```
+
+```csharp
+deck.Slip = true;
+song.Reverse = true;
+song.Reverse = false;
+deck.LoopBeats(1);
+deck.LoopBeats(0);
+deck.BeatJump(-4);
+deck.SlipReturn();
+long? shadow = deck.SlipPosition;     // the "ghost" playhead for a waveform display
+```
+
+- **What starts one**: `fa_stream_set_reverse` on the deck's stream, a deck loop (`fa_deck_set_loop`, `fa_deck_set_loop_beats`) and `fa_deck_beat_jump`, while the deck plays. Further ones during a slip join it: the count goes on from the first start.
+- **What ends one**: the excursions ending, that is the direction back to what it was with no deck loop on (the last of the two to end returns), or `fa_deck_slip_return` (`SlipReturn`), which also ends the reverse and the loop. A beat jump has no end of its own, so it needs `fa_deck_slip_return` (the moment the jump button is let go). Without a slip running, `fa_deck_slip_return` does nothing.
+- **What forgets one**: a seek, a cue (`fa_deck_cue`), a stop, loading the deck, or turning slip mode off: playback then carries on from where it is. Pausing pauses the count, as it would have paused the track.
+- The slip position wraps the stream's own `fa_stream_set_loop` loop like playback would, and stops at the song's end: returning past it ends the song.
+- Sync's own phase jumps don't move the slip position; a locked deck pulls itself back onto the beat after the return anyway.
 
 ## Auto-mix
 
