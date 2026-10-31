@@ -367,9 +367,21 @@ public sealed class AudioEngine : IDisposable
         ArgumentNullException.ThrowIfNull(url);
         var h = Handle;
         using var opts = NativeOptions.Create(options);
+        GCHandle? download = null;
+        if (options?.Network?.Downloaded is { } handler)
+        {
+            // Lives as long as the native stream (adopted by it below), freed here if the open fails.
+            var gc = GCHandle.Alloc(new AudioStream.DownloadState(handler, null));
+            download = gc;
+            opts.Pointer->Net->DownloadProc = &AudioStream.OnDownload;
+            opts.Pointer->Net->DownloadUser = (void*)GCHandle.ToIntPtr(gc);
+        }
         int rc = NativeMethods.fa_stream_open_url(h, url, opts.Pointer, out nint s);
+        if (rc < 0) download?.Free();
         if (rc == (int)ErrorCode.InvalidArgument) throw new ArgumentException("Not an absolute http or https URL.", nameof(url));
-        return AudioStream.Wrap(this, rc, s, null);
+        var stream = AudioStream.Wrap(this, rc, s, download);
+        stream.InitDownloadHandle(download);
+        return stream;
     }
 
     /// <summary>

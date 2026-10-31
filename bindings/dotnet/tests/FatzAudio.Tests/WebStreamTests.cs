@@ -181,6 +181,39 @@ public sealed class WebStreamTests : IDisposable
     }
 
     [Fact]
+    public void Downloaded_GetsTheBytesAsServed()
+    {
+        using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true });
+        var saved = new MemoryStream();
+        var opts = DecodeOnly with { Network = DecodeOnly.Network! with { Downloaded = data => { lock (saved) saved.Write(data); } } };
+        using var web = engine.OpenUrl(Url("/tone.wav"), opts);
+        var buf = new float[4096];
+        while (web.Read(buf) > 0) { }
+        for (int i = 0; i < 500 && !web.NetworkStatus!.Finished; i++) Thread.Sleep(10);
+        lock (saved) Assert.True(saved.ToArray().AsSpan().SequenceEqual(_wav));
+    }
+
+    [Fact]
+    public void SetDownloadHandler_StartsAndStops()
+    {
+        using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true });
+        using var radio = engine.OpenUrl(Url("/radio"), DecodeOnly);
+        long bytes = 0;
+        radio.SetDownloadHandler(data => Interlocked.Add(ref bytes, data.Length));
+        var buf = new float[4096 * 2];
+        long frames = 0;
+        while (Interlocked.Read(ref bytes) < 65536 && frames < 20 * 44100) frames += radio.Read(buf) / 2;
+        Assert.True(Interlocked.Read(ref bytes) >= 65536);
+        radio.SetDownloadHandler(null);
+        long after = Interlocked.Read(ref bytes);
+        for (int i = 0; i < 20; i++) radio.Read(buf);
+        Assert.Equal(after, Interlocked.Read(ref bytes));
+
+        using var file = engine.OpenMemory(_wav, new StreamOptions { DecodeOnly = true });
+        Assert.Throws<InvalidOperationException>(() => file.SetDownloadHandler(_ => { }));
+    }
+
+    [Fact]
     public void OpenUrl_Errors()
     {
         using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true });

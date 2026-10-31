@@ -72,7 +72,8 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_StreamCreateURL | `fa_stream_open_url`: HTTP/HTTPS files with range seeking, Icecast/Shoutcast radio, HLS, `.pls`/`.m3u`; reconnects by itself ([web streams](../features/web-streams.md)) | `engine.OpenUrl(url)` | ✅ WAV/FLAC/MP3/OGG/Opus/AAC/AC-3 built in |
 | BASS_StreamCreateURL with request headers after the URL (`"url\r\nHeader: value\r\n"`) | `fa_net_options.headers`, the same `Name: value` lines; sent with every request, the same way on every platform, except `Authorization` and `Cookie`, which only go to the URL's own server (not to other hosts a redirect or playlist leads to) ([request headers](../features/web-streams.md#request-headers)) | `NetworkOptions.Headers` | ✅ |
 | BASS_StreamCreateURL with `https://` on Android | The system's HTTPS (`HttpURLConnection` on the app's Java VM): no SSL library to ship. Android 12+ and .NET for Android need nothing; Java/Kotlin apps on Android 7 to 11 call `fa_android_set_java_vm` once ([web streams](../features/web-streams.md#android)) | automatic (`AudioEngine.SetAndroidJavaVM` if needed) | ✅ |
-| BASS_StreamCreateURL `DOWNLOADPROC` (raw bytes to save a station) | Planned | | 🗓️ |
+| BASS_StreamCreateURL `DOWNLOADPROC` (raw bytes to save a station) | `fa_net_options.download_proc` (from the first byte), `fa_stream_set_download_callback` (start or stop while it plays); radio comes without its ICY title blocks, HLS as the segments' audio, so the saved bytes play as a file ([saving a station](../features/web-streams.md#saving-a-station-as-it-plays)) | `NetworkOptions.Downloaded`, `SetDownloadHandler` | ✅ |
+| Cookies a web server sets (BASS keeps none: the app reads `Set-Cookie` and sends it back in the request headers) | Kept per stream: what a playlist, a login redirect or a segment sets goes back on the stream's later requests, together with the app's own `Cookie` line ([cookies](../features/web-streams.md#cookies)) | automatic | ✅ |
 | BASS_StreamCreateURL `BASS_STREAM_BLOCK` | Not needed: memory per web stream is bounded (4 MB) and seeking still works | — | ➖ (by design) |
 | BASS_StreamCreateURL `BASS_STREAM_STATUS` (+ `BASS_TAG_HTTP` during connect) | `fa_stream_get_http_header` and `fa_stream_get_net_status` after the open | `GetHttpHeader`, `NetworkStatus` | ✅ |
 | BASS_StreamCreate (STREAMPROC_PUSH) + BASS_StreamPutData | `fa_stream_open_push` + `fa_stream_push_pcm`, with an optional pts per push ([FFmpeg hand-off](../features/ffmpeg.md)) | `engine.CreatePushStream(format)`, `Push(samples, pts)` | ✅ |
@@ -160,7 +161,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 |---|---|---|---|
 | BASS_ChannelGetPosition minus the latency from BASS_GetInfo, converted with Bytes2Seconds, to find which video frame to show | `fa_stream_get_clock`: the time leaving the speaker, latency included, interpolated between callbacks; holds while paused, stalled or ended ([FFmpeg hand-off](../features/ffmpeg.md#following-the-clock-with-the-video)) | `stream.Clock` | ✅ |
 | Keeping your own offset from the first pushed pts | Not needed: push streams report the pts you pushed, timestamp jumps included | `Clock` | ➖ (by design) |
-| BASS_SYNC_STALL (stalled / resumed) | `FA_EVENT_STALLED` / `FA_EVENT_RESUMED` on push and packet streams | `Stalled` / `Resumed` | ✅ (web streams 🗓️) |
+| BASS_SYNC_STALL (stalled / resumed) | `FA_EVENT_STALLED` / `FA_EVENT_RESUMED` on push, packet and web streams ([buffering](../features/web-streams.md#buffering-stalls-and-reconnects)) | `Stalled` / `Resumed` | ✅ |
 | BASS_ChannelIsActive == BASS_ACTIVE_STALLED | `FA_STATE_BUFFERING`; resumes by itself at about 100 ms queued | `StreamState.Buffering` | ✅ |
 | BASS_FFMPEG / BASS_DSHOW add-ons (third-party) to play the audio of video files | `fa_stream_open_packets` fed from the FFmpeg demuxer your app already has | `OpenPackets` | ✅ |
 
@@ -575,7 +576,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | bass_ac3.dll | Built-in AC-3 and E-AC-3 decoder: raw `.ac3`/`.ec3` files, MP4/MKV tracks, web streams and HLS, and pushed packets, with dynamic range modes ([Dolby Digital](../features/dolby.md)) | ✅ (passthrough 🗓️) |
 | bassalac.dll | Built-in ALAC decoder: ALAC tracks in MP4/M4A/MOV and Matroska files, over HTTP, and pushed packets, bit exact on every platform ([bassalac](#bassalac-apple-lossless)) | ✅ |
 | bassflac.dll | Built-in: `.flac` files, Ogg FLAC (`.oga`), FLAC tracks in MP4 and Matroska, FLAC web streams and FLAC packets through `fa_stream_open_packets`, all with the same decoder ([bassflac](#bassflac)) | ✅ |
-| basshls.dll (if used) | Built-in: `fa_stream_open_url` plays `.m3u8` (MPEG-TS, fMP4, AES-128) | ✅ |
+| basshls.dll (if used) | Built-in: `fa_stream_open_url` plays `.m3u8` (MPEG-TS, fMP4, AES-128, audio renditions chosen by bandwidth) | ✅ |
 | bassopus.dll | Built-in: `.opus` files, Opus web radio, Opus in WebM/MKV/MP4, and raw packets through `fa_stream_open_packets` ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
 | basswebm.dll | Built-in Matroska/WebM demuxer, any audio track (`audio_track`); PCM, MP3, AAC, AC-3, E-AC-3, Opus, Vorbis, FLAC and ALAC tracks built in, others unsupported ([streams](../features/streams.md#video-files-and-audio-tracks)) | ✅ |
 | OGG Vorbis in bass.dll | Built-in: `.ogg` files, chained files, Ogg radio with song titles ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |

@@ -83,6 +83,8 @@ internal unsafe struct FaNetOptions
     public uint ReconnectMs;
     public uint Flags;
     public uint HlsMaxBandwidth;
+    public delegate* unmanaged[Cdecl]<void*, void*, nuint, void> DownloadProc;
+    public void* DownloadUser;
 }
 
 [StructLayout(LayoutKind.Sequential)]

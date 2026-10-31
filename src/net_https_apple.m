@@ -25,6 +25,7 @@
     NSError* error;
     int done;
     int stop;         /* the reader wants no more data */
+    int multiplexed;  /* the task ran over HTTP/2 or 3 (known from its metrics, before it completes) */
 }
 @end
 
@@ -73,6 +74,15 @@
         done = 1;
     }
     pthread_cond_broadcast(&cond);
+    pthread_mutex_unlock(&mutex);
+}
+- (void)URLSession:(NSURLSession*)session task:(NSURLSessionTask*)task
+    didFinishCollectingMetrics:(NSURLSessionTaskMetrics*)metrics
+{
+    NSString* proto = metrics.transactionMetrics.lastObject.networkProtocolName;
+    (void)session;
+    pthread_mutex_lock(&mutex);
+    if (task == current) multiplexed = proto != nil && ![proto hasPrefix:@"http/1"];
     pthread_mutex_unlock(&mutex);
 }
 /* Redirects come back to fa_http_fetch, which follows them for every transport
@@ -125,8 +135,8 @@ static int session_open(fa_http_session* s, const fa_http_request* req)
     NSURLSession* session;
     cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
     cfg.URLCache = nil;
-    /* No cookie store, as on the other transports: the kept session would replay a
-     * server's cookies on the stream's later requests. The app's Cookie line still goes. */
+    /* No cookie store: the stream's own jar (fa_http_request.cookies) keeps them, the
+     * same on every transport. The app's Cookie line still goes. */
     cfg.HTTPCookieStorage = nil;
     cfg.HTTPShouldSetCookies = NO;
     cfg.HTTPCookieAcceptPolicy = NSHTTPCookieAcceptPolicyNever;
@@ -199,6 +209,23 @@ static int add_request_header(void* user, const char* name, const char* value)
     return 0;
 }
 
+/* URLSession joins a response's Set-Cookie lines into one value (Expires dates hold
+ * commas too): NSHTTPCookie splits them, and each goes back as a line of its own. */
+static void append_cookies(NSMutableString* lines, NSString* value, NSURL* url)
+{
+    NSArray<NSHTTPCookie*>* cookies = [NSHTTPCookie cookiesWithResponseHeaderFields:@{ @"Set-Cookie": value } forURL:url];
+    for (NSHTTPCookie* c in cookies) {
+        [lines appendFormat:@"Set-Cookie: %@=%@; Path=%@", c.name, c.value, c.path.length ? c.path : @"/"];
+        if ([c.domain hasPrefix:@"."]) [lines appendFormat:@"; Domain=%@", [c.domain substringFromIndex:1]];
+        if (c.isSecure) [lines appendString:@"; Secure"];
+        if (c.expiresDate) {
+            long long left = (long long)c.expiresDate.timeIntervalSinceNow;
+            [lines appendFormat:@"; Max-Age=%lld", left > 0 ? left : 0];
+        }
+        [lines appendString:@"\r\n"];
+    }
+}
+
 fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_head, fa_http_data_proc on_data, void* user,
                             char** out_redirect)
 {
@@ -212,7 +239,7 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
         NSMutableURLRequest* request;
         NSURLSessionDataTask* task;
         FAFetchDelegate* d;
-        int head_done = 0, cancelled = 0, redirect = 0;
+        int head_done = 0, cancelled = 0, redirect = 0, unframed = 0;
         size_t drained = 0;
         if (!url) return FA_ERROR_INVALID_ARG;
 
@@ -242,6 +269,7 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
         d->error = nil;
         d->done = 0;
         d->stop = 0;
+        d->multiplexed = 0;
         pthread_mutex_unlock(&d->mutex);
         [task resume];
 
@@ -257,21 +285,32 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
                     fa_http_response fr;
                     char* headers;
                     int stop;
-                    for (NSString* key in resp.allHeaderFields)
+                    for (NSString* key in resp.allHeaderFields) {
+                        if ([key caseInsensitiveCompare:@"Set-Cookie"] == NSOrderedSame) {
+                            append_cookies(lines, resp.allHeaderFields[key], url);
+                            continue;
+                        }
                         [lines appendFormat:@"%@: %@\r\n", key, resp.allHeaderFields[key]];
+                    }
                     headers = strdup(lines.UTF8String ? lines.UTF8String : "");
                     if (headers && strlen(headers) > FA_HTTP_HEAD_MAX) { free(headers); r = FA_ERROR_NETWORK; break; }   /* as the other backends */
                     memset(&fr, 0, sizeof(fr));
                     fr.status = (int)resp.statusCode;
                     fr.headers = headers ? headers : (char*)"";
                     fr.final_url = req->url;
-                    redirect = fa_http_redirect_target(req->url, fr.status, fr.headers, out_redirect);
+                    redirect = fa_http_redirect_target(req, fr.status, fr.headers, out_redirect);
                     if (redirect) {
                         free(headers);
                         if (redirect < 0) { r = FA_ERROR_NETWORK; break; }
                         continue;    /* its body is read to the end, so the connection can be kept */
                     }
                     fa_http_fill_lengths(&fr);
+                    /* URLSession accepts a chunked body the server closes before its last
+                     * chunk, so a body without a Content-Length may have been cut either way. */
+                    {
+                        char v[64];
+                        unframed = !fa_http_header(fr.headers, "Content-Length", v, sizeof(v));
+                    }
                     pthread_mutex_unlock(&d->mutex);
                     stop = on_head ? on_head(user, &fr) : 0;
                     free(headers);
@@ -299,6 +338,8 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
             }
             if (d->done) {
                 r = d->error && !redirect ? FA_ERROR_NETWORK : FA_OK;
+                /* A short body is an error above; one without a length may have been cut. */
+                if (r == FA_OK && !redirect && req->closed_end && unframed && !d->multiplexed) *req->closed_end = 1;
                 break;
             }
             timed_wait(d, 100);

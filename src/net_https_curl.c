@@ -30,7 +30,8 @@ enum {
     C_HEADERFUNCTION = 20079, C_NOSIGNAL = 99, C_CONNECTTIMEOUT_MS = 156,
     C_XFERINFOFUNCTION = 20219
 };
-enum { CI_RESPONSE_CODE = 0x200002 };
+enum { CI_RESPONSE_CODE = 0x200002, CI_HTTP_VERSION = 0x200000 + 46 };
+enum { C_HTTP_VERSION_2_0 = 3 };   /* CURLINFO_HTTP_VERSION's answers: 1.0 = 1, 1.1 = 2, 2 = 3, 3 = 30 */
 enum { CE_OK = 0, CE_WRITE_ERROR = 23, CE_ABORTED_BY_CALLBACK = 42 };
 #define C_GLOBAL_DEFAULT 3L   /* CURL_GLOBAL_SSL | CURL_GLOBAL_WIN32 */
 
@@ -147,7 +148,7 @@ static int deliver_head(curl_ctx* c)
     resp.status = c->status;
     resp.headers = c->headers ? c->headers : (char*)"";
     resp.final_url = c->req->url;
-    switch (fa_http_redirect_target(c->req->url, c->status, resp.headers, &c->redirect)) {
+    switch (fa_http_redirect_target(c->req, c->status, resp.headers, &c->redirect)) {
     case 1: return 1;
     case -1: c->bad_redirect = 1; return 1;
     default: break;
@@ -260,7 +261,13 @@ fa_result fa_http_fetch_tls(const fa_http_request* req, fa_http_head_proc on_hea
         else if (c.redirect) { r = FA_OK; *out_redirect = c.redirect; c.redirect = NULL; }
         else if (c.failed_status) r = FA_ERROR_NOT_FOUND;
         else if (c.stopped) r = FA_OK;
-        else if (code == CE_OK) r = FA_OK;
+        else if (code == CE_OK) {
+            long version = 0;
+            r = FA_OK;
+            if (req->closed_end && fa_http_unframed(c.headers ? c.headers : "") &&
+                (g_curl.getinfo(c.curl, CI_HTTP_VERSION, &version) != CE_OK || version < C_HTTP_VERSION_2_0))
+                *req->closed_end = 1;   /* HTTP/2 and 3 end a stream on purpose */
+        }
         else r = FA_ERROR_NETWORK;
     }
     (void)CE_WRITE_ERROR; (void)CE_ABORTED_BY_CALLBACK;

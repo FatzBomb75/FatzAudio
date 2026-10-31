@@ -18,9 +18,18 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- Web streams: a raw-bytes tap for saving a station as it plays (BASS's `DOWNLOADPROC`): `fa_net_options.download_proc`
+  from the first byte, `fa_stream_set_download_callback` to start or stop it while playing (.NET
+  `NetworkOptions.Downloaded`, `AudioStream.SetDownloadHandler`); radio comes without its ICY title blocks, HLS as the
+  segments' audio. Each stream keeps the cookies its servers set (a playlist's or a login redirect's session cookie)
+  and sends them back on its later requests, on every platform. HLS plays the audio rendition of the chosen variant's
+  `AUDIO=` group, so `hls_max_bandwidth` also picks the audio tier. A live stream without length or chunked framing that
+  the server closes cleanly now reconnects instead of ending. `fa_stream_close` returns at once while a host name lookup
+  hangs. See [docs/features/web-streams.md](docs/features/web-streams.md#saving-a-station-as-it-plays).
+
 - Tags (extras step 14): ID3v2 frames stored with the zlib flag are read (encrypted ones are still skipped); `SYLT`
   synced lyrics come as timed `[mm:ss.mmm]text` lines; Lyrics3 v1.00 and v2.00 are read (new `FA_TAG_FORMAT_LYRICS3`,
-  .NET `TagFormat.Lyrics3`) and skipped by the decoders; Matroska tags aimed at a track, chapter, edition or attachment
+  .NET `TagFormat.Lyrics3`) and left out of `audio_bytes` and the bitrate; Matroska tags aimed at a track, chapter, edition or attachment
   come as `TRACK:<uid>/NAME` and so on; FLAC cue sheets as `CUESHEET/...` items; the Vorbis vendor string as `VENDOR`;
   `fa_tags_read_path` / `fa_tags_read_memory` read a MIDI file's title, artist, copyright and length without a
   soundfont (`fa_tags_get_info` no longer returns `FA_ERROR_NOT_FOUND` for it).

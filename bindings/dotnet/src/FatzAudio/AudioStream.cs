@@ -249,6 +249,92 @@ public unsafe class AudioStream : IDisposable
         return Marshal.PtrToStringUTF8((nint)buf);
     }
 
+    private readonly object _downloadLock = new();
+    private GCHandle? _download;
+
+    // The handle of NetworkOptions.Downloaded (already adopted by the stream handle), so a later
+    // SetDownloadHandler frees it like any replaced handler.
+    internal void InitDownloadHandle(GCHandle? gc)
+    {
+        if (gc is { } g && g.Target is DownloadState st) st.Owner = this;
+        _download = gc;
+    }
+
+    // What the native tap's user pointer leads to: the handler, and the stream it is for.
+    internal sealed class DownloadState(DownloadHandler handler, AudioStream? owner)
+    {
+        public DownloadHandler Handler { get; } = handler;
+        public AudioStream? Owner { get; set; } = owner;
+    }
+
+    /// <summary>
+    /// Starts handing this web stream's raw bytes to <paramref name="handler"/> from the next downloaded byte on, to
+    /// save a station while it plays; null stops it. Once this returns, the previous handler is not called again.
+    /// To catch the stream from its first byte, set <see cref="NetworkOptions.Downloaded"/> when opening instead.
+    /// After a seek that restarts the download elsewhere, the bytes continue from there.
+    /// </summary>
+    /// <param name="handler">The handler, or null.</param>
+    /// <exception cref="InvalidOperationException">This is not a web stream.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    /// <example>
+    /// <code>
+    /// var file = File.Create("recording.mp3");
+    /// radio.SetDownloadHandler(data => file.Write(data));
+    /// // ...
+    /// radio.SetDownloadHandler(null);
+    /// file.Dispose();
+    /// </code>
+    /// </example>
+    public void SetDownloadHandler(DownloadHandler? handler)
+    {
+        var h = Handle;
+        // From inside this stream's handler the lock is skipped: another thread holding it waits in the native call
+        // for the handler to return, and makes its change after this one, in the same order as the native side.
+        if (ReferenceEquals(t_inDownloadOf, this))
+        {
+            SwapDownloadHandler(h, handler);
+            return;
+        }
+        lock (_downloadLock) SwapDownloadHandler(h, handler);
+    }
+
+    private unsafe void SwapDownloadHandler(StreamHandle h, DownloadHandler? handler)
+    {
+        GCHandle? gc = handler is null ? null : _handle.Pin(new DownloadState(handler, this));
+        int rc = NativeMethods.fa_stream_set_download_callback(h, gc is null ? null : &OnDownload,
+            gc is { } g ? (void*)GCHandle.ToIntPtr(g) : null);
+        if (rc < 0)
+        {
+            if (gc is { } failed) _handle.Unpin(failed);
+            if (rc == (int)ErrorCode.InvalidArgument) throw new InvalidOperationException("Not a web stream.");
+            throw new FatzAudioException((ErrorCode)rc);
+        }
+        // The native side no longer calls the previous handler, so its handle can go.
+        if (_download is { } previous) _handle.Unpin(previous);
+        _download = gc;
+    }
+
+    [ThreadStatic] private static AudioStream? t_inDownloadOf;
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static unsafe void OnDownload(void* user, void* data, nuint size)
+    {
+        try
+        {
+            if (user != null && GCHandle.FromIntPtr((nint)user).Target is DownloadState st)
+            {
+                var outer = t_inDownloadOf;
+                t_inDownloadOf = st.Owner;
+                try { st.Handler(new ReadOnlySpan<byte>(data, checked((int)size))); }
+                finally { t_inDownloadOf = outer; }
+            }
+        }
+        catch
+        {
+            // never throw across the native boundary
+        }
+    }
+
     internal TimeSpan FramesToTime(long frames) => TimeConvert.FromFrames(frames, _sampleRate);
     internal long TimeToFrames(TimeSpan time) => TimeConvert.ToFrames(time, _sampleRate);
 

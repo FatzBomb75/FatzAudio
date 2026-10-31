@@ -137,6 +137,9 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_http_header(StreamHandle stream, string name, byte* value, nuint valueSize);
 
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_download_callback(StreamHandle stream, delegate* unmanaged[Cdecl]<void*, void*, nuint, void> proc, void* user);
+
     // ---- Transport and position -------------------------------------------
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_attach(StreamHandle stream, DeviceHandle device, nint bus);
