@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#  include <unistd.h>
+#endif
 #ifdef _WIN32
 #  include <windows.h>
 static void sleep_ms(unsigned ms) { Sleep(ms); }
@@ -145,11 +148,14 @@ static int64_t FA_CALL sine_proc(void* buffer, fa_frames frames, void* user)
 static void test_stats_and_loudness(void)
 {
     fa_audio_format f = { FA_FORMAT_F32, 48000, 2, 0 };
-    sine t = { 0.0, 0.0, 48000, 0 };
+    /* Static: a failed CHECK returns with the stream still calling sine_proc. */
+    static sine t;
     fa_device* d = NULL;
     fa_stream* s = NULL;
     fa_engine_stats st;
     double m = 0.0, sh = 0.0, dm = 0.0, dsh = 0.0;
+    memset(&t, 0, sizeof(t));
+    t.rate = 48000;
     t.amp = pow(10.0, -23.0 / 20.0);
     CHECK_EQ(fa_device_open(g_engine, NULL, &d), FA_OK);
     CHECK_EQ(fa_stream_open_callback(g_engine, &f, sine_proc, &t, NULL, &s), FA_OK);
@@ -216,11 +222,13 @@ static void test_stats_and_loudness(void)
 static void test_callback_plays_to_end(void)
 {
     fa_audio_format f = { FA_FORMAT_S16, 44100, 2, 0 };
-    ramp r = { 0, 44100 / 4, 0, 0 };
+    static ramp r;   /* static: a failed CHECK returns with the stream still calling ramp_proc */
     fa_device* d = NULL;
     fa_stream* s = NULL;
     fa_stream_state state = FA_STATE_STOPPED;
     int i;
+    memset(&r, 0, sizeof(r));
+    r.total = 44100 / 4;
     CHECK_EQ(fa_device_open(g_engine, NULL, &d), FA_OK);
     CHECK_EQ(fa_stream_open_callback(g_engine, &f, ramp_proc, &r, NULL, &s), FA_OK);
     CHECK_EQ(fa_stream_attach(s, d, NULL), FA_OK);
@@ -260,7 +268,7 @@ static void test_capture_read(void)
     CHECK_EQ(info.format.channels, 2);
     CHECK_EQ(info.format.sample_rate, 48000);
     /* The null input gives silence in real time; 0 frames while nothing new is there. */
-    for (i = 0; i < 100 && total < 4800; i++) {
+    for (i = 0; i < 300 && total < 4800; i++) {
         fa_frames got = 0, k;
         CHECK_EQ(fa_stream_read(s, buf, 512, &got), FA_OK);
         for (k = 0; k < got * 2; k++) CHECK(buf[k] == 0.0f);
@@ -327,6 +335,11 @@ static void test_capture_plays(void)
 int main(void)
 {
     fa_engine_config cfg;
+#if defined(__APPLE__)
+    /* The iOS simulator starts programs elsewhere: tools/ios-sim/run.sh names the folder. */
+    if (getenv("FA_TEST_CWD") && chdir(getenv("FA_TEST_CWD")) != 0) return 1;
+#endif
+    setvbuf(stdout, NULL, _IONBF, 0);   /* the readings show even if a test crashes */
     fa_engine_config_init(&cfg);
     cfg.flags = FA_ENGINE_NULL_OUTPUT;
     if (fa_engine_create(&cfg, &g_engine) != FA_OK) {
