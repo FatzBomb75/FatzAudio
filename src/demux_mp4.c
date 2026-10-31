@@ -7,8 +7,13 @@
  * afterwards: a video track's samples are never touched. PCM samples (one frame
  * each in QuickTime) are grouped into packets of up to 4096 frames. Fragmented
  * files (moof/traf/trun) are indexed up front when the source can seek, and read
- * fragment by fragment from forward-only sources. */
+ * fragment by fragment from forward-only sources. A web stream with a fragment
+ * index (sidx, or mfra at the end of the file) reads the fragments as playback or
+ * a seek reaches them instead (one request for each at most), and tells the
+ * download where the next packets are, so a decode worker never waits for them in
+ * a read (fa_net_will_read). */
 #include "demux.h"
+#include "net.h"
 #include "pkt_index.h"
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +25,15 @@
  * end of a cut-off file are kept: reading stops there. */
 #define MP4_MAX_OFFSET (INT64_MAX / 2)
 #define MP4_PCM_FRAMES 4096
+#define MP4_MAX_INDEX (1u << 20)      /* sidx read into memory */
+#define MP4_TAIL (256 * 1024)         /* read from the end for mfra and the last fragment */
+#define MP4_HINT_TIME 0.5             /* seconds of packets announced ahead ... */
+#define MP4_HINT_SPAN (1 << 20)       /* ... over at most this many bytes of the file */
+#define MP4_HINT_HEADER 16384         /* announced for a fragment's moof */
+
+typedef struct mp4_frag {         /* a fragment (moof) from an index, and its start time */
+    int64_t off, pts;
+} mp4_frag;
 
 typedef struct mp4 {
     fa_br br;
@@ -39,6 +53,14 @@ typedef struct mp4 {
     size_t data_cap;
     uint8_t* extra;               /* codec extradata built here */
     size_t extra_len;
+    fa_net* net;                  /* a seekable web stream: the next reads are announced */
+    size_t hint_redo;             /* the packet from which they are announced again */
+    /* Fragments of an index (indexed): the packet list holds those from first_frag
+     * on that were read so far, and grows as playback goes on. */
+    mp4_frag* frags;
+    size_t nfrags, first_frag;
+    int64_t pkt_dur;              /* a packet's duration, from the first fragment read */
+    int indexed;
 } mp4;
 
 /* ---- boxes in memory ---------------------------------------------------------------- */
@@ -376,8 +398,9 @@ static int load_fragment(mp4* m, fa_result* err)
         if (m->lazy) { fa_pkt_clear(&m->pk); m->cur = before = 0; }       /* forward-only: the past is gone anyway */
         *err = parse_moof(m, buf, (size_t)(size - hdr), pos);
         if (*err != FA_OK) break;
-        if (m->lazy && m->next_box >= 0) {
-            /* Step over the media data now, while its header is still ahead of us. */
+        if ((m->lazy || m->indexed) && m->next_box >= 0) {
+            /* Step over the media data now, while its header is still ahead of us
+             * (and, on a web stream, before the audio in it is read). */
             uint32_t t2;
             int64_t s2;
             int h2;
@@ -388,6 +411,268 @@ static int load_fragment(mp4* m, fa_result* err)
     }
     free(buf);
     return 0;
+}
+
+/* ---- fragment indexes (web streams) ------------------------------------------------- */
+
+/* `t` in units of 1/`ts` s, in the track's timescale. */
+static int64_t to_track_time(const mp4* m, uint64_t t, uint32_t ts)
+{
+    if (ts == m->timescale) return (int64_t)t;
+    return (int64_t)((double)t * m->timescale / ts + 0.5);
+}
+
+static int frags_alloc(mp4* m, size_t n)
+{
+    free(m->frags);
+    m->nfrags = 0;
+    m->frags = (mp4_frag*)malloc((n ? n : 1) * sizeof(mp4_frag));
+    return m->frags != NULL;
+}
+
+/* A sidx box (14496-12 8.16.3): where each subsegment starts and when. Only an index
+ * of fragments that reaches the end of the file (a sidx of sidx boxes, or one per
+ * segment, is left to mfra or the fragment walk). `anchor` is the file offset right
+ * after the box. 1 = frags set, *ref the track it times. */
+static int parse_sidx(mp4* m, const uint8_t* p, size_t len, int64_t anchor, uint32_t* ref, int64_t* out_end)
+{
+    uint32_t ts, count, i;
+    uint64_t t, off;
+    size_t o = 12;
+    int64_t pos;
+    if (len < 12) return 0;
+    *ref = fa_be32(p + 4);
+    ts = fa_be32(p + 8);
+    if (ts == 0) return 0;
+    if (p[0] == 1) {
+        if (len < o + 20) return 0;
+        t = fa_be64(p + o);
+        off = fa_be64(p + o + 8);
+        o += 16;
+    } else {
+        if (len < o + 12) return 0;
+        t = fa_be32(p + o);
+        off = fa_be32(p + o + 4);
+        o += 8;
+    }
+    count = fa_be16(p + o + 2);
+    o += 4;
+    if (count == 0 || count > (len - o) / 12 || off > (uint64_t)MP4_MAX_OFFSET || t > (uint64_t)INT64_MAX / 4) return 0;
+    if (!frags_alloc(m, count)) return 0;
+    pos = anchor + (int64_t)off;
+    for (i = 0; i < count; i++, o += 12) {
+        uint32_t word = fa_be32(p + o);
+        if (word & 0x80000000u) return 0;            /* refers to another sidx */
+        if (pos > MP4_MAX_OFFSET || t > (uint64_t)INT64_MAX / 4) return 0;
+        m->frags[i].off = pos;
+        m->frags[i].pts = to_track_time(m, t, ts);
+        pos += word;
+        t += fa_be32(p + o + 4);
+    }
+    /* All of the file's fragments, or the first of several segments, each with a
+     * sidx of its own (only an mfra or the like may follow the last one). */
+    if (m->br.src->length > 0 && m->br.src->length - pos > MP4_TAIL) return 0;
+    m->nfrags = count;
+    *out_end = to_track_time(m, t, ts);
+    return 1;
+}
+
+/* The track's tfra box (in mfra): a time and moof offset per entry, several for one
+ * fragment when it has several sync samples. 1 = frags set. */
+static int parse_tfra(mp4* m, const uint8_t* p, size_t len)
+{
+    uint32_t sizes, count, i;
+    size_t rec, o = 16;
+    int v1;
+    if (len < 16 || fa_be32(p + 4) != m->track_id) return 0;
+    v1 = p[0] == 1;
+    sizes = fa_be32(p + 8);
+    rec = (v1 ? 16u : 8u) + ((sizes >> 4) & 3) + ((sizes >> 2) & 3) + (sizes & 3) + 3;
+    count = fa_be32(p + 12);
+    if (count > (len - o) / rec) count = (uint32_t)((len - o) / rec);
+    if (count == 0 || !frags_alloc(m, count)) return 0;
+    for (i = 0; i < count; i++, o += rec) {
+        uint64_t t = v1 ? fa_be64(p + o) : fa_be32(p + o);
+        uint64_t off = v1 ? fa_be64(p + o + 8) : fa_be32(p + o + 4);
+        if (off > (uint64_t)MP4_MAX_OFFSET || t > (uint64_t)INT64_MAX / 4) return 0;
+        if (m->nfrags > 0 && (int64_t)off == m->frags[m->nfrags - 1].off) continue;   /* the same fragment */
+        if (m->nfrags > 0 && ((int64_t)off < m->frags[m->nfrags - 1].off || (int64_t)t < m->frags[m->nfrags - 1].pts)) return 0;
+        m->frags[m->nfrags].off = (int64_t)off;
+        m->frags[m->nfrags].pts = (int64_t)t;
+        m->nfrags++;
+    }
+    return m->nfrags > 0;
+}
+
+/* mfra from the end of the file (one request, two if it is larger than MP4_TAIL),
+ * and the last fragment's end when its moof is in the same bytes. */
+static int read_mfra(mp4* m, int64_t* out_end)
+{
+    int64_t len = m->br.src->length, from;
+    uint8_t* buf = NULL;
+    size_t n, tail;
+    uint32_t mfra_size;
+    int ok = 0;
+    *out_end = FA_DEMUX_NO_PTS;
+    if (len < 16) return 0;
+    tail = len < MP4_TAIL ? (size_t)len : MP4_TAIL;
+    from = len - (int64_t)tail;
+    if (fa_net_read_range(m->net, from, (int64_t)tail, &buf, &n) != FA_OK || n != tail) goto done;
+    if (fa_be32(buf + n - 16) != 16 || fa_be32(buf + n - 12) != FA_FOURCC('m', 'f', 'r', 'o')) goto done;
+    mfra_size = fa_be32(buf + n - 4);
+    if (mfra_size < 16 || (int64_t)mfra_size > len) goto done;
+    if (mfra_size > n) {
+        free(buf);
+        buf = NULL;
+        from = len - (int64_t)mfra_size;
+        if (fa_net_read_range(m->net, from, (int64_t)mfra_size, &buf, &n) != FA_OK || n != mfra_size) goto done;
+    }
+    {
+        const uint8_t* cur = buf + n - mfra_size;
+        box mfra, b;
+        if (!next_box(&cur, buf + n, &mfra) || mfra.type != FA_FOURCC('m', 'f', 'r', 'a')) goto done;
+        cur = mfra.p;
+        while (!ok && next_box(&cur, mfra.p + mfra.len, &b))
+            if (b.type == FA_FOURCC('t', 'f', 'r', 'a')) ok = parse_tfra(m, b.p, b.len);
+    }
+    if (ok && m->frags[m->nfrags - 1].off >= from && m->frags[m->nfrags - 1].off + 8 <= from + (int64_t)n) {
+        /* The last fragment's moof is here too: its samples give the end. */
+        const uint8_t* cur = buf + (m->frags[m->nfrags - 1].off - from);
+        size_t left = n - (size_t)(cur - buf);
+        box moof;
+        if (fa_be32(cur) <= left && next_box(&cur, buf + n, &moof) && moof.type == FA_FOURCC('m', 'o', 'o', 'f')) {
+            /* Only when it is the file's last moof: tfra need not list every fragment. */
+            const uint8_t* after = cur;
+            box x;
+            int last = 1;
+            while (last && next_box(&after, buf + n - mfra_size, &x)) if (x.type == FA_FOURCC('m', 'o', 'o', 'f')) last = 0;
+            m->end_pts = m->frags[m->nfrags - 1].pts;
+            if (last && parse_moof(m, moof.p, moof.len, m->frags[m->nfrags - 1].off) == FA_OK && m->pk.n > 0)
+                *out_end = m->pk.end_pts;
+            fa_pkt_clear(&m->pk);
+        }
+    }
+done:
+    free(buf);
+    return ok;
+}
+
+/* A web stream's fragmented file whose moov lists no samples: finds the fragment
+ * index, a sidx box in front of the first fragment or an mfra at the end. 1 = the
+ * fragments are read as they are reached; *out_end is the end, FA_DEMUX_NO_PTS when
+ * the index doesn't tell. */
+static int read_index(mp4* m, int64_t* out_end)
+{
+    int64_t pos = m->next_box;
+    int boxes = 0, have = 0;
+    uint8_t* buf = NULL;
+    size_t cap = 0;
+    *out_end = FA_DEMUX_NO_PTS;
+    while (pos >= 0 && boxes++ < 16) {
+        uint32_t type, ref = 0;
+        int64_t size, end = FA_DEMUX_NO_PTS;
+        int hdr;
+        if (!read_box_header(m, pos, &type, &size, &hdr) || size < 0) break;
+        if (type == FA_FOURCC('m', 'o', 'o', 'f') || type == FA_FOURCC('m', 'd', 'a', 't')) break;
+        if (type == FA_FOURCC('s', 'i', 'd', 'x') && size - hdr <= (int64_t)MP4_MAX_INDEX &&
+            fa_br_read_alloc(&m->br, (size_t)(size - hdr), MP4_MAX_INDEX, &buf, &cap) == FA_OK) {
+            /* One sidx per track may be listed: the track's own, else the first. */
+            mp4_frag* keep = m->frags;
+            size_t nkeep = m->nfrags;
+            m->frags = NULL;
+            if (parse_sidx(m, buf, (size_t)(size - hdr), pos + size, &ref, &end) && (!have || ref == m->track_id)) {
+                free(keep);
+                have = 1;
+                /* Another track's sidx times its own samples: no exact end for this one. */
+                *out_end = ref == m->track_id ? end : FA_DEMUX_NO_PTS;
+                if (ref == m->track_id) break;
+            } else {
+                free(m->frags);
+                m->frags = keep;
+                m->nfrags = nkeep;
+            }
+        }
+        pos += size;
+    }
+    free(buf);
+    if (!have) have = m->br.src->length > 0 && read_mfra(m, out_end);
+    if (!have) {
+        free(m->frags);
+        m->frags = NULL;
+        m->nfrags = 0;
+        return 0;
+    }
+    m->first_frag = 0;
+    m->next_box = m->frags[0].off;
+    m->end_pts = m->frags[0].pts;
+    return 1;
+}
+
+/* The packets of fragment `i` on, until one comes after time t, or (t < 0) of
+ * fragment i alone (indexed). */
+static fa_result load_frags(mp4* m, size_t i, int64_t t)
+{
+    fa_result r = FA_OK;
+    int64_t stop = t < 0 && i + 1 < m->nfrags ? m->frags[i + 1].off : -1;
+    fa_pkt_clear(&m->pk);
+    m->cur = 0;
+    m->hint_redo = 0;
+    m->first_frag = i;
+    m->next_box = m->frags[i].off;
+    m->end_pts = m->frags[i].pts;
+    while ((t < 0 ? m->pk.n == 0 || (stop >= 0 && m->next_box >= 0 && m->next_box < stop) : m->pk.n == 0 || m->pk.end_pts <= t) &&
+           load_fragment(m, &r)) {}
+    return r;
+}
+
+/* The loaded packets hold time t, with `packets_back` packets and `bytes_back` bytes
+ * in front of it (or all there is in front of it, from the first fragment). */
+static int loaded_covers(const mp4* m, int64_t t, int packets_back, size_t bytes_back)
+{
+    fa_pkt p;
+    size_t k;
+    int n = 0;
+    size_t bytes = 0;
+    if (m->pk.n == 0) return 0;
+    fa_pkt_get(&m->pk, 0, &p);
+    if (p.pts > t || (t >= m->pk.end_pts && m->next_box >= 0)) return 0;
+    if (m->first_frag == 0) return 1;
+    k = fa_pkt_find(&m->pk, t);
+    while (k > 0 && (n < packets_back || bytes < bytes_back)) {
+        k--;
+        n++;
+        bytes += fa_pkt_size(&m->pk, k);
+    }
+    return n >= packets_back && bytes >= bytes_back;
+}
+
+/* ---- telling the download what comes next (web streams) ------------------------------- */
+
+/* Announces the packets of the next MP4_HINT_TIME seconds from the current one (in
+ * file order, at most MP4_HINT_SPAN bytes), or the next fragment's moof when the
+ * loaded packets are used up. Renewed from halfway through the announced packets. */
+static void mp4_hint(mp4* m)
+{
+    fa_pkt p;
+    int64_t start, end, t_end;
+    size_t i;
+    if (!m->net) return;
+    if (m->cur >= m->pk.n) {
+        if (m->indexed && m->next_box >= 0) fa_net_will_read(m->net, m->next_box, m->next_box + MP4_HINT_HEADER);
+        return;
+    }
+    if (m->cur < m->hint_redo) return;
+    fa_pkt_get(&m->pk, m->cur, &p);
+    start = p.off;
+    end = p.off + p.size;
+    t_end = p.pts + (int64_t)(MP4_HINT_TIME * m->timescale);
+    for (i = m->cur + 1; i < m->pk.n; i++) {
+        fa_pkt_get(&m->pk, i, &p);
+        if (p.pts >= t_end || p.off < start || p.off + p.size - start > MP4_HINT_SPAN) break;
+        if (p.off + p.size > end) end = p.off + p.size;
+    }
+    m->hint_redo = m->cur + (i - m->cur + 1) / 2;
+    fa_net_will_read(m->net, start, end);
 }
 
 /* ---- sample descriptions ------------------------------------------------------------------ */
@@ -700,6 +985,7 @@ static void mp4_free(mp4* m)
     fa_pkt_free(&m->pk);
     free(m->data);
     free(m->extra);
+    free(m->frags);
     free(m);
 }
 
@@ -709,7 +995,7 @@ static fa_result mp4_next(void* ctx, fa_demux_packet* out)
     fa_pkt p;
     fa_result r;
     if (m->cur >= m->pk.n) {
-        if (!m->lazy) return FA_ERROR_END_OF_STREAM;
+        if (!m->lazy && !m->indexed) return FA_ERROR_END_OF_STREAM;
         if (!load_fragment(m, &r)) return r != FA_OK ? r : FA_ERROR_END_OF_STREAM;
     }
     fa_pkt_get(&m->pk, m->cur, &p);
@@ -723,6 +1009,7 @@ static fa_result mp4_next(void* ctx, fa_demux_packet* out)
     out->pts = p.pts;
     out->duration = p.dur;
     m->cur++;
+    mp4_hint(m);
     return FA_OK;
 }
 
@@ -730,7 +1017,29 @@ static fa_result mp4_seek_packets(void* ctx, int64_t t, int packets_back, size_t
 {
     mp4* m = (mp4*)ctx;
     if (m->lazy) return FA_ERROR_NOT_SEEKABLE;
+    if (m->indexed && !loaded_covers(m, t, packets_back, bytes_back)) {
+        /* The fragment holding t. When t is within a few packets of its start, the
+         * one before instead: decoding goes on from its last packets into this one,
+         * which is then read in file order (on a web stream two requests, not four
+         * when the fragments lie far apart). */
+        size_t lo = 0, hi = m->nfrags;
+        fa_result r;
+        while (hi - lo > 1) {
+            size_t mid = lo + (hi - lo) / 2;
+            if (m->frags[mid].pts <= t) lo = mid;
+            else hi = mid;
+        }
+        if (lo > 0 && t - m->frags[lo].pts < (int64_t)(packets_back + 4) * m->pkt_dur) {
+            r = load_frags(m, lo - 1, -1);
+        } else {
+            r = load_frags(m, lo, t);
+            if (r == FA_OK && lo > 0 && !loaded_covers(m, t, packets_back, bytes_back)) r = load_frags(m, lo - 1, t);
+        }
+        if (r != FA_OK) return r;
+    }
     m->cur = fa_pkt_seek_back(&m->pk, t, packets_back, bytes_back);
+    m->hint_redo = 0;
+    mp4_hint(m);
     return FA_OK;
 }
 
@@ -743,6 +1052,7 @@ static fa_result mp4_open(fa_decoder* dec)
     fa_track_params tp;
     int64_t pos = 0;
     int qt = 1, have_moov = 0, count;
+    int64_t index_end = FA_DEMUX_NO_PTS, mehd_end = FA_DEMUX_NO_PTS;
     box moov, trak, b;
     fa_result r;
     static const uint32_t mdhd_path[2] = { FA_FOURCC('m', 'd', 'i', 'a'), FA_FOURCC('m', 'd', 'h', 'd') };
@@ -756,6 +1066,7 @@ static fa_result mp4_open(fa_decoder* dec)
     m->limit = src->length > 0 ? src->length / 4 + 1024 : (int64_t)1 << 22;
     if (m->limit > ((int64_t)1 << 25)) m->limit = (int64_t)1 << 25;
     m->next_box = -1;
+    m->net = src->seekable ? fa_net_of(src) : NULL;
 
     /* Top level: find the movie box. */
     for (;;) {
@@ -813,13 +1124,24 @@ static fa_result mp4_open(fa_decoder* dec)
     /* Fragments: trex holds the track's sample defaults. */
     if (find_box(moov.p, moov.len, FA_FOURCC('m', 'v', 'e', 'x'), &b)) {
         const uint8_t* cur = b.p;
+        uint64_t mehd = 0;            /* the whole length, movie timescale */
         box x;
-        while (next_box(&cur, b.p + b.len, &x))
+        while (next_box(&cur, b.p + b.len, &x)) {
             if (x.type == FA_FOURCC('t', 'r', 'e', 'x') && x.len >= 20 && fa_be32(x.p + 4) == m->track_id) {
                 m->trex_duration = fa_be32(x.p + 12);
                 m->trex_size = fa_be32(x.p + 16);
             }
-        if (src->seekable) {
+            if (x.type == FA_FOURCC('m', 'e', 'h', 'd') && x.len >= 8)
+                mehd = x.p[0] == 1 && x.len >= 12 ? fa_be64(x.p + 4) : fa_be32(x.p + 4);
+        }
+        if (src->seekable && m->net && m->pk.n == 0 && read_index(m, &index_end)) {
+            /* A web stream reads the fragments as it reaches them. Without an end from
+             * the index, mehd gives the length (not exact: nothing is cut there). */
+            m->indexed = 1;
+            if (index_end == FA_DEMUX_NO_PTS && mehd > 0 && m->movie_timescale > 0 && mehd < (uint64_t)INT64_MAX / 4) {
+                mehd_end = to_track_time(m, mehd, m->movie_timescale);
+            }
+        } else if (src->seekable) {
             while (load_fragment(m, &r)) {}
             if (r != FA_OK) goto fail;
         } else {
@@ -832,7 +1154,7 @@ static fa_result mp4_open(fa_decoder* dec)
      * ends. Later edits are not followed. */
     tp.time_base = 1.0 / m->timescale;
     tp.start = 0;
-    tp.end = m->lazy ? FA_DEMUX_NO_PTS : m->end_pts;
+    tp.end = m->lazy ? FA_DEMUX_NO_PTS : m->indexed ? index_end : m->end_pts;
     {
         static const uint32_t elst_path[2] = { FA_FOURCC('e', 'd', 't', 's'), FA_FOURCC('e', 'l', 's', 't') };
         box e;
@@ -857,20 +1179,23 @@ static fa_result mp4_open(fa_decoder* dec)
         }
     }
     tp.clip_to_end = tp.end != FA_DEMUX_NO_PTS;
+    if (tp.end == FA_DEMUX_NO_PTS) tp.end = mehd_end;
     tp.exact_durations = 1;
     tp.last_pts = FA_DEMUX_NO_PTS;
 
     r = fa_track_open(&m->track, dec, &mp4_ops, m, &tp);
     if (r != FA_OK) goto fail;
+    if (m->indexed && m->pk.n > 0) m->pkt_dur = fa_pkt_dur(&m->pk, 0);
     /* Only open reads the moov (the codec has its extradata, fragments are read
      * from the file), and a complete packet list grows no more. */
     free(m->moov);
     m->moov = NULL;
     m->moov_len = 0;
-    if (!m->lazy) fa_pkt_trim(&m->pk);
+    if (!m->lazy && !m->indexed) fa_pkt_trim(&m->pk);
     dec->impl = m;
     dec->seekable = src->seekable && !m->lazy;
-    if (!m->lazy) {
+    mp4_hint(m);
+    if (!m->lazy && !m->indexed) {
         /* The track's own samples: exact even with video and other tracks in the file. */
         dec->audio_bytes = fa_pkt_total_bytes(&m->pk);
     }

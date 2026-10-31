@@ -9,7 +9,7 @@
 | An HLS playlist (`.m3u8`), on demand or live | The best audio variant, MPEG-TS, fMP4 or plain audio segments, AES-128 encryption. On-demand HLS is seekable to the frame |
 | A `.pls` or `.m3u` playlist (what radio sites usually link to) | Its first entry is played |
 
-The format is detected from the content, as for files ([streams](streams.md#how-detection-works)): WAV, FLAC, MP3, Ogg Opus, Ogg Vorbis, Ogg FLAC, AAC, AC-3 and E-AC-3, also inside HLS segments (MPEG-TS, fMP4 or packed audio). AAC, which most HLS and many radio stations use, including HE-AAC and HE-AAC v2, decodes with FatzAudio's own decoder on every platform, with no FFmpeg ([AAC](streams.md#aac)).
+The format is detected from the content, as for files ([streams](streams.md#how-detection-works)): WAV, FLAC, MP3, Ogg Opus, Ogg Vorbis, Ogg FLAC, AAC, AC-3 and E-AC-3, MP4/M4A/MOV and Matroska/WebM files (also with video, [below](#mp4-and-matroska-files)), and inside HLS segments (MPEG-TS, fMP4 or packed audio). AAC, which most HLS and many radio stations use, including HE-AAC and HE-AAC v2, decodes with FatzAudio's own decoder on every platform, with no FFmpeg ([AAC](streams.md#aac)).
 
 ## C
 
@@ -163,7 +163,23 @@ A URL that isn't an absolute http or https URL throws `ArgumentException`. Other
 
 A seek outside what's downloaded waits for a network round trip. From a UI thread or a seek bar, use `fa_stream_seek_async` (.NET `RequestSeek`), which returns at once and lets a decode worker wait for the server instead ([what a seek costs](playback.md#what-a-seek-costs)).
 
-MP3 and AAC files over the network seek by estimated byte position, as most players do for files without an index, and land within a few frames of the target. The reported position is the one you asked for. WAV and FLAC seek exactly.
+MP3 and AAC files over the network seek by estimated byte position, as most players do for files without an index, and land within a few frames of the target. The reported position is the one you asked for. WAV, FLAC, MP4 and Matroska seek exactly.
+
+## MP4 and Matroska files
+
+MP4, M4A, MOV, Matroska and WebM files, also with video, play over the network as from disk, with the same length and samples. Only the audio track's own bytes are waited for, and the download is told where the next audio packets are, so video between them is downloaded but never waited for by a decode worker.
+
+| File | Opening | Seeking |
+|---|---|---|
+| MP4 with its index (`moov`) in front ("faststart", what web servers usually get) | Reads the index from the first bytes | Exact; outside what's downloaded, one reconnect at the audio's byte |
+| MP4 with its index at the end | Two reconnects: to the index at the end, and back to the start | As above |
+| Fragmented MP4 (DASH, `frag_keyframe`) with a `sidx` in front | Reads the `sidx`: fragments are read as playback reaches them | Exact: one reconnect at the fragment holding the target, two when it is within a few packets of a fragment's start (decoding starts in the fragment before) |
+| Fragmented MP4 with an `mfra` at the end and no `sidx` | One request of its own for the last 256 KB (the `mfra`, and the last fragment for the exact length); the download stays at the start | As above |
+| Fragmented MP4 with neither | Every fragment's header is read at open: a reconnect for each when they lie further apart than the download reads ahead | Exact |
+| Matroska / WebM with Cues in front | Reads them from the first bytes; the last cluster (for the exact length) costs one request of its own | Exact; outside what's downloaded, one reconnect at the cluster |
+| Matroska / WebM with Cues after the clusters (most muxers write them there) | One request of its own for the Cues and the last cluster in front of them; the download stays at the first cluster | As above |
+
+A file whose audio is spread over a lot of video (a 1080p film's soundtrack) needs the video between the packets downloaded too, so it needs the film's bitrate from the server, not the soundtrack's. Decode workers wait for 0.3 s of the whole file's bytes (from its size and length), so they never wait in a read for video that is still on its way.
 
 ## Song titles (ICY metadata)
 

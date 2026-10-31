@@ -37,6 +37,16 @@ fa_result fa_br_init(fa_br* b, fa_source* src)
     return FA_OK;
 }
 
+void fa_br_init_block(fa_br* b, fa_source* src, uint8_t* data, size_t n, int64_t base)
+{
+    memset(b, 0, sizeof(*b));
+    b->src = src;
+    b->buf = data;
+    b->cap = b->len = b->max = b->chunk = n;
+    b->base = base;
+    b->fixed = 1;
+}
+
 void fa_br_free(fa_br* b)
 {
     free(b->buf);
@@ -53,6 +63,7 @@ fa_result fa_br_seek(fa_br* b, int64_t pos)
         b->off = (size_t)(pos - b->base);
         return FA_OK;
     }
+    if (b->fixed) return FA_ERROR_IO;
     if (!b->src->seekable && pos < b->base + (int64_t)b->len) return FA_ERROR_NOT_SEEKABLE;
     r = fa_source_seek(b->src, pos);
     if (r != FA_OK) return r;
@@ -78,6 +89,7 @@ size_t fa_br_read(fa_br* b, void* out, size_t n)
             done += k;
             continue;
         }
+        if (b->fixed) break;
         b->base += (int64_t)b->len;
         b->len = b->off = 0;
         if (n - done >= b->chunk) {
