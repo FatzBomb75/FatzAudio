@@ -475,6 +475,7 @@ static fa_result reopen_codec(fa_track* t, const fa_codec_params* p)
     if (r != FA_OK) return r;
     t->codec_ready = 1;
     t->codec.dynamic_range = t->dec->dynamic_range;
+    t->codec.dolby_mix = t->dec->dolby_mix;
     codec_settings(t, p);
     return FA_OK;
 }
@@ -556,6 +557,7 @@ fa_result fa_track_open(fa_track* t, fa_decoder* dec, const fa_demux_ops* ops, v
     if (r != FA_OK) return r;
     t->codec_ready = 1;
     t->codec.dynamic_range = dec->dynamic_range;
+    t->codec.dolby_mix = dec->dolby_mix;
     codec_settings(t, &p->codec);
     t->place = 1;
 

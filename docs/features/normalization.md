@@ -33,8 +33,9 @@ For each stream, the first of these that is available wins:
 | 1 | A value your app stored earlier, given with `fa_stream_set_loudness` | instant | `FA_LOUDNESS_APP` |
 | 2 | ReplayGain 2 or R128 tags in the file (ID3v2 `TXXX`, FLAC and Ogg Vorbis comments, OpusTags, APEv2, WMA/ASF attributes) | instant | `FA_LOUDNESS_TAGS` |
 | 3 | The scan cache (`fa_engine_config.cache_directory`), keyed by the file's content | instant | `FA_LOUDNESS_CACHE` |
-| 4 | A background scan of the file, then written to the cache | see below | `FA_LOUDNESS_SCAN` |
-| 5 | Until one of the above is known, and for streams that cannot be scanned: a running estimate over the last 15 s of decoded audio | continuous | `FA_LOUDNESS_ESTIMATE` |
+| 4 | Only with `fa_engine_set_dialnorm` on: a Dolby (AC-3, E-AC-3) file's stated dialogue level ([dialnorm](dolby.md#dialogue-level-dialnorm)) | instant | `FA_LOUDNESS_DIALNORM` |
+| 5 | A background scan of the file, then written to the cache | see below | `FA_LOUDNESS_SCAN` |
+| 6 | Until one of the above is known, and for streams that cannot be scanned: a running estimate over the last 15 s of decoded audio | continuous | `FA_LOUDNESS_ESTIMATE` |
 
 ### Why the scan is fast, even on large video files
 
@@ -57,7 +58,7 @@ Streams that can't be read a second time (`fa_stream_open_io` and [web streams](
 
 ## Gain
 
-`gain = target − loudness`, limited to **−30 … +12 dB**. Silent or unmeasurable streams get 0 dB. `fa_loudness.gain_db` tells you the gain a stream gets with the current settings.
+`gain = target − loudness`, limited to **−30 … +12 dB**. Silent or unmeasurable streams get 0 dB. `fa_loudness.gain_db` tells you the gain a stream gets with the current settings. Dolby 5.1 and 7.1 mixed down to stereo get back what their downmix took off to stay below full scale, on top of that ([stereo downmix](dolby.md#stereo-downmix)).
 
 | Target | Typical use |
 |---|---|

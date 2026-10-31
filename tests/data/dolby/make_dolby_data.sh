@@ -42,6 +42,16 @@ gen aht_71 2 7.1 4 aht
 ./eac3_writer snr_any.ec3 2 any 8 snrpair snr_any_frame.ec3
 rm eac3_writer
 
+# Downmix levels and dialogue level as FFmpeg writes them: AC-3, AC-3's alternate
+# syntax (Annex D) and E-AC-3 mixing metadata. A tone per channel: L 500 Hz, R 700,
+# C 900, LFE 60, SL 1100, SR 1300.
+TONES='aevalsrc=0.5*sin(2*PI*500*t)|0.5*sin(2*PI*700*t)|0.5*sin(2*PI*900*t)|0.5*sin(2*PI*60*t)|0.5*sin(2*PI*1100*t)|0.5*sin(2*PI*1300*t):s=48000:d=0.25:c=5.1(side)'
+ff -f lavfi -i "$TONES" -c:a ac3 -b:a 384k -center_mixlev 0.5 -surround_mixlev 0 -dialnorm -24 mix_std.ac3
+ff -f lavfi -i "$TONES" -c:a ac3 -b:a 384k -dmix_mode ltrt -ltrt_cmixlev 1.414 -ltrt_surmixlev 0.841 \
+   -loro_cmixlev 1.0 -loro_surmixlev 0.5 -dialnorm -20 mix_alt.ac3
+ff -f lavfi -i "$TONES" -c:a eac3 -b:a 384k -dmix_mode loro -ltrt_cmixlev 0.595 -ltrt_surmixlev 0.5 \
+   -loro_cmixlev 0.841 -loro_surmixlev 0.707 -dialnorm -27 mix.ec3
+
 ff -i ../tone.ac3 -c:a copy -map_metadata -1 -fflags +bitexact tone_ac3.mp4
 ff -i ../tone.eac3 -c:a copy -map_metadata -1 -fflags +bitexact tone_eac3.mkv
-ls -l *.ec3 *.wav *.mp4 *.mkv
+ls -l *.ec3 *.ac3 *.wav *.mp4 *.mkv
