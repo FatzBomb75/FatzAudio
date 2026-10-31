@@ -25,6 +25,7 @@
 #define FA_CONVERT_CHUNK (FA_DECODE_CHUNK * 2)   /* most device frames one converter call makes */
 #define FA_DEFAULT_BUFFER_MS 500
 #define FA_PREFILL_MS 100
+#define FA_VOICE_BUFFER_MS 200   /* sound voices read memory: a short decode-ahead is plenty */
 #define FA_DEZIPPER_NS 5000000   /* plain parameter changes glide over 5 ms */
 #define FA_RAMP_BLOCK 16         /* ramp curves are evaluated every 16 frames */
 #define FA_NORM_GLIDE_DOWN_DB_S 12.0f
@@ -666,6 +667,27 @@ FA_API fa_result FA_CALL fa_stream_open_callback(fa_engine* engine, const fa_aud
     return FA_OK;
 }
 
+/* Sound voices (sound.c): no source, the sound's PCM decoder; never normalized. */
+fa_result fa_stream_open_voice(fa_engine* engine, fa_decoder* dec, struct fa_sound* owner, fa_stream** out)
+{
+    struct fa_stream* s;
+    fa_open_options o;
+    fa_result r;
+    *out = NULL;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_NO_NORMALIZE | FA_OPEN_NO_CDG;
+    o.buffer_ms = FA_VOICE_BUFFER_MS;
+    r = stream_create(engine, &o, &s);
+    if (r != FA_OK) { fa_decoder_close(dec); return r; }
+    s->decoder = *dec;
+    memset(dec, 0, sizeof(*dec));
+    s->decoder.src = &s->source;
+    s->decoder_ready = 1;
+    fa_exchange_ptr(&s->sound, owner);
+    *out = s;
+    return FA_OK;
+}
+
 FA_API void FA_CALL fa_midi_stream_options_init(fa_midi_stream_options* options)
 {
     if (!options) return;
@@ -882,6 +904,10 @@ FA_API void FA_CALL fa_stream_close(fa_stream* stream)
     uintptr_t self;
     if (!stream) return;
     e = stream->engine;
+    {
+        struct fa_sound* snd = (struct fa_sound*)fa_exchange_ptr(&stream->sound, NULL);
+        if (snd) fa_sound_forget(snd, stream);   /* a voice closed by the app */
+    }
     fa_mixer_stream_leaving(stream, NULL);   /* the mixer's event thread lets go of a deck's stream */
     fa_stream_cdg_detach(stream);   /* CD+G surface calls on other threads finish first */
     fa_stream_grid_closing(stream);   /* a module's grid rendered in the background stops */
@@ -3254,6 +3280,39 @@ fa_result fa_stream_ramp_tempo_quiet(struct fa_stream* s, float target, fa_time 
     r = post_tempo_locked(s, FA_PARAM_TEMPO, target, duration, NULL, 0, 0, 0);
     fa_mutex_unlock(&s->api_lock);
     return r;
+}
+
+fa_result fa_stream_voice_start(fa_stream* s, float volume, float pan)
+{
+    fa_result r = check_param(FA_PARAM_VOLUME, &volume);
+    if (r == FA_OK) r = check_param(FA_PARAM_PAN, &pan);
+    if (r != FA_OK) return r;
+    fa_mutex_lock(&s->api_lock);
+    if (!is_attached(s)) {
+        r = FA_ERROR_INVALID_ARG;
+    } else {
+        /* Duration 0: the new copy starts at its own level, not gliding from the last one's. */
+        post_lane_locked(s, FA_PARAM_VOLUME, volume, 0, NULL, 0, 0, -1, 0);
+        post_lane_locked(s, FA_PARAM_PAN, pan, 0, NULL, 0, 0, -1, 0);
+        /* A voice the app detached mid-play was left paused there: a new copy plays
+         * from the start, so make start_locked rewind it. */
+        fa_cas32(&s->state, FA_STATE_PAUSED, FA_STATE_STOPPED);
+        start_locked(s, -1);
+    }
+    fa_mutex_unlock(&s->api_lock);
+    return r;
+}
+
+int fa_stream_voice_busy(fa_stream* s)
+{
+    int busy;
+    int32_t st;
+    fa_mutex_lock(&s->api_lock);
+    st = fa_load32(&s->state);
+    busy = is_attached(s) && (st == FA_STATE_PLAYING || st == FA_STATE_PAUSED || st == FA_STATE_SCHEDULED ||
+                              st == FA_STATE_BUFFERING);
+    fa_mutex_unlock(&s->api_lock);
+    return busy;
 }
 
 FA_API fa_result FA_CALL fa_stream_set_param(fa_stream* stream, fa_param param, float value)

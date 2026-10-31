@@ -343,6 +343,72 @@ public sealed partial class AudioEngine : IDisposable
         return AudioStream.Wrap(this, rc, s, null);
     }
 
+    /// <summary>
+    /// Loads a short sound into memory to play as many overlapping copies as needed (<see cref="Sound"/>): any
+    /// format a stream opens. The whole file is decoded now.
+    /// </summary>
+    /// <param name="path">Path of the file.</param>
+    /// <param name="options">Voice limit, steal rule and open options; null = 8 voices, oldest stolen.</param>
+    /// <returns>The sound; dispose it when done.</returns>
+    /// <exception cref="FatzAudioException">The file could not be opened or decoded, or is over 1 GB as PCM
+    /// (<see cref="ErrorCode.TooLarge"/>).</exception>
+    /// <example>
+    /// <code>
+    /// using var horn = engine.LoadSound("horn.wav", new SoundOptions { MaxVoices = 4 });
+    /// horn.Play(output);
+    /// </code>
+    /// </example>
+    public unsafe Sound LoadSound(string path, SoundOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        var h = Handle;
+        var o = Sound.ToNative(options);
+        using var opts = NativeOptions.Create(options?.Open);
+        o.Open = opts.Pointer;
+        return Sound.Wrap(this, NativeMethods.fa_sound_load_path(h, path, &o, out nint s), s);
+    }
+
+    /// <summary>Loads a short sound from a file held in memory (decoded now; the bytes are not kept).</summary>
+    /// <param name="data">Encoded audio file contents.</param>
+    /// <param name="options">Voice limit, steal rule and open options.</param>
+    /// <returns>The sound; dispose it when done.</returns>
+    /// <exception cref="FatzAudioException">The data could not be decoded.</exception>
+    public unsafe Sound LoadSound(ReadOnlyMemory<byte> data, SoundOptions? options = null)
+    {
+        var h = Handle;
+        var o = Sound.ToNative(options);
+        using var opts = NativeOptions.Create(options?.Open);
+        o.Open = opts.Pointer;
+        using var pin = data.Pin();
+        return Sound.Wrap(this, NativeMethods.fa_sound_load_memory(h, pin.Pointer, (nuint)data.Length, &o, out nint s), s);
+    }
+
+    /// <summary>Makes a sound from your own samples (BASS_SampleCreate + BASS_SampleSetData). They are copied.</summary>
+    /// <param name="samples">Interleaved 32-bit float samples, a whole number of frames.</param>
+    /// <param name="sampleRate">1000 to 768000 Hz.</param>
+    /// <param name="channels">1 to 32.</param>
+    /// <param name="options">Voice limit and steal rule (Open is ignored).</param>
+    /// <returns>The sound; dispose it when done.</returns>
+    /// <exception cref="ArgumentException">The samples are empty or not a whole number of frames.</exception>
+    /// <example>
+    /// <code>
+    /// var beep = new float[4800];
+    /// for (int i = 0; i &lt; beep.Length; i++) beep[i] = 0.3f * MathF.Sin(i * 2 * MathF.PI * 1000 / 48000);
+    /// using var sound = engine.CreateSound(beep, 48000, 1);
+    /// </code>
+    /// </example>
+    public unsafe Sound CreateSound(ReadOnlySpan<float> samples, int sampleRate, int channels, SoundOptions? options = null)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(channels, 1);
+        if (samples.IsEmpty || samples.Length % channels != 0)
+            throw new ArgumentException("The samples must be a whole number of frames.", nameof(samples));
+        var h = Handle;
+        var o = Sound.ToNative(options);
+        var f = new FaAudioFormat { SampleFormat = 0, SampleRate = (uint)Math.Max(sampleRate, 0), Channels = (uint)channels };
+        fixed (float* p = samples)
+            return Sound.Wrap(this, NativeMethods.fa_sound_load_pcm(h, &f, p, samples.Length / channels, &o, out nint s), s);
+    }
+
     /// <summary>Opens a managed <see cref="Stream"/> as audio source via custom I/O callbacks.</summary>
     /// <param name="source">A readable stream. Seeking and length are used when <see cref="Stream.CanSeek"/> is true.</param>
     /// <param name="options">Optional open options.</param>

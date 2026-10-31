@@ -8,6 +8,7 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Opening and decoding streams (format detection, custom I/O, MP4 and MKV audio tracks, built-in AAC, Ogg Opus, Vorbis and FLAC, FLAC in MP4 and MKV) | [streams.md](streams.md) | ✅ |
 | Playback, buffering and threads (decode-ahead, transport, device clock, engine load) | [playback.md](playback.md) | ✅ |
 | Callback streams and capture streams (audio from your own function; an input device as a stream, for recording) | [callback-capture.md](callback-capture.md) | ✅ |
+| Sounds: a voice pool (a short sound loaded once, many overlapping copies with their own volume and pan, voice limit and steal rules) | [sounds.md](sounds.md) | ✅ |
 | Volume, pan and ramps (7 curves, scheduled starts, ramp-done) | [ramps.md](ramps.md) | ✅ volume and pan |
 | Events | [events.md](events.md) | ✅ ended, ramp done, marker, started, loudness final, metadata, stalled/resumed, decode error, MIDI text |
 | Loudness normalization (R128 scans, tags, cache, limiter) | [normalization.md](normalization.md) | ✅ |

@@ -31,6 +31,15 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   `SoundFontStackEntry`, `SoundFont.Presets`. DLS banks: connections with a controller, velocity, key or pressure
   (velocity to attack time, the mod wheel scaling the LFO, key to filter cutoff) play as SoundFont 2 modulators, and
   DLS 2 conditional chunks are followed. See [docs/features/midi.md](docs/features/midi.md#several-soundfonts-as-one).
+
+- Sounds, a voice pool (extras step 24): a short sound decoded once into memory and played as many overlapping copies
+  as needed, each with its own volume and pan (BASS_Sample*). `fa_sound_load_path`, `fa_sound_load_memory`,
+  `fa_sound_load_pcm`, `fa_sound_play` (device, bus, volume, pan; returns the voice), `fa_sound_stop`,
+  `fa_sound_get_voices`, `fa_sound_get_info`, `fa_sound_set_options`, `fa_sound_close`. Voices are ordinary streams
+  that all read the one PCM buffer; free voices are reused; `max_voices` (default 8, up to 1024) with the steal rules
+  `FA_SOUND_STEAL_OLDEST` (default), `_QUIETEST` and `_NONE`. .NET: `engine.LoadSound`, `engine.CreateSound`, `Sound`,
+  `SoundOptions`, `SoundSteal`, `SoundInfo`. New file `src/sound.c`. See [docs/features/sounds.md](docs/features/sounds.md).
+
 - MIDI events and a real-time MIDI stream (extras step 15). `fa_stream_open_midi` (BASS_MIDI_StreamCreate): a
   synthesizer with no file that plays the events the app sends, rendering only `fa_midi_stream_options.latency_ms`
   (30 ms by default, 10..500) ahead of the output. `fa_stream_send_midi_events` (`fa_midi_event`: notes, key and

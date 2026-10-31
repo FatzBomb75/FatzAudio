@@ -419,12 +419,15 @@ public unsafe partial class AudioStream : IDisposable
     internal nint NativeHandle => _handle.DangerousGetHandle();
 
     // A DJ deck attached the stream to the mixer's device (fa_deck_load): mirror it here.
-    internal void JoinedDeck(OutputDevice device)
+    internal void JoinedDeck(OutputDevice device) => JoinedVoice(device, null);
+
+    // A sound attached one of its voices natively (fa_sound_play): mirror it here.
+    internal void JoinedVoice(OutputDevice device, MixBus? bus)
     {
         var h = Handle;
         if (!ReferenceEquals(_device, device)) h.AttachDevice(device.Handle);
         _device = device;
-        _bus = null;
+        _bus = bus;
     }
 
     // The deck let it go (unloaded: detached natively).
