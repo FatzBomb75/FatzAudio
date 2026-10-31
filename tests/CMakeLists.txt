@@ -30,6 +30,13 @@ if(UNIX)
 endif()
 add_test(NAME analysis COMMAND fa_test_analysis WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
 
+add_executable(fa_test_parity test_parity.c)
+target_link_libraries(fa_test_parity PRIVATE fatzaudio)
+if(UNIX)
+    target_link_libraries(fa_test_parity PRIVATE m)
+endif()
+add_test(NAME parity COMMAND fa_test_parity WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+
 # White-box tests: the library sources linked straight into the test, so it can
 # drive the mixer by hand and check exact sample values.
 list(TRANSFORM FA_SOURCES PREPEND ${PROJECT_SOURCE_DIR}/)

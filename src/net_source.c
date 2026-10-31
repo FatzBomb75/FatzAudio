@@ -550,6 +550,35 @@ static void download_main(void* arg)
 
 /* ---- opening and closing ------------------------------------------------------ */
 
+/* The app raised its open cancel flag (fa_open_options.cancel) while the opening
+ * thread waits here: the download ends for good, as in fa_net_interrupt, and the
+ * waits that check `quit` return. Caller holds the lock (released for a moment). */
+static int open_cancelled_locked(fa_net* n)
+{
+    if (!n->cfg.open_cancel || !*n->cfg.open_cancel) return 0;
+    if (!n->open_aborted) {
+        n->open_aborted = 1;
+        n->quit = 1;
+        fa_store32(&n->cancel, 1);
+        fa_cond_broadcast(&n->cond);
+        fa_mutex_unlock(&n->lock);
+        fa_http_abort(&n->cancel);
+        fa_mutex_lock(&n->lock);
+    }
+    return 1;
+}
+
+fa_result fa_net_open_done(fa_net* n)
+{
+    fa_result r;
+    fa_mutex_lock(&n->lock);
+    open_cancelled_locked(n);   /* raised after the last wait: the open is still cancelled */
+    n->cfg.open_cancel = NULL;
+    r = n->open_aborted ? FA_ERROR_CANCELLED : FA_OK;
+    fa_mutex_unlock(&n->lock);
+    return r;
+}
+
 fa_result fa_net_open(const fa_net_config* cfg, fa_net** out)
 {
     fa_net* n;
@@ -585,9 +614,13 @@ fa_result fa_net_open(const fa_net_config* cfg, fa_net** out)
     fa_mutex_lock(&n->lock);
     {
         int64_t deadline = fa_monotonic_ns() + (int64_t)n->cfg.timeout_ms * 1000000 * 2;
-        while (!n->finished && !(n->head_ready && n->win_end >= FA_PROBE_BYTES) && fa_monotonic_ns() < deadline)
+        while (!n->finished && !(n->head_ready && n->win_end >= FA_PROBE_BYTES) && fa_monotonic_ns() < deadline &&
+               !open_cancelled_locked(n))
             fa_cond_wait_ms(&n->cond, &n->lock, 50);
-        if (n->win_end == 0) {
+        /* Raised while the download failed by itself: still the app's cancel. */
+        if (n->open_aborted || (n->win_end == 0 && open_cancelled_locked(n))) {
+            r = FA_ERROR_CANCELLED;
+        } else if (n->win_end == 0) {
             r = n->error != FA_OK ? n->error : (n->finished ? FA_ERROR_UNSUPPORTED_FORMAT : FA_ERROR_NETWORK);
             if (n->finished && n->head_ready && n->http_status < 400 && n->error == FA_OK) r = FA_ERROR_UNSUPPORTED_FORMAT;
         }
@@ -681,6 +714,7 @@ static int64_t FA_CALL io_read(void* user, void* buffer, size_t bytes)
             fa_store32(&n->cancel, 1);
             fa_cond_broadcast(&n->cond);
         }
+        if (open_cancelled_locked(n)) continue;   /* ends at `quit` above */
         if (!waited && n->sample_rate) fa_fetch_add32(&fa_net_test_read_waits, 1);
         waited = 1;
         fa_cond_wait_ms(&n->cond, &n->lock, 100);

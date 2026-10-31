@@ -34,7 +34,7 @@ int fa_sample_kind(fa_sample_format f, int* out_planar)
     }
 }
 
-static int sample_bytes(int kind)
+int fa_sample_bytes(int kind)
 {
     static const int b[] = { 1, 1, 2, 3, 4, 8, 4, 8 };
     return b[kind];
@@ -122,7 +122,7 @@ void fa_zero_non_finite(float* p, size_t n)
 void fa_convert_to_f32(const void* const* planes, int kind, int planar, int big_endian,
                        uint32_t channels, fa_frames frames, float* out)
 {
-    size_t bytes = (size_t)sample_bytes(kind);
+    size_t bytes = (size_t)fa_sample_bytes(kind);
     int swap = big_endian && !native_big_endian();
     uint32_t c;
     if (kind == FA_SAMPLE_F32 && !planar && !swap) {
@@ -315,7 +315,7 @@ typedef struct pcm_state {
 static fa_result pcm_decode(fa_codec* c, const uint8_t* data, size_t size)
 {
     pcm_state* st = (pcm_state*)c->impl;
-    size_t frame_bytes = (size_t)sample_bytes(st->layout->kind) * c->channels, whole;
+    size_t frame_bytes = (size_t)fa_sample_bytes(st->layout->kind) * c->channels, whole;
     fa_frames n;
     fa_result r;
     const void* plane[1];

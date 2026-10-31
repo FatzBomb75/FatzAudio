@@ -56,6 +56,9 @@ typedef struct fa_disc_ops {
     fa_result (*tray)(void* h, int open);
     fa_result (*lock)(void* h, int locked);
     void (*close)(void* h);
+    /* The pregap of a track (fa_disc_get_pregap) when the backend knows it (a cue
+     * sheet); NULL: found from the Q subcode. */
+    fa_result (*read_pregap)(void* h, int track, int64_t* out_sectors);
 } fa_disc_ops;
 
 /* Opens a disc over a backend; takes ownership of `h` (closed on failure too). */

@@ -19,13 +19,13 @@
 #define FA_SPECTRUM_MAX_LOG2 14   /* 16384 */
 #define FA_TWO_PI 6.283185307179586
 
-/* Frames for 1 s windows on `dev`: a window ends at the speaker, up to the latency
- * and a callback behind the newest frame written, and stays a guard of two
+/* Frames for windows of `seconds` on `dev`: a window ends at the speaker, up to the
+ * latency and a callback behind the newest frame written, and stays a guard of two
  * callbacks clear of what the next ones write (view_open). */
-static uint32_t tap_frames(fa_device* dev)
+static uint32_t tap_frames(fa_device* dev, uint32_t seconds)
 {
     uint32_t rate = dev ? dev->rate : 48000, frames = 65536, cb = 0;
-    int64_t need = rate, latency = 0;
+    int64_t need = (int64_t)rate * seconds, latency = 0;
     if (dev) {
         cb = (uint32_t)fa_load32(&dev->period_frames);
         if (dev->cb_prev_frames > cb) cb = dev->cb_prev_frames;   /* the callbacks seen, if bigger */
@@ -36,12 +36,13 @@ static uint32_t tap_frames(fa_device* dev)
     return frames;
 }
 
-static fa_tap* tap_new(uint32_t frames)
+static fa_tap* tap_new(fa_device* device, uint32_t seconds)
 {
     fa_tap* t = (fa_tap*)calloc(1, sizeof(*t));
     if (!t) return NULL;
-    t->frames = frames;
-    t->buf = (float*)calloc((size_t)frames * FA_DEVICE_CHANNELS, sizeof(float));
+    t->seconds = seconds;
+    t->frames = tap_frames(device, seconds);
+    t->buf = (float*)calloc((size_t)t->frames * FA_DEVICE_CHANNELS, sizeof(float));
     if (!t->buf) { free(t); return NULL; }
     return t;
 }
@@ -50,7 +51,7 @@ fa_tap* fa_tap_get(fa_atomic_ptr* slot, fa_device* device)
 {
     fa_tap* t = (fa_tap*)fa_load_ptr(slot);
     if (t) return t;
-    t = tap_new(tap_frames(device));
+    t = tap_new(device, 1);
     if (!t) return NULL;
     if (!fa_cas_ptr(slot, NULL, t)) {   /* another thread made one first */
         fa_tap_free(t);
@@ -59,15 +60,33 @@ fa_tap* fa_tap_get(fa_atomic_ptr* slot, fa_device* device)
     return t;
 }
 
-void fa_tap_fit(fa_atomic_ptr* slot, fa_device* device)
+/* Replaces the tap in `slot` by an empty one for windows of `seconds`. */
+static void tap_replace(fa_atomic_ptr* slot, fa_device* device, uint32_t seconds)
 {
-    fa_tap* t = (fa_tap*)fa_load_ptr(slot), *bigger;
-    if (!t || t->frames >= tap_frames(device)) return;
-    bigger = tap_new(tap_frames(device));
+    fa_tap* t = (fa_tap*)fa_load_ptr(slot), *bigger = tap_new(device, seconds);
     if (!bigger) return;   /* windows are shortened to what fits */
     fa_exchange_ptr(slot, bigger);
-    fa_device_wait_quiescent(device);   /* a callback still writing the old one is done */
+    /* A callback still writing the old one is done (with no device, the caller's
+     * api_lock keeps the stream from being attached meanwhile). */
+    if (device) fa_device_wait_quiescent(device);
     fa_tap_free(t);
+}
+
+void fa_tap_fit(fa_atomic_ptr* slot, fa_device* device)
+{
+    fa_tap* t = (fa_tap*)fa_load_ptr(slot);
+    if (!t || t->frames >= tap_frames(device, t->seconds)) return;
+    tap_replace(slot, device, t->seconds);
+}
+
+/* The tap in `slot` for windows of `seconds` on `device` (NULL: not attached), made
+ * or made bigger as needed. Same callers and locking as fa_tap_fit. */
+static fa_tap* tap_for(fa_atomic_ptr* slot, fa_device* device, uint32_t seconds)
+{
+    fa_tap* t = fa_tap_get(slot, device);
+    if (t && t->seconds < seconds) tap_replace(slot, device, seconds);
+    else if (device) fa_tap_fit(slot, device);
+    return (fa_tap*)fa_load_ptr(slot);
 }
 
 void fa_tap_free(fa_tap* t)
@@ -182,6 +201,52 @@ static void zero_levels(float* peak, float* rms, uint32_t channels)
     if (rms) memset(rms, 0, channels * sizeof(float));
 }
 
+/* ---- loudness meters ---------------------------------------------------- */
+
+#define FA_LOUD_SUBS 30          /* short-term: 3 s of 100 ms sub-blocks; momentary: the last 4 */
+#define FA_LOUD_WARMUP_MS 200    /* the K-weighting filters settle on the audio before the window */
+#define FA_LOUD_CHUNK 1024
+
+/* Frames a loudness view covers on `dev`: the warm-up and 3 s. */
+static int64_t loudness_frames(const fa_device* dev, int64_t* out_warm)
+{
+    int64_t sub = ((int64_t)dev->rate + 5) / 10;   /* fa_meter's sub-block */
+    *out_warm = (int64_t)dev->rate * FA_LOUD_WARMUP_MS / 1000;
+    return *out_warm + FA_LOUD_SUBS * sub;
+}
+
+static double subs_lufs(const fa_meter* m, int64_t count)
+{
+    double sum = 0.0;
+    int64_t i;
+    for (i = 0; i < count; i++) sum += m->subs[(m->nsubs - 1 - i) % m->cap];
+    sum /= (double)count;
+    return sum > 0.0 ? -0.691 + 10.0 * log10(sum) : -HUGE_VAL;
+}
+
+/* Momentary (400 ms) and short-term (3 s) loudness of a view of loudness_frames. */
+static fa_result loudness(const tap_view* v, uint32_t rate, int64_t warm, double* momentary, double* short_term)
+{
+    float buf[FA_LOUD_CHUNK * 2];
+    fa_meter m;
+    int64_t f, i;
+    fa_result r = fa_meter_init(&m, rate, 2, 0, FA_LOUD_SUBS);
+    if (r != FA_OK) return r;
+    m.skip = warm;
+    for (f = 0; f < v->n && r == FA_OK; f += FA_LOUD_CHUNK) {
+        int64_t k = v->n - f < FA_LOUD_CHUNK ? v->n - f : FA_LOUD_CHUNK;
+        for (i = 0; i < k; i++) view_frame(v, f + i, &buf[i * 2], &buf[i * 2 + 1]);
+        r = fa_meter_process(&m, buf, k);
+    }
+    if (r == FA_OK && m.nsubs < FA_LOUD_SUBS) r = FA_ERROR_GENERIC;   /* never: the view is 30 sub-blocks */
+    if (r == FA_OK) {
+        if (momentary) *momentary = subs_lufs(&m, 4);
+        if (short_term) *short_term = subs_lufs(&m, FA_LOUD_SUBS);
+    }
+    fa_meter_free(&m);
+    return r;
+}
+
 /* ---- spectrum ----------------------------------------------------------- */
 
 /* Per size: cos and sin of 2 pi k / n for k < n/2, the Hann window and its sum
@@ -291,6 +356,9 @@ static int64_t speaker_end(fa_device* dev, int after_limiter)
 }
 
 typedef struct measure {
+    uint32_t seconds;         /* the tap's window: 1, or 4 for loudness */
+    double *momentary, *short_term; /* loudness: loud != 0 */
+    int loud;
     fa_time window;           /* levels: > 0 */
     float *peak, *rms;
     uint32_t channels;
@@ -303,7 +371,9 @@ typedef struct measure {
 static fa_result run_measure(const measure* m, fa_tap* t, fa_device* dev, int after_limiter)
 {
     tap_view v;
-    if (device_live(dev) && view_open(&v, t, dev, speaker_end(dev, after_limiter), m->window, m->size)) {
+    int64_t warm = 0, frames = m->loud ? loudness_frames(dev, &warm) : m->size;
+    if (device_live(dev) && view_open(&v, t, dev, speaker_end(dev, after_limiter), m->window, frames)) {
+        if (m->loud) return loudness(&v, dev->rate, warm, m->momentary, m->short_term);
         if (m->bins) {
             const fa_fft_tables* tb = fa_fft_tables_get(m->size);
             if (!tb) return FA_ERROR_OUT_OF_MEMORY;
@@ -318,7 +388,10 @@ static fa_result run_measure(const measure* m, fa_tap* t, fa_device* dev, int af
 
 static void zero_measure(const measure* m)
 {
-    if (m->bins) {
+    if (m->loud) {
+        if (m->momentary) *m->momentary = -HUGE_VAL;
+        if (m->short_term) *m->short_term = -HUGE_VAL;
+    } else if (m->bins) {
         memset(m->bins, 0, (m->size / 2) * sizeof(float));
         if (m->bin_hz) *m->bin_hz = 0.0f;
     } else {
@@ -337,9 +410,7 @@ static fa_result stream_measure(struct fa_stream* s, const measure* m)
     {
         /* Made also before the stream is attached, so a meter set up first sees it start;
          * made bigger when the device's latency or callbacks grew past what it holds. */
-        fa_tap* t;
-        if (dev) fa_tap_fit(&s->tap, dev);
-        t = fa_tap_get(&s->tap, dev);
+        fa_tap* t = tap_for(&s->tap, dev, m->seconds);
         if (!t) r = FA_ERROR_OUT_OF_MEMORY;
         else if (dev && fa_load32(&s->state) == FA_STATE_PLAYING) r = run_measure(m, t, dev, 0);
     }
@@ -350,10 +421,13 @@ static fa_result stream_measure(struct fa_stream* s, const measure* m)
 
 static fa_result device_measure(fa_device* dev, const measure* m)
 {
-    fa_tap* t = fa_tap_get(&dev->tap, dev);
+    fa_tap* t;
     fa_result r;
-    if (!t) return FA_ERROR_OUT_OF_MEMORY;
-    r = run_measure(m, t, dev, 1);
+    /* The first loudness read replaces the tap by a longer one: readers take turns. */
+    fa_mutex_lock(&dev->lock);
+    t = tap_for(&dev->tap, dev, m->seconds);
+    r = t ? run_measure(m, t, dev, 1) : FA_ERROR_OUT_OF_MEMORY;
+    fa_mutex_unlock(&dev->lock);
     if (r == FA_ERROR_NOT_FOUND) { zero_measure(m); r = FA_OK; }
     return r;
 }
@@ -361,6 +435,7 @@ static fa_result device_measure(fa_device* dev, const measure* m)
 static int levels_args(measure* m, fa_time window, float* peak, float* rms, uint32_t channels)
 {
     memset(m, 0, sizeof(*m));
+    m->seconds = 1;
     m->window = window;
     m->peak = peak;
     m->rms = rms;
@@ -368,9 +443,20 @@ static int levels_args(measure* m, fa_time window, float* peak, float* rms, uint
     return window > 0 && (channels == 1 || channels == 2) && (peak || rms);
 }
 
+static int loudness_args(measure* m, double* momentary, double* short_term)
+{
+    memset(m, 0, sizeof(*m));
+    m->seconds = 4;
+    m->loud = 1;
+    m->momentary = momentary;
+    m->short_term = short_term;
+    return momentary || short_term;
+}
+
 static int spectrum_args(measure* m, uint32_t size, uint32_t flags, float* bins, float* bin_hz)
 {
     memset(m, 0, sizeof(*m));
+    m->seconds = 1;
     m->size = size;
     m->flags = flags;
     m->bins = bins;
@@ -393,6 +479,21 @@ FA_API fa_result FA_CALL fa_stream_get_spectrum(fa_stream* stream, uint32_t size
     if (!spectrum_args(&m, size, flags, out_bins, out_bin_hz) || !stream || (stream->flags & FA_OPEN_DECODE_ONLY))
         return FA_ERROR_INVALID_ARG;
     return stream_measure(stream, &m);
+}
+
+FA_API fa_result FA_CALL fa_stream_get_loudness_meter(fa_stream* stream, double* out_momentary_lufs, double* out_short_term_lufs)
+{
+    measure m;
+    if (!loudness_args(&m, out_momentary_lufs, out_short_term_lufs) || !stream || (stream->flags & FA_OPEN_DECODE_ONLY))
+        return FA_ERROR_INVALID_ARG;
+    return stream_measure(stream, &m);
+}
+
+FA_API fa_result FA_CALL fa_device_get_loudness_meter(fa_device* device, double* out_momentary_lufs, double* out_short_term_lufs)
+{
+    measure m;
+    if (!loudness_args(&m, out_momentary_lufs, out_short_term_lufs) || !device) return FA_ERROR_INVALID_ARG;
+    return device_measure(device, &m);
 }
 
 FA_API fa_result FA_CALL fa_device_get_levels(fa_device* device, fa_time window, float* out_peak, float* out_rms, uint32_t channels)

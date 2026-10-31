@@ -651,7 +651,7 @@ public unsafe class AudioStream : IDisposable
         {
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_cdg_info(Handle, out var i));
             return new CdgInfo((CdgSource)i.Source, (long)i.PackCount, TimeConvert.FromNanoseconds(i.CheckpointInterval),
-                (int)i.CheckpointCount, i.DiscParity < 0 ? null : i.DiscParity != 0);
+                (int)i.CheckpointCount, i.DiscParity < 0 ? null : i.DiscParity != 0, (long)i.DiscCorrected, (long)i.DiscDropped);
         }
     }
 
@@ -1231,13 +1231,15 @@ public unsafe class AudioStream : IDisposable
 
     /// <summary>
     /// Plays backwards (bass_fx's <c>BASS_FX_ReverseCreate</c> and <c>BASS_ATTRIB_REVERSE_DIR</c>). Can be changed at any
-    /// time, also while playing: the stream restarts at the position heard, as a seek does. Reversed, the position and
+    /// time, also while playing: playing or paused, it turns at once (the last 200 ms heard play back the other way while
+    /// the decoder catches up, so there is no gap); stopped or ended, it starts over at the position. Reversed, the position and
     /// the clock count down and the stream ends at the cue-in marker (or the start); playing from stopped or ended
     /// starts at the cue-out marker (or the end), and a loop wraps from its start to its end. Tempo, pitch, rate and
     /// fades work as forward. Events tied to a frame (markers, <see cref="Looped"/>, positions, MIDI texts, tracker rows)
     /// are raised as the position counts down past it, last first. On a DJ deck, sync, deck loops and beat jumps work
     /// mirrored: the deck is pulled onto the leader's beat with its beats counting down, and loops turn at their in
-    /// point. The blocks the source is decoded in are cross-faded where they meet.
+    /// point; with <see cref="DjDeck.Slip"/> on, turning back returns to where the deck would be. The blocks the source
+    /// is decoded in are cross-faded where they meet.
     /// </summary>
     /// <exception cref="FatzAudioException">Turning it on for a stream that cannot seek (push and packet streams):
     /// <see cref="ErrorCode.NotSeekable"/>; for a web stream: <see cref="ErrorCode.NotImplemented"/>.</exception>
@@ -1630,6 +1632,24 @@ public unsafe class AudioStream : IDisposable
                 handle, TimeConvert.ToNanoseconds(window ?? StreamLevels.DefaultWindow), pp, pr, (uint)ch));
         }
         return ch;
+    }
+
+    /// <summary>
+    /// Loudness meters (BASSloud, EBU R128) of the stream's audio being heard now: the momentary (last 400 ms) and
+    /// short-term (last 3 s) loudness in LUFS, K-weighted (same source and timing as <see cref="GetLevels(TimeSpan?)"/>:
+    /// before volume, pan, fades and normalization). <see cref="double.NegativeInfinity"/> for silence and while the
+    /// stream is not playing. The first call starts measuring, so the values read low for 3 s. Each call measures
+    /// afresh (about 1 ms): 10 calls a second from a UI timer are plenty. A whole song's integrated loudness is
+    /// <see cref="GetLoudness"/>.
+    /// </summary>
+    /// <returns>The momentary and short-term loudness.</returns>
+    /// <exception cref="FatzAudioException">A decode-only stream (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public LoudnessMeter GetLoudnessMeter()
+    {
+        double m, st;
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_loudness_meter(Handle, &m, &st));
+        return new LoudnessMeter(m, st);
     }
 
     /// <summary>

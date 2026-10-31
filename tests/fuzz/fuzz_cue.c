@@ -23,6 +23,10 @@ static void play(fa_disc* d)
     for (t = 0; t <= toc.track_count && t < 6; t++)
         for (k = FA_DISC_TEXT_TITLE; k <= FA_DISC_TEXT_CODE; k++)
             (void)fa_disc_get_text(d, t ? toc.first_track + t - 1 : 0, (fa_disc_text)k, text, sizeof(text));
+    for (t = 0; t < toc.track_count && t < 6; t++) {
+        int64_t gap;
+        (void)fa_disc_get_pregap(d, toc.first_track + t, &gap);   /* the cue sheet, or the Q subcode search */
+    }
     for (t = 0; t < toc.track_count && t < 4; t++) {
         fa_open_options o;
         fa_stream* s = NULL;

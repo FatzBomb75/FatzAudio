@@ -34,6 +34,7 @@ struct fa_disc {
     fa_disc_toc toc;
     char* text[FA_DISC_MAX_TRACKS + 1][CD_TEXT_FIELDS];   /* [0] = album; NULL = none */
     uint8_t code_tried[FA_DISC_MAX_TRACKS + 1];          /* subcode asked for the CODE field */
+    int64_t pregap[FA_DISC_MAX_TRACKS];                  /* per toc.tracks[] entry, -1 = not known yet */
     uint8_t* bust;                  /* one sector, for cache-busting reads */
 };
 
@@ -198,16 +199,19 @@ static void make_musicbrainz(fa_disc_toc* toc, int last, int64_t leadout)
 
 /* ---- CD-Text ------------------------------------------------------------------------ */
 
-uint16_t fa_cdtext_crc(const uint8_t* p)
+/* CRC-16 (x^16 + x^12 + x^5 + 1), inverted: CD-Text packs and the Q subcode. */
+static uint16_t crc16_inv(const uint8_t* p, int n)
 {
     uint16_t crc = 0;
     int i, b;
-    for (i = 0; i < 16; i++) {
+    for (i = 0; i < n; i++) {
         crc ^= (uint16_t)(p[i] << 8);
         for (b = 0; b < 8; b++) crc = (uint16_t)((crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1);
     }
     return (uint16_t)~crc;
 }
+
+uint16_t fa_cdtext_crc(const uint8_t* p) { return crc16_inv(p, 16); }
 
 /* ISO 8859-1 (and ASCII) to UTF-8. */
 static char* latin1_to_utf8(const uint8_t* s, size_t n)
@@ -343,6 +347,7 @@ static fa_result read_toc_locked(fa_disc* d)
     if (!resp) return FA_ERROR_OUT_OF_MEMORY;
     memset(toc, 0, sizeof(*toc));
     clear_text(d);
+    for (k = 0; k < FA_DISC_MAX_TRACKS; k++) d->pregap[k] = -1;
 
     r = d->ops->read_toc(d->h, 0, 1, resp, 4 + 8 * 100, &len);
     if (r != FA_OK || len < 4 + 16) { free(resp); return r == FA_OK || r == FA_ERROR_IO ? FA_ERROR_NO_DISC : r; }
@@ -405,6 +410,120 @@ static const fa_disc_track* find_track(const fa_disc_toc* toc, int32_t number)
     int k = number - toc->first_track;
     if (k < 0 || k >= toc->track_count || toc->tracks[k].number != number) return NULL;
     return &toc->tracks[k];
+}
+
+/* ---- pregaps ---------------------------------------------------------------------- */
+
+#define PREGAP_TRIES 4              /* sectors tried around a probe whose Q cannot be read */
+#define Q_SHIFT_UNKNOWN 99
+
+/* A search for a track's pregap in the Q subcode. It takes the disc lock for each read
+ * only, so a track playing meanwhile goes on reading between them. */
+typedef struct pregap_search {
+    fa_disc* d;
+    int32_t gen;                    /* the disc's generation when it started */
+    int32_t number;                 /* the track */
+    int64_t leadout;
+    int shift;                      /* the drive returns the Q of sector lba + shift with lba */
+    fa_result io;                   /* FA_ERROR_NOT_IMPLEMENTED or NO_DISC: the search stops */
+} pregap_search;
+
+static int bcd(uint8_t v) { return (v >> 4) < 10 && (v & 15) < 10 ? (v >> 4) * 10 + (v & 15) : -1; }
+
+/* The Q subcode read with sector `lba`: 1 when it is index 0 of the track searched for,
+ * 0 for any other place on the disc, -1 when it cannot be told (a read error, a data
+ * sector, a Q that fails its CRC or holds no position). *where is the sector it
+ * describes, from its absolute time. Q is bit 6 of each raw subcode byte; a drive that
+ * hands the channels one after another (12 bytes each) is understood too. */
+static int q_read(pregap_search* ps, int64_t lba, int64_t* where)
+{
+    fa_disc* d = ps->d;
+    uint8_t sec[FA_CD_SECTOR_BYTES + FA_CD_SUB_BYTES], q[12];
+    const uint8_t* sub = sec + FA_CD_SECTOR_BYTES;
+    int layout, k;
+    fa_result r;
+    if (lba < 0 || lba >= ps->leadout) return -1;
+    fa_mutex_lock(&d->lock);
+    if (fa_load32(&d->generation) != ps->gen) r = FA_ERROR_NO_DISC;
+    else if ((r = d->ops->read_cd(d->h, lba, 1, FA_CD_AREA_AUDIO | FA_CD_AREA_SUB, sec)) == FA_ERROR_NO_DISC) disc_forget(d);
+    fa_mutex_unlock(&d->lock);
+    if (r == FA_ERROR_NOT_IMPLEMENTED || r == FA_ERROR_NO_DISC) ps->io = r;
+    if (r != FA_OK) return -1;
+    for (layout = 0; layout < 2; layout++) {
+        int m, sc, f;
+        if (layout == 0) {
+            memset(q, 0, sizeof(q));
+            for (k = 0; k < FA_CD_SUB_BYTES; k++) q[k / 8] |= (uint8_t)(((sub[k] >> 6) & 1) << (7 - k % 8));
+        } else {
+            memcpy(q, sub + 12, 12);
+        }
+        if (((q[10] << 8) | q[11]) != crc16_inv(q, 10) || (q[0] & 0x0F) != 1) continue;   /* ADR 1: a position */
+        m = bcd(q[7]); sc = bcd(q[8]); f = bcd(q[9]);
+        *where = m >= 0 && sc >= 0 && f >= 0 ? ((int64_t)m * 60 + sc) * 75 + f - FA_CD_PREGAP : lba;
+        return q[1] == (uint8_t)(((ps->number / 10) << 4) | (ps->number % 10)) && q[2] == 0;
+    }
+    return -1;
+}
+
+/* What the Q subcode says about sector `lba` (q_read), read with the sector that carries
+ * it on this drive: the first Q read tells how far off the drive's subcode is (some
+ * return the next or the previous sector's), up to 2 sectors. */
+static int q_in_pregap(pregap_search* ps, int64_t lba)
+{
+    int64_t where = lba;
+    int v = q_read(ps, lba - (ps->shift == Q_SHIFT_UNKNOWN ? 0 : ps->shift), &where);
+    if (v < 0 || ps->shift != Q_SHIFT_UNKNOWN) return v;
+    ps->shift = where - lba >= -2 && where - lba <= 2 ? (int)(where - lba) : 0;
+    return ps->shift ? q_in_pregap(ps, lba) : v;
+}
+
+/* q_in_pregap at the first readable sector from `lba` towards `step` (+1 or -1), at
+ * most PREGAP_TRIES and not reaching `stop`; *at gets that sector. */
+static int q_near(pregap_search* ps, int64_t lba, int step, int64_t stop, int64_t* at)
+{
+    int k, v;
+    for (k = 0; k < PREGAP_TRIES && lba != stop && ps->io == FA_OK; k++, lba += step) {
+        v = q_in_pregap(ps, lba);
+        if (v >= 0) { *at = lba; return v; }
+    }
+    return -1;
+}
+
+/* The pregap of the track starting at `start` from the Q subcode: index 0 runs from
+ * some sector up to the track's start, so its first sector is searched for between the
+ * previous track's start `prev` and this one (2 s, the usual length, is tried first).
+ * Sectors whose Q cannot be read are stepped over; where none can be on either side of
+ * a probe, the search goes on as if they were not in the pregap. */
+static fa_result pregap_from_q(pregap_search* ps, int64_t start, int64_t prev, int64_t* out)
+{
+    int64_t in_gap, not_gap = prev, at = 0;
+    int v = q_near(ps, start - 1, -1, not_gap, &at);
+    if (ps->io != FA_OK) return ps->io;
+    if (v < 0) return FA_ERROR_IO;
+    *out = 0;
+    if (v == 0) return FA_OK;   /* the sector before it belongs to the track before */
+    in_gap = at;
+    if (start - 151 > not_gap && start - 150 < in_gap) {
+        v = q_near(ps, start - 150, 1, in_gap, &at);
+        if (v == 1) in_gap = at;
+        if (v == 0) not_gap = at;
+        if (v == 1 && at == start - 150) {
+            v = q_near(ps, start - 151, -1, not_gap, &at);
+            if (v == 1) in_gap = at;
+            if (v == 0) not_gap = at;
+        }
+    }
+    while (ps->io == FA_OK && in_gap - not_gap > 1) {
+        int64_t mid = not_gap + (in_gap - not_gap) / 2;
+        v = q_near(ps, mid, 1, in_gap, &at);
+        if (v < 0) v = q_near(ps, mid - 1, -1, not_gap, &at);
+        if (v == 1) in_gap = at;
+        else if (v == 0) not_gap = at;
+        else not_gap = mid + PREGAP_TRIES - 1 < in_gap ? mid + PREGAP_TRIES - 1 : in_gap - 1;
+    }
+    if (ps->io != FA_OK) return ps->io;
+    *out = start - in_gap;
+    return FA_OK;
 }
 
 /* ---- audio reads ---------------------------------------------------------------- */
@@ -926,6 +1045,49 @@ FA_API fa_result FA_CALL fa_disc_get_text(fa_disc* disc, int32_t track, fa_disc_
     }
     fa_mutex_unlock(&disc->lock);
     return r;
+}
+
+FA_API fa_result FA_CALL fa_disc_get_pregap(fa_disc* disc, int32_t track, int64_t* out_sectors)
+{
+    const fa_disc_track* t;
+    pregap_search ps;
+    int64_t start = 0, prev = 0, n = 0;
+    int k = 0, search = 0;
+    fa_result r;
+    if (!disc || !out_sectors) return FA_ERROR_INVALID_ARG;
+    *out_sectors = 0;
+    fa_mutex_lock(&disc->lock);
+    r = read_toc_locked(disc);
+    t = r == FA_OK ? find_track(&disc->toc, track) : NULL;
+    if (r == FA_OK && !t) r = FA_ERROR_NOT_FOUND;
+    if (r == FA_OK && !t->is_audio) r = FA_ERROR_UNSUPPORTED_FORMAT;
+    if (r == FA_OK) {
+        k = (int)(t - disc->toc.tracks);
+        if (disc->pregap[k] < 0) {
+            if (disc->ops->read_pregap) r = disc->ops->read_pregap(disc->h, track, &n);
+            else if (k == 0) n = t->start_sector;   /* everything before the first track */
+            else search = 1;
+            if (r == FA_OK && !search) disc->pregap[k] = n;
+        }
+        if (r == FA_OK && !search) *out_sectors = disc->pregap[k];
+        start = t->start_sector;
+        prev = k > 0 ? disc->toc.tracks[k - 1].start_sector : 0;
+        ps.d = disc;
+        ps.gen = fa_load32(&disc->generation);
+        ps.number = track;
+        ps.leadout = disc->toc.leadout_sector;
+        ps.shift = Q_SHIFT_UNKNOWN;
+        ps.io = FA_OK;
+    }
+    fa_mutex_unlock(&disc->lock);
+    if (r != FA_OK || !search) return r;
+    r = pregap_from_q(&ps, start, prev, &n);
+    if (r != FA_OK) return r;
+    fa_mutex_lock(&disc->lock);
+    if (disc->toc_valid && fa_load32(&disc->generation) == ps.gen) disc->pregap[k] = n;
+    fa_mutex_unlock(&disc->lock);
+    *out_sectors = n;
+    return FA_OK;
 }
 
 /* ---- drive control ------------------------------------------------------------------ */

@@ -449,6 +449,8 @@ internal struct FaCdgInfo
     public long CheckpointInterval;
     public uint CheckpointCount;
     public int DiscParity;
+    public ulong DiscCorrected;
+    public ulong DiscDropped;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -706,6 +708,28 @@ internal unsafe struct FaMixerConfig
     public byte* CueDeviceId;
     public uint CueChannel;
     public int Latency;
+    public uint Flags;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaEngineStats
+{
+    public uint StructSize;
+    public float AudioLoad;
+    public float AudioLoadPeak;
+    public float WorkerLoad;
+    public uint Workers;
+    public uint Devices;
+    public uint AttachedStreams;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaCaptureOptions
+{
+    public uint StructSize;
+    public byte* DeviceId;
+    public uint SampleRate;
+    public uint Channels;
     public uint Flags;
 }
 

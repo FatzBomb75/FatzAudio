@@ -176,22 +176,21 @@ struct fa_cdg_surface {
     cdg_state st;
     size_t stale_from;            /* packs from here were rewritten (SIZE_MAX = none), under cdg_lock */
     /* Presentation scaling: the screen area [mx0, mx0 + mw) x [my0, my0 + mh) drawn at
-     * sc.n (the crop, and what smooth-scroll offsets can bring into it), from which
-     * update_into copies. */
+     * sc.n (the crop and a tile around it) as it is shown, the picture area moved by
+     * the smooth-scroll offsets, from which update_into copies. */
     cdg_scaler sc;
     uint8_t* master;
     size_t master_stride;
     int mx0, my0, mw, mh;
     int master_tb;                /* its border was drawn transparent */
     uint8_t master_pm[CDG_SCALE_COLORS][4]; /* the colours it was drawn with */
-    uint8_t eidx[FA_CDG_HEIGHT][FA_CDG_WIDTH]; /* the screen as drawn: 16 = transparent border */
+    uint8_t eidx[FA_CDG_HEIGHT][FA_CDG_WIDTH]; /* the screen as shown: 16 = transparent border */
     uint16_t* rows;               /* the scaler's scratch rows (cdg_scale_rect) */
     /* Effects (fa_surface_set_effects), with presentation scaling: drawn from the
      * master into fxm, which update_into then copies from. */
     int has_fx;
     fa_surface_effects fx;
     int fx_on;                    /* fxm holds the master with the effects */
-    int fx_wide;                  /* ... computed over the whole master (smooth-scroll offsets) */
     uint8_t* fxm;
     void* fx_scratch;
     size_t fx_scratch_size;
@@ -698,12 +697,11 @@ static void index_build(fa_cdg_data* d)
 
 /* Discs: packs [first, first + n) were written, `changed` if they differ from what
  * was there. Checkpoints after a change no longer hold: the decoder goes back to the
- * last one that does. It then runs over this write and at most 10 s more towards
- * the packs written so far, so no write holds the lock long. */
+ * last one that does and runs over this write; index_catch_up takes it on to the
+ * packs written so far. */
 static void index_written(fa_cdg_data* d, size_t first, size_t n, int changed)
 {
     struct fa_cdg_index* ix = d->index;
-    size_t upto;
     if (!ix) return;
     if (changed && first < ix->build.next) {
         size_t keep = first / ix->step;
@@ -711,10 +709,19 @@ static void index_written(fa_cdg_data* d, size_t first, size_t n, int changed)
         if (ix->count) checkpoint_load(&ix->at[ix->count - 1], &ix->build); else state_reset(&ix->build);
     }
     if (first + n > ix->high) ix->high = first + n;
-    upto = first + n > ix->build.next ? first + n : ix->build.next;
-    upto += CDG_CHECKPOINT_PACKS;
-    if (upto > ix->high) upto = ix->high;
+    if (first + n > ix->build.next) index_advance(ix, d, first + n);
+}
+
+/* Runs the disc decoder at most `most` packs further towards what was written; 1 while
+ * it is still behind. */
+static int index_catch_up(fa_cdg_data* d, size_t most)
+{
+    struct fa_cdg_index* ix = d->index;
+    size_t upto;
+    if (!ix || ix->build.next >= ix->high) return 0;
+    upto = ix->high - ix->build.next > most ? ix->build.next + most : ix->high;
     index_advance(ix, d, upto);
+    return ix->build.next < ix->high;
 }
 
 /* ---- rendering ------------------------------------------------------------------- */
@@ -940,6 +947,16 @@ static void master_mark(const fa_cdg_surface* f, fa_rects* m, int x0, int y0, in
     int a = f->sc.reach_across, l = f->sc.reach_along;
     master_add(f, m, x0 - l, y0 - a, x1 + l, y1 + a);
     if (l != a) master_add(f, m, x0 - a, y0 - l, x1 + a, y1 + l);
+}
+
+/* Screen area [x0, x1) x [y0, y1) changed: the master pixels that depend on it where
+ * it is shown, the border as it is and the picture area moved by the smooth-scroll
+ * offsets (both places: more than needed at worst). */
+static void master_mark_shown(const fa_cdg_surface* f, fa_rects* m, int x0, int y0, int x1, int y1)
+{
+    int dx = f->st.hoff, dy = f->st.voff;
+    master_mark(f, m, x0, y0, x1, y1);
+    if (dx || dy) master_mark(f, m, x0 - dx, y0 - dy, x1 - dx, y1 - dy);
 }
 
 /* Moves the rows (h of them, `len` bytes from byte `from`, to byte `to`) of a plane
@@ -1307,7 +1324,11 @@ static void fx_recolor(fa_cdg_surface* f, const fa_fx_plan* plan, const fa_rects
 static void recolor_mark(const fa_cdg_surface* f, const uint8_t pm[CDG_SCALE_COLORS][4], int tb, fa_rects* m)
 {
     uint8_t changed[CDG_SCALE_COLORS];
-    int i, x, y, y0, xa = tb ? CDG_BORDER_X : 0, xb = tb ? FA_CDG_WIDTH - CDG_BORDER_X : FA_CDG_WIDTH;
+    int i, x, y, y0, xa, xb;
+    /* With smooth-scroll offsets the picture area shows screen pixels of the border. */
+    if (f->st.hoff || f->st.voff) tb = 0;
+    xa = tb ? CDG_BORDER_X : 0;
+    xb = tb ? FA_CDG_WIDTH - CDG_BORDER_X : FA_CDG_WIDTH;
     for (i = 0; i < CDG_SCALE_COLORS; i++) changed[i] = (uint8_t)(memcmp(pm[i], f->master_pm[i], 4) != 0);
     for (y0 = 0; y0 < FA_CDG_HEIGHT; y0 += CDG_TILE_H) {
         uint8_t col[FA_CDG_WIDTH];
@@ -1327,13 +1348,13 @@ static void recolor_mark(const fa_cdg_surface* f, const uint8_t pm[CDG_SCALE_COL
         for (x = xa; x < xb; x++) {
             if (!col[x]) continue;
             if (start >= 0 && x - last > CDG_TILE_W) {
-                master_mark(f, m, start, ya, last + 1, yb);
+                master_mark_shown(f, m, start, ya, last + 1, yb);
                 start = -1;
             }
             if (start < 0) start = x;
             last = x;
         }
-        if (start >= 0) master_mark(f, m, start, ya, last + 1, yb);
+        if (start >= 0) master_mark_shown(f, m, start, ya, last + 1, yb);
     }
 }
 
@@ -1415,26 +1436,27 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
     uint8_t pm[CDG_SCALE_COLORS][4];
     fa_rects m, e;
     fa_fx_plan plan;
-    int tb = f->tb && !st->hoff && !st->voff, i, y;
+    int tb = f->tb, i, y;
     int moved = st->shift_x || st->shift_y, full, view_full, fx = fx_ready(f, &plan), keep;
-    /* The effects see the crop, or with smooth-scroll offsets everything they can show. */
-    int wide = st->hoff || st->voff;
+    /* New smooth-scroll offsets move the whole picture area. A scroll while they are set
+     * moves it and the border apart along the seam between them: drawn afresh too (songs
+     * that use the offsets are rare). */
+    int reshown = st->hoff != f->shown_hoff || st->voff != f->shown_voff || (moved && (st->hoff || st->voff));
     scaled_palette(f, pal, pm);
-    full = !f->drawn || abs(st->shift_x) >= f->mw || abs(st->shift_y) >= f->mh || fx != f->fx_on ||
-           (fx && wide != f->fx_wide);
+    full = !f->drawn || abs(st->shift_x) >= f->mw || abs(st->shift_y) >= f->mh || fx != f->fx_on || reshown;
     /* What the effects kept still holds unless they or the master were drawn afresh;
      * new colours alone keep it. */
-    keep = fx && f->keep_ok && f->drawn && f->fx_on && wide == f->fx_wide && abs(st->shift_x) < f->mw &&
+    keep = fx && f->keep_ok && f->drawn && f->fx_on && !reshown && abs(st->shift_x) < f->mw &&
            abs(st->shift_y) < f->mh && memcmp(&plan, &f->keep_plan, sizeof(plan)) == 0;
     if (!keep) f->keep_ok = 0;
     f->fx_on = fx;
-    f->fx_wide = wide;
     fa_rects_clear(&m);
     if (full) {
         fa_rects_add(&m, f->mx0, f->my0, f->mx0 + f->mw, f->my0 + f->mh);
     } else {
         if (moved) master_shift(f, st->shift_x, st->shift_y, &m);
-        for (i = 0; i < st->dirty.n; i++) master_mark(f, &m, st->dirty.r[i][0], st->dirty.r[i][1], st->dirty.r[i][2], st->dirty.r[i][3]);
+        for (i = 0; i < st->dirty.n; i++)
+            master_mark_shown(f, &m, st->dirty.r[i][0], st->dirty.r[i][1], st->dirty.r[i][2], st->dirty.r[i][3]);
         /* A transparent border stays where it is while the picture moves under it, and
          * the transparent pixels the move carried into the picture are drawn again. */
         if (tb != f->master_tb || (tb && moved)) mark_border(f, &m, 0, 0);
@@ -1444,6 +1466,12 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
     }
     if (m.n) {
         memcpy(f->eidx, st->screen, sizeof(f->eidx));
+        /* The picture area as shown, so smoothing, edge blend and the effects see the
+         * pixels next to each other on screen. */
+        if (st->hoff || st->voff)
+            for (y = CDG_BORDER_Y; y < FA_CDG_HEIGHT - CDG_BORDER_Y; y++)
+                memcpy(f->eidx[y] + CDG_BORDER_X, st->screen[y + st->voff] + CDG_BORDER_X + st->hoff,
+                       FA_CDG_WIDTH - 2 * CDG_BORDER_X);
         if (tb)
             for (y = 0; y < FA_CDG_HEIGHT; y++) {
                 if (y < CDG_BORDER_Y || y >= FA_CDG_HEIGHT - CDG_BORDER_Y) {
@@ -1469,7 +1497,7 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
         /* The effects of what changed, as far as they reach; after a move also along
          * the edges, where what reached in from outside the master has gone. */
         int n = (int)f->sc.n, pn = f->x2 ? 2 * n : n, rc = (plan.reach + pn - 1) / pn + 1;
-        int mx1 = f->mx0 + (wide ? f->mw : (int)f->win_w), my1 = f->my0 + (wide ? f->mh : (int)f->win_h);
+        int mx1 = f->mx0 + (int)f->win_w, my1 = f->my0 + (int)f->win_h;
         fa_rects done;
         fa_rects_clear(&e);
         fa_rects_clear(&done);
@@ -1499,61 +1527,61 @@ static void advance_scaled(fa_cdg_surface* f, const uint8_t pal[16][4], fa_rects
         m = e;                    /* what changed in what is shown */
     }
     /* A move or new offsets change where everything is shown. */
-    view_full = full || moved || st->hoff != f->shown_hoff || st->voff != f->shown_voff;
+    view_full = full || moved;
     if (view_full) {
         fa_rects_add(area, (int)f->lay.pic_x, (int)f->lay.pic_y, (int)(f->lay.pic_x + f->lay.pic_w),
                      (int)(f->lay.pic_y + f->lay.pic_h));
         return;
     }
-    for (i = 0; i < m.n; i++) {
-        /* The screen area is shown as it is in the border, and shifted by the offsets
-         * inside it: both, clipped (more than needed at worst). */
-        view_to_buffer(f, area, m.r[i][0], m.r[i][1], m.r[i][2], m.r[i][3]);
-        if (st->hoff || st->voff)
-            view_to_buffer(f, area, m.r[i][0] - st->hoff, m.r[i][1] - st->voff, m.r[i][2] - st->hoff, m.r[i][3] - st->voff);
-    }
+    for (i = 0; i < m.n; i++) view_to_buffer(f, area, m.r[i][0], m.r[i][1], m.r[i][2], m.r[i][3]);
 }
 
-/* Copies buffer rectangle r (x0 y0 x1 y1) from the master: the border as it is on the
- * screen, the picture area shifted by the smooth-scroll offsets, padding and margin
- * transparent. A transparent border while the offsets are set is not in the master
- * (it holds the screen's colours there, which the offsets can bring into view). */
+/* Copies buffer rectangle r (x0 y0 x1 y1) from the master, which holds the picture as
+ * shown; padding and margin transparent. */
 static void copy_out(const fa_cdg_surface* f, uint8_t* dst, int32_t stride, const int r[4])
 {
     const cdg_layout* l = &f->lay;
-    int n = (int)l->n, oy, x0 = r[0], x1 = r[2];
-    int a = x0 > (int)l->pic_x ? x0 : (int)l->pic_x;
-    int b = x1 < (int)(l->pic_x + l->pic_w) ? x1 : (int)(l->pic_x + l->pic_w);
-    /* Where the picture area starts and ends in buffer x. */
-    int i0 = (int)l->pic_x + (CDG_BORDER_X - (int)f->win_x) * n, i1 = (int)l->pic_x + (FA_CDG_WIDTH - CDG_BORDER_X - (int)f->win_x) * n;
-    int zero_border = f->tb && (f->st.hoff || f->st.voff);
+    int n = (int)l->n, oy;
+    int a = r[0] > (int)l->pic_x ? r[0] : (int)l->pic_x;
+    int b = r[2] < (int)(l->pic_x + l->pic_w) ? r[2] : (int)(l->pic_x + l->pic_w);
+    const uint8_t* plane = f->fx_on ? f->fxm : f->master;
+    size_t col = (size_t)((a - (int)l->pic_x) + ((int)f->win_x - f->mx0) * n) * 4;
     fill_padding(f, dst, stride, r);
-    if (i0 < a) i0 = a;
-    if (i0 > b) i0 = b;
-    if (i1 < i0) i1 = i0;
-    if (i1 > b) i1 = b;
     if (a >= b) return;
     for (oy = r[1]; oy < r[3]; oy++) {
-        uint8_t* row = dst + (size_t)oy * (size_t)stride;
-        int vy, sub, seg;
+        int vy;
         if (oy < (int)l->pic_y || oy >= (int)(l->pic_y + l->pic_h)) continue;
         vy = (int)f->win_y + (oy - (int)l->pic_y) / n;
-        sub = (oy - (int)l->pic_y) % n;
-        for (seg = 0; seg < 3; seg++) {
-            int sa = seg == 0 ? a : seg == 1 ? i0 : i1, sb = seg == 0 ? i0 : seg == 1 ? i1 : b, sy = vy, col;
-            int shifted = seg == 1 && vy >= CDG_BORDER_Y && vy < FA_CDG_HEIGHT - CDG_BORDER_Y;
-            const uint8_t* src;
-            if (sa >= sb) continue;
-            if (!shifted && zero_border) { memset(row + (size_t)sa * 4, 0, (size_t)(sb - sa) * 4); continue; }
-            col = (sa - (int)l->pic_x) + ((int)f->win_x - f->mx0) * n;
-            if (shifted) { sy += f->st.voff; col += f->st.hoff * n; }
-            src = (f->fx_on ? f->fxm : f->master) + (size_t)((sy - f->my0) * n + sub) * f->master_stride + (size_t)col * 4;
-            memcpy(row + (size_t)sa * 4, src, (size_t)(sb - sa) * 4);
-        }
+        memcpy(dst + (size_t)oy * (size_t)stride + (size_t)a * 4,
+               plane + (size_t)((vy - f->my0) * n + (oy - (int)l->pic_y) % n) * f->master_stride + col, (size_t)(b - a) * 4);
     }
 }
 
 /* ---- updates ------------------------------------------------------------------------ */
+
+/* Window rectangle [x0, x1) x [y0, y1) (screen coordinates, `pad` pixels more each
+ * way), as the output pixels whose source lies in it (a superset), into `area`. */
+static void window_to_output(const fa_cdg_surface* f, fa_rects* area, int64_t x0, int64_t y0, int64_t x1, int64_t y1, int pad)
+{
+    uint32_t ox0, oy0, ox1, oy1;
+    int px = (int)f->lay.pic_x, py = (int)f->lay.pic_y;
+    x0 -= (int64_t)f->win_x + pad;
+    y0 -= (int64_t)f->win_y + pad;
+    x1 += pad - (int64_t)f->win_x;
+    y1 += pad - (int64_t)f->win_y;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (int64_t)f->win_w) x1 = f->win_w;
+    if (y1 > (int64_t)f->win_h) y1 = f->win_h;
+    if (x0 >= x1 || y0 >= y1) return;
+    ox0 = (uint32_t)(x0 * f->width / f->win_w);
+    oy0 = (uint32_t)(y0 * f->height / f->win_h);
+    ox1 = (uint32_t)((x1 * f->width + f->win_w - 1) / f->win_w);
+    oy1 = (uint32_t)((y1 * f->height + f->win_h - 1) / f->win_h);
+    if (ox1 > f->width) ox1 = f->width;
+    if (oy1 > f->height) oy1 = f->height;
+    fa_rects_add(area, px + (int)ox0, py + (int)oy0, px + (int)ox1, py + (int)oy1);
+}
 
 /* advance() without presentation scaling: the output pixels the changed screen area
  * maps to. */
@@ -1561,36 +1589,22 @@ static void advance_classic(fa_cdg_surface* f, int palette_changed, fa_rects* ar
 {
     cdg_state* st = &f->st;
     int i, px = (int)f->lay.pic_x, py = (int)f->lay.pic_y;
+    int pad = (f->flags & FA_CDG_SMOOTH) && f->format != FA_CDG_PIXELS_INDEXED8 ? 1 : 0;
     /* Indexed pixels do not depend on the palette; colour pixels do. Smooth-scroll
-     * offsets move the whole picture area; so does a scroll (the whole screen moves),
-     * and anything drawn while the offsets are set (rare: redraw all rather than map
-     * the shift). */
+     * offsets move the whole picture area; so does a scroll (the whole screen moves). */
     if (st->hoff != f->shown_hoff || st->voff != f->shown_voff || st->shift_x || st->shift_y ||
-        (palette_changed && f->format != FA_CDG_PIXELS_INDEXED8) || (st->dirty.n && (st->hoff || st->voff))) {
+        (palette_changed && f->format != FA_CDG_PIXELS_INDEXED8)) {
         fa_rects_add(area, px, py, px + (int)f->width, py + (int)f->height);
         return;
     }
-    {
-        int pad = (f->flags & FA_CDG_SMOOTH) && f->format != FA_CDG_PIXELS_INDEXED8 ? 1 : 0;
-        for (i = 0; i < st->dirty.n; i++) {
-            const int* d = st->dirty.r[i];
-            int64_t x0 = (int64_t)d[0] - f->win_x - pad, y0 = (int64_t)d[1] - f->win_y - pad;
-            int64_t x1 = (int64_t)d[2] - f->win_x + pad, y1 = (int64_t)d[3] - f->win_y + pad;
-            uint32_t ox0, oy0, ox1, oy1;
-            if (x0 < 0) x0 = 0;
-            if (y0 < 0) y0 = 0;
-            if (x1 > (int64_t)f->win_w) x1 = f->win_w;
-            if (y1 > (int64_t)f->win_h) y1 = f->win_h;
-            if (x0 >= x1 || y0 >= y1) continue;
-            /* Output pixels whose source lies in the window rectangle (a superset). */
-            ox0 = (uint32_t)(x0 * f->width / f->win_w);
-            oy0 = (uint32_t)(y0 * f->height / f->win_h);
-            ox1 = (uint32_t)((x1 * f->width + f->win_w - 1) / f->win_w);
-            oy1 = (uint32_t)((y1 * f->height + f->win_h - 1) / f->win_h);
-            if (ox1 > f->width) ox1 = f->width;
-            if (oy1 > f->height) oy1 = f->height;
-            fa_rects_add(area, px + (int)ox0, py + (int)oy0, px + (int)ox1, py + (int)oy1);
-        }
+    for (i = 0; i < st->dirty.n; i++) {
+        const int* d = st->dirty.r[i];
+        /* Shown as it is in the border and moved by the offsets in the picture area:
+         * both (more than needed at worst). */
+        window_to_output(f, area, d[0], d[1], d[2], d[3], pad);
+        if (st->hoff || st->voff)
+            window_to_output(f, area, (int64_t)d[0] - st->hoff, (int64_t)d[1] - st->voff, (int64_t)d[2] - st->hoff,
+                             (int64_t)d[3] - st->voff, pad);
     }
 }
 
@@ -1992,7 +2006,28 @@ int fa_stream_cdg_write(struct fa_stream* s, uint32_t token, size_t first, const
         }
     }
     fa_mutex_unlock(&s->cdg_lock);
+    /* After a rewrite the checkpoints behind packs written earlier are redone now, so a
+     * jump there replays no more than one interval. In steps of one interval, each
+     * holding the lock briefly, so surface updates on other threads go on meanwhile. */
+    while (ok) {
+        int behind;
+        fa_mutex_lock(&s->cdg_lock);
+        data = s->cdg;
+        behind = data && s->cdg_gen == token && index_catch_up(data, CDG_CHECKPOINT_PACKS);
+        fa_mutex_unlock(&s->cdg_lock);
+        if (!behind) break;
+    }
     return ok;
+}
+
+void fa_stream_cdg_disc_counts(struct fa_stream* s, uint32_t token, uint64_t corrected, uint64_t dropped)
+{
+    fa_mutex_lock(&s->cdg_lock);
+    if (s->cdg && s->cdg_gen == token) {
+        s->cdg->disc_corrected = corrected;
+        s->cdg->disc_dropped = dropped;
+    }
+    fa_mutex_unlock(&s->cdg_lock);
 }
 
 static int watch_list(struct fa_stream* s, int on);
@@ -2157,7 +2192,11 @@ FA_API fa_result FA_CALL fa_stream_get_cdg_info(fa_stream* stream, fa_cdg_info* 
         out_info->pack_count = d->count;
         out_info->checkpoint_interval = (fa_time)index_step(d->count) * 1000000000 / FA_CDG_PACKS_PER_SECOND;
         if (d->index) out_info->checkpoint_count = (uint32_t)d->index->count;
-        if (d->from_disc) out_info->disc_parity = d->disc_parity;
+        if (d->from_disc) {
+            out_info->disc_parity = d->disc_parity;
+            out_info->disc_corrected = d->disc_corrected;
+            out_info->disc_dropped = d->disc_dropped;
+        }
     }
     fa_mutex_unlock(&stream->cdg_lock);
     return FA_OK;

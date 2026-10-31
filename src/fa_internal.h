@@ -130,6 +130,10 @@ struct fa_decoder {
      * that a playlist gives for the same data (HLS) is that much longer. */
     fa_frames lead_trim;
     int seekable;
+    /* Live sources (an app callback, a capture device) only: 0 while there is nothing
+     * to give, so the workers leave the stream until there is. Called by workers
+     * without decode_lock: it reads only atomics. */
+    int (*ready)(fa_decoder* dec);
     char codec[32];
     char container[32];
     /* Push decoders: the pts (ns) of the first frame the last read returned, when
@@ -454,12 +458,15 @@ int fa_chroma_key(fa_chroma* c, fa_key_info* out);
 typedef struct fa_ring {
     float* data;
     uint32_t channels;
-    int64_t capacity;     /* frames */
+    int64_t capacity;     /* frames readable at most */
+    int64_t size;         /* frames held: capacity + the kept ones (fa_ring_init_kept) */
     fa_atomic64 write;    /* total frames written (producer) */
     fa_atomic64 read;     /* total frames read (consumer) */
 } fa_ring;
 
 fa_result fa_ring_init(fa_ring* r, uint32_t channels, int64_t capacity);
+/* The same, also keeping the last `keep` frames read: the writer never reaches them. */
+fa_result fa_ring_init_kept(fa_ring* r, uint32_t channels, int64_t capacity, int64_t keep);
 void fa_ring_free(fa_ring* r);
 int64_t fa_ring_readable(fa_ring* r);
 int64_t fa_ring_writable(fa_ring* r);
@@ -471,6 +478,8 @@ void fa_ring_commit(fa_ring* r, int64_t frames);
 /* Consumer: up to two contiguous regions holding `frames` readable frames. */
 void fa_ring_regions(fa_ring* r, int64_t frames, const float** p1, int64_t* n1, const float** p2, int64_t* n2);
 void fa_ring_advance_read(fa_ring* r, int64_t frames);
+/* Frame `idx` (a total count), read or not: valid back to `keep` before the read count. */
+const float* fa_ring_frame(fa_ring* r, int64_t idx);
 /* Only while neither side can run (stream flushing and decode lock held). */
 void fa_ring_reset(fa_ring* r);
 
@@ -621,6 +630,10 @@ void fa_tmap_add(fa_tmap* m, int64_t at, double src, double slope);
 /* Source position at ring frame `at`; *out_slope and *out_next (where the segment
  * ends, INT64_MAX = open) may be NULL. */
 double fa_tmap_pos(fa_tmap* m, int64_t at, double base_src, double base_slope, double* out_slope, int64_t* out_next);
+/* The segment holding ring frame `at`: where it starts (0 for the base), its source
+ * position there and its slope. */
+void fa_tmap_segment_at(fa_tmap* m, int64_t at, double base_src, double base_slope, int64_t* out_start,
+                        double* out_src, double* out_slope);
 /* Ring frames from `at` until the source position reaches `target` (0 if it has). */
 int64_t fa_tmap_frames_to(fa_tmap* m, int64_t at, double target, double base_src, double base_slope);
 void fa_tmap_release(fa_tmap* m, int64_t at);   /* audio thread */
@@ -664,7 +677,8 @@ void fa_truepeak_flush(fa_truepeak* tp);
  * audio thread only; read without locks. */
 typedef struct fa_tap {
     float* buf;               /* `frames` stereo frames, a ring by device frame */
-    uint32_t frames;          /* power of two: 1 s plus the device's latency and callbacks */
+    uint32_t frames;          /* power of two: `seconds` plus the device's latency and callbacks */
+    uint32_t seconds;         /* the longest window it serves: 1, or 4 once a loudness meter reads it */
     fa_atomic64 start;        /* first device frame written since the last jump */
     fa_atomic64 end;          /* device frame after the newest one written */
 } fa_tap;
@@ -926,6 +940,9 @@ struct fa_engine {
     fa_atomic32 quit;
     int destroy_on_event_thread; /* fa_engine_destroy ran inside a callback: the event
                                     thread finishes the teardown when it exits */
+    fa_atomic64 worker_busy_ns;  /* time the workers spent working, ever (fa_engine_get_stats) */
+    int64_t stats_at, stats_busy_ns; /* list_lock: the previous fa_engine_get_stats */
+    float stats_worker_load;     /* list_lock: what it reported */
 
     /* Normalization and limiter settings, read by the audio thread. */
     fa_atomic32 norm_mode;       /* fa_normalize_mode */
@@ -965,7 +982,7 @@ struct fa_device {
     fa_engine* engine;
     ma_device device;
     uint32_t rate;
-    fa_mutex lock;               /* serializes voice list edits (API threads only) */
+    fa_mutex lock;               /* serializes voice list edits and output tap readers (API threads only) */
     /* Held by the audio callback while it takes commands, and by fa_crossfade while it
      * posts a start and two fades for the current clock, so a callback sees all of
      * them or none. The callback only tries it: when fa_crossfade holds it, `xf_busy`
@@ -983,6 +1000,12 @@ struct fa_device {
     int64_t cb_prev_time;        /* audio thread: smoothing state */
     uint32_t cb_prev_frames;
     fa_atomic64 epoch;           /* odd while the audio callback runs */
+    /* Callback load (fa_engine_get_stats), in percent of the audio each callback made:
+     * written by the audio callback, read by any thread. */
+    fa_atomic32 load;            /* float, averaged over about 1 s */
+    fa_atomic32 load_peak;       /* float, the slowest callback of the last 1 to 2 s */
+    float load_avg, load_win_max, load_prev_max;   /* audio thread */
+    int64_t load_win_frames;     /* audio thread */
     fa_event_queue events;       /* audio callback -> event thread */
     fa_atomic32 spilled;         /* 1 = some stream on this device used its spill slots */
     fa_atomic32 publishing;      /* audio thread is between taking a sequence number and publishing */
@@ -1323,6 +1346,7 @@ struct fa_stream {
     fa_clock clock;
     fa_push_times* ptimes;       /* push streams, set at open; NULL for the others */
     struct fa_push* push;        /* NULL for file, memory and I/O streams */
+    int live;                    /* a callback or capture stream (live source, set at open) */
     fa_atomic64 played_audible;  /* frames played since the last flush (stall events) */
     int stalled;                 /* audio thread: FA_EVENT_STALLED raised, RESUMED owed */
     fa_atomic_ptr eq;            /* fa_stream_eq*, NULL until an EQ call (flat); kept until freed */
@@ -1437,6 +1461,15 @@ struct fa_stream {
     float* rev_buf;
     float* rev_ov;               /* inside rev_buf: the held frames while the block below decodes */
     fa_frames rev_cap, rev_n, rev_pos, rev_hold;
+    /* Slip (fa_deck_set_slip): while a reverse, a deck loop or a beat jump takes the deck
+     * elsewhere, where it would be playing is slip_from (the source frame heard when the
+     * slip began, going on the way slip_rev says) plus slip_run timeline frames (counted
+     * as linear frames run, see above) up to where that count stood at the run value
+     * slip_mark, plus what the timeline ran since. slip_active is cleared by any restart,
+     * a worker's too; the rest is under api_lock. */
+    fa_atomic32 slip_active;
+    int slip_rev;
+    double slip_from, slip_run, slip_mark;
 
     /* CD+G graphics (cdg.c): the packs, the surfaces drawing them, and a generation
      * count that tells surfaces the graphics were replaced. Never touched by the
@@ -1540,6 +1573,15 @@ fa_result fa_stream_jump(struct fa_stream* s, fa_frames at, fa_frames delta);
 /* Moves a playing deck loop: a jump of `delta` a margin ahead of the mix that sets the
  * loop to `in`..`out` at the same join (out > in), so either both happen or neither. */
 fa_result fa_stream_jump_loop(struct fa_stream* s, fa_frames delta, fa_frames in, fa_frames out);
+/* Slip (fa_deck_set_slip, mixer.c): a beat jump begins one (a no-op when one runs or the
+ * stream is not playing); the return joins where playback would be; cancel forgets it. */
+int fa_stream_slip_begin(struct fa_stream* s);   /* 1 = began one */
+fa_result fa_stream_slip_return(struct fa_stream* s);
+void fa_stream_slip_cancel(struct fa_stream* s);
+/* FA_FRAMES_UNSET when no slip runs. */
+fa_frames fa_stream_slip_position(struct fa_stream* s);
+/* Whether a stream on this bus slips: its deck has slip mode on (mixer.c). */
+int fa_mixer_bus_slips(fa_bus* bus);
 /* A TEMPO ramp from where it is that raises no FA_EVENT_RAMP_DONE (auto-mix's glide back). */
 fa_result fa_stream_ramp_tempo_quiet(struct fa_stream* s, float target, fa_time duration);
 /* Device frame at the speaker at monotonic time `now_ns` (latency included). */
@@ -1674,6 +1716,8 @@ void fa_convert_to_f32(const void* const* planes, int kind, int planar, int big_
 void fa_zero_non_finite(float* p, size_t n);
 /* fa_sample_format -> FA_SAMPLE_* and planar; -1 if invalid. */
 int fa_sample_kind(fa_sample_format f, int* out_planar);
+/* Bytes of one sample of FA_SAMPLE_* `kind`. */
+int fa_sample_bytes(int kind);
 
 #ifdef _WIN32
 /* codec_mf.c: Windows Media Audio (wmav1, wmav2, wmapro, wmalossless, wmavoice),
@@ -1746,6 +1790,15 @@ fa_result fa_aac_codec_open(fa_codec* c, const fa_codec_params* p);
  * samples in an AC-3 or E-AC-3 packet from its frame headers (-1 if none). */
 fa_result fa_ac3_codec_open(fa_codec* c, const fa_codec_params* p);
 int64_t fa_ac3_packet_samples(const uint8_t* d, size_t n, uint32_t* out_rate);
+
+/* ---- Live sources (callback.c, capture.c) ---------------------------------------- */
+
+/* callback.c: fa_stream_open_callback's decoder (the app's fa_stream_proc). */
+fa_result fa_callback_decoder_open(fa_decoder* dec, const fa_audio_format* format, fa_stream_proc proc, void* user);
+/* capture.c: fa_stream_open_capture's decoder (an input device). Its ring holds 1 s
+ * plus `extra_ms` (half the stream's decode-ahead buffer when it may be attached), so
+ * the workers' top-ups in turns of a quarter buffer never overflow it. */
+fa_result fa_capture_decoder_open(fa_decoder* dec, fa_engine* engine, const fa_capture_options* options, uint32_t extra_ms);
 
 /* ---- Push streams (push.c) ------------------------------------------------------ */
 

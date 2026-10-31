@@ -16,6 +16,11 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ## Unreleased
 
+### Breaking
+
+- `fa_cdg_info` gained `disc_corrected` and `disc_dropped` at its end (it has no `struct_size`): rebuild against the new
+  header. .NET `CdgInfo` gained the two matching positional parameters.
+
 ### Added
 
 - MIDI GS/XG effects A (extras step 6): the GS reverb pre-delay (`40 01 37`), chorus send to reverb (GS `3F`, XG `2E`)
@@ -27,6 +32,19 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   types. Drum keys' delay/variation sends (GS map `9`, XG setup `07`, NRPN `1F`). In GM files CC94 still does nothing.
   Files without these messages (and without CC94 after a GS reset) render bit for bit as before. New internal file
   `src/midi_var.c`. See [docs/features/midi.md](docs/features/midi.md#delay-gs-and-variation-xg).
+
+- DJ instant reverse and slip mode (extras step 9): `fa_stream_set_reverse` while playing or paused now turns at once,
+  playing the last 200 ms heard back the other way out of the stream's buffer while the decoder catches up (no gap,
+  no re-buffer). Slip mode: `fa_deck_set_slip` / `fa_deck_get_slip`, `fa_deck_slip_return`, `fa_deck_get_slip_position`
+  (.NET `DjDeck.Slip`, `SlipReturn`, `SlipPosition`): reverses, deck loops and beat jumps count on underneath and come
+  back to where the deck would be, to the frame. See [docs/features/dj-mixer.md](docs/features/dj-mixer.md#slip-mode).
+
+- Disc and CD+G (extras step 19): `fa_disc_get_pregap` (.NET `Disc.GetPregap`, basscd's `BASS_CD_GetTrackPregap`)
+  gives a track's pregap in sectors, from the cue sheet (`INDEX 00`, `PREGAP`) or from a drive's Q subcode. CD+G packs
+  read from a disc with two damaged symbols are now repaired as well as those with one (three or more are still
+  dropped), and `fa_cdg_info.disc_corrected` / `disc_dropped` count them. A seek before a disc track's graphics were
+  found keeps the subcode read so far, and a part read again with different packs redoes the seek checkpoints after it
+  at once instead of 10 s per write. See [docs/features/disc.md](docs/features/disc.md#pregaps).
 
 - MIDI scale tuning and drum setup: GS (`40 1x 40`-`4B`) and XG (`08 nn 41`-`4C`) scale tuning, GS drum map edits
   (`41 mp rr`), XG drum setups (`3n rr pp`, and the drum setup reset) and the GS/XG drum NRPNs (MSB 14-1E) set each drum
@@ -49,6 +67,15 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   Tested over HTTP: fragmented MP4 with `sidx`, with `mfra` and with neither, Matroska with Cues at the end, video
   files with several audio tracks, fMP4 HLS. See
   [docs/features/web-streams.md](docs/features/web-streams.md#mp4-and-matroska-files).
+- Engine and stream parity (extras step 17): `fa_engine_get_stats` (.NET `AudioEngine.GetStats`, BASS's `BASS_GetCPU`)
+  reports the output callbacks' load (average and peak) and the decode workers' load. Callback streams
+  (`fa_stream_open_callback`, .NET `AudioEngine.OpenCallback`, BASS's `STREAMPROC`) ask the app's function for audio on a
+  decode worker. Capture streams (`fa_stream_open_capture` with `fa_capture_options`, .NET `AudioEngine.OpenCapture` with
+  `CaptureOptions`) open an input as an ordinary stream, to record it with `fa_encoder_encode_stream`, read or play it.
+  Momentary and short-term loudness meters: `fa_stream_get_loudness_meter`, `fa_device_get_loudness_meter` (.NET
+  `GetLoudnessMeter`, BASSloud). `fa_open_options.cancel` now also stops `fa_stream_open_url` (name lookup, connection,
+  first bytes) within about 100 ms; .NET adds `AudioEngine.OpenUrlAsync` and `OpenFileAsync` with a
+  `CancellationToken`. See [docs/features/callback-capture.md](docs/features/callback-capture.md).
 
 - Web streams: a raw-bytes tap for saving a station as it plays (BASS's `DOWNLOADPROC`): `fa_net_options.download_proc`
   from the first byte, `fa_stream_set_download_callback` to start or stop it while playing (.NET
@@ -262,6 +289,11 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- CD+G presentation scaling with smooth-scroll offsets: the picture is smoothed, edge-blended and given its effects
+  as shown, with the picture area moved, so the seam where it meets the border is drawn against its real neighbours and
+  a transparent border stays transparent under the effects. The classic picture maps tiles drawn while the offsets are
+  set to the area they show in instead of redrawing the whole surface. Songs without the offsets draw the same pixels
+  as before.
 - Containers (extras step 23, no change for well-formed files): Matroska's EBML elements and MP4's boxes are read by one walker each (`src/walk.c`), shared by the demuxers and the tag reader; the ADTS header and the AudioSpecificConfig each have one parser (`fa_adts_parse`, `fa_aac_parse_asc` in aac.c), and an Ogg link's comments are parsed once. The system AAC decoders (Media Foundation, AudioToolbox, MediaCodec) lose their ADTS handling, which nothing reached: ADTS always plays through the built-in decoder. Malformed files can come out differently; see docs/engineering-notes.md.
 
 - Analysis: the key's chroma FFT carries two windows at once (as the onset side does), and the bars' chroma shares a bin wider than a semitone among the pitch classes it covers (low chord changes show). The accuracy report is unchanged (all 44 bar songs right, 48 of 48 keys).
