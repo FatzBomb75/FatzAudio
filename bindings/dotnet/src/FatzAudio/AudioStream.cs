@@ -1234,8 +1234,10 @@ public unsafe class AudioStream : IDisposable
     /// time, also while playing: the stream restarts at the position heard, as a seek does. Reversed, the position and
     /// the clock count down and the stream ends at the cue-in marker (or the start); playing from stopped or ended
     /// starts at the cue-out marker (or the end), and a loop wraps from its start to its end. Tempo, pitch, rate and
-    /// fades work as forward. Marker, loop, MIDI text and tracker row events are not raised while reversed, and deck sync
-    /// does not pull a reversed deck into phase.
+    /// fades work as forward. Events tied to a frame (markers, <see cref="Looped"/>, positions, MIDI texts, tracker rows)
+    /// are raised as the position counts down past it, last first. On a DJ deck, sync, deck loops and beat jumps work
+    /// mirrored: the deck is pulled onto the leader's beat with its beats counting down, and loops turn at their in
+    /// point. The blocks the source is decoded in are cross-faded where they meet.
     /// </summary>
     /// <exception cref="FatzAudioException">Turning it on for a stream that cannot seek (push and packet streams):
     /// <see cref="ErrorCode.NotSeekable"/>; for a web stream: <see cref="ErrorCode.NotImplemented"/>.</exception>
@@ -1752,7 +1754,7 @@ public unsafe class AudioStream : IDisposable
     /// Raises <see cref="PositionReached"/> once, the first time playback passes <paramref name="position"/>; the
     /// request is then gone. Add it again from the handler to hear about the next pass (a loop's next turn, or after
     /// seeking back). Frame-exact like markers: it follows tempo, rate and loops, and is raised as that audio is
-    /// mixed, about one device latency before it is heard. Unlike markers it is raised playing in
+    /// mixed, about one device latency before it is heard. Like markers it is raised playing in
     /// <see cref="Reverse"/> too. A seek over the position doesn't raise it: it stays armed. Streams playing on a
     /// device only. Up to 64 positions are armed at once; adding one that is already armed does nothing.
     /// </summary>
@@ -1860,7 +1862,7 @@ public unsafe class AudioStream : IDisposable
     /// as the audio is mixed, about one device latency before the jump is heard; follow <see cref="Clock"/> for
     /// frame-exact timing.
     /// <see cref="StreamEventArgs.Frame"/> is the loop end it left and <see cref="StreamEventArgs.Value"/> the frame it
-    /// went to. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method
+    /// went to (in <see cref="Reverse"/>, the loop start it left and the loop end it went to). Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method
     /// but should return quickly, since they delay later events.
     /// </summary>
     public event EventHandler<StreamEventArgs>? Looped;

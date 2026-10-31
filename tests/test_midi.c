@@ -7,6 +7,7 @@
 #  define _POSIX_C_SOURCE 200809L
 #endif
 #include "fa_internal.h"
+#include "reverse_check.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1665,6 +1666,49 @@ static void test_shared_font_threads(void)
     free(song.d);
 }
 
+/* Reversed: half-second blocks, each after a seek, cross-faded where they meet. A
+ * seek strikes held notes again (with effects on, a second before the target), so
+ * the blocks of a long held chord differ where they meet; the cross-fade leaves no
+ * step there beyond the steps around it. */
+static void test_reverse_joins(void)
+{
+    buf f = { 0 }, t = { 0 };
+    int effects;
+    mthd(&f, 0, 1, 480);
+    ev3(&t, 0, 0x90, 60, 110);
+    ev3(&t, 0, 0x90, 64, 100);
+    ev3(&t, 0, 0x90, 67, 100);
+    ev3(&t, 4800, 0x80, 60, 0);   /* 5 s */
+    ev3(&t, 0, 0x80, 64, 0);
+    ev3(&t, 0, 0x80, 67, 0);
+    eot(&t, 0);
+    mtrk(&f, &t);
+    free(t.d);
+    for (effects = 0; effects < 2; effects++) {
+        float *full, *rev;
+        int64_t n = 0, nr = 0;
+        uint32_t ch = 0, rate = 0;
+        double worst = 0, excess = 0;
+        fa_stream* s = open_bytes(&f, FA_OPEN_DECODE_ONLY, NULL, NULL);
+        CHECK(s);
+        fa_stream_set_midi_effects(s, effects);
+        full = rc_read_all(s, -1, &n, &ch, &rate);
+        s = open_bytes(&f, FA_OPEN_DECODE_ONLY, NULL, NULL);
+        CHECK(s);
+        fa_stream_set_midi_effects(s, effects);
+        rev = rc_read_all(s, n, &nr, &ch, &rate);
+        CHECK(full && rev);
+        CHECK_EQ(nr, n);
+        rc_compare(full, rev, n, ch, rate, &worst, &excess);
+        printf("  effects %s: reversed vs straight %g, steps at the joins beyond those around %g\n", effects ? "on" : "off",
+               worst, excess);
+        CHECK(excess < 0.002);
+        free(full);
+        free(rev);
+    }
+    free(f.d);
+}
+
 /* ---- on a device: FA_EVENT_MIDI_TEXT -------------------------------------------- */
 
 typedef struct text_rec {
@@ -1684,23 +1728,24 @@ static void FA_CALL on_event(const fa_event* ev, void* user)
     fa_mutex_unlock(&r->lock);
 }
 
-static void test_text_events_on_device(void)
+/* Plays `song` through the device (rendered here, not by a device thread), forward
+ * or reversed from the end, until it ends, and collects the text events. */
+static void play_texts(const buf* song, int reverse, text_rec* rec)
 {
-    buf song = make_song();
     fa_device* dev = NULL;
     fa_stream* s;
-    text_rec rec;
     float out[512 * 2];
     int64_t rendered = 0, total;
-    int tries, i;
-    memset(&rec, 0, sizeof(rec));
-    fa_mutex_init(&rec.lock);
-    CHECK_EQ(fa_device_open(g_engine, NULL, &dev), FA_OK);
-    s = open_bytes(&song, 0, NULL, NULL);
-    CHECK(s);
-    fa_stream_set_event_callback(s, on_event, &rec);
-    CHECK_EQ(fa_stream_attach(s, dev, NULL), FA_OK);
-    CHECK_EQ(fa_stream_play(s), FA_OK);
+    int tries;
+    memset(rec, 0, sizeof(*rec));
+    fa_mutex_init(&rec->lock);
+    if (fa_device_open(g_engine, NULL, &dev) != FA_OK) return;
+    s = open_bytes(song, 0, NULL, NULL);
+    if (!s) { fa_device_close(dev); return; }
+    fa_stream_set_event_callback(s, on_event, rec);
+    if (reverse) fa_stream_set_reverse(s, 1);
+    fa_stream_attach(s, dev, NULL);
+    fa_stream_play(s);
     /* This test plays the audio thread: the device was never started. */
     total = (int64_t)dev->rate * 7 / 2;
     while (rendered < total) {
@@ -1715,22 +1760,41 @@ static void test_text_events_on_device(void)
     }
     for (tries = 0; tries < 400; tries++) {
         int done;
-        fa_mutex_lock(&rec.lock);
-        done = rec.ended;
-        fa_mutex_unlock(&rec.lock);
+        fa_mutex_lock(&rec->lock);
+        done = rec->ended;
+        fa_mutex_unlock(&rec->lock);
         if (done) break;
         fa_sleep_ms(5);
     }
     fa_stream_close(s);
     fa_device_close(dev);
+}
+
+static void test_text_events_on_device(void)
+{
+    buf song = make_song();
+    text_rec rec;
+    fa_frames at[5];
+    int i;
     /* Every text once, in order, at its frame. */
+    play_texts(&song, 0, &rec);
     CHECK(rec.ended);
     CHECK_EQ(rec.count, 5);
     for (i = 0; i < rec.count; i++) {
         CHECK_EQ(rec.values[i], i);
         if (i > 0) CHECK(rec.frames[i] >= rec.frames[i - 1]);
+        at[i] = rec.frames[i];
     }
     CHECK_EQ(rec.frames[4], 66150);
+    fa_mutex_destroy(&rec.lock);
+    /* Reversed: every text once, last first, at the same frames. */
+    play_texts(&song, 1, &rec);
+    CHECK(rec.ended);
+    CHECK_EQ(rec.count, 5);
+    for (i = 0; i < rec.count; i++) {
+        CHECK_EQ(rec.values[i], 4 - i);
+        CHECK_EQ(rec.frames[i], at[4 - i]);
+    }
     fa_mutex_destroy(&rec.lock);
     free(song.d);
 }
@@ -2199,6 +2263,7 @@ int main(void)
     RUN(test_effects);
     RUN(test_gs_xg_effects);
     RUN(test_seek_keeps_tails);
+    RUN(test_reverse_joins);
     RUN(test_format2);
     RUN(test_not_midi);
     RUN(test_soundfont_lifetime);

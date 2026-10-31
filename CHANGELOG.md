@@ -247,6 +247,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 - Containers (extras step 23, no change for well-formed files): Matroska's EBML elements and MP4's boxes are read by one walker each (`src/walk.c`), shared by the demuxers and the tag reader; the ADTS header and the AudioSpecificConfig each have one parser (`fa_adts_parse`, `fa_aac_parse_asc` in aac.c), and an Ogg link's comments are parsed once. The system AAC decoders (Media Foundation, AudioToolbox, MediaCodec) lose their ADTS handling, which nothing reached: ADTS always plays through the built-in decoder. Malformed files can come out differently; see docs/engineering-notes.md.
 
+- Reverse playback: the half-second blocks the source is decoded in are each decoded 10 ms past their end and
+  cross-faded with the block above, so where a seek is not exact (AAC noise and prediction, MIDI notes struck again) the
+  joins no longer click; exact decoders give the same audio as before. Markers, `FA_EVENT_LOOPED` (reversed: from the
+  loop start to its end), MIDI texts and tracker rows are now raised while reversed, last first. Deck loops, loop changes
+  and beat jumps join without a gap while reversed instead of restarting like a seek, deck sync pulls a reversed deck
+  into phase (its beats counting down), `fa_deck_play_synced` starts a reversed deck on the beat, and a beat loop set
+  while reversed lies below the beat heard. Forward playback is unchanged. See
+  [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md#reverse-playback).
 - AC-3 and E-AC-3 with more than two channels are mixed down to stereo with the stream's own centre, surround (and
   E-AC-3 LFE) levels and its Lo/Ro or Lt/Rt preference, as ETSI TS 102 366 describes, scaled so the mix cannot clip.
   Without normalization Dolby 5.1 therefore plays about 7.7 dB quieter than with the engine's generic downmix
