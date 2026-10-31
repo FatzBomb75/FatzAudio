@@ -274,6 +274,25 @@ typedef enum fa_dynamic_range {
                                    mode"); streams without heavy gains use NORMAL's */
 } fa_dynamic_range;
 
+/* How Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3) audio with more than two
+ * channels is mixed down for the (stereo) output. These streams carry their own
+ * centre and surround mix levels and say which kind of stereo they prefer; the
+ * downmix uses them as ETSI TS 102 366 describes, turned down so it cannot clip
+ * (normalization, when on, gives that back). A custom channel matrix
+ * (fa_stream_set_matrix) always wins. Other formats are not affected. */
+typedef enum fa_dolby_downmix {
+    FA_DOLBY_DOWNMIX_AUTO = 0,  /* default: the kind the stream prefers, Lo/Ro when it
+                                   names none */
+    FA_DOLBY_DOWNMIX_LORO,      /* Lo/Ro: plain stereo with the stream's centre and
+                                   surround levels */
+    FA_DOLBY_DOWNMIX_LTRT,      /* Lt/Rt: matrix surround (Dolby Surround, Pro Logic):
+                                   the surrounds go in out of phase, so a surround
+                                   decoder downstream can bring them back */
+    FA_DOLBY_DOWNMIX_ENGINE     /* the engine's own downmix, as for every other format;
+                                   the stream's levels are ignored (the downmix of
+                                   FatzAudio before this setting) */
+} fa_dolby_downmix;
+
 typedef struct fa_open_options {
     uint32_t struct_size;
     uint32_t flags;          /* fa_open_flags */
@@ -305,6 +324,8 @@ typedef struct fa_open_options {
                                 a block of the compressed data, and the song is not opened.
                                 Read only during the call, so it may be freed
                                 after. Other opens ignore it */
+    int32_t dolby_downmix;   /* fa_dolby_downmix (default AUTO); can be changed later
+                                with fa_stream_set_dolby_downmix */
 } fa_open_options;
 
 /* fa_open_options.text_code_page, and fa_midi_credits.code_page. */
@@ -765,6 +786,14 @@ FA_API fa_result FA_CALL fa_stream_get_info(fa_stream* stream, fa_stream_info* o
  * default). Streams of other formats accept and ignore it. */
 FA_API fa_result FA_CALL fa_stream_set_dynamic_range(fa_stream* stream, fa_dynamic_range mode);
 FA_API fa_result FA_CALL fa_stream_get_dynamic_range(fa_stream* stream, fa_dynamic_range* out_mode);
+
+/* Dolby downmix (see fa_dolby_downmix). Between AUTO, LORO and LTRT the change
+ * applies like the dynamic range, to audio decoded from now on. To or from ENGINE
+ * an attached stream rebuilds its chain and carries on from where it plays, as
+ * fa_stream_set_matrix does (FA_ERROR_NOT_SEEKABLE on a live stream: change it
+ * while detached). Streams of other formats accept and ignore it. */
+FA_API fa_result FA_CALL fa_stream_set_dolby_downmix(fa_stream* stream, fa_dolby_downmix mode);
+FA_API fa_result FA_CALL fa_stream_get_dolby_downmix(fa_stream* stream, fa_dolby_downmix* out_mode);
 
 /* ---- Tags and cover art ------------------------------------------------
  *
@@ -1583,7 +1612,8 @@ typedef enum fa_loudness_source {
     FA_LOUDNESS_TAGS,      /* ReplayGain / R128 tags */
     FA_LOUDNESS_CACHE,     /* an earlier scan of the same content */
     FA_LOUDNESS_SCAN,      /* a full scan */
-    FA_LOUDNESS_APP        /* fa_stream_set_loudness */
+    FA_LOUDNESS_APP,       /* fa_stream_set_loudness */
+    FA_LOUDNESS_DIALNORM   /* a Dolby stream's dialogue level (fa_engine_set_dialnorm) */
 } fa_loudness_source;
 
 typedef struct fa_loudness {
@@ -1601,6 +1631,15 @@ typedef struct fa_loudness {
  * EBU broadcast. Valid range -60..0. Takes effect on playing streams at once,
  * with the same glide. Starts the analysis of streams that are attached. */
 FA_API fa_result FA_CALL fa_engine_set_normalization(fa_engine* engine, fa_normalize_mode mode, double target_lufs);
+
+/* Dolby streams (AC-3, E-AC-3) state their dialogue level ("dialnorm", -1 to -31
+ * dBFS), which broadcasters set to the programme's loudness (ATSC A/85). With this
+ * on (default off), a file's dialnorm counts as its loudness when there is no
+ * value from the app, no ReplayGain / R128 tag and no earlier scan in the cache:
+ * final at once, so a two-hour film needs no scan. -31, the value encoders write
+ * when nobody set it, is not used. Applies to streams whose analysis starts afterwards; live and
+ * app-I/O streams keep the running estimate. Off measures every file. */
+FA_API fa_result FA_CALL fa_engine_set_dialnorm(fa_engine* engine, int32_t enabled);
 
 typedef enum fa_limiter_mode {
     FA_LIMITER_AUTO = 0,   /* default: on while normalization is on */

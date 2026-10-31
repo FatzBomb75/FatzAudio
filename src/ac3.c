@@ -346,6 +346,7 @@ typedef struct frame {
     float compr[2];
     int chanmape;
     uint32_t chanmap;
+    fa_ac3_mix mix;
     /* audfrm (E-AC-3) */
     int ahte, snroffststr, blkswe, dithflage, bamode, frmfgaincode, dbaflde, skipflde;
     int cplstre[AC3_MAX_BLOCKS], cplinu_blk[AC3_MAX_BLOCKS];
@@ -404,6 +405,8 @@ struct fa_ac3 {
     int loc_used[LOC_COUNT];
     float blk[6][AC3_BLOCK];     /* one block per channel, for units mixed directly */
     int last_used[LOC_COUNT];    /* the locations of the last good unit */
+    uint64_t mix;                /* fa_ac3_mix_pack of the last independent frame of program 0 */
+    uint32_t out_used;           /* the output channels the last unit had audio for (bit per channel) */
 };
 
 fa_ac3* fa_ac3_create(void)
@@ -647,25 +650,35 @@ static int parse_bsi(bits* b, frame* f)
     const fa_ac3_header* h = &f->h;
     int i, acmod = h->acmod, nprog = acmod == 0 ? 2 : 1;
     f->nfchans = acmod_nfchans[acmod];
+    fa_ac3_mix* m = &f->mix;
     f->compre[0] = f->compre[1] = 0;
     f->chanmape = 0;
+    fa_ac3_mix_defaults(m, acmod, h->lfeon);   /* for the levels a stream does not give */
     if (!h->eac3) {
+        static const int cmix_code[4] = { 4, 5, 6, 5 }, surmix_code[4] = { 4, 6, 7, 6 };
         skipb(b, 16 + 16);                        /* syncword, crc1 */
         f->fscod = (int)gb(b, 2);
         skipb(b, 6 + 5 + 3 + 3);                  /* frmsizecod, bsid, bsmod, acmod */
-        if ((acmod & 1) && acmod != 1) skipb(b, 2);
-        if (acmod & 4) skipb(b, 2);
-        if (acmod == 2) skipb(b, 2);
+        if ((acmod & 1) && acmod != 1) m->lorocmix = cmix_code[gb(b, 2)];
+        if (acmod & 4) m->lorosurmix = surmix_code[gb(b, 2)];
+        if (acmod == 2) skipb(b, 2);              /* dsurmod */
         skipb(b, 1);                              /* lfeon */
         for (i = 0; i < nprog; i++) {
-            skipb(b, 5);                          /* dialnorm */
+            int dialnorm = (int)gb(b, 5);
+            if (i == 0) m->dialnorm = dialnorm;
             if ((f->compre[i] = gb1(b)) != 0) f->compr[i] = compr_gain((int)gb(b, 8));
             if (gb1(b)) skipb(b, 8);              /* langcod */
             if (gb1(b)) skipb(b, 5 + 2);          /* mixlevel, roomtyp */
         }
         skipb(b, 2);                              /* copyrightb, origbs */
         if (h->bsid == 6) {                       /* alternate syntax (A/52 Annex D) */
-            if (gb1(b)) skipb(b, 2 + 3 + 3 + 3 + 3);
+            if (gb1(b)) {                         /* xbsi1e */
+                m->dmixmod = (int)gb(b, 2);
+                m->ltrtcmix = (int)gb(b, 3);
+                m->ltrtsurmix = (int)gb(b, 3);
+                m->lorocmix = (int)gb(b, 3);
+                m->lorosurmix = (int)gb(b, 3);
+            }
             if (gb1(b)) skipb(b, 2 + 2 + 1 + 8 + 1);
         } else {
             if (gb1(b)) skipb(b, 14);
@@ -687,15 +700,22 @@ static int parse_bsi(bits* b, frame* f)
         }
         skipb(b, 3 + 1 + 5);                      /* acmod, lfeon, bsid */
         for (i = 0; i < nprog; i++) {
-            skipb(b, 5);                          /* dialnorm */
+            int dialnorm = (int)gb(b, 5);
+            if (i == 0) m->dialnorm = dialnorm;
             if ((f->compre[i] = gb1(b)) != 0) f->compr[i] = compr_gain((int)gb(b, 8));
         }
         if (h->strmtyp == 1 && (f->chanmape = gb1(b)) != 0) f->chanmap = gb(b, 16);
         if (gb1(b)) {                             /* mixmdate */
-            if (acmod > 2) skipb(b, 2);           /* dmixmod */
-            if ((acmod & 1) && acmod > 2) skipb(b, 3 + 3);
-            if (acmod & 4) skipb(b, 3 + 3);
-            if (h->lfeon && gb1(b)) skipb(b, 5);  /* lfemixlevcod */
+            if (acmod > 2) m->dmixmod = (int)gb(b, 2);
+            if ((acmod & 1) && acmod > 2) {
+                m->ltrtcmix = (int)gb(b, 3);
+                m->lorocmix = (int)gb(b, 3);
+            }
+            if (acmod & 4) {
+                m->ltrtsurmix = (int)gb(b, 3);
+                m->lorosurmix = (int)gb(b, 3);
+            }
+            if (h->lfeon && gb1(b)) m->lfemix = (int)gb(b, 5);   /* lfemixlevcod */
             if (h->strmtyp == 0) {
                 for (i = 0; i < nprog; i++) if (gb1(b)) skipb(b, 6);   /* pgmscl */
                 if (gb1(b)) skipb(b, 6);          /* extpgmscl */
@@ -1637,10 +1657,20 @@ static int reserve_out(float** pcm, size_t* cap, size_t need)
     return 0;
 }
 
+/* Notes which output channels the plan gives audio (for the downmix weights). */
+static void note_used(fa_ac3* d, const mix_plan* m)
+{
+    uint32_t used = 0;
+    int i;
+    for (i = 0; i < m->nroute; i++) used |= 1u << m->route[i].ch;
+    if (used) d->out_used = used;   /* a damaged unit (silence) keeps the last layout's */
+}
+
 static int mix_out(fa_ac3* d, int frames, float** pcm, size_t* cap, int* out_channels)
 {
     mix_plan m;
     plan_mix(d->loc_used, d->loc, &m);
+    note_used(d, &m);
     if (reserve_out(pcm, cap, (size_t)frames * m.nch) < 0) return -1;
     render_mix(&m, d->loc, 0, *pcm, frames);
     *out_channels = m.nch;
@@ -1677,6 +1707,7 @@ static int decode_frame(fa_ac3* d, const uint8_t* p, const fa_ac3_header* h, int
     b.end = h->frame_size * 8;
     b.overrun = 0;
     if (parse_bsi(&b, f) < 0) return -1;
+    if (state == 0) d->mix = fa_ac3_mix_pack(&f->mix);
     if (h->eac3) {
         r = parse_audfrm(&b, f);
         if (r != 0) return r;
@@ -1708,6 +1739,7 @@ static int decode_frame(fa_ac3* d, const uint8_t* p, const fa_ac3_header* h, int
         memset(src, 0, sizeof(src));
         for (ch = 0; ch < 6; ch++) if (loc[ch] >= 0) { used[loc[ch]] = 1; src[loc[ch]] = d->blk[ch]; }
         plan_mix(used, src, &plan);
+        note_used(d, &plan);
         if (reserve_out(direct->pcm, direct->cap, (size_t)h->blocks * AC3_BLOCK * plan.nch) < 0) return -2;
         direct->channels = plan.nch;
     } else {
@@ -1875,4 +1907,98 @@ fa_result fa_ac3_decode(fa_ac3* d, const uint8_t* data, size_t size, int drc,
     if (err == 0) memcpy(d->last_used, d->loc_used, sizeof(d->loc_used));
     if (err < 0) return FA_ERROR_GENERIC;
     return FA_OK;
+}
+
+/* ---- downmix information ----------------------------------------------------------- */
+
+void fa_ac3_mix_defaults(fa_ac3_mix* m, int acmod, int lfeon)
+{
+    memset(m, 0, sizeof(*m));
+    m->acmod = acmod;
+    m->lfeon = lfeon;
+    m->ltrtcmix = m->ltrtsurmix = 4;
+    m->lorocmix = 5;
+    m->lorosurmix = 6;
+    m->lfemix = -1;
+}
+
+uint64_t fa_ac3_mix_pack(const fa_ac3_mix* m)
+{
+    uint32_t v = 1u << 31 | (uint32_t)m->acmod | (uint32_t)m->lfeon << 3 | (uint32_t)m->dmixmod << 4 |
+                 (uint32_t)m->ltrtcmix << 6 | (uint32_t)m->ltrtsurmix << 9 | (uint32_t)m->lorocmix << 12 |
+                 (uint32_t)m->lorosurmix << 15 | (m->lfemix >= 0 ? 1u << 18 | (uint32_t)m->lfemix << 19 : 0) |
+                 (uint32_t)m->dialnorm << 24;
+    return (uint64_t)(m->used & 0xff) << 32 | v;
+}
+
+int fa_ac3_mix_unpack(uint64_t packed, fa_ac3_mix* m)
+{
+    uint32_t v = (uint32_t)packed;
+    if (!v) return 0;
+    m->acmod = (int)(v & 7);
+    m->lfeon = (int)(v >> 3 & 1);
+    m->dmixmod = (int)(v >> 4 & 3);
+    m->ltrtcmix = (int)(v >> 6 & 7);
+    m->ltrtsurmix = (int)(v >> 9 & 7);
+    m->lorocmix = (int)(v >> 12 & 7);
+    m->lorosurmix = (int)(v >> 15 & 7);
+    m->lfemix = v >> 18 & 1 ? (int)(v >> 19 & 31) : -1;
+    m->dialnorm = (int)(v >> 24 & 31);
+    m->used = (uint32_t)(packed >> 32 & 0xff);
+    return 1;
+}
+
+uint64_t fa_ac3_mix_info(const fa_ac3* d)
+{
+    fa_ac3_mix m;
+    if (!fa_ac3_mix_unpack(d->mix, &m)) return 0;
+    m.used = d->out_used;
+    return fa_ac3_mix_pack(&m);
+}
+
+int fa_ac3_downmix(const fa_ac3_mix* m, int channels, int ltrt, float* w, float* out_scale)
+{
+    /* Tables D.1.2 to D.1.5; the reserved surround codes 0..2 read as 0.841. */
+    static const float level[8] = { 1.4142136f, 1.1892071f, 1.0f, 0.8408964f, 0.7071068f, 0.5946036f, 0.5f, 0.0f };
+    /* What each output channel of fa_ac3_decode is, by channel count (see plan_mix):
+     * F front L/R, C centre, E LFE, S single rear surround, l/r a surround pair. */
+    static const char* const kinds[9] = { "", "", "", "FFC", "FFCS", "FFClr", "FFCElr", "FFCESlr", "FFCElrlr" };
+    int ccode = ltrt ? m->ltrtcmix : m->lorocmix, scode = ltrt ? m->ltrtsurmix : m->lorosurmix;
+    float cl = level[ccode & 7], sl = level[scode < 3 ? 3 : scode & 7];
+    float sum0 = 0.0f, sum1 = 0.0f, scale;
+    int fronts = (m->used & 3) != 0, i;
+    if (channels < 3 || channels > 8) return 0;
+    memset(w, 0, (size_t)channels * 2 * sizeof(float));
+    /* Only channels with audio get a weight, so silent ones (C of a 2.1 stream, the
+     * surrounds of stereo plus LFE) take no headroom. */
+    for (i = 0; i < channels; i++) {
+        float* o = w + i * 2;
+        if (!(m->used >> i & 1)) continue;
+        switch (kinds[channels][i]) {
+        case 'F': o[i] = 1.0f; break;                              /* L into left, R into right */
+        case 'C': o[0] = o[1] = fronts ? cl : 0.7071068f; break;   /* a mono programme: -3 dB */
+        case 'E':                                                  /* E.2.9: its mix level - 4.5 dB */
+            if (m->lfemix >= 0) o[0] = o[1] = powf(10.0f, (float)(10 - m->lfemix) / 20.0f - 0.225f);
+            break;
+        case 'S':
+            if (ltrt) { o[0] = -sl; o[1] = sl; }
+            else o[0] = o[1] = 0.7f * sl;                          /* 6.8.2: 0.7 x slev */
+            break;
+        case 'l': case 'r':
+            if (ltrt) { o[0] = -sl; o[1] = sl; }                   /* both into Lt inverted, Rt as they are */
+            else o[kinds[channels][i] == 'r'] = sl;
+            break;
+        default: break;
+        }
+    }
+    /* 6.8.1: all weights down alike until no output can pass full scale. */
+    for (i = 0; i < channels; i++) {
+        sum0 += fabsf(w[i * 2 + 0]);
+        sum1 += fabsf(w[i * 2 + 1]);
+    }
+    scale = sum0 > sum1 ? sum0 : sum1;
+    scale = scale > 1.0f ? 1.0f / scale : 1.0f;
+    for (i = 0; i < channels * 2; i++) w[i] *= scale;
+    if (out_scale) *out_scale = scale;
+    return 1;
 }
