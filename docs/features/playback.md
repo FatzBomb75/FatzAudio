@@ -23,6 +23,25 @@ When a stream is attached to a device, FatzAudio decodes it **ahead of time on w
 
 On Windows the audio thread runs in the MMCSS "Pro Audio" class.
 
+### How busy it is
+
+`fa_engine_get_stats` (.NET `engine.GetStats()`, BASS's `BASS_GetCPU`) reports the load for a diagnostics panel:
+
+| Field | .NET | Meaning |
+|---|---|---|
+| `audio_load` | `AudioLoad` | Percent: the time the output callbacks take to mix, of the time of the audio they make, averaged over about 1 s and added up over the open outputs. Near 100 the mix can't keep up and the sound breaks up |
+| `audio_load_peak` | `AudioLoadPeak` | Percent: the slowest single callback of any output in the last 1 to 2 s. Spikes here, with a low average, point at something that blocks now and then |
+| `worker_load` | `WorkerLoad` | Percent of one core: the decode workers' time (decoding ahead and the tempo, pitch and effects that run with it) since the previous call; up to 100 times `workers` |
+| `workers`, `devices`, `attached_streams` | `Workers`, `Devices`, `AttachedStreams` | Decode workers, open outputs, streams attached to an output |
+
+Set `struct_size` first. It is cheap: call it from a UI timer (calls less than 100 ms apart repeat the previous `worker_load`). Mic inputs on the DJ mixer and capture streams are not counted in `audio_load`.
+
+```c
+fa_engine_stats st = { sizeof(st) };
+fa_engine_get_stats(engine, &st);
+printf("mix %.1f%% (peak %.1f%%), decoding %.1f%% of a core\n", st.audio_load, st.audio_load_peak, st.worker_load);
+```
+
 ## Buffer length
 
 The default decode-ahead buffer is 500 ms per stream. Change it per stream:

@@ -194,13 +194,37 @@ void fa_device_render_output(fa_device* dev, float* out, uint32_t channels, uint
     else fa_device_render_at(dev, out, frames, now_ns);
 }
 
+/* The callback's load: the time it took over the time of the audio it made. The
+ * average follows over about a second; the peak is the slowest callback of the
+ * current and the previous second. */
+static void note_load(fa_device* dev, int64_t busy_ns, uint32_t frames)
+{
+    uint32_t rate = dev->rate ? dev->rate : 48000;
+    double audio_ns = (double)frames * 1e9 / rate, k = audio_ns / 1e9;
+    float load;
+    if (frames == 0) return;
+    load = (float)(100.0 * (double)busy_ns / audio_ns);
+    dev->load_avg += (load - dev->load_avg) * (float)(k > 1.0 ? 1.0 : k);
+    if (load > dev->load_win_max) dev->load_win_max = load;
+    dev->load_win_frames += frames;
+    if (dev->load_win_frames >= rate) {
+        dev->load_prev_max = dev->load_win_max;
+        dev->load_win_max = 0.0f;
+        dev->load_win_frames = 0;
+    }
+    fa_store_float(&dev->load, dev->load_avg);
+    fa_store_float(&dev->load_peak, dev->load_win_max > dev->load_prev_max ? dev->load_win_max : dev->load_prev_max);
+}
+
 static void data_callback(ma_device* d, void* output, const void* input, ma_uint32 frames)
 {
     fa_device* dev = (fa_device*)d->pUserData;
+    int64_t start = fa_monotonic_ns();
     (void)input;
     fa_fetch_add64(&dev->epoch, 1);
-    fa_device_render_output(dev, (float*)output, d->playback.channels, frames, fa_monotonic_ns());
+    fa_device_render_output(dev, (float*)output, d->playback.channels, frames, start);
     fa_fetch_add64(&dev->epoch, 1);
+    note_load(dev, fa_monotonic_ns() - start, frames);
 }
 
 /* Output latency of the open ma_device (life_lock held, or nobody else can see it yet). */

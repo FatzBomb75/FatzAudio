@@ -3128,6 +3128,81 @@ static void test_close_during_resolve(void)
     CHECK(took < 500000000LL);
 }
 
+/* fa_open_options.cancel stops an open that waits for the server (here a name
+ * lookup that hangs): FA_ERROR_CANCELLED soon after the flag goes up, nothing
+ * opened. A flag raised before the call cancels at once. */
+static volatile int32_t g_open_cancel;
+
+static void hold_every_resolve(const char* host)
+{
+    (void)host;
+    fa_fetch_add32(&g_resolve_in, 1);
+    while (fa_load32(&g_resolve_hold)) fa_sleep_ms(2);
+    fa_fetch_add32(&g_resolve_out, 1);
+}
+
+static void raise_cancel(void* arg)
+{
+    (void)arg;
+    while (!fa_load32(&g_resolve_in)) fa_sleep_ms(2);   /* the open is waiting now */
+    fa_sleep_ms(50);
+    g_open_cancel = 1;
+}
+
+static fa_result open_cancellable(const char* path, fa_stream** s)
+{
+    char url[256];
+    fa_open_options o;
+    fa_net_options net;
+    url_of(url, sizeof(url), path);
+    fa_net_options_init(&net);
+    net.proxy = "";
+    net.timeout_ms = 3000;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    o.net = &net;
+    o.cancel = &g_open_cancel;
+    return fa_stream_open_url(g_engine, url, &o, s);
+}
+
+static void test_cancel_open(void)
+{
+    fa_thread raiser;
+    fa_stream* s = NULL;
+    fa_result r;
+    int64_t t0, took;
+    if (strcmp(g_scheme, "http") != 0) return;
+    fa_store32(&g_resolve_in, 0);
+    fa_store32(&g_resolve_out, 0);
+    fa_store32(&g_resolve_hold, 1);
+    g_open_cancel = 0;
+    fa_net_test_resolve_hook = hold_every_resolve;
+    if (fa_thread_create(&raiser, raise_cancel, NULL) != 0) { fa_net_test_resolve_hook = NULL; CHECK(0); }
+    t0 = fa_monotonic_ns();
+    r = open_cancellable("/tone.wav", &s);
+    took = fa_monotonic_ns() - t0;
+    fa_thread_join(&raiser);
+    /* Let the abandoned lookup finish before any check can return. */
+    fa_store32(&g_resolve_hold, 0);
+    t0 = fa_monotonic_ns();
+    while (fa_load32(&g_resolve_out) < fa_load32(&g_resolve_in) && fa_monotonic_ns() - t0 < 5000000000LL) fa_sleep_ms(2);
+    fa_sleep_ms(50);
+    fa_net_test_resolve_hook = NULL;
+    printf("  cancelled open returned after %.1f ms\n", (double)took / 1e6);
+    CHECK_EQ(r, FA_ERROR_CANCELLED);
+    CHECK(s == NULL);
+    CHECK(took < 1500000000LL);   /* the flag goes up after ~50 ms; the timeout would be 6 s */
+
+    g_open_cancel = 1;
+    r = open_cancellable("/tone.wav", &s);
+    CHECK_EQ(r, FA_ERROR_CANCELLED);
+    CHECK(s == NULL);
+    g_open_cancel = 0;
+    r = open_cancellable("/tone.wav", &s);
+    CHECK_EQ(r, FA_OK);
+    fa_stream_close(s);
+}
+
 /* A live stream without a length or chunked framing that the server closes cleanly
  * is reconnected like a dropped one, not taken as the end of a file. */
 static void test_clean_close_reconnects(void)
@@ -3747,6 +3822,7 @@ int main(void)
     RUN(test_close_while_streaming);
     RUN(test_hls_audio_groups);
     RUN(test_close_during_resolve);
+    RUN(test_cancel_open);
     RUN(test_clean_close_reconnects);
     RUN(test_download_tap);
     RUN(test_cookie_jar);

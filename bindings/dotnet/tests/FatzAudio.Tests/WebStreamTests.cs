@@ -96,6 +96,10 @@ public sealed class WebStreamTests : IDisposable
                     }
                 }
             }
+            else if (path == "/silent")
+            {
+                await Task.Delay(System.Threading.Timeout.Infinite, _stop.Token);   // a server that never answers
+            }
             else
             {
                 await Write(s, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -211,6 +215,23 @@ public sealed class WebStreamTests : IDisposable
 
         using var file = engine.OpenMemory(_wav, new StreamOptions { DecodeOnly = true });
         Assert.Throws<InvalidOperationException>(() => file.SetDownloadHandler(_ => { }));
+    }
+
+    [Fact]
+    public async Task OpenUrlAsync_OpensAndCancels()
+    {
+        using var engine = AudioEngine.Create(new AudioEngineOptions { NullOutput = true });
+        using (var web = await engine.OpenUrlAsync(Url("/tone.wav"), DecodeOnly))
+            Assert.Equal(44100, web.Info.Format.SampleRate);
+
+        // A server that never answers: cancelling ends the wait at once, not after the timeout.
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => engine.OpenUrlAsync(Url("/silent"), DecodeOnly, cts.Token));
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2), $"took {sw.Elapsed}");
+
+        // Already cancelled: nothing is started.
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => engine.OpenUrlAsync(Url("/tone.wav"), DecodeOnly, cts.Token));
     }
 
     [Fact]

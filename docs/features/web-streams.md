@@ -133,10 +133,24 @@ A URL that isn't an absolute http or https URL throws `ArgumentException`. Other
 
 `fa_stream_open_url` connects, follows redirects (up to 8) and playlists, and waits for the first few KB so the format can be detected. That takes one round trip or a few, and at most twice `timeout_ms` when the server is slow, so call it off your UI thread. Everything after that runs on the stream's own download thread.
 
+To give up on an open (the user picked another station before this one answered), point `fa_open_options.cancel` at a flag and set it from another thread: the open returns `FA_ERROR_CANCELLED` within about 100 ms, also during a name lookup or a connection that hangs, and nothing is opened. In .NET, `await engine.OpenUrlAsync(url, options, token)` runs the open on the thread pool and throws `OperationCanceledException` when the token is cancelled:
+
+```csharp
+_tuning?.Cancel();
+_tuning = new CancellationTokenSource();
+try
+{
+    var radio = await engine.OpenUrlAsync(station.Url, cancellationToken: _tuning.Token);
+    radio.PlayOn(output);
+}
+catch (OperationCanceledException) { /* another station was picked meanwhile */ }
+```
+
 | Result | Why |
 |---|---|
 | `FA_OK` | Connected and recognised |
 | `FA_ERROR_INVALID_ARG` | Not an absolute `http://` or `https://` URL |
+| `FA_ERROR_CANCELLED` | The app raised `fa_open_options.cancel` |
 | `FA_ERROR_NETWORK` | The server can't be reached, refused the connection, or timed out |
 | `FA_ERROR_NOT_FOUND` | The server answered with an error (404, 403, 500, ...) |
 | `FA_ERROR_UNSUPPORTED_FORMAT` | What came back isn't audio FatzAudio can decode (a web page, say) |

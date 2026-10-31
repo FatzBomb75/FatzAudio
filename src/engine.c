@@ -179,8 +179,10 @@ static void worker_main(void* arg)
             fa_mutex_unlock(&e->list_lock);
             /* Top up to full, in turns of at most half a buffer so one stream
              * cannot starve the others. */
+            int64_t t0 = fa_monotonic_ns();
             int busy = !fa_stream_work(pick, pick->ring.capacity / 2);
             fa_mutex_unlock(&pick->decode_lock);
+            fa_fetch_add64(&e->worker_busy_ns, fa_monotonic_ns() - t0);
             fa_mutex_lock(&e->list_lock);
             /* A seek waiting for an API call to finish: try again shortly. */
             if (busy) fa_cond_wait_ms(&e->work_cond, &e->list_lock, 1);
@@ -188,10 +190,19 @@ static void worker_main(void* arg)
         }
         /* No stream wants decoding: help with work being shared out, which someone
          * waits for, then a surface rendering ahead may want a frame (cdg.c). */
-        if (par_help(e)) continue;
+        {
+            int64_t t0 = fa_monotonic_ns();
+            if (par_help(e)) {
+                fa_fetch_add64(&e->worker_busy_ns, fa_monotonic_ns() - t0);
+                continue;
+            }
+        }
         if (fa_load32(&e->cdg_render_count)) {
+            int64_t t0;
             fa_mutex_unlock(&e->list_lock);
+            t0 = fa_monotonic_ns();
             fa_cdg_render_one(e);
+            fa_fetch_add64(&e->worker_busy_ns, fa_monotonic_ns() - t0);
             fa_mutex_lock(&e->list_lock);
             continue;
         }
@@ -209,6 +220,42 @@ static void worker_main(void* arg)
 }
 
 void fa_event_thread_main(void* arg);
+
+FA_API fa_result FA_CALL fa_engine_get_stats(fa_engine* engine, fa_engine_stats* out_stats)
+{
+    fa_engine_stats st;
+    struct fa_device* d;
+    struct fa_stream* s;
+    int64_t now, busy;
+    if (!engine || !out_stats || out_stats->struct_size < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+    memset(&st, 0, sizeof(st));
+    st.struct_size = sizeof(st);
+    st.workers = engine->worker_count;
+    now = fa_monotonic_ns();
+    fa_mutex_lock(&engine->list_lock);
+    for (d = engine->devices; d; d = d->next) {
+        int64_t last = fa_load64(&d->cb_time);
+        float peak = fa_load_float(&d->load_peak);
+        st.devices++;
+        /* A stopped or lost output keeps its last figures: it mixes nothing now. */
+        if (last == 0 || now - last > 500000000) continue;
+        st.audio_load += fa_load_float(&d->load);
+        if (peak > st.audio_load_peak) st.audio_load_peak = peak;
+    }
+    for (s = engine->streams; s; s = s->next) st.attached_streams++;
+    /* Workers: over the time since the previous call (since the engine started, the
+     * first time); calls closer together than 100 ms repeat the previous value. */
+    busy = fa_load64(&engine->worker_busy_ns);
+    if (now - engine->stats_at >= 100000000) {
+        engine->stats_worker_load = (float)(100.0 * (double)(busy - engine->stats_busy_ns) / (double)(now - engine->stats_at));
+        engine->stats_at = now;
+        engine->stats_busy_ns = busy;
+    }
+    st.worker_load = engine->stats_worker_load;
+    fa_mutex_unlock(&engine->list_lock);
+    fa_copy_sized(out_stats, &st, sizeof(st));
+    return FA_OK;
+}
 
 /* The app's temp directory gets a folder of FatzAudio's own, so the sweep never
  * touches the app's files. One that cannot be made now is tried again when a song
@@ -270,6 +317,7 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
         fa_mutex_destroy(&e->scan_lock); ma_mutex_uninit(&e->lock); free_strings(e); free(e);
         return FA_ERROR_GENERIC;
     }
+    e->stats_at = fa_monotonic_ns();
     fa_store32(&e->norm_mode, FA_NORMALIZE_OFF);
     fa_store_float(&e->norm_target, -16.0f);
     fa_store32(&e->limiter_mode, FA_LIMITER_AUTO);

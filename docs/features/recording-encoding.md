@@ -16,6 +16,7 @@ Each encoder takes its audio from one source:
 | A DJ mixer's master or vocals | `fa_encoder_attach_mixer` + `fa_mixer_start_recording` | `encoder.Record(mixer, tap)` + `mixer.StartRecording(...)` | Stems that start on one frame, the vocals lined up as the singer heard the music ([DJ mixer recording](dj-mixer.md#recording)) |
 | One playing stream | `fa_encoder_attach_stream` | `encoder.Record(stream)` | The stream as heard: volume, pan, fades, crossfades, normalization and its bus applied. Only what it plays: nothing before it starts or after it ends, and nothing while it is paused or stalled |
 | A stream that is not playing | `fa_encoder_encode_stream` | `encoder.Encode(stream)` | The stream from its position to its end, as fast as it decodes, at its own rate and channels (file conversion). Tempo, pitch and rate apply, as for `fa_stream_read` |
+| An input (a microphone, a line input) | `fa_stream_open_capture` with `FA_OPEN_DECODE_ONLY`, then `fa_encoder_encode_stream` | `engine.OpenCapture(...)`, then `encoder.Encode(stream)` | The input from the encoder's first read until `fa_encoder_close`, at the input's rate and channels ([capture streams](callback-capture.md#capture-streams)) |
 | Your own samples | `fa_encoder_write` | `encoder.Write(span, rate, channels)` | Interleaved float frames from any thread. It blocks while the queue is full, so nothing is lost |
 
 Several encoders can share a source, for example an MP3 for the web and a WAV archive of the same mix.
@@ -178,4 +179,3 @@ LAME is LGPL, so FatzAudio never links or bundles it (the same model as FFmpeg).
 ## Not yet
 
 - Opus and AAC encoding (planned in the design: Opus with the built-in Opus codec, AAC through the operating system's encoders), the Windows Media Foundation MP3 encoder as a fallback when LAME is missing, and broadcasting to Icecast/Shoutcast servers. See [engineering notes](../engineering-notes.md).
-- Recording from input devices (microphones, line in) comes with capture devices; until then, feed captured samples to `fa_encoder_write`.

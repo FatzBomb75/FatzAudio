@@ -1,6 +1,6 @@
-# Levels and spectrum
+# Levels, loudness meters and spectrum
 
-FatzAudio measures what is being heard, for VU meters and visualizers: peak and RMS levels, and a magnitude spectrum (FFT). Both work on one stream or on a whole output device. They replace `BASS_ChannelGetLevel`/`GetLevelEx` and `BASS_ChannelGetData` with the `BASS_DATA_FFT...` flags.
+FatzAudio measures what is being heard, for VU meters and visualizers: peak and RMS levels, momentary and short-term loudness ([below](#loudness-meters)), and a magnitude spectrum (FFT). Both work on one stream or on a whole output device. They replace `BASS_ChannelGetLevel`/`GetLevelEx` and `BASS_ChannelGetData` with the `BASS_DATA_FFT...` flags.
 
 | Call | Measures |
 |---|---|
@@ -29,6 +29,28 @@ Nothing is recorded until the first call: once something asks, a stream or devic
 - Magnitudes are linear: a full-scale sine reads 1.0 in its bin, a little less when its frequency falls between two bins.
 - A Hann window is applied unless `FA_SPECTRUM_NO_WINDOW` is set. `FA_SPECTRUM_LEFT` or `FA_SPECTRUM_RIGHT` analyse one channel; the default is both mixed.
 - The library gives the raw bins only. Grouping them into bars, a log frequency scale, dB, smoothing and peak-hold are the app's choice and take a few lines (below).
+
+## Loudness meters
+
+`fa_stream_get_loudness_meter(stream, &momentary, &short_term)` and `fa_device_get_loudness_meter(device, ...)` give the loudness of what is heard now, in LUFS, the way a broadcast loudness meter shows it (EBU R128, ITU-R BS.1770; BASSloud's `BASS_LOUDNESS_CURRENT`):
+
+- **Momentary**: the last 400 ms. Moves with every phrase; what a meter's needle shows.
+- **Short-term**: the last 3 s. Steadier; what you aim at -23 LUFS (broadcast) or about -14 to -16 (streaming).
+
+Both channels are K-weighted and added as BS.1770 says, so a 1 kHz sine at -23 dBFS in both channels reads -23 LUFS. Same source and timing as the levels: a stream's own audio before its volume and normalization, a device's whole output after the limiter. They read `-INFINITY` (.NET `double.NegativeInfinity`) for silence, while the stream is not playing and while the device is stopped. Either output may be NULL.
+
+The first call starts measuring (the stream or device then keeps 4 s instead of 1 s, about 2 MB at 48 kHz), so the values read low for the first 3 s. Each call measures afresh from that audio, about 1 ms of work: 10 calls a second from a UI timer are plenty. The loudness of a whole song (integrated, range, true peak) is `fa_stream_get_loudness` ([normalization](normalization.md)).
+
+```c
+double momentary, short_term;
+fa_device_get_loudness_meter(output, &momentary, &short_term);
+if (isfinite(short_term)) printf("%.1f LUFS (3 s)\n", short_term);
+```
+
+```csharp
+var meter = output.GetLoudnessMeter();
+loudnessLabel.Text = double.IsFinite(meter.ShortTerm) ? $"{meter.ShortTerm:0.0} LUFS" : "-inf";
+```
 
 ## C
 

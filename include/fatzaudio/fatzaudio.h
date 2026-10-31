@@ -162,6 +162,28 @@ FA_API fa_result FA_CALL fa_engine_create(const fa_engine_config* config, fa_eng
 /* Close every stream and device of the engine before destroying it. */
 FA_API void FA_CALL fa_engine_destroy(fa_engine* engine);
 
+/* How busy the engine is (BASS_GetCPU), for a diagnostics panel: cheap enough to
+ * call from a UI timer. Set struct_size (sizeof(fa_engine_stats)) first. */
+typedef struct fa_engine_stats {
+    uint32_t struct_size;
+    float audio_load;        /* percent: the time the output callbacks take to mix, of the
+                                time of the audio they make, averaged over about 1 s and
+                                added up over the open outputs. Near 100 the mix cannot
+                                keep up and the sound breaks up. Mic inputs are not counted */
+    float audio_load_peak;   /* percent: the slowest single callback of any output in the
+                                last 1 to 2 s */
+    float worker_load;       /* percent of one CPU core: the time the decode workers spent
+                                decoding ahead (and the tempo, pitch and effects that run
+                                with it) since the previous call, or since the engine was
+                                created; up to 100 x workers. Calls less than 100 ms apart
+                                repeat the previous value */
+    uint32_t workers;        /* decode worker threads */
+    uint32_t devices;        /* open outputs */
+    uint32_t attached_streams; /* streams attached to an output */
+} fa_engine_stats;
+
+FA_API fa_result FA_CALL fa_engine_get_stats(fa_engine* engine, fa_engine_stats* out_stats);
+
 /* ---- Supported formats -------------------------------------------------- */
 
 /* Everything the built-in decoder registry can open. Replaces BASS_PluginGetInfo:
@@ -318,12 +340,19 @@ typedef struct fa_open_options {
                                 Windows-1252; forced Windows-1252 and Shift-JIS read
                                 every event that way */
     const volatile int32_t* cancel; /* NULL = none. A flag the app sets to non-zero (from
-                                another thread) to stop the open: unpacking a ZIP
-                                song (the one long step of an open from a file or
-                                memory) then returns FA_ERROR_CANCELLED within about
-                                a block of the compressed data, and the song is not opened.
-                                Read only during the call, so it may be freed
-                                after. Other opens ignore it */
+                                another thread) to stop the open, which then returns
+                                FA_ERROR_CANCELLED and opens nothing (BASS_StreamCancel):
+                                - fa_stream_open_url: the name lookup, connection,
+                                  playlist and wait for the first bytes, within about
+                                  100 ms (the request in flight is aborted);
+                                - unpacking a ZIP song (the one long step of an open
+                                  from a file or memory): within about a block of the
+                                  compressed data.
+                                Run the open on a thread of its own and raise the flag
+                                when the user moves on (.NET: OpenUrlAsync and
+                                OpenFileAsync with a CancellationToken). Read only
+                                during the call, so it may be freed after. Other
+                                opens ignore it */
     int32_t dolby_downmix;   /* fa_dolby_downmix (default AUTO); can be changed later
                                 with fa_stream_set_dolby_downmix */
 } fa_open_options;
@@ -458,6 +487,75 @@ FA_API fa_result FA_CALL fa_stream_push_flush(fa_stream* stream);
  * jump in the timeline adds nothing. A queued packet without a duration counts
  * like the one before it until it is decoded. */
 FA_API fa_result FA_CALL fa_stream_get_buffered(fa_stream* stream, fa_time* out_duration);
+
+/* ---- Callback streams ----------------------------------------------------
+ *
+ * The stream asks your function for audio whenever it wants more (BASS_StreamCreate
+ * with a STREAMPROC), instead of you pushing it: a synthesizer, a tone generator,
+ * audio from a library of your own. It plays, decodes, records and takes tempo,
+ * effects and meters like any other stream.
+ *
+ * `proc` writes up to `frames` interleaved frames in `format` (any interleaved sample
+ * format; planar ones are FA_ERROR_INVALID_ARG) into `buffer` and returns how many it
+ * wrote. Fewer is fine. 0 means nothing right now: it is asked again about 5 ms later
+ * (a playing stream that runs dry meanwhile goes FA_STATE_BUFFERING). FA_STREAM_PROC_END
+ * (or any negative value) means there is no more: the stream plays what it has, then
+ * ends (FA_EVENT_ENDED); return the last frames first.
+ *
+ * Threads: proc runs on a decode worker, ahead of playback by the stream's buffer
+ * (fa_open_options.buffer_ms), or on your thread inside fa_stream_read for
+ * FA_OPEN_DECODE_ONLY streams. It is never called on the audio thread, never twice at
+ * once, and never after fa_stream_close returns (so `user` may be freed then). It may
+ * take locks and do real work, but should not block: the stream runs dry meanwhile.
+ * The stream cannot seek or loop (FA_ERROR_NOT_SEEKABLE; FA_OPEN_LOOP is
+ * FA_ERROR_INVALID_ARG) and its length is unknown. */
+#define FA_STREAM_PROC_END (-1)
+typedef int64_t (FA_CALL *fa_stream_proc)(void* buffer, fa_frames frames, void* user);
+FA_API fa_result FA_CALL fa_stream_open_callback(fa_engine* engine, const fa_audio_format* format, fa_stream_proc proc,
+                                                 void* user, const fa_open_options* options, fa_stream** out_stream);
+
+/* ---- Capture streams -----------------------------------------------------
+ *
+ * An input device (a microphone, a line input) as an ordinary stream (BASS_RecordStart
+ * for uses other than a live mic): record it to a file, read its samples, meter it, or
+ * play it like any other stream. The input starts at the open; the stream begins with
+ * the audio of its first read (the first fa_stream_read, an encoder's first read, or
+ * fa_stream_attach, which starts reading ahead), not with what waited before. Input nobody reads for about 1 s is
+ * dropped, and reading then goes on with live input.
+ *
+ *   record to a file   open with FA_OPEN_DECODE_ONLY, then fa_encoder_encode_stream;
+ *                      fa_encoder_close ends the recording (close the stream after)
+ *   read the samples   FA_OPEN_DECODE_ONLY + fa_stream_read: 0 frames with FA_OK when
+ *                      nothing new has arrived yet (call again later)
+ *   hear it            fa_stream_attach + fa_stream_play. The input and the output run
+ *                      on two clocks and nothing corrects the drift, so this is for
+ *                      checking an input, not for singing through: a karaoke or DJ mic
+ *                      belongs on the mixer (fa_mixer_add_mic), which corrects drift
+ *                      and keeps latency low.
+ *
+ * The stream's format is the input's (or what capture_options asks for: the system
+ * converts). It cannot seek or loop and its length is unknown. An input that goes away
+ * (unplugged) ends the stream (FA_EVENT_ENDED) once what it gave is read, unless the
+ * system moved a default input to the new default within about a second.
+ * FA_ERROR_PERMISSION_DENIED when the system refuses the microphone (macOS, iOS,
+ * Android and Windows privacy settings: ask the user for it first); FA_ERROR_DEVICE
+ * when the input cannot be opened. */
+#define FA_CAPTURE_OS_PROCESSING (1u << 0)  /* keep the system's voice processing (echo
+                                               cancelling, noise suppression, automatic
+                                               gain): for calls, not for music */
+typedef struct fa_capture_options {
+    uint32_t    struct_size;  /* set by fa_capture_options_init */
+    const char* device_id;    /* fa_device_info.id of an FA_DEVICE_CAPTURE device, NULL =
+                                 the default input */
+    uint32_t    sample_rate;  /* 0 = the input's own (8000..384000 otherwise) */
+    uint32_t    channels;     /* 0 = the input's own (1..32 otherwise) */
+    uint32_t    flags;        /* FA_CAPTURE_* */
+} fa_capture_options;
+
+FA_API void FA_CALL fa_capture_options_init(fa_capture_options* options);
+/* capture_options may be NULL (the default input, as it is). */
+FA_API fa_result FA_CALL fa_stream_open_capture(fa_engine* engine, const fa_capture_options* capture_options,
+                                                const fa_open_options* options, fa_stream** out_stream);
 
 FA_API void FA_CALL fa_stream_close(fa_stream* stream);
 
@@ -3390,6 +3488,19 @@ FA_API fa_result FA_CALL fa_stream_remove_dsp(fa_stream* stream, uint32_t dsp_id
  * Decode-only streams: FA_ERROR_INVALID_ARG (measure what fa_stream_read gives). */
 FA_API fa_result FA_CALL fa_stream_get_levels(fa_stream* stream, fa_time window, float* out_peak, float* out_rms, uint32_t channels);
 FA_API fa_result FA_CALL fa_device_get_levels(fa_device* device, fa_time window, float* out_peak, float* out_rms, uint32_t channels);
+
+/* Loudness meters (BASSloud's BASS_LOUDNESS_CURRENT, EBU R128): the momentary (last
+ * 400 ms) and short-term (last 3 s) loudness of what is heard now, in LUFS, both
+ * channels K-weighted to ITU-R BS.1770. Same source and timing as the levels above: a
+ * stream's own audio before volume, pan, fades and normalization; a device's whole
+ * output after the limiter. -INFINITY for silence, while the stream is not playing,
+ * or the device is stopped. The first call starts measuring, so the values read low
+ * for the first 3 s (what came before counts as silence). Either output may be NULL.
+ * Each call measures afresh (about 1 ms of work): 10 calls a second from a UI timer
+ * are plenty. Integrated loudness, range and true peak of a whole song are
+ * fa_stream_get_loudness. Decode-only streams: FA_ERROR_INVALID_ARG. */
+FA_API fa_result FA_CALL fa_stream_get_loudness_meter(fa_stream* stream, double* out_momentary_lufs, double* out_short_term_lufs);
+FA_API fa_result FA_CALL fa_device_get_loudness_meter(fa_device* device, double* out_momentary_lufs, double* out_short_term_lufs);
 
 typedef enum fa_spectrum_flags {
     FA_SPECTRUM_LEFT      = 1 << 0,  /* the left channel only (default: both, mixed) */

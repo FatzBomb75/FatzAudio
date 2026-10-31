@@ -184,6 +184,7 @@ typedef struct fa_net_config {
     uint32_t hls_max_bandwidth;
     fa_download_proc download_proc;
     void* download_user;
+    const volatile int32_t* open_cancel; /* the app's fa_open_options.cancel, until fa_net_open_done */
 } fa_net_config;
 
 struct fa_net {
@@ -195,6 +196,7 @@ struct fa_net {
     int thread_done;         /* the download thread has finished for good */
     fa_atomic32 cancel;      /* stops the transfer in progress (close, or a restart) */
     int quit;
+    int open_aborted;        /* the app's open_cancel flag ended it (lock) */
 
     /* The window: absolute byte x of the resource is at buf[x % cap] while
      * win_start <= x < win_end. The reader is at read_pos. */
@@ -280,6 +282,9 @@ fa_result fa_net_hls_seek(fa_net* n, double seconds, double* out_start);
 /* Opens `url` and waits until the response headers and the first bytes are in.
  * Takes ownership of the config's strings, also on failure. */
 fa_result fa_net_open(const fa_net_config* cfg, fa_net** out);
+/* The stream's open is over: the app's cancel flag is not read any more.
+ * FA_ERROR_CANCELLED when it ended the download meanwhile. */
+fa_result fa_net_open_done(fa_net* n);
 /* Ends the download for good and wakes a reader waiting for bytes (its read
  * returns the end). For closing a stream while a worker may be reading. NULL ok. */
 void fa_net_interrupt(fa_net* n);

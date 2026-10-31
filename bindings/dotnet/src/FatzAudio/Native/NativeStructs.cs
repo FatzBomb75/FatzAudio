@@ -712,6 +712,28 @@ internal unsafe struct FaMixerConfig
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal struct FaEngineStats
+{
+    public uint StructSize;
+    public float AudioLoad;
+    public float AudioLoadPeak;
+    public float WorkerLoad;
+    public uint Workers;
+    public uint Devices;
+    public uint AttachedStreams;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaCaptureOptions
+{
+    public uint StructSize;
+    public byte* DeviceId;
+    public uint SampleRate;
+    public uint Channels;
+    public uint Flags;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal unsafe struct FaMicConfig
 {
     public uint StructSize;
