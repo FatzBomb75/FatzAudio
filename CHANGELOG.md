@@ -205,6 +205,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Reverse playback: the half-second blocks the source is decoded in are each decoded 10 ms past their end and
+  cross-faded with the block above, so where a seek is not exact (AAC noise and prediction, MIDI notes struck again) the
+  joins no longer click; exact decoders give the same audio as before. Markers, `FA_EVENT_LOOPED` (reversed: from the
+  loop start to its end), MIDI texts and tracker rows are now raised while reversed, last first. Deck loops, loop changes
+  and beat jumps join without a gap while reversed instead of restarting like a seek, deck sync pulls a reversed deck
+  into phase (its beats counting down), `fa_deck_play_synced` starts a reversed deck on the beat, and a beat loop set
+  while reversed lies below the beat heard. Forward playback is unchanged. See
+  [docs/features/tempo-pitch.md](docs/features/tempo-pitch.md#reverse-playback).
 - Chained Ogg files (several songs one after another) find where each song ends by bisection on the serial numbers,
   as vorbisfile does, instead of reading every page: an hour of 20 songs opens in about 6 ms instead of 41 ms. Links,
   lengths, decoded audio and seeks are the same as before. A file whose songs reuse a serial number (against the Ogg

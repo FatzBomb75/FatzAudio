@@ -199,6 +199,23 @@ public class PlaybackTests
     }
 
     [Fact]
+    public async Task Reverse_Looping_RaisesLoopedFromStartToEnd()
+    {
+        using var engine = CreateHeadless();
+        using var output = engine.OpenOutput();
+        using var s = engine.OpenMemory(TestAudio.SineWav(seconds: 0.3));   // 13230 frames at 44.1 kHz
+        var looped = new TaskCompletionSource<StreamEventArgs>(TaskCreationOptions.RunContinuationsAsynchronously);
+        s.Looped += (_, e) => looped.TrySetResult(e);
+        s.Loop = true;
+        s.Reverse = true;
+        s.PlayOn(output);
+        var e = await looped.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(0, e.Frame);            // left the start
+        Assert.Equal(13230, e.Value);        // went to the end
+        Assert.NotEqual(StreamState.Ended, s.State);
+    }
+
+    [Fact]
     public void Reverse_ReadsBackwards()
     {
         using var engine = CreateHeadless();

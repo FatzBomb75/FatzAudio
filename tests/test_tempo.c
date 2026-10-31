@@ -1232,6 +1232,67 @@ static void test_reverse_decode(void)
     free(buf);
 }
 
+/* A decoder whose seeks are not exact: each seek adds its own offset to what is
+ * decoded after it (as AAC noise or a tracker's row seek would differ), so a hard
+ * join between reverse blocks would step by up to 0.03. */
+static const fa_decoder_vtable* g_inexact_inner;
+static fa_decoder_vtable g_inexact_vt;
+static int g_inexact_seeks;
+static float g_inexact_offset;
+
+static fa_result inexact_seek(fa_decoder* d, fa_frames frame)
+{
+    g_inexact_seeks++;
+    g_inexact_offset = 0.01f * (float)(g_inexact_seeks % 4);
+    return g_inexact_inner->seek(d, frame);
+}
+
+static fa_result inexact_read(fa_decoder* d, float* out, fa_frames frames, fa_frames* got)
+{
+    fa_result r = g_inexact_inner->read(d, out, frames, got);
+    fa_frames i;
+    for (i = 0; i < *got * (fa_frames)d->format.channels; i++) out[i] += g_inexact_offset;
+    return r;
+}
+
+/* Reversed, each block is decoded a little past its end and cross-faded with the
+ * block above: the offsets blend over FA_REVERSE_OVERLAP_MS instead of stepping, and
+ * the frames come out in order, all of them. */
+static void test_reverse_joins_cross_fade(void)
+{
+    const fa_frames len = 3 * RATE + 123;
+    fa_stream* s = open_wav((uint32_t)len, ramp_sig, FA_OPEN_DECODE_ONLY);
+    float* buf = (float*)malloc((size_t)len * 2 * sizeof(float));
+    fa_frames got = 0, total = 0, i;
+    double step = 0, lo = 1, hi = -1;
+    fa_result r = FA_OK;
+    CHECK(s != NULL);
+    g_inexact_inner = s->decoder.vt;
+    g_inexact_vt = *s->decoder.vt;
+    g_inexact_vt.seek = inexact_seek;
+    g_inexact_vt.read = inexact_read;
+    s->decoder.vt = &g_inexact_vt;
+    g_inexact_seeks = 0;
+    CHECK_EQ(fa_stream_seek(s, len), FA_OK);
+    CHECK_EQ(fa_stream_set_reverse(s, 1), FA_OK);
+    while (r == FA_OK && total < len) {
+        r = fa_stream_read(s, buf + total * 2, 1000, &got);
+        total += got;
+    }
+    CHECK_EQ(total, len);
+    CHECK(g_inexact_seeks >= 6);   /* a seek per block */
+    for (i = 0; i < total; i++) {
+        double off = buf[i * 2] - ramp_sig((double)(len - 1 - i) / RATE, 0);
+        if (off < lo) lo = off;
+        if (off > hi) hi = off;
+        if (i > 0 && fabs((double)buf[i * 2] - buf[(i - 1) * 2]) > step) step = fabs((double)buf[i * 2] - buf[(i - 1) * 2]);
+    }
+    CHECK(lo > -1e-6 && hi < 0.03 + 1e-6);                 /* the source plus some block's offset */
+    CHECK(step < 1e-4);                                    /* blended over ov frames, never stepped */
+    fa_stream_close(s);
+    free(buf);
+}
+
 /* With the rate at 2x, the chain runs on the reversed audio: twice as fast,
  * counting down, and what comes out is the source at that position. */
 static void test_reverse_with_rate(void)
@@ -1517,6 +1578,7 @@ int main(void)
     RUN(test_device_rate_timing_and_end);
     RUN(test_transient_mode);
     RUN(test_reverse_decode);
+    RUN(test_reverse_joins_cross_fade);
     RUN(test_reverse_with_rate);
     RUN(test_reverse_attached);
     RUN(test_reverse_api);

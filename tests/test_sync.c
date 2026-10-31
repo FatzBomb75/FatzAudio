@@ -377,6 +377,78 @@ static void test_jump_large_error(void)
     rig_close(&r);
 }
 
+/* ---- reversed decks --------------------------------------------------------------- */
+
+/* Phase of a reversed deck `b` against a forward `a` of the same tempo, both with
+ * their first beat at 0, in frames wrapped to the nearest beat: b's beats count down,
+ * so they line up with a's where the two positions add up to whole beats. */
+static double reversed_phase(fa_stream* a, fa_stream* b, double beat)
+{
+    double x = (double)(pos(a) + pos(b));
+    return x - beat * floor(x / beat + 0.5);
+}
+
+/* A deck playing backwards is pulled into phase like a forward one: by bending its
+ * tempo (10 ms) or by a jump on its next beat down (150 ms); the jump joins without
+ * a gap. */
+static void test_reverse_pull(void)
+{
+    static const double late[2] = { 0.010, 0.150 };
+    int k;
+    for (k = 0; k < 2; k++) {
+        rig r;
+        fa_stream *a, *b;
+        double beat = seconds(0.5);
+        CHECK(rig_open(&r));
+        a = load(r.a, (uint32_t)seconds(20), 120.0, 0);
+        b = load(r.b, (uint32_t)seconds(20), 120.0, 0);
+        CHECK(a && b);
+        CHECK_EQ(fa_stream_seek(b, (fa_frames)seconds(15)), FA_OK);
+        CHECK_EQ(fa_stream_set_reverse(b, 1), FA_OK);
+        CHECK_EQ(fa_stream_play_at(a, at_frame(&r, 480)), FA_OK);
+        CHECK_EQ(fa_stream_play_at(b, at_frame(&r, 480 + (int64_t)seconds(late[k]))), FA_OK);
+        rig_run(&r, (uint32_t)seconds(0.5));
+        CHECK_NEAR(reversed_phase(a, b, beat), seconds(late[k]), 1.0);
+        CHECK_EQ(fa_deck_sync(r.b, r.a, FA_SYNC_BEAT), FA_OK);
+        rig_run(&r, (uint32_t)seconds(k ? 2.0 : 6.0));
+        CHECK_NEAR(reversed_phase(a, b, beat), 0.0, seconds(0.001));
+        CHECK_NEAR(tempo_of(b), 1.0, 1e-6);
+        CHECK(pos(b) < (fa_frames)seconds(15 - 1.5));   /* still going down */
+        rig_close(&r);
+    }
+}
+
+/* fa_deck_play_synced on a reversed deck: its next beat down lands on the leader's
+ * beat. A beat loop set while reversed ends at the beat heard and lies below it. */
+static void test_reverse_play_synced_and_loop(void)
+{
+    rig r;
+    fa_stream *a, *b;
+    fa_frames in = -1, out = -1;
+    double beat = seconds(0.5);
+    CHECK(rig_open(&r));
+    a = load(r.a, (uint32_t)seconds(20), 120.0, 0);
+    b = load(r.b, (uint32_t)seconds(20), 120.0, 0);
+    CHECK(a && b);
+    CHECK_EQ(fa_stream_seek(b, (fa_frames)seconds(10.3)), FA_OK);
+    CHECK_EQ(fa_stream_set_reverse(b, 1), FA_OK);
+    CHECK_EQ(fa_stream_play_at(a, at_frame(&r, 480)), FA_OK);
+    rig_run(&r, (uint32_t)seconds(0.37));
+    CHECK_EQ(fa_deck_play_synced(r.b, r.a, FA_SYNC_BEAT), FA_OK);
+    rig_run(&r, (uint32_t)seconds(1.0));
+    CHECK_NEAR(reversed_phase(a, b, beat), 0.0, 1.0);
+    /* Heard at beat 19.x (10.3 s less about 0.6 s): the loop is beats 16..20. */
+    CHECK_EQ(fa_deck_set_loop_beats(r.b, 4.0), FA_OK);
+    fa_deck_get_loop(r.b, &in, &out);
+    CHECK_EQ(in, (fa_frames)(16 * beat));
+    CHECK_EQ(out, (fa_frames)(20 * beat));
+    CHECK_EQ(fa_deck_set_loop_beats(r.b, 2.0), FA_OK);   /* halved: the same end */
+    fa_deck_get_loop(r.b, &in, &out);
+    CHECK_EQ(in, (fa_frames)(18 * beat));
+    CHECK_EQ(out, (fa_frames)(20 * beat));
+    rig_close(&r);
+}
+
 /* LOCK follows the leader's tempo moves and keeps the phase. */
 static void test_lock_follows(void)
 {
@@ -1010,6 +1082,8 @@ int main(void)
     RUN(test_pull_small_error);
     RUN(test_jump_large_error);
     RUN(test_lock_follows);
+    RUN(test_reverse_pull);
+    RUN(test_reverse_play_synced_and_loop);
     RUN(test_stream_jump);
     RUN(test_loop_beats);
     RUN(test_beat_jump);
