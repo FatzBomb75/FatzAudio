@@ -230,6 +230,8 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Analysis: the key's chroma FFT carries two windows at once (as the onset side does), and the bars' chroma shares a bin wider than a semitone among the pitch classes it covers (low chord changes show). The accuracy report is unchanged (all 44 bar songs right, 48 of 48 keys).
+- Lyric surface: a line growing in during a page fade-in is drawn again at its size instead of upscaled, and a line or page that failed for lack of memory is tried again after about 90 frames.
 - Chained Ogg files (several songs one after another) find where each song ends by bisection on the serial numbers,
   as vorbisfile does, instead of reading every page: an hour of 20 songs opens in about 6 ms instead of 41 ms. Links,
   lengths, decoded audio and seeks are the same as before. A file whose songs reuse a serial number (against the Ogg

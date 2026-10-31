@@ -42,6 +42,7 @@
 #define ONSET_DELAY 0.42         /* attack to flux peak, in windows (calibrated) */
 #define CHROMA_LO_HZ 130.0       /* pitch classes for bars: C3 .. */
 #define CHROMA_HI_HZ 4000.0      /* ... about B7 */
+#define CHROMA_SPAN 12           /* most pitch classes one bin is spread over */
 #define CHROMA_STEP 4            /* envelope frames per chroma frame */
 #define BAR_MIN_BEATS 32
 
@@ -60,7 +61,9 @@ struct fa_onset {
     float* env;                  /* the envelope, one value per frame (all bins) */
     float* low;                  /* the same below 200 Hz */
     int64_t nenv, cap;
-    uint8_t* bin_pc;             /* pitch class of each bin, 255 = not counted */
+    uint8_t* bin_pc;             /* first pitch class of each bin, 255 = not counted */
+    uint8_t* bin_cnt;            /* pitch classes it covers (they follow each other) */
+    float* bin_w;                /* their shares of the bin, CHROMA_SPAN per bin, summing to 1 */
     float acc[12];               /* the chroma frame being summed */
     int acc_n;
     float* chroma;               /* 12 per CHROMA_STEP envelope frames */
@@ -101,14 +104,37 @@ fa_onset* fa_onset_new(uint32_t rate)
     o->cur = (float*)calloc(n / 2 + 1, sizeof(float));
     o->until_hop = o->hop;
     o->bin_pc = (uint8_t*)malloc(o->bins + 1);
-    if (o->bin_pc) {
+    o->bin_cnt = (uint8_t*)calloc(o->bins + 1, 1);
+    o->bin_w = (float*)calloc((size_t)(o->bins + 1) * CHROMA_SPAN, sizeof(float));
+    if (o->bin_pc && o->bin_cnt && o->bin_w) {
         uint32_t k;
         for (k = 0; k <= o->bins; k++) {
-            double f = k * binhz;
-            o->bin_pc[k] = f >= CHROMA_LO_HZ && f <= CHROMA_HI_HZ ? (uint8_t)(((long)lround(12.0 * log2(f / 440.0)) % 12 + 21) % 12) : 255;
+            double f = k * binhz, lo, hi, tot = 0.0;
+            long j0, j1, j;
+            o->bin_pc[k] = 255;
+            if (f < CHROMA_LO_HZ || f > CHROMA_HI_HZ) continue;
+            /* The bin covers f +- half its width; low bins are wider than a semitone,
+             * so a chord's low notes would fall on whichever class the bin's centre
+             * is nearest. Each semitone cell [j - 0.5, j + 0.5] (in semitones from A440)
+             * takes the share of the bin that overlaps it. */
+            lo = 12.0 * log2((f - binhz / 2.0 > 1.0 ? f - binhz / 2.0 : 1.0) / 440.0);
+            hi = 12.0 * log2((f + binhz / 2.0) / 440.0);
+            j0 = (long)floor(lo + 0.5);
+            j1 = (long)floor(hi + 0.5);
+            if (j1 - j0 >= CHROMA_SPAN) j1 = j0 + CHROMA_SPAN - 1;
+            for (j = j0; j <= j1; j++) {
+                double a = lo > j - 0.5 ? lo : j - 0.5, b = hi < j + 0.5 ? hi : j + 0.5;
+                double w = b > a ? b - a : 0.0;
+                o->bin_w[(size_t)k * CHROMA_SPAN + (size_t)(j - j0)] = (float)w;
+                tot += w;
+            }
+            if (tot <= 0.0) { o->bin_w[(size_t)k * CHROMA_SPAN] = 1.0f; tot = 1.0; j1 = j0; }
+            for (j = j0; j <= j1; j++) o->bin_w[(size_t)k * CHROMA_SPAN + (size_t)(j - j0)] /= (float)tot;
+            o->bin_cnt[k] = (uint8_t)(j1 - j0 + 1);
+            o->bin_pc[k] = (uint8_t)(((j0 % 12) + 21) % 12);
         }
     }
-    if (!o->tb || !o->ring || !o->pending || !o->re || !o->im || !o->prev || !o->cur || !o->bin_pc) {
+    if (!o->tb || !o->ring || !o->pending || !o->re || !o->im || !o->prev || !o->cur || !o->bin_pc || !o->bin_cnt || !o->bin_w) {
         fa_onset_free(o);
         return NULL;
     }
@@ -127,6 +153,8 @@ void fa_onset_free(fa_onset* o)
     free(o->env);
     free(o->low);
     free(o->bin_pc);
+    free(o->bin_cnt);
+    free(o->bin_w);
     free(o->chroma);
     free(o);
 }
@@ -181,7 +209,11 @@ static float flux_of(fa_onset* o, const float* re, const float* im, int which, f
         else { xr = 0.5f * (zi - ci); xi = -0.5f * (zr - cr); }
         mag = sqrtf(xr * xr + xi * xi) * scale;
         o->cur[k] = logf(1.0f + ONSET_LOG_GAIN * mag);
-        if (o->bin_pc[k] < 12) o->acc[o->bin_pc[k]] += mag;
+        if (o->bin_pc[k] < 12) {
+            const float* w = o->bin_w + (size_t)k * CHROMA_SPAN;
+            unsigned c, pc = o->bin_pc[k];
+            for (c = 0; c < o->bin_cnt[k]; c++) o->acc[(pc + c) % 12] += mag * w[c];
+        }
         d = o->cur[k] - o->prev[k];
         if (d > 0.0f) {
             sum += d;
