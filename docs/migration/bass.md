@@ -195,9 +195,20 @@ BASS has no normalization: apps measure each file themselves with a decode pass 
 
 ### Samples (in-memory sounds)
 
-| BASS | FatzAudio | Status |
-|---|---|---|
-| BASS_SampleLoad / Create / SetData / GetData / GetInfo / SetInfo / GetChannel / GetChannels / Stop / Free | `fa_stream_open_memory` covers playback of a loaded sound; a voice pool for many simultaneous copies is planned | 🗓️ |
+A sound is loaded once and played as many overlapping voices as needed ([sounds](../features/sounds.md)).
+
+| BASS | FatzAudio | .NET | Status |
+|---|---|---|---|
+| BASS_SampleLoad | `fa_sound_load_path`, `fa_sound_load_memory` (any format a stream opens) | `engine.LoadSound(path)`, `engine.LoadSound(bytes)` | ✅ |
+| BASS_SampleCreate + BASS_SampleSetData | `fa_sound_load_pcm` (any interleaved sample format, copied) | `engine.CreateSound(samples, rate, channels)` | ✅ |
+| BASS_SampleGetChannel + BASS_ChannelPlay | `fa_sound_play(sound, device, bus, volume, pan, &voice)`: picks a free voice or makes one, starts it at once. The voice is an ordinary `fa_stream` | `sound.Play(output, volume, pan)` returns the voice's `AudioStream` | ✅ |
+| `max` and BASS_SAMPLE_OVER_POS / OVER_VOL (BASS_SampleLoad, BASS_SampleSetInfo) | `fa_sound_options.max_voices` and `.steal` (`FA_SOUND_STEAL_OLDEST` default, `_QUIETEST`, `_NONE` = BASS's default), `fa_sound_set_options` | `SoundOptions`, `sound.MaxVoices`, `sound.Steal` | ✅ |
+| BASS_SAMPLE_OVER_DIST | Not needed: no 3D positioning | — | ➖ |
+| BASS_SampleGetInfo | `fa_sound_get_info`: rate, channels, length, memory, limit, voices made and busy | `sound.Info`, `VoiceCount`, `PlayingCount` | ✅ |
+| BASS_SampleGetChannels | `fa_sound_get_voices` (busy voices, oldest first) | `sound.GetPlayingVoices()` | ✅ |
+| BASS_SampleStop / BASS_SampleFree | `fa_sound_stop` / `fa_sound_close` (closes the voices) | `sound.Stop()` / `sound.Dispose()` | ✅ |
+| BASS_SampleGetData | Not offered: keep your own copy of PCM you made, or decode the file with `FA_OPEN_DECODE_ONLY` | — | ➖ |
+| BASS_ChannelSetAttribute on a sample channel (volume, pan, freq) | Every stream call works on a voice: `fa_stream_set_param` (volume, pan, rate, pitch), ramps, effects, loops, events | `AudioStream` members | ✅ |
 
 ### Tracker music
 

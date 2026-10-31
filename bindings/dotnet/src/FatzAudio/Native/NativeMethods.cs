@@ -457,6 +457,38 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial void fa_soundfont_close(nint font);
 
+    // ---- Sounds (a voice pool) ---------------------------------------------
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_sound_options_init(FaSoundOptions* options);
+
+    [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_sound_load_path(EngineHandle engine, string path, FaSoundOptions* options, out nint sound);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_sound_load_memory(EngineHandle engine, void* data, nuint size, FaSoundOptions* options, out nint sound);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_sound_load_pcm(EngineHandle engine, FaAudioFormat* format, void* data, long frames,
+        FaSoundOptions* options, out nint sound);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_sound_close(nint sound);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_sound_get_info(SoundHandle sound, FaSoundInfo* info);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_sound_set_options(SoundHandle sound, FaSoundOptions* options);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_sound_play(SoundHandle sound, DeviceHandle device, nint bus, float volume, float pan, out nint voice);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_sound_stop(SoundHandle sound);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_sound_get_voices(SoundHandle sound, nint* voices, uint capacity, out uint count);
+
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_soundfont_get_info(SoundFontHandle font, FaSoundFontInfo* info);
 

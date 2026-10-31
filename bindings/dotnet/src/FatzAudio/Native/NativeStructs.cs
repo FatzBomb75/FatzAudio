@@ -865,3 +865,25 @@ internal struct FaAutomixOptions
     public float MinConfidence;
     public long RestoreTime;
 }
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaSoundOptions
+{
+    public uint StructSize;
+    public uint MaxVoices;
+    public int Steal;
+    public FaOpenOptions* Open;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaSoundInfo
+{
+    public uint SampleRate;
+    public uint Channels;
+    public long Frames;
+    public ulong MemoryBytes;
+    public uint MaxVoices;
+    public int Steal;
+    public uint Voices;
+    public uint Playing;
+}

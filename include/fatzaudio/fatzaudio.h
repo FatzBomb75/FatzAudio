@@ -559,6 +559,107 @@ FA_API fa_result FA_CALL fa_stream_open_capture(fa_engine* engine, const fa_capt
 
 FA_API void FA_CALL fa_stream_close(fa_stream* stream);
 
+/* ---- Sounds: one short sound, many voices ---------------------------------
+ *
+ * A sound is decoded once into memory and played as many overlapping copies
+ * (voices) as you like, each with its own volume and pan (BASS_Sample*): jingles,
+ * applause, air horns, sound-effect pads. Every voice reads the one copy of the
+ * PCM, so ten voices of a 2 MB sound still use 2 MB.
+ *
+ *   fa_sound_load_path(engine, "horn.wav", NULL, &horn);
+ *   fa_sound_play(horn, device, NULL, 1.0f, 0.0f, NULL);   (fire and forget)
+ *   fa_sound_play(horn, device, NULL, 0.5f, -0.8f, NULL);  (a second copy, left)
+ *   ...
+ *   fa_sound_close(horn);                                   (closes its voices)
+ *
+ * Each voice is an ordinary stream (fa_stream), attached and started by
+ * fa_sound_play, so everything a stream can do works on it: fa_stream_stop,
+ * fa_stream_set_param (volume, pan, rate, pitch), ramps, loops, a bus, effects,
+ * events (FA_EVENT_ENDED when it finishes). The sound owns its voices: do not
+ * fa_stream_close them (it is allowed, and the sound forgets that voice). A voice
+ * that ended or was stopped is free, and a later fa_sound_play reuses it, so a
+ * voice pointer stays valid until fa_sound_close (also after fa_sound_set_options
+ * retired it) but may by then be playing a newer copy. A reused voice starts at the volume and pan of its play with looping
+ * off; other settings you gave it (rate, effects, an event callback) stay.
+ *
+ * At most max_voices voices play at once. A play when all of them are busy
+ * (playing, paused or scheduled) takes one over by the steal rule: it restarts at
+ * once (no fade) as the new copy. Voices are made as they are first needed.
+ * A sound is used from any thread, but not while fa_sound_close runs (nor its voices
+ * closed then): finish plays on other threads and in event callbacks first, as with
+ * any object being freed. Close every sound before fa_engine_destroy. */
+typedef struct fa_sound fa_sound;
+
+typedef enum fa_sound_steal {
+    FA_SOUND_STEAL_OLDEST = 0,   /* default: the voice that started longest ago
+                                    (BASS_SAMPLE_OVER_POS) */
+    FA_SOUND_STEAL_QUIETEST,     /* the voice with the lowest volume (FA_PARAM_VOLUME now,
+                                    ramps included); the older one on a tie
+                                    (BASS_SAMPLE_OVER_VOL) */
+    FA_SOUND_STEAL_NONE          /* none: fa_sound_play returns FA_ERROR_BUSY (BASS's
+                                    default without an OVER flag) */
+} fa_sound_steal;
+
+#define FA_SOUND_MAX_VOICES 1024
+
+typedef struct fa_sound_options {
+    uint32_t struct_size;   /* set by fa_sound_options_init */
+    uint32_t max_voices;    /* copies playing at once: 1..FA_SOUND_MAX_VOICES, 0 = default (8) */
+    int32_t  steal;         /* fa_sound_steal (default OLDEST) */
+    const fa_open_options* open; /* fa_sound_load_path and _memory: how the file is opened
+                                    (audio_track, soundfont, mime_hint, ...), NULL =
+                                    defaults. Flags are ignored */
+} fa_sound_options;
+
+typedef struct fa_sound_info {
+    uint32_t  sample_rate;  /* the sound's own rate and channels: each voice converts to */
+    uint32_t  channels;     /* its device, as a stream does */
+    fa_frames frames;       /* length */
+    uint64_t  memory_bytes; /* the PCM in memory (32-bit float), shared by all voices */
+    uint32_t  max_voices;
+    int32_t   steal;        /* fa_sound_steal */
+    uint32_t  voices;       /* voices made so far (busy or free) */
+    uint32_t  playing;      /* of them busy now: playing, paused or scheduled */
+} fa_sound_info;
+
+FA_API void FA_CALL fa_sound_options_init(fa_sound_options* options);
+/* Decodes the whole file (any format a stream opens, ZIP included) into memory.
+ * For short sounds: a 3-minute stereo song at 44.1 kHz takes about 64 MB. Sounds over
+ * 1 GB of PCM are FA_ERROR_TOO_LARGE; a file with no audio at all is
+ * FA_ERROR_UNSUPPORTED_FORMAT.
+ * options may be NULL (defaults). */
+FA_API fa_result FA_CALL fa_sound_load_path(fa_engine* engine, const char* path, const fa_sound_options* options, fa_sound** out_sound);
+/* The same from a file in memory; the data is decoded at once and not kept. */
+FA_API fa_result FA_CALL fa_sound_load_memory(fa_engine* engine, const void* data, size_t size, const fa_sound_options* options,
+                                              fa_sound** out_sound);
+/* Your own PCM (BASS_SampleCreate + BASS_SampleSetData): `frames` interleaved frames in
+ * `format` (any interleaved sample format, 1..32 channels, 1000..768000 Hz; planar is
+ * FA_ERROR_INVALID_ARG). Copied. */
+FA_API fa_result FA_CALL fa_sound_load_pcm(fa_engine* engine, const fa_audio_format* format, const void* data, fa_frames frames,
+                                           const fa_sound_options* options, fa_sound** out_sound);
+/* Stops and closes every voice, then frees the sound. */
+FA_API void FA_CALL fa_sound_close(fa_sound* sound);
+FA_API fa_result FA_CALL fa_sound_get_info(fa_sound* sound, fa_sound_info* out_info);
+/* A new voice limit and steal rule (options->open is ignored). Lowering the limit
+ * retires the voices over it, free ones first, then the oldest busy ones: they stop
+ * and the sound no longer uses them (their pointers stay valid until fa_sound_close). */
+FA_API fa_result FA_CALL fa_sound_set_options(fa_sound* sound, const fa_sound_options* options);
+
+/* Plays a copy now on `device`, through `bus` (fa_bus_create, NULL = the master mix)
+ * at `volume` (linear gain >= 0) and `pan` (-1..1), as fa_stream_set_param takes them.
+ * It starts at once from the start of the sound, and the first frames are buffered
+ * before the call returns. The voice playing it is returned in out_voice (may be
+ * NULL). FA_ERROR_BUSY: every voice is busy and the steal rule is NONE. Devices of
+ * another engine and a bus of another device are FA_ERROR_INVALID_ARG. */
+FA_API fa_result FA_CALL fa_sound_play(fa_sound* sound, fa_device* device, fa_bus* bus, float volume, float pan,
+                                       fa_stream** out_voice);
+/* Stops every voice (BASS_SampleStop). */
+FA_API fa_result FA_CALL fa_sound_stop(fa_sound* sound);
+/* The busy voices, oldest first (BASS_SampleGetChannels): up to `capacity` into
+ * `out_voices` (may be NULL with capacity 0); out_count gets how many are busy, which
+ * may be more than capacity. */
+FA_API fa_result FA_CALL fa_sound_get_voices(fa_sound* sound, fa_stream** out_voices, uint32_t capacity, uint32_t* out_count);
+
 /* ---- Web streams --------------------------------------------------------
  *
  * fa_stream_open_url plays what is behind an http:// or https:// URL:

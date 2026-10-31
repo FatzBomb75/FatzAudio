@@ -172,10 +172,18 @@ internal sealed class StreamHandle : SafeHandle
         }
         _device?.DangerousRelease();
         _device = null;
+        _owner?.DangerousRelease();
+        _owner = null;
         _engine?.DangerousRelease();
         _engine = null;
         return true;
     }
+
+    private SafeHandle? _owner;
+
+    /// <summary>Keeps the object that owns the native stream (a sound, for its voices) open until the stream is
+    /// closed.</summary>
+    public void SetOwner(SafeHandle owner) => _owner = HandleRef.AddRef(owner);
 }
 
 /// <summary>Owns an <c>fa_bus*</c> and keeps its device (and so its engine) alive.</summary>
@@ -225,6 +233,30 @@ internal sealed class SoundFontHandle : SafeHandle
     protected override bool ReleaseHandle()
     {
         NativeMethods.fa_soundfont_close(handle);
+        return true;
+    }
+}
+
+/// <summary>Owns an <c>fa_sound*</c> and keeps its engine alive. Its voices' stream handles hold a reference to
+/// it, so the sound is closed only after every voice wrapper let go (<c>fa_sound_close</c> closes the voices left).</summary>
+internal sealed class SoundHandle : SafeHandle
+{
+    private EngineHandle? _engine;
+
+    public SoundHandle() : base(0, true) { }
+    public override bool IsInvalid => handle == 0;
+
+    public void Initialize(nint native, EngineHandle engine)
+    {
+        _engine = HandleRef.AddRef(engine);
+        SetHandle(native);
+    }
+
+    protected override bool ReleaseHandle()
+    {
+        NativeMethods.fa_sound_close(handle);
+        _engine?.DangerousRelease();
+        _engine = null;
         return true;
     }
 }
