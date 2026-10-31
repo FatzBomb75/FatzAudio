@@ -623,6 +623,51 @@ FA_API fa_result FA_CALL fa_stream_open_push(fa_engine* engine, const fa_audio_f
     return FA_OK;
 }
 
+/* Callback and capture streams: a live decoder, no source. */
+static void open_live(struct fa_stream* s)
+{
+    s->live = 1;
+    s->decoder.src = &s->source;
+    s->decoder_ready = 1;
+    if (!(s->flags & FA_OPEN_DECODE_ONLY) &&
+        fa_meter_init(&s->run_meter, s->decoder.format.sample_rate, s->decoder.format.channels, 0, FA_RUNNING_SUBS) == FA_OK)
+        s->run_meter_ready = 1;
+    stream_opened(s);
+}
+
+FA_API fa_result FA_CALL fa_stream_open_callback(fa_engine* engine, const fa_audio_format* format, fa_stream_proc proc,
+                                                 void* user, const fa_open_options* options, fa_stream** out_stream)
+{
+    struct fa_stream* s; fa_result r;
+    if (out_stream) *out_stream = NULL;
+    if (!engine || !format || !proc || !out_stream) return FA_ERROR_INVALID_ARG;
+    if (options && options->flags & FA_OPEN_LOOP) return FA_ERROR_INVALID_ARG;
+    r = stream_create(engine, options, &s);
+    if (r != FA_OK) return r;
+    r = fa_callback_decoder_open(&s->decoder, format, proc, user);
+    if (r != FA_OK) { stream_discard(s); return r; }
+    open_live(s);
+    *out_stream = s;
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_open_capture(fa_engine* engine, const fa_capture_options* capture_options,
+                                                const fa_open_options* options, fa_stream** out_stream)
+{
+    struct fa_stream* s; fa_result r;
+    if (out_stream) *out_stream = NULL;
+    if (!engine || !out_stream) return FA_ERROR_INVALID_ARG;
+    if (options && options->flags & FA_OPEN_LOOP) return FA_ERROR_INVALID_ARG;
+    r = stream_create(engine, options, &s);
+    if (r != FA_OK) return r;
+    r = fa_capture_decoder_open(&s->decoder, engine, capture_options,
+                                (s->flags & FA_OPEN_DECODE_ONLY) ? 0 : s->buffer_ms / 2);
+    if (r != FA_OK) { stream_discard(s); return r; }
+    open_live(s);
+    *out_stream = s;
+    return FA_OK;
+}
+
 FA_API void FA_CALL fa_codec_params_init(fa_codec_params* params)
 {
     if (!params) return;
@@ -706,6 +751,7 @@ FA_API fa_result FA_CALL fa_stream_open_url(fa_engine* engine, const char* url, 
     if (fa_url_parse(url, &parsed) != FA_OK) return FA_ERROR_INVALID_ARG;
     r = net_config(url, options, &cfg);
     if (r != FA_OK) return r;
+    cfg.open_cancel = open_cancel(options);
     r = stream_create(engine, options, &s);
     if (r != FA_OK) { free(cfg.url); free(cfg.user_agent); free(cfg.headers); free(cfg.proxy); return r; }
     r = fa_net_open(&cfg, &s->net);           /* takes the config's strings */
@@ -742,6 +788,12 @@ FA_API fa_result FA_CALL fa_stream_open_url(fa_engine* engine, const char* url, 
             }
             r = stream_open_decoder(s, parsed.path, &o);
         }
+    }
+    if (s->net) {
+        /* The app's flag stopped the download: a failed open is cancelled, and so is
+         * one that got there after it was raised. */
+        fa_result c = fa_net_open_done(s->net);
+        if (c != FA_OK) r = c;
     }
     if (r == FA_OK) fa_net_set_sample_rate(s->net, s->decoder.format.sample_rate, s->decoder.length);
     if (r != FA_OK) { stream_discard(s); return r; }
@@ -1182,12 +1234,20 @@ static int push_waiting(struct fa_stream* s)
     return s->push && !fa_push_has_input(s->push) && !fa_load32(&s->staged);
 }
 
+/* A callback or capture stream with nothing to give right now (fa_decoder.ready):
+ * left alone until it has, which the polling worker finds out. */
+static int live_waiting(struct fa_stream* s)
+{
+    return s->live && s->decoder_ready && !s->decoder.ready(&s->decoder) && !fa_load32(&s->staged);
+}
+
 int fa_stream_needs_work(struct fa_stream* s)
 {
     if (s->ring.data && fa_load32(&s->zcrc_pending)) return 1;   /* a stored ZIP entry still to check */
     if (s->ring.data && fa_load64(&s->seek_pending) >= 0) return 1;
     if (!s->ring.data || fa_load32(&s->eof) || fa_load32(&s->flushing)) return 0;
     if (push_waiting(s)) return 0;   /* nothing pushed yet */
+    if (live_waiting(s)) return 0;   /* no new input yet */
     if (fa_ring_readable(&s->ring) > fill_target(s) * 3 / 4) return 0;
     if (fa_tmap_full(tmap_of(s))) return 0;   /* waits for playback to catch up */
     /* Web streams: only once the bytes are downloaded, so a worker never waits. */
@@ -1205,6 +1265,7 @@ uint32_t fa_stream_poll_ms(struct fa_stream* s)
     if (fa_load64(&s->seek_pending) >= 0) return FA_WORKER_POLL_MIN_MS;
     /* Flushing ends with unflush, which wakes them (a failed rebuild leaves it set). */
     if (fa_load32(&s->flushing) || fa_load32(&s->eof) || push_waiting(s)) return 0;
+    if (live_waiting(s)) return FA_WORKER_POLL_MIN_MS;   /* input arrives by itself: nobody wakes them */
     ms = (int64_t)fa_ring_readable(&s->ring) * 1000 / s->dev_rate / 4;
     if (ms < FA_WORKER_POLL_MIN_MS) return FA_WORKER_POLL_MIN_MS;
     return ms > FA_WORKER_POLL_MAX_MS ? FA_WORKER_POLL_MAX_MS : (uint32_t)ms;
@@ -4038,10 +4099,10 @@ static void stream_mix(struct fa_stream* s, fa_device* dev, float* out, uint32_t
             return;
         }
         fa_fetch_add32(&s->underruns, 1);
-        /* A push or web stream that ran dry waits for more: the app's next data, or
-         * the network (whose download buffer only hands data on once prebuffer_ms are
-         * in, so the ring then refills at once). */
-        if ((s->push || s->net) && fa_cas32(&s->state, FA_STATE_PLAYING, FA_STATE_BUFFERING) &&
+        /* A push, live or web stream that ran dry waits for more: the app's next data,
+         * the input, or the network (whose download buffer only hands data on once
+         * prebuffer_ms are in, so the ring then refills at once). */
+        if ((s->push || s->live || s->net) && fa_cas32(&s->state, FA_STATE_PLAYING, FA_STATE_BUFFERING) &&
             fa_load64(s->push ? &s->played_audible : &s->played) > 0 && !s->stalled) {
             s->stalled = 1;
             push_event(dev, s, FA_EVENT_STALLED, 0);

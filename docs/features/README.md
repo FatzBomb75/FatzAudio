@@ -4,9 +4,10 @@ One page per feature, each with: what it does, C example, C# example, options, t
 
 | Feature | Page | Status |
 |---|---|---|
-| Devices (output, start/stop, silent output) | [devices.md](devices.md) | ✅ output and default following; input 🗓️ |
+| Devices (output, start/stop, silent output) | [devices.md](devices.md) | ✅ output and default following; inputs as [capture streams](callback-capture.md#capture-streams) and [mixer mics](dj-mixer.md#microphones) |
 | Opening and decoding streams (format detection, custom I/O, MP4 and MKV audio tracks, built-in AAC, Ogg Opus, Vorbis and FLAC, FLAC in MP4 and MKV) | [streams.md](streams.md) | ✅ |
-| Playback, buffering and threads (decode-ahead, transport, device clock) | [playback.md](playback.md) | ✅ |
+| Playback, buffering and threads (decode-ahead, transport, device clock, engine load) | [playback.md](playback.md) | ✅ |
+| Callback streams and capture streams (audio from your own function; an input device as a stream, for recording) | [callback-capture.md](callback-capture.md) | ✅ |
 | Volume, pan and ramps (7 curves, scheduled starts, ramp-done) | [ramps.md](ramps.md) | ✅ volume and pan |
 | Events | [events.md](events.md) | ✅ ended, ramp done, marker, started, loudness final, metadata, stalled/resumed, decode error, MIDI text |
 | Loudness normalization (R128 scans, tags, cache, limiter) | [normalization.md](normalization.md) | ✅ |
@@ -25,5 +26,5 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Tracker modules (MOD, XM, S3M, IT, MPTM and more via libopenmpt; info and names, order/row seeking, interpolation, stereo separation, channel mute) | [trackers.md](trackers.md) | ✅ (currently-heard order/row and row events 🗓️) |
 | Recording and encoding (WAV, FLAC, MP3 via LAME; device, stream or file sources) | [recording-encoding.md](recording-encoding.md) | ✅ WAV/FLAC/MP3; Opus, AAC and casting 🗓️ |
 | Equalizer, presets and user DSP (parametric/graphic EQ, 14 presets, `fa_stream_add_dsp`) | [equalizer.md](equalizer.md) | ✅ |
-| Levels and spectrum (VU meters, FFT for visualizers; per stream or the whole output) | [levels-spectrum.md](levels-spectrum.md) | ✅ |
+| Levels, loudness meters and spectrum (VU meters, momentary and short-term LUFS, FFT for visualizers; per stream or the whole output) | [levels-spectrum.md](levels-spectrum.md) | ✅ |
 | Tags, cover art and file properties (ID3v1/v2, APEv2, Vorbis comments, MP4, ASF, RIFF, AIFF, Matroska; bitrate, sizes) | [tags.md](tags.md) | ✅ |

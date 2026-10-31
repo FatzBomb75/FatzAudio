@@ -91,6 +91,8 @@ set(FA_SOURCES
     src/tinysoundfont_impl.c
     src/mdct.c
     src/push.c
+    src/callback.c
+    src/capture.c
     src/demux.c
     src/demux_mp4.c
     src/demux_adts.c

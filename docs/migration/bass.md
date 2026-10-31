@@ -58,7 +58,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_ATTRIB_SRC / BASS_CONFIG_SRC / BASS_CONFIG_SRC_SAMPLE (resampling quality) | Not needed: conversion to the device rate, and of pushed frames to the push stream's rate, is always windowed sinc (about -90 dB of aliasing), above BASS's best setting | — | ➖ (by design) |
 | BASS_CONFIG_UPDATETHREADS / UPDATEPERIOD | `fa_engine_config.worker_threads`; workers refill the emptiest buffer first, nothing to tune | `AudioEngineOptions.WorkerThreads` | ✅ |
 | BASS_Update / BASS_ChannelUpdate | Not needed: worker threads keep buffers full | — | ➖ (by design) |
-| BASS_GetCPU | Planned `fa_engine_get_stats` | | 🗓️ |
+| BASS_GetCPU | `fa_engine_get_stats`: the output callbacks' load (average and peak, in percent of real time) and the decode workers' load, plus counts of workers, outputs and attached streams ([how busy it is](../features/playback.md#how-busy-it-is)) | `engine.GetStats()` | ✅ |
 | BASS_GetDSoundObject | Not provided (Windows-only escape hatch) | — | ➖ |
 
 ### Streams
@@ -84,11 +84,11 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_ChannelSetPosition from a seek bar (BASS blocks until the decoder has seeked) | `fa_stream_seek_async`: returns at once, a worker seeks; position and clock report the target at once; a drag costs one seek per worker pass ([seek cost](../features/playback.md#what-a-seek-costs)) | `RequestSeek(time)` | ✅ |
 | BASS_ChannelSetPosition(h, 0, ...) to clear a push stream after the app seeks | `fa_stream_push_flush`: drops everything queued at once; the clock holds until the new audio plays | `Flush()` | ✅ |
 | Decode compressed audio yourself (FFmpeg) and push PCM | `fa_stream_open_packets` + `fa_stream_push_packet`: packets straight from `av_read_frame`; PCM, MP3, AAC, AC-3, E-AC-3, Opus, Vorbis, FLAC, ALAC (and WMA on Windows) built in; for other codecs decode with your FFmpeg and push frames (`fa_stream_push_frame`) | `engine.OpenPackets(params)`, `PushPacket(...)` | ✅ |
-| BASS_StreamCreate (STREAMPROC callback) | Planned pull-callback source | | 🗓️ |
+| BASS_StreamCreate (STREAMPROC callback) | `fa_stream_open_callback`: your `fa_stream_proc` writes up to N frames in any interleaved format and returns how many (0 = nothing now, `FA_STREAM_PROC_END` = the end); it runs on a decode worker, never on the audio thread ([callback streams](../features/callback-capture.md#callback-streams)) | `engine.OpenCallback(rate, channels, buffer => frames)` | ✅ |
 | BASS_StreamPutFileData | `fa_stream_open_io` with `seek = NULL` (forward-only source fed from your own buffer) | `engine.OpenStream(stream)` with a non-seekable stream | ✅ |
 | BASS_StreamGetFilePosition (web streams) | `fa_stream_get_net_status`: `BASS_FILEPOS_DOWNLOAD` → `downloaded`, `BUFFER` → `buffered_bytes` (and `buffered` as time), `END`/`SIZE` → `content_length`, `CONNECTED` → `connected`, `BUFFERING` → `FA_STATE_BUFFERING` ([web streams](../features/web-streams.md#status-and-headers)) | `NetworkStatus` | ✅ |
 | BASS_StreamGetFilePosition (files) | Positions are in frames: use `fa_stream_get_position`. `BASS_FILEPOS_END`/`SIZE` (file size) → `fa_stream_info.file_size`; `START` (where the audio begins, after tags) is not needed: `audio_bytes` already leaves tags and headers out | `stream.Info.FileSize`, `AudioBytes` | ✅ |
-| BASS_StreamCancel | Async open with cancellation | | 🗓️ |
+| BASS_StreamCancel (BASS_StreamCreateURL / File on another thread) | `fa_open_options.cancel`: a flag set from another thread stops `fa_stream_open_url` (name lookup, connection, first bytes) within about 100 ms, and a ZIP unpack, with `FA_ERROR_CANCELLED` ([opening](../features/web-streams.md#opening)) | `await engine.OpenUrlAsync(url, options, token)`, `OpenFileAsync`; `OperationCanceledException` | ✅ |
 | BASS_StreamFree / BASS_ChannelFree | `fa_stream_close` | `Dispose()` | ✅ |
 | `BASS_STREAM_DECODE` flag + BASS_ChannelGetData (PCM) | `FA_OPEN_DECODE_ONLY` + `fa_stream_read`; returns `FA_ERROR_END_OF_STREAM` with 0 frames at the end ([decoding](../features/streams.md#decoding-without-playback)) | `Read(Span<float>)`, 0 at the end | ✅ |
 
@@ -188,7 +188,8 @@ BASS has no normalization: apps measure each file themselves with a decode pass 
 | Analysing files ahead of playback (library import) | `fa_scan_loudness_path`: audio only, all cores, cached | `engine.ScanLoudness(path)` | ✅ |
 | `BASS_ATTRIB_VOLDSP` to boost above 1.0 | Normalization gain is separate from `FA_PARAM_VOLUME` and boosts up to +12 dB; volume stays free for fades | automatic | ✅ |
 | Reading ReplayGain tags yourself (`BASS_ChannelGetTags` + parsing) | Read automatically: ID3v2 `TXXX` (also in WAV and AIFF), FLAC and Ogg Vorbis comments, OpusTags, APEv2, MP4 freeform atoms, ASF attributes; RG2 and R128. The raw values are also in `fa_tags_get_item` | automatic | ✅ |
-| BASSloud: `BASS_Loudness_Start` / `GetLevel` (integrated, range, true peak) | `fa_stream_get_loudness`, `fa_scan_loudness_path` (BS.1770-4 / R128) | `GetLoudness()`, `ScanLoudness()` | ✅ integrated, range, true peak; momentary/short-term meters 🗓️ |
+| BASSloud: `BASS_Loudness_Start` / `GetLevel` (integrated, range, true peak) | `fa_stream_get_loudness`, `fa_scan_loudness_path` (BS.1770-4 / R128) | `GetLoudness()`, `ScanLoudness()` | ✅ integrated, range, true peak |
+| BASSloud: `BASS_Loudness_GetLevel` with `BASS_LOUDNESS_CURRENT` (momentary) or a 3 s window (short-term), on a channel or the output | `fa_stream_get_loudness_meter`, `fa_device_get_loudness_meter`: momentary (400 ms) and short-term (3 s) LUFS of what is heard now ([loudness meters](../features/levels-spectrum.md#loudness-meters)) | `stream.GetLoudnessMeter()`, `output.GetLoudnessMeter()` | ✅ |
 | bass_fx `BASS_FX_BFX_DAMP` (dynamic amplification) on live streams | Running loudness estimate drives the gain for streams that can't be scanned | automatic | ✅ |
 | bass_fx `BASS_FX_BFX_COMPRESSOR2` used to stop clipping | `fa_engine_set_limiter`: true-peak, look-ahead, on every device | `engine.SetLimiter(...)` | ✅ |
 
@@ -252,7 +253,8 @@ MOD, S3M, XM, IT, MPTM and many more play through the statically linked libopenm
 | BASS_Encode_Start on the mixer plus one on the record channel, started together (a karaoke night as stems) | `fa_encoder_attach_mixer(enc, mixer, FA_MIXER_TAP_MASTER / FA_MIXER_TAP_VOCALS)` + `fa_mixer_start_recording`: one start frame, the vocals lined up as the singer heard the music. In .NET: `encoder.Record(mixer, MixerTap.Vocals)`, `mixer.StartRecording([...])` | ✅ |
 | Measuring a karaoke system's mic-to-speaker latency by hand (play a click, record it, find it in the recording) and guessing a safe mic gain | `fa_mixer_measure_latency`: the [setup check](../features/dj-mixer.md#setup-check) plays test chirps and pink noise, measures each latency mode, gives the most feedback-safe mic gain and advises whether to monitor; the mixer then uses the measured latency. In .NET: `await mixer.MeasureLatencyAsync(mic, new LatencyCheckOptions { AllModes = true })` | ✅ |
 | BASS_CONFIG_REC_WASAPI / BASSWASAPI exclusive mode for low-latency mic monitoring | `FA_LATENCY_EXCLUSIVE` in `fa_mixer_config.latency`, or `fa_mixer_set_latency_mode` on a running mixer (opt-in; output and mics in WASAPI exclusive, 3 ms periods). Mics capture in WASAPI raw mode (no voice processing) where the driver offers it. In .NET: `DjMixerOptions.Latency`, `mixer.LatencyMode` | ✅ (Windows) |
-| BASS_RecordInit / Free / SetDevice / GetDevice / GetInfo / Start for other uses | Capture devices as stream sources | 🗓️ |
+| BASS_RecordInit + BASS_RecordStart for other uses (record an input to a file, read its samples, meter it) | `fa_stream_open_capture` (`fa_capture_options`: device, rate, channels): the input as an ordinary stream; record it with `FA_OPEN_DECODE_ONLY` + `fa_encoder_encode_stream`, read it with `fa_stream_read`, or play it ([capture streams](../features/callback-capture.md#capture-streams)). In .NET: `engine.OpenCapture(new CaptureOptions { Device = input })` | ✅ |
+| BASS_RecordFree / SetDevice / GetDevice / GetInfo | Not needed: each capture stream opens its input and closes it with `fa_stream_close`; `fa_device_get_info(FA_DEVICE_CAPTURE)` lists the inputs | ➖ (by design) |
 | BASS_RecordGetInput / SetInput / GetInputName | Not provided (old WinMM mixer lines) | ➖ |
 
 ### Encoding and recording (BASSenc, BASSenc_MP3, BASSenc_FLAC)

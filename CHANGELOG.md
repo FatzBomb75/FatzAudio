@@ -26,6 +26,15 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   Tested over HTTP: fragmented MP4 with `sidx`, with `mfra` and with neither, Matroska with Cues at the end, video
   files with several audio tracks, fMP4 HLS. See
   [docs/features/web-streams.md](docs/features/web-streams.md#mp4-and-matroska-files).
+- Engine and stream parity (extras step 17): `fa_engine_get_stats` (.NET `AudioEngine.GetStats`, BASS's `BASS_GetCPU`)
+  reports the output callbacks' load (average and peak) and the decode workers' load. Callback streams
+  (`fa_stream_open_callback`, .NET `AudioEngine.OpenCallback`, BASS's `STREAMPROC`) ask the app's function for audio on a
+  decode worker. Capture streams (`fa_stream_open_capture` with `fa_capture_options`, .NET `AudioEngine.OpenCapture` with
+  `CaptureOptions`) open an input as an ordinary stream, to record it with `fa_encoder_encode_stream`, read or play it.
+  Momentary and short-term loudness meters: `fa_stream_get_loudness_meter`, `fa_device_get_loudness_meter` (.NET
+  `GetLoudnessMeter`, BASSloud). `fa_open_options.cancel` now also stops `fa_stream_open_url` (name lookup, connection,
+  first bytes) within about 100 ms; .NET adds `AudioEngine.OpenUrlAsync` and `OpenFileAsync` with a
+  `CancellationToken`. See [docs/features/callback-capture.md](docs/features/callback-capture.md).
 
 - Web streams: a raw-bytes tap for saving a station as it plays (BASS's `DOWNLOADPROC`): `fa_net_options.download_proc`
   from the first byte, `fa_stream_set_download_callback` to start or stop it while playing (.NET

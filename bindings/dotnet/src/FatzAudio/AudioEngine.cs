@@ -35,6 +35,30 @@ public sealed class AudioEngine : IDisposable
         }
     }
 
+    /// <summary>What an <see cref="AudioCallback"/> returns when there is no more audio.</summary>
+    public const int EndOfStream = -1;
+
+    /// <summary>
+    /// How busy the engine is (BASS_GetCPU), for a diagnostics panel: the output callbacks' load and the decode
+    /// workers'. Cheap enough to call from a UI timer.
+    /// </summary>
+    /// <returns>The current figures.</returns>
+    /// <exception cref="ObjectDisposedException">The engine was disposed.</exception>
+    /// <example>
+    /// <code>
+    /// var stats = engine.GetStats();
+    /// cpuLabel.Text = $"Mix {stats.AudioLoad:0.0}% (peak {stats.AudioLoadPeak:0.0}%), decoding {stats.WorkerLoad:0.0}%";
+    /// </code>
+    /// </example>
+    public unsafe EngineStats GetStats()
+    {
+        FaEngineStats st = default;
+        st.StructSize = (uint)sizeof(FaEngineStats);
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_engine_get_stats(Handle, &st));
+        return new EngineStats(st.AudioLoad, st.AudioLoadPeak, st.WorkerLoad, (int)st.Workers, (int)st.Devices,
+            (int)st.AttachedStreams);
+    }
+
     /// <summary>Creates an engine.</summary>
     /// <param name="options">Optional configuration; null uses the defaults.</param>
     /// <returns>A new engine that must be disposed.</returns>
@@ -259,6 +283,23 @@ public sealed class AudioEngine : IDisposable
     }
 
     /// <summary>
+    /// Opens an audio file on a worker thread, so the caller does not wait for it. Cancelling stops a long open (a
+    /// compressed song in a ZIP archive being unpacked) and throws <see cref="OperationCanceledException"/>.
+    /// </summary>
+    /// <param name="path">Path of the file.</param>
+    /// <param name="options">Optional open options.</param>
+    /// <param name="cancellationToken">Stops the open; no stream is created.</param>
+    /// <returns>The stream; dispose it when done.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="path"/> is null.</exception>
+    /// <exception cref="OperationCanceledException">The token was cancelled.</exception>
+    /// <exception cref="FatzAudioException">See <see cref="OpenFile"/>.</exception>
+    public Task<AudioStream> OpenFileAsync(string path, StreamOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        return OpenAsync(o => OpenFile(path, o), options, cancellationToken);
+    }
+
+    /// <summary>
     /// Opens one audio track of a CD (or disc image). The stream is 44.1 kHz stereo and seekable, and works
     /// like any other: crossfades, queues (gapless track to track), normalization and buses.
     /// </summary>
@@ -412,6 +453,69 @@ public sealed class AudioEngine : IDisposable
         return OpenUrl(url.AbsoluteUri, options);
     }
 
+    /// <summary>
+    /// Opens a URL (as <see cref="OpenUrl(string, StreamOptions?)"/>) on a worker thread, so the caller does not wait
+    /// for the server (BASS_StreamCreateURL on a thread, with BASS_StreamCancel). Cancelling stops the name lookup,
+    /// connection or download in progress within about 100 ms and throws <see cref="OperationCanceledException"/>:
+    /// the user picked another station before this one answered.
+    /// </summary>
+    /// <param name="url">The URL.</param>
+    /// <param name="options">Optional open options; <see cref="StreamOptions.Network"/> holds the connection settings.</param>
+    /// <param name="cancellationToken">Stops the open; no stream is created.</param>
+    /// <returns>The stream; dispose it when done.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="url"/> is null.</exception>
+    /// <exception cref="OperationCanceledException">The token was cancelled.</exception>
+    /// <exception cref="FatzAudioException">See <see cref="OpenUrl(string, StreamOptions?)"/>.</exception>
+    /// <example>
+    /// <code>
+    /// _tuning?.Cancel();
+    /// _tuning = new CancellationTokenSource();
+    /// try
+    /// {
+    ///     using var radio = await engine.OpenUrlAsync(station.Url, cancellationToken: _tuning.Token);
+    ///     radio.PlayOn(output);
+    /// }
+    /// catch (OperationCanceledException) { /* another station was picked meanwhile */ }
+    /// </code>
+    /// </example>
+    public Task<AudioStream> OpenUrlAsync(string url, StreamOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(url);
+        return OpenAsync(o => OpenUrl(url, o), options, cancellationToken);
+    }
+
+    /// <summary>Runs an open on the thread pool with the token in its options (with the options' own, if any).</summary>
+    private static Task<AudioStream> OpenAsync(Func<StreamOptions, AudioStream> open, StreamOptions? options,
+        CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested) return Task.FromCanceled<AudioStream>(cancellationToken);
+        return Task.Run(() =>
+        {
+            using var linked = options is { CancellationToken.CanBeCanceled: true }
+                ? CancellationTokenSource.CreateLinkedTokenSource(options.CancellationToken, cancellationToken)
+                : null;
+            var token = linked?.Token ?? cancellationToken;
+            // The caller's own token when it is the one that fired, so `when (e.CancellationToken == token)` matches.
+            CancellationToken Fired() => cancellationToken.IsCancellationRequested ? cancellationToken : token;
+            AudioStream stream;
+            try
+            {
+                stream = open((options ?? new StreamOptions()) with { CancellationToken = token });
+            }
+            catch (FatzAudioException e) when (e.ErrorCode == ErrorCode.Cancelled)
+            {
+                throw new OperationCanceledException(e.Message, e, Fired());
+            }
+            // Cancelled just after the open got through: the caller has moved on, so the stream must not reach it.
+            if (token.IsCancellationRequested)
+            {
+                stream.Dispose();
+                throw new OperationCanceledException(Fired());
+            }
+            return stream;
+        }, CancellationToken.None);
+    }
+
     /// <summary>Creates a stream that you feed with PCM data yourself.</summary>
     /// <param name="format">Format of the PCM data that will be pushed.</param>
     /// <param name="options">Optional open options.</param>
@@ -435,6 +539,94 @@ public sealed class AudioEngine : IDisposable
         var sh = new StreamHandle();
         sh.Initialize(s, h);
         return new PushAudioStream(this, sh, format);
+    }
+
+    /// <summary>
+    /// Opens a stream that asks your callback for audio whenever it wants more (BASS_StreamCreate with a STREAMPROC):
+    /// a synthesizer, a tone generator, audio from a library of your own. It plays, decodes, records and takes tempo,
+    /// effects and meters like any other stream; it cannot seek or loop.
+    /// </summary>
+    /// <param name="sampleRate">The audio's sample rate.</param>
+    /// <param name="channels">The audio's channel count (interleaved).</param>
+    /// <param name="fill">
+    /// Writes interleaved float samples and returns the frames written. It runs on a decode worker thread, ahead of
+    /// playback by the stream's buffer (or on your thread inside <see cref="AudioStream.Read(Span{float})"/> for
+    /// <see cref="StreamOptions.DecodeOnly"/> streams), never twice at once and never after the stream is disposed.
+    /// It may take locks but should not block: the stream runs dry meanwhile.
+    /// </param>
+    /// <param name="options">Optional open options (<see cref="StreamOptions.Loop"/> is not allowed).</param>
+    /// <returns>The stream; dispose it when done.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="fill"/> is null.</exception>
+    /// <exception cref="FatzAudioException">An invalid rate or channel count, or <see cref="StreamOptions.Loop"/>
+    /// (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    /// <example>
+    /// <code>
+    /// double phase = 0;
+    /// using var tone = engine.OpenCallback(48000, 2, buffer =>
+    /// {
+    ///     for (int i = 0; i &lt; buffer.Length; i += 2, phase += 2 * Math.PI * 440 / 48000)
+    ///         buffer[i] = buffer[i + 1] = (float)(0.2 * Math.Sin(phase));
+    ///     return buffer.Length / 2;
+    /// });
+    /// tone.PlayOn(output);
+    /// </code>
+    /// </example>
+    public unsafe AudioStream OpenCallback(int sampleRate, int channels, AudioCallback fill, StreamOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(fill);
+        var h = Handle;
+        using var opts = NativeOptions.Create(options);
+        if (sampleRate <= 0 || channels <= 0) throw new FatzAudioException(ErrorCode.InvalidArgument);
+        var nf = AudioFormat.Float32(sampleRate, channels).ToNative();
+        // Lives as long as the native stream (adopted by it below), freed here if the open fails.
+        var gc = GCHandle.Alloc(new CallbackState(fill, channels));
+        int rc = NativeMethods.fa_stream_open_callback(h, &nf, &CallbackState.Fill, (void*)GCHandle.ToIntPtr(gc), opts.Pointer, out nint s);
+        if (rc < 0) gc.Free();
+        return AudioStream.Wrap(this, rc, s, gc);
+    }
+
+    /// <summary>
+    /// Opens an input (a microphone, a line input) as an ordinary stream (BASS_RecordStart): record it to a file
+    /// (<see cref="StreamOptions.DecodeOnly"/> and <see cref="AudioEncoder.Encode"/>), read its samples, meter
+    /// it, or play it to check it. The stream begins with the audio of its first read (or of <see cref="AudioStream.PlayOn(OutputDevice)"/>), not with what came before.
+    /// To sing or talk through the speakers use a mixer mic (<see cref="DjMixer.AddMic"/>), which corrects the clock
+    /// drift between input and output and keeps latency low.
+    /// </summary>
+    /// <param name="capture">The input and its format; null = the default input, as it is.</param>
+    /// <param name="options">Optional open options (<see cref="StreamOptions.Loop"/> is not allowed).</param>
+    /// <returns>The stream; dispose it when done. If the input goes away (unplugged), the stream ends.</returns>
+    /// <exception cref="ArgumentException"><see cref="CaptureOptions.Device"/> is not an input.</exception>
+    /// <exception cref="FatzAudioException"><see cref="ErrorCode.PermissionDenied"/> without the microphone permission;
+    /// <see cref="ErrorCode.Device"/> when the input cannot be opened.</exception>
+    /// <example>
+    /// <code>
+    /// using var mic = engine.OpenCapture(options: new StreamOptions { DecodeOnly = true });
+    /// using var file = AudioEncoder.Create("memo.flac", new EncoderOptions { Format = EncodeFormat.Flac });
+    /// file.Encode(mic);
+    /// // ... later: file.Dispose() completes the recording.
+    /// </code>
+    /// </example>
+    public unsafe AudioStream OpenCapture(CaptureOptions? capture = null, StreamOptions? options = null)
+    {
+        if (capture?.Device is { Kind: not DeviceKind.Capture })
+            throw new ArgumentException("Not an input device.", nameof(capture));
+        var h = Handle;
+        using var opts = NativeOptions.Create(options);
+        FaCaptureOptions c;
+        NativeMethods.fa_capture_options_init(&c);
+        c.SampleRate = (uint)Math.Max(0, capture?.SampleRate ?? 0);
+        c.Channels = (uint)Math.Max(0, capture?.Channels ?? 0);
+        c.Flags = capture?.KeepOsProcessing == true ? 1u : 0u;
+        byte* id = capture?.Device?.Id is { } devId ? (byte*)Marshal.StringToCoTaskMemUTF8(devId) : null;
+        try
+        {
+            c.DeviceId = id;
+            return AudioStream.Wrap(this, NativeMethods.fa_stream_open_capture(h, &c, opts.Pointer, out nint s), s, null);
+        }
+        finally
+        {
+            if (id != null) Marshal.FreeCoTaskMem((nint)id);
+        }
     }
 
     /// <summary>

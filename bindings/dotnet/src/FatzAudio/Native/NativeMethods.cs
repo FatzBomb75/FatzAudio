@@ -24,6 +24,9 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial void fa_engine_destroy(nint engine);
 
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_engine_get_stats(EngineHandle engine, FaEngineStats* stats);
+
     // ---- Supported formats -------------------------------------------------
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial uint fa_format_count();
@@ -89,6 +92,16 @@ internal static unsafe partial class NativeMethods
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_open_push(EngineHandle engine, FaAudioFormat* format, FaOpenOptions* options, out nint stream);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_open_callback(EngineHandle engine, FaAudioFormat* format,
+        delegate* unmanaged[Cdecl]<void*, long, void*, long> proc, void* user, FaOpenOptions* options, out nint stream);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_capture_options_init(FaCaptureOptions* options);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_open_capture(EngineHandle engine, FaCaptureOptions* capture, FaOpenOptions* options, out nint stream);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_push_pcm(StreamHandle stream, void** planes, long frames, long pts);
@@ -539,6 +552,12 @@ internal static unsafe partial class NativeMethods
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_device_get_levels(DeviceHandle device, long window, float* peak, float* rms, uint channels);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_loudness_meter(StreamHandle stream, double* momentary, double* shortTerm);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_device_get_loudness_meter(DeviceHandle device, double* momentary, double* shortTerm);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_spectrum(StreamHandle stream, uint size, uint flags, float* bins, float* binHz);
