@@ -324,7 +324,7 @@ var layout = cdg.GetLayout();   // layout.Width x layout.Height, 4 bytes per pix
 
 ### Change events (push model)
 
-Apps that would rather be told than call update every frame turn on `fa_stream_set_cdg_events(song, 1)`. The engine's event thread then follows the stream's clock over the packs and raises `FA_EVENT_CDG_CHANGED` on the stream's event callback whenever the picture heard changes: lyrics being coloured in, a screen clear, a colour change, a seek, new graphics (a disc's included). Packs that change nothing raise nothing, a paused stream raises nothing, and one event covers all packs since the last (at most one every few milliseconds). The first event after turning it on covers the whole screen.
+Apps that would rather be told than call update every frame turn on `fa_stream_set_cdg_events(song, 1)`. The engine's event thread then follows the stream's clock over the packs and raises `FA_EVENT_CDG_CHANGED` on the stream's event callback whenever the picture heard changes: lyrics being coloured in, a screen clear, a colour change, a seek, new graphics (a disc's included). Packs that change nothing raise nothing, a paused stream raises nothing, and one event covers all packs since the last (at most one every few milliseconds). The first event after turning it on covers the whole screen. It can arrive before `fa_stream_set_cdg_events` returns, so set the event callback first.
 
 On the event, update your surfaces (in the callback, or by waking your render thread) and upload what they report. Surfaces stay yours: the engine never draws into them, so their threading rules above don't change.
 

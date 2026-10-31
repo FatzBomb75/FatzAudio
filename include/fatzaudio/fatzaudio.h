@@ -2241,7 +2241,8 @@ FA_API fa_result FA_CALL fa_stream_get_cdg_info(fa_stream* stream, fa_cdg_info* 
  * graphics. At most one event per few milliseconds, covering all packs since the
  * last. On the event, call fa_cdg_surface_update for your surfaces (from your render
  * thread, or in the callback) and upload what they report; the surfaces themselves
- * stay yours. The first event after turning it on covers the whole screen.
+ * stay yours. The first event after turning it on covers the whole screen; it can
+ * arrive before this returns, so set the event callback first.
  * fa_event.frame is the number of packs shown, fa_event.value what changed, in
  * native 300x216 screen pixels (a surface's dirty rectangle is in its own pixels):
  *   FA_CDG_CHANGE_X/Y/WIDTH/HEIGHT(value)  the area (0 wide: only colours changed)
