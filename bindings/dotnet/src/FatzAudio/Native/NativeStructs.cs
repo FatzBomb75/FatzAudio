@@ -69,6 +69,7 @@ internal unsafe struct FaOpenOptions
     public nint SoundFont;
     public int TextCodePage;
     public int* Cancel;
+    public int DolbyDownmix;
 }
 
 [StructLayout(LayoutKind.Sequential)]

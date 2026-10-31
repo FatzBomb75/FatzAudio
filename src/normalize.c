@@ -31,7 +31,9 @@ float fa_stream_norm_target_db(struct fa_stream* s)
     if (mode == FA_NORMALIZE_ALBUM) lufs = fa_load_float(&s->norm_album);
     if (lufs != lufs) lufs = fa_load_float(&s->norm_track);
     if (lufs != lufs) lufs = fa_load_float(&s->norm_est);
-    return fa_engine_norm_gain_db(s->engine, lufs);
+    /* The loudness is of the source's channels; a Dolby downmix scaled down so it
+     * cannot clip gets that back (the limiter catches the peaks). */
+    return fa_engine_norm_gain_db(s->engine, lufs) + fa_load_float(&s->dolby_makeup);
 }
 
 /* Starts tags/cache/scan for the stream once. */
@@ -89,6 +91,13 @@ FA_API fa_result FA_CALL fa_engine_set_normalization(fa_engine* engine, fa_norma
             if (!(s->flags & FA_OPEN_NO_NORMALIZE)) fa_stream_start_analysis(s);
         fa_mutex_unlock(&engine->list_lock);
     }
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_engine_set_dialnorm(fa_engine* engine, int32_t enabled)
+{
+    if (!engine) return FA_ERROR_INVALID_ARG;
+    fa_store32(&engine->use_dialnorm, enabled != 0);
     return FA_OK;
 }
 

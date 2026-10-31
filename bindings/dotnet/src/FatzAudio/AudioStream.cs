@@ -697,6 +697,32 @@ public unsafe class AudioStream : IDisposable
         }
     }
 
+    /// <summary>
+    /// How Dolby Digital (AC-3) and Dolby Digital Plus (E-AC-3) audio with more than two channels is mixed down:
+    /// with the stream's own levels (<see cref="FatzAudio.DolbyDownmix.Auto"/>, LoRo, LtRt) or the engine's
+    /// downmix. Between Auto, LoRo and LtRt the change applies to audio decoded from now on, like
+    /// <see cref="DynamicRange"/>. To or from Engine a playing stream rebuilds its chain and carries on where it
+    /// plays, as <see cref="SetMatrix"/> does. Other formats ignore it.
+    /// </summary>
+    /// <exception cref="ArgumentException">An unknown <see cref="FatzAudio.DolbyDownmix"/>.</exception>
+    /// <exception cref="FatzAudioException">To or from Engine on a playing live stream (<see cref="ErrorCode.NotSeekable"/>): change it while detached.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public DolbyDownmix DolbyDownmix
+    {
+        get
+        {
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_dolby_downmix(Handle, out int mode));
+            return (DolbyDownmix)mode;
+        }
+        set
+        {
+            int rc = NativeMethods.fa_stream_set_dolby_downmix(Handle, (int)value);
+            if (rc == (int)ErrorCode.InvalidArgument)
+                throw new ArgumentException("Unknown Dolby downmix.", nameof(value));
+            FatzAudioException.ThrowIfFailed(rc);
+        }
+    }
+
     // ---- MIDI -----------------------------------------------------------------
 
     /// <summary>

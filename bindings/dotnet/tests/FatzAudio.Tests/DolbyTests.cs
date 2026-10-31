@@ -58,4 +58,43 @@ public class DolbyTests
         Assert.Equal(DynamicRange.Normal, full.DynamicRange);
         Assert.Throws<ArgumentException>(() => full.DynamicRange = (DynamicRange)7);
     }
+
+    [Fact]
+    public void DolbyDownmix_OptionAndProperty()
+    {
+        using var engine = CreateHeadless();
+        using var output = engine.OpenOutput();
+        string path = FindTestFile("tests/data/dolby/mix_alt.ac3");
+        using var auto = engine.OpenFile(path);
+        Assert.Equal(DolbyDownmix.Auto, auto.DolbyDownmix);
+        using var engineMix = engine.OpenFile(path, new StreamOptions { DolbyDownmix = DolbyDownmix.Engine });
+        Assert.Equal(DolbyDownmix.Engine, engineMix.DolbyDownmix);
+
+        // While playing, also to and from the engine's downmix (the chain is rebuilt).
+        auto.PlayOn(output);
+        auto.DolbyDownmix = DolbyDownmix.LtRt;
+        Assert.Equal(DolbyDownmix.LtRt, auto.DolbyDownmix);
+        auto.DolbyDownmix = DolbyDownmix.Engine;
+        Assert.Equal(DolbyDownmix.Engine, auto.DolbyDownmix);
+        auto.DolbyDownmix = DolbyDownmix.LoRo;
+        Assert.Equal(DolbyDownmix.LoRo, auto.DolbyDownmix);
+        Assert.Throws<ArgumentException>(() => auto.DolbyDownmix = (DolbyDownmix)9);
+    }
+
+    [Fact]
+    public async Task Dialnorm_CountsAsLoudnessWhenEnabled()
+    {
+        using var engine = CreateHeadless();
+        engine.SetDialnorm(true);
+        using var s = engine.OpenFile(FindTestFile("tests/data/dolby/mix_alt.ac3"));
+        Loudness l = s.GetLoudness();
+        for (int i = 0; i < 400 && !l.IsFinal; i++)
+        {
+            await Task.Delay(10);
+            l = s.GetLoudness();
+        }
+        Assert.True(l.IsFinal);
+        Assert.Equal(LoudnessSource.Dialnorm, l.Source);
+        Assert.Equal(-20.0, l.IntegratedLufs);
+    }
 }

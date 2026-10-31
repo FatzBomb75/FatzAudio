@@ -163,6 +163,8 @@ static fa_result ac3c_decode(fa_codec* c, const uint8_t* data, size_t size)
             if (direct) c->out_cap = (fa_frames)cap;
             else st->pcm_cap = cap;
             if (r == FA_ERROR_OUT_OF_MEMORY) return r;
+            if (c->dolby_mix && fa_ac3_mix_info(st->dec))
+                fa_store64(c->dolby_mix, (int64_t)fa_ac3_mix_info(st->dec));
             pos += n;
             if (frames <= 0) continue;
             if (direct) {

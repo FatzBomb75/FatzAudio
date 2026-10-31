@@ -30,6 +30,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   found keeps the subcode read so far, and a part read again with different packs redoes the seek checkpoints after it
   at once instead of 10 s per write. See [docs/features/disc.md](docs/features/disc.md#pregaps).
 
+- Dolby downmix (extras step 20): `fa_open_options.dolby_downmix` and `fa_stream_set_dolby_downmix` /
+  `fa_stream_get_dolby_downmix` (.NET `StreamOptions.DolbyDownmix`, `AudioStream.DolbyDownmix`) choose Lo/Ro, Lt/Rt
+  (Pro Logic matrix surround) or the stream's own preference; `fa_engine_set_dialnorm` (.NET `AudioEngine.SetDialnorm`)
+  lets a Dolby file's dialogue level stand in for a loudness scan (`FA_LOUDNESS_DIALNORM`, .NET
+  `LoudnessSource.Dialnorm`). See [docs/features/dolby.md](docs/features/dolby.md#stereo-downmix).
+
 - Web streams: MP4 and Matroska files over the network read only what they need. A fragmented MP4 with a `sidx` (or an
   `mfra` at the end) reads its fragments as playback or a seek reaches them instead of every fragment at open, and
   Matroska reads Cues stored after the clusters, with the last cluster for the exact length, in one range request of
@@ -257,6 +263,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   set to the area they show in instead of redrawing the whole surface. Songs without the offsets draw the same pixels
   as before.
 
+- AC-3 and E-AC-3 with more than two channels are mixed down to stereo with the stream's own centre, surround (and
+  E-AC-3 LFE) levels and its Lo/Ro or Lt/Rt preference, as ETSI TS 102 366 describes, scaled so the mix cannot clip.
+  Without normalization Dolby 5.1 therefore plays about 7.7 dB quieter than with the engine's generic downmix
+  before; with normalization on, the gain gives that scaling back (the limiter catches the peaks).
+  `FA_DOLBY_DOWNMIX_ENGINE` (.NET `DolbyDownmix.Engine`) keeps the old downmix. Decode-only reads still hand out every
+  channel. Only channels that carry audio count, so stereo plus LFE still plays at full level.
 - Chained Ogg files (several songs one after another) find where each song ends by bisection on the serial numbers,
   as vorbisfile does, instead of reading every page: an hour of 20 songs opens in about 6 ms instead of 41 ms. Links,
   lengths, decoded audio and seeks are the same as before. A file whose songs reuse a serial number (against the Ogg
