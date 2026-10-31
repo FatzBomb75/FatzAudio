@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes the small ZIP, HLS, WAV, MIDI and tracker seeds for the fuzz targets into
+"""Writes the small ZIP, HLS, WAV, MIDI, tracker and tag seeds for the fuzz targets into
 seeds/. The other audio seeds are the files in tests/data (run.sh passes those)."""
 import os, struct, zipfile
 
@@ -131,3 +131,23 @@ tw = os.path.join(here, "seeds", "tracker")
 os.makedirs(tw, exist_ok=True)
 open(os.path.join(tw, "mk.mod"), "wb").write(mod(b"M.K.", 4))
 open(os.path.join(tw, "8chn.mod"), "wb").write(mod(b"8CHN", 8))
+
+# Tags: ID3v2 frames stored with the zlib flag (v2.3 and v2.4), Lyrics3 v1.00 and v2.00 at the end of an
+# MP3 stub. (The MIDI seeds, the FLAC cue sheet and SYLT files are passed by run.sh from elsewhere.)
+import zlib
+tg = os.path.join(here, "seeds", "tags")
+os.makedirs(tg, exist_ok=True)
+def synchsafe(v): return bytes([(v >> 21) & 127, (v >> 14) & 127, (v >> 7) & 127, v & 127])
+def id3(ver, frames): return b"ID3" + bytes([ver, 0, 0]) + synchsafe(len(frames)) + frames
+stub = b"\xff\xfb\x90\x00" + b"\x00" * 400
+z = zlib.compress(b"\x00Compressed Title")
+f3 = b"TIT2" + struct.pack(">I", 4 + len(z)) + b"\x00\x80" + struct.pack(">I", 17) + z
+z = zlib.compress(b"\x03Zlib Artist")
+f4 = b"TPE1" + synchsafe(4 + len(z)) + b"\x00\x09" + synchsafe(12) + z
+open(os.path.join(tg, "id3v23_zlib.mp3"), "wb").write(id3(3, f3) + stub)
+open(os.path.join(tg, "id3v24_zlib.mp3"), "wb").write(id3(4, f4 + f4) + stub)
+def l3(fid, d): return fid + b"%05d" % len(d) + d
+body = l3(b"IND", b"10") + l3(b"LYR", b"Line one\r\nLine two") + l3(b"ETT", b"Title") + l3(b"EAR", b"Artist")
+v1 = b"TAG" + b"T".ljust(30, b"\0") + b"\0" * 95
+open(os.path.join(tg, "lyrics3_v2.mp3"), "wb").write(stub + b"LYRICSBEGIN" + body + b"%06d" % (len(body) + 11) + b"LYRICS200" + v1)
+open(os.path.join(tg, "lyrics3_v1.mp3"), "wb").write(stub + b"LYRICSBEGIN" + b"Just the words" + b"LYRICSEND")

@@ -131,6 +131,11 @@ void fa_tags_parse_vorbis_comments(const uint8_t* p, size_t n, fa_tag_sink* sink
     if (n < 8) return;
     pos = 4 + (size_t)fa_le32(p);            /* vendor string */
     if (pos + 4 > n || pos < 4) return;
+    if (pos > 4 && pos - 4 <= sink->max_text && fa_utf8_valid(p + 4, pos - 4)) {
+        char* vendor = fa_strndup((const char*)p + 4, pos - 4);
+        if (vendor) sink->text(sink, FA_TAG_FORMAT_VORBIS, "VENDOR", vendor);
+        free(vendor);
+    }
     count = fa_le32(p + pos);
     pos += 4;
     for (i = 0; i < count && pos + 4 <= n; i++) {
@@ -374,7 +379,11 @@ static const field_map field_maps[] = {
     { FA_TAG_FORMAT_MIDI, "TITLE", FA_TAG_TITLE }, { FA_TAG_FORMAT_MIDI, "ARTIST", FA_TAG_ARTIST },
     { FA_TAG_FORMAT_MIDI, "COPYRIGHT", FA_TAG_COPYRIGHT },
     { FA_TAG_FORMAT_TRACKER, "TITLE", FA_TAG_TITLE }, { FA_TAG_FORMAT_TRACKER, "ARTIST", FA_TAG_ARTIST },
-    { FA_TAG_FORMAT_TRACKER, "COMMENT", FA_TAG_COMMENT }
+    { FA_TAG_FORMAT_TRACKER, "COMMENT", FA_TAG_COMMENT },
+
+    { FA_TAG_FORMAT_LYRICS3, "LYR", FA_TAG_LYRICS }, { FA_TAG_FORMAT_LYRICS3, "ETT", FA_TAG_TITLE },
+    { FA_TAG_FORMAT_LYRICS3, "EAR", FA_TAG_ARTIST }, { FA_TAG_FORMAT_LYRICS3, "EAL", FA_TAG_ALBUM },
+    { FA_TAG_FORMAT_LYRICS3, "INF", FA_TAG_COMMENT }
 };
 
 /* Limits for hostile tags: items and pictures kept, and the length of a field
@@ -526,6 +535,13 @@ FA_API void FA_CALL fa_tags_close(fa_tags* t)
     free(t);
 }
 
+static int tags_have_format(const fa_tags* t, int format)
+{
+    uint32_t i;
+    for (i = 0; i < t->nitems; i++) if (t->items[i].format == format) return 1;
+    return 0;
+}
+
 /* Tags and (unless FA_TAGS_NO_INFO) the properties of the file in `src`. With
  * `audio_only`, a file no decoder recognises is skipped (returns 0) before any of
  * its tags are taken. */
@@ -534,12 +550,20 @@ static int read_source(fa_tags* t, fa_source* src, const char* name, uint32_t fl
     if (audio_only || !(flags & FA_TAGS_NO_INFO)) {
         fa_decoder dec;
         fa_source_seek(src, 0);
-        if (fa_decoder_open(&dec, src, name, NULL, -1, NULL) == FA_OK) {
+        fa_result r = fa_decoder_open(&dec, src, name, NULL, -1, NULL);
+        if (r == FA_OK) {
             if (!(flags & FA_TAGS_NO_INFO)) {
                 fa_decoder_get_info(&dec, &t->info);
                 t->have_info = 1;
             }
             fa_decoder_close(&dec);
+        } else if (r == FA_ERROR_NO_SOUNDFONT) {
+            /* A MIDI file: no soundfont to play it with, but its tags and length can be read. */
+            fa_source_seek(src, 0);
+            if (fa_midi_read_tags(src, (flags & FA_TAGS_NO_INFO) ? NULL : &t->info, &t->sink) == FA_OK && !(flags & FA_TAGS_NO_INFO))
+                t->have_info = 1;
+            fa_source_seek(src, 0);
+            return 1;
         } else if (audio_only) {
             return 0;
         }
@@ -676,7 +700,7 @@ FA_API fa_result FA_CALL fa_stream_get_tags(fa_stream* stream, uint32_t flags, f
             fa_source_close(&src);
         }
     }
-    if (stream->midi) {
+    if (stream->midi && !tags_have_format(t, FA_TAG_FORMAT_MIDI)) {
         fa_midi_info mi;
         if (fa_stream_get_midi_info(stream, &mi) == FA_OK) {
             collect_text(&t->sink, FA_TAG_FORMAT_MIDI, "TITLE", mi.title);

@@ -25,7 +25,7 @@ for t in "$@"; do
     stream_wav) bin=fuzz_stream; seeds="$D/seeds/wav $DATA/tags/tags.aiff" ;;
     stream_midi) bin=fuzz_stream; seeds="$D/seeds/midi" ;;
     stream_tracker) bin=fuzz_stream; seeds="$D/seeds/tracker" ;;
-    tags) bin=fuzz_tags; seeds="$DATA/tags $DATA/mp3 $DATA/flac $DATA/caf" ;;
+    tags) bin=fuzz_tags; seeds="$DATA/tags $D/seeds/tags $D/seeds/midi $DATA/mp3 $DATA/flac $DATA/caf" ;;
     zip) bin=fuzz_zip; seeds="$D/seeds/zip" ;;
     hls) bin=fuzz_hls; seeds="$D/seeds/hls" ;;
     *) echo "unknown target $t"; exit 2 ;;

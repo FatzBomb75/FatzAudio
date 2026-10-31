@@ -695,6 +695,9 @@ struct fa_tag_sink {
 /* Reads every tag of the source into `sink`, in priority order (see fa_tags_get).
  * Moves the read position; needs a seekable source. */
 void fa_tags_collect(fa_source* src, fa_tag_sink* sink);
+/* A MIDI file's properties (if `info`) and title, artist and copyright (if `sink`),
+ * read without a soundfont (dec_midi.c). An error when `src` is not MIDI. */
+fa_result fa_midi_read_tags(fa_source* src, fa_stream_info* info, fa_tag_sink* sink);
 /* Where the audio of an MP3, AAC, AC-3 or FLAC file lies: after an ID3v2 tag and
  * FLAC's metadata blocks, before APEv2 and ID3v1 tags. *out_bits = FLAC's bits
  * per sample, else 0. Moves the read position. */

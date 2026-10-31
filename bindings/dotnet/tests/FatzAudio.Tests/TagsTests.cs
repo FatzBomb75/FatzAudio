@@ -78,6 +78,60 @@ public class TagsTests
     }
 
     [Fact]
+    public void Read_SyncedLyricsAsTimedLines()
+    {
+        var tags = Tags.Read(FindTestFile("tests/data/tags/sylt.mp3"), TagReadOptions.NoInfo);
+        Assert.Equal("[00:01.000]Hello\n[00:01.500] world\n\n[01:02.340]Second line", tags["SYLT:Karaoke"]);
+    }
+
+    [Fact]
+    public void Read_FlacCueSheetAndVendor()
+    {
+        var tags = Tags.Read(FindTestFile("tests/data/tags/cue.flac"), TagReadOptions.NoInfo);
+        Assert.Equal("0123456789012", tags["CUESHEET/CATALOG"]);
+        Assert.Equal("00:00.000", tags["CUESHEET/TRACK01"]);
+        Assert.Equal("USRC17607839", tags["CUESHEET/TRACK01/ISRC"]);
+        Assert.Equal("00:00.510", tags["CUESHEET/TRACK02"]);
+        Assert.Null(tags["CUESHEET/TRACK170"]);
+        Assert.Equal("ffmpeg", tags["VENDOR"]);
+    }
+
+    [Fact]
+    public void Read_Lyrics3AtTheEndOfAnMp3()
+    {
+        byte[] body = System.Text.Encoding.Latin1.GetBytes("IND0000210" + "LYR00014Just the words" + "ETT00005Title");
+        var file = new List<byte> { 0xFF, 0xFB, 0x90, 0x00 };
+        file.AddRange(new byte[200]);
+        file.AddRange(System.Text.Encoding.Latin1.GetBytes("LYRICSBEGIN"));
+        file.AddRange(body);
+        file.AddRange(System.Text.Encoding.Latin1.GetBytes((body.Length + 11).ToString("D6") + "LYRICS200"));
+        var tags = Tags.Read(file.ToArray(), TagReadOptions.NoInfo);
+        Assert.Equal("Just the words", tags.Lyrics);
+        Assert.Equal("Title", tags.Title);
+        Assert.Contains(tags.Items, i => i.Key == "LYR" && i.Format == TagFormat.Lyrics3);
+    }
+
+    [Fact]
+    public void Read_MidiFileGivesTagsAndLengthWithoutASoundfont()
+    {
+        byte[] track =
+        {
+            0, 0xFF, 0x03, 4, (byte)'S', (byte)'o', (byte)'n', (byte)'g',
+            0, 0x90, 60, 100, 0x83, 0x60, 0x80, 60, 0, 0, 0xFF, 0x2F, 0,
+        };
+        var file = new List<byte>();
+        file.AddRange("MThd"u8.ToArray());
+        file.AddRange(new byte[] { 0, 0, 0, 6, 0, 0, 0, 1, 0x01, 0xE0 });
+        file.AddRange("MTrk"u8.ToArray());
+        file.AddRange(new byte[] { 0, 0, 0, (byte)track.Length });
+        file.AddRange(track);
+        var tags = Tags.Read(file.ToArray());
+        Assert.Equal("Song", tags.Title);
+        Assert.Equal("midi", tags.Codec);
+        Assert.InRange(tags.Duration!.Value.TotalSeconds, 0.4, 4);
+    }
+
+    [Fact]
     public void Read_MissingFileThrows()
     {
         var ex = Assert.Throws<FatzAudioException>(() => Tags.Read(Path.Combine(Path.GetTempPath(), "no-such-file.mp3")));
