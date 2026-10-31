@@ -23,6 +23,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- Sounds, a voice pool (extras step 24): a short sound decoded once into memory and played as many overlapping copies
+  as needed, each with its own volume and pan (BASS_Sample*). `fa_sound_load_path`, `fa_sound_load_memory`,
+  `fa_sound_load_pcm`, `fa_sound_play` (device, bus, volume, pan; returns the voice), `fa_sound_stop`,
+  `fa_sound_get_voices`, `fa_sound_get_info`, `fa_sound_set_options`, `fa_sound_close`. Voices are ordinary streams
+  that all read the one PCM buffer; free voices are reused; `max_voices` (default 8, up to 1024) with the steal rules
+  `FA_SOUND_STEAL_OLDEST` (default), `_QUIETEST` and `_NONE`. .NET: `engine.LoadSound`, `engine.CreateSound`, `Sound`,
+  `SoundOptions`, `SoundSteal`, `SoundInfo`. New file `src/sound.c`. See [docs/features/sounds.md](docs/features/sounds.md).
+
 - MIDI GS/XG effects B, insertion effects (extras step 7): the MU100's XG insertion 1 and 2 (`03 00 xx`, `03 01 xx`:
   type, parameters, part, MW/bend/aftertouch/AC1/AC2 depths) and the SC-88 Pro's EFX (`40 03 00`-`1E`: type,
   parameters, send levels, control sources and depths) with each part's EFX switch (`40 4x 22`). All 64 SC-88 Pro EFX

@@ -48,6 +48,16 @@ radio.PlayOn(output);
 
 C: `fa_stream_open_url(engine, url, NULL, &stream)`, then attach and play as above. More: [web streams](features/web-streams.md).
 
+## Play jingles and sound effects over the music
+
+```csharp
+using var horn = engine.LoadSound("horn.wav");   // decoded once into memory
+horn.Play(output);                               // every call is a new copy, over the others
+horn.Play(output, volume: 0.5f, pan: -0.8f);
+```
+
+C: `fa_sound_load_path(engine, "horn.wav", NULL, &horn)`, then `fa_sound_play(horn, device, NULL, 1.0f, 0.0f, NULL)`. More: [sounds](features/sounds.md).
+
 ## Read tags and cover art
 
 No engine or device needed:

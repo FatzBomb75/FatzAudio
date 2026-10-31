@@ -1324,6 +1324,7 @@ struct fa_bus {
 
 struct fa_stream {
     fa_engine* engine;
+    fa_atomic_ptr sound;         /* struct fa_sound* owning this voice (sound.c), NULL = none */
     uint32_t flags;
     uint32_t buffer_ms;
     fa_mutex api_lock;           /* serializes API calls that reconfigure the stream */
@@ -1855,6 +1856,18 @@ int64_t fa_ac3_packet_samples(const uint8_t* d, size_t n, uint32_t* out_rate);
 /* ---- Live sources (callback.c, capture.c) ---------------------------------------- */
 
 /* callback.c: fa_stream_open_callback's decoder (the app's fa_stream_proc). */
+/* Sounds (sound.c): a voice is a stream over the sound's shared PCM. `dec` is an open
+ * decoder the stream takes over (also on failure). */
+struct fa_sound;
+fa_result fa_stream_open_voice(fa_engine* engine, fa_decoder* dec, struct fa_sound* owner, fa_stream** out);
+/* Sets volume and pan at once (no glide) and starts the attached voice from its start. */
+fa_result fa_stream_voice_start(fa_stream* s, float volume, float pan);
+/* 1 while the voice is attached and playing, paused, scheduled or buffering. */
+int fa_stream_voice_busy(fa_stream* s);
+/* fa_stream_close of a voice: its sound lets go of it. */
+void fa_sound_forget(struct fa_sound* sound, fa_stream* voice);
+/* Tests: the shared PCM a voice reads (NULL if not a voice) and its reference count. */
+const float* fa_sound_voice_data(fa_stream* voice, int32_t* out_refs);
 fa_result fa_callback_decoder_open(fa_decoder* dec, const fa_audio_format* format, fa_stream_proc proc, void* user);
 /* capture.c: fa_stream_open_capture's decoder (an input device). Its ring holds 1 s
  * plus `extra_ms` (half the stream's decode-ahead buffer when it may be attached), so
