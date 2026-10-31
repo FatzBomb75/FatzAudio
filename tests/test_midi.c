@@ -1859,12 +1859,36 @@ static void try_font(const uint8_t* d, size_t n, const buf* song)
     fa_stream_close(s);
 }
 
+/* The loops below open thousands of damaged files, and every open measures the song's
+ * tail by rendering its last seconds. They run on an engine at 8 kHz: the same code
+ * paths for a sixth of the rendering at 48 kHz (sanitizer and emulator runs). */
+static fa_engine* low_rate_begin(void)
+{
+    fa_engine_config cfg;
+    fa_engine* keep = g_engine, *e = NULL;
+    fa_engine_config_init(&cfg);
+    cfg.flags = FA_ENGINE_NULL_OUTPUT;
+    cfg.worker_threads = 2;
+    cfg.mix_sample_rate = 8000;
+    if (fa_engine_create(&cfg, &e) != FA_OK) return keep;   /* the loops still run, slower */
+    fa_engine_set_soundfont(e, g_font);
+    g_engine = e;
+    return keep;
+}
+
+static void low_rate_end(fa_engine* keep)
+{
+    if (g_engine != keep) fa_engine_destroy(g_engine);
+    g_engine = keep;
+}
+
 static void test_malformed_midi(void)
 {
     buf song = make_song(), f = { 0 }, t = { 0 };
     uint8_t* copy = (uint8_t*)malloc(song.n + 64);
     size_t n;
     int i;
+    fa_engine* keep = low_rate_begin();
     /* Every truncation. */
     for (n = 0; n <= song.n; n++) try_midi(song.d, n);
     /* Random damage. */
@@ -1888,6 +1912,7 @@ static void test_malformed_midi(void)
     put(&f, "RIFF", 4); put32le(&f, 100); put(&f, "RMIDdata", 8); put32le(&f, 0xFFFFFFF0); put(&f, song.d, song.n);
     try_midi(f.d, f.n); f.n = 0;
     free(copy); free(song.d); free(f.d); free(t.d);
+    low_rate_end(keep);
 }
 
 static void test_malformed_soundfont(void)
@@ -1896,6 +1921,7 @@ static void test_malformed_soundfont(void)
     uint8_t* copy = (uint8_t*)malloc(sf.n);
     size_t n;
     int i;
+    fa_engine* keep = low_rate_begin();
     for (n = 0; n <= sf.n; n += (n < 200 || n > sf.n - 2000 ? 1 : 97)) try_font(sf.d, n, &song);
     for (i = 0; i < 1500; i++) {
         int k, flips = 1 + (int)(rnd() % 4);
@@ -1908,6 +1934,7 @@ static void test_malformed_soundfont(void)
         try_font(copy, sf.n, &song);
     }
     free(copy); free(sf.d); free(song.d);
+    low_rate_end(keep);
 }
 
 /* ---- DLS banks ------------------------------------------------------------------- */
@@ -2175,6 +2202,7 @@ static void test_malformed_dls(void)
     uint8_t* copy = (uint8_t*)malloc(dls.n);
     size_t n;
     int i;
+    fa_engine* keep = low_rate_begin();
     for (n = 0; n <= dls.n; n += (n < 300 ? 1 : 61)) try_font(dls.d, n, &song);
     for (i = 0; i < 1500; i++) {
         int k, flips = 1 + (int)(rnd() % 4);
@@ -2184,6 +2212,7 @@ static void test_malformed_dls(void)
         try_font(copy, dls.n, &song);
     }
     free(copy); free(dls.d); free(song.d);
+    low_rate_end(keep);
 }
 
 /* MIDI files opened without a soundfont play with the OS's bank, loaded once per
