@@ -344,6 +344,9 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- The MIDI reverb (also the microphone reverb) runs about 1.45 times faster, with the same output to the bit: its delay
+  lines are worked a block at a time instead of frame by frame. Opening a MIDI file (which measures the song's tail),
+  seeking and playing MIDI all get cheaper with it.
 - Soundfont samples are kept in memory as 16 bits instead of 32-bit float: half the memory (TimGM6mb: 11.4 to 5.9 MB),
   `fa_soundfont_info.sample_memory` halves with it. MIDI renders at the same speed and the same within float
   rounding (at most 2.4e-7, 130 dB below full scale).

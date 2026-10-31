@@ -46,6 +46,7 @@
 
 #define FX_COMBS 8
 #define FX_ALLPASSES 4
+typedef char fx_combs_in_fours[FX_COMBS % 4 == 0 ? 1 : -1];   /* reverb_process runs them four at a time */
 #define FX_SPREAD 23                    /* extra delay of the right channel, frames at 44.1 kHz */
 #define FX_INPUT_GAIN 0.015f
 #define FX_ROOM 0.84f                   /* comb feedback: about 1.3 s to -60 dB */
@@ -308,6 +309,53 @@ static void echo_process(fa_midi_fx* fx, const float* in, float* out, int frames
     }
 }
 
+/* Four comb lines over `n` frames, adding what each gives to y in line order. Four at once so their feedback chains overlap; the
+ * frames are cut where a line wraps, so the inner loop has no wrap tests. */
+static void combs4(fx_line* c, const float* x, float* y, int n, float damp, float room)
+{
+    const float keep = 1.0f - damp;
+    float l0 = c[0].lp, l1 = c[1].lp, l2 = c[2].lp, l3 = c[3].lp;
+    int k = 0, j;
+    while (k < n) {
+        float* b0 = c[0].buf + c[0].pos; float* b1 = c[1].buf + c[1].pos;
+        float* b2 = c[2].buf + c[2].pos; float* b3 = c[3].buf + c[3].pos;
+        int m = n - k;
+        for (j = 0; j < 4; j++) if (c[j].len - c[j].pos < m) m = c[j].len - c[j].pos;
+        for (j = 0; j < m; j++) {
+            float d0 = b0[j], d1 = b1[j], d2 = b2[j], d3 = b3[j], v = x[k + j];
+            l0 = d0 * keep + l0 * damp;
+            l1 = d1 * keep + l1 * damp;
+            l2 = d2 * keep + l2 * damp;
+            l3 = d3 * keep + l3 * damp;
+            b0[j] = v + l0 * room;
+            b1[j] = v + l1 * room;
+            b2[j] = v + l2 * room;
+            b3[j] = v + l3 * room;
+            y[k + j] = y[k + j] + d0 + d1 + d2 + d3;
+        }
+        for (j = 0; j < 4; j++) if ((c[j].pos += m) == c[j].len) c[j].pos = 0;
+        k += m;
+    }
+    c[0].lp = l0; c[1].lp = l1; c[2].lp = l2; c[3].lp = l3;
+}
+
+/* An allpass line over `n` frames, y in and out. */
+static void allpass(fx_line* a, float* y, int n)
+{
+    int k = 0, j;
+    while (k < n) {
+        float* b = a->buf + a->pos;
+        int m = a->len - a->pos < n - k ? a->len - a->pos : n - k;
+        for (j = 0; j < m; j++) {
+            float d = b[j];
+            b[j] = y[k + j] + d * FX_ALLPASS_FEEDBACK;
+            y[k + j] = d - y[k + j];
+        }
+        if ((a->pos += m) == a->len) a->pos = 0;
+        k += m;
+    }
+}
+
 static void reverb_process(fa_midi_fx* fx, const float* in, float* out, int frames)
 {
     float peak = 0.0f;
@@ -322,35 +370,32 @@ static void reverb_process(fa_midi_fx* fx, const float* in, float* out, int fram
         if (fx->reverb_quiet > fx->echo_len && fx->echo_soft > fx->echo_len) reverb_clear(fx);
         return;
     }
-    for (f = 0; f < frames; f++) {
-        float x = (in[f * 2] + in[f * 2 + 1]) * fx->in_gain;
-        x = lowpass(x, fx->pre_a, &fx->pre_z);
-        if (fx->pre_len) {
-            float d = fx->pre[fx->pre_pos];
-            fx->pre[fx->pre_pos] = x;
-            if (++fx->pre_pos >= fx->pre_len) fx->pre_pos = 0;
-            x = d;
+    /* A chunk at a time, each line on its own: every line still steps through the
+     * frames in order and the lines' sums keep their order, so the float result is
+     * the same as frame by frame, faster. */
+    for (f = 0; f < frames; f += FX_CHUNK) {
+        float x[FX_CHUNK], y[FX_CHUNK];
+        int n = frames - f < FX_CHUNK ? frames - f : FX_CHUNK, k;
+        for (k = 0; k < n; k++) {
+            float v = (in[(f + k) * 2] + in[(f + k) * 2 + 1]) * fx->in_gain;
+            v = lowpass(v, fx->pre_a, &fx->pre_z);
+            if (fx->pre_len) {
+                float d = fx->pre[fx->pre_pos];
+                fx->pre[fx->pre_pos] = v;
+                if (++fx->pre_pos >= fx->pre_len) fx->pre_pos = 0;
+                v = d;
+            }
+            x[k] = v;
         }
         for (ch = 0; ch < 2; ch++) {
-            float y = 0.0f;
-            for (i = 0; i < FX_COMBS; i++) {
-                fx_line* c = &fx->comb[ch][i];
-                float d = c->buf[c->pos];
-                c->lp = d * (1.0f - fx->damp) + c->lp * fx->damp;
-                c->buf[c->pos] = x + c->lp * fx->room;
-                if (++c->pos == c->len) c->pos = 0;
-                y += d;
+            for (k = 0; k < n; k++) y[k] = 0.0f;
+            for (i = 0; i < FX_COMBS; i += 4) combs4(&fx->comb[ch][i], x, y, n, fx->damp, fx->room);
+            for (i = 0; i < FX_ALLPASSES; i++) allpass(&fx->allpass[ch][i], y, n);
+            for (k = 0; k < n; k++) {
+                float v = y[k] * fx->wet;
+                out[(f + k) * 2 + ch] += v;
+                if (fabsf(v) > peak) peak = fabsf(v);
             }
-            for (i = 0; i < FX_ALLPASSES; i++) {
-                fx_line* a = &fx->allpass[ch][i];
-                float d = a->buf[a->pos];
-                a->buf[a->pos] = y + d * FX_ALLPASS_FEEDBACK;
-                if (++a->pos == a->len) a->pos = 0;
-                y = d - y;
-            }
-            y *= fx->wet;
-            out[f * 2 + ch] += y;
-            if (fabsf(y) > peak) peak = fabsf(y);
         }
     }
     /* Cleared only once the last input has gone all the way through the delay
