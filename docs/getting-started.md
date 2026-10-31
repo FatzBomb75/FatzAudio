@@ -57,4 +57,4 @@ song.Ended += (_, _) => Console.WriteLine("done");
 song.PlayOn(output);
 ```
 
-> The .NET API shown here is being built now; names may still change until the first release.
+Next: [Common tasks in five minutes](common-tasks.md) (volume, seek, end of song, URLs, tags, karaoke).

@@ -4,6 +4,7 @@
 |---|---|
 | [Concepts](concepts.md) | Engine, devices, streams, buses, the clock, threading, errors |
 | [Getting started](getting-started.md) | Play a file in C and in .NET |
+| [Common tasks](common-tasks.md) | Volume, seek, end of song, URLs, tags and karaoke in a few lines each |
 | [Building](building.md) | Build for Windows, macOS, Linux, Android and iOS, and run the tests |
 | [Feature guides](features/README.md) | One page per feature: what it does, how to use it, options, pitfalls; for example [MIDI and karaoke files](features/midi.md) |
 | [Migrating from BASS](migration/bass.md) | Every BASS function and add-on mapped to FatzAudio |
