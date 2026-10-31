@@ -645,6 +645,14 @@ double fa_tmap_pos(fa_tmap* m, int64_t at, double base_src, double base_slope, d
     return s0 + (double)(at - a0) * k;
 }
 
+void fa_tmap_segment_at(fa_tmap* m, int64_t at, double base_src, double base_slope, int64_t* out_start,
+                        double* out_src, double* out_slope)
+{
+    int64_t w = m ? fa_load64(&m->write) : 0, lo = 0, end;
+    int64_t i = w > 0 ? tmap_find(m, at, w, &lo) : -1;
+    tmap_segment(m, i, lo, w, base_src, base_slope, out_start, out_src, out_slope, &end);
+}
+
 int64_t fa_tmap_frames_to(fa_tmap* m, int64_t at, double target, double base_src, double base_slope)
 {
     int64_t w = m ? fa_load64(&m->write) : 0, lo = 0, i = -1, a0, end;

@@ -956,6 +956,51 @@ public sealed partial class DjDeck
     }
 
     /// <summary>
+    /// Slip mode (a CDJ's SLIP), off by default. While it is on, <see cref="AudioStream.Reverse"/>, a deck
+    /// <see cref="Loop"/> (or <see cref="LoopBeats"/>) and a <see cref="BeatJump"/> take playback elsewhere while the
+    /// deck goes on counting where it would be playing (<see cref="SlipPosition"/>), at the speed it plays. When they
+    /// end (the direction back and the loop off) the deck joins there, 15 ms ahead of the mix and without a gap, so it
+    /// lands on the beat it would have been on. A beat jump has no end of its own: <see cref="SlipReturn"/> comes back.
+    /// A seek, a cue, a stop or a load forget the slip, and so does turning slip mode off (playback carries on from
+    /// where it is). Pausing pauses the count.
+    /// </summary>
+    public bool Slip
+    {
+        get
+        {
+            using var _ = _mixer.Lease();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_get_slip(_deck, out int on));
+            return on != 0;
+        }
+        set
+        {
+            using var _ = _mixer.Lease();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_set_slip(_deck, value ? 1 : 0));
+        }
+    }
+
+    /// <summary>Where the deck would be playing now (a source frame) while a <see cref="Slip"/> runs; null otherwise.</summary>
+    public long? SlipPosition
+    {
+        get
+        {
+            using var _ = _mixer.Lease();
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_get_slip_position(_deck, out long frame));
+            return frame < 0 ? null : frame;   // FA_FRAMES_UNSET
+        }
+    }
+
+    /// <summary>
+    /// Ends a running <see cref="Slip"/> now: the reverse and the deck loop end too, and the deck joins to where it
+    /// would be playing. Does nothing when no slip runs.
+    /// </summary>
+    public void SlipReturn()
+    {
+        using var _ = _mixer.Lease();
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_slip_return(_deck));
+    }
+
+    /// <summary>
     /// The deck's channel meter: peak and RMS after trim, EQ and fader, before the crossfader, as heard now. The
     /// first call starts measuring, so it reads silence.
     /// </summary>

@@ -18,6 +18,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- DJ instant reverse and slip mode (extras step 9): `fa_stream_set_reverse` while playing or paused now turns at once,
+  playing the last 200 ms heard back the other way out of the stream's buffer while the decoder catches up (no gap,
+  no re-buffer). Slip mode: `fa_deck_set_slip` / `fa_deck_get_slip`, `fa_deck_slip_return`, `fa_deck_get_slip_position`
+  (.NET `DjDeck.Slip`, `SlipReturn`, `SlipPosition`): reverses, deck loops and beat jumps count on underneath and come
+  back to where the deck would be, to the frame. See [docs/features/dj-mixer.md](docs/features/dj-mixer.md#slip-mode).
+
 - Dolby downmix (extras step 20): `fa_open_options.dolby_downmix` and `fa_stream_set_dolby_downmix` /
   `fa_stream_get_dolby_downmix` (.NET `StreamOptions.DolbyDownmix`, `AudioStream.DolbyDownmix`) choose Lo/Ro, Lt/Rt
   (Pro Logic matrix surround) or the stream's own preference; `fa_engine_set_dialnorm` (.NET `AudioEngine.SetDialnorm`)

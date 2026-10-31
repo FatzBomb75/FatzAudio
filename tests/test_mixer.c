@@ -506,6 +506,130 @@ static void test_reverse_jump(void)
     free(idx);
 }
 
+/* ---- instant reverse ------------------------------------------------------------ */
+
+/* Turning while playing: the audio just heard plays back the other way at once, out of
+ * the ring, then the decoder carries on where it ends. Every frame steps by one; the
+ * turn itself plays the frame heard last again (the mirror). Both ways, with no flush. */
+static void test_turn_instant(void)
+{
+    static mem_io m;   /* outlives a failed CHECK's early return (the stream reads it) */
+    fa_stream* s = open_saw_io(&m, 400000);
+    int* idx = (int*)malloc(sizeof(int) * 200000);
+    int n = 0, k, hist = (int)(g_rate * 200 / 1000);
+    fa_frames pos = 0;
+    CHECK(s && idx);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_seek(s, 100000), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    render_saw(s, 20000, idx, &n);                      /* heard up to 119999 */
+    CHECK_EQ(fa_stream_set_reverse(s, 1), FA_OK);
+    CHECK_EQ(fa_load32(&s->flushing), 0);
+    CHECK(fa_ring_readable(&s->ring) >= hist);
+    fa_stream_get_position(s, &pos);
+    CHECK_EQ(pos, 120000);
+    render_saw(s, 60000, idx, &n);
+    CHECK_EQ(idx[20000], 119999 % 4096);
+    CHECK_EQ(first_jump_down(idx, n, 20000), -1);
+    fa_stream_get_position(s, &pos);
+    CHECK_EQ(pos, 60000);
+    CHECK_EQ(fa_stream_set_reverse(s, 0), FA_OK);
+    k = n;
+    render_saw(s, 60000, idx, &n);
+    CHECK_EQ(idx[k], 60000 % 4096);
+    CHECK_EQ(first_jump(idx, n, k), -1);
+    fa_stream_get_position(s, &pos);
+    CHECK_EQ(pos, 120000);
+    /* The history needs no decoder: with every seek failing it still plays, then the
+     * stream ends where it runs out. */
+    fa_store32(&m.fail_seeks, 1);
+    fa_stream_set_reverse(s, 1);
+    k = n;
+    render_saw(s, (uint32_t)hist + 2000, idx, &n);
+    CHECK_EQ(idx[k], 119999 % 4096);
+    CHECK_EQ(first_jump_down(idx, n, k), k + hist);
+    fa_stream_close(s);
+    free(idx);
+}
+
+/* Inside a deck loop the history stops where the loop last turned (what played before
+ * came from its out point); reversed, the loop then turns at its in point. */
+static void test_turn_in_loop(void)
+{
+    fa_stream* s = open_wav(400000, 0, 0.0);
+    int* idx = (int*)malloc(sizeof(int) * 80000);
+    int n = 0, k;
+    CHECK(s && idx);
+    CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    CHECK_EQ(fa_stream_set_loop_region(s, 10000, 30000), FA_OK);
+    render_saw(s, 33000, idx, &n);                      /* turned at 30000: heard 10000..12999 */
+    CHECK_EQ(first_jump(idx, n, 0), 30000);
+    CHECK_EQ(fa_stream_set_reverse(s, 1), FA_OK);
+    k = n;
+    render_saw(s, 30000, idx, &n);
+    CHECK_EQ(idx[k], 12999 % 4096);
+    CHECK_EQ(first_jump_down(idx, n, k), k + 3000);     /* down to 10000, then from 29999 */
+    CHECK_EQ(idx[k + 3000], 29999 % 4096);
+    CHECK_EQ(first_jump_down(idx, n, k + 3000), k + 23000);
+    fa_stream_close(s);
+    free(idx);
+}
+
+/* Largest step between neighbouring samples (left channel) of out[from, to). */
+static double max_step(const float* out, int from, int to)
+{
+    double m = 0.0;
+    int i;
+    for (i = from + 1; i < to; i++) {
+        double d = fabs((double)out[i * 2] - (double)out[(i - 1) * 2]);
+        if (d > m) m = d;
+    }
+    return m;
+}
+
+/* A sine turned while playing: no step at the turn, nor where the history meets the
+ * decoder, above the sine's own. Through the stretcher (TEMPO 1.25) that second join is
+ * a cut, like a loop's (the stretcher starts over there), but nothing goes silent; the
+ * position counts down by the frames played x TEMPO both ways. */
+static void test_turn_smooth(void)
+{
+    static const float tempos[] = { 1.0f, 1.25f };
+    float* out = (float*)malloc(sizeof(float) * 2 * 2 * 48128);
+    int t;
+    CHECK(out);
+    for (t = 0; t < 2; t++) {
+        fa_stream* s = open_wav(g_rate * 6, 1, 440.0);
+        fa_frames p0 = 0, p1 = 0;
+        int i, half = 48128;
+        CHECK(s);
+        CHECK_EQ(fa_stream_set_param(s, FA_PARAM_TEMPO, tempos[t]), FA_OK);
+        CHECK_EQ(fa_stream_attach(s, g_dev, NULL), FA_OK);
+        CHECK_EQ(fa_stream_seek(s, g_rate * 3), FA_OK);
+        CHECK_EQ(fa_stream_play(s), FA_OK);
+        for (i = 0; i < half; i += 512) render(s, out + (size_t)i * 2, 512);
+        fa_stream_get_position(s, &p0);
+        CHECK_EQ(fa_stream_set_reverse(s, 1), FA_OK);
+        for (i = half; i < 2 * half; i += 512) render(s, out + (size_t)i * 2, 512);
+        fa_stream_get_position(s, &p1);
+        if (t == 0) {
+            double own = max_step(out, 2000, half);      /* the sine's own, steady */
+            CHECK(own > 0.01);
+            CHECK(max_step(out, half - 2000, 2 * half) < own * 1.01);
+        }
+        for (i = half - 2000; i + 128 <= 2 * half; i += 64) {   /* no silent stretch: 128-frame peaks */
+            double pk = 0.0;
+            int j;
+            for (j = i; j < i + 128; j++) if (fabs(out[j * 2]) > pk) pk = fabs(out[j * 2]);
+            if (pk < 0.2) break;
+        }
+        CHECK(i + 128 > 2 * half);
+        CHECK_NEAR((double)p1, (double)p0 - half * tempos[t], 2.0);
+        fa_stream_close(s);
+    }
+    free(out);
+}
+
 /* A loop change or a jump whose join fails (the decoder cannot seek) reports the
  * error and leaves the loop as it was. */
 static void test_failed_join_keeps_loop(void)
@@ -1138,6 +1262,9 @@ int main(void)
     RUN(test_reverse_loop_joins);
     RUN(test_reverse_loop_late_and_off);
     RUN(test_reverse_jump);
+    RUN(test_turn_instant);
+    RUN(test_turn_in_loop);
+    RUN(test_turn_smooth);
     RUN(test_loop_with_tempo);
     RUN(test_failed_join_keeps_loop);
     RUN(test_loop_region_readers);

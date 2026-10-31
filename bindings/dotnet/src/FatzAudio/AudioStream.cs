@@ -1231,13 +1231,15 @@ public unsafe class AudioStream : IDisposable
 
     /// <summary>
     /// Plays backwards (bass_fx's <c>BASS_FX_ReverseCreate</c> and <c>BASS_ATTRIB_REVERSE_DIR</c>). Can be changed at any
-    /// time, also while playing: the stream restarts at the position heard, as a seek does. Reversed, the position and
+    /// time, also while playing: playing or paused, it turns at once (the last 200 ms heard play back the other way while
+    /// the decoder catches up, so there is no gap); stopped or ended, it starts over at the position. Reversed, the position and
     /// the clock count down and the stream ends at the cue-in marker (or the start); playing from stopped or ended
     /// starts at the cue-out marker (or the end), and a loop wraps from its start to its end. Tempo, pitch, rate and
     /// fades work as forward. Events tied to a frame (markers, <see cref="Looped"/>, positions, MIDI texts, tracker rows)
     /// are raised as the position counts down past it, last first. On a DJ deck, sync, deck loops and beat jumps work
     /// mirrored: the deck is pulled onto the leader's beat with its beats counting down, and loops turn at their in
-    /// point. The blocks the source is decoded in are cross-faded where they meet.
+    /// point; with <see cref="DjDeck.Slip"/> on, turning back returns to where the deck would be. The blocks the source
+    /// is decoded in are cross-faded where they meet.
     /// </summary>
     /// <exception cref="FatzAudioException">Turning it on for a stream that cannot seek (push and packet streams):
     /// <see cref="ErrorCode.NotSeekable"/>; for a web stream: <see cref="ErrorCode.NotImplemented"/>.</exception>
