@@ -98,6 +98,17 @@ TSFDEF tsf* tsf_load(struct tsf_stream* stream);
 // (This function isn't thread-safe without locking.)
 TSFDEF tsf* tsf_copy(tsf* f);
 
+// FatzAudio: a soundfont made of presets of other loaded soundfonts (a stack). Each entry is
+// a preset of `font` (by index), the bank and preset number it plays as and a gain (dB) added
+// to its notes; entries must not
+// share a bank and number. The stack shares the fonts' regions, samples and modulators: they
+// must stay loaded until the stack and every copy of it are closed. Returns NULL when out of
+// memory or n is not positive.
+struct tsf_stack_preset { const tsf* font; int presetIndex; int bank, preset; float gainDB; };
+TSFDEF tsf* tsf_load_stack(const struct tsf_stack_preset* presets, int n);
+// FatzAudio: the bank and preset number of a preset index (0 if out of range)
+TSFDEF int tsf_get_preset_bank_number(const tsf* f, int preset_index, int* bank, int* preset_number);
+
 // Free the memory related to this tsf instance
 TSFDEF void tsf_close(tsf* f);
 
@@ -381,7 +392,7 @@ typedef char tsf_char20[20];
 struct tsf
 {
 	struct tsf_preset* presets;
-	float* fontSamples;
+	tsf_s16* fontSamples; // FatzAudio: 16-bit, as in the file (the renderer converts per voice)
 	struct tsf_voice* voices;
 	struct tsf_channels* channels;
 
@@ -401,6 +412,7 @@ struct tsf
 	tsf_u32 modGC;      // FatzAudio: general controllers some modulator reads (bit n = source n)
 	struct tsf_drumkey* drumKeys; // FatzAudio: TSF_DRUM_KITS * 128 drum key edits, of this synth only (NULL: none yet)
 	float noteGainDB;   // FatzAudio: tsf_set_note_gain
+	int stacked;        // FatzAudio: tsf_load_stack: presets of other fonts (their regions, samples and modulators not ours)
 };
 
 #ifndef TSF_NO_STDIO
@@ -500,6 +512,8 @@ struct tsf_region
 	int freqVibLFO, vibLfoToPitch;
 	float chorusSend, reverbSend; // FatzAudio: effect sends, 0.1% units (generators 15 and 16)
 	int modStart, modNum; // FatzAudio: the region's modulators in tsf::modulators
+	const tsf_s16* samples; // FatzAudio: the font's sample data (a stack plays several fonts' regions)
+	const struct tsf_modulator* mods; // FatzAudio: modulators + modStart, set once the font is loaded
 };
 
 // FatzAudio: a SoundFont modulator, ready to evaluate: sources as in the file (SF2 2.04
@@ -512,6 +526,7 @@ struct tsf_preset
 	tsf_u16 preset, bank;
 	struct tsf_region* regions;
 	int regionNum;
+	float gainDB; // FatzAudio: added to the preset's notes (a stack's per-font volume; 0 when loaded)
 };
 
 struct tsf_voice
@@ -996,7 +1011,7 @@ static int tsf_load_presets(tsf* res, struct tsf_hydra *hydra, unsigned int font
 	if (!res->presets || !sortedPhdrs || !res->modulators) { TSF_FREE(res->presets); res->presets = TSF_NULL; TSF_FREE(sortedPhdrs); TSF_FREE(res->modulators); res->modulators = TSF_NULL; return 0; }
 	tsf_modlist_defaults(&il);
 	for (res->modulatorNum = 0; res->modulatorNum != TSF_DEFAULT_MODS; res->modulatorNum++) res->modulators[res->modulatorNum] = il.mods[res->modulatorNum];
-	{ int i; for (i = 0; i != res->presetNum; i++) { res->presets[i].regions = TSF_NULL; res->presets[i].regionNum = 0; sortedPhdrs[i] = &hydra->phdrs[i]; } }
+	{ int i; for (i = 0; i != res->presetNum; i++) { res->presets[i].regions = TSF_NULL; res->presets[i].regionNum = 0; res->presets[i].gainDB = 0.0f; sortedPhdrs[i] = &hydra->phdrs[i]; } }
 	qsort(sortedPhdrs, (size_t)res->presetNum, sizeof(struct tsf_hydra_phdr*), tsf_phdr_compare);
 	for (phdrIndex = 0; phdrIndex != res->presetNum; phdrIndex++)
 	{
@@ -1291,9 +1306,10 @@ static int tsf_decode_sf3_samples(const void* rawBuffer, float** pFloatBuffer, u
 
 #define TSF_SAMPLE_PADDING 4
 
-static int tsf_load_samples(void** pRawBuffer, float** pFloatBuffer, unsigned int* pSmplCount, struct tsf_riffchunk *chunkSmpl, struct tsf_stream* stream)
+static int tsf_load_samples(void** pRawBuffer, tsf_s16** pSampleBuffer, unsigned int* pSmplCount, struct tsf_riffchunk *chunkSmpl, struct tsf_stream* stream)
 {
 	#ifdef STB_VORBIS_INCLUDE_STB_VORBIS_H
+	#error FatzAudio: samples are kept as 16 bits; SF3 is converted to SF2 before loading (src/sf3.c)
 	// With OGG Vorbis support we cannot pre-allocate the memory for tsf_decode_sf3_samples
 	tsf_u32 resNum, resMax; float* oldres;
 	*pSmplCount = chunkSmpl->size;
@@ -1309,20 +1325,35 @@ static int tsf_load_samples(void** pRawBuffer, float** pFloatBuffer, unsigned in
 	*pSmplCount = resNum;
 	return (*pFloatBuffer ? 1 : 0);
 	#else
-	// Inline convert the samples from short to float
-	float *res, *out; const short *in;
+	// FatzAudio: the samples stay 16-bit (half the memory of floats; tsf_voice_render converts
+	// each one it reads), followed by TSF_SAMPLE_PADDING silent samples (the interpolation
+	// reads one sample past a region's end); a short read is an error. The bytes are
+	// little-endian in the file: swapped on a big-endian host.
+	tsf_s16* res;
 	(void)pRawBuffer;
 	*pSmplCount = chunkSmpl->size / (unsigned int)sizeof(short);
-	// FatzAudio: TSF_SAMPLE_PADDING silent samples after the data (the interpolation
-	// reads one sample past a region's end), and a short read is an error
-	*pFloatBuffer = (float*)TSF_MALLOC(((size_t)*pSmplCount + TSF_SAMPLE_PADDING) * sizeof(float));
-	if (!*pFloatBuffer || stream->read(stream->data, *pFloatBuffer, chunkSmpl->size) != (int)chunkSmpl->size) return 0;
-	for (res = *pFloatBuffer, out = res + *pSmplCount, in = (short*)res + *pSmplCount; out != res;)
-		*(--out) = (float)(*(--in) / 32767.0);
-	TSF_MEMSET(*pFloatBuffer + *pSmplCount, 0, TSF_SAMPLE_PADDING * sizeof(float));
+	res = (tsf_s16*)TSF_MALLOC(((size_t)*pSmplCount + TSF_SAMPLE_PADDING) * sizeof(tsf_s16));
+	*pSampleBuffer = res;
+	if (!res || stream->read(stream->data, res, *pSmplCount * (unsigned int)sizeof(short)) != (int)(*pSmplCount * sizeof(short))) return 0;
+	if (chunkSmpl->size & 1) stream->skip(stream->data, 1);
+	{
+		const unsigned short one = 1;
+		if (!*(const unsigned char*)&one)
+		{
+			unsigned int i;
+			for (i = 0; i != *pSmplCount; i++) { unsigned short u = (unsigned short)res[i]; res[i] = (tsf_s16)(unsigned short)((u >> 8) | (u << 8)); }
+		}
+	}
+	TSF_MEMSET(res + *pSmplCount, 0, TSF_SAMPLE_PADDING * sizeof(tsf_s16));
 	return 1;
 	#endif
 }
+
+// FatzAudio: samples are 16-bit; the voice interpolates and filters them at that scale (the
+// filter is linear) and its gain takes the 1/32767 TinySoundFont used to convert them at load.
+// The output differs from float samples only by float rounding, at no cost per sample.
+#define TSF_SAMPLE(s) ((float)(s))
+#define TSF_SAMPLE_SCALE (1.0f / 32767.0f)
 
 static int tsf_voice_envelope_release_samples(struct tsf_voice_envelope* e, float outSampleRate)
 {
@@ -1659,7 +1690,7 @@ static void tsf_voice_modulate(tsf* f, struct tsf_voice* v, TSF_BOOL start)
 {
 	struct tsf_region* r = v->region;
 	struct tsf_channel* c = (f->channels && v->playingChannel >= 0 && v->playingChannel < f->channels->channelNum ? &f->channels->channels[v->playingChannel] : TSF_NULL);
-	const struct tsf_modulator *mod = f->modulators + r->modStart, *modEnd = mod + r->modNum;
+	const struct tsf_modulator *mod = r->mods, *modEnd = mod + r->modNum; // FatzAudio: the region's font's (a stack's members)
 	float m[TSF_MOD_SLOTS], sAttack = 0.0f, sDecay = 0.0f, sRelease = 0.0f, sDelay = 0.0f, depth = 0.0f, val, val2, env[15];
 	TSF_BOOL envChanged = TSF_FALSE;
 	int i;
@@ -1774,7 +1805,7 @@ static void tsf_voice_modulate(tsf* f, struct tsf_voice* v, TSF_BOOL start)
 static void tsf_voice_render(tsf* f, struct tsf_voice* v, float* outputBuffer, int numSamples)
 {
 	struct tsf_region* region = v->region;
-	float* input = f->fontSamples;
+	const tsf_s16* input = region->samples; // FatzAudio: 16-bit samples, see TSF_SAMPLE
 	float* outL = outputBuffer;
 	float* outR = (f->outputmode == TSF_STEREO_UNWEAVED ? outL + numSamples : TSF_NULL);
 
@@ -1838,7 +1869,7 @@ static void tsf_voice_render(tsf* f, struct tsf_voice* v, float* outputBuffer, i
 		if (dynamicGain)
 			noteGain = tsf_decibelsToGain(v->noteGainDB + (v->modlfo.level * tmpModLfoToVolume));
 
-		gainMono = noteGain * v->ampenv.level;
+		gainMono = noteGain * v->ampenv.level * TSF_SAMPLE_SCALE; // FatzAudio: 16-bit samples
 
 		// Update EG.
 		tsf_voice_envelope_process(&v->ampenv, blockSamples, tmpSampleRate);
@@ -1857,7 +1888,7 @@ static void tsf_voice_render(tsf* f, struct tsf_voice* v, float* outputBuffer, i
 					unsigned int pos = (unsigned int)tmpSourceSamplePosition, nextPos = (pos >= tmpLoopEnd && isLooping ? tmpLoopStart : pos + 1);
 
 					// Simple linear interpolation.
-					float alpha = (float)(tmpSourceSamplePosition - pos), val = (input[pos] * (1.0f - alpha) + input[nextPos] * alpha);
+					float alpha = (float)(tmpSourceSamplePosition - pos), val = (TSF_SAMPLE(input[pos]) * (1.0f - alpha) + TSF_SAMPLE(input[nextPos]) * alpha);
 
 					// Low-pass filter.
 					if (tmpLowpass.active) val = tsf_voice_lowpass_process(&tmpLowpass, val);
@@ -1878,7 +1909,7 @@ static void tsf_voice_render(tsf* f, struct tsf_voice* v, float* outputBuffer, i
 					unsigned int pos = (unsigned int)tmpSourceSamplePosition, nextPos = (pos >= tmpLoopEnd && isLooping ? tmpLoopStart : pos + 1);
 
 					// Simple linear interpolation.
-					float alpha = (float)(tmpSourceSamplePosition - pos), val = (input[pos] * (1.0f - alpha) + input[nextPos] * alpha);
+					float alpha = (float)(tmpSourceSamplePosition - pos), val = (TSF_SAMPLE(input[pos]) * (1.0f - alpha) + TSF_SAMPLE(input[nextPos]) * alpha);
 
 					// Low-pass filter.
 					if (tmpLowpass.active) val = tsf_voice_lowpass_process(&tmpLowpass, val);
@@ -1898,7 +1929,7 @@ static void tsf_voice_render(tsf* f, struct tsf_voice* v, float* outputBuffer, i
 					unsigned int pos = (unsigned int)tmpSourceSamplePosition, nextPos = (pos >= tmpLoopEnd && isLooping ? tmpLoopStart : pos + 1);
 
 					// Simple linear interpolation.
-					float alpha = (float)(tmpSourceSamplePosition - pos), val = (input[pos] * (1.0f - alpha) + input[nextPos] * alpha);
+					float alpha = (float)(tmpSourceSamplePosition - pos), val = (TSF_SAMPLE(input[pos]) * (1.0f - alpha) + TSF_SAMPLE(input[nextPos]) * alpha);
 
 					// Low-pass filter.
 					if (tmpLowpass.active) val = tsf_voice_lowpass_process(&tmpLowpass, val);
@@ -1936,7 +1967,7 @@ static tsf* tsf_load_sized(struct tsf_stream* stream, tsf_u32 total)
 	struct tsf_riffchunk chunkList;
 	struct tsf_hydra hydra;
 	void* rawBuffer = TSF_NULL;
-	float* floatBuffer = TSF_NULL;
+	tsf_s16* floatBuffer = TSF_NULL; // FatzAudio: 16-bit samples
 	tsf_u32 smplCount = 0;
 
 	if (!tsf_riffchunk_read(TSF_NULL, &chunkHead, stream) || !TSF_FourCCEquals(chunkHead.id, "sfbk"))
@@ -2014,6 +2045,18 @@ static tsf* tsf_load_sized(struct tsf_stream* stream, tsf_u32 total)
 		res->outSampleRate = 44100.0f;
 		res->fontSamples = floatBuffer;
 		floatBuffer = TSF_NULL; // don't free below
+		{
+			// FatzAudio: each region points at its font's samples and modulators (a stack plays
+			// regions of several fonts)
+			int p, r;
+			for (p = 0; p != res->presetNum; p++)
+				for (r = 0; r != res->presets[p].regionNum; r++)
+				{
+					struct tsf_region* region = &res->presets[p].regions[r];
+					region->samples = res->fontSamples;
+					region->mods = res->modulators + region->modStart;
+				}
+		}
 	}
 	if (0)
 	{
@@ -2051,13 +2094,57 @@ TSFDEF tsf* tsf_copy(tsf* f)
 	return res;
 }
 
+static int tsf_stack_compare(const void* a, const void* b)
+{
+	const struct tsf_preset *x = (const struct tsf_preset*)a, *y = (const struct tsf_preset*)b;
+	if (x->bank != y->bank) return (x->bank < y->bank ? -1 : 1);
+	return (x->preset < y->preset ? -1 : (x->preset > y->preset ? 1 : 0));
+}
+
+TSFDEF tsf* tsf_load_stack(const struct tsf_stack_preset* presets, int n)
+{
+	tsf* res;
+	int i, k;
+	if (!presets || n <= 0) return TSF_NULL;
+	res = (tsf*)TSF_MALLOC(sizeof(tsf));
+	if (!res) return TSF_NULL;
+	TSF_MEMSET(res, 0, sizeof(tsf));
+	res->presets = (struct tsf_preset*)TSF_MALLOC((size_t)n * sizeof(struct tsf_preset));
+	if (!res->presets) { TSF_FREE(res); return TSF_NULL; }
+	res->presetNum = n;
+	res->stacked = 1;
+	res->outSampleRate = 44100.0f;
+	for (i = 0; i != n; i++)
+	{
+		const struct tsf_preset* src = &presets[i].font->presets[presets[i].presetIndex];
+		struct tsf_preset* dst = &res->presets[i];
+		*dst = *src; // name, regions (shared)
+		dst->bank = (tsf_u16)presets[i].bank;
+		dst->preset = (tsf_u16)presets[i].preset;
+		dst->gainDB = src->gainDB + presets[i].gainDB;
+		// A modulator of any member may read a controller: the stack listens to all of them.
+		for (k = 0; k != 4; k++) res->modCC[k] |= presets[i].font->modCC[k];
+		res->modGC |= presets[i].font->modGC;
+	}
+	qsort(res->presets, (size_t)n, sizeof(struct tsf_preset), tsf_stack_compare);
+	return res;
+}
+
+TSFDEF int tsf_get_preset_bank_number(const tsf* f, int preset_index, int* bank, int* preset_number)
+{
+	if (!f || preset_index < 0 || preset_index >= f->presetNum) return 0;
+	if (bank) *bank = f->presets[preset_index].bank;
+	if (preset_number) *preset_number = f->presets[preset_index].preset;
+	return 1;
+}
+
 TSFDEF void tsf_close(tsf* f)
 {
 	if (!f) return;
 	if (!f->refCount || !--(*f->refCount))
 	{
 		struct tsf_preset *preset = f->presets, *presetEnd = preset + f->presetNum;
-		for (; preset != presetEnd; preset++) TSF_FREE(preset->regions);
+		if (!f->stacked) for (; preset != presetEnd; preset++) TSF_FREE(preset->regions); // FatzAudio: a stack's are its members'
 		TSF_FREE(f->presets);
 		TSF_FREE(f->fontSamples);
 		TSF_FREE(f->modulators); // FatzAudio
@@ -2229,7 +2316,7 @@ TSFDEF int tsf_note_on(tsf* f, int preset_index, int key, float vel)
 		voice->heldSustain = 0;
 		// FatzAudio: the SF2 default velocity-to-attenuation modulator (concave, 96 dB), which is
 		// 40*log10(vel) dB, as FluidSynth and DLS synths play it (was 20*log10, half the range)
-		voice->noteGainDB = f->globalGainDB - region->attenuation - 2.0f * tsf_gainToDecibels(1.0f / vel);
+		voice->noteGainDB = f->globalGainDB - region->attenuation - 2.0f * tsf_gainToDecibels(1.0f / vel) + f->presets[preset_index].gainDB; // FatzAudio: + the preset's gain
 		// FatzAudio: the region's values until tsf_voice_modulate below
 		voice->playingChannel = -1;
 		voice->vibLfoToPitch = (float)region->vibLfoToPitch; voice->modLfoToPitch = (float)region->modLfoToPitch;

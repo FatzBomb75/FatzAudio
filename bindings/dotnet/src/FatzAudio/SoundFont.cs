@@ -15,7 +15,8 @@ namespace FatzAudio;
 /// <remarks>
 /// The native soundfont is reference-counted: the engine and every stream using it keep their own reference, so
 /// disposing this object at any time is safe and the instruments are freed when the last user is done. Samples
-/// are held in memory as 32-bit float (about twice the size of the file). All members are thread-safe.
+/// are held in memory as 16 bits, as in the file. Several soundfonts can play as one: <see cref="Stack"/>. All
+/// members are thread-safe.
 /// </remarks>
 /// <example>
 /// <code>
@@ -83,6 +84,79 @@ public sealed class SoundFont : IDisposable
         return Wrap(rc, native);
     }
 
+    /// <summary>
+    /// Several soundfonts played as one (BASSMIDI's font stacks): a new soundfont made of presets of others, used like any
+    /// soundfont. When two entries give the same bank and program, the earlier entry wins. The stack shares the samples of
+    /// its soundfonts and keeps them alive, so they may be disposed once the stack is made.
+    /// </summary>
+    /// <param name="entries">What to take from which soundfont, the first winning.</param>
+    /// <returns>The stack, a soundfont that must be disposed.</returns>
+    /// <exception cref="FatzAudioException">A number is out of range (<see cref="ErrorCode.InvalidArgument"/>), or the
+    /// entries select no preset at all (<see cref="ErrorCode.NotFound"/>).</exception>
+    /// <exception cref="ObjectDisposedException">A soundfont of the entries was disposed.</exception>
+    /// <example>
+    /// <code>
+    /// using var piano = SoundFont.FromFile("Grand.sf2");
+    /// using var gm = SoundFont.FromFile("GeneralUser.sf2");
+    /// using var both = SoundFont.Stack(
+    ///     new SoundFontStackEntry(piano) { Bank = 0, Program = 0 },   // its piano only
+    ///     new SoundFontStackEntry(gm));                                // everything else
+    /// engine.DefaultSoundFont = both;
+    /// </code>
+    /// </example>
+    public static unsafe SoundFont Stack(params SoundFontStackEntry[] entries)
+    {
+        ArgumentNullException.ThrowIfNull(entries);
+        if (entries.Length == 0) throw new ArgumentException("At least one entry is needed.", nameof(entries));
+        NativeLoader.EnsureInitialized();
+        var refs = new List<SoundFontHandle>(entries.Length);
+        var native = new FaSoundFontStackEntry[entries.Length];
+        try
+        {
+            for (int i = 0; i < entries.Length; i++)
+            {
+                var e = entries[i] ?? throw new ArgumentNullException(nameof(entries));
+                ArgumentNullException.ThrowIfNull(e.Font, nameof(entries));
+                var h = Native.HandleRef.AddRef(e.Font.Handle);
+                refs.Add(h);
+                native[i] = new FaSoundFontStackEntry
+                {
+                    Font = h.DangerousGetHandle(),
+                    Bank = e.Bank ?? -1,
+                    Program = e.Program ?? -1,
+                    ToBank = e.ToBank ?? -1,
+                    ToProgram = e.ToProgram ?? -1,
+                    Volume = e.Volume,
+                };
+            }
+            int rc;
+            nint font;
+            fixed (FaSoundFontStackEntry* p = native) rc = NativeMethods.fa_soundfont_open_stack(p, (uint)native.Length, out font);
+            return Wrap(rc, font);
+        }
+        finally
+        {
+            foreach (var h in refs) h.DangerousRelease();
+        }
+    }
+
+    /// <summary>The instruments and drum kits, in bank and program order (read once, on first use).</summary>
+    public IReadOnlyList<SoundFontPreset> Presets => _presets ??= ReadPresets();
+
+    private IReadOnlyList<SoundFontPreset>? _presets;
+
+    private unsafe IReadOnlyList<SoundFontPreset> ReadPresets()
+    {
+        var list = new SoundFontPreset[Info.PresetCount];
+        for (int i = 0; i < list.Length; i++)
+        {
+            FaSoundFontPreset p;
+            FatzAudioException.ThrowIfFailed(NativeMethods.fa_soundfont_get_preset(Handle, (uint)i, &p));
+            list[i] = new SoundFontPreset(p.Bank, p.Program, NativeText.Read(p.Name));
+        }
+        return list;
+    }
+
     private static SoundFont Wrap(int rc, nint native)
     {
         FatzAudioException.ThrowIfFailed(rc);
@@ -103,6 +177,35 @@ public sealed class SoundFont : IDisposable
 
     /// <summary>Releases this reference. Engines and streams using the soundfont keep theirs.</summary>
     public void Dispose() => _handle.Dispose();
+}
+
+/// <summary>One instrument or drum kit of a <see cref="SoundFont"/>.</summary>
+/// <param name="Bank">Bank select MSB 0..127; 128 for drum kits.</param>
+/// <param name="Program">0..127.</param>
+/// <param name="Name">The preset's name in the file.</param>
+public sealed record SoundFontPreset(int Bank, int Program, string Name);
+
+/// <summary>
+/// One entry of <see cref="SoundFont.Stack"/>: presets of a soundfont, all of them or one bank or program, optionally played as
+/// another bank or program and louder or quieter.
+/// </summary>
+/// <param name="Font">The soundfont (a stack too).</param>
+public sealed record SoundFontStackEntry(SoundFont Font)
+{
+    /// <summary>The font's bank to take (0..16383, drum kits 128); null for every bank.</summary>
+    public int? Bank { get; init; }
+
+    /// <summary>The font's program to take (0..127); null for every program.</summary>
+    public int? Program { get; init; }
+
+    /// <summary>The bank they play as; null for their own.</summary>
+    public int? ToBank { get; init; }
+
+    /// <summary>The program they play as; null for their own.</summary>
+    public int? ToProgram { get; init; }
+
+    /// <summary>Their notes' level, 1 as is (0..16; BASSMIDI's font volume).</summary>
+    public float Volume { get; init; } = 1f;
 }
 
 /// <summary>Information about a <see cref="SoundFont"/>.</summary>

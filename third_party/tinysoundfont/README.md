@@ -63,7 +63,13 @@ against untrusted files and add what the decoder needs:
 - `tsf_hydra_valid`: minimum record counts, and every bag/generator/instrument/sample
   index checked monotonic and in range; out-of-range sample IDs and instrument indices
   skipped; sample offsets and loop points clamped inside the sample.
-- Sample data followed by zeroed padding floats; a short read is an error. Hydra arrays
+- Samples kept as 16 bits (half the memory of floats): `tsf_voice_render` interpolates and filters them at that
+  scale and its gain takes the 1/32767 the load used to apply, so the output equals the float version within float
+  rounding. Each region points at its font's samples and modulators (`samples`, `mods`), so `tsf_load_stack` can make
+  a soundfont of other fonts' presets (sharing their regions; `tsf_get_preset_bank_number` lists them), each preset
+  with a gain of its own (`gainDB`). The Ogg Vorbis (`smpo`) path is disabled (`#error`): SF3 is converted to SF2
+  before loading.
+- Sample data followed by zeroed padding samples; a short read is an error. Hydra arrays
   zeroed after allocation. `TSF_MAX_REGIONS` caps the region count.
 - No negative left shift (`GEN_UINT_ADD15`), keynum-scaled hold/decay clamped,
   `offsetof` in `_TSFREGIONOFFSET`, presets sorted with `qsort` (was O(n^2)).

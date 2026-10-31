@@ -181,7 +181,7 @@ public sealed partial class AudioEngine
 
     /// <summary>
     /// Opens a MIDI stream that plays a list of events as a MIDI file would (BASS_MIDI_StreamCreateEvents): seekable,
-    /// its length the last event plus one second. Frames count at <see cref="MidiStreamOptions.SampleRate"/> (set it to
+    /// its length measured as a file's (until the last events' sound has died away). Frames count at <see cref="MidiStreamOptions.SampleRate"/> (set it to
     /// know them; <see cref="MidiEvent.Now"/> is frame 0). The events are copied and sorted by frame (equal frames keep
     /// their order); <see cref="MidiEvent.Track"/> picks the track for <see cref="AudioStream.SetMidiTrackVolume"/>.
     /// </summary>

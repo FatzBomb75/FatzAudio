@@ -58,7 +58,10 @@
 #define FA_MIDI_MAX_FILE ((size_t)16 << 20)   /* the largest real MIDI files are a few MB */
 #define FA_MIDI_MAX_SOUNDFONT ((size_t)1 << 30)
 #define FA_MIDI_MAX_SECONDS (6.0 * 3600.0)  /* events later than this are dropped */
-#define FA_MIDI_TAIL_S 1.0                /* after the last event: the last notes ring out */
+#define FA_MIDI_TAIL_S 1.0                /* after the last event, when not measured (tags without a soundfont) */
+#define FA_MIDI_TAIL_MAX_S 10.0           /* the longest tail measured after the last event (notes never ended) */
+#define FA_MIDI_TAIL_QUIET_S 1.0          /* this long under FA_MIDI_TAIL_FLOOR ends the measured tail */
+#define FA_MIDI_TAIL_FLOOR 1.0e-4f        /* -80 dBFS: the song has died away */
 #define FA_MIDI_VOICES 256                /* polyphony per stream (oldest released voices go first) */
 #define FA_MIDI_GAIN_DB 0.0f
 #define FA_MIDI_DRUMS 9                   /* channel 10 */
@@ -77,10 +80,12 @@ struct fa_soundfont {
     uint64_t sample_memory;
     uint32_t presets;
     char name[256];
+    fa_soundfont** members;     /* a stack: the soundfonts its presets play from (references) */
+    uint32_t nmembers;
 };
 
 /* The bank's name: RIFF sfbk > LIST INFO > INAM. Also the size of the sample data
- * (smpl in LIST sdta), each kept as float. */
+ * (smpl in LIST sdta), kept as 16 bits. */
 static void sf2_scan(const uint8_t* d, size_t n, char* name, size_t cap, uint64_t* sample_memory)
 {
     size_t pos = 12;
@@ -103,7 +108,7 @@ static void sf2_scan(const uint8_t* d, size_t n, char* name, size_t cap, uint64_
                     while (k < len && k + 1 < cap && d[sub + 8 + k]) { name[k] = (char)d[sub + 8 + k]; k++; }
                     name[k] = '\0';
                 }
-                if (sdta && memcmp(d + sub, "smpl", 4) == 0) *sample_memory = (uint64_t)(len / 2) * sizeof(float);
+                if (sdta && memcmp(d + sub, "smpl", 4) == 0) *sample_memory = (uint64_t)(len / 2) * sizeof(int16_t);
                 sub += 8 + (size_t)len + (len & 1);
             }
         }
@@ -204,8 +209,11 @@ fa_soundfont* fa_soundfont_retain(fa_soundfont* f)
 void fa_soundfont_release(fa_soundfont* f)
 {
     if (!f || fa_fetch_add32(&f->refs, -1) != 1) return;
-    /* The last reference: every stream's copy has been closed already. */
+    /* The last reference: every stream's copy has been closed already. A stack's
+     * members go after it (it plays their regions and samples). */
     tsf_close(f->bank);
+    while (f->nmembers) fa_soundfont_release(f->members[--f->nmembers]);
+    free(f->members);
     fa_mutex_destroy(&f->lock);
     free(f);
 }
@@ -228,6 +236,124 @@ FA_API fa_result FA_CALL fa_soundfont_get_info(fa_soundfont* font, fa_soundfont_
     out_info->preset_count = font->presets;
     out_info->sample_memory = font->sample_memory;
     return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_soundfont_get_preset(fa_soundfont* font, uint32_t index, fa_soundfont_preset* out_preset)
+{
+    int bank = 0, program = 0;
+    char raw[24];
+    if (out_preset) memset(out_preset, 0, sizeof(*out_preset));
+    if (!font || !out_preset || index >= font->presets || !tsf_get_preset_bank_number(font->bank, (int)index, &bank, &program))
+        return FA_ERROR_INVALID_ARG;
+    out_preset->bank = bank;
+    out_preset->program = program;
+    snprintf(raw, sizeof(raw), "%s", tsf_get_presetname(font->bank, (int)index));
+    latin1_to_utf8(raw, out_preset->name, sizeof(out_preset->name));
+    return FA_OK;
+}
+
+/* ---- Stacks ---------------------------------------------------------------------- */
+
+FA_API void FA_CALL fa_soundfont_stack_entry_init(fa_soundfont_stack_entry* entry, fa_soundfont* font)
+{
+    if (!entry) return;
+    memset(entry, 0, sizeof(*entry));
+    entry->font = font;
+    entry->bank = entry->program = entry->to_bank = entry->to_program = FA_SOUNDFONT_ALL;
+    entry->volume = 1.0f;
+}
+
+typedef struct stack_pick {
+    struct tsf_stack_preset p;
+    uint32_t order;             /* entry, then the font's preset index: lower wins */
+} stack_pick;
+
+static int stack_pick_compare(const void* a, const void* b)
+{
+    const stack_pick *x = (const stack_pick*)a, *y = (const stack_pick*)b;
+    if (x->p.bank != y->p.bank) return x->p.bank < y->p.bank ? -1 : 1;
+    if (x->p.preset != y->p.preset) return x->p.preset < y->p.preset ? -1 : 1;
+    return x->order < y->order ? -1 : x->order > y->order;
+}
+
+static int stack_number_ok(int32_t v, int32_t max) { return v == FA_SOUNDFONT_ALL || (v >= 0 && v <= max); }
+
+FA_API fa_result FA_CALL fa_soundfont_open_stack(const fa_soundfont_stack_entry* entries, uint32_t count, fa_soundfont** out_font)
+{
+    stack_pick* picks = NULL;
+    struct tsf_stack_preset* list = NULL;
+    fa_soundfont* f = NULL;
+    size_t total = 0, n = 0, kept = 0, i;
+    uint32_t e;
+    fa_result r = FA_ERROR_OUT_OF_MEMORY;
+    if (out_font) *out_font = NULL;
+    if (!entries || count == 0 || count > 1024 || !out_font) return FA_ERROR_INVALID_ARG;
+    for (e = 0; e < count; e++) {
+        const fa_soundfont_stack_entry* x = &entries[e];
+        if (!x->font || !stack_number_ok(x->bank, 16383) || !stack_number_ok(x->program, 127) ||
+            !stack_number_ok(x->to_bank, 16383) || !stack_number_ok(x->to_program, 127) ||
+            !(x->volume >= 0.0f && x->volume <= 16.0f))
+            return FA_ERROR_INVALID_ARG;
+        total += x->font->presets;
+    }
+    picks = (stack_pick*)malloc((total ? total : 1) * sizeof(*picks));
+    if (!picks) return FA_ERROR_OUT_OF_MEMORY;
+    for (e = 0; e < count; e++) {
+        const fa_soundfont_stack_entry* x = &entries[e];
+        float gain_db = x->volume > 0.0f ? 20.0f * log10f(x->volume) : -200.0f;
+        for (i = 0; i < x->font->presets; i++) {
+            int bank = 0, program = 0;
+            stack_pick* k;
+            if (!tsf_get_preset_bank_number(x->font->bank, (int)i, &bank, &program)) continue;
+            if ((x->bank != FA_SOUNDFONT_ALL && bank != x->bank) || (x->program != FA_SOUNDFONT_ALL && program != x->program)) continue;
+            k = &picks[n++];
+            k->p.font = x->font->bank;
+            k->p.presetIndex = (int)i;
+            k->p.bank = x->to_bank != FA_SOUNDFONT_ALL ? x->to_bank : bank;
+            k->p.preset = x->to_program != FA_SOUNDFONT_ALL ? x->to_program : program;
+            k->p.gainDB = gain_db;
+            k->order = (uint32_t)n;   /* entries in order, each font's presets in order */
+        }
+    }
+    if (n == 0) { r = FA_ERROR_NOT_FOUND; goto done; }
+    /* By bank and program, the winner first; the others with the same numbers go. */
+    qsort(picks, n, sizeof(*picks), stack_pick_compare);
+    list = (struct tsf_stack_preset*)malloc(n * sizeof(*list));
+    f = (fa_soundfont*)calloc(1, sizeof(*f));
+    if (!list || !f) goto done;
+    for (i = 0; i < n; i++)
+        if (i == 0 || picks[i].p.bank != picks[i - 1].p.bank || picks[i].p.preset != picks[i - 1].p.preset) list[kept++] = picks[i].p;
+    f->members = (fa_soundfont**)malloc(count * sizeof(*f->members));
+    if (!f->members) goto done;
+    if (fa_mutex_init(&f->lock) != 0) { free(f->members); f->members = NULL; r = FA_ERROR_GENERIC; goto done; }
+    f->bank = tsf_load_stack(list, (int)kept);
+    if (!f->bank) { fa_mutex_destroy(&f->lock); free(f->members); f->members = NULL; goto done; }
+    f->presets = (uint32_t)kept;
+    f->key = 0xcbf29ce484222325ULL;
+    for (e = 0; e < count; e++) {
+        const fa_soundfont_stack_entry* x = &entries[e];
+        uint32_t j;
+        int32_t nums[5];
+        int seen = 0;
+        for (j = 0; j < f->nmembers; j++) seen |= f->members[j] == x->font;
+        if (!seen) f->sample_memory += x->font->sample_memory;
+        f->members[f->nmembers++] = fa_soundfont_retain(x->font);
+        /* The key (loudness caches): each member's, then how it is used. */
+        nums[0] = x->bank; nums[1] = x->program; nums[2] = x->to_bank; nums[3] = x->to_program;
+        memcpy(&nums[4], &x->volume, sizeof(float));
+        f->key = fa_fnv1a(f->key, (const uint8_t*)&x->font->key, sizeof(x->font->key));
+        f->key = fa_fnv1a(f->key, (const uint8_t*)nums, sizeof(nums));
+    }
+    snprintf(f->name, sizeof(f->name), "%s", entries[0].font->name);
+    fa_store32(&f->refs, 1);
+    *out_font = f;
+    f = NULL;
+    r = FA_OK;
+done:
+    free(f);
+    free(list);
+    free(picks);
+    return r;
 }
 
 FA_API fa_result FA_CALL fa_engine_set_soundfont(fa_engine* engine, fa_soundfont* font)
@@ -469,6 +595,7 @@ struct fa_midi {
     tsf* synth;
     uint32_t rate;
     fa_frames length;
+    fa_frames last_event;       /* the time of the last event (end of track included) */
 
     midi_event* ev;
     size_t nev, next;           /* next: first event not applied yet */
@@ -1244,9 +1371,8 @@ static void restart_held(struct fa_midi* m)
     }
 }
 
-static fa_result midi_seek(fa_decoder* dec, fa_frames frame)
+static fa_result seek_to(struct fa_midi* m, fa_frames frame)
 {
-    struct fa_midi* m = (struct fa_midi*)dec->impl;
     fa_frames block = frame - frame % FA_MIDI_BLOCK, from = block;
     tsf* fresh;
     if (m->realtime) return FA_ERROR_NOT_SEEKABLE;
@@ -1280,7 +1406,9 @@ static fa_result midi_seek(fa_decoder* dec, fa_frames frame)
     }
     m->rpos = from;
     m->blk_len = m->blk_off = 0;
-    if (frame < m->length) {
+    if (frame == 0) {
+        /* The start: the first read renders it (with the controls set by then). */
+    } else if (frame < m->length) {
         while (m->rpos < block) render_block(m);
         render_block(m);
         m->blk_off = (int)(frame - block);
@@ -1288,6 +1416,45 @@ static fa_result midi_seek(fa_decoder* dec, fa_frames frame)
         m->rpos = m->length;   /* at the end: nothing more to read */
     }
     return FA_OK;
+}
+
+static fa_result midi_seek(fa_decoder* dec, fa_frames frame)
+{
+    return seek_to((struct fa_midi*)dec->impl, frame);
+}
+
+/* The song's length: until what the last events leave sounding (release envelopes, the
+ * reverb and chorus) has died away, at most FA_MIDI_TAIL_MAX_S after the last event. The
+ * end is rendered once, unheard, from a seek to the last event (which plays the second
+ * before it, so the notes released there are at their real level): blocks follow until
+ * FA_MIDI_TAIL_QUIET_S in a row stay under FA_MIDI_TAIL_FLOOR, and the length ends after
+ * the last block above it. Then the song is put back at its start. Cost: what playing the
+ * last 2 to 3 seconds costs, as a seek does. */
+static fa_result measure_length(struct fa_midi* m)
+{
+    fa_frames last = m->last_event, limit = last + (fa_frames)(FA_MIDI_TAIL_MAX_S * m->rate), end = last, quiet = 0;
+    fa_frames need = (fa_frames)(FA_MIDI_TAIL_QUIET_S * m->rate);
+    fa_result r;
+    m->length = limit;
+    r = seek_to(m, last);
+    if (r != FA_OK) return r;
+    m->blk_off = 0;   /* the block with the last event is measured whole */
+    for (;;) {
+        float peak = 0.0f;
+        int i;
+        for (i = 0; i < m->blk_len * 2; i++) {
+            float a = fabsf(m->blk[i]);
+            if (a > peak) peak = a;
+        }
+        if (peak >= FA_MIDI_TAIL_FLOOR) { end = m->rpos; quiet = 0; }
+        else quiet += m->blk_len;
+        if (quiet >= need || m->rpos >= limit) break;
+        render_block(m);
+    }
+    m->length = end > last ? end : last;
+    r = seek_to(m, 0);
+    if (r == FA_OK) refresh_values(m);   /* the values of the start, not of the end */
+    return r;
 }
 
 static void midi_free(struct fa_midi* m)
@@ -1761,6 +1928,7 @@ static fa_result build(struct fa_midi* m, tml_message* first, const uint8_t* smf
     }
     if (r != FA_OK) return r;
     m->nev = k;
+    m->last_event = last;
     m->length = last + (fa_frames)(FA_MIDI_TAIL_S * rate);
     m->info.text_count = m->ntexts;
     m->info.lyric_count = m->nlyrics;
@@ -1862,6 +2030,7 @@ static fa_result midi_open(fa_decoder* dec)
     r = midi_parse(dec->src, dec->midi_rate ? dec->midi_rate : FA_MIDI_DEFAULT_RATE, dec->text_code_page, !dec->soundfont, &m, &rmid);
     if (r != FA_OK) return r;
     r = midi_start(m, dec->soundfont);
+    if (r == FA_OK) r = measure_length(m);
     if (r != FA_OK) { midi_free(m); return r; }
     midi_publish(dec, m, rmid ? "rmid" : "smf");
     return FA_OK;
@@ -2002,6 +2171,7 @@ static fa_result build_events(struct fa_midi* m, const fa_midi_event* events, ui
     m->nev = k;
     if (sort_events(m->ev, k) != FA_OK) return FA_ERROR_OUT_OF_MEMORY;
     m->info.tracks = tracks;
+    m->last_event = last;
     m->length = last + (fa_frames)(FA_MIDI_TAIL_S * m->rate);
     return FA_OK;
 }
@@ -2025,6 +2195,7 @@ fa_result fa_midi_decoder_open_events(fa_decoder* dec, fa_soundfont* font, uint3
         r = build_events(m, events, count);
     }
     if (r == FA_OK) r = midi_start(m, font);
+    if (r == FA_OK && !realtime) r = measure_length(m);
     if (r != FA_OK) { midi_free(m); return r; }
     memset(dec, 0, sizeof(*dec));
     dec->vt = &fa_decoder_midi;

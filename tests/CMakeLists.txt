@@ -348,6 +348,14 @@ if(UNIX)
 endif()
 add_test(NAME midi_drums COMMAND fa_test_midi_drums)
 
+add_executable(fa_test_soundfont test_soundfont.c)
+target_compile_options(fa_test_soundfont PRIVATE ${FA_WARNINGS})
+target_link_libraries(fa_test_soundfont PRIVATE fatzaudio)
+if(UNIX)
+    target_link_libraries(fa_test_soundfont PRIVATE m)
+endif()
+add_test(NAME soundfont COMMAND fa_test_soundfont)
+
 # White-box (the effect blocks) and whole songs: GS delay, XG chorus parameters and variation.
 add_executable(fa_test_midi_fx test_midi_fx.c)
 target_compile_options(fa_test_midi_fx PRIVATE ${FA_WARNINGS})
