@@ -21,6 +21,7 @@
 #include <string.h>
 
 #define FA_DECODE_CHUNK 1024
+#define FA_LIVE_CHUNK 128        /* frames a real-time MIDI stream renders at a time */
 #define FA_CONVERT_CHUNK (FA_DECODE_CHUNK * 2)   /* most device frames one converter call makes */
 #define FA_DEFAULT_BUFFER_MS 500
 #define FA_PREFILL_MS 100
@@ -141,6 +142,13 @@ static void stream_discard(struct fa_stream* s)
     fa_stream_free_memory(s);
 }
 
+/* The app chose its own decode-ahead (fa_open_options.buffer_ms, when its struct has it). */
+static int app_buffer_ms(const fa_open_options* options)
+{
+    return options && options->struct_size >= offsetof(fa_open_options, buffer_ms) + sizeof(options->buffer_ms) &&
+           options->buffer_ms;
+}
+
 static fa_result stream_create(fa_engine* engine, const fa_open_options* options, struct fa_stream** out)
 {
     int i;
@@ -180,8 +188,7 @@ static fa_result stream_create(fa_engine* engine, const fa_open_options* options
     fa_store64(&s->seek_pending, -1);
     fa_store64(&s->found_end, -1);
     s->buffer_ms = FA_DEFAULT_BUFFER_MS;
-    if (options && options->struct_size >= offsetof(fa_open_options, buffer_ms) + sizeof(options->buffer_ms) &&
-        options->buffer_ms) {
+    if (app_buffer_ms(options)) {
         s->buffer_ms = options->buffer_ms;
         if (s->buffer_ms < 50) s->buffer_ms = 50;
         if (s->buffer_ms > 10000) s->buffer_ms = 10000;
@@ -255,9 +262,7 @@ static fa_result stream_open_decoder(struct fa_stream* s, const char* name_hint,
     }
     /* MIDI and tracker live controls are heard after the decode-ahead: keep it short unless
      * the app chose its own. */
-    if ((s->midi || s->tracker) && !(options && options->struct_size >= offsetof(fa_open_options, buffer_ms) + sizeof(options->buffer_ms) &&
-                     options->buffer_ms))
-        s->buffer_ms = FA_MIDI_BUFFER_MS;
+    if ((s->midi || s->tracker) && !app_buffer_ms(options)) s->buffer_ms = FA_MIDI_BUFFER_MS;
     /* Running loudness estimate for playback; decode-only streams are never normalized. */
     if (!(s->flags & FA_OPEN_DECODE_ONLY) &&
         fa_meter_init(&s->run_meter, s->decoder.format.sample_rate, s->decoder.format.channels, 0, FA_RUNNING_SUBS) == FA_OK)
@@ -628,16 +633,22 @@ FA_API fa_result FA_CALL fa_stream_open_push(fa_engine* engine, const fa_audio_f
     return FA_OK;
 }
 
-/* Callback and capture streams: a live decoder, no source. */
-static void open_live(struct fa_stream* s)
+/* A decoder that reads no source (callback, capture and MIDI event streams). */
+static void open_sourceless(struct fa_stream* s)
 {
-    s->live = 1;
     s->decoder.src = &s->source;
     s->decoder_ready = 1;
     if (!(s->flags & FA_OPEN_DECODE_ONLY) &&
         fa_meter_init(&s->run_meter, s->decoder.format.sample_rate, s->decoder.format.channels, 0, FA_RUNNING_SUBS) == FA_OK)
         s->run_meter_ready = 1;
     stream_opened(s);
+}
+
+/* Callback and capture streams: a live decoder, no source. */
+static void open_live(struct fa_stream* s)
+{
+    s->live = 1;
+    open_sourceless(s);
 }
 
 FA_API fa_result FA_CALL fa_stream_open_callback(fa_engine* engine, const fa_audio_format* format, fa_stream_proc proc,
@@ -675,6 +686,64 @@ fa_result fa_stream_open_voice(fa_engine* engine, fa_decoder* dec, struct fa_sou
     fa_exchange_ptr(&s->sound, owner);
     *out = s;
     return FA_OK;
+}
+
+FA_API void FA_CALL fa_midi_stream_options_init(fa_midi_stream_options* options)
+{
+    if (!options) return;
+    memset(options, 0, sizeof(*options));
+    options->struct_size = (uint32_t)sizeof(*options);
+}
+
+/* Real-time MIDI streams and lists of events: a MIDI decoder with no source. */
+static fa_result open_midi(fa_engine* engine, int realtime, const fa_midi_event* events, uint32_t count,
+                           const fa_midi_stream_options* midi_options, const fa_open_options* options, fa_stream** out_stream)
+{
+    struct fa_stream* s; fa_result r;
+    fa_midi_stream_options mo;
+    uint32_t rate;
+    if (out_stream) *out_stream = NULL;
+    if (!engine || !out_stream || (count && !events)) return FA_ERROR_INVALID_ARG;
+    if (options && options->flags & FA_OPEN_LOOP && realtime) return FA_ERROR_INVALID_ARG;
+    fa_midi_stream_options_init(&mo);
+    if (midi_options) {
+        size_t sz = midi_options->struct_size;
+        if (sz < sizeof(uint32_t)) return FA_ERROR_INVALID_ARG;
+        memcpy(&mo, midi_options, sz < sizeof(mo) ? sz : sizeof(mo));
+    }
+    if (mo.sample_rate && (mo.sample_rate < 8000 || mo.sample_rate > 192000)) return FA_ERROR_INVALID_ARG;
+    if (mo.latency_ms && (mo.latency_ms < 10 || mo.latency_ms > 500)) return FA_ERROR_INVALID_ARG;
+    rate = mo.sample_rate ? mo.sample_rate : fa_engine_midi_rate(engine);
+    r = stream_create(engine, options, &s);
+    if (r != FA_OK) return r;
+    if (!s->soundfont) s->soundfont = fa_engine_system_soundfont(engine);
+    r = fa_midi_decoder_open_events(&s->decoder, s->soundfont, rate, realtime, events, count);
+    if (r != FA_OK) { stream_discard(s); return r; }
+    s->decoder.soundfont = s->soundfont;
+    s->midi = fa_midi_of(&s->decoder);
+    if (!app_buffer_ms(options)) s->buffer_ms = FA_MIDI_BUFFER_MS;
+    if (realtime) {
+        s->live_ms = mo.latency_ms ? mo.latency_ms : FA_MIDI_LIVE_MS;
+        if (s->live_ms > s->buffer_ms) s->buffer_ms = s->live_ms;
+        open_live(s);
+    } else {
+        open_sourceless(s);
+    }
+    *out_stream = s;
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_open_midi(fa_engine* engine, const fa_midi_stream_options* midi_options,
+                                             const fa_open_options* options, fa_stream** out_stream)
+{
+    return open_midi(engine, 1, NULL, 0, midi_options, options, out_stream);
+}
+
+FA_API fa_result FA_CALL fa_stream_open_midi_events(fa_engine* engine, const fa_midi_event* events, uint32_t count,
+                                                    const fa_midi_stream_options* midi_options,
+                                                    const fa_open_options* options, fa_stream** out_stream)
+{
+    return open_midi(engine, 0, events, count, midi_options, options, out_stream);
 }
 
 FA_API fa_result FA_CALL fa_stream_open_capture(fa_engine* engine, const fa_capture_options* capture_options,
@@ -1253,6 +1322,10 @@ static int64_t fill_target(struct fa_stream* s)
         int64_t t = (int64_t)s->dev_rate * s->tempo_latency_ms / 1000;
         if (t < cap) cap = t;
     }
+    if (s->live_ms && s->dev_rate) {
+        int64_t t = (int64_t)s->dev_rate * s->live_ms / 1000;
+        if (t < cap) cap = t;
+    }
     return cap;
 }
 
@@ -1671,6 +1744,7 @@ void fa_stream_fill(struct fa_stream* s, int64_t max_frames)
                 break;
             }
             if (end >= 0 && !reversed(s) && s->src_pos + want > end) want = end > s->src_pos ? end - s->src_pos : 0;
+            if (s->live_ms && want > FA_LIVE_CHUNK) want = FA_LIVE_CHUNK;   /* what is sent now is in the next piece */
             from_carry = s->carry_count > 0;
             if (from_carry && want > 0) {         /* audio decoded ahead before a detach */
                 got = s->carry_count < want ? s->carry_count : want;

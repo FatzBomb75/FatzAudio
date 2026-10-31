@@ -31,6 +31,21 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   `FA_SOUND_STEAL_OLDEST` (default), `_QUIETEST` and `_NONE`. .NET: `engine.LoadSound`, `engine.CreateSound`, `Sound`,
   `SoundOptions`, `SoundSteal`, `SoundInfo`. New file `src/sound.c`. See [docs/features/sounds.md](docs/features/sounds.md).
 
+- MIDI events and a real-time MIDI stream (extras step 15). `fa_stream_open_midi` (BASS_MIDI_StreamCreate): a
+  synthesizer with no file that plays the events the app sends, rendering only `fa_midi_stream_options.latency_ms`
+  (30 ms by default, 10..500) ahead of the output. `fa_stream_send_midi_events` (`fa_midi_event`: notes, key and
+  channel pressure, controllers, programs, pitch bend, SysEx) and `fa_stream_send_midi` (raw MIDI bytes, running
+  status) work on real-time and file streams: each event is heard at its frame, to the sample, or at once with
+  `FA_MIDI_NOW`; senders on any thread go through a lock-free queue of `FA_MIDI_QUEUE` (8192) events
+  (`FA_ERROR_BUSY` when full). `fa_stream_open_midi_events` (BASS_MIDI_StreamCreateEvents) plays a list of events as
+  a song. `fa_stream_get_midi_events` (BASS_MIDI_StreamGetEvents) lists a file's events by track and type,
+  `fa_stream_get_midi_value` (BASS_MIDI_StreamGetEvent) gives a channel's controller, program, bend or pressure, and
+  `fa_stream_set_midi_track_volume` / `_get_` (BASS_ATTRIB_MIDI_TRACK_VOL) scales a track's notes. .NET:
+  `AudioEngine.OpenMidi`, `OpenMidiEvents`, `MidiEvent` (with `NoteOn`, `Control`, `SysEx`, ... factories),
+  `MidiStreamOptions`, `AudioStream.SendMidi`, `SendMidiBytes`, `GetMidiEvents`, `GetMidiValue`,
+  `SetMidiTrackVolume` / `GetMidiTrackVolume`. MIDI files render bit for bit as before. See
+  [docs/features/midi.md](docs/features/midi.md#sending-events-and-the-real-time-synthesizer).
+
 - MIDI GS/XG effects B, insertion effects (extras step 7): the MU100's XG insertion 1 and 2 (`03 00 xx`, `03 01 xx`:
   type, parameters, part, MW/bend/aftertouch/AC1/AC2 depths) and the SC-88 Pro's EFX (`40 03 00`-`1E`: type,
   parameters, send levels, control sources and depths) with each part's EFX switch (`40 4x 22`). All 64 SC-88 Pro EFX

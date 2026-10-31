@@ -78,7 +78,7 @@ public delegate void DspProcessor(Span<float> samples, int channels, int sampleR
 /// await done.Task;
 /// </code>
 /// </example>
-public unsafe class AudioStream : IDisposable
+public unsafe partial class AudioStream : IDisposable
 {
     private readonly StreamHandle _handle;
     private int _sampleRate;

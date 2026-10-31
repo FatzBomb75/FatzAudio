@@ -12,7 +12,8 @@ FatzAudio plays MIDI files itself, with a built-in SoundFont 2 synthesizer. They
 | Lyrics and other text | Lyric, text, marker, cue, track and instrument name, copyright: listed and raised as events |
 | Tempo and signatures | Tempo changes, time and key signatures, listed with their numbers |
 | Effects | Reverb and chorus, on by default: the soundfont's effect sends plus CC91 and CC93; the file's GS or XG SysEx picks their type, level and time ([below](#reverb-and-chorus)) |
-| Live controls | Transpose (the synthesizer plays the new notes), channel mute, plus every stream parameter (volume, tempo, pitch) |
+| Live controls | Transpose (the synthesizer plays the new notes), channel mute, track volume, plus every stream parameter (volume, tempo, pitch) |
+| Events from the app | A real-time synthesizer fed with notes, programs, controllers, bends and SysEx; events sent to any MIDI stream, sample-exact; lists of events played as a song; a file's events read back ([below](#sending-events-and-the-real-time-synthesizer)) |
 
 Files are detected from their content (`MThd`, or `RIFF....RMID`), never from the extension. `fa_stream_get_info` reports codec `midi`, container `smf` or `rmid`, and stereo F32 audio at the engine's `mix_sample_rate`, or 44100 Hz when that is 0 (device native).
 
@@ -241,6 +242,54 @@ song.MidiTranspose = -2;
 song.SetMidiChannelMuted(3, true);
 ```
 
+## Sending events and the real-time synthesizer
+
+Your app can play MIDI events itself: notes, programs, controllers, pitch bend, pressure and SysEx. Send them to a **real-time MIDI stream**, which has no file and plays only what it's sent (a keyboard, a sequencer of your own, a game's music), or to a MIDI file's stream, on top of what the file plays. A list of events can also be played as if it were a file.
+
+| What | C | C# | Notes |
+|---|---|---|---|
+| Real-time synthesizer | `fa_stream_open_midi(engine, &midi_options, &options, &s)` | `engine.OpenMidi(midiOptions, options)` | Silent until sent events, endless, not seekable. Renders only `latency_ms` (30 ms by default, 10..500) ahead of the output. Starts as after a GM reset. |
+| Send events | `fa_stream_send_midi_events(s, events, count)` | `stream.SendMidi(MidiEvent.NoteOn(0, 60, 100))`, `SendMidi(span)` | Heard at `frame`, to the sample, or at once with `FA_MIDI_NOW` / `MidiEvent.Now`. All or none; `FA_ERROR_BUSY` (C#: `false`) when the queue is full. |
+| Send MIDI bytes | `fa_stream_send_midi(s, frame, bytes, size)` | `stream.SendMidiBytes(bytes, frame)` | Bytes as a MIDI device or a file's track gives them: running status, SysEx `F0`..`F7`; clock and other real-time bytes are skipped. |
+| A list of events as a song | `fa_stream_open_midi_events(engine, events, count, &midi_options, &options, &s)` | `engine.OpenMidiEvents(events, midiOptions, options)` | Plays, seeks and loops like a file: its length is the last event plus one second. Sorted by frame (equal frames keep their order). |
+| A file's events | `fa_stream_get_midi_events(s, track, type, out, capacity, &count)` | `stream.GetMidiEvents(track, type)` | Notes, controllers, programs, pressure, bends and SysEx in time order, for one track or all, one type or all. A note on with velocity 0 comes as a note off. |
+| A channel's value now | `fa_stream_get_midi_value(s, channel, type, param, &value)` | `stream.GetMidiValue(channel, type, controller)` | A controller, the program, the pitch bend or the channel pressure, as the synth has it (up to the decode-ahead past what is heard). |
+| Track volume | `fa_stream_set_midi_track_volume(s, track, volume)` / `_get_` | `SetMidiTrackVolume(track, volume)` / `GetMidiTrackVolume` | 0 (silent) to 4, 1 by default. Scales the level of that track's notes, whatever channel they are on, from their next note on. |
+
+```c
+fa_stream* synth;
+fa_midi_event e[2] = {
+    { FA_MIDI_NOW, 0, FA_MIDI_EVENT_PROGRAM, 0, 0, 19 },     /* channel 1: church organ */
+    { FA_MIDI_NOW, 0, FA_MIDI_EVENT_NOTE_ON, 0, 60, 100 },  /* middle C, at once */
+};
+fa_stream_open_midi(engine, NULL, NULL, &synth);            /* the engine's soundfont */
+fa_stream_attach(synth, output, NULL);
+fa_stream_play(synth);
+fa_stream_send_midi_events(synth, e, 2);
+/* ... on key up: */
+fa_stream_send_midi(synth, FA_MIDI_NOW, "\x80\x3C\x00", 3);
+```
+
+```csharp
+using var synth = engine.OpenMidi();
+synth.PlayOn(output);
+synth.SendMidi([MidiEvent.Program(0, 19), MidiEvent.NoteOn(0, 60, 100)]);
+// ... on key up:
+synth.SendMidi(MidiEvent.NoteOff(0, 60));
+
+// Every program change of a file:
+foreach (var p in song.GetMidiEvents(type: MidiEventType.Program))
+    Console.WriteLine($"{p.Position}: channel {p.Channel + 1} plays program {p.Value}");
+```
+
+**Timing.** An event's `frame` counts in the stream's own frames (source frames at the stream's rate: `fa_midi_stream_options.sample_rate`, else the rate MIDI files get). The synth renders in pieces, and an event lands inside a piece at its exact frame. An event for a frame already rendered, or `FA_MIDI_NOW`, plays at the start of the next frames rendered, in the order sent. A real-time stream on an output keeps only `latency_ms` rendered ahead, so a note sent now is heard within about that time (a test with 20 ms heard it about 12 ms later); a file stream renders its usual 150 ms ahead. For exact timing (a sequencer), send events ahead with frames past `fa_stream_get_position`. On a decode-only stream, what you send before a `fa_stream_read` is in it at its frames.
+
+**Threads.** Any thread may send. Events go into a queue (`FA_MIDI_QUEUE`, 8192 events) that the synth empties each time it renders; the audio thread never waits for a sender and a sender never waits for the audio. A stream that isn't playing takes nothing, so a full queue answers `FA_ERROR_BUSY` until it plays.
+
+**On a file stream**, sent events mix with the file's: transpose, channel mute and track volume apply to them as well. A seek starts the synth again from the file's own events, so what sent events changed before it (a program, a controller) is forgotten; events still waiting play when their frame comes, or at once if the seek went past it. Played reversed, the synth renders the song's blocks out of order, so a sent event plays when it first renders past its frame (`FA_MIDI_NOW` events at once).
+
+Low latency needs a machine that keeps up: with `latency_ms` at 10 the decode workers must render a piece every few milliseconds. When they don't, the stream runs dry and resumes (`FA_EVENT_STALLED` and `FA_EVENT_RESUMED`); raise the latency then.
+
 ## Controllers and modulators
 
 The file's controllers shape each note the way a GM, GS or XG module would. Nothing needs setting up: they are part of the file. Files that use none of the controllers below sound exactly as they did before these were added.
@@ -464,7 +513,7 @@ Rendering runs on the engine's worker threads like decoding of any other format.
 - Note velocity sets the level by the SoundFont 2 default curve (concave, 96 dB range): 40·log10(velocity/127) dB, so velocity 64 is 11.9 dB below 127, as in FluidSynth and DLS synths. A soundfont's own modulators are applied ([modulators](#soundfont-modulators)), except where they repeat a built-in default.
 - Mono and legato modes (CC126/127), GM2 controller destination settings (what pressure and the mod wheel drive, `7F 09 01`-`03`) and the SoundFont NRPNs (MSB 120) are ignored; portamento glides in every mode.
 - Each instrument's level (`initialAttenuation`) is applied as the SoundFont 2 spec states it, 0.1 dB per unit. FluidSynth applies 0.4 of that (an EMU hardware habit), so a bank tuned by ear in FluidSynth can sound with a wider gap between its quiet and loud instruments here.
-- SFZ soundfonts and MIDI input from devices aren't supported yet. See the [engineering notes](../engineering-notes.md).
+- SFZ soundfonts and MIDI input from devices aren't supported yet (feed a device's bytes to `fa_stream_send_midi` yourself). A real-time stream has 16 channels (no ports). See the [engineering notes](../engineering-notes.md).
 - Text in code pages other than UTF-8, Windows-1252 and Shift-JIS (Korean, Chinese, Cyrillic files) comes out as Windows-1252. Shift-JIS user-defined characters (lead bytes F0-F9) come out as U+FFFD.
 - SysEx other than the messages listed [above](#sysex) is ignored: the part parameters not listed have no effect.
 - The insertion effect types' curves and defaults (drive and amp tones, formants, lo-fi, the multi-effects' blocks, where the manuals give no default) are our reading of the published SC-88 Pro and MU100 tables, not a copy of a module; nobody has compared them with real hardware yet.

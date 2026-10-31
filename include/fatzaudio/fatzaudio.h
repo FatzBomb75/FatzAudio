@@ -2738,6 +2738,116 @@ FA_API fa_result FA_CALL fa_stream_get_midi_channel_mute(fa_stream* stream, uint
 FA_API fa_result FA_CALL fa_stream_set_midi_effects(fa_stream* stream, int32_t enabled);
 FA_API fa_result FA_CALL fa_stream_get_midi_effects(fa_stream* stream, int32_t* out_enabled);
 
+/* ---- MIDI events and the real-time MIDI stream ----------------------------
+ *
+ * Events sent by the app play on any MIDI stream: a file's (on top of what the file
+ * plays) or a real-time one, which has no file and plays only what it is sent: a
+ * keyboard, a sequencer of your own, a game's music.
+ *
+ *     fa_stream* synth;
+ *     fa_stream_open_midi(engine, NULL, NULL, &synth);   (the engine's soundfont)
+ *     fa_stream_attach(synth, output, NULL);
+ *     fa_stream_play(synth);
+ *     fa_midi_event on = { FA_MIDI_NOW, 0, FA_MIDI_EVENT_NOTE_ON, 0, 60, 100 };
+ *     fa_stream_send_midi_events(synth, &on, 1);           (middle C, at once)
+ *
+ * An event is heard at its `frame` (the stream's source frames, at the stream's rate),
+ * to the sample, or at the next frames rendered when that frame was already
+ * rendered or is FA_MIDI_NOW. A real-time stream renders only about latency_ms ahead
+ * of the device (fa_midi_stream_options), so FA_MIDI_NOW events are heard that soon;
+ * for exact timing, give frames ahead of fa_stream_get_position. Decode-only streams
+ * render on fa_stream_read: events sent before a read are in it at their frames.
+ *
+ * Sending never blocks the audio or waits for the synth: events go into a queue the
+ * synth takes them from (FA_ERROR_BUSY when it holds FA_MIDI_QUEUE events not taken
+ * yet, nothing sent: a stream that is not playing takes none). Any thread may send.
+ * On a file stream, a seek starts the synth again from the file's own events: what
+ * sent events did before is forgotten (events still queued play when reached).
+ * Transpose, channel mute and track volume apply to sent notes as to the file's.
+ * While reversed, the synth renders the song's blocks out of order: a sent event
+ * plays when it first renders past its frame. */
+
+#define FA_MIDI_NOW ((fa_frames)-1)
+#define FA_MIDI_QUEUE 8192
+
+typedef enum fa_midi_event_type {
+    FA_MIDI_EVENT_NOTE_OFF = 0,          /* param = key */
+    FA_MIDI_EVENT_NOTE_ON,               /* param = key, value = velocity 1..127 (0: a note off) */
+    FA_MIDI_EVENT_KEY_PRESSURE,          /* param = key, value = 0..127 (poly aftertouch) */
+    FA_MIDI_EVENT_CONTROL,               /* param = controller 0..127, value = 0..127 */
+    FA_MIDI_EVENT_PROGRAM,               /* value = program 0..127 (bank: CC0 and CC32 first) */
+    FA_MIDI_EVENT_CHANNEL_PRESSURE,      /* value = 0..127 */
+    FA_MIDI_EVENT_PITCH_BEND,            /* value = 0..16383, 8192 = centre */
+    FA_MIDI_EVENT_SYSEX                  /* data / size: the message from its F0 to its F7 */
+} fa_midi_event_type;
+
+/* One MIDI event, sent or read from a file (fa_stream_get_midi_events). */
+typedef struct fa_midi_event {
+    fa_frames frame;             /* where it is heard (source frames); sent: FA_MIDI_NOW = at once */
+    fa_time time;                /* read: the same in nanoseconds; ignored when sent */
+    int32_t type;                /* fa_midi_event_type */
+    int32_t channel;             /* 0..15 (MIDI channel 1..16); ignored for SysEx */
+    int32_t param;               /* key or controller */
+    int32_t value;
+    int32_t track;               /* read: the MTrk chunk, 0-based; sent: ignored */
+    uint32_t size;               /* SysEx: bytes at data */
+    const uint8_t* data;         /* SysEx (read: valid while the stream is open; a file's
+                                    SysEx of more than 64 bytes after the F0 is left out) */
+} fa_midi_event;
+
+typedef struct fa_midi_stream_options {
+    uint32_t struct_size;        /* sizeof(fa_midi_stream_options) */
+    uint32_t sample_rate;        /* 8000..192000, 0 = as MIDI files (the engine's mix_sample_rate,
+                                    else 44100); event frames count at this rate */
+    uint32_t latency_ms;         /* how far ahead of the device the synth renders: 0 = 30 ms;
+                                    10..500. Lower is heard sooner but needs a less busy machine */
+} fa_midi_stream_options;
+
+FA_API void FA_CALL fa_midi_stream_options_init(fa_midi_stream_options* options);
+/* A real-time MIDI stream (BASS_MIDI_StreamCreate): silent until sent events, endless,
+ * not seekable. It plays with fa_open_options.soundfont, else the engine's, else the
+ * OS's instruments (FA_ERROR_NO_SOUNDFONT where there are none). Starts as after a GM
+ * reset; the GS and XG resets and settings work as in files. FA_OPEN_LOOP is not
+ * allowed. fa_stream_get_midi_info gives zeros, no texts and no marks. */
+FA_API fa_result FA_CALL fa_stream_open_midi(fa_engine* engine, const fa_midi_stream_options* midi_options,
+                                             const fa_open_options* options, fa_stream** out_stream);
+/* A MIDI stream that plays a list of events as a file would (BASS_MIDI_StreamCreateEvents):
+ * seekable, its length the last event's frame plus one second. `events` in time order
+ * (frames at midi_options->sample_rate; FA_MIDI_NOW is frame 0), copied; `track` sets
+ * the track for fa_stream_set_midi_track_volume (0..65534). SysEx longer than 65 bytes
+ * (bulk data) is left out, as in files. */
+FA_API fa_result FA_CALL fa_stream_open_midi_events(fa_engine* engine, const fa_midi_event* events, uint32_t count,
+                                                    const fa_midi_stream_options* midi_options,
+                                                    const fa_open_options* options, fa_stream** out_stream);
+/* Sends `count` events (BASS_MIDI_StreamEvent / StreamEvents), all or none: FA_ERROR_BUSY
+ * when the queue has no room for them all. FA_ERROR_INVALID_ARG for streams that are
+ * not MIDI, more than FA_MIDI_QUEUE events, or an event out of range. */
+FA_API fa_result FA_CALL fa_stream_send_midi_events(fa_stream* stream, const fa_midi_event* events, uint32_t count);
+/* Sends MIDI bytes as they come from a device or a file's track (BASS_MIDI_EVENTS_RAW):
+ * status bytes with running status, SysEx from F0 to F7; real-time (F8..FF) and
+ * system common bytes are skipped, and so is an incomplete message at the end. All
+ * play at `frame`. Running status does not carry over to the next call. */
+FA_API fa_result FA_CALL fa_stream_send_midi(fa_stream* stream, fa_frames frame, const void* bytes, size_t size);
+/* A file's note, controller, program, pitch bend, pressure and SysEx events, in time
+ * order (BASS_MIDI_StreamGetEvents): `track` -1 for all tracks, `type` -1 for all
+ * types. Copies up to `capacity` into `out_events` (NULL with capacity 0 to count them)
+ * and gives how many match in *out_count. A note on with velocity 0 is given as a note
+ * off. Texts are fa_stream_get_midi_text, tempo and signatures fa_stream_get_midi_marks.
+ * Sent events are not listed. */
+FA_API fa_result FA_CALL fa_stream_get_midi_events(fa_stream* stream, int32_t track, int32_t type,
+                                                   fa_midi_event* out_events, uint32_t capacity, uint32_t* out_count);
+/* A channel's current value as the synth has it (BASS_MIDI_StreamGetEvent): `type`
+ * FA_MIDI_EVENT_CONTROL (param = controller), PROGRAM, PITCH_BEND or CHANNEL_PRESSURE.
+ * It is the value where the synth has rendered to, up to the decode-ahead past what is
+ * heard. */
+FA_API fa_result FA_CALL fa_stream_get_midi_value(fa_stream* stream, uint32_t channel, int32_t type, int32_t param,
+                                                  int32_t* out_value);
+/* A track's volume (BASS_ATTRIB_MIDI_TRACK_VOL): 0 (silent) to 4, 1 by default. It
+ * scales the level of the track's notes from the next note on (held notes keep theirs),
+ * whatever channel they are on. FA_ERROR_INVALID_ARG past the file's tracks. */
+FA_API fa_result FA_CALL fa_stream_set_midi_track_volume(fa_stream* stream, uint32_t track, float volume);
+FA_API fa_result FA_CALL fa_stream_get_midi_track_volume(fa_stream* stream, uint32_t track, float* out_volume);
+
 /* ---- MIDI lyric surface ---------------------------------------------------
  *
  * A karaoke surface (see Surfaces) that draws a MIDI or .kar song's lyrics: the

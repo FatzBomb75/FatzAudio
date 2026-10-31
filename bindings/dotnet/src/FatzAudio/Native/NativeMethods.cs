@@ -568,6 +568,34 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_stream_get_midi_marks(StreamHandle stream, FaMidiMark* marks, uint capacity, uint* count);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_midi_stream_options_init(FaMidiStreamOptions* options);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_open_midi(EngineHandle engine, FaMidiStreamOptions* midiOptions, FaOpenOptions* options, out nint stream);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_open_midi_events(EngineHandle engine, FaMidiEvent* events, uint count,
+        FaMidiStreamOptions* midiOptions, FaOpenOptions* options, out nint stream);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_send_midi_events(StreamHandle stream, FaMidiEvent* events, uint count);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_send_midi(StreamHandle stream, long frame, byte* bytes, nuint size);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_midi_events(StreamHandle stream, int track, int type, FaMidiEvent* events, uint capacity, uint* count);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_midi_value(StreamHandle stream, uint channel, int type, int param, out int value);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_set_midi_track_volume(StreamHandle stream, uint track, float volume);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_midi_track_volume(StreamHandle stream, uint track, out float volume);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_set_midi_transpose(StreamHandle stream, int semitones);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]

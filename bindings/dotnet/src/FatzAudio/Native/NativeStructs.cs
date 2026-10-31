@@ -594,6 +594,28 @@ internal unsafe struct FaMidiMark
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaMidiEvent
+{
+    public long Frame;
+    public long Time;
+    public int Type;
+    public int Channel;
+    public int Param;
+    public int Value;
+    public int Track;
+    public uint Size;
+    public byte* Data;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaMidiStreamOptions
+{
+    public uint StructSize;
+    public uint SampleRate;
+    public uint LatencyMs;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal unsafe struct FaTrackerInfo
 {
     public uint StructSize;
