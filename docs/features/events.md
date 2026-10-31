@@ -19,6 +19,8 @@ Each stream has one event callback. The audio thread queues events without locki
 | `FA_EVENT_MIDI_TEXT` | the text's frame | its index for `fa_stream_get_midi_text` | ✅ MIDI lyrics and text, streams on a device ([MIDI](midi.md#lyrics-and-text-events)) |
 | `FA_EVENT_LOOPED` | the loop end it left (cue-out or the length); reversed, the loop start it left | the frame it went to (cue-in or 0); reversed, the loop end | ✅ looping streams on a device, once per jump; raised as the audio is mixed, like markers ([playback](playback.md#loop-and-mute-while-playing)) |
 | `FA_EVENT_TRACKER_ROW` | the row's first frame | `order << 16 \| row` | ✅ tracker modules with `FA_TRACKER_ROW_EVENTS` on; raised as the audio is mixed, like markers ([trackers](trackers.md#row-events)) |
+| `FA_EVENT_TRACKER_INSTRUMENT` | the row's first frame | `channel << 16 \| instrument` (0-based) | ✅ tracker modules with `FA_TRACKER_CELL_EVENTS` bit 1 ([trackers](trackers.md#instrument-and-sync-events)) |
+| `FA_EVENT_TRACKER_SYNC` | the row's first frame | `channel << 16 \| Zxx parameter` | ✅ tracker modules with `FA_TRACKER_CELL_EVENTS` bit 2 |
 | `FA_EVENT_SEEK_FAILED` | the target of `fa_stream_seek_async` that was not reached | the `fa_result` | ✅ a worker could not seek there (a web server refusing the range); playback goes on where it was ([seek cost](playback.md#what-a-seek-costs)) |
 
 ## C
@@ -87,5 +89,5 @@ song.ClearPositionEvents();   // drops the ones not reached yet
 - When `fa_stream_set_event_callback` (replacing a callback) or `fa_stream_close` returns, the previous callback isn't running and won't be called again, so you can free its `user` data. The one exception is calling them from inside that callback itself.
 - Events queued for a stream that has since been closed are dropped, not delivered.
 - Events for a stream arrive in the order they happened, whether the audio thread raised them (a ramp finishing) or an API call did (a ramp replaced before it started).
-- `ENDED`, `RAMP_DONE` and `STARTED` aren't lost, so a `RampAsync` or `CrossfadeTo` always completes. `MARKER`, `POSITION`, `MIDI_TEXT` and `TRACKER_ROW` are best effort: they can be dropped in the rare case that the device's event queue (1024 events) fills before the engine empties it. A slow callback only delays later events: the decode workers keep moving events off the audio thread's queue every few milliseconds while your callback runs.
+- `ENDED`, `RAMP_DONE` and `STARTED` aren't lost, so a `RampAsync` or `CrossfadeTo` always completes. `MARKER`, `POSITION`, `MIDI_TEXT`, `TRACKER_ROW`, `TRACKER_INSTRUMENT` and `TRACKER_SYNC` are best effort: they can be dropped in the rare case that the device's event queue (1024 events) fills before the engine empties it. A slow callback only delays later events: the decode workers keep moving events off the audio thread's queue every few milliseconds while your callback runs.
 - Closing a device delivers what it had queued. A callback may also call `fa_engine_destroy` after closing the engine's streams; the teardown finishes once the callback returns.

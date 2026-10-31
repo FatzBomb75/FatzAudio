@@ -9,7 +9,9 @@ FatzAudio plays tracker modules itself, with [libopenmpt](https://lib.openmpt.or
 | Names | Song message, instrument, sample, channel, pattern and subsong names (UTF-8) |
 | Subsongs | Choosing the subsong to play, the subsong count and names |
 | Order and row | The time a row first plays, seeking to an order and row, the order and row heard now, and an event for each row (or each order) |
-| Live controls | Interpolation, stereo separation, volume ramping, Amiga resampler emulation, channel mute, plus every stream parameter (volume, tempo, pitch) |
+| Live controls | Interpolation, stereo separation, volume ramping, Amiga resampler emulation, channel mute, plus every stream parameter (volume, tempo, pitch). The module's own state: tempo and speed, global volume, channel volume, instrument mute, amplification |
+| Order list | The pattern of each order |
+| Events | A row, a note with an instrument, a Zxx command |
 | Tags | Title, artist and song message as `FA_TAG_FORMAT_TRACKER` items |
 
 Files are detected from their content, never from the extension, so a module with the wrong extension, from memory, from your own I/O callbacks or from a URL still plays. `fa_stream_get_info` reports stereo F32 audio at the engine's `mix_sample_rate`, or 44100 Hz when that is 0 (device native), like MIDI. No add-on library and no sample bank are needed: modules carry their own samples.
@@ -157,6 +159,74 @@ song.TrackerRowReached += (_, e) =>
 };
 ```
 
+## Module tempo, volumes and the order list
+
+These change the **song's own state**, as `BASS_ATTRIB_MUSIC_*` did. They are not a time-stretch: `FA_PARAM_TEMPO` (`Tempo`) stretches the finished audio and leaves the song as it is, while the calls below change the song's tempo and speed, so a pattern's notes land on different frames. They take effect after the decode-ahead buffer.
+
+| What | C | .NET | Range |
+|---|---|---|---|
+| Tempo | `fa_stream_set_tracker_tempo` / `_get_` | `TrackerTempo` | 32 to 512 beats per minute (the exact meaning depends on the format's tempo mode) |
+| Speed | `fa_stream_set_tracker_speed` / `_get_` | `TrackerSpeed` | 1 to 255 ticks per row |
+| Global volume | `fa_stream_set_tracker_global_volume` / `_get_` | `TrackerGlobalVolume` | 0.0 to 1.0 |
+| Channel volume | `fa_stream_set_tracker_channel_volume` / `_get_` | `SetTrackerChannelVolume`, `GetTrackerChannelVolume` | 0.0 to 1.0, the first 64 channels |
+| Instrument mute | `fa_stream_set_tracker_instrument_mute` / `_get_` | `SetTrackerInstrumentMuted`, `IsTrackerInstrumentMuted` | the 0-based instrument, or the sample in formats without instruments (MOD, S3M) |
+| Amplification | `fa_stream_set_tracker_param(FA_TRACKER_AMPLIFY, millibel)` | `TrackerAmplificationDb` | -60 to 60 dB, 0 by default |
+
+- Tempo, speed and the global volume are the song's *current* values: a tempo or speed command (`Fxx`, `Axx`, `Txx`) or a global volume command later in the song sets them again, and a seek, or a loop that starts the song again, puts the module back in its own state at the target. Set them again after a seek if you want to keep them.
+- Channel volumes and instrument mutes **stay** through seeks, and the song's own channel volume commands do not undo them until they are met again. Amplification is an output gain on top of everything and always stays.
+- The stream keeps its length (the song played once at its own tempo): a song made faster ends early and silence follows to the old end, a slower one is cut at it. A seek by frame therefore lands at a different place in the song than before the change. Row events and `fa_stream_get_tracker_position` follow the song as it plays.
+- The getters read the song as decoded so far, which is ahead of what is heard by the decode-ahead buffer. A call right after a set returns the new value.
+- libopenmpt has no volume per instrument: `BASS_ATTRIB_MUSIC_VOL_INST` maps to the instrument mute. Mute and unmute give the on/off case; for a mix level per instrument use the channel volume of the channel it plays on.
+- A module without the interactive controls (libopenmpt always has them for the formats it plays) returns `FA_ERROR_NOT_IMPLEMENTED`.
+
+```c
+fa_stream_set_tracker_tempo(song, 150.0);                  /* the song's own tempo */
+fa_stream_set_tracker_channel_volume(song, 2, 0.25);       /* quiet channel 2 */
+fa_stream_set_tracker_instrument_mute(song, 5, 1);         /* no drums */
+fa_stream_set_tracker_param(song, FA_TRACKER_AMPLIFY, 300);   /* +3 dB */
+```
+
+```csharp
+song.TrackerTempo = 150;
+song.SetTrackerChannelVolume(2, 0.25);
+song.SetTrackerInstrumentMuted(5, true);
+song.TrackerAmplificationDb = 3;
+```
+
+### The order list
+
+`fa_stream_get_tracker_orders` gives the pattern played at each order (`BASS_TAG_MUSIC_ORDERS`); call it with capacity 0 to ask for the count. 65534 is a skipped order ("+++") and 65535 the end of the song ("---"). With the pattern names from `FA_TRACKER_TEXT_PATTERN` and the time of each order from `fa_stream_get_tracker_time` this is a full pattern jump list.
+
+```c
+uint32_t count, patterns[256];
+fa_stream_get_tracker_orders(song, patterns, 256, &count);
+```
+
+```csharp
+IReadOnlyList<int> patterns = song.GetTrackerOrders();
+```
+
+### Instrument and sync events
+
+`FA_TRACKER_CELL_EVENTS` (.NET `TrackerCellEvents`) picks what is reported as the rows are heard, read from the pattern data:
+
+- bit 1, `FA_EVENT_TRACKER_INSTRUMENT` (.NET `TrackerInstrumentPlayed`; replaces `BASS_SYNC_MUSICINST`): a note with an instrument number. `value` is `channel << 16 | instrument`, the instrument 0-based. A note without an instrument number (it plays the channel's last one) and an instrument number without a note do not count.
+- bit 2, `FA_EVENT_TRACKER_SYNC` (.NET `TrackerSyncReached`; replaces `BASS_SYNC_MUSICFX`): the `Zxx` command (IT, S3M and the other formats libopenmpt reads it from). `value` is `channel << 16 | xx`. MOD and XM have no `Zxx`; the command is meant for songs that carry cues for the app.
+
+The event's `frame` is the first frame of the row. Like the row events they are raised as the audio is mixed and are best effort (see [events](events.md)); a row with more than 256 such cells loses the rest. In [reverse playback](tempo-pitch.md#reverse-playback) they come last first, with the rows. Only rows decoded after the setting is turned on report cells.
+
+```c
+fa_stream_set_tracker_param(song, FA_TRACKER_CELL_EVENTS, 3);   /* both */
+/* in the event callback */
+if (ev->type == FA_EVENT_TRACKER_SYNC && (ev->value & 0xFFFF) == 0x42) { /* a cue */ }
+```
+
+```csharp
+song.TrackerCellEvents = TrackerCellEvents.Instruments | TrackerCellEvents.Sync;
+song.TrackerInstrumentPlayed += (_, e) => Light(e.Channel, e.Value);   // e.Value: the instrument
+song.TrackerSyncReached += (_, e) => { if (e.Value == 0x42) Cue(); };
+```
+
 ## Subsongs
 
 Some modules hold several songs. They are the stream's audio tracks: `fa_stream_info.audio_track_count` is the subsong count, and `fa_open_options.audio_track` (.NET `StreamOptions.AudioTrack`) picks the one to play (0 by default). A subsong past the last returns `FA_ERROR_NOT_FOUND` from the open. `fa_tracker_info.subsong` (.NET `TrackerInfo.Subsong`) says which one plays, the names are in `FA_TRACKER_TEXT_SUBSONG` (.NET `TrackerInfo.Subsongs`), and the restart position and the duration are the playing subsong's.
@@ -229,9 +299,9 @@ Console.WriteLine($"{tags.Title} / {tags.Artist}");
 
 ## Limits and pitfalls
 
-- Files over **128 MB** are refused with `FA_ERROR_UNSUPPORTED_FORMAT`; a module is read into memory before it opens, and libopenmpt keeps what it needs.
+- Files over **128 MB** are refused with `FA_ERROR_UNSUPPORTED_FORMAT`. libopenmpt reads the file through the stream's source while it opens, so the file is not held twice in memory (a module from memory, from your own I/O callbacks or from a URL works the same).
 - A song longer than 6 hours is cut at 6 hours. A file libopenmpt reads with no playable length fails to open.
 - Output is always stereo; there is no surround mode.
 - Streams that are not modules return `FA_ERROR_INVALID_ARG` from every tracker call.
 - libopenmpt renders differently from BASS's own MOD player (resampling, filtering, levels), so a song does not sound bit for bit as it did.
-- Not available yet 🗓️: the live module controls BASS has as `BASS_ATTRIB_MUSIC_*` (tempo, speed, per-channel and per-instrument volume). See the [BASS migration table](../migration/bass.md#tracker-music).
+- There is no volume per instrument (libopenmpt has none): use the instrument mute, or the volume of the channel it plays on. See the [BASS migration table](../migration/bass.md#tracker-music).

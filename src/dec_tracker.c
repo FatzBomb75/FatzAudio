@@ -38,19 +38,29 @@
 #define FA_TRACKER_MAX_FILE ((size_t)128 << 20)
 #define FA_TRACKER_MAX_SECONDS (6.0 * 3600.0)
 #define FA_TRACKER_MUTE_CHANNELS 64
+#define FA_TRACKER_AMPLIFY_MIN (-6000)   /* millibel */
+#define FA_TRACKER_AMPLIFY_MAX 6000
 #define FA_TRACKER_STEP 64          /* row starts are noted to within this many frames */
 #define FA_TRACKER_ROWS 4096        /* row log entries (a power of two) */
 #define FA_TRACKER_RUNS 8           /* runs kept (seeks) */
 #define FA_TRACKER_NEW_ORDER ((int64_t)1 << 32)
 
 typedef struct fa_tracker_row { fa_atomic64 tag, frame, value; } fa_tracker_row;   /* value: order << 16 | row, + NEW_ORDER */
+/* An instrument or sync event of a row: value = run << 48 | kind << 32 | channel << 16 | data. */
+#define FA_TRACKER_CELLS 2048       /* cell event entries kept (a power of two) */
+#define FA_TRACKER_KIND_INSTRUMENT 1
+#define FA_TRACKER_KIND_SYNC 2
+#define FA_TRACKER_CMD_MIDI 31      /* libopenmpt's internal command for the Zxx macro (IT, S3M) */
+#define FA_TRACKER_NOTE_MAX 128
+typedef struct fa_tracker_cell { fa_atomic64 tag, frame, value; } fa_tracker_cell;
 typedef struct fa_tracker_run { fa_atomic64 tag, first, start, end; } fa_tracker_run;
 
 struct fa_tracker {
     openmpt_module_ext* ext;
     openmpt_module* mod;
     openmpt_module_ext_interface_interactive interactive;
-    int has_interactive;
+    openmpt_module_ext_interface_interactive3 interactive3;
+    int has_interactive, has_interactive3;
     uint32_t rate;
     fa_frames length;
     fa_frames pos;              /* frames handed out (the stream position) */
@@ -65,16 +75,24 @@ struct fa_tracker {
     uint32_t name_count[FA_TRACKER_TEXT_SUBSONG + 1];
 
     /* Set by the API, applied by the decode thread. */
-    fa_atomic32 interpolation, separation, ramping, amiga;
+    fa_atomic32 interpolation, separation, ramping, amiga, amplify;
     fa_atomic64 mute;           /* bit n = channel n */
-    int32_t interpolation_now, separation_now, ramping_now, amiga_now;
+    int32_t interpolation_now, separation_now, ramping_now, amiga_now, amplify_now;
     uint64_t mute_now;
     fa_atomic32 row_events;     /* FA_TRACKER_ROW_EVENTS */
+    fa_atomic32 cell_events;    /* FA_TRACKER_CELL_EVENTS */
+
+    /* Channel volumes set by the API (under the stream's decode_lock): a seek
+     * puts the module back in its own state at the target, so they are set again. */
+    double chan_vol[FA_TRACKER_MUTE_CHANNELS];
+    uint64_t chan_vol_set;      /* bit n = channel n has one */
 
     /* Row log (see the top). */
     fa_tracker_row rows[FA_TRACKER_ROWS];
     fa_tracker_run runs[FA_TRACKER_RUNS];
     fa_atomic64 rows_w, runs_w;
+    fa_tracker_cell cells[FA_TRACKER_CELLS];   /* instrument and sync events of the rows, in the same runs */
+    fa_atomic64 cells_w;
     int64_t last_value;         /* the run's last entry, -1 = none yet */
     int log_after;              /* at open: note the first row after the first read */
 
@@ -134,6 +152,40 @@ static void grid_note(struct fa_tracker* t, fa_frames frame)
     g->rows_per_beat = rpb > 0 ? rpb : 4;
 }
 
+/* Instrument and sync events of the row libopenmpt is on (FA_TRACKER_CELL_EVENTS), read
+ * from the pattern data: a note with an instrument number, and the Zxx macro command. */
+static void note_cell(struct fa_tracker* t, fa_frames frame, int kind, int32_t channel, int32_t data)
+{
+    int64_t i = fa_load64(&t->cells_w);
+    fa_tracker_cell* e = &t->cells[i & (FA_TRACKER_CELLS - 1)];
+    fa_store64(&e->tag, -1);
+    fa_store64(&e->frame, frame);
+    fa_store64(&e->value, (int64_t)((uint64_t)((fa_load64(&t->runs_w) - 1) & 0xFFFF) << 48) | (int64_t)kind << 32 |
+                              (int64_t)(channel & 0xFFFF) << 16 | (data & 0xFFFF));
+    fa_store64(&e->tag, i);
+    fa_store64(&t->cells_w, i + 1);
+}
+
+static void note_cells(struct fa_tracker* t, fa_frames frame)
+{
+    int32_t mask = fa_load32(&t->cell_events), pat, row, ch, n;
+    if (!mask) return;
+    pat = openmpt_module_get_current_pattern(t->mod);
+    row = openmpt_module_get_current_row(t->mod);
+    n = (int32_t)t->info.channels;
+    for (ch = 0; ch < n; ch++) {
+        if (mask & 1) {
+            int32_t instr = openmpt_module_get_pattern_row_channel_command(t->mod, pat, row, ch, OPENMPT_MODULE_COMMAND_INSTRUMENT);
+            int32_t note = instr ? openmpt_module_get_pattern_row_channel_command(t->mod, pat, row, ch, OPENMPT_MODULE_COMMAND_NOTE) : 0;
+            if (instr && note >= 1 && note <= FA_TRACKER_NOTE_MAX) note_cell(t, frame, FA_TRACKER_KIND_INSTRUMENT, ch, instr - 1);
+        }
+        if ((mask & 2) &&
+            openmpt_module_get_pattern_row_channel_command(t->mod, pat, row, ch, OPENMPT_MODULE_COMMAND_EFFECT) == FA_TRACKER_CMD_MIDI)
+            note_cell(t, frame, FA_TRACKER_KIND_SYNC, ch,
+                      openmpt_module_get_pattern_row_channel_command(t->mod, pat, row, ch, OPENMPT_MODULE_COMMAND_PARAMETER));
+    }
+}
+
 /* The row playing at `frame` (libopenmpt's current one), noted if it is new. */
 static void log_row(struct fa_tracker* t, fa_frames frame)
 {
@@ -157,6 +209,7 @@ static void log_row(struct fa_tracker* t, fa_frames frame)
     fa_store64(&e->tag, i);
     fa_store64(&t->rows_w, i + 1);
     t->last_value = v;
+    note_cells(t, frame);
     if (t->grid_on) grid_note(t, frame);
 }
 
@@ -180,7 +233,7 @@ static int read_row(const struct fa_tracker* t, int64_t i, fa_frames* frame, int
     return fa_load64(&e->tag) == i;
 }
 
-typedef struct run_view { int64_t first, last; fa_frames start, end; } run_view;
+typedef struct run_view { int64_t first, last, k; fa_frames start, end; } run_view;
 
 /* The newest run that decoded `frame`, with entries in it, as its entry range. */
 static int find_run(const struct fa_tracker* t, fa_frames frame, run_view* out)
@@ -198,6 +251,7 @@ static int find_run(const struct fa_tracker* t, fa_frames frame, run_view* out)
         if (start <= frame && frame < end && next > f) {
             out->first = f > rw - FA_TRACKER_ROWS + 1 ? f : rw - FA_TRACKER_ROWS + 1;
             out->last = next - 1;
+            out->k = k;
             out->start = start;
             out->end = end;
             if (out->last >= out->first) return 1;
@@ -261,6 +315,54 @@ uint32_t fa_tracker_rows_in(const struct fa_tracker* t, fa_frames from, fa_frame
     return n;
 }
 
+int fa_tracker_cell_events_on(const struct fa_tracker* t)
+{
+    return fa_load32((fa_atomic32*)&t->cell_events) != 0;
+}
+
+/* The instrument and sync events of the rows starting in [from, to) (values: kind << 32 |
+ * channel << 16 | data), from the newest run that decoded each stretch, like rows_in. */
+uint32_t fa_tracker_cells_in(const struct fa_tracker* t, fa_frames from, fa_frames to, fa_frames* frames,
+                             int64_t* values, uint32_t cap)
+{
+    uint32_t n = 0;
+    if (fa_load32((fa_atomic32*)&t->cell_events) == 0) return 0;
+    while (from < to && n < cap) {
+        run_view rv;
+        int64_t w = fa_load64((fa_atomic64*)&t->cells_w), i, lo = w;
+        fa_frames stop;
+        if (!find_run(t, from, &rv)) break;
+        stop = rv.end < to ? rv.end : to;
+        /* Entries of one run are contiguous, in frame order: back to the first one at or after `from`. */
+        for (i = w - 1; i >= 0 && i >= w - FA_TRACKER_CELLS; i--) {
+            fa_tracker_cell* e = (fa_tracker_cell*)&t->cells[i & (FA_TRACKER_CELLS - 1)];
+            int64_t f, v;
+            int16_t d;
+            if (fa_load64(&e->tag) != i) break;
+            f = fa_load64(&e->frame);
+            v = fa_load64(&e->value);
+            if (fa_load64(&e->tag) != i) break;
+            d = (int16_t)(((v >> 48) - rv.k) & 0xFFFF);
+            if (d > 0) continue;       /* a newer run */
+            if (d < 0 || f < from) break;
+            lo = i;
+        }
+        for (i = lo; i < w && n < cap; i++) {
+            fa_tracker_cell* e = (fa_tracker_cell*)&t->cells[i & (FA_TRACKER_CELLS - 1)];
+            int64_t f, v;
+            if (fa_load64(&e->tag) != i) break;
+            f = fa_load64(&e->frame);
+            v = fa_load64(&e->value);
+            if (fa_load64(&e->tag) != i) break;
+            if ((int16_t)(((v >> 48) - rv.k) & 0xFFFF) != 0 || f >= stop) break;
+            frames[n] = f;
+            values[n++] = v & 0xFFFFFFFFFFLL;
+        }
+        from = stop;
+    }
+    return n;
+}
+
 struct fa_tracker* fa_tracker_of(fa_decoder* dec)
 {
     return dec && dec->vt == &fa_decoder_tracker ? (struct fa_tracker*)dec->impl : NULL;
@@ -301,13 +403,34 @@ int fa_probe_tracker(const uint8_t* data, size_t size, size_t id3_size)
     return 0;
 }
 
-static fa_result read_source(fa_source* src, uint8_t** out, size_t* out_size)
+/* libopenmpt reads the file through the source itself (seeking as it needs), so the
+ * whole file is never held a second time next to what libopenmpt keeps. */
+typedef struct src_ctx { fa_source* src; fa_result err; } src_ctx;   /* err: the first read error */
+
+static size_t src_read(void* stream, void* dst, size_t bytes)
 {
-    *out = NULL;
-    *out_size = 0;
-    /* A live or unknown-length source is never a module, and a weak probe
-     * (no magic number) is checked again with the real file size before the
-     * whole file is read. */
+    src_ctx* c = (src_ctx*)stream;
+    int64_t got = fa_source_read(c->src, dst, bytes);
+    if (got < 0 && c->err == FA_OK) c->err = (fa_result)got;
+    return got > 0 ? (size_t)got : 0;
+}
+
+static int src_seek(void* stream, int64_t offset, int whence)
+{
+    fa_source* src = ((src_ctx*)stream)->src;
+    int64_t base = whence == OPENMPT_STREAM_SEEK_CUR ? fa_source_tell(src) : whence == OPENMPT_STREAM_SEEK_END ? src->length : 0;
+    if (whence != OPENMPT_STREAM_SEEK_SET && whence != OPENMPT_STREAM_SEEK_CUR && whence != OPENMPT_STREAM_SEEK_END) return -1;
+    if (base < 0 || offset < -base || offset > src->length - base) return -1;
+    return fa_source_seek(src, base + offset) == FA_OK ? 0 : -1;
+}
+
+static int64_t src_tell(void* stream) { return fa_source_tell(((src_ctx*)stream)->src); }
+
+/* Checks that the source is a module (a weak probe is checked again with the real file
+ * size) and leaves it at the start. */
+static fa_result check_source(fa_source* src)
+{
+    /* A live or unknown-length source is never a module. */
     if (src->length <= 0 || src->length > (int64_t)FA_TRACKER_MAX_FILE) return FA_ERROR_UNSUPPORTED_FORMAT;
     {
         uint8_t head[4096];
@@ -325,7 +448,7 @@ static fa_result read_source(fa_source* src, uint8_t** out, size_t* out_size)
         if (pr != OPENMPT_PROBE_FILE_HEADER_RESULT_SUCCESS) return FA_ERROR_UNSUPPORTED_FORMAT;
         if (fa_source_seek(src, 0) != FA_OK) return FA_ERROR_NOT_SEEKABLE;
     }
-    return fa_source_read_rest(src, FA_TRACKER_MAX_FILE, out, out_size);
+    return FA_OK;
 }
 
 /* `in` (UTF-8, from libopenmpt) into `out`, cut at a character boundary. */
@@ -424,6 +547,11 @@ static void take_controls(struct fa_tracker* t)
         openmpt_module_ctl_set_boolean(t->mod, "render.resampler.emulate_amiga", v);
         t->amiga_now = v;
     }
+    v = fa_load32(&t->amplify);
+    if (v != t->amplify_now) {
+        openmpt_module_set_render_param(t->mod, OPENMPT_MODULE_RENDER_MASTERGAIN_MILLIBEL, v);
+        t->amplify_now = v;
+    }
     mute = (uint64_t)fa_load64(&t->mute);
     if (mute != t->mute_now && t->has_interactive) {
         int32_t ch;
@@ -503,6 +631,11 @@ static fa_result tracker_seek(fa_decoder* dec, fa_frames frame)
         if (from > frame) from = frame;   /* not reached: the start is after it (cannot happen at 0) */
     }
     t->pos = from;
+    if (t->has_interactive && t->chan_vol_set) {
+        int32_t ch;
+        for (ch = 0; ch < FA_TRACKER_MUTE_CHANNELS && ch < (int32_t)t->info.channels; ch++)
+            if ((t->chan_vol_set >> ch) & 1) t->interactive.set_channel_volume(t->ext, ch, t->chan_vol[ch]);
+    }
     log_start(t, from);
     /* On to the exact frame, without handing anything out. */
     while (t->pos < frame) {
@@ -528,25 +661,36 @@ static void tracker_close(fa_decoder* dec)
 static fa_result tracker_open(fa_decoder* dec)
 {
     struct fa_tracker* t;
-    uint8_t* bytes;
-    size_t size;
+    openmpt_stream_callbacks cb;
+    src_ctx ctx;
     int err = 0;
     double duration;
     const char* s;
-    fa_result r = read_source(dec->src, &bytes, &size);
+    fa_result r = check_source(dec->src);
     if (r != FA_OK) return r;
     t = (struct fa_tracker*)calloc(1, sizeof(*t));
-    if (!t) { free(bytes); return FA_ERROR_OUT_OF_MEMORY; }
-    t->ext = openmpt_module_ext_create_from_memory(bytes, size, openmpt_log_func_silent, NULL, openmpt_error_func_store,
-                                                   &err, &err, NULL, NULL);
-    free(bytes);   /* libopenmpt keeps its own copy of what it needs */
+    if (!t) return FA_ERROR_OUT_OF_MEMORY;
+    cb.read = src_read;
+    cb.seek = src_seek;
+    cb.tell = src_tell;
+    ctx.src = dec->src;
+    ctx.err = FA_OK;
+    t->ext = openmpt_module_ext_create(cb, &ctx, openmpt_log_func_silent, NULL, openmpt_error_func_store,
+                                       &err, &err, NULL, NULL);
+    if (t->ext && ctx.err != FA_OK) {   /* a read failed but libopenmpt carried on with what it had */
+        openmpt_module_ext_destroy(t->ext);
+        t->ext = NULL;
+    }
     if (!t->ext) {
         free(t);
+        if (ctx.err != FA_OK) return ctx.err;
         return err == OPENMPT_ERROR_OUT_OF_MEMORY ? FA_ERROR_OUT_OF_MEMORY : FA_ERROR_UNSUPPORTED_FORMAT;
     }
     t->mod = openmpt_module_ext_get_module(t->ext);
     t->has_interactive = openmpt_module_ext_get_interface(t->ext, LIBOPENMPT_EXT_C_INTERFACE_INTERACTIVE,
                                                           &t->interactive, sizeof(t->interactive)) != 0;
+    t->has_interactive3 = openmpt_module_ext_get_interface(t->ext, LIBOPENMPT_EXT_C_INTERFACE_INTERACTIVE3,
+                                                           &t->interactive3, sizeof(t->interactive3)) != 0;
     t->rate = dec->midi_rate ? dec->midi_rate : FA_MIDI_DEFAULT_RATE;
     openmpt_module_set_repeat_count(t->mod, 0);
     /* Subsongs are the stream's audio tracks (fa_open_options.audio_track). A
@@ -578,6 +722,7 @@ static fa_result tracker_open(fa_decoder* dec)
     fa_store32(&t->separation, 100);
     fa_store32(&t->ramping, -1);
     fa_store32(&t->amiga, 0);
+    fa_store32(&t->amplify, 0);
     fa_store64(&t->mute, 0);
 
     t->info.struct_size = sizeof(t->info);
@@ -709,6 +854,14 @@ FA_API fa_result FA_CALL fa_stream_set_tracker_param(fa_stream* stream, fa_track
         if (value < 0 || value > 2) return FA_ERROR_INVALID_ARG;
         fa_store32(&t->row_events, value);
         return FA_OK;
+    case FA_TRACKER_AMPLIFY:
+        if (value < FA_TRACKER_AMPLIFY_MIN || value > FA_TRACKER_AMPLIFY_MAX) return FA_ERROR_INVALID_ARG;
+        fa_store32(&t->amplify, value);
+        return FA_OK;
+    case FA_TRACKER_CELL_EVENTS:
+        if (value < 0 || value > 3) return FA_ERROR_INVALID_ARG;
+        fa_store32(&t->cell_events, value);
+        return FA_OK;
     default:
         return FA_ERROR_INVALID_ARG;
     }
@@ -724,6 +877,8 @@ FA_API fa_result FA_CALL fa_stream_get_tracker_param(fa_stream* stream, fa_track
     case FA_TRACKER_VOLUME_RAMPING: *out_value = fa_load32(&t->ramping); return FA_OK;
     case FA_TRACKER_AMIGA_RESAMPLER: *out_value = fa_load32(&t->amiga); return FA_OK;
     case FA_TRACKER_ROW_EVENTS: *out_value = fa_load32(&t->row_events); return FA_OK;
+    case FA_TRACKER_AMPLIFY: *out_value = fa_load32(&t->amplify); return FA_OK;
+    case FA_TRACKER_CELL_EVENTS: *out_value = fa_load32(&t->cell_events); return FA_OK;
     default: return FA_ERROR_INVALID_ARG;
     }
 }
@@ -767,6 +922,148 @@ FA_API fa_result FA_CALL fa_stream_get_tracker_channel_mute(fa_stream* stream, u
         channel >= FA_TRACKER_MUTE_CHANNELS)
         return FA_ERROR_INVALID_ARG;
     *out_muted = (int32_t)(((uint64_t)fa_load64(&stream->tracker->mute) >> channel) & 1);
+    return FA_OK;
+}
+
+/* ---- Live module controls ------------------------------------------------------- */
+
+/* These change the module's own state, so they take the stream's decode lock; they are
+ * heard after the decode-ahead buffer. */
+
+static struct fa_tracker* live_of(fa_stream* stream) { return stream ? stream->tracker : NULL; }
+
+FA_API fa_result FA_CALL fa_stream_set_tracker_tempo(fa_stream* stream, double bpm)
+{
+    struct fa_tracker* t = live_of(stream);
+    int ok;
+    if (!t || !(bpm >= 32.0 && bpm <= 512.0)) return FA_ERROR_INVALID_ARG;
+    if (!t->has_interactive3) return FA_ERROR_NOT_IMPLEMENTED;
+    fa_mutex_lock(&stream->decode_lock);
+    ok = t->interactive3.set_current_tempo2(t->ext, bpm);
+    fa_mutex_unlock(&stream->decode_lock);
+    return ok ? FA_OK : FA_ERROR_INVALID_ARG;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_tracker_tempo(fa_stream* stream, double* out_bpm)
+{
+    struct fa_tracker* t = live_of(stream);
+    if (!t || !out_bpm) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&stream->decode_lock);
+    *out_bpm = openmpt_module_get_current_tempo2(t->mod);
+    fa_mutex_unlock(&stream->decode_lock);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_set_tracker_speed(fa_stream* stream, int32_t ticks_per_row)
+{
+    struct fa_tracker* t = live_of(stream);
+    int ok;
+    if (!t || ticks_per_row < 1 || ticks_per_row > 255) return FA_ERROR_INVALID_ARG;
+    if (!t->has_interactive) return FA_ERROR_NOT_IMPLEMENTED;
+    fa_mutex_lock(&stream->decode_lock);
+    ok = t->interactive.set_current_speed(t->ext, ticks_per_row);
+    fa_mutex_unlock(&stream->decode_lock);
+    return ok ? FA_OK : FA_ERROR_INVALID_ARG;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_tracker_speed(fa_stream* stream, int32_t* out_ticks_per_row)
+{
+    struct fa_tracker* t = live_of(stream);
+    if (!t || !out_ticks_per_row) return FA_ERROR_INVALID_ARG;
+    fa_mutex_lock(&stream->decode_lock);
+    *out_ticks_per_row = openmpt_module_get_current_speed(t->mod);
+    fa_mutex_unlock(&stream->decode_lock);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_set_tracker_global_volume(fa_stream* stream, double volume)
+{
+    struct fa_tracker* t = live_of(stream);
+    int ok;
+    if (!t || !(volume >= 0.0 && volume <= 1.0)) return FA_ERROR_INVALID_ARG;
+    if (!t->has_interactive) return FA_ERROR_NOT_IMPLEMENTED;
+    fa_mutex_lock(&stream->decode_lock);
+    ok = t->interactive.set_global_volume(t->ext, volume);
+    fa_mutex_unlock(&stream->decode_lock);
+    return ok ? FA_OK : FA_ERROR_INVALID_ARG;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_tracker_global_volume(fa_stream* stream, double* out_volume)
+{
+    struct fa_tracker* t = live_of(stream);
+    if (!t || !out_volume) return FA_ERROR_INVALID_ARG;
+    if (!t->has_interactive) return FA_ERROR_NOT_IMPLEMENTED;
+    fa_mutex_lock(&stream->decode_lock);
+    *out_volume = t->interactive.get_global_volume(t->ext);
+    fa_mutex_unlock(&stream->decode_lock);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_set_tracker_channel_volume(fa_stream* stream, uint32_t channel, double volume)
+{
+    struct fa_tracker* t = live_of(stream);
+    int ok;
+    if (!t || channel >= t->info.channels || channel >= FA_TRACKER_MUTE_CHANNELS || !(volume >= 0.0 && volume <= 1.0))
+        return FA_ERROR_INVALID_ARG;
+    if (!t->has_interactive) return FA_ERROR_NOT_IMPLEMENTED;
+    fa_mutex_lock(&stream->decode_lock);
+    ok = t->interactive.set_channel_volume(t->ext, (int32_t)channel, volume);
+    if (ok) {
+        t->chan_vol[channel] = volume;
+        t->chan_vol_set |= (uint64_t)1 << channel;
+    }
+    fa_mutex_unlock(&stream->decode_lock);
+    return ok ? FA_OK : FA_ERROR_INVALID_ARG;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_tracker_channel_volume(fa_stream* stream, uint32_t channel, double* out_volume)
+{
+    struct fa_tracker* t = live_of(stream);
+    if (!t || !out_volume || channel >= t->info.channels || channel >= FA_TRACKER_MUTE_CHANNELS) return FA_ERROR_INVALID_ARG;
+    if (!t->has_interactive) return FA_ERROR_NOT_IMPLEMENTED;
+    fa_mutex_lock(&stream->decode_lock);
+    *out_volume = t->interactive.get_channel_volume(t->ext, (int32_t)channel);
+    fa_mutex_unlock(&stream->decode_lock);
+    return FA_OK;
+}
+
+/* Instruments, or the samples of a module without instruments (MOD, S3M). */
+static uint32_t instrument_count(const struct fa_tracker* t) { return t->info.instruments ? t->info.instruments : t->info.samples; }
+
+FA_API fa_result FA_CALL fa_stream_set_tracker_instrument_mute(fa_stream* stream, uint32_t instrument, int32_t muted)
+{
+    struct fa_tracker* t = live_of(stream);
+    if (!t || instrument >= instrument_count(t)) return FA_ERROR_INVALID_ARG;
+    if (!t->has_interactive) return FA_ERROR_NOT_IMPLEMENTED;
+    fa_mutex_lock(&stream->decode_lock);
+    t->interactive.set_instrument_mute_status(t->ext, (int32_t)instrument, muted ? 1 : 0);
+    fa_mutex_unlock(&stream->decode_lock);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_tracker_instrument_mute(fa_stream* stream, uint32_t instrument, int32_t* out_muted)
+{
+    struct fa_tracker* t = live_of(stream);
+    if (!t || !out_muted || instrument >= instrument_count(t)) return FA_ERROR_INVALID_ARG;
+    if (!t->has_interactive) return FA_ERROR_NOT_IMPLEMENTED;
+    fa_mutex_lock(&stream->decode_lock);
+    *out_muted = t->interactive.get_instrument_mute_status(t->ext, (int32_t)instrument) ? 1 : 0;
+    fa_mutex_unlock(&stream->decode_lock);
+    return FA_OK;
+}
+
+FA_API fa_result FA_CALL fa_stream_get_tracker_orders(fa_stream* stream, uint32_t* patterns, uint32_t capacity,
+                                                      uint32_t* out_count)
+{
+    struct fa_tracker* t = live_of(stream);
+    uint32_t i;
+    if (out_count) *out_count = 0;
+    if (!t || !out_count || (capacity && !patterns)) return FA_ERROR_INVALID_ARG;
+    *out_count = t->info.orders;
+    for (i = 0; i < capacity && i < t->info.orders; i++) {
+        int32_t p = openmpt_module_get_order_pattern(t->mod, (int32_t)i);
+        patterns[i] = p < 0 ? 0xFFFFu : (uint32_t)p;
+    }
     return FA_OK;
 }
 

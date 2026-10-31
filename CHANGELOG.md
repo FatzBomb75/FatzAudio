@@ -23,6 +23,16 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- Tracker parity (extras step 18): the module's own live state, as `BASS_ATTRIB_MUSIC_*` had it. `fa_stream_set_tracker_tempo` /
+  `_get_` and `fa_stream_set_tracker_speed` / `_get_` (the song's tempo and speed, not a time-stretch),
+  `fa_stream_set_tracker_global_volume`, `fa_stream_set_tracker_channel_volume` (kept through seeks),
+  `fa_stream_set_tracker_instrument_mute`, `FA_TRACKER_AMPLIFY` (millibel), `fa_stream_get_tracker_orders` (the order list),
+  and `FA_TRACKER_CELL_EVENTS` with the new events `FA_EVENT_TRACKER_INSTRUMENT` (a note with an instrument) and
+  `FA_EVENT_TRACKER_SYNC` (the `Zxx` command). A module is now read by libopenmpt through the stream's source, so the
+  file is no longer held in memory twice while it opens. .NET: `TrackerTempo`, `TrackerSpeed`, `TrackerGlobalVolume`,
+  `SetTrackerChannelVolume` / `GetTrackerChannelVolume`, `SetTrackerInstrumentMuted` / `IsTrackerInstrumentMuted`,
+  `TrackerAmplificationDb`, `GetTrackerOrders`, `TrackerCellEvents`, `TrackerInstrumentPlayed`, `TrackerSyncReached`.
+  See [docs/features/trackers.md](docs/features/trackers.md#module-tempo-volumes-and-the-order-list).
 - MIDI GS/XG effects A (extras step 6): the GS reverb pre-delay (`40 01 37`), chorus send to reverb (GS `3F`, XG `2E`)
   and to delay (`40`), the SC-88 delay (`40 01 50`-`5A`: macros, three taps, feedback, send to reverb) with CC94 and the
   part delay send as its send, the XG chorus's LFO frequency, depth, feedback and delay offset (`02 01 22`-`25`), and the
