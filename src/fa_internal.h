@@ -305,10 +305,31 @@ void fa_midi_fx_process(fa_midi_fx* fx, const float* reverb_in, const float* cho
 /* Where the third effect's input comes from now: -2 nowhere (no third effect), -1 the
  * CC94 send bus, 0-15 that MIDI part's whole sound (XG insertion). */
 int fa_midi_fx_route(const fa_midi_fx* fx);
-/* XG insertion: the part's dry sound `in` through the variation, mixed by its dry/wet
- * setting, added to `out` and, at the part's sends rs and cs, to the reverb and chorus
- * buses (before process). Nothing when the route is not a part. */
-void fa_midi_fx_insert(fa_midi_fx* fx, const float* in, float* out, float* reverb, float* chorus, float rs, float cs, int frames, fa_frames song_frame);
+/* Insertion effects. chain: the blocks a part's whole sound goes through now, one bit
+ * each, in this order: XG insertion 1, insertion 2, the XG variation in insertion mode,
+ * the GS EFX; 0 for none (the part plays as usual, with its sends). */
+enum { FA_MIDI_CHAIN_INS1 = 1, FA_MIDI_CHAIN_INS2 = 2, FA_MIDI_CHAIN_VAR = 4, FA_MIDI_CHAIN_EFX = 8, FA_MIDI_CHAINS = 15 };
+int fa_midi_fx_chain(const fa_midi_fx* fx, int ch);
+/* The dry sound `in` of the parts with that chain through its blocks (each mixed by
+ * its dry/wet setting), added to `out` and, at rs, cs and vs, to the reverb, chorus and
+ * CC94 buses (before process; var may be NULL). insert_sends gives those levels: the
+ * part's CC91/93/94 (CC94 only to a system-mode variation or the GS delay), or the GS
+ * EFX's own send levels. */
+void fa_midi_fx_insert(fa_midi_fx* fx, int chain, const float* in, float* out, float* reverb, float* chorus, float* var,
+                       float rs, float cs, float vs, int frames, fa_frames song_frame);
+void fa_midi_fx_insert_sends(const fa_midi_fx* fx, int chain, int cc91, int cc93, int cc94, float* rs, float* cs, float* vs);
+/* XG insertion block k (0, 1): 03 0k `addr` (type 00-01, parameters 1-10 02-0B and as
+ * two bytes 30-43, part 0C, control depths 0D-11, parameters 11-16 20-25). GS EFX:
+ * 40 03 `addr` (type 00-01, parameters 03-16, send levels 17-19, controls 1B-1E);
+ * gs_part_efx: a part's EFX switch (40 4x 22). */
+void fa_midi_fx_xg_insertion(fa_midi_fx* fx, int k, int addr, int value);
+void fa_midi_fx_gs_efx(fa_midi_fx* fx, int addr, int value);
+void fa_midi_fx_gs_part_efx(fa_midi_fx* fx, int ch, int on);
+/* Takes the controllers the insertion effects follow, once a block: get returns a
+ * channel's controller 0-127 (0..1), FA_MIDI_CTL_PRESSURE (0..1) or FA_MIDI_CTL_BEND (-1..1). */
+enum { FA_MIDI_CTL_PRESSURE = 128, FA_MIDI_CTL_BEND = 129 };
+typedef float (*fa_midi_ctl_fn)(void* user, int ch, int src);
+void fa_midi_fx_controls(fa_midi_fx* fx, fa_midi_ctl_fn get, void* user);
 /* The chorus alone (the XG variation's chorus types). */
 void fa_midi_fx_chorus(fa_midi_fx* fx, const float* in, float* out, int frames, fa_frames song_frame);
 /* The reverb alone, with its own tuning (the DJ mixer's mic reverb): room is the comb
@@ -341,6 +362,40 @@ int fa_midi_var_dry_wet(const fa_midi_var* v);
 void fa_midi_var_gs(fa_midi_var* v, int addr, int value);
 int fa_midi_var_gs_get(const fa_midi_var* v, int addr);
 int fa_midi_var_process(fa_midi_var* v, const float* in, float* wet, int frames, fa_frames song_frame);
+/* Controllers on the effect (insertion): which 0 and 1 are the GS EFX's control 1 and 2
+ * (on the type's + and # parameters), 2 the XG controllers' sum (MW, bend, aftertouch,
+ * AC1/2 times their depths) on the type's controlled parameter; amount -1..1 of the
+ * parameter's range. */
+void fa_midi_var_control(fa_midi_var* v, int which, float amount);
+/* GS EFX SysEx 40 03 `addr` (00 type MSB, 01 LSB, 03-16 parameters 1-20): the block
+ * becomes the EFX (Thru first). Returns whether its type is one we play. gs_efx_get
+ * reads one back. */
+int fa_midi_var_gs_efx(fa_midi_var* v, int addr, int value);
+int fa_midi_var_gs_efx_get(const fa_midi_var* v, int addr);
+/* The insertion effect types midi_var.c's families don't cover (src/midi_efx.c,
+ * src/midi_efx_types.c): the SC-88 Pro EFX (gs = 1) and the MU100's XG additions.
+ * known: whether (msb, lsb) is a type (exact: that LSB, else any LSB of the MSB).
+ * set_type loads the type's defaults (returns 0 for none: then process does
+ * nothing); set_param takes parameter `index` (GS 0-19, XG 0-15) as its whole value.
+ * dry_wet: the XG type's dry/wet parameter, 127 when it has none (GS: 127, the type
+ * mixes its own). process writes the sound to `out` (the whole sound for GS types and
+ * XG types without dry/wet, else the wet sound) and returns 1, or 0 when there is none. */
+typedef struct fa_midi_efx fa_midi_efx;
+fa_midi_efx* fa_midi_efx_new(uint32_t rate);
+void fa_midi_efx_free(fa_midi_efx* e);
+void fa_midi_efx_reset(fa_midi_efx* e);
+int fa_midi_efx_known(int gs, int msb, int lsb, int exact);
+int fa_midi_efx_set_type(fa_midi_efx* e, int gs, int msb, int lsb);
+void fa_midi_efx_set_param(fa_midi_efx* e, int index, int value);
+int fa_midi_efx_param(const fa_midi_efx* e, int index);
+int fa_midi_efx_dry_wet(const fa_midi_efx* e);
+void fa_midi_efx_control(fa_midi_efx* e, int which, float amount);
+int fa_midi_efx_process(fa_midi_efx* e, const float* in, float* out, int frames, fa_frames song_frame);
+int fa_midi_efx_gs_count(void);
+int fa_midi_efx_xg_count(void);
+/* XG EQ tables: frequency (0-60, 20 Hz to 20 kHz in sixth octaves) and gain (52-76, dB). */
+double fa_xg_eq_hz(int v);
+double fa_xg_eq_db(int v);
 /* XG parameter tables: LFO frequency (Hz), modulation delay offset and depth (ms),
  * feedback level (1-127 as -0.98..0.98). */
 double fa_xg_lfo_hz(int v);

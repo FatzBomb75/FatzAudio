@@ -92,6 +92,8 @@ set(FA_SOURCES
     src/sf3.c
     src/midi_fx.c
     src/midi_var.c
+    src/midi_efx.c
+    src/midi_efx_types.c
     src/tinysoundfont_impl.c
     src/mdct.c
     src/push.c

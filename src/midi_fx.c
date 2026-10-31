@@ -162,6 +162,16 @@ struct fa_midi_fx {
     int var_kind;                       /* VAR_* */
     int var_on;                         /* XG: a type midi_var.c plays */
     int var_msb, var_system, var_part, var_return, var_pan, var_to_rev, var_to_cho;
+    int var_depth[4];                   /* XG 5C-5F: MW, bend, aftertouch, AC1 on the variation (insertion mode) */
+
+    /* Insertion effects: XG insertion 1 and 2 (03 0n xx), the GS EFX (40 03 xx). */
+    int ins_mode;                       /* FA_MIDI_FX_GM: none; _GS: the EFX; _XG: insertion 1 and 2 */
+    fa_midi_var* ins[2];
+    int ins_on[2], ins_msb[2], ins_part[2], ins_depth[2][5];
+    fa_midi_var* efx;
+    int efx_on, efx_send[3], efx_src[2], efx_depth[2];
+    unsigned efx_parts;                 /* the parts switched through it (40 4x 22), one bit each */
+    float sc_x[FX_CHUNK * 2];
     float sc_rin[FX_CHUNK * 2], sc_cin[FX_CHUNK * 2], sc_din[FX_CHUNK * 2];   /* inputs with what other effects send */
     float sc_cwet[FX_CHUNK * 2], sc_vwet[FX_CHUNK * 2];                      /* chorus and third effect outputs */
 };
@@ -215,6 +225,9 @@ void fa_midi_fx_free(fa_midi_fx* fx)
 {
     if (!fx) return;
     fa_midi_var_free(fx->var);
+    fa_midi_var_free(fx->ins[0]);
+    fa_midi_var_free(fx->ins[1]);
+    fa_midi_var_free(fx->efx);
     free(fx->pre);
     free(fx->echo);
     free(fx->mem);
@@ -263,6 +276,9 @@ void fa_midi_fx_reset(fa_midi_fx* fx)
     chorus_clear(fx);
     fx->lfo_next = -1;
     fa_midi_var_reset(fx->var);
+    fa_midi_var_reset(fx->ins[0]);
+    fa_midi_var_reset(fx->ins[1]);
+    fa_midi_var_reset(fx->efx);
 }
 
 /* The one-pole lowpass of the GS pre-LPF (a: 0 is none). */
@@ -510,26 +526,115 @@ void fa_midi_fx_process(fa_midi_fx* fx, const float* reverb_in, const float* cho
     }
 }
 
-void fa_midi_fx_insert(fa_midi_fx* fx, const float* in, float* out, float* reverb, float* chorus, float rs, float cs, int frames, fa_frames song_frame)
+/* Whether block `bit` of a chain (insertion 1, 2, the variation, the EFX) plays now, and
+ * its effect: a part rendered apart while the routing changed (SysEx in the block) goes
+ * through it dry. */
+static fa_midi_var* chain_block(fa_midi_fx* fx, int bit, float* w)
 {
-    int off, n, i;
-    float w, dry;
-    if (!fx || frames <= 0) return;
-    /* Dry/wet 1..127: 64 is half each. A part rendered apart while the routing changed
-     * (SysEx in the block) is added back dry. */
-    w = fa_midi_fx_route(fx) < 0 ? 0.0f : (float)(fa_midi_var_dry_wet(fx->var) - 1) / 126.0f;
-    w = w < 0.0f ? 0.0f : w > 1.0f ? 1.0f : w;
-    dry = 1.0f - w;
+    fa_midi_var* v = NULL;
+    int on = 0;
+    switch (bit) {
+    case FA_MIDI_CHAIN_INS1: case FA_MIDI_CHAIN_INS2: {
+        int k = bit == FA_MIDI_CHAIN_INS2;
+        v = fx->ins[k];
+        on = fx->ins_mode == FA_MIDI_FX_XG && fx->ins_on[k] && fx->ins_part[k] < 16;
+        break;
+    }
+    case FA_MIDI_CHAIN_VAR: v = fx->var; on = fa_midi_fx_route(fx) >= 0; break;
+    default: v = fx->efx; on = fx->ins_mode == FA_MIDI_FX_GS && fx->efx_on; break;
+    }
+    *w = on && v ? (float)(fa_midi_var_dry_wet(v) - 1) / 126.0f : 0.0f;
+    *w = *w < 0.0f ? 0.0f : *w > 1.0f ? 1.0f : *w;
+    return v;
+}
+
+void fa_midi_fx_insert(fa_midi_fx* fx, int chain, const float* in, float* out, float* reverb, float* chorus, float* var,
+                       float rs, float cs, float vs, int frames, fa_frames song_frame)
+{
+    static const int order[4] = { FA_MIDI_CHAIN_INS1, FA_MIDI_CHAIN_INS2, FA_MIDI_CHAIN_VAR, FA_MIDI_CHAIN_EFX };
+    fa_midi_var* blk[4];
+    float w[4], dry[4];
+    int off, n, i, k;
+    if (!fx || frames <= 0 || !chain) return;
+    /* Dry/wet 1..127: 64 is half each; 127 (the GS EFX, types without a dry/wet) the effect alone. */
+    for (k = 0; k < 4; k++) {
+        w[k] = 0.0f;
+        blk[k] = (chain & order[k]) ? chain_block(fx, order[k], &w[k]) : NULL;
+        dry[k] = 1.0f - w[k];
+    }
     for (off = 0; off < frames; off += n) {
         const float* x = in + off * 2;
-        int vout;
         n = frames - off < FX_CHUNK ? frames - off : FX_CHUNK;
-        vout = w > 0.0f ? fa_midi_var_process(fx->var, x, fx->sc_vwet, n, song_frame + off) : 0;
+        for (k = 0; k < 4; k++) {
+            int vout;
+            if (!(chain & order[k])) continue;
+            vout = w[k] > 0.0f ? fa_midi_var_process(blk[k], x, fx->sc_vwet, n, song_frame + off) : 0;
+            for (i = 0; i < n * 2; i++) fx->sc_x[i] = x[i] * dry[k] + (vout ? fx->sc_vwet[i] * w[k] : 0.0f);
+            x = fx->sc_x;
+        }
         for (i = 0; i < n * 2; i++) {
-            float y = x[i] * dry + (vout ? fx->sc_vwet[i] * w : 0.0f);
+            float y = x[i];
             out[off * 2 + i] += y;
             reverb[off * 2 + i] += y * rs;
             chorus[off * 2 + i] += y * cs;
+        }
+        if (var && vs != 0.0f) for (i = 0; i < n * 2; i++) var[off * 2 + i] += x[i] * vs;
+    }
+}
+
+int fa_midi_fx_chain(const fa_midi_fx* fx, int ch)
+{
+    int m = 0, k;
+    if (!fx || ch < 0 || ch > 15) return 0;
+    if (fx->ins_mode == FA_MIDI_FX_XG)
+        for (k = 0; k < 2; k++) if (fx->ins[k] && fx->ins_on[k] && fx->ins_part[k] == ch) m |= k ? FA_MIDI_CHAIN_INS2 : FA_MIDI_CHAIN_INS1;
+    if (fa_midi_fx_route(fx) == ch) m |= FA_MIDI_CHAIN_VAR;
+    if (fx->ins_mode == FA_MIDI_FX_GS && fx->efx && fx->efx_on && (fx->efx_parts >> ch & 1u)) m |= FA_MIDI_CHAIN_EFX;
+    return m;
+}
+
+void fa_midi_fx_insert_sends(const fa_midi_fx* fx, int chain, int cc91, int cc93, int cc94, float* rs, float* cs, float* vs)
+{
+    int route = fa_midi_fx_route(fx);
+    if (chain & FA_MIDI_CHAIN_EFX) {
+        /* The EFX's own send levels in place of the parts' (SC-88 Pro). */
+        *rs = (float)fx->efx_send[0] * (0.2f / 127.0f);
+        *cs = (float)fx->efx_send[1] * (0.2f / 127.0f);
+        *vs = route == -1 ? (float)fx->efx_send[2] * (0.2f / 127.0f) : 0.0f;
+        return;
+    }
+    *rs = (float)cc91 * (0.2f / 127.0f);
+    *cs = (float)cc93 * (0.2f / 127.0f);
+    *vs = route == -1 && !(chain & FA_MIDI_CHAIN_VAR) ? (float)cc94 * (0.2f / 127.0f) : 0.0f;
+}
+
+/* The controllers' sum on a block: depths 0-127 (64: none) times the sources. */
+static float xg_amount(const int* depth, int n, int ch, fa_midi_ctl_fn get, void* user)
+{
+    static const int src[5] = { 1, FA_MIDI_CTL_BEND, FA_MIDI_CTL_PRESSURE, 16, 17 };   /* MW, bend, aftertouch, AC1, AC2 */
+    float a = 0.0f;
+    int j;
+    for (j = 0; j < n; j++) if (depth[j] != 64) a += (float)(depth[j] - 64) / 64.0f * get(user, ch, src[j]);
+    return a;
+}
+
+void fa_midi_fx_controls(fa_midi_fx* fx, fa_midi_ctl_fn get, void* user)
+{
+    int k, route;
+    if (!fx || !get) return;
+    if (fx->ins_mode == FA_MIDI_FX_XG)
+        for (k = 0; k < 2; k++)
+            if (fx->ins[k] && fx->ins_on[k] && fx->ins_part[k] < 16)
+                fa_midi_var_control(fx->ins[k], 2, xg_amount(fx->ins_depth[k], 5, fx->ins_part[k], get, user));
+    route = fa_midi_fx_route(fx);
+    if (route >= 0) fa_midi_var_control(fx->var, 2, xg_amount(fx->var_depth, 4, route, get, user));
+    if (fx->ins_mode == FA_MIDI_FX_GS && fx->efx && fx->efx_on && fx->efx_parts) {
+        int ch = 0;
+        while (!(fx->efx_parts >> ch & 1u)) ch++;   /* the lowest part switched through it */
+        for (k = 0; k < 2; k++) {
+            int s = fx->efx_src[k], code = s >= 1 && s <= 95 ? s : s == 96 ? FA_MIDI_CTL_PRESSURE : s == 97 ? FA_MIDI_CTL_BEND : -1;
+            float depth = (float)(fx->efx_depth[k] - 64) / 50.0f;
+            fa_midi_var_control(fx->efx, k, code < 0 || depth == 0.0f ? 0.0f : depth * get(user, ch, code));
         }
     }
 }
@@ -639,6 +744,7 @@ static int var_make(fa_midi_fx* fx, int kind)
 
 void fa_midi_fx_defaults(fa_midi_fx* fx, int mode)
 {
+    int k, j;
     if (!fx) return;
     fx->rev_type = GS_HALL2;
     fx->rev_time = FX_ROOM_TIME;
@@ -659,6 +765,89 @@ void fa_midi_fx_defaults(fa_midi_fx* fx, int mode)
     /* The third effect: the SC-88 delay, the XG variation, or none (GM, GM2). */
     fx->var_kind = VAR_NONE;   /* back to the reset state */
     if (mode != FA_MIDI_FX_GM) var_make(fx, mode == FA_MIDI_FX_GS ? VAR_GS : VAR_XG);
+    /* Insertion: the GS EFX (Thru, no part) or XG insertion 1 and 2 (no part), or none. */
+    fx->ins_mode = mode;
+    fx->efx_parts = 0;
+    fx->efx_send[0] = 40;
+    fx->efx_send[1] = fx->efx_send[2] = 0;
+    fx->efx_src[0] = fx->efx_src[1] = 0;
+    fx->efx_depth[0] = fx->efx_depth[1] = 64;
+    if (fx->efx) fx->efx_on = fa_midi_var_gs_efx(fx->efx, 0x00, 0);
+    for (k = 0; k < 2; k++) {
+        fx->ins_part[k] = 127;
+        fx->ins_msb[k] = 0x49;
+        for (j = 0; j < 5; j++) fx->ins_depth[k][j] = 64;
+        if (fx->ins[k]) fx->ins_on[k] = fa_midi_var_set_type(fx->ins[k], 0x49, 0);
+    }
+    for (j = 0; j < 4; j++) fx->var_depth[j] = 64;
+}
+
+/* XG insertion block `k` (Distortion, no part, after an XG reset) or the GS EFX (Thru),
+ * made when first needed. 0: no memory. */
+static int ins_make(fa_midi_fx* fx, int k)
+{
+    if (fx->ins[k]) return 1;
+    if (!(fx->ins[k] = fa_midi_var_new(fx->rate))) return 0;
+    fx->ins_on[k] = fa_midi_var_set_type(fx->ins[k], fx->ins_msb[k], 0);
+    return 1;
+}
+
+static int efx_make(fa_midi_fx* fx)
+{
+    if (fx->efx) return 1;
+    if (!(fx->efx = fa_midi_var_new(fx->rate))) return 0;
+    fx->efx_on = fa_midi_var_gs_efx(fx->efx, 0x00, 0);
+    return 1;
+}
+
+void fa_midi_fx_xg_insertion(fa_midi_fx* fx, int k, int addr, int v)
+{
+    fa_midi_var* b;
+    if (!fx || k < 0 || k > 1) return;
+    v &= 0x7F;
+    fx->ins_mode = FA_MIDI_FX_XG;
+    if (!ins_make(fx, k)) return;
+    b = fx->ins[k];
+    if (addr == 0x00 || addr == 0x01) {
+        if (addr == 0x00) fx->ins_msb[k] = v;
+        fx->ins_on[k] = fa_midi_var_set_type(b, fx->ins_msb[k], addr == 0x01 ? v : 0);
+    } else if (addr >= 0x02 && addr <= 0x0B) {
+        fa_midi_var_set_param(b, addr - 0x02, v, 0);
+    } else if (addr == 0x0C) {
+        if (v != fx->ins_part[k]) fa_midi_var_reset(b);   /* another part: from silence */
+        fx->ins_part[k] = v;
+    } else if (addr >= 0x0D && addr <= 0x11) {
+        fx->ins_depth[k][addr - 0x0D] = v;
+    } else if (addr >= 0x20 && addr <= 0x25) {
+        fa_midi_var_set_param(b, 10 + addr - 0x20, v, 0);
+    } else if (addr >= 0x30 && addr <= 0x43) {
+        fa_midi_var_set_param(b, (addr - 0x30) / 2, v, (addr - 0x30) % 2 ? 2 : 1);
+    }
+}
+
+void fa_midi_fx_gs_efx(fa_midi_fx* fx, int addr, int v)
+{
+    if (!fx) return;
+    v &= 0x7F;
+    fx->ins_mode = FA_MIDI_FX_GS;
+    if (!efx_make(fx)) return;
+    if (addr <= 0x16 && addr != 0x02) fx->efx_on = fa_midi_var_gs_efx(fx->efx, addr, v);
+    else if (addr >= 0x17 && addr <= 0x19) fx->efx_send[addr - 0x17] = v;
+    else if (addr == 0x1B || addr == 0x1D) fx->efx_src[addr == 0x1D] = v;
+    else if (addr == 0x1C || addr == 0x1E) fx->efx_depth[addr == 0x1E] = v;
+}
+
+void fa_midi_fx_gs_part_efx(fa_midi_fx* fx, int ch, int on)
+{
+    if (!fx || ch < 0 || ch > 15) return;
+    if (on) {
+        fx->ins_mode = FA_MIDI_FX_GS;
+        if (!efx_make(fx)) return;
+        fx->efx_parts |= 1u << ch;
+    } else if (fx->efx_parts & 1u << ch) {
+        fx->efx_parts &= ~(1u << ch);
+        if (!fx->efx_parts) fa_midi_var_reset(fx->efx);   /* no part left: from silence when one comes back */
+    }
 }
 
 /* GS: 40 01 30 .. 40 01 5A (reverb 30-37, chorus 38-40, delay 50-5A). */
@@ -764,11 +953,20 @@ static void xg_variation(fa_midi_fx* fx, int addr, int v)
         case 0x58: fx->var_to_rev = v; break;
         case 0x59: fx->var_to_cho = v; break;
         case 0x5A:
-            if ((v & 1) != fx->var_system) fa_midi_var_reset(fx->var);   /* rewired: from silence */
+            if ((v & 1) != fx->var_system) {   /* rewired: from silence, and the part's controllers let go */
+                fa_midi_var_reset(fx->var);
+                fa_midi_var_control(fx->var, 2, 0.0f);
+            }
             fx->var_system = v & 1;
             break;
+        case 0x5C: case 0x5D: case 0x5E: case 0x5F:   /* MW, bend, aftertouch, AC1 control depth */
+            fx->var_depth[addr - 0x5C] = v;
+            break;
         default:                            /* 5B: 0-15, 127 none */
-            if (v != fx->var_part) fa_midi_var_reset(fx->var);   /* another part: from silence */
+            if (v != fx->var_part) {   /* another part: from silence, its controllers taken next block */
+                fa_midi_var_reset(fx->var);
+                fa_midi_var_control(fx->var, 2, 0.0f);
+            }
             fx->var_part = v;
             break;
         }
@@ -804,7 +1002,7 @@ void fa_midi_fx_xg(fa_midi_fx* fx, int addr, int v)
     case 0x2C: fx->cho_level = v; break;   /* chorus return */
     case 0x2E: fx->cho_to_rev = v; return;
     default:
-        if ((addr >= 0x40 && addr <= 0x5B) || (addr >= 0x70 && addr <= 0x75)) xg_variation(fx, addr, v);
+        if ((addr >= 0x40 && addr <= 0x5F) || (addr >= 0x70 && addr <= 0x75)) xg_variation(fx, addr, v);
         return;
     }
     if (addr < 0x20) reverb_update(fx);

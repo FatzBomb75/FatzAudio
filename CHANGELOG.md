@@ -23,6 +23,18 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- MIDI GS/XG effects B, insertion effects (extras step 7): the MU100's XG insertion 1 and 2 (`03 00 xx`, `03 01 xx`:
+  type, parameters, part, MW/bend/aftertouch/AC1/AC2 depths) and the SC-88 Pro's EFX (`40 03 00`-`1E`: type,
+  parameters, send levels, control sources and depths) with each part's EFX switch (`40 4x 22`). All 64 SC-88 Pro EFX
+  types (EQs, enhancer, humanizer, drives, phaser, wah, rotary, flangers, choruses, tremolo, pan, compressor, limiter,
+  delays, reverbs, pitch shifters, 3D, lo-fi, the series, guitar/bass/keyboard multis and the parallel pairs) and the
+  MU100's 24 insertion type entries (comp/wah/touch wah with drive, pitch change, exciter, compressor, noise gate,
+  voice cancel, 2-way rotary, ensemble detune, ambience, talking modulation, lo-fi and the drive+delay chains), which
+  the XG variation now plays too, with the variation's `5C`-`5F` controls. A part can go through insertion 1, 2, the
+  variation and the EFX in turn; unknown types are dry. Files without insertion SysEx render bit for bit as before.
+  New internal files `src/midi_efx.c`, `src/midi_efx_types.c`. See
+  [docs/features/midi.md](docs/features/midi.md#insertion-effects-xg-insertion-and-gs-efx).
+
 - Tracker parity (extras step 18): the module's own live state, as `BASS_ATTRIB_MUSIC_*` had it. `fa_stream_set_tracker_tempo` /
   `_get_` and `fa_stream_set_tracker_speed` / `_get_` (the song's tempo and speed, not a time-stretch),
   `fa_stream_set_tracker_global_volume`, `fa_stream_set_tracker_channel_volume` (kept through seeks),
@@ -33,6 +45,7 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   `SetTrackerChannelVolume` / `GetTrackerChannelVolume`, `SetTrackerInstrumentMuted` / `IsTrackerInstrumentMuted`,
   `TrackerAmplificationDb`, `GetTrackerOrders`, `TrackerCellEvents`, `TrackerInstrumentPlayed`, `TrackerSyncReached`.
   See [docs/features/trackers.md](docs/features/trackers.md#module-tempo-volumes-and-the-order-list).
+
 - MIDI GS/XG effects A (extras step 6): the GS reverb pre-delay (`40 01 37`), chorus send to reverb (GS `3F`, XG `2E`)
   and to delay (`40`), the SC-88 delay (`40 01 50`-`5A`: macros, three taps, feedback, send to reverb) with CC94 and the
   part delay send as its send, the XG chorus's LFO frequency, depth, feedback and delay offset (`02 01 22`-`25`), and the

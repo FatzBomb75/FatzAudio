@@ -316,7 +316,7 @@ static void test_route(void)
     CHECK_EQ(fa_midi_fx_route(fx), -1);                 /* system */
     fa_midi_fx_xg(fx, 0x40, 0x00);
     CHECK_EQ(fa_midi_fx_route(fx), -2);                 /* no effect */
-    fa_midi_fx_xg(fx, 0x40, 0x5E);
+    fa_midi_fx_xg(fx, 0x40, 0x7E);
     CHECK_EQ(fa_midi_fx_route(fx), -2);                 /* a type we don't play */
     fa_midi_fx_xg(fx, 0x40, 0x41);
     CHECK_EQ(fa_midi_fx_route(fx), -1);
@@ -338,7 +338,7 @@ static void test_insert_mix(void)
     fa_midi_fx_defaults(fx, FA_MIDI_FX_XG);
     fa_midi_fx_xg(fx, 0x40, 0x40);   /* Thru */
     fa_midi_fx_xg(fx, 0x5B, 0);
-    fa_midi_fx_insert(fx, x, out, rev, cho, 0.5f, 0.25f, n, 0);
+    fa_midi_fx_insert(fx, FA_MIDI_CHAIN_VAR, x, out, rev, cho, NULL, 0.5f, 0.25f, 0.0f, n, 0);
     for (i = 0; i < n * 2; i++) {
         CHECK(out[i] == x[i]);
         CHECK(rev[i] == x[i] * 0.5f);
@@ -347,7 +347,7 @@ static void test_insert_mix(void)
     /* Distortion, all wet: louder than the clean sine and clipped flat on top. */
     memset(out, 0, n * 2 * sizeof(float));
     fa_midi_fx_xg(fx, 0x40, 0x49);
-    fa_midi_fx_insert(fx, x, out, rev, cho, 0.0f, 0.0f, n, 0);
+    fa_midi_fx_insert(fx, FA_MIDI_CHAIN_VAR, x, out, rev, cho, NULL, 0.0f, 0.0f, 0.0f, n, 0);
     CHECK(rms_ch(out, 0, 256, n) > 0.0);
     CHECK(fabs(rms_ch(out, 0, 256, n) - rms_ch(x, 0, 256, n)) > 0.01);
     free(x); free(out); free(rev); free(cho);
