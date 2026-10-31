@@ -27,3 +27,30 @@ ff -f lavfi -i "aevalsrc=0.5*sin(2*PI*440*t):s=8000:d=0.5" -write_id3v2 1 "$@" t
 # Matroska with a cover attachment.
 ff -f lavfi -i "$src" -c:a libopus -b:a 64k "$@" -attach cover.jpg -metadata:s:t mimetype=image/jpeg \
    -metadata:s:t filename=cover.jpg tags.mka
+
+# Synchronised lyrics (ID3v2.4 SYLT, milliseconds) and a FLAC cue sheet: mutagen (a test tool) writes them.
+ff -f lavfi -i "$src" -c:a libmp3lame -b:a 128k -id3v2_version 4 -metadata "title=Sung" sylt.mp3
+python3 - <<'PY'
+from mutagen.id3 import ID3, SYLT, Encoding
+t = ID3("sylt.mp3")
+t.add(SYLT(encoding=Encoding.UTF8, lang="eng", format=2, type=1, desc="Karaoke",
+           text=[("Hello", 1000), (" world", 1500), ("\nSecond line", 62340)]))
+t.save(v2_version=4)
+PY
+ff -f lavfi -i "$src" -c:a flac -fflags +bitexact cue.flac
+python3 - <<'PY'
+import io, struct
+from mutagen.flac import FLAC, CueSheet
+def track(number, start, isrc, indexes):
+    b = struct.pack(">QB12sB13xB", start, number, isrc, 0, len(indexes))
+    for n, off in indexes:
+        b += struct.pack(">QB3x", off, n)
+    return b
+block = struct.pack(">128sQB258xB", b"0123456789012", 88200, 0x80, 3)
+block += track(1, 0, b"USRC17607839", [(1, 0)])
+block += track(2, 22050, b"", [(0, 0), (1, 441)])
+block += track(170, 44100, b"", [])
+f = FLAC("cue.flac")
+f.cuesheet = CueSheet(io.BytesIO(block))     # mutagen parses the block too: a second reader
+f.save()
+PY
