@@ -3042,6 +3042,31 @@ static void test_cookie_jar(void)
         CHECK_STR(w.text, "Accept=*/*|Accept-Encoding=identity|X-A=1|Cookie=s=1|");
         fa_http_cookies_destroy(j);
     }
+    /* A long jar line still fits the plain-socket client's request (6 KB of cookies). */
+    {
+        char big[3100], line[3200], url[256];
+        fa_http_request req;
+        conn_fetch c;
+        memset(big, 'v', 3000);
+        big[3000] = 0;
+        j = fa_http_cookies_create();
+        snprintf(line, sizeof(line), "Set-Cookie: a=%s\r\n", big);
+        fa_http_cookies_take(j, "http://127.0.0.1/", line);
+        snprintf(line, sizeof(line), "Set-Cookie: b=%s\r\n", big);
+        fa_http_cookies_take(j, "http://127.0.0.1/", line);
+        snprintf(url, sizeof(url), "http://127.0.0.1:%d/echo-headers", g_port);
+        memset(&c, 0, sizeof(c));
+        memset(&req, 0, sizeof(req));
+        req.url = url;
+        req.range_start = -1;
+        req.proxy = "";
+        req.timeout_ms = 3000;
+        req.cookies = j;
+        CHECK_EQ(fa_http_fetch(&req, cf_head, cf_data, &c), FA_OK);
+        CHECK(c.body.p != NULL && strstr(c.body.p, "Cookie: a=vvv") != NULL && strstr(c.body.p, "; b=vvv") != NULL);
+        free(c.body.p);
+        fa_http_cookies_destroy(j);
+    }
 }
 
 /* An HLS stream behind a login redirect: the cookies the redirect and the playlist

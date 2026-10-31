@@ -427,7 +427,7 @@ static void download_main(void* arg)
     int hops = 0;
     uint32_t backoff = 250;
     int64_t fail_start = 0;
-    n->download_tid = fa_thread_current_id();
+    fa_store64(&n->download_tid, (int64_t)fa_thread_current_id());
     n->http = fa_http_session_create();   /* only this thread uses them */
     n->cookies = fa_http_cookies_create();
     fa_mutex_lock(&n->lock);
@@ -583,7 +583,7 @@ fa_result fa_net_open(const fa_net_config* cfg, fa_net** out)
 
 void fa_net_set_tap(fa_net* n, fa_download_proc proc, void* user)
 {
-    if (fa_thread_current_id() == n->download_tid) {   /* from inside the tap: tap_lock is held already */
+    if ((int64_t)fa_thread_current_id() == fa_load64(&n->download_tid)) {   /* from inside the tap: tap_lock is held already */
         n->tap = proc;
         n->tap_user = user;
         return;

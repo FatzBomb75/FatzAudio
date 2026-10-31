@@ -241,7 +241,7 @@ struct fa_net {
     fa_mutex tap_lock;
     fa_download_proc tap;
     void* tap_user;
-    uintptr_t download_tid;  /* the download thread, which may change the tap from inside it */
+    fa_atomic64 download_tid;   /* the download thread, which may change the tap from inside it */
     char final_url[FA_NET_URL_MAX];
     char content_type[128];
     uint32_t icy_br;

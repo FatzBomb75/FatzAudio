@@ -284,7 +284,8 @@ fa_result fa_http_each_header(const fa_http_request* req, const fa_url* url, fa_
             if (add(user, name, value)) r = FA_ERROR_OUT_OF_MEMORY;
         }
     }
-    if (r == FA_OK && jar && add(user, "Cookie", jar)) r = FA_ERROR_OUT_OF_MEMORY;
+    /* Too long a line is left out, as on the joined line above. */
+    if (r == FA_OK && jar && strlen(jar) <= FA_HTTP_LINE_MAX && add(user, "Cookie", jar)) r = FA_ERROR_OUT_OF_MEMORY;
     free(jar);
     free(app);
     return r;
@@ -603,7 +604,14 @@ static int add_text_line(void* user, const char* name, const char* value)
 {
     text_sink* t = (text_sink*)user;
     size_t ln = strlen(name), lv = strlen(value);
-    if (t->n + ln + lv + 7 > t->cap) return 1;   /* + ": ", CRLF, and the blank line's CRLF and NUL */
+    if (t->n + ln + lv + 7 > t->cap) {   /* + ": ", CRLF, and the blank line's CRLF and NUL */
+        /* Grows for lines not counted up front (the cookie jar's Cookie line). */
+        size_t cap = (t->n + ln + lv + 7) * 2;
+        char* p = (char*)realloc(t->buf, cap);
+        if (!p) return 1;
+        t->buf = p;
+        t->cap = cap;
+    }
     memcpy(t->buf + t->n, name, ln);
     memcpy(t->buf + t->n + ln, ": ", 2);
     memcpy(t->buf + t->n + ln + 2, value, lv);
@@ -658,6 +666,8 @@ fa_result fa_http_fetch_socket(const fa_http_request* req, fa_http_head_proc on_
         sink.n = (size_t)n;
         sink.cap = req_cap;
         r = fa_http_each_header(req, &url, add_text_line, &sink);
+        request = sink.buf;
+        req_cap = sink.cap;
         if (r != FA_OK) goto done;
         n = (int)sink.n;
     }
