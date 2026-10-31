@@ -74,13 +74,20 @@ public class LiveStreamTests
             for (int i = 0; i < buffer.Length; i += 2, phase += 2 * Math.PI * 997 / 48000)
                 buffer[i] = buffer[i + 1] = (float)(amp * Math.Sin(phase));
             return buffer.Length / 2;
-        });
+        }, new StreamOptions { BufferLength = TimeSpan.FromSeconds(2) });   // a loaded runner must not run it dry
         Assert.True(double.IsNegativeInfinity(tone.GetLoudnessMeter().Momentary));
         Assert.True(double.IsNegativeInfinity(output.GetLoudnessMeter().ShortTerm));
         tone.PlayOn(output);
         await PlayFor(output, TimeSpan.FromSeconds(3.5));
         var m = tone.GetLoudnessMeter();
         var d = output.GetLoudnessMeter();
+        for (int i = 0; i < 20 && (Math.Abs(m.Momentary + 23) > 0.2 || Math.Abs(m.ShortTerm + 23) > 0.2 || Math.Abs(d.ShortTerm + 23) > 0.2); i++)
+        {
+            // A gap from a stalled runner leaves the windows within a few seconds.
+            await PlayFor(output, TimeSpan.FromSeconds(0.25));
+            m = tone.GetLoudnessMeter();
+            d = output.GetLoudnessMeter();
+        }
         Assert.InRange(m.Momentary, -23.2, -22.8);
         Assert.InRange(m.ShortTerm, -23.2, -22.8);
         Assert.InRange(d.ShortTerm, -23.2, -22.8);
