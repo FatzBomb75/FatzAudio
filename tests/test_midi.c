@@ -169,7 +169,8 @@ static void mtrk(buf* f, buf* t) { put(f, "MTrk", 4); put32be(f, (uint32_t)t->n)
 
 /* Format 0, 480 ticks per beat at 120 bpm (1 tick = 1/960 s). Note 69 from 0 to
  * 0.5 s, silence, note 69 from 1.5 s to 2 s. Lyrics "Hel" "lo" (0, 0.25 s) and
- * "world" after a CR (1.5 s); title and copyright. */
+ * "world" after a CR (1.5 s); title and copyright. The track ends at 3 s, after the
+ * reverb of the last note has died away, so the song is 3 s long. */
 static buf make_song(void)
 {
     buf f = { 0 }, t = { 0 };
@@ -185,7 +186,7 @@ static buf make_song(void)
     meta(&t, 960, 0x05, "\rworld");
     ev3(&t, 0, 0x90, 69, 100);
     ev3(&t, 480, 0x80, 69, 0);
-    eot(&t, 0);
+    eot(&t, 960);
     mtrk(&f, &t);
     free(t.d);
     return f;
@@ -561,8 +562,8 @@ static void test_detect_and_length(void)
     CHECK_EQ(info.format.sample_rate, RATE);
     CHECK_EQ(info.format.channels, 2);
     CHECK(info.seekable);
-    /* The last event is at 2 s; one second of tail after it. */
-    CHECK_EQ(info.length_frames, 2 * RATE + RATE);
+    /* The last note ends at 2 s and its reverb has died away before the track's end at 3 s. */
+    CHECK_EQ(info.length_frames, 3 * RATE);
     fa_stream_close(s);
     for (i = 0; i < fa_format_count(); i++) {
         fa_format_info f;
@@ -1154,8 +1155,8 @@ static void test_sf3(void)
     CHECK_EQ(fa_soundfont_get_info(font, &fi), FA_OK);
     CHECK(strcmp(fi.name, "Test SF3") == 0);
     CHECK_EQ(fi.preset_count, 2);
-    /* 1.5 s of decoded tone plus the PCM sine, each padded, as floats. */
-    CHECK(fi.sample_memory >= (uint64_t)(RATE * 3 / 2 + SINE_LEN) * sizeof(float));
+    /* 1.5 s of decoded tone plus the PCM sine, each padded, as 16 bits. */
+    CHECK(fi.sample_memory >= (uint64_t)(RATE * 3 / 2 + SINE_LEN) * sizeof(int16_t));
     /* The Vorbis sample plays at its pitch. */
     s = open_bytes(&melody, FA_OPEN_DECODE_ONLY, font, NULL);
     CHECK(s);
@@ -1220,7 +1221,7 @@ static buf make_fx_song(int cc91, int cc93, int second)
         ev3(&t, (uint32_t)(second * 960 - 480), 0x90, 69, 127);
         ev3(&t, 480, 0x80, 69, 0);
     }
-    eot(&t, 0);
+    eot(&t, 960);   /* a second after the note: at least that long whatever the tail */
     mtrk(&f, &t);
     free(t.d);
     return f;
@@ -1346,9 +1347,9 @@ static void test_effects(void)
 #define GS_PART1(a, v) { 0x41, 0x10, 0x42, 0x12, 0x40, 0x11, (a), (v), 0x00, 0xF7 }
 #define XG(a, v) { 0x43, 0x10, 0x4C, 0x02, 0x01, (a), (v), 0xF7 }
 
-/* SysEx, then one note (channel 0, key 69, 0..1 s), and the song going on to 4.5 s
- * (a controller at 3.5 s; the length is a second after the last event), so the
- * reverb rings out. */
+/* SysEx, then one note (channel 0, key 69, 0..1 s), and the song going on to at
+ * least 4.5 s (a controller at 3.5 s, the end of the track at 4.5 s), so the reverb
+ * rings out. */
 static buf make_fx_song_ticks(const uint8_t* const* msgs, const size_t* lens, int count, uint32_t ticks)
 {
     buf f = { 0 }, t = { 0 };
@@ -1358,7 +1359,7 @@ static buf make_fx_song_ticks(const uint8_t* const* msgs, const size_t* lens, in
     ev3(&t, 0, 0x90, 69, 127);
     ev3(&t, ticks, 0x80, 69, 0);
     ev3(&t, 3360 - ticks, 0xBF, 1, 0);
-    eot(&t, 0);
+    eot(&t, 960);
     mtrk(&f, &t);
     free(t.d);
     return f;
@@ -1569,13 +1570,13 @@ static void test_format2(void)
     meta(&t, 0, 0x05, "\xE0\x80\xAF");
     ev3(&t, 0, 0x90, 69, 100);
     ev3(&t, 480, 0x80, 69, 0);
-    eot(&t, 0);
+    eot(&t, 960);
     mtrk(&f, &t);
     s = open_bytes(&f, FA_OPEN_DECODE_ONLY, NULL, NULL);
     CHECK(s);
     if (s) {
         fa_stream_get_info(s, &info);
-        CHECK_EQ(info.length_frames, 2 * RATE);       /* 0.5 s + 0.5 s + the 1 s tail */
+        CHECK_EQ(info.length_frames, 2 * RATE);       /* 0.5 s + 0.5 s + the second track's 1 s to its end */
         CHECK_EQ(fa_stream_get_midi_info(s, &mi), FA_OK);
         CHECK_EQ(mi.format, 2);
         CHECK_EQ(mi.karaoke, 1);
@@ -1622,7 +1623,7 @@ static void test_soundfont_lifetime(void)
     CHECK_EQ(fa_soundfont_get_info(font, &info), FA_OK);
     CHECK(strcmp(info.name, "Test Sine") == 0);
     CHECK_EQ(info.preset_count, 2);
-    CHECK_EQ(info.sample_memory, (SINE_LEN + 46) * 4);
+    CHECK_EQ(info.sample_memory, (SINE_LEN + 46) * 2);   /* 16-bit samples */
     s = open_bytes(&song, FA_OPEN_DECODE_ONLY, font, NULL);
     CHECK(s);
     /* The stream holds its own reference: closing ours changes nothing. */
@@ -2037,7 +2038,7 @@ static buf make_prog_note(int ch, int prog, int key)
     varlen(&t, 0); put8(&t, 0xC0 | ch); put8(&t, prog);
     ev3(&t, 0, 0x90 | ch, key, 127);
     ev3(&t, 960, 0x80 | ch, key, 0);
-    eot(&t, 0);
+    eot(&t, 960);
     mtrk(&f, &t);
     free(t.d);
     return f;

@@ -23,6 +23,15 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Added
 
+- Soundfont stacks (extras step 16): `fa_soundfont_open_stack` (BASS_MIDI_StreamSetFonts with several fonts,
+  BASS_MIDI_FONTEX mapping, BASS_MIDI_FontSetVolume) makes one soundfont of the presets of others: each
+  `fa_soundfont_stack_entry` takes all of a soundfont, one bank or one program, optionally as another bank or program
+  and at another volume; the earlier entry wins. The stack shares its members' samples and keeps them alive.
+  `fa_soundfont_get_preset` (BASS_MIDI_FontGetPresets) lists a soundfont's presets. .NET: `SoundFont.Stack`,
+  `SoundFontStackEntry`, `SoundFont.Presets`. DLS banks: connections with a controller, velocity, key or pressure
+  (velocity to attack time, the mod wheel scaling the LFO, key to filter cutoff) play as SoundFont 2 modulators, and
+  DLS 2 conditional chunks are followed. See [docs/features/midi.md](docs/features/midi.md#several-soundfonts-as-one).
+
 - Sounds, a voice pool (extras step 24): a short sound decoded once into memory and played as many overlapping copies
   as needed, each with its own volume and pan (BASS_Sample*). `fa_sound_load_path`, `fa_sound_load_memory`,
   `fa_sound_load_pcm`, `fa_sound_play` (device, bus, volume, pan; returns the voice), `fa_sound_stop`,
@@ -335,6 +344,13 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 
 ### Changed
 
+- Soundfont samples are kept in memory as 16 bits instead of 32-bit float: half the memory (TimGM6mb: 11.4 to 5.9 MB),
+  `fa_soundfont_info.sample_memory` halves with it. MIDI renders at the same speed and the same within float
+  rounding (at most 2.4e-7, 130 dB below full scale).
+- A MIDI song's length runs until the sound of its last events has died away (releases, reverb and chorus tails,
+  under -80 dBFS for a second, at most 10 s after the last event) instead of the last event plus one second: opening a
+  MIDI file or event list renders its end once, unheard (about the cost of two seeks). Songs with a long release or
+  reverb at the end are longer, songs whose sound ends before the end of the track end with the track.
 - Idle threads sleep instead of polling every 5 ms: the event thread and encoders recording a device, a stream or a
   DJ mixer are woken by the audio thread through a lock-free wake-up (a futex on Linux and Android, a dispatch
   semaphore on Apple, an event on Windows). Events are delivered as soon as they are raised; a recording encoder wakes

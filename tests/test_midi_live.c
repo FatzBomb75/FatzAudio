@@ -342,7 +342,7 @@ static void test_event_list(void)
     t = open_file(&f);
     CHECK(t);
     len = length_of(s);
-    CHECK(len == (fa_frames)(0.9 * RATE + 0.5) + RATE);
+    CHECK(len > (fa_frames)(0.9 * RATE + 0.5) && len == length_of(t));   /* the same tail as the file's */
     a = read_frames(s, 2 * RATE, 999);
     b = read_frames(t, 2 * RATE, 1024);
     CHECK(a && b);

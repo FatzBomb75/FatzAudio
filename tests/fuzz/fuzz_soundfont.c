@@ -1,5 +1,5 @@
 /* Fuzz target: soundfonts. fa_soundfont_open_memory (SF2, SF3 with its Vorbis samples,
- * DLS through the converter), then the synthesizer plays a few notes on every preset
+ * DLS through the converter), its preset list and a stack of it, then the synthesizer plays a few notes on every preset
  * (up to 256), with the controllers that reach the SoundFont modulators moved.
  * Fails (abort) on a sanitizer report, a hang, or rendered samples that are not finite. */
 #include "fa_internal.h"
@@ -57,6 +57,21 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     tsf* bank;
     if (fa_soundfont_open_memory(data, size, &font) != FA_OK) return 0;
     fa_soundfont_get_info(font, &info);
+    {
+        /* Its presets, and a stack of it over itself moved to another bank. */
+        fa_soundfont_preset p;
+        fa_soundfont_stack_entry e[2];
+        fa_soundfont* st = NULL;
+        uint32_t i;
+        for (i = 0; i < info.preset_count; i++)
+            if (fa_soundfont_get_preset(font, i, &p) != FA_OK) abort();
+        fa_soundfont_stack_entry_init(&e[0], font);
+        fa_soundfont_stack_entry_init(&e[1], font);
+        e[1].to_bank = 5;
+        e[1].volume = 0.5f;
+        if (fa_soundfont_open_stack(e, 2, &st) != FA_OK) abort();
+        fa_soundfont_close(st);
+    }
     fa_soundfont_close(font);
     /* The bank the stream would play: the same conversion fa_soundfont_open_memory made. */
     if (fa_dls_probe(data, size)) {

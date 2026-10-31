@@ -23,7 +23,7 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | MIDI lyric surface (karaoke lyrics drawn for you: lines, pages, wipes, countdown, presets, effects) | [lyrics.md](lyrics.md) | ✅ (intro and ending pages 🗓️) |
 | Dolby Digital and Dolby Digital Plus (AC-3, E-AC-3, up to 7.1, dynamic range) | [dolby.md](dolby.md) | ✅ (passthrough 🗓️) |
 | Disc playback (audio CDs, CD+G discs and `.cue` images) | [disc.md](disc.md) | ✅ |
-| MIDI and karaoke files (SoundFont 2 and DLS, the OS's gm.dls by default, lyrics, transpose, channel mute) | [midi.md](midi.md) | ✅ (SF3, SFZ and MIDI input 🗓️) |
+| MIDI and karaoke files (SoundFont 2, SF3 and DLS, stacks of several soundfonts, the OS's gm.dls by default, lyrics, transpose, channel mute) | [midi.md](midi.md) | ✅ (SFZ and MIDI input 🗓️) |
 | Tracker modules (MOD, XM, S3M, IT, MPTM and more via libopenmpt; info and names, order/row seeking, order list, interpolation, stereo separation, channel mute and volume, live tempo and speed, amplification, row/instrument/sync events) | [trackers.md](trackers.md) | ✅ |
 | Recording and encoding (WAV, FLAC, MP3 via LAME; device, stream or file sources) | [recording-encoding.md](recording-encoding.md) | ✅ WAV/FLAC/MP3; Opus, AAC and casting 🗓️ |
 | Equalizer, presets and user DSP (parametric/graphic EQ, 14 presets, `fa_stream_add_dsp`) | [equalizer.md](equalizer.md) | ✅ |

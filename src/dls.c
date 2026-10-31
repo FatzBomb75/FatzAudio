@@ -14,8 +14,12 @@
  * centibels, and the defaults of both formats (velocity to volume, mod wheel to
  * vibrato) already agree. Each wave becomes one block of 16-bit samples; a
  * region whose loop differs from another's gets a sample header of its own over
- * the same block. Connections SF2 has no generator for (a controller as the
- * control source, velocity to attack time) are left out. */
+ * the same block. Connections with a MIDI controller, velocity, key or pressure
+ * as source or control (velocity to attack time, a controller scaling the LFO, key to
+ * filter cutoff) become SF2 instrument modulators. DLS 2 conditional chunks ('cdl ')
+ * leave out the instruments, regions and articulations whose condition this synth
+ * doesn't meet. Regions on different DLS 2 layers may overlap and all play, as do SF2
+ * zones; the layer number itself only groups regions for editors. */
 #include "fa_internal.h"
 #include <math.h>
 #include <stdlib.h>
@@ -58,6 +62,115 @@ static int next_chunk(const uint8_t** p, const uint8_t* end, chunk* c)
 
 static int is_list(const chunk* c, const char* type) { return memcmp(c->id, "LIST", 4) == 0 && memcmp(c->type, type, 4) == 0; }
 static int is_id(const chunk* c, const char* id) { return memcmp(c->id, id, 4) == 0; }
+
+/* ---- DLS 2 conditional chunks ----------------------------------------------------- */
+
+/* A 'cdl ' chunk is an expression over what the synthesizer supports (DLS 2 section
+ * 1.14): when it is false, the list holding it (an instrument, a region, an articulation)
+ * is not used. FatzAudio answers as a software DLS 2 synthesizer with no instruments of its
+ * own: GM, GS and XG sets "in hardware" no (the bank's own instruments are wanted), DLS 1 and
+ * DLS 2 yes, sample memory 1 GB, playback rate 44100 Hz, manufacturer and product 0. A query
+ * it doesn't know is 0 (and "supported" 0). An expression it can't read counts as true, so a
+ * malformed chunk loses nothing. */
+enum {
+    CDL_AND = 1, CDL_OR, CDL_XOR, CDL_ADD, CDL_SUBTRACT, CDL_MULTIPLY, CDL_DIVIDE, CDL_LOGICAL_AND, CDL_LOGICAL_OR,
+    CDL_LT, CDL_LE, CDL_GT, CDL_GE, CDL_EQ, CDL_NOT, CDL_CONST, CDL_QUERY, CDL_QUERYSUPPORTED
+};
+
+typedef struct cdl_query {
+    uint32_t d1;
+    uint16_t d2, d3;
+    uint8_t d4[8];
+    uint32_t value;
+} cdl_query;
+
+static const cdl_query cdl_queries[] = {
+    { 0x178f2f24, 0xc364, 0x11d1, { 0xa7, 0x60, 0x00, 0x00, 0xf8, 0x75, 0xac, 0x12 }, 0 },          /* GM in hardware */
+    { 0x178f2f25, 0xc364, 0x11d1, { 0xa7, 0x60, 0x00, 0x00, 0xf8, 0x75, 0xac, 0x12 }, 0 },          /* GS in hardware */
+    { 0x178f2f26, 0xc364, 0x11d1, { 0xa7, 0x60, 0x00, 0x00, 0xf8, 0x75, 0xac, 0x12 }, 0 },          /* XG in hardware */
+    { 0x178f2f27, 0xc364, 0x11d1, { 0xa7, 0x60, 0x00, 0x00, 0xf8, 0x75, 0xac, 0x12 }, 1 },          /* supports DLS 1 */
+    { 0xf14599e5, 0x4689, 0x11d2, { 0xaf, 0xa6, 0x00, 0xaa, 0x00, 0x24, 0xd8, 0xb6 }, 1 },          /* supports DLS 2 */
+    { 0x178f2f28, 0xc364, 0x11d1, { 0xa7, 0x60, 0x00, 0x00, 0xf8, 0x75, 0xac, 0x12 }, 0x40000000 }, /* sample memory */
+    { 0xb03e1181, 0x8095, 0x11d2, { 0xa1, 0xef, 0x00, 0x60, 0x08, 0x33, 0xdb, 0xd8 }, 0 },          /* manufacturer */
+    { 0xb03e1182, 0x8095, 0x11d2, { 0xa1, 0xef, 0x00, 0x60, 0x08, 0x33, 0xdb, 0xd8 }, 0 },          /* product */
+    { 0x2a91f713, 0xa4bf, 0x11d2, { 0xbb, 0xdf, 0x00, 0x60, 0x08, 0x33, 0xdb, 0xd8 }, 44100 },      /* playback rate */
+};
+
+/* The query of a GUID (16 bytes as in the file): its value, -1 if unknown. */
+static int64_t cdl_query_value(const uint8_t* g)
+{
+    size_t i;
+    for (i = 0; i < sizeof(cdl_queries) / sizeof(cdl_queries[0]); i++) {
+        const cdl_query* q = &cdl_queries[i];
+        if (fa_le32(g) == q->d1 && fa_le16(g + 4) == q->d2 && fa_le16(g + 6) == q->d3 && memcmp(g + 8, q->d4, 8) == 0)
+            return q->value;
+    }
+    return -1;
+}
+
+static int cdl_true(const uint8_t* p, uint32_t n)
+{
+    uint32_t st[64];
+    int sp = 0;
+    const uint8_t* end = p + n;
+    while (end - p >= 2) {
+        unsigned op = fa_le16(p);
+        uint32_t a, b, v = 0;
+        p += 2;
+        if (op == CDL_CONST || op == CDL_QUERY || op == CDL_QUERYSUPPORTED) {
+            if (sp == 64) return 1;
+            if (op == CDL_CONST) {
+                if (end - p < 4) return 1;
+                v = fa_le32(p);
+                p += 4;
+            } else {
+                int64_t q;
+                if (end - p < 16) return 1;
+                q = cdl_query_value(p);
+                p += 16;
+                v = op == CDL_QUERYSUPPORTED ? q >= 0 : q >= 0 ? (uint32_t)q : 0;
+            }
+            st[sp++] = v;
+            continue;
+        }
+        if (op == CDL_NOT) {
+            if (sp < 1) return 1;
+            st[sp - 1] = !st[sp - 1];
+            continue;
+        }
+        if (op < CDL_AND || op > CDL_EQ || sp < 2) return 1;   /* not an operator we know */
+        b = st[--sp];
+        a = st[sp - 1];
+        switch (op) {
+        case CDL_AND: v = a & b; break;
+        case CDL_OR: v = a | b; break;
+        case CDL_XOR: v = a ^ b; break;
+        case CDL_ADD: v = a + b; break;
+        case CDL_SUBTRACT: v = a - b; break;
+        case CDL_MULTIPLY: v = a * b; break;
+        case CDL_DIVIDE: v = b ? a / b : 0; break;
+        case CDL_LOGICAL_AND: v = a && b; break;
+        case CDL_LOGICAL_OR: v = a || b; break;
+        case CDL_LT: v = a < b; break;
+        case CDL_LE: v = a <= b; break;
+        case CDL_GT: v = a > b; break;
+        case CDL_GE: v = a >= b; break;
+        default: v = a == b; break;
+        }
+        st[sp - 1] = v;
+    }
+    return sp == 0 || st[sp - 1] != 0;
+}
+
+/* A list's chunks [p, p + n): 0 when a 'cdl ' among them is false. */
+static int list_enabled(const uint8_t* p, uint32_t n)
+{
+    const uint8_t* end = p + n;
+    chunk c;
+    while (next_chunk(&p, end, &c))
+        if (is_id(&c, "cdl ") && !cdl_true(c.data, c.size)) return 0;
+    return 1;
+}
 
 /* ---- growable output ---------------------------------------------------------- */
 
@@ -197,13 +310,24 @@ enum {
     G_MODENV_DECAY = 28, G_MODENV_SUSTAIN = 29, G_MODENV_RELEASE = 30, G_KEY_MODENV_HOLD = 31, G_KEY_MODENV_DECAY = 32,
     G_VOLENV_DELAY = 33, G_VOLENV_ATTACK = 34, G_VOLENV_HOLD = 35, G_VOLENV_DECAY = 36, G_VOLENV_SUSTAIN = 37,
     G_VOLENV_RELEASE = 38, G_KEY_VOLENV_HOLD = 39, G_KEY_VOLENV_DECAY = 40, G_INSTRUMENT = 41, G_KEYRANGE = 43,
-    G_VELRANGE = 44, G_ATTENUATION = 48, G_FINETUNE = 52, G_SAMPLE = 53, G_SAMPLEMODES = 54, G_EXCLUSIVE = 57,
+    G_CHORUS = 15, G_REVERB = 16, G_VELRANGE = 44, G_ATTENUATION = 48, G_FINETUNE = 52, G_SAMPLE = 53, G_SAMPLEMODES = 54, G_EXCLUSIVE = 57,
     G_ROOTKEY = 58, G_COUNT = 60
 };
+
+#define ZONE_MODS 16                  /* modulators a zone keeps (connections with a controller) */
+
+/* An SF2 modulator record (SF2 2.04 section 7.4). */
+typedef struct sf2_mod {
+    uint16_t src, dst;
+    int16_t amount;
+    uint16_t amt_src, trans;
+} sf2_mod;
 
 typedef struct gens {
     uint8_t set[G_COUNT];
     double v[G_COUNT];
+    sf2_mod mods[ZONE_MODS];
+    uint32_t nmods;
     /* Key number to EG1 hold and decay, EG2 hold and decay (DLS scale), turned
      * into SF2 generators once the zone is complete (finish_zone). */
     uint8_t key_set[4];
@@ -226,7 +350,9 @@ static double level_to_cb(double permille)
 
 /* Connection sources and destinations of DLS Level 1 and 2. */
 enum {
-    SRC_NONE = 0, SRC_LFO = 1, SRC_VELOCITY = 2, SRC_KEY = 3, SRC_EG1 = 4, SRC_EG2 = 5, SRC_VIBRATO = 9,
+    SRC_NONE = 0, SRC_LFO = 1, SRC_VELOCITY = 2, SRC_KEY = 3, SRC_EG1 = 4, SRC_EG2 = 5, SRC_PITCH_WHEEL = 6,
+    SRC_POLY_PRESSURE = 7, SRC_CHANNEL_PRESSURE = 8, SRC_VIBRATO = 9, SRC_CC = 0x80, SRC_RPN0 = 0x100,
+    DST_CHORUS = 0x80, DST_REVERB = 0x81,
     DST_GAIN = 1, DST_PITCH = 3, DST_PAN = 4, DST_LFO_FREQ = 0x104, DST_LFO_DELAY = 0x105, DST_VIB_FREQ = 0x114,
     DST_VIB_DELAY = 0x115, DST_EG1_ATTACK = 0x206, DST_EG1_DECAY = 0x207, DST_EG1_RELEASE = 0x209,
     DST_EG1_SUSTAIN = 0x20A, DST_EG1_DELAY = 0x20B, DST_EG1_HOLD = 0x20C, DST_EG2_ATTACK = 0x30A,
@@ -234,10 +360,128 @@ enum {
     DST_EG2_HOLD = 0x310, DST_FILTER_FC = 0x500, DST_FILTER_Q = 0x501
 };
 
-static void apply_connection(gens* g, unsigned src, unsigned ctl, unsigned dst, int32_t scale)
+/* A DLS source (a MIDI controller or what the synth knows of the note) as an SF2 modulator
+ * source operand, with the connection's curve, polarity and direction; 0 when SF2 has no
+ * such source. DLS 2 packs those into the transform: source bits 10-15, control bits 4-9. */
+static uint16_t mod_source(unsigned src, unsigned trans, int control, int art2)
+{
+    unsigned index, curve, bipolar, invert;
+    if (src == SRC_VELOCITY) index = 2;
+    else if (src == SRC_KEY) index = 3;
+    else if (src == SRC_POLY_PRESSURE) index = 10;
+    else if (src == SRC_CHANNEL_PRESSURE) index = 13;
+    else if (src == SRC_PITCH_WHEEL) index = 14;
+    else if (src >= SRC_CC && src < SRC_CC + 128) index = 0x80 | (src - SRC_CC);
+    else return 0;
+    if (art2) {
+        unsigned bits = control ? (trans >> 4) & 0x3F : (trans >> 10) & 0x3F;
+        curve = bits & 0xF;
+        bipolar = (bits >> 4) & 1;
+        invert = (bits >> 5) & 1;
+        if (curve > 3) curve = 0;
+    } else {
+        curve = !control && trans == 1 ? 1 : 0;   /* DLS 1: concave, or nothing */
+        bipolar = invert = 0;
+    }
+    if (src == SRC_PITCH_WHEEL) bipolar = 1;   /* the wheel is centred whatever the writer says */
+    return (uint16_t)(curve << 10 | bipolar << 9 | invert << 8 | index);
+}
+
+/* The SF2 generator a DLS destination becomes, and the factor from DLS units to its; -1 none. */
+static int mod_dest(unsigned dst, double* unit)
+{
+    *unit = 1.0;
+    switch (dst) {
+    case DST_GAIN: *unit = -1.0; return G_ATTENUATION;    /* + = louder in DLS, quieter in SF2 */
+    case DST_PITCH: return G_FINETUNE;
+    case DST_PAN: return G_PAN;
+    case DST_FILTER_FC: return G_FILTER_FC;
+    case DST_FILTER_Q: *unit = 10.0; return G_FILTER_Q;
+    case DST_EG1_ATTACK: return G_VOLENV_ATTACK;
+    case DST_EG1_DECAY: return G_VOLENV_DECAY;
+    case DST_EG1_RELEASE: return G_VOLENV_RELEASE;
+    case DST_EG1_DELAY: return G_VOLENV_DELAY;
+    case DST_EG1_HOLD: return G_VOLENV_HOLD;
+    case DST_EG2_ATTACK: return G_MODENV_ATTACK;
+    case DST_EG2_DECAY: return G_MODENV_DECAY;
+    case DST_EG2_RELEASE: return G_MODENV_RELEASE;
+    case DST_EG2_DELAY: return G_MODENV_DELAY;
+    case DST_EG2_HOLD: return G_MODENV_HOLD;
+    case DST_LFO_FREQ: return G_MODLFO_FREQ;
+    case DST_LFO_DELAY: return G_MODLFO_DELAY;
+    case DST_VIB_FREQ: return G_VIBLFO_FREQ;
+    case DST_VIB_DELAY: return G_VIBLFO_DELAY;
+    case DST_CHORUS: return G_CHORUS;
+    case DST_REVERB: return G_REVERB;
+    default: return -1;
+    }
+}
+
+/* Adds (or replaces: the same sources and destination) a modulator of the zone. */
+static void add_mod(gens* g, uint16_t src, uint16_t dst, double amount, uint16_t amt_src)
+{
+    uint32_t i;
+    long a = lround(amount);
+    if (a < -32768) a = -32768;
+    if (a > 32767) a = 32767;
+    for (i = 0; i < g->nmods; i++)
+        if (g->mods[i].src == src && g->mods[i].dst == dst && g->mods[i].amt_src == amt_src) break;
+    if (i == g->nmods) {
+        if (g->nmods == ZONE_MODS) return;
+        g->nmods++;
+    }
+    g->mods[i].src = src;
+    g->mods[i].dst = dst;
+    g->mods[i].amount = (int16_t)a;
+    g->mods[i].amt_src = amt_src;
+    g->mods[i].trans = 0;
+}
+
+/* A connection with a MIDI controller in it (as its source or its control): an SF2
+ * modulator. An LFO or envelope scaled by a controller becomes a modulator of the depth
+ * generator (LFO x mod wheel -> pitch: the mod wheel to the vibrato depth, as SF2's own
+ * default does). The connections SF2 synths apply anyway (pitch wheel x RPN 0 -> pitch, and
+ * the mod wheel or channel pressure to 50 cents of vibrato) are left to the synth's
+ * defaults, which follow the channel's modulation depth range. */
+static void apply_controlled(gens* g, unsigned src, unsigned ctl, unsigned dst, unsigned trans, int32_t scale, int art2)
+{
+    double s = (double)scale / 65536.0, unit;
+    int depth = -1, gen;
+    uint16_t a, b;
+    if (src == SRC_LFO || src == SRC_VIBRATO || src == SRC_EG2) {
+        if (src == SRC_EG2) depth = dst == DST_PITCH ? G_MODENV_PITCH : dst == DST_FILTER_FC ? G_MODENV_FC : -1;
+        else if (dst == DST_PITCH) depth = G_VIBLFO_PITCH;   /* the LFO the mod wheel drives */
+        else if (dst == DST_GAIN) depth = G_MODLFO_VOL;
+        else if (dst == DST_FILTER_FC) depth = G_MODLFO_FC;
+        a = mod_source(ctl, trans, 1, art2);
+        if (depth < 0 || !a) return;
+        if (depth == G_VIBLFO_PITCH && (a == 0x0081 || a == 0x000D) && lround(s) == 50) return;   /* SF2's defaults */
+        add_mod(g, a, (uint16_t)depth, s, 0);
+        return;
+    }
+    if (src == SRC_PITCH_WHEEL && ctl == SRC_RPN0 && dst == DST_PITCH) return;   /* the synth's bend */
+    gen = mod_dest(dst, &unit);
+    if (gen < 0) return;
+    if (src == SRC_NONE) { src = ctl; ctl = SRC_NONE; trans = (trans & ~0xFC00u) | ((trans >> 4 & 0x3F) << 10); }
+    /* DLS's implied connections written out by some editors (CC7 and CC11 to gain, CC10 to
+     * pan, CC91 and CC93 to the sends): the synth applies those itself, whatever curve bits
+     * the file gives them, so a modulator would apply them twice. */
+    if (ctl == SRC_NONE && ((gen == G_ATTENUATION && (src == SRC_CC + 7 || src == SRC_CC + 11)) || (gen == G_PAN && src == SRC_CC + 10) ||
+                            (gen == G_REVERB && src == SRC_CC + 91) || (gen == G_CHORUS && src == SRC_CC + 93)))
+        return;
+    a = mod_source(src, trans, 0, art2);
+    b = ctl == SRC_NONE ? 0 : mod_source(ctl, trans, 1, art2);
+    if (!a || (ctl != SRC_NONE && !b)) return;
+    add_mod(g, a, (uint16_t)gen, s * unit, b);
+}
+
+static void apply_connection(gens* g, unsigned src, unsigned ctl, unsigned dst, unsigned trans, int32_t scale, int art2)
 {
     double s = (double)scale / 65536.0;
-    if (ctl != SRC_NONE) return;          /* controller-scaled: no generator for it */
+    if (ctl != SRC_NONE || (src >= SRC_PITCH_WHEEL && src != SRC_VIBRATO)) {
+        apply_controlled(g, src, ctl, dst, trans, scale, art2);
+        return;
+    }
     switch (src) {
     case SRC_NONE:
         switch (dst) {
@@ -262,6 +506,8 @@ static void apply_connection(gens* g, unsigned src, unsigned ctl, unsigned dst, 
         case DST_PAN: gen_set(g, G_PAN, s); break;
         case DST_FILTER_FC: gen_set(g, G_FILTER_FC, s); break;
         case DST_FILTER_Q: gen_set(g, G_FILTER_Q, s * 10.0); break;     /* dB to centibels */
+        case DST_CHORUS: gen_set(g, G_CHORUS, s); break;                 /* 0.1 % in both */
+        case DST_REVERB: gen_set(g, G_REVERB, s); break;
         default: break;
         }
         break;
@@ -280,8 +526,14 @@ static void apply_connection(gens* g, unsigned src, unsigned ctl, unsigned dst, 
     case SRC_KEY: {
         int k = dst == DST_EG1_HOLD ? 0 : dst == DST_EG1_DECAY ? 1 : dst == DST_EG2_HOLD ? 2 : dst == DST_EG2_DECAY ? 3 : -1;
         if (k >= 0) { g->key_set[k] = 1; g->key[k] = s; }
+        else if (dst != DST_PITCH) apply_controlled(g, src, ctl, dst, trans, scale, art2);   /* key to filter cutoff... */
         break;
     }
+    case SRC_VELOCITY:
+        /* Velocity to volume is the synth's own curve (as SF2's default); velocity to
+         * attack time, filter cutoff and the rest are modulators. */
+        if (dst != DST_GAIN) apply_controlled(g, src, ctl, dst, trans, scale, art2);
+        break;
     default:
         break;
     }
@@ -303,8 +555,14 @@ static void finish_zone(gens* g)
     /* DLS 1 has one LFO, which the default mod wheel vibrato also uses: SF2 drives
      * that from its vibrato LFO, so it takes the LFO's rate and delay unless a DLS 2
      * vibrato LFO sets its own. Unset rates are DLS's 5 Hz (SF2's default is 8.18 Hz). */
-    if (!g->set[G_MODLFO_FREQ] && (g->set[G_MODLFO_PITCH] || g->set[G_MODLFO_VOL] || g->set[G_MODLFO_FC]))
-        gen_set(g, G_MODLFO_FREQ, -851.0);
+    if (!g->set[G_MODLFO_FREQ]) {
+        int uses_lfo = g->set[G_MODLFO_PITCH] || g->set[G_MODLFO_VOL] || g->set[G_MODLFO_FC];
+        uint32_t i;
+        /* Also an LFO only a controller scales (a modulator of its depth). */
+        for (i = 0; i < g->nmods && !uses_lfo; i++)
+            uses_lfo = g->mods[i].dst == G_MODLFO_PITCH || g->mods[i].dst == G_MODLFO_VOL || g->mods[i].dst == G_MODLFO_FC;
+        if (uses_lfo) gen_set(g, G_MODLFO_FREQ, -851.0);
+    }
     if (!g->set[G_VIBLFO_FREQ]) gen_set(g, G_VIBLFO_FREQ, g->set[G_MODLFO_FREQ] ? g->v[G_MODLFO_FREQ] : -851.0);
     if (!g->set[G_VIBLFO_DELAY] && g->set[G_MODLFO_DELAY]) gen_set(g, G_VIBLFO_DELAY, g->v[G_MODLFO_DELAY]);
 }
@@ -323,7 +581,7 @@ static void parse_articulation(const uint8_t* p, uint32_t n, gens* g)
         if (cb < 8 || cb > c.size) continue;
         for (i = 0; i < count && cb + (size_t)(i + 1) * 12 <= c.size; i++) {
             const uint8_t* b = c.data + cb + (size_t)i * 12;
-            apply_connection(g, fa_le16(b), fa_le16(b + 2), fa_le16(b + 4), (int32_t)fa_le32(b + 8));
+            apply_connection(g, fa_le16(b), fa_le16(b + 2), fa_le16(b + 4), fa_le16(b + 6), (int32_t)fa_le32(b + 8), is_id(&c, "art2"));
         }
     }
 }
@@ -428,6 +686,7 @@ static void parse_region(conv* cv, const uint8_t* p, uint32_t n, const gens* ins
     const dls_wave* w;
     int channel = -1;
     wsmp.present = 0;
+    if (!list_enabled(p, n)) return;   /* a DLS 2 condition this synth doesn't meet */
     while (next_chunk(&p, end, &c)) {
         if (is_id(&c, "rgnh") && c.size >= 12) {
             klo = fa_le16(c.data); khi = fa_le16(c.data + 2);
@@ -440,7 +699,7 @@ static void parse_region(conv* cv, const uint8_t* p, uint32_t n, const gens* ins
             channel_mask = fa_le32(c.data + 4);
             cue = fa_le32(c.data + 8);
             have_wlnk = 1;
-        } else if (is_list(&c, "lart") || is_list(&c, "lar2")) {
+        } else if ((is_list(&c, "lart") || is_list(&c, "lar2")) && list_enabled(c.data, c.size)) {
             /* The region's own articulation replaces the instrument's. */
             if (!own_art) { memset(&g, 0, sizeof(g)); own_art = 1; }
             parse_articulation(c.data, c.size, &g);
@@ -503,6 +762,7 @@ static void parse_instrument(conv* cv, const uint8_t* p, uint32_t n)
     preset* pr;
     char name[64] = "";
     memset(&art, 0, sizeof(art));
+    if (!list_enabled(p, n)) return;
     while (next_chunk(&p, end, &c)) {
         if (is_id(&c, "insh") && c.size >= 12) {
             bank = fa_le32(c.data + 4);
@@ -511,7 +771,7 @@ static void parse_instrument(conv* cv, const uint8_t* p, uint32_t n)
         } else if (is_list(&c, "lrgn")) {
             lrgn = c.data;
             lrgn_n = c.size;
-        } else if (is_list(&c, "lart") || is_list(&c, "lar2")) {
+        } else if ((is_list(&c, "lart") || is_list(&c, "lar2")) && list_enabled(c.data, c.size)) {
             parse_articulation(c.data, c.size, &art);
         } else if (is_list(&c, "INFO")) {
             info_name(c.data, c.size, name, sizeof(name));
@@ -585,8 +845,9 @@ static void write_chunk_hdr(obuf* b, const char* id, uint32_t size) { ob_put(b, 
 static fa_result write_sf2(conv* cv, const char* bank_name, uint8_t** out, size_t* out_n)
 {
     obuf o = { 0 }, smpl = { 0 }, phdr = { 0 }, pbag = { 0 }, pgen = { 0 }, inst = { 0 }, ibag = { 0 }, igen = { 0 }, shdr = { 0 };
+    obuf imod = { 0 };
     block* blocks = NULL;
-    uint32_t nblocks = 0, cap_blocks = 0, i, j, ngen = 0, nbag = 0;
+    uint32_t nblocks = 0, cap_blocks = 0, i, j, ngen = 0, nbag = 0, nmod = 0;
     size_t riff_at, pdta_at;
     fa_result r = FA_ERROR_OUT_OF_MEMORY;
 
@@ -645,18 +906,26 @@ static fa_result write_sf2(conv* cv, const char* bank_name, uint8_t** out, size_
         ob_u16(&inst, nbag);
         for (j = 0; j < p->zones; j++) {
             const zone* z = &cv->zones[p->first_zone + j];
-            if (ngen > 0xFFFF || z->sample > 0xFFFF) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
-            ob_u16(&ibag, ngen); ob_u16(&ibag, 0);
+            uint32_t k;
+            if (ngen > 0xFFFF || nmod > 0xFFFF || z->sample > 0xFFFF) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
+            ob_u16(&ibag, ngen); ob_u16(&ibag, nmod);
             ngen += write_gens(&igen, &z->g, z->sample);
+            for (k = 0; k < z->g.nmods; k++) {
+                const sf2_mod* x = &z->g.mods[k];
+                ob_u16(&imod, x->src); ob_u16(&imod, x->dst); ob_u16(&imod, (unsigned)(uint16_t)x->amount);
+                ob_u16(&imod, x->amt_src); ob_u16(&imod, x->trans);
+            }
+            nmod += z->g.nmods;
             nbag++;
         }
     }
-    if (nbag > 0xFFFF || ngen > 0xFFFF || cv->npresets > 0xFFFF) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
+    if (nbag > 0xFFFF || ngen > 0xFFFF || nmod > 0xFFFF || cv->npresets > 0xFFFF) { r = FA_ERROR_UNSUPPORTED_FORMAT; goto done; }
     ob_name(&phdr, "EOP"); ob_u16(&phdr, 0); ob_u16(&phdr, 0); ob_u16(&phdr, cv->npresets); ob_u32(&phdr, 0); ob_u32(&phdr, 0); ob_u32(&phdr, 0);
     ob_u16(&pbag, cv->npresets); ob_u16(&pbag, 0);
     ob_u16(&pgen, 0); ob_u16(&pgen, 0);
     ob_name(&inst, "EOI"); ob_u16(&inst, nbag);
-    ob_u16(&ibag, ngen); ob_u16(&ibag, 0);
+    ob_u16(&ibag, ngen); ob_u16(&ibag, nmod);
+    ob_put(&imod, NULL, 10);             /* the terminal record */
     ob_u16(&igen, 0); ob_u16(&igen, 0);
 
     write_chunk_hdr(&o, "RIFF", 0);
@@ -685,10 +954,10 @@ static fa_result write_sf2(conv* cv, const char* bank_name, uint8_t** out, size_
     write_chunk_hdr(&o, "pgen", (uint32_t)pgen.n); ob_put(&o, pgen.p, pgen.n);
     write_chunk_hdr(&o, "inst", (uint32_t)inst.n); ob_put(&o, inst.p, inst.n);
     write_chunk_hdr(&o, "ibag", (uint32_t)ibag.n); ob_put(&o, ibag.p, ibag.n);
-    write_chunk_hdr(&o, "imod", 10); ob_put(&o, NULL, 10);
+    write_chunk_hdr(&o, "imod", (uint32_t)imod.n); ob_put(&o, imod.p, imod.n);
     write_chunk_hdr(&o, "igen", (uint32_t)igen.n); ob_put(&o, igen.p, igen.n);
     write_chunk_hdr(&o, "shdr", (uint32_t)shdr.n); ob_put(&o, shdr.p, shdr.n);
-    if (o.oom || smpl.oom || phdr.oom || pbag.oom || pgen.oom || inst.oom || ibag.oom || igen.oom || shdr.oom || cv->oom) goto done;
+    if (o.oom || smpl.oom || phdr.oom || pbag.oom || pgen.oom || inst.oom || ibag.oom || igen.oom || shdr.oom || imod.oom || cv->oom) goto done;
     ob_set32(&o, pdta_at + 4, (uint32_t)(o.n - pdta_at - 8));
     ob_set32(&o, riff_at, (uint32_t)(o.n - 8));
     *out = o.p;
@@ -697,6 +966,7 @@ static fa_result write_sf2(conv* cv, const char* bank_name, uint8_t** out, size_
     r = FA_OK;
 done:
     free(o.p); free(smpl.p); free(phdr.p); free(pbag.p); free(pgen.p); free(inst.p); free(ibag.p); free(igen.p); free(shdr.p);
+    free(imod.p);
     free(blocks);
     return r;
 }

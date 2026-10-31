@@ -493,6 +493,12 @@ internal static unsafe partial class NativeMethods
     public static partial int fa_soundfont_get_info(SoundFontHandle font, FaSoundFontInfo* info);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_soundfont_get_preset(SoundFontHandle font, uint index, FaSoundFontPreset* preset);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_soundfont_open_stack(FaSoundFontStackEntry* entries, uint count, out nint font);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_engine_set_soundfont(EngineHandle engine, nint font);
 
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
