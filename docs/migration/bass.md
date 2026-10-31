@@ -534,7 +534,7 @@ basscd is an add-on DLL; FatzAudio reads CDs and `.cue` images itself, with one 
 
 ### bassmidi (MIDI files and soundfonts)
 
-MIDI files are a built-in format: the ordinary open calls play them with a SoundFont 2 or DLS bank you load once, or with the OS's own bank (Windows `gm.dls`) when you load none ([MIDI](../features/midi.md#the-oss-instruments)). There are no per-stream font arrays, font handles per preset or sample loading on demand.
+MIDI files are a built-in format: the ordinary open calls play them with a SoundFont 2 or DLS bank you load once, or with the OS's own bank (Windows `gm.dls`) when you load none ([MIDI](../features/midi.md#the-oss-instruments)). Several fonts play as one through a stack (`fa_soundfont_open_stack`), which stands in for BASSMIDI's per-stream font arrays and preset mapping; there is no sample loading on demand.
 
 | BASSMIDI | FatzAudio (C) | FatzAudio (.NET) | Status |
 |---|---|---|---|
@@ -544,13 +544,15 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | BASS_MIDI_FontInit (file or BASS_MIDI_FONT_MEM) | `fa_soundfont_open_path` / `fa_soundfont_open_memory`, for `.sf2` and also `.dls` banks | `SoundFont.FromFile` / `SoundFont.FromMemory` | ✅ SF2, SF3 (Ogg Vorbis samples) and DLS; SFZ 🗓️ |
 | BASS_MIDI_FontInitUser | Read the file yourself and use `fa_soundfont_open_memory` | `SoundFont.FromMemory` | ✅ |
 | BASS_MIDI_FontFree | `fa_soundfont_close` (reference-counted: streams using it keep it) | `soundFont.Dispose()` | ✅ |
-| BASS_MIDI_FontGetInfo | `fa_soundfont_get_info` (name, presets, sample memory) | `soundFont.Info` | ✅ |
+| BASS_MIDI_FontGetInfo | `fa_soundfont_get_info` (name, presets, sample memory: 16 bits per sample, as in the file) | `soundFont.Info` | ✅ |
+| BASS_MIDI_FontGetPresets / BASS_MIDI_FontGetPreset | `fa_soundfont_get_preset` (bank, program and name of each preset) | `soundFont.Presets` | ✅ |
 | BASS_MIDI_FontLoad / BASS_MIDI_FontCompact / BASS_MIDI_FontUnload | Not needed: the whole bank loads at open | — | ➖ (by design) |
 | BASS_MIDI_FontPack / BASS_MIDI_FontUnpack (SF2PACK) | Not provided: SF3 is supported instead (`.sf3` loads like an `.sf2`) | — | ➖ |
 | BASS_CONFIG_MIDI_DEFFONT, BASS_MIDI_StreamSetFonts(0, ...) | `fa_engine_set_soundfont` | `engine.DefaultSoundFont` | ✅ |
 | BASSMIDI's default font (it looks only for its own default `.sf2` in the Windows folder; nothing plays without one, though Windows ships `gm.dls`) | Automatic: with no soundfont set, MIDI plays with the OS's bank (`gm.dls` on Windows, `gs_instruments.dls` on macOS, a GM `.sf2` package on Linux); `FA_ENGINE_NO_SYSTEM_SOUNDFONT` turns it off; `fa_soundfont_open_system` loads it yourself | Automatic; `AudioEngineOptions.NoSystemSoundFont`, `SoundFont.FromSystem()` | ✅ |
-| BASS_MIDI_StreamSetFonts(stream, ...) | `fa_open_options.soundfont` when opening | `StreamOptions.SoundFont` | ✅ (one font per stream; no stacks or per-preset mapping) |
-| BASS_MIDI_FontSetVolume | Stream volume (`FA_PARAM_VOLUME`) | `Volume` | ✅ |
+| BASS_MIDI_StreamSetFonts(stream, ...) | `fa_open_options.soundfont` when opening | `StreamOptions.SoundFont` | ✅ (fixed once the stream is open: open it again to change fonts) |
+| BASS_MIDI_StreamSetFonts with several fonts (a stack), BASS_MIDI_FONT / BASS_MIDI_FONTEX preset and bank mapping | `fa_soundfont_open_stack`: one soundfont made of the presets of others, each entry all of a font or one bank or program, optionally as another bank or program; the earlier entry wins. Use it as the engine's or a stream's soundfont ([MIDI](../features/midi.md#several-soundfonts-as-one)) | `SoundFont.Stack(new SoundFontStackEntry(font) { Bank, Program, ToBank, ToProgram, Volume })` | ✅ |
+| BASS_MIDI_FontSetVolume | Per font in a stack: `fa_soundfont_stack_entry.volume`; or the stream volume (`FA_PARAM_VOLUME`) | `SoundFontStackEntry.Volume`; `Volume` | ✅ |
 | BASS_MIDI_StreamGetMark (LYRIC, TEXT, MARKER, CUE, COPY, TRACK, INST) | `fa_stream_get_midi_text` (cleaned-up lyrics with line and paragraph flags, UTF-8) and `fa_stream_get_midi_info` | `stream.MidiTexts`, `stream.MidiInfo` | ✅ |
 | BASS_CONFIG_MIDI_KARAOKE / text code page (BASSMIDI returns the raw bytes; the app guesses the code page) | Text comes out as UTF-8, code page detected per file (UTF-8, Shift-JIS, Windows-1252); `fa_open_options.text_code_page` forces one ([MIDI](../features/midi.md#text-encoding)) | `StreamOptions.TextCodePage` | ✅ |
 | Parsing `@T`/`@I` lines and credit text events yourself | `fa_stream_get_midi_credits`: title, artist, writer, lyricist, year, copyright, key, tempo, time signature, other ([MIDI](../features/midi.md#song-credits)) | `stream.MidiCredits` | ✅ |
@@ -576,7 +578,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | BASS_ATTRIB_MIDI_PPQN, BASS_POS_MIDI_TICK | Not provided: positions are frames and time | — | ➖ |
 | BASS_ATTRIB_MIDI_TRACK_VOL | `fa_stream_set_midi_track_volume(s, track, volume)` / `_get_`: 0..4, the track's notes from their next note on ([sending events](../features/midi.md#sending-events-and-the-real-time-synthesizer)) | `SetMidiTrackVolume(track, volume)` / `GetMidiTrackVolume` | ✅ |
 | BASS_MIDI_StreamGetChannel (a channel handle for per-MIDI-channel DSP) | Not provided: DSPs work on the whole stream (`fa_stream_add_dsp`); channel mute and controllers cover the usual uses | — | ➖ |
-| BASS_MIDI_DECAYEND | Always on: one second after the last event | — | ✅ |
+| BASS_MIDI_DECAYEND | Always on: the length runs until the sound of the last events (releases, reverb) has died away, at most 10 s after the last event | — | ✅ |
 | Notes held across a seek (BASSMIDI starts them again) | The same: held notes, by key or sustain pedal, start again at the target; drum notes don't ([seeking](../features/midi.md#seeking-and-length)) | automatic | ✅ |
 | BASS_MIDI_DECAYSEEK (let the sound before a seek decay) | Not provided: a seek starts from silence, with the held notes restarted | — | ➖ |
 | BASS_MIDI_NOFX (reverb and chorus) | Reverb and chorus are on by default; `fa_stream_set_midi_effects(stream, 0)` turns them off ([MIDI](../features/midi.md#reverb-and-chorus)) | `stream.MidiEffects` | ✅ |
@@ -605,7 +607,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | OGG Vorbis in bass.dll | Built-in: `.ogg` files, chained files, Ogg radio with song titles ([Ogg](../features/streams.md#ogg-opus-and-ogg-vorbis)) | ✅ |
 | basswma.dll | Built-in ASF demuxer (`.wma`, `.asf`, `.wmv` audio; files, memory, your own reader, HTTP), decoded by Media Foundation on Windows (unsupported elsewhere); ReplayGain attributes for normalization, tags and covers ([WMA](../features/streams.md#wma)) | ✅ playback; ➖ encoding (record to MP3, FLAC or WAV with `fa_encoder_*` instead), MMS, broadcasting and DRM |
 | bassenc.dll, bassenc_mp3.dll, bassenc_flac.dll (if added later) | Built in: `fa_encoder_*` writes WAV and FLAC itself and MP3 through the app's LAME ([recording and encoding](../features/recording-encoding.md)) | ✅ WAV/FLAC/MP3, 🗓️ Opus/AAC/casting |
-| bassmidi.dll | Built-in SoundFont 2 synthesizer for `.mid`, `.kar` and `.rmi`: SF2 or DLS banks, engine-wide or per-stream, the OS's `gm.dls` when the app sets none, SF3 banks, reverb and chorus, lyrics and text events, transpose and channel mute, a real-time synthesizer and events sent by the app ([MIDI](../features/midi.md)) | ✅ (SFZ and MIDI input 🗓️) |
+| bassmidi.dll | Built-in SoundFont 2 synthesizer for `.mid`, `.kar` and `.rmi`: SF2 or DLS banks, engine-wide or per-stream, stacks of several banks, the OS's `gm.dls` when the app sets none, SF3 banks, reverb and chorus, lyrics and text events, transpose and channel mute, a real-time synthesizer and events sent by the app ([MIDI](../features/midi.md)) | ✅ (SFZ and MIDI input 🗓️) |
 | bass_fx.dll | Tempo/pitch/rate params on every stream ([tempo and pitch](../features/tempo-pitch.md)); BPM and beat detection in [track analysis](../features/analysis.md); reverse playback with `fa_stream_set_reverse`. DAMP and COMPRESSOR2 used for level control are replaced by normalization and the output limiter | ✅ tempo/pitch/rate, reverse, BPM and beats, and level control |
 | basscd.dll | Built-in disc source: drives on Windows, macOS and Linux, `.cue` images, CD-Text, freedb and MusicBrainz ids, CD+G graphics ([disc playback](../features/disc.md)); analog playback not provided | ✅ disc and CD+G discs |
 | Your own CD+G decoder and renderer (MP3+G, ZIP) | Built in: `fa_cdg_surface_*` draws the graphics in sync with the audio ([CD+G](../features/cdg.md)) | ✅ |

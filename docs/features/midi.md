@@ -55,9 +55,41 @@ Console.WriteLine(sys?.Info.Name);
 using var strict = AudioEngine.Create(new AudioEngineOptions { NoSystemSoundFont = true });
 ```
 
-A soundfont is reference-counted. The engine and every stream that uses it hold their own reference, so you can close yours right after setting it, and replace the engine's at any time (open streams keep theirs). It's freed when the last user is done. Its samples are kept in memory as 32-bit float, about twice the size of the `.sf2` file (DLS banks' 8-bit samples take four times their size); `fa_soundfont_get_info` gives the figure.
+A soundfont is reference-counted. The engine and every stream that uses it hold their own reference, so you can close yours right after setting it, and replace the engine's at any time (open streams keep theirs). It's freed when the last user is done. Its samples are kept in memory as 16 bits, as in the `.sf2` file (DLS banks' 8-bit samples take twice their size); `fa_soundfont_get_info` gives the figure, and `fa_soundfont_get_preset` (`Presets`) lists the instruments and drum kits.
 
-Unlike BASSMIDI there are no font handles per preset, no font stacks and no sample loading on demand: one call loads the whole bank, and it's ready.
+There is no sample loading on demand: one call loads the whole bank, and it's ready.
+
+### Several soundfonts as one
+
+`fa_soundfont_open_stack` (`SoundFont.Stack`) makes a soundfont out of the presets of others, like BASSMIDI's font stacks: a grand piano from one bank over a full General MIDI set from another, a drum kit moved to another program, one bank's instruments a little quieter. The stack is used like any soundfont (the engine's, or one stream's), and the files are not loaded again: it plays the samples of the soundfonts it is made of, and holds a reference to each, so you can close them once the stack is made.
+
+Each entry takes presets of one soundfont: all of them, or one bank, or one program of one bank (`bank`, `program`; `FA_SOUNDFONT_ALL`, or null in C#, for all). They can play as another bank or program (`to_bank`, `to_program`) and at another level (`volume`, 1 as is, BASSMIDI's `BASS_MIDI_FontSetVolume`). When two entries give the same bank and program, the earlier entry wins. A program the stack lacks falls back as with any soundfont (bank 0, then program 0).
+
+```c
+fa_soundfont_stack_entry e[3];
+fa_soundfont_stack_entry_init(&e[0], grand);      /* the grand piano's bank 0 program 0... */
+e[0].bank = 0; e[0].program = 0;
+fa_soundfont_stack_entry_init(&e[1], kits);       /* ...its drum kit 25 as the standard kit... */
+e[1].bank = 128; e[1].program = 25; e[1].to_program = 0;
+fa_soundfont_stack_entry_init(&e[2], gm);         /* ...and General MIDI for the rest, a bit quieter */
+e[2].volume = 0.8f;
+fa_soundfont* mix = NULL;
+fa_soundfont_open_stack(e, 3, &mix);
+fa_soundfont_close(grand); fa_soundfont_close(kits); fa_soundfont_close(gm);   /* the stack keeps them */
+fa_engine_set_soundfont(engine, mix);
+fa_soundfont_close(mix);
+```
+
+```csharp
+using var mix = SoundFont.Stack(
+    new SoundFontStackEntry(grand) { Bank = 0, Program = 0 },
+    new SoundFontStackEntry(kits) { Bank = 128, Program = 25, ToProgram = 0 },
+    new SoundFontStackEntry(gm) { Volume = 0.8f });
+engine.DefaultSoundFont = mix;
+foreach (var p in mix.Presets) Console.WriteLine($"{p.Bank}:{p.Program} {p.Name}");
+```
+
+A stack is fixed once made; to change it, make another and set it (streams already open keep theirs).
 
 ### C
 
@@ -251,7 +283,7 @@ Your app can play MIDI events itself: notes, programs, controllers, pitch bend, 
 | Real-time synthesizer | `fa_stream_open_midi(engine, &midi_options, &options, &s)` | `engine.OpenMidi(midiOptions, options)` | Silent until sent events, endless, not seekable. Renders only `latency_ms` (30 ms by default, 10..500) ahead of the output. Starts as after a GM reset. |
 | Send events | `fa_stream_send_midi_events(s, events, count)` | `stream.SendMidi(MidiEvent.NoteOn(0, 60, 100))`, `SendMidi(span)` | Heard at `frame`, to the sample, or at once with `FA_MIDI_NOW` / `MidiEvent.Now`. All or none; `FA_ERROR_BUSY` (C#: `false`) when the queue is full. |
 | Send MIDI bytes | `fa_stream_send_midi(s, frame, bytes, size)` | `stream.SendMidiBytes(bytes, frame)` | Bytes as a MIDI device or a file's track gives them: running status, SysEx `F0`..`F7`; clock and other real-time bytes are skipped. |
-| A list of events as a song | `fa_stream_open_midi_events(engine, events, count, &midi_options, &options, &s)` | `engine.OpenMidiEvents(events, midiOptions, options)` | Plays, seeks and loops like a file: its length is the last event plus one second. Sorted by frame (equal frames keep their order). |
+| A list of events as a song | `fa_stream_open_midi_events(engine, events, count, &midi_options, &options, &s)` | `engine.OpenMidiEvents(events, midiOptions, options)` | Plays, seeks and loops like a file: its length runs until the sound of the last events has died away (see [length](#seeking-and-length)). Sorted by frame (equal frames keep their order). |
 | A file's events | `fa_stream_get_midi_events(s, track, type, out, capacity, &count)` | `stream.GetMidiEvents(track, type)` | Notes, controllers, programs, pressure, bends and SysEx in time order, for one track or all, one type or all. A note on with velocity 0 comes as a note off. |
 | A channel's value now | `fa_stream_get_midi_value(s, channel, type, param, &value)` | `stream.GetMidiValue(channel, type, controller)` | A controller, the program, the pitch bend or the channel pressure, as the synth has it (up to the decode-ahead past what is heard). |
 | Track volume | `fa_stream_set_midi_track_volume(s, track, volume)` / `_get_` | `SetMidiTrackVolume(track, volume)` / `GetMidiTrackVolume` | 0 (silent) to 4, 1 by default. Scales the level of that track's notes, whatever channel they are on, from their next note on. |
@@ -498,7 +530,7 @@ Seeking is sample-exact and fast: the events up to the target are replayed into 
 
 With effects on (the default), a seek also renders the second before the target without playing it, so the reverb and chorus of what was playing just before ring on into the target instead of starting from silence. The replay then stops a second before the target, and notes held there start again at that point, so at the target they are a second into their sound. Within the first second of the song this makes a seek exactly the same as playing through; later, only the reverb of what played more than a second before is missing (at least 45 dB down with the default reverb). This makes a seek take longer: about 20 ms for a dense eight-part song on a desktop CPU, against well under a millisecond with effects off.
 
-The length is the time of the last event plus one second, so the final notes ring out. Audio from a given position is the same whatever the read size or the seeks before it, so loudness scans are cached like those of any other file (the cache key includes the soundfont and the sample rate).
+The length runs until what the last events leave sounding has died away: the release of the last notes and the reverb and chorus tails, until the sound stays below -80 dBFS for a second, and at most 10 seconds after the last event (a note the file never ends would ring forever). When everything is silent before the end of the track, the song ends with the track. To find this, opening a file renders its end once without playing it (from a second before the last event, as a seek does), which costs about what two seeks cost. A looped note still held at the end (no note-off, or the sustain pedal down) is known to ring forever, so such a song gets the 10 seconds without that render. The length is measured with effects on and the stream's soundfont; a song read for its tags alone (`fa_tags_read_*`, no soundfont) reports the last event plus one second. Audio from a given position is the same whatever the read size or the seeks before it, so loudness scans are cached like those of any other file (the cache key includes the soundfont and the sample rate).
 
 ## Threads
 
@@ -509,7 +541,7 @@ Rendering runs on the engine's worker threads like decoding of any other format.
 - MIDI files up to 16 MB; events later than 6 hours are dropped. Soundfonts up to 1 GB.
 - 256 voices per stream. When a dense passage needs more, the voices furthest into their release are cut; if all 256 are held, the new notes are skipped.
 - Damaged files play what can be read: a track cut short plays up to the cut. A file with no usable track fails with `FA_ERROR_UNSUPPORTED_FORMAT`.
-- DLS banks play their regions, samples, loops, envelopes, LFOs, filter and gains. Articulation scaled by a controller (other than the default mod wheel vibrato) and DLS 2 conditional chunks are ignored. A region with its own articulation uses it instead of the instrument's, as the DLS spec says. A region's net gain above 0 dB plays at 0 dB (SoundFont 2 attenuation can't be negative).
+- DLS banks play their regions, samples, loops, envelopes, LFOs, filter, gains and effect sends. Connections with a MIDI controller, velocity, key or pressure in them (velocity to attack time, the mod wheel scaling the LFO, a controller to volume, key to filter cutoff) play as SoundFont 2 modulators; connections to the sustain levels or from the envelopes other than to pitch and cutoff are left out. DLS 2 conditional chunks are followed as a software DLS 2 synthesizer with no instruments of its own answers them (GM, GS and XG "in hardware": no; DLS 1 and 2: yes); a condition that can't be read keeps what it guards. Regions on different DLS 2 layers may overlap and all play. A region with its own articulation uses it instead of the instrument's, as the DLS spec says. A region's net gain above 0 dB plays at 0 dB (SoundFont 2 attenuation can't be negative).
 - Note velocity sets the level by the SoundFont 2 default curve (concave, 96 dB range): 40·log10(velocity/127) dB, so velocity 64 is 11.9 dB below 127, as in FluidSynth and DLS synths. A soundfont's own modulators are applied ([modulators](#soundfont-modulators)), except where they repeat a built-in default.
 - Mono and legato modes (CC126/127), GM2 controller destination settings (what pressure and the mod wheel drive, `7F 09 01`-`03`) and the SoundFont NRPNs (MSB 120) are ignored; portamento glides in every mode.
 - Each instrument's level (`initialAttenuation`) is applied as the SoundFont 2 spec states it, 0.1 dB per unit. FluidSynth applies 0.4 of that (an EMU hardware habit), so a bank tuned by ear in FluidSynth can sound with a wider gap between its quiet and loud instruments here.
@@ -518,4 +550,4 @@ Rendering runs on the engine's worker threads like decoding of any other format.
 - SysEx other than the messages listed [above](#sysex) is ignored: the part parameters not listed have no effect.
 - The insertion effect types' curves and defaults (drive and amp tones, formants, lo-fi, the multi-effects' blocks, where the manuals give no default) are our reading of the published SC-88 Pro and MU100 tables, not a copy of a module; nobody has compared them with real hardware yet.
 - A seek keeps the effects of the second before the target. A long GS delay (up to 1 s) or an XG echo with strong feedback can still ring past that second, and those repeats are missing after a seek.
-- The reverb's tail is cut at the end of the song (a second after the last event), so a long reverb time set by the file doesn't ring out fully at the very end.
+- The end of a song is measured to where its sound dies away, at most 10 seconds after the last event: a note the file never ends is cut there, and so is an extremely long reverb or release.

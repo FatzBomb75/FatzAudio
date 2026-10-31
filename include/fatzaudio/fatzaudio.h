@@ -2571,8 +2571,9 @@ FA_API fa_result FA_CALL fa_cdg_surface_get_presentation(fa_surface* surface, fa
  * FA_ERROR_NO_SOUNDFONT.
  * A soundfont is reference-counted: the engine and every stream using it hold a
  * reference, so it may be closed (or replaced on the engine) at any time and is
- * freed when the last user is done. Its samples are kept in memory as 32-bit
- * float (about twice the size of the .sf2 file).
+ * freed when the last user is done. Its samples are kept in memory as 16 bits,
+ * as in the .sf2 file (DLS banks' 8-bit samples become 16-bit; SF3 banks are decoded).
+ * Several soundfonts can play as one: fa_soundfont_open_stack.
  *
  * Seeking is sample-exact and fast: events up to the target are replayed without
  * rendering audio. Programs, controllers, pitch bends and SysEx settings are
@@ -2590,8 +2591,9 @@ FA_API fa_result FA_CALL fa_cdg_surface_get_presentation(fa_surface* surface, fa
  * drum channels other than channel 10; bank select MSB 127 (XG) and 120 (GM2)
  * pick drum kits; master volume (universal, GS and XG) and master fine and coarse
  * tuning take effect. Other SysEx is ignored.
- * The length is the time of the last event plus one second, so the last notes
- * ring out. Lyrics and other text events are listed by fa_stream_get_midi_text and
+ * The length runs until what the last events leave sounding (releases, reverb and
+ * chorus tails) has died away, at most 10 s after the last event; opening a file
+ * renders its end once, unheard, to measure it. Lyrics and other text events are listed by fa_stream_get_midi_text and
  * raised as FA_EVENT_MIDI_TEXT when they are heard. */
 
 /* A SoundFont 2 (.sf2), SF3 (.sf3, SoundFont 2 with Ogg Vorbis samples, decoded
@@ -2617,6 +2619,50 @@ typedef struct fa_soundfont_info {
 } fa_soundfont_info;
 
 FA_API fa_result FA_CALL fa_soundfont_get_info(fa_soundfont* font, fa_soundfont_info* out_info);
+
+/* One instrument or drum kit of a soundfont, by index (0 .. preset_count - 1, in bank and
+ * program order). FA_ERROR_INVALID_ARG past the end. */
+typedef struct fa_soundfont_preset {
+    int32_t bank;                /* bank select MSB 0..127; 128 = drum kits (a stack's to_bank: up to 16383) */
+    int32_t program;             /* 0..127 */
+    char name[24];               /* UTF-8 */
+} fa_soundfont_preset;
+
+FA_API fa_result FA_CALL fa_soundfont_get_preset(fa_soundfont* font, uint32_t index, fa_soundfont_preset* out_preset);
+
+/* Several soundfonts played as one (BASSMIDI's font stacks): a new soundfont made of the
+ * presets of others, used like any soundfont (fa_engine_set_soundfont,
+ * fa_open_options.soundfont). Each entry takes presets from one soundfont, all of them or
+ * one bank or one program, optionally under another bank and program number; when two
+ * entries give the same bank and program, the earlier entry wins. So a song can play a
+ * piano from one bank over a full General MIDI set from another:
+ *
+ *     fa_soundfont_stack_entry e[2];
+ *     fa_soundfont_stack_entry_init(&e[0], piano);   (the piano bank's presets...)
+ *     e[0].bank = 0; e[0].program = 0;               (...only its bank 0 program 0)
+ *     fa_soundfont_stack_entry_init(&e[1], gm);      (everything else)
+ *     fa_soundfont_open_stack(e, 2, &stack);
+ *
+ * The stack shares the samples of its soundfonts (no copy) and holds a reference to
+ * each, so they may be closed once the stack is made. FA_ERROR_INVALID_ARG for a
+ * missing font or a number out of range, FA_ERROR_NOT_FOUND when the entries select no
+ * preset at all. */
+#define FA_SOUNDFONT_ALL (-1)
+
+typedef struct fa_soundfont_stack_entry {
+    fa_soundfont* font;          /* any soundfont, a stack too */
+    int32_t bank;                /* the font's bank to take (0..16383, drum kits 128),
+                                    FA_SOUNDFONT_ALL every bank */
+    int32_t program;             /* the font's program to take (0..127), FA_SOUNDFONT_ALL every one */
+    int32_t to_bank;             /* the bank they play as, FA_SOUNDFONT_ALL their own */
+    int32_t to_program;          /* the program they play as, FA_SOUNDFONT_ALL their own */
+    float volume;                /* their notes' level: 1 = as is (0..16) */
+} fa_soundfont_stack_entry;
+
+/* Every preset of `font` as they are: banks and programs FA_SOUNDFONT_ALL, volume 1. */
+FA_API void FA_CALL fa_soundfont_stack_entry_init(fa_soundfont_stack_entry* entry, fa_soundfont* font);
+FA_API fa_result FA_CALL fa_soundfont_open_stack(const fa_soundfont_stack_entry* entries, uint32_t count,
+                                                 fa_soundfont** out_font);
 
 /* The soundfont for MIDI streams opened from now on (streams already open keep
  * theirs). The engine takes its own reference; NULL removes it. */
@@ -2813,7 +2859,7 @@ FA_API void FA_CALL fa_midi_stream_options_init(fa_midi_stream_options* options)
 FA_API fa_result FA_CALL fa_stream_open_midi(fa_engine* engine, const fa_midi_stream_options* midi_options,
                                              const fa_open_options* options, fa_stream** out_stream);
 /* A MIDI stream that plays a list of events as a file would (BASS_MIDI_StreamCreateEvents):
- * seekable, its length the last event's frame plus one second. `events` in time order
+ * seekable, its length measured as a file's (until the last events' sound dies away). `events` in time order
  * (frames at midi_options->sample_rate; FA_MIDI_NOW is frame 0), copied; `track` sets
  * the track for fa_stream_set_midi_track_volume (0..65534). SysEx longer than 65 bytes
  * (bulk data) is left out, as in files. */

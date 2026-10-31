@@ -571,6 +571,25 @@ internal unsafe struct FaSoundFontInfo
 }
 
 [StructLayout(LayoutKind.Sequential)]
+internal unsafe struct FaSoundFontPreset
+{
+    public int Bank;
+    public int Program;
+    public fixed byte Name[24];
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct FaSoundFontStackEntry
+{
+    public nint Font;
+    public int Bank;
+    public int Program;
+    public int ToBank;
+    public int ToProgram;
+    public float Volume;
+}
+
+[StructLayout(LayoutKind.Sequential)]
 internal unsafe struct FaMidiText
 {
     public long Frame;

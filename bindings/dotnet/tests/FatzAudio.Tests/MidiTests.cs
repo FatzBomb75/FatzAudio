@@ -124,7 +124,7 @@ public class MidiTests
         Meta(t, 960, 0x05, "\rworld");
         Ev(t, 0, 0x90, 69, 100);
         Ev(t, 480, 0x80, 69, 0);
-        Ev(t, 0, 0xFF, 0x2F, 0);
+        Ev(t, 960, 0xFF, 0x2F, 0); // the end of the track at 3 s, after the reverb has died away
         var f = new List<byte>();
         f.AddRange("MThd"u8.ToArray()); f.AddRange(new byte[] { 0, 0, 0, 6, 0, 0, 0, 1, 480 >> 8, 480 & 255 });
         f.AddRange("MTrk"u8.ToArray());
@@ -164,7 +164,7 @@ public class MidiTests
         Assert.Equal("midi", info.Codec);
         Assert.Equal(Rate, info.Format.SampleRate);
         Assert.Equal(2, info.Format.Channels);
-        Assert.Equal(3L * Rate, info.LengthFrames); // last event at 2 s, plus 1 s to ring out
+        Assert.Equal(3L * Rate, info.LengthFrames); // the end of the track: the sound died away before it
         s.MidiEffects = false; // dry: silence in the gap, and a seek clears the reverb tail
         var all = ReadAll(s, 3L * Rate);
         Assert.True(Rms(all, 1000, 20000) > 0.1);
@@ -174,6 +174,36 @@ public class MidiTests
         s.PositionFrames = 66150;
         var again = ReadAll(s, 3L * Rate - 66150);
         Assert.True(all.AsSpan(66150 * 2).SequenceEqual(again));
+    }
+
+    [Fact]
+    public void Stack_MapsPresetsAndKeepsItsFonts()
+    {
+        using var engine = CreateHeadless();
+        SoundFont stack;
+        using (var a = SoundFont.FromMemory(SineSoundFont()))
+        using (var b = SoundFont.FromMemory(SineSoundFont()))
+        {
+            Assert.Equal(new[] { (0, 0), (128, 0) }, a.Presets.Select(p => (p.Bank, p.Program)));
+            Assert.Equal("Sine", a.Presets[0].Name);
+            stack = SoundFont.Stack(
+                new SoundFontStackEntry(a) { Bank = 0, Program = 0, ToProgram = 5, Volume = 0.5f },
+                new SoundFontStackEntry(b));
+            Assert.Throws<FatzAudioException>(() => SoundFont.Stack(new SoundFontStackEntry(a) { Bank = 9 }));
+            var bad = Assert.Throws<FatzAudioException>(() => SoundFont.Stack(new SoundFontStackEntry(a) { Program = 200 }));
+            Assert.Equal(ErrorCode.InvalidArgument, bad.ErrorCode);
+        }
+        // The members were disposed: the stack keeps them.
+        using (stack)
+        {
+            Assert.Equal(new[] { (0, 0), (0, 5), (128, 0) }, stack.Presets.Select(p => (p.Bank, p.Program)));
+            Assert.Equal(2 * 2 * (4410 + 46), stack.Info.SampleMemory);
+            using var s = engine.OpenMemory(Song(), DecodeOnly with { SoundFont = stack });
+            s.MidiEffects = false;
+            var x = ReadAll(s, Rate / 2);
+            Assert.True(Rms(x, 1000, 20000) > 0.1);
+        }
+        Assert.Throws<ArgumentException>(() => SoundFont.Stack());
     }
 
     [Fact]
