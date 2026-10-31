@@ -4,8 +4,14 @@
  * midi_var.c) are driven directly and measured from impulse and sine responses; then
  * whole songs through the decoder check the routing (CC94, part sends, insertion),
  * GM files ignoring CC94, seeks and read sizes. */
+#if !defined(_WIN32)
+#  define _POSIX_C_SOURCE 200809L
+#endif
 #include "fa_internal.h"
 #include "midi_synth_test.h"
+#if defined(__APPLE__)
+#  include <unistd.h>
+#endif
 
 #define BLOCK 64
 #define CHECK_EQ(a, b) do { long long va_ = (long long)(a), vb_ = (long long)(b); if (va_ != vb_) { \
