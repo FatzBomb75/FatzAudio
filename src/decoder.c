@@ -93,6 +93,25 @@ void fa_decoder_get_info(const fa_decoder* d, fa_stream_info* out)
     }
 }
 
+int fa_decoder_recognizes(const uint8_t* data, size_t size)
+{
+    uint32_t i, count = fa_decoder_registry_count;
+    size_t n = size < FA_PROBE_BYTES ? size : FA_PROBE_BYTES, id3;
+    if (count > 16) count = 16;
+    if (n == 0) return 1;
+    id3 = fa_probe_id3v2_size(data, n);
+    if (id3 > 0 && id3 + 16 > n) {
+        /* A tag fills the window: look right after it, as fa_decoder_open does. */
+        if (id3 + 16 > size) return 1;
+        data += id3;
+        n = size - id3 < FA_PROBE_BYTES ? size - id3 : FA_PROBE_BYTES;
+        id3 = 0;
+    }
+    for (i = 0; i < count; i++)
+        if (fa_decoder_registry[i]->probe(data, n, id3) > 0) return 1;
+    return 0;
+}
+
 fa_result fa_decoder_open(fa_decoder* dec, fa_source* src, const char* name_hint, const char* mime_hint,
                           int32_t audio_track, const fa_decoder_env* env)
 {

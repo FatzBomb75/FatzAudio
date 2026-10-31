@@ -620,6 +620,8 @@ internal unsafe ref struct NativeOptions
     private FaNetOptions* _net;
     private byte* _userAgent, _headers, _proxy;
     private SoundFontHandle? _font;
+    private int* _cancel;
+    private CancellationTokenRegistration _cancelRegistration;
 
     public readonly FaOpenOptions* Pointer => _ptr;
 
@@ -639,6 +641,14 @@ internal unsafe ref struct NativeOptions
         o._ptr->AudioTrack = options.AudioTrack;
         o._ptr->DynamicRange = (int)options.DynamicRange;
         o._ptr->TextCodePage = (int)options.TextCodePage;
+        if (options.CancellationToken.CanBeCanceled)
+        {
+            // The native open reads this flag while it unpacks; the token sets it from any thread.
+            o._cancel = (int*)NativeMemory.AllocZeroed(sizeof(int));
+            o._ptr->Cancel = o._cancel;
+            o._cancelRegistration = options.CancellationToken.Register(
+                static state => Volatile.Write(ref *(int*)(nint)state!, 1), (nint)o._cancel);
+        }
         if (options.SoundFont is { } font)
         {
             // Held until the open call returns; the native stream takes its own reference.
@@ -683,6 +693,10 @@ internal unsafe ref struct NativeOptions
 
     public void Dispose()
     {
+        // Disposing the registration waits for a callback that is running, so the flag is not written after it is freed.
+        _cancelRegistration.Dispose();
+        if (_cancel != null) NativeMemory.Free(_cancel);
+        _cancel = null;
         if (_mime != null) Marshal.FreeCoTaskMem((nint)_mime);
         if (_userAgent != null) Marshal.FreeCoTaskMem((nint)_userAgent);
         if (_headers != null) Marshal.FreeCoTaskMem((nint)_headers);

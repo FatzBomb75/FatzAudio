@@ -317,6 +317,13 @@ public sealed record StreamOptions
     /// says which was used. Other formats ignore it.
     /// </summary>
     public TextCodePage TextCodePage { get; init; } = TextCodePage.Detect;
+    /// <summary>
+    /// Stops an open that is unpacking a compressed song from a ZIP archive (the one long step of opening a file or
+    /// memory block): the call then throws a <see cref="FatzAudioException"/> with <see cref="ErrorCode.Cancelled"/>,
+    /// within about a megabyte of work, and no stream is created. A token that is already cancelled stops it at once.
+    /// Other opens ignore it.
+    /// </summary>
+    public CancellationToken CancellationToken { get; init; }
 }
 
 /// <summary>Text encodings of MIDI files (<see cref="StreamOptions.TextCodePage"/>).</summary>

@@ -229,6 +229,74 @@ public class CdgTests
     }
 
     [Fact]
+    public void OpenFile_CancellationToken_StopsAZipUnpack()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "fa-cdg-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string zip = Path.Combine(dir, "Big.zip");
+            using (var z = ZipFile.Open(zip, ZipArchiveMode.Create))
+            {
+                using var e = z.CreateEntry("Big.wav", CompressionLevel.Optimal).Open();
+                e.Write(TestAudio.SineWav(20));
+            }
+
+            using var engine = CreateHeadless();
+            using (var cancelled = new CancellationTokenSource())
+            {
+                cancelled.Cancel();
+                var ex = Assert.Throws<FatzAudioException>(() => engine.OpenFile(zip, DecodeOnly with { CancellationToken = cancelled.Token }));
+                Assert.Equal(ErrorCode.Cancelled, ex.ErrorCode);
+            }
+
+            // A token nobody cancelled changes nothing.
+            using var idle = new CancellationTokenSource();
+            using var song = engine.OpenFile(zip, DecodeOnly with { CancellationToken = idle.Token });
+            Assert.Equal(20 * 44100, TestAudio.ReadAll(song));
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
+    public void OpenFile_TempFileSong_GetsALoudnessScan()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "fa-cdg-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string zip = Path.Combine(dir, "Big.zip");
+            using (var z = ZipFile.Open(zip, ZipArchiveMode.Create))
+            {
+                using var e = z.CreateEntry("Big.wav", CompressionLevel.Optimal).Open();
+                e.Write(TestAudio.SineWav(20));
+            }
+
+            using var engine = AudioEngine.Create(new AudioEngineOptions
+            {
+                NullOutput = true, ZipMemoryLimitMb = 1, TempDirectory = Path.Combine(dir, "temp"),
+            });
+            using var song = engine.OpenFile(zip);   // unpacked into a temp file
+            var until = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+            Loudness l;
+            do
+            {
+                Thread.Sleep(20);
+                l = song.GetLoudness();
+            } while (!l.IsFinal && DateTime.UtcNow < until);
+            Assert.True(l.IsFinal);
+            Assert.Equal(LoudnessSource.Scan, l.Source);
+        }
+        finally
+        {
+            Directory.Delete(dir, true);
+        }
+    }
+
+    [Fact]
     public void Surface_FollowsTheAudioClock()
     {
         using var engine = CreateHeadless();

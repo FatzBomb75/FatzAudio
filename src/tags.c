@@ -576,7 +576,18 @@ static fa_result read_zip(fa_tags* t, fa_source* src, uint32_t flags)
             } else {
                 uint8_t* audio;
                 fa_source mem;
-                if (fa_zip_extract(src, &e[i], FA_ZIP_DEFAULT_MEMORY_LIMIT, &audio) != FA_OK) continue;
+                /* Not audio (a video, a PDF): told from a 64 KB prefix, not by unpacking it. */
+                if (e[i].size > FA_ZIP_PROBE_BYTES) {
+                    uint8_t* head = (uint8_t*)malloc(FA_ZIP_PROBE_BYTES);
+                    size_t got = 0;
+                    fa_result pr;
+                    if (!head) continue;
+                    pr = fa_zip_extract_prefix(src, &e[i], head, FA_ZIP_PROBE_BYTES, &got);
+                    ok = pr != FA_OK || fa_decoder_recognizes(head, got);
+                    free(head);
+                    if (!ok) continue;
+                }
+                if (fa_zip_extract(src, &e[i], FA_ZIP_DEFAULT_MEMORY_LIMIT, NULL, &audio) != FA_OK) continue;
                 fa_source_open_memory_ref(&mem, audio, (size_t)e[i].size);
                 ok = read_source(t, &mem, e[i].name, flags, 1);
                 fa_source_close(&mem);
@@ -652,11 +663,13 @@ FA_API fa_result FA_CALL fa_stream_get_tags(fa_stream* stream, uint32_t flags, f
     if (!t) return FA_ERROR_OUT_OF_MEMORY;
     /* The file is read again through a source of its own: the stream's source
      * belongs to its decode thread. Memory blocks stay fixed while the stream is open. */
-    if (stream->path || stream->source.kind == FA_SOURCE_MEMORY) {
+    if (stream->path || stream->source.kind == FA_SOURCE_MEMORY || stream->source.shared) {
         fa_source src;
-        /* A stored ZIP entry is reopened as its bytes in the archive. */
-        r = stream->path ? fa_source_open_path_window(&src, stream->path, stream->path_offset, stream->path_length)
-                         : fa_source_open_memory_ref(&src, stream->source.mem, stream->source.mem_size);
+        /* A stored ZIP entry is reopened as its bytes in the archive, an unpacked
+         * one (temp file) through the stream's shared file. */
+        if (stream->source.shared) r = fa_source_open_shared(&src, stream->source.shared);
+        else if (stream->path) r = fa_source_open_path_window(&src, stream->path, stream->path_offset, stream->path_length);
+        else r = fa_source_open_memory_ref(&src, stream->source.mem, stream->source.mem_size);
         if (r == FA_OK) {
             /* A ZIP (MP3+G) gives the tags of the audio file inside it. */
             r = read_any(t, &src, stream->path_name[0] ? stream->path_name : NULL, flags | FA_TAGS_NO_INFO);
