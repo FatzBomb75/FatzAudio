@@ -1986,6 +1986,31 @@ public unsafe partial class AudioStream : IDisposable
         TrackAnalysis.RunAsync(Handle, h => TrackAnalysis.Run(h, kinds, options), cancellationToken);
 
     /// <summary>
+    /// Where this stream is silent: the first and last audible frame (for <see cref="StreamMarkers.CueIn"/> and
+    /// <see cref="StreamMarkers.CueOut"/>) and the silence regions, read with a decoder of its own (playback is not touched).
+    /// Answers from the analysis cache when an <see cref="AnalysisKinds.Silence"/> analysis with the same options is there
+    /// (every region); otherwise it decodes only the start up to the first sound and the end back to the last one, usually
+    /// a few milliseconds, so it is ready between open and play (then <see cref="SilenceInfo.IsComplete"/> is false on long
+    /// files: only the leading and trailing regions are known). MIDI files and tracker modules are measured on their
+    /// rendered audio, release tails and reverb included. Blocks while it decodes: call it where you open streams.
+    /// </summary>
+    /// <param name="options">Mode, threshold and lengths; null uses the defaults (RMS over 50 ms windows, -50 dBFS, 1 s, sounds from 200 ms).</param>
+    /// <returns>The result, a plain object with nothing to dispose.</returns>
+    /// <exception cref="FatzAudioException">The stream cannot be read twice (web, push, packet, callback and app I/O streams:
+    /// <see cref="ErrorCode.NotSeekable"/>; use a <see cref="SilenceDetector"/>), or the options are invalid.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public SilenceInfo DetectSilence(SilenceOptions? options = null)
+    {
+        var o = SilenceOptions.ToNative(options);
+        var h = Handle;
+        return SilenceInfo.Read((FaSilence* s, FaSilenceRegion* r, uint cap, uint* n) =>
+        {
+            var opt = o;
+            return NativeMethods.fa_stream_get_silence(h, &opt, s, r, cap, n);
+        });
+    }
+
+    /// <summary>
     /// The stream's beat grid, for decks (sync, beat loops, aligned mixes). Reading returns the grid set last, else, for MIDI
     /// files and tracker modules, the exact one from the file (for a module the first read renders it once without sound,
     /// about 0.25 s for a 4-minute song), else null. Setting one from an analysis (<see cref="TrackAnalysis.Beats"/>), from the

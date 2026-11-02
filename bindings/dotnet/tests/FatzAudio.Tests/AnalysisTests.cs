@@ -73,7 +73,7 @@ public class AnalysisTests
         Assert.Equal(28, System.Runtime.InteropServices.Marshal.SizeOf<Native.FaKeyInfo>());
         Assert.Equal(24, (int)System.Runtime.InteropServices.Marshal.OffsetOf<Native.FaKeyInfo>(nameof(Native.FaKeyInfo.Camelot)));
         Assert.Equal(24, System.Runtime.InteropServices.Marshal.SizeOf<Native.FaAnalysisInfo>());
-        Assert.Equal(20, System.Runtime.InteropServices.Marshal.SizeOf<Native.FaAnalysisOptions>());
+        Assert.Equal(40, System.Runtime.InteropServices.Marshal.SizeOf<Native.FaAnalysisOptions>());
         Assert.Equal(16, System.Runtime.InteropServices.Marshal.SizeOf<Native.FaWaveformPoint>());
     }
 

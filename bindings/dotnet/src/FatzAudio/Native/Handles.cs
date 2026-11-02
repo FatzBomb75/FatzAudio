@@ -254,6 +254,21 @@ internal sealed class SoundFontHandle : SafeHandle
     }
 }
 
+/// <summary>Owns an <c>fa_silence_detector*</c>.</summary>
+internal sealed class SilenceDetectorHandle : SafeHandle
+{
+    public SilenceDetectorHandle() : base(0, true) { }
+    public override bool IsInvalid => handle == 0;
+
+    public void Initialize(nint native) => SetHandle(native);
+
+    protected override bool ReleaseHandle()
+    {
+        NativeMethods.fa_silence_detector_free(handle);
+        return true;
+    }
+}
+
 /// <summary>Owns an <c>fa_sound*</c> and keeps its engine alive. Its voices' stream handles hold a reference to
 /// it, so the sound is closed only after every voice wrapper let go (<c>fa_sound_close</c> closes the voices left).</summary>
 internal sealed class SoundHandle : SafeHandle

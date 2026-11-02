@@ -416,6 +416,30 @@ internal static unsafe partial class NativeMethods
     [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_stream_get_beat_grid(StreamHandle stream, FaBeatGrid* grid, FaTempoSegment* segments, uint capacity, uint* count);
 
+    // ---- Silence -----------------------------------------------------------
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_silence_options_init(FaSilenceOptions* options);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_stream_get_silence(StreamHandle stream, FaSilenceOptions* options, FaSilence* silence,
+        FaSilenceRegion* regions, uint capacity, uint* count);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_analysis_get_silence(nint analysis, FaSilence* silence, FaSilenceRegion* regions, uint capacity, uint* count);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_silence_detector_create(FaAudioFormat* format, FaSilenceOptions* options, out nint detector);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_silence_detector_feed(SilenceDetectorHandle detector, void** planes, long frames);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial int fa_silence_detector_get(SilenceDetectorHandle detector, FaSilence* silence, FaSilenceRegion* regions,
+        uint capacity, uint* count);
+
+    [LibraryImport(Lib)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+    public static partial void fa_silence_detector_free(nint detector);
+
     // ---- Tags --------------------------------------------------------------
     [LibraryImport(Lib, StringMarshalling = StringMarshalling.Utf8)] [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
     public static partial int fa_tags_read_path(string path, uint flags, out nint tags);

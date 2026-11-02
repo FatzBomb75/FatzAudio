@@ -15,6 +15,8 @@ public enum AnalysisKinds
     Key = 4,
     /// <summary>Peak and low/mid/high band levels every 10 ms, for drawing the track.</summary>
     Waveform = 8,
+    /// <summary>Silence regions and the first and last audible frame (<see cref="SilenceInfo"/>), with every region found.</summary>
+    Silence = 16,
 }
 
 /// <summary>How a <see cref="BeatGrid"/> came about and what it knows.</summary>
@@ -48,6 +50,11 @@ public sealed record AnalysisOptions
     public float MaxBpm { get; init; } = 180f;
     /// <summary>Neither read nor write the analysis cache (<see cref="AudioEngineOptions.CacheDirectory"/>).</summary>
     public bool NoCache { get; init; }
+    /// <summary>
+    /// <see cref="AnalysisKinds.Silence"/>: the mode, threshold and lengths (defaults: RMS over 50 ms, -50 dBFS, 1 s). Use the same
+    /// settings as <see cref="AudioStream.DetectSilence"/>, so it answers from the cache.
+    /// </summary>
+    public SilenceOptions Silence { get; init; } = new();
 }
 
 /// <summary>A stretch of a song at one tempo (<see cref="BeatGrid.Segments"/>).</summary>
@@ -387,8 +394,9 @@ public readonly record struct WaveformPoint(float Peak, float Low, float Mid, fl
 public sealed class TrackAnalysis
 {
     internal TrackAnalysis(AnalysisKinds kinds, bool fromCache, int sampleRate, long length, BeatGrid? beats, MusicalKey? key,
-        WaveformPoint[]? waveform, Loudness? loudness)
+        WaveformPoint[]? waveform, Loudness? loudness, SilenceInfo? silence)
     {
+        Silence = silence;
         Kinds = kinds;
         FromCache = fromCache;
         SampleRate = sampleRate;
@@ -423,6 +431,9 @@ public sealed class TrackAnalysis
     /// <summary>The loudness; null when <see cref="AnalysisKinds.Loudness"/> was not asked for.</summary>
     public Loudness? Loudness { get; }
 
+    /// <summary>The silence, with every region (<see cref="SilenceInfo.IsComplete"/>); null when <see cref="AnalysisKinds.Silence"/> was not asked for.</summary>
+    public SilenceInfo? Silence { get; }
+
     internal static unsafe FaAnalysisOptions NativeOptions(AnalysisKinds kinds, AnalysisOptions? options)
     {
         FaAnalysisOptions o = default;
@@ -433,6 +444,12 @@ public sealed class TrackAnalysis
             o.MinBpm = options.MinBpm;
             o.MaxBpm = options.MaxBpm;
             if (options.NoCache) o.Flags |= 1; // FA_ANALYZE_NO_CACHE
+            var silence = SilenceOptions.ToNative(options.Silence);
+            o.SilenceThresholdDb = silence.ThresholdDb;
+            o.SilenceMinLengthMs = silence.MinLengthMs;
+            o.SilenceMode = silence.Mode;
+            o.SilenceWindowMs = silence.WindowMs;
+            o.SilenceMinSoundMs = silence.MinSoundMs;
         }
         return o;
     }
@@ -456,8 +473,11 @@ public sealed class TrackAnalysis
                 FatzAudioException.ThrowIfFailed(NativeMethods.fa_analysis_get_loudness(analysis, ref l));
                 loudness = FatzAudio.Loudness.From(l);
             }
+            SilenceInfo? silence = (kinds & AnalysisKinds.Silence) != 0
+                ? SilenceInfo.Read((FaSilence* s, FaSilenceRegion* r, uint cap, uint* n) => NativeMethods.fa_analysis_get_silence(analysis, s, r, cap, n))
+                : null;
             return new TrackAnalysis(kinds, (info.Flags & 1) != 0 /* FA_ANALYSIS_FROM_CACHE */, (int)info.SampleRate, info.Length,
-                beats, key, waveform, loudness);
+                beats, key, waveform, loudness, silence);
         }
         finally
         {

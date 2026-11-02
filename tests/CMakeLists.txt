@@ -503,3 +503,11 @@ endif()
 # directory, so ctest -j must not run two of them at once. Everything else runs
 # in parallel.
 set_tests_properties(core loudness cdg disc encode midi internal tags analysis PROPERTIES RESOURCE_LOCK fa_scratch_files)
+
+add_executable(fa_test_silence test_silence.c)
+target_compile_options(fa_test_silence PRIVATE ${FA_WARNINGS})
+target_link_libraries(fa_test_silence PRIVATE fatzaudio)
+if(UNIX)
+    target_link_libraries(fa_test_silence PRIVATE m)
+endif()
+add_test(NAME silence COMMAND fa_test_silence)

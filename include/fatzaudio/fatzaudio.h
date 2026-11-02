@@ -1992,6 +1992,8 @@ FA_API fa_result FA_CALL fa_scan_loudness_path(fa_engine* engine, const char* pa
  *   - KEY: tonic and mode, the name ("F#m") and the Camelot code ("11A").
  *   - WAVEFORM: peak and low/mid/high band levels every 10 ms, for drawing.
  *   - LOUDNESS: the same measurement as fa_scan_loudness_path, in the same pass.
+ *   - SILENCE: every silence region and the first and last audible frame ("Silence"
+ *     below), with the settings in the silence_* fields.
  * Results are cached in fa_engine_config.cache_directory, keyed by the file's
  * content like loudness scans, so a song is analysed once.
  *
@@ -2008,7 +2010,9 @@ typedef enum fa_analysis_kind {
     FA_ANALYZE_LOUDNESS = 1 << 0,
     FA_ANALYZE_BEATS    = 1 << 1,
     FA_ANALYZE_KEY      = 1 << 2,
-    FA_ANALYZE_WAVEFORM = 1 << 3
+    FA_ANALYZE_WAVEFORM = 1 << 3,
+    FA_ANALYZE_SILENCE  = 1 << 4     /* silence regions, first and last audible frame
+                                        (fa_analysis_get_silence; "Silence" below) */
 } fa_analysis_kind;
 
 typedef enum fa_analysis_flags {
@@ -2023,6 +2027,11 @@ typedef struct fa_analysis_options {
     float max_bpm;           /* ... 180; min_bpm >= 30, max_bpm <= 400 and at least
                                 1.9 x min_bpm. MIDI and tracker grids are never folded */
     uint32_t flags;          /* fa_analysis_flags */
+    float silence_threshold_db;     /* SILENCE: as fa_silence_options.threshold_db (default -50) */
+    uint32_t silence_min_length_ms; /* SILENCE: as fa_silence_options.min_length_ms (default 1000) */
+    uint32_t silence_mode;          /* SILENCE: as fa_silence_options.mode (default FA_SILENCE_RMS) */
+    uint32_t silence_window_ms;     /* SILENCE: as fa_silence_options.window_ms (default 50) */
+    uint32_t silence_min_sound_ms;  /* SILENCE: as fa_silence_options.min_sound_ms (default 200) */
 } fa_analysis_options;
 
 FA_API void FA_CALL fa_analysis_options_init(fa_analysis_options* options);
@@ -2143,6 +2152,123 @@ FA_API fa_result FA_CALL fa_stream_set_beat_grid(fa_stream* stream, const fa_bea
 FA_API fa_result FA_CALL fa_stream_get_beat_grid(fa_stream* stream, fa_beat_grid* out_grid,
                                                  fa_tempo_segment* out_segments, uint32_t capacity,
                                                  uint32_t* out_count);
+
+/* ---- Silence ---------------------------------------------------------------
+ *
+ * Where a song is silent, so an app can play only its audible part: set CUE_IN to
+ * first_audible and CUE_OUT to last_audible (fa_stream_set_marker), or skip the
+ * regions. One rule everywhere, in one of two modes:
+ *   - FA_SILENCE_RMS (the default, for trimming): the audio is cut into windows of
+ *     window_ms (50 ms by default), counted from frame 0; a window is audible when
+ *     the RMS level of any channel over it is at or above the threshold. Audible
+ *     windows in a row that last less than min_sound_ms (200 ms by default) count
+ *     as silence: a lone click, a crackle or a count-in tick does not count as
+ *     audio, while a soft fade-in counts from the first window that reaches the
+ *     threshold. Audible times and regions fall on window edges. A full-scale sine
+ *     reads -3 dB RMS.
+ *   - FA_SILENCE_PEAK: a frame is audible when any channel's sample is at or above
+ *     the threshold (|x| >= 10^(threshold_db / 20)); exact to the frame, and a
+ *     single click counts.
+ * A silence region is a run that is not audible, at least min_length_ms long.
+ * Frames are the stream's source frames (the unit of markers). Every result says
+ * the mode and settings that made it (fa_silence), and the analysis cache keeps
+ * results of other settings apart.
+ *
+ * Three ways to get it, all giving the same answer for the same audio:
+ *   - fa_stream_get_silence: per stream, quick enough to call between open and
+ *     play. It answers from the analysis cache when a SILENCE analysis of the
+ *     same content and settings is there (every region), else decodes only the
+ *     start up to the first audible frame and the end back to the last one
+ *     (leading and trailing regions; files that cannot seek cheaply, and short
+ *     ones, are decoded whole and get every region).
+ *   - fa_analyze_path / fa_analyze_stream with FA_ANALYZE_SILENCE: every region,
+ *     in the same pass as the other kinds, and cached. Analyse a library ahead and
+ *     each later fa_stream_get_silence is instant and complete.
+ *   - fa_silence_detector: for audio the library cannot read twice, such as the
+ *     PCM an app pushes (fa_stream_push_pcm) or reads from a decode-only stream.
+ *     Feed it the same frames; frames count from the first one fed.
+ * MIDI files and tracker modules are measured on their rendered audio, so release
+ * tails, reverb and sample decay count as audible (their note events would end too
+ * early). Rendering silence costs next to nothing. */
+typedef enum fa_silence_mode {
+    FA_SILENCE_RMS = 0,      /* RMS level over windows of window_ms (default) */
+    FA_SILENCE_PEAK = 1      /* sample peak, frame by frame */
+} fa_silence_mode;
+
+typedef struct fa_silence_options {
+    uint32_t struct_size;    /* sizeof(fa_silence_options) */
+    float threshold_db;      /* dBFS, -120..0; default -50 */
+    uint32_t min_length_ms;  /* shortest silence that is a region, 1..3600000; default 1000 */
+    uint32_t mode;           /* fa_silence_mode; default FA_SILENCE_RMS */
+    uint32_t window_ms;      /* RMS window, 10..1000; default 50 (ignored by PEAK) */
+    uint32_t min_sound_ms;   /* RMS: shortest audible run that counts, 0..10000 (0 = any);
+                                default 200 (ignored by PEAK) */
+} fa_silence_options;
+
+FA_API void FA_CALL fa_silence_options_init(fa_silence_options* options);
+
+typedef enum fa_silence_flags {
+    FA_SILENCE_COMPLETE   = 1 << 0,  /* the regions cover the whole stream; without it
+                                        only the leading and trailing ones are known */
+    FA_SILENCE_FROM_CACHE = 1 << 1   /* read from the analysis cache, not measured now */
+} fa_silence_flags;
+
+typedef struct fa_silence_region {
+    fa_frames start;         /* first silent frame */
+    fa_frames end;           /* frame after the last silent one */
+} fa_silence_region;
+
+typedef struct fa_silence {
+    uint32_t struct_size;    /* sizeof(fa_silence), set before the call; filled up to it */
+    uint32_t flags;          /* fa_silence_flags */
+    uint32_t sample_rate;    /* of the frames */
+    fa_frames first_audible; /* first audible frame (for CUE_IN); FA_FRAMES_UNSET when
+                                nothing is audible */
+    fa_frames last_audible;  /* the frame after the last audible one (for CUE_OUT);
+                                FA_FRAMES_UNSET when nothing is audible */
+    fa_frames length;        /* frames measured: the stream's length (a detector: the
+                                frames fed so far) */
+    float threshold_db;      /* the settings that produced this result (a cached one */
+    uint32_t min_length_ms;  /* has those it was measured with) */
+    uint32_t mode;           /* fa_silence_mode */
+    uint32_t window_ms;      /* RMS window; 0 for PEAK */
+    uint32_t min_sound_ms;   /* RMS shortest sound; 0 for PEAK */
+} fa_silence;
+
+/* A stream's silence (above). options NULL = defaults. Copies up to `capacity`
+ * regions, in order (NULL with capacity 0 for none); *out_count (may be NULL) gets
+ * how many there are. Blocks while it decodes, usually a few milliseconds (a song's
+ * start and its last 30 s); call it from a worker thread, as opening is. Playback is
+ * not touched: it reads the file with a decoder of its own. FA_ERROR_NOT_SEEKABLE for
+ * push, packet, web, callback and app-I/O streams, which cannot be read twice (use
+ * fa_silence_detector). */
+FA_API fa_result FA_CALL fa_stream_get_silence(fa_stream* stream, const fa_silence_options* options,
+                                               fa_silence* out_silence, fa_silence_region* out_regions,
+                                               uint32_t capacity, uint32_t* out_count);
+/* The silence an analysis with FA_ANALYZE_SILENCE found (always COMPLETE); regions as
+ * for fa_stream_get_silence. FA_ERROR_NOT_FOUND when the kind was not asked for. */
+FA_API fa_result FA_CALL fa_analysis_get_silence(const fa_analysis* analysis, fa_silence* out_silence,
+                                                 fa_silence_region* out_regions, uint32_t capacity,
+                                                 uint32_t* out_count);
+
+/* The same detector for PCM the app has. `format` is the PCM given to feed (any
+ * fa_sample_format, 1..32 channels); options NULL = defaults. Not thread safe: use
+ * one detector from one thread at a time. */
+typedef struct fa_silence_detector fa_silence_detector;
+FA_API fa_result FA_CALL fa_silence_detector_create(const fa_audio_format* format, const fa_silence_options* options,
+                                                    fa_silence_detector** out_detector);
+/* Frames in the detector's format: planes as for fa_stream_push_pcm (one pointer
+ * for interleaved formats, one per channel for planar ones). */
+FA_API fa_result FA_CALL fa_silence_detector_feed(fa_silence_detector* detector, const void* const* planes,
+                                                  fa_frames frames);
+/* What the frames fed so far show. A silent run still going at the end is a region
+ * once it is long enough, and grows while more silence is fed; an RMS window still
+ * being filled counts with the frames it has. FA_SILENCE_COMPLETE
+ * is never set: only the app knows when its audio is over. */
+FA_API fa_result FA_CALL fa_silence_detector_get(fa_silence_detector* detector, fa_silence* out_silence,
+                                                 fa_silence_region* out_regions, uint32_t capacity,
+                                                 uint32_t* out_count);
+FA_API void FA_CALL fa_silence_detector_free(fa_silence_detector* detector);
 
 /* ---- CD+G karaoke graphics ---------------------------------------------
  *

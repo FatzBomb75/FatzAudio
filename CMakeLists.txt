@@ -107,6 +107,7 @@ set(FA_SOURCES
     src/mdct.c
     src/push.c
     src/callback.c
+    src/silence.c
     src/sound.c
     src/capture.c
     src/demux.c
