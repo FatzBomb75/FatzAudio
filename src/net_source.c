@@ -389,7 +389,7 @@ static int on_data(void* user, const uint8_t* data, size_t size)
 }
 
 /* First entry of a .pls ("File1=...") or plain .m3u playlist, resolved. */
-static int playlist_first_entry(const char* text, const char* base, char* out, size_t cap)
+int fa_playlist_first_entry(const char* text, const char* base, char* out, size_t cap)
 {
     const char* line = text;
     int pls = fa_strncasecmp_ascii(text, "[playlist]", 10) == 0;
@@ -495,7 +495,7 @@ static void download_main(void* arg)
                 break;
             } else {
                 char next[FA_NET_URL_MAX];
-                if (++hops > FA_NET_PLAYLIST_HOPS || !playlist_first_entry(n->playlist, n->final_url, next, sizeof(next))) {
+                if (++hops > FA_NET_PLAYLIST_HOPS || !fa_playlist_first_entry(n->playlist, n->final_url, next, sizeof(next))) {
                     n->error = FA_ERROR_UNSUPPORTED_FORMAT;
                     break;
                 }

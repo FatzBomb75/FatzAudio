@@ -1,5 +1,5 @@
 /* Fuzz target: the HLS playlist parser (master and media, byte ranges, keys, init
- * sections) and the MPEG-TS audio extractor. The input is split at its first NUL:
+ * sections), the .pls / .m3u first-entry reader and the MPEG-TS audio extractor. The input is split at its first NUL:
  * before it a playlist, after it TS bytes (a plain playlist if there is no NUL). */
 #include "fa_internal.h"
 #include "net.h"
@@ -18,7 +18,18 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     const uint8_t* nul = (const uint8_t*)memchr(data, 0, size);
     size_t plen = nul ? (size_t)(nul - data) : size;
     fa_hls_playlist p;
+    char entry[FA_NET_URL_MAX];
     memset(&p, 0, sizeof(p));
+    {   /* the same text as a .pls / .m3u radio playlist (the first entry, resolved), when it is text */
+        char* text = (char*)malloc(plen + 1);
+        if (text) {
+            memcpy(text, data, plen);
+            text[plen] = 0;
+            (void)fa_playlist_first_entry(text, "http://h.com/m/list.pls", entry, sizeof(entry));
+            (void)fa_playlist_first_entry(text, "https://[::1]:8443/a?b#c", entry, 24);
+            free(text);
+        }
+    }
     if (fa_hls_parse((const char*)data, plen, "http://h.com/m/master.m3u8", &p) == FA_OK) {
         (void)fa_hls_audio_uri(&p, fa_hls_pick_variant(&p, 0));
         (void)fa_hls_audio_uri(&p, fa_hls_pick_variant(&p, 128000));

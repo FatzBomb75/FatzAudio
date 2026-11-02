@@ -32,6 +32,8 @@ fa_result fa_proxy_parse(const char* setting, fa_url* out);
 /* Resolves `ref` (absolute, or relative as in an HLS playlist) against the absolute
  * URL `base` (RFC 3986 section 5). FA_ERROR_INVALID_ARG if it does not fit. */
 fa_result fa_url_resolve(const char* base, const char* ref, char* out, size_t cap);
+/* First entry of a .pls ("File1=...") or plain .m3u playlist in `text`, resolved against `base` into `out`; 0 when there is none. */
+int fa_playlist_first_entry(const char* text, const char* base, char* out, size_t cap);
 /* Base64 of `n` bytes into `out` (cap >= 4 * ((n + 2) / 3) + 1). */
 void fa_base64(const uint8_t* in, size_t n, char* out);
 /* Case-insensitive ASCII compare of at most n characters. */

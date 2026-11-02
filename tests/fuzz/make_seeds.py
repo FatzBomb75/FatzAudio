@@ -24,6 +24,14 @@ with zipfile.ZipFile(os.path.join(here, "seeds", "zip", "zip64.zip"), "w", zipfi
     with z.open(zinfo("big.bin", zipfile.ZIP_DEFLATED), "w", force_zip64=True) as f:
         f.write(b"abc" * 500)
 
+# Songs inside ZIPs, for the readers behind them (tags.c read_zip, stream.c open_zip_entry): an ID3-tagged MP3 and a FLAC
+# with tags and a cue sheet, stored and deflated, and a MIDI file with a text file in front.
+tagsd = os.path.join(data, "tags")
+tagged = open(os.path.join(tagsd, "id3v24.mp3"), "rb").read()[:20000]
+flac = open(os.path.join(tagsd, "tags.flac"), "rb").read()[:20000]
+zipseed("song_tags.zip", [("readme.txt", b"karaoke"), ("tagged.mp3", tagged), ("tagged.flac", flac)], zipfile.ZIP_STORED)
+zipseed("song_tags_deflate.zip", [("tagged.mp3", tagged), ("tagged.flac", flac)], zipfile.ZIP_DEFLATED)
+
 def shared_range_zip(k, data):
     # One local entry, k central entries pointing at it (final audit H2: entries after the first are left out)
     import zlib
@@ -120,10 +128,62 @@ seeds = {
                      [(0, meta(0x01, b"@I")), (0, meta(0x01, b"\\Hel")), (24, meta(0x01, b"lo ")),
                       (24, meta(0x01, b"/world")), (24, meta(0x05, b"la"))], melody]),
 }
+# Effect and tuning SysEx: GS EFX (40 03 ..) cycling through the insertion types with their parameters and the
+# part switch (40 4x 22), XG insertion (03 0n ..) and variation (02 01 40 ..), GS and XG drum setups, GS and XG
+# scale tuning, the universal master tuning and volume. Each type change is followed by notes, so it renders.
+def gs_dt(addr, data):   # Roland DT1 (device 10, model 42): the checksum is not checked, so it is left 0
+    return sysex(bytes([0x41, 0x10, 0x42, 0x12]) + bytes(addr) + bytes(data) + b"\x00\xf7")
+def xg_pc(addr, data):
+    return sysex(bytes([0x43, 0x10, 0x4C]) + bytes(addr) + bytes(data) + b"\xf7")
+def note_pair(ch, k, d=24): return [(0, bytes([0x90 | ch, k, 100])), (d, bytes([0x80 | ch, k, 0]))]
+gs_types = [(1, 0), (1, 1), (1, 2), (1, 3), (1, 0x10), (1, 0x11), (1, 0x20), (1, 0x21), (1, 0x22), (1, 0x23), (1, 0x24), (1, 0x25),
+            (1, 0x26), (1, 0x30), (1, 0x31), (1, 0x40), (1, 0x41), (1, 0x42), (1, 0x43), (1, 0x44), (1, 0x50), (1, 0x51),
+            (1, 0x52), (1, 0x53), (1, 0x54), (1, 0x55), (1, 0x56), (1, 0x57), (1, 0x60), (1, 0x61), (1, 0x70), (1, 0x71),
+            (1, 0x72), (1, 0x73), (2, 0), (2, 3), (2, 0x0C), (4, 0), (4, 3), (5, 0), (0x11, 0), (0x11, 3), (0x11, 8)]
+efx = [(0, gs_reset), (0, b"\xb0\x5b\x40"), (0, gs_dt((0x40, 0x03, 0x17), (100, 80, 60))),   # sends to reverb, chorus, delay
+       (0, gs_dt((0x40, 0x40, 0x22), (1,))), (0, gs_dt((0x40, 0x41, 0x22), (1,)))]
+for i, (m, l) in enumerate(gs_types):
+    efx += [(0, gs_dt((0x40, 0x03, 0x00), (m, l))), (0, gs_dt((0x40, 0x03, 0x03), tuple((i * 7 + j * 5) & 0x7F for j in range(20))))]
+    efx += note_pair(0, 60 + i % 12) + note_pair(1, 48 + i % 12, 12)
+efx += [(0, gs_dt((0x40, 0x03, 0x1B), (3, 90, 4, 80))), (0, gs_dt((0x40, 0x40, 0x22), (0,))), (0, gs_dt((0x40, 0x41, 0x22), (0,)))] + note_pair(0, 64)
+xg_ins = [(0, xg_on), (0, b"\xb0\x5b\x40")]
+xg_msbs = [(0x49, 1), (0x4E, 1), (0x4E, 2), (0x50, 0), (0x50, 1), (0x51, 0), (0x52, 0), (0x52, 1), (0x52, 8), (0x53, 0), (0x54, 0),
+           (0x55, 0), (0x56, 0), (0x57, 0), (0x58, 0), (0x5D, 0), (0x5E, 0), (0x5F, 0), (0x5F, 1), (0x60, 0), (0x61, 1), (0x41, 0), (0x42, 0)]
+for i, (m, l) in enumerate(xg_msbs):
+    k = i & 1
+    xg_ins += [(0, xg_pc((3, k, 0), (m, l))), (0, xg_pc((3, k, 2), tuple((i * 11 + j * 3) & 0x7F for j in range(10)))),
+               (0, xg_pc((3, k, 0x0C), (0,))), (0, xg_pc((3, k, 0x0D), (90, 64, 32, 100, 50))),
+               (0, xg_pc((3, k, 0x30), tuple((i + j) & 0x7F for j in range(20))))]
+    xg_ins += note_pair(0, 60 + i % 12) + note_pair(1, 40 + i % 12, 12)
+xg_var = [(0, xg_on)]
+for i, (m, l) in enumerate([(5, 0), (6, 0), (7, 0), (0x10, 0), (0x11, 0), (0x12, 0), (0x13, 0), (0x14, 0), (0x15, 0), (0x16, 0), (0x17, 0),
+                            (0x41, 0), (0x42, 0), (0x44, 0), (0x45, 0), (0x49, 1), (0x50, 0), (0x5E, 0)]):
+    xg_var += [(0, xg_pc((2, 1, 0x40), (m, l))), (0, xg_pc((2, 1, 0x42), tuple((i * 5 + j * 9) & 0x7F for j in range(16)))),
+               (0, xg_pc((2, 1, 0x5A), (1, 64, 100))), (0, xg_pc((2, 1, 0x70), (0, 64, 64, 64, 64, 64)))]
+    xg_var += note_pair(0, 62 + i % 9) + note_pair(2, 55 + i % 9, 12)
+xg_var += [(0, xg_pc((2, 1, 0x03), (2, 1))), (0, xg_pc((2, 1, 0x0C), (90,))), (0, xg_pc((2, 1, 0x20), (0x41, 0))), (0, xg_pc((2, 1, 0x2C), (80,)))] + \
+          note_pair(0, 64)
+tune = [(0, gs_reset), (0, sysex(bytes.fromhex("7f 7f 04 03 00 50 f7"))), (0, sysex(bytes.fromhex("7f 7f 04 04 00 46 f7"))),
+        (0, sysex(bytes.fromhex("7f 7f 04 01 00 60 f7"))),
+        (0, gs_dt((0x40, 0x10, 0x40), tuple(40 + 3 * j for j in range(12)))),                    # GS scale tuning, part 1
+        (0, xg_pc((0x08, 0x00, 0x41), tuple(50 + 2 * j for j in range(12)))),                     # XG scale tuning, part 1
+        (0, gs_dt((0x41, 0x10, 0x24), (60, 70, 80, 90))), (0, gs_dt((0x41, 0x00, 0x24), (64,))),  # GS drum maps (pitch, level, ...)
+        (0, xg_pc((0x30, 0x24, 0x00), (70, 20, 64, 100, 60, 40))), (0, xg_pc((0x31, 0x26, 0x03), (50, 90, 30))),   # XG drum setups
+        (0, xg_pc((0x00, 0x00, 0x7D), (0,))),                                                      # drum setup reset
+        (0, b"\xb0\x65\x00"), (0, b"\xb0\x64\x02"), (0, b"\xb0\x06\x41"), (0, b"\xb0\x26\x00")]
+tune_notes = []
+for k in (60, 64, 67, 71):
+    tune_notes += note_pair(0, k, 48)
+drums2 = [(0, b"\x99\x24\x7f"), (24, b"\x89\x24\x00"), (0, b"\x99\x26\x7f"), (24, b"\x89\x26\x00"), (0, b"\x99\x2a\x60"), (24, b"\x89\x2a\x00")]
+seeds["efx_gs.mid"] = smf(1, [efx, melody])
+seeds["efx_xg_insertion.mid"] = smf(1, [xg_ins, melody], div=480)
+seeds["efx_xg_variation.mid"] = smf(1, [xg_var, melody], div=480)
+seeds["tuning_drums.mid"] = smf(1, [tune + tune_notes + drums2 + [(0, xg_on)] + drums2, melody])
 seeds["song.rmi"] = b"RIFF" + struct.pack("<I", 4 + 8 + len(seeds["fmt0.mid"])) + b"RMID" + b"data" + \
     struct.pack("<I", len(seeds["fmt0.mid"])) + seeds["fmt0.mid"]
 for n, b in seeds.items():
     open(os.path.join(mw, n), "wb").write(b)
+zipseed("song_midi.zip", [("a.txt", b"hello"), ("song.mid", seeds["efx_gs.mid"])], zipfile.ZIP_DEFLATED)
 
 # Tracker: a 4-channel ProTracker module (M.K.) and an 8-channel one (8CHN) with a looped
 # sine, a few effects and an order jump. libopenmpt is fuzzed upstream; this covers our glue.
@@ -179,7 +239,7 @@ def lst(t, body): return ck(b"LIST", t + body)
 def name20(s): return s.encode().ljust(20, b"\0")[:20]
 def sine16(n, period, amp=20000):
     return b"".join(struct.pack("<h", int(round(math.sin(2 * math.pi * i / period) * amp))) for i in range(n))
-def sf2(samples, smpl, ifil=(2, 1), sf3=False):
+def sf2(samples, smpl, ifil=(2, 1), sf3=False, sm24=None):
     phdr = name20("Piano") + struct.pack("<HHHIII", 0, 0, 0, 0, 0, 0) + \
            name20("Strings") + struct.pack("<HHHIII", 48, 0, 1, 0, 0, 0) + \
            name20("Kit") + struct.pack("<HHHIII", 0, 128, 2, 0, 0, 0) + \
@@ -205,7 +265,7 @@ def sf2(samples, smpl, ifil=(2, 1), sf3=False):
     pdta = ck(b"phdr", phdr) + ck(b"pbag", pbag) + ck(b"pmod", pmod) + ck(b"pgen", pgen) + ck(b"inst", inst) + \
            ck(b"ibag", ibag) + ck(b"imod", imod) + ck(b"igen", igen) + ck(b"shdr", shdr)
     info = ck(b"ifil", struct.pack("<HH", *ifil)) + ck(b"INAM", b"Seed bank\0") + ck(b"isng", b"EMU8000\0")
-    return ck(b"RIFF", b"sfbk" + lst(b"INFO", info) + lst(b"sdta", ck(b"smpl", smpl)) + lst(b"pdta", pdta))
+    return ck(b"RIFF", b"sfbk" + lst(b"INFO", info) + lst(b"sdta", ck(b"smpl", smpl) + (ck(b"sm24", sm24) if sm24 is not None else b"")) + lst(b"pdta", pdta))
 sfw = os.path.join(here, "seeds", "soundfont")
 os.makedirs(sfw, exist_ok=True)
 pcm = sine16(441, 44.1) + b"\0" * 92 + sine16(882, 88.2, 12000) + b"\0" * 92
@@ -215,6 +275,39 @@ def pcm_samples(base):
             ("L", (b, b + 882, b + 10, b + 872, 44100, 57, -5, 2, 4)),   # linked to R
             ("R", (b, b + 882, b + 10, b + 872, 44100, 57, 5, 1, 2))]    # linked to L
 open(os.path.join(sfw, "bank.sf2"), "wb").write(sf2(pcm_samples(0), pcm))
+# 24-bit: ifil 2.04 and an sm24 chunk (the low bytes, one per sample, padded to even); and the same bank with sm24 one byte
+# short and with a version too old for it (both ignored by the reader).
+nsmp = len(pcm) // 2
+low = bytes((i * 37) & 0xFF for i in range(nsmp))
+open(os.path.join(sfw, "bank_sm24.sf2"), "wb").write(sf2(pcm_samples(0), pcm, ifil=(2, 4), sm24=low + b"\0" * (nsmp & 1)))
+open(os.path.join(sfw, "bank_sm24_short.sf2"), "wb").write(sf2(pcm_samples(0), pcm, ifil=(2, 4), sm24=low[:-3]))
+open(os.path.join(sfw, "bank_sm24_old.sf2"), "wb").write(sf2(pcm_samples(0), pcm, ifil=(2, 1), sm24=low + b"\0" * (nsmp & 1)))
+
+# Stacks: one preset whose global preset zone and two zones (overlapping key ranges, velocity layers) lead to instruments
+# with a global zone, a linked stereo pair and a second layer, so the zone merge, the generator limits and the
+# modulator lists run through every level.
+def sf2_stack():
+    g = lambda o, v: struct.pack("<Hh", o, v)
+    gu = lambda o, v: struct.pack("<HH", o, v)
+    pbag_gens = [[g(48, 60)], [gu(43, 0x3F00), gu(41, 0)], [gu(43, 0x7F20), gu(44, 0x7F40), g(33, -1200), gu(41, 1)]]
+    ibag_gens = [[g(8, 9000), g(34, -1500)], [gu(54, 1), g(53, 0)], [gu(43, 0x7F00), gu(44, 0x3F00), g(53, 1), g(51, -12)],
+                 [gu(44, 0x7F40), g(53, 2), g(52, 25), g(17, 250)]]
+    def bags(zones):
+        out, at = b"", 0
+        for z in zones:
+            out += struct.pack("<HH", at, 0)
+            at += len(z)
+        return out + struct.pack("<HH", at, 0)
+    phdr = name20("Stack") + struct.pack("<HHHIII", 0, 0, 0, 0, 0, 0) + name20("EOP") + struct.pack("<HHHIII", 0, 1, 3, 0, 0, 0)
+    inst = name20("I0") + struct.pack("<H", 0) + name20("I1") + struct.pack("<H", 2) + name20("EOI") + struct.pack("<H", 4)
+    shdr = b"".join(name20(n) + struct.pack("<IIIIIBbHH", *v) for n, v in pcm_samples(0)) + name20("EOS") + b"\0" * 26
+    pdta = ck(b"phdr", phdr) + ck(b"pbag", bags(pbag_gens)) + ck(b"pmod", b"\0" * 10) + ck(b"pgen", b"".join(sum(pbag_gens, [])) + g(0, 0)) + \
+           ck(b"inst", inst) + ck(b"ibag", bags(ibag_gens)) + ck(b"imod", b"\0" * 10) + ck(b"igen", b"".join(sum(ibag_gens, [])) + g(0, 0)) + \
+           ck(b"shdr", shdr)
+    info = ck(b"ifil", struct.pack("<HH", 2, 4)) + ck(b"INAM", b"Stack\0\0")
+    return ck(b"RIFF", b"sfbk" + lst(b"INFO", info) + lst(b"sdta", ck(b"smpl", pcm) + ck(b"sm24", low + b"\0" * (nsmp & 1))) + lst(b"pdta", pdta))
+open(os.path.join(sfw, "stack.sf2"), "wb").write(sf2_stack())
+
 ogg = os.path.join(sfw, "sample.ogg.tmp")
 sf3_out = os.path.join(sfw, "bank.sf3")
 if not os.path.exists(sf3_out) and shutil.which("ffmpeg"):
@@ -242,10 +335,11 @@ def dls_art(level2):
         conns += [(0, 0, 0x500, 0, 6000 * 65536), (0, 0, 0x501, 0, 10 * 65536), (0x0, 0, 0x30C, 0, 500 * 65536)]
     body = struct.pack("<II", 8, len(conns)) + b"".join(struct.pack("<HHHHi", *c) for c in conns)
     return lst(b"lar2" if level2 else b"lart", ck(b"art2" if level2 else b"art1", body))
-def dls_rgn(lo, hi, cue, level2, ch=1, vel=(0, 127)):
+def dls_rgn(lo, hi, cue, level2, ch=1, vel=(0, 127), cdl=None):
     body = ck(b"rgnh", struct.pack("<HHHHHH", lo, hi, vel[0], vel[1], 0, 0)) + \
            ck(b"wlnk", struct.pack("<HHII", 0, 0, ch, cue))
     if level2: body += dls_art(True)
+    if cdl is not None: body += ck(b"cdl ", cdl)
     return lst(b"rgn2" if level2 else b"rgn ", body)
 def dls_ins(bank, prog, nm, rgns, art):
     body = ck(b"insh", struct.pack("<III", len(rgns), bank, prog)) + lst(b"lrgn", b"".join(rgns))
@@ -264,6 +358,26 @@ def dls(level2):
            ck(b"ptbl", struct.pack("<II", 8, len(offs)) + b"".join(struct.pack("<I", o) for o in offs)) + \
            lst(b"wvpl", pool) + lst(b"INFO", ck(b"INAM", b"Seed DLS\0"))
     return ck(b"RIFF", body)
+# DLS 2 conditional chunks ('cdl '): true and false constants, a query of "supports DLS 2" compared to 1, a query of an
+# unknown GUID, sample memory above a constant, a stack underflow and an operator that is not one (read as true).
+def cdl_const(v): return struct.pack("<HI", 15, v)
+guid_dls2 = struct.pack("<IHH", 0xf14599e5, 0x4689, 0x11d2) + bytes([0xaf, 0xa6, 0x00, 0xaa, 0x00, 0x24, 0xd8, 0xb6])
+guid_mem = struct.pack("<IHH", 0x178f2f28, 0xc364, 0x11d1) + bytes([0xa7, 0x60, 0x00, 0x00, 0xf8, 0x75, 0xac, 0x12])
+cdls = [cdl_const(1), cdl_const(0), struct.pack("<H", 16) + guid_dls2 + cdl_const(1) + struct.pack("<H", 13),
+        struct.pack("<H", 17) + b"\x01" * 16, struct.pack("<H", 16) + guid_mem + cdl_const(1 << 20) + struct.pack("<H", 12),
+        struct.pack("<H", 1), struct.pack("<H", 99) + cdl_const(1), cdl_const(5) + cdl_const(0) + struct.pack("<H", 6) + struct.pack("<H", 14),
+        cdl_const(1) + struct.pack("<H", 14) + cdl_const(7)]
+def dls_cdl():
+    waves = [dls_wave(1, 16, 44100, 441, 44.1)]
+    ins = b""
+    for i, c in enumerate(cdls):
+        r = [dls_rgn(0, 63, 0, True, cdl=c), dls_rgn(64, 127, 0, True, cdl=cdls[(i + 1) % len(cdls)])]
+        body = ck(b"insh", struct.pack("<III", len(r), 0, i)) + lst(b"lrgn", b"".join(r)) + dls_art(True) + ck(b"cdl ", c)
+        ins += lst(b"ins ", body + lst(b"INFO", ck(b"INAM", b"Cond%d\0" % i)))
+    body = b"DLS " + ck(b"colh", struct.pack("<I", len(cdls))) + lst(b"lins", ins) + \
+           ck(b"ptbl", struct.pack("<II", 8, 1) + struct.pack("<I", 0)) + lst(b"wvpl", waves[0])
+    return ck(b"RIFF", body)
+open(os.path.join(sfw, "cdl.dls"), "wb").write(dls_cdl())
 open(os.path.join(sfw, "level1.dls"), "wb").write(dls(False))
 open(os.path.join(sfw, "level2.dls"), "wb").write(dls(True))
 
@@ -341,3 +455,55 @@ ct = cdtext_packs([(0x8F, 0, b"\0"), (0x80, 0, b"Album\0One\0\x09\0Three\0"), (0
 cues["mmc_drive.cue"] = ("", toc + struct.pack(">H", len(ct) + 2) + b"\0\0" + ct + sectors[:40000])
 for n, (sheet, img) in cues.items():
     open(os.path.join(qw, n), "wb").write(sheet.encode("latin-1") + b"\0" + img)
+
+# HLS target: playlists as .pls / .m3u radio lists too (the target reads the same text both ways).
+open(os.path.join(here, "seeds", "hls", "list.pls"), "w").write(
+    "[playlist]\nNumberOfEntries=2\nFile1= http://radio.example:8000/live.mp3 \nTitle1=One\nFile2=../b.aac\n")
+open(os.path.join(here, "seeds", "hls", "list.m3u"), "w").write(
+    "#EXTM3U\n#EXTINF:-1,Station\n\n  /streams/main.mp3  \nhttps://u:p@h.example/x\n")
+
+# Net target (fuzz_net.c): the first byte is the mode. 0: URL NUL headers NUL URL (Set-Cookie lines and their dates);
+# 1: a whole server reply (status line, headers, body); 2: a file served with byte ranges; 3: an HLS playlist, a NUL,
+# then the segment bytes.
+nw = os.path.join(here, "seeds", "net")
+os.makedirs(nw, exist_ok=True)
+def nseed(name, mode, payload): open(os.path.join(nw, name), "wb").write(bytes([mode]) + payload)
+nseed("cookies.bin", 0, b"https://www.example.com/a/b/c?x=1\0Set-Cookie: sid=abc; Path=/a; Domain=example.com; Secure; HttpOnly; "
+      b"Expires=Wed, 21 Oct 2037 07:28:00 GMT\r\nset-cookie: t=1; Max-Age=3600; Path=/; SameSite=Lax\r\n"
+      b"Set-Cookie: old=1; Expires=Thu, 01 Jan 1970 00:00:01 GMT\r\nSet-Cookie: =x\r\nSet-Cookie: n=v; Domain=.com\r\n"
+      b"Set-Cookie: d=1; Expires=Sunday, 06-Nov-94 08:49:37 GMT\r\nSet-Cookie: e=2; Expires=Sun Nov  6 08:49:37 1994\r\n"
+      b"Content-Length: 5\r\nLocation: ../up/x.mp3\r\n\0http://sub.example.com/a/b/d")
+nseed("playlist.bin", 0, b"http://h.example/dir/list.pls\0[playlist]\r\nFile1=http://s.example/live\r\n\0../x.m3u8")
+reply_mp3 = open(os.path.join(data, "net", "tone_cbr.mp3"), "rb").read()[:20000]
+chunks = b"".join(b"%x\r\n" % len(reply_mp3[i:i + 4000]) + reply_mp3[i:i + 4000] + b"\r\n" for i in range(0, len(reply_mp3), 4000)) + b"0\r\n\r\n"
+nseed("reply_chunked.bin", 1, b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nTransfer-Encoding: chunked\r\nSet-Cookie: s=1; Path=/\r\n\r\n" + chunks)
+nseed("reply_length.bin", 1, b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: %d\r\n\r\n" % len(reply_mp3) + reply_mp3)
+nseed("reply_unframed.bin", 1, b"HTTP/1.0 200 OK\r\nContent-Type: audio/mpeg\r\n\r\n" + reply_mp3)
+nseed("reply_redirect.bin", 1, b"HTTP/1.1 302 Found\r\nLocation: /next/../y.mp3\r\nSet-Cookie: r=1\r\nContent-Length: 4\r\n\r\nmove")
+nseed("reply_206.bin", 1, b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-%d/%d\r\nContent-Length: %d\r\n\r\n" %
+      (len(reply_mp3) - 1, len(reply_mp3) * 2, len(reply_mp3)) + reply_mp3)
+meta = b"StreamTitle='Artist - Song';StreamUrl='http://x';"
+meta += b"\0" * (-len(meta) % 16)
+icy = b""
+for i in range(0, 8000, 2000): icy += reply_mp3[i:i + 2000] + (bytes([len(meta) // 16]) + meta if i == 2000 else b"\0")
+nseed("reply_icy.bin", 1, b"ICY 200 OK\r\nicy-name:Seed\r\nicy-metaint:2000\r\nicy-br:128\r\nContent-Type: audio/mpeg\r\n\r\n" + icy)
+nseed("file_frag_m4a.bin", 2, open(os.path.join(data, "net", "frag.m4a"), "rb").read())
+nseed("file_frag_mp4.bin", 2, open(os.path.join(data, "frag.mp4"), "rb").read())
+nseed("file_mkv.bin", 2, open(os.path.join(data, "av_tracks.mkv"), "rb").read())
+nseed("file_webm.bin", 2, open(os.path.join(data, "opus.webm"), "rb").read())
+nseed("file_mp3.bin", 2, reply_mp3)
+nseed("hls_aac.bin", 3, b"#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:3\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:1.5,\n#EXT-X-BYTERANGE:6000@0\ns.aac\n"
+      b"#EXTINF:1.5,\n#EXT-X-BYTERANGE:6000\ns.aac\n#EXT-X-ENDLIST\n\0" + open(os.path.join(data, "net", "tone.aac"), "rb").read()[:12000])
+nseed("hls_ts.bin", 3, b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:3.0,\ns1.ts\n#EXT-X-ENDLIST\n\0" +
+      open(os.path.join(here, "seeds", "hls", "ts.bin"), "rb").read().split(b"\0", 1)[-1])
+
+# Sound target (fuzz_sound.c): a script length byte, the script (op | arg << 3), the sound's file.
+sdw = os.path.join(here, "seeds", "sound")
+os.makedirs(sdw, exist_ok=True)
+def sdseed(name, script, filebytes): open(os.path.join(sdw, name), "wb").write(bytes([len(script)]) + bytes(script) + filebytes)
+play = lambda vol, pan: 0 | (vol << 3)
+sdseed("wav_voices.bin", [play(16, 0), play(8, 31), 5 | 3 << 3, play(16, 16), play(16, 16), 3, 2 | 0 << 3, play(16, 0), 4, 3, 5 | 7 << 3, 6, 1,
+                          play(4, 0), 7, 5 | 1 << 3], open(os.path.join(here, "seeds", "wav", "s16.wav"), "rb").read())
+sdseed("midi_steal.bin", [2 | 1 << 3, play(16, 0), play(16, 0), play(16, 0), 2 | 2 << 3, 5 | 2 << 3, 2 | 4 << 3, play(10, 0), 3, 4, 4, 1],
+       seeds["fmt0.mid"])
+sdseed("pcm_raw.bin", [play(16, 0), 5 | 5 << 3, play(16, 0), 6, play(16, 0), 1, 7], bytes(range(256)) * 8)

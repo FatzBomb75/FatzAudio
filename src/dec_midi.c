@@ -60,7 +60,9 @@
 #define FA_MIDI_MAX_SOUNDFONT ((size_t)1 << 30)
 #define FA_MIDI_MAX_SECONDS (6.0 * 3600.0)  /* events later than this are dropped */
 #define FA_MIDI_TAIL_S 1.0                /* after the last event, when not measured (tags without a soundfont) */
+#ifndef FA_MIDI_TAIL_MAX_S                /* (the fuzz build shortens it: a measured tail is rendered in full on every open) */
 #define FA_MIDI_TAIL_MAX_S 10.0           /* the longest tail measured after the last event (notes never ended) */
+#endif
 #define FA_MIDI_TAIL_QUIET_S 1.0          /* this long under FA_MIDI_TAIL_FLOOR ends the measured tail */
 #define FA_MIDI_TAIL_FLOOR 1.0e-4f        /* -80 dBFS: the song has died away */
 #define FA_MIDI_VOICES 256                /* polyphony per stream (oldest released voices go first) */

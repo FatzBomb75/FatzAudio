@@ -462,6 +462,7 @@ endif()
 option(FA_FUZZ "Build the fuzz targets (tests/fuzz)" OFF)
 if(FA_FUZZ)
     target_compile_options(fa_whitebox PRIVATE -fsanitize-coverage=trace-pc)
+    target_compile_definitions(fa_whitebox PRIVATE FA_MIDI_TAIL_MAX_S=2.0)   # a measured MIDI tail is rendered on every open
 endif()
 add_executable(fa_test_midi_font_change test_midi_font_change.c)
 target_compile_options(fa_test_midi_font_change PRIVATE ${FA_WARNINGS})

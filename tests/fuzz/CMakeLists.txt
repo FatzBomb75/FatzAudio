@@ -4,7 +4,7 @@
 # Otherwise it builds fuzz_regress_<target> and runs every input in regress/<target>
 # (inputs that once crashed or hung a reader), and in seeds/<target> if there is one, as an
 # ordinary test.
-set(FA_FUZZ_TARGETS stream tags zip hls soundfont cue cdg font)
+set(FA_FUZZ_TARGETS stream tags zip hls soundfont cue cdg font net sound)
 foreach(t ${FA_FUZZ_TARGETS})
     if(FA_FUZZ)
         add_executable(fuzz_${t} fuzz_${t}.c fuzz_driver.c)

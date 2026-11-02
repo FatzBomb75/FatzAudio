@@ -1,0 +1,5 @@
+#EXTM3U
+#EXTINF:-1,Station
+
+  /streams/main.mp3  
+https://u:p@h.example/x

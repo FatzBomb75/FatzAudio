@@ -84,6 +84,23 @@ static fa_soundfont* make_soundfont(void)
     return font;
 }
 
+/* MIDI: the file's first SysEx (F0, a one-byte length, the data) sent to the stream as live MIDI bytes, as an app sends
+ * a GS or XG message from a controller; the file plays it too, so both paths see every mutation. Other streams refuse. */
+static void send_first_sysex(fa_stream* s, const uint8_t* data, size_t size)
+{
+    const uint8_t* p = (const uint8_t*)memchr(data, 0xF0, size);
+    if (p && (size_t)(p - data) + 2 < size && p[1] < 0x80) {
+        size_t n = p[1], avail = size - (size_t)(p - data) - 2;
+        uint8_t msg[130];
+        if (n > avail) n = avail;
+        if (n > sizeof(msg) - 2) n = sizeof(msg) - 2;
+        msg[0] = 0xF0;
+        memcpy(msg + 1, p + 2, n);
+        if (msg[n] != 0xF7) msg[++n] = 0xF7;
+        (void)fa_stream_send_midi(s, 0, msg, n + 1);
+    }
+}
+
 static void exercise(const uint8_t* data, size_t size, int32_t track)
 {
     fa_open_options o;
@@ -96,6 +113,11 @@ static void exercise(const uint8_t* data, size_t size, int32_t track)
     o.audio_track = track;
     if (fa_stream_open_memory(g_engine, data, size, &o, &s) != FA_OK) return;
     fa_stream_get_info(s, &info);
+    /* Modules: every cell and row event on (they are read off the pattern as it plays). Only streams that are modules
+     * accept it. */
+    (void)fa_stream_set_tracker_param(s, FA_TRACKER_CELL_EVENTS, 3);
+    (void)fa_stream_set_tracker_param(s, FA_TRACKER_ROW_EVENTS, 1);
+    send_first_sysex(s, data, size);
     for (k = 0; k < 24; k++) {
         fa_frames got = 0, i;
         uint32_t ch = info.format.channels ? info.format.channels : 1;
@@ -114,6 +136,32 @@ static void exercise(const uint8_t* data, size_t size, int32_t track)
     fa_stream_close(s);
 }
 
+/* The same SysEx on a real-time synth (the engine's soundfont), with notes sent after it, so the effects it sets run. */
+static void exercise_live(const uint8_t* data, size_t size)
+{
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_stream_info linfo = { .struct_size = sizeof(linfo) };
+    static float buf[32768];
+    static const uint8_t notes[] = { 0x90, 60, 100, 0x91, 64, 100, 0x99, 36, 120, 0xB0, 0x5B, 0x60, 0xB0, 0x5D, 0x60 };
+    int k;
+    if (!memchr(data, 0xF0, size)) return;
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    if (fa_stream_open_midi(g_engine, NULL, &o, &s) != FA_OK) return;
+    fa_stream_get_info(s, &linfo);
+    send_first_sysex(s, data, size);
+    (void)fa_stream_send_midi(s, 0, notes, sizeof(notes));
+    for (k = 0; k < 12; k++) {
+        fa_frames got = 0, i;
+        uint32_t ch = linfo.format.channels ? linfo.format.channels : 1;
+        if (fa_stream_read(s, buf, ch < 4096 ? 4096 / ch : 1, &got) != FA_OK || got == 0) break;
+        for (i = 0; i < got * ch; i++)
+            if (!isfinite(buf[i])) { fprintf(stderr, "non-finite live sample %zu of block %d\n", (size_t)i, k); abort(); }
+    }
+    fa_stream_close(s);
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
 {
     if (!g_engine) {
@@ -127,5 +175,6 @@ int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)
     }
     exercise(data, size, -1);
     exercise(data, size, 1);
+    exercise_live(data, size);
     return 0;
 }
