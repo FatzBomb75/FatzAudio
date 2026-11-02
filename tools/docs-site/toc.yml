@@ -1,0 +1,38 @@
+- name: Home
+  href: README.md
+- name: Getting started
+  href: getting-started.md
+- name: Concepts
+  href: concepts.md
+- name: Guides
+  href: features/README.md
+- name: Tutorials
+  href: tutorials/README.md
+- name: Cookbook
+  href: cookbook.md
+- name: Migration
+  href: migration/bass.md
+- name: Reference
+  items:
+    - name: C API
+      href: reference/c-api.md
+    - name: .NET API
+      href: api/
+    - name: Karaoke lyric display
+      href: reference/karaoke-lyric-display.md
+- name: Help
+  items:
+    - name: Troubleshooting and error codes
+      href: troubleshooting.md
+    - name: Platforms
+      href: platforms.md
+    - name: Formats and codecs
+      href: formats.md
+    - name: Limits and performance
+      href: limits.md
+    - name: FAQ
+      href: faq.md
+    - name: Building
+      href: building.md
+    - name: About
+      href: about.md

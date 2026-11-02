@@ -1,0 +1,42 @@
+{
+  "metadata": [
+    {
+      "src": [
+        {
+          "src": "../../bindings/dotnet/src/FatzAudio",
+          "files": [
+            "FatzAudio.csproj"
+          ]
+        }
+      ],
+      "dest": "../../build/docs-stage/api",
+      "properties": {
+        "TargetFramework": "net10.0"
+      },
+      "outputFormat": "apiPage",
+      "namespaceLayout": "flattened"
+    }
+  ],
+  "build": {
+    "content": [
+      {
+        "src": "../../build/docs-stage",
+        "files": [
+          "**/*.md",
+          "**/*.yml"
+        ]
+      }
+    ],
+    "output": "../../build/docs-site",
+    "globalMetadata": {
+      "_appTitle": "FatzAudio",
+      "_appName": "FatzAudio",
+      "_enableSearch": true
+    },
+    "template": [
+      "default",
+      "modern"
+    ],
+    "markdownEngineName": "markdig"
+  }
+}

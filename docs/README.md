@@ -38,3 +38,14 @@ A feature is not finished until it has:
 2. XML doc comments on every public .NET member (the build fails without them).
 3. A page in `docs/features/` with a C and a C# example.
 4. Its rows in [migration/bass.md](migration/bass.md) updated (status and example).
+
+## Reading and publishing these docs as a website
+
+The Markdown here is the single source; GitHub shows it as it is. To build a searchable HTML site (with the .NET API reference made from the XML comments, and the C reference made from the header):
+
+```bash
+dotnet tool install -g docfx          # once; the .NET 10 SDK is needed
+python3 tools/build-docs.py --zip     # build/docs-site/ and build/FatzAudio-docs.zip
+```
+
+Upload the contents of `build/docs-site/` to any static web host. To browse offline, unzip `FatzAudio-docs.zip` and run `open-docs.ps1` (Windows) or `python3 serve.py`: the menu and search need a local web server, so opening the pages straight from disk shows them without the menu. `python3 tools/check-doc-links.py` checks every link and anchor; `python3 tools/gen-c-reference.py --check` says whether the C reference matches the headers.
