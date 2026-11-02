@@ -4241,7 +4241,7 @@ FA_API fa_result FA_CALL fa_device_get_loudness_meter(fa_device* device, double*
 typedef enum fa_spectrum_flags {
     FA_SPECTRUM_LEFT      = 1 << 0,  /* the left channel only (default: both, mixed) */
     FA_SPECTRUM_RIGHT     = 1 << 1,  /* the right channel only */
-    FA_SPECTRUM_NO_WINDOW = 1 << 2   /* no Hann window (BASS_FFT_NOWINDOW) */
+    FA_SPECTRUM_NO_WINDOW = 1 << 2   /* no Hann window (BASS_DATA_FFT_NOWINDOW) */
 } fa_spectrum_flags;
 
 /* The magnitude spectrum of the last `size` frames being heard now, for a
