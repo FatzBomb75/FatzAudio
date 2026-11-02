@@ -4,9 +4,9 @@
 
 FatzAudio follows semantic versioning for its C ABI and the .NET package, which share one version number (`FA_VERSION_*` in the header, `fa_version()` at run time, `AudioEngine.NativeVersion` in .NET).
 
-- Before 1.0 a **minor** bump (0.2 to 0.3) may break the API or ABI. Every break is listed in the [changelog](../CHANGELOG.md) under "Breaking". A **patch** bump never breaks.
+- Before 1.0 a **minor** bump (0.1 to 0.2) may break the API or ABI. Every break is listed in the [changelog](../CHANGELOG.md) under "Breaking". A **patch** bump never breaks.
 - From 1.0 on only a major bump breaks.
-- The .NET binding refuses a native library of another major.minor version, so a mismatched library is caught at once. On Linux the SONAME carries the minor version (`libfatzaudio.so.0.3`).
+- The .NET binding refuses a native library of another major.minor version, so a mismatched library is caught at once. On Linux the SONAME carries the minor version while the major is 0, and only the major from 1.0 on (`libfatzaudio.so.1`).
 - New functions, new enum values at the end and new fields at the end of a struct that has a `struct_size` are not breaking.
 
 Versioned output structs start with a `struct_size` that you set to `sizeof` before the call, so a newer library never writes past an older caller's struct ([concepts](concepts.md)).

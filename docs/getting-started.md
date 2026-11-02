@@ -18,7 +18,7 @@ Next: [Concepts](concepts.md), then [Common tasks in five minutes](common-tasks.
 The package is `FatzAudio`, for `net8.0` and `net10.0`. CI publishes a prerelease of every `main` build to the repository owner's GitHub Packages feed; stable versions are published by hand. Setting up the feed (`nuget.config`, token, version pinning) is in [Building](building.md#nuget-package-and-versions).
 
 ```bash
-dotnet add package FatzAudio --version 0.3.0-ci.*
+dotnet add package FatzAudio --version 1.0.0-rc.1
 ```
 
 The package carries the native library for **win-x64** and **linux-x64**, in `runtimes/<rid>/native/`, and .NET finds it from there. For **macOS, Android and iOS** build the native library yourself ([Building](building.md)) and put it in `runtimes/<rid>/native/` (macOS), in the app's `lib/<abi>/` folders (Android) or link the xcframework (iOS). Nothing else is needed: there are no add-on libraries and no runtime to install.

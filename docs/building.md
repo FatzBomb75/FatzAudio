@@ -49,20 +49,23 @@ the run's `nuget` artifact. The Linux library is built on Ubuntu 22.04, so it
 runs on any distribution with glibc 2.35 or newer (Debian 12, Ubuntu 22.04,
 Fedora 36 and later).
 
-Each run's package is a prerelease, such as `0.2.0-ci.123`, and pushes to
+Each run's package is a prerelease, such as `1.0.0-ci.123`, and pushes to
 `main` publish it to the repository owner's GitHub Packages feed, so the
-newest `main` is always there. The stable `0.2.0` is published by running the
-`build` workflow by hand on `main` (Actions, build, Run workflow) with
-"release" ticked.
+newest `main` is always there. A pinned release candidate (`1.0.0-rc.1`) is
+published by running the `build` workflow by hand on `main` (Actions, build,
+Run workflow) with its name in "prerelease" (`rc.1`), and the stable `1.0.0`
+with "release" ticked. A published version can never be published again, so
+the next candidate is `rc.2`.
 
 The version is set in one place, `FA_VERSION_*` in
 `include/fatzaudio/fatzaudio.h`; CMake and the .NET project read it from there.
 [CHANGELOG.md](../CHANGELOG.md) lists every version and every breaking change.
 Before 1.0 a minor bump may break the API, so bump the minor version with any
-breaking change and the patch version otherwise. A stable version can be
-published only once (the run fails otherwise), so bump the version before each
+breaking change and the patch version otherwise; from 1.0 on only a major bump
+breaks. A stable or release-candidate version can be published only once (the
+run fails otherwise), so bump the version or the candidate number before each
 release. On Linux the minor version is part of the SONAME while the major is 0
-(`libfatzaudio.so.0.2`), so a C program linked against 0.1 does not load 0.2.
+(`libfatzaudio.so.0.2`) and only the major from 1.0 on (`libfatzaudio.so.1`).
 
 To use the feed, add it to the app's `nuget.config`. GitHub Packages needs a
 personal access token with `read:packages`, even for your own packages:
@@ -83,8 +86,8 @@ personal access token with `read:packages`, even for your own packages:
 
 Or download the `nuget` artifact of a CI run and point a local folder feed at it.
 Pin the version in `Directory.Packages.props` as usual:
-`<PackageVersion Include="FatzAudio" Version="0.2.0" />`, or
-`Version="0.2.0-ci.*"` to follow `main`.
+`<PackageVersion Include="FatzAudio" Version="1.0.0-rc.1" />`, or
+`Version="1.0.0-ci.*"` to follow `main`.
 
 To pack locally, put the libraries under
 `bindings/dotnet/src/FatzAudio/runtimes/<rid>/native/` and run

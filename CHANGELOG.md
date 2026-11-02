@@ -4,7 +4,7 @@ FatzAudio follows [semantic versioning](https://semver.org) for its C ABI and th
 version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()` at run time;
 `AudioEngine.NativeVersion` in .NET).
 
-- Before 1.0, a **minor** bump (0.2 to 0.3) may break the API or ABI; every break is listed below under
+- Before 1.0, a **minor** bump (0.1 to 0.2) may break the API or ABI; every break is listed below under
   "Breaking". A **patch** bump never does.
 - From 1.0 on, only a major bump breaks.
 - The .NET binding refuses to start against a native library of another major.minor version
@@ -14,11 +14,12 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Additions (new functions, new enum values at the end, new fields at the end of a struct that has a
   `struct_size`) are not breaking.
 
-## 0.3.0 (not released yet)
+## 1.0.0 (release candidate 1.0.0-rc.1)
 
-`FA_VERSION` is 0.3.0 on main; what lands before the stable 0.3.0 package is listed here. The Linux SONAME is
-`libfatzaudio.so.0.3`, and the .NET package refuses a 0.2 native library (and the 0.2 package a 0.3 one), so an app
-updates the package and the native library together and rebuilds.
+`FA_VERSION` is 1.0.0 on main. The first package built from it is the prerelease `1.0.0-rc.1`; the stable 1.0.0 follows
+once the real-device checks pass. There never was a 0.3.0 package: everything that was listed under 0.3.0 is part of
+1.0.0. The Linux SONAME is `libfatzaudio.so.1`, and the .NET package refuses a 0.x native library (and a 0.x package a
+1.0 one), so an app updates the package and the native library together and rebuilds.
 
 ### Breaking
 
