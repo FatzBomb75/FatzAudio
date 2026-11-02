@@ -1,6 +1,6 @@
 # FatzAudio for .NET
 
-Idiomatic .NET binding for the [FatzAudio](https://github.com/) native audio engine.
+Idiomatic .NET binding for the [FatzAudio](https://github.com/FatzBomb75/FatzAudio) native audio engine.
 Targets `net8.0` and `net10.0`. The package ships the native library under `runtimes/<rid>/native/`.
 
 ```csharp
@@ -31,7 +31,14 @@ song.Ramp(AudioParameter.Volume, 0f, TimeSpan.FromSeconds(3), Curve.EqualPower);
 | `CdgSurface` | Draws a stream's CD+G graphics in sync with the audio: `Update()` returns the pixels (BGRA, RGBA or indexed, any size) and the rectangle that changed, ready for a WPF bitmap or a texture. |
 | `PushAudioStream` | Stream you feed with PCM via `Push(...)`, or with decoded frames in any format via `PushFrame(...)`. `End`, `Flush`, `Buffered`. |
 | `PacketAudioStream` | Stream you feed with compressed packets from your demuxer (FFmpeg): `PushPacket(...)`. Decoded on worker threads; `Clock` follows your timestamps. |
-| `FFmpeg` | `Load(folder)`, `Info`, `ToSampleFormat(...)`: the FFmpeg your app already uses, loaded at runtime (never bundled). |
+| `FFmpeg` | `ToSampleFormat(...)`: maps an FFmpeg `AVSampleFormat` to a `SampleFormat` for `PushFrame`. FatzAudio never loads or bundles FFmpeg: your app decodes or demuxes with its own and hands over packets or frames ([FFmpeg hand-off](../../docs/features/ffmpeg.md)). |
+| `DjMixer`, `DjDeck`, `Mic` | Two-deck DJ mixer: crossfader, isolator EQ, headphone cue, beat sync, loops, auto-mix (`mixer.AutoMix`), karaoke microphones with effects and ducking, latency check, aligned stem recording ([DJ mixer](../../docs/features/dj-mixer.md)). |
+| `Equalizer` | Parametric and graphic EQ presets for `SetEqualizer` ([equalizer](../../docs/features/equalizer.md)). |
+| `Disc` | Audio CD and `.cue` image drives: table of contents, CD-Text, ids, `engine.OpenDisc` ([disc playback](../../docs/features/disc.md)). |
+| `Tags` | Tags, cover art and file properties for any file without a stream: `Tags.Read(path)` ([tags](../../docs/features/tags.md)). |
+| `Sound` | A short sound loaded once and played as many overlapping voices: `engine.LoadSound`, `Play` ([sounds](../../docs/features/sounds.md)). |
+| `LyricSurface`, `CdgSurface` | Draw MIDI/.kar lyrics and CD+G graphics in sync with the audio ([lyrics](../../docs/features/lyrics.md), [CD+G](../../docs/features/cdg.md)). |
+| `TrackAnalysis`, `SilenceDetector` | Beat grid and BPM, key, waveform, loudness and silence of a file or of PCM you feed ([analysis](../../docs/features/analysis.md)). |
 | `AudioEncoder` | Writes WAV, FLAC or MP3 to a file or any `Stream` on its own thread: `Record(output)`, `Record(stream)`, `Encode(stream)`, `Write(...)`, `ConvertFile(...)`, `IsPaused`, `Status`, `Wait`, `Close`. |
 | `Lame` | `Load(folder)`, `Info`: the libmp3lame your app ships, loaded at runtime for MP3 (never bundled). |
 | `Curve` | `Linear`, `EqualPower`, `Logarithmic`, `Exponential`, `SCurve`, `Bezier(x1, y1, x2, y2)`, `Points(...)`. |
@@ -53,7 +60,7 @@ alive until it is disposed itself, so disposal order never causes a crash.
 
 ## Native library
 
-Resolved through the normal `runtimes/<rid>/native` layout, with a fallback to the application directory.
+Resolved through the normal `runtimes/<rid>/native` layout, with a fallback to the application directory. The NuGet package ships **win-x64** and **linux-x64** only. For macOS, Android and iOS build the native library and place it in the app yourself ([Building](../../docs/building.md)).
 
 When packing, the `win-x64` library is taken from `$(FatzAudioNativeDir)\fatzaudio.dll`
 (default: `build\bin\Release` of the repository; override with `-p:FatzAudioNativeDir=...`).
@@ -67,8 +74,7 @@ version may change the ABI ([CHANGELOG.md](../../CHANGELOG.md)).
 
 ## Status
 
-Functions the native library does not implement yet throw `FatzAudioException` with
-`ErrorCode.NotImplemented`. See the [feature guides](../../docs/features/README.md) for what is available.
+The public API is complete. A call a platform cannot do throws `FatzAudioException` with `ErrorCode.NotImplemented` (for example microphone capture on an engine with `NullOutput`, or Windows-only features elsewhere); the feature guides say where. See the [feature guides](../../docs/features/README.md) for what is available, and [Getting started](../../docs/getting-started.md) to install the package.
 
 ## Tests
 

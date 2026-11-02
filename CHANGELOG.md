@@ -408,6 +408,14 @@ updates the package and the native library together and rebuilds.
 
 ### Changed
 
+- Documentation (final audit gaps D1 to D3, docs only): the BASS migration guide has appendices for the error codes,
+  channel states, stream types, configuration, attributes, syncs, positions, flags, tags and data flags, and names every
+  bass.dll export. Getting started and Concepts are rewritten (install, first sound, devices, errors, headless, a "no
+  sound?" checklist, a glossary). The events page lists the mixer events and `CDG_CHANGED`. Added
+  `THIRD_PARTY_NOTICES.md`. The karaoke design reference moved to `docs/reference/`, the DJ mixer plan and the BASS
+  analysis to `docs/archive/` (the plan's future work is in the DJ mixer page), and the early design draft is marked
+  historical. The status symbol 🗓️ now means "possible future update, not needed for release".
+
 - Decoding comes first (karaoke timing step K1): a worker tops up any stream short of its full buffer before it
   renders ahead or helps with surface effects; drawing work (render-ahead and effect helpers together) never takes the
   last worker, so one is always free to decode; and a worker runs at a lower priority while it renders ahead (Windows below

@@ -177,6 +177,10 @@ LAME is LGPL, so FatzAudio never links or bundles it (the same model as FFmpeg).
 
 `fa_lame_load(directory)` (.NET `Lame.Load(dir)`) loads it from a folder of your choice; call it before the first MP3 encoder. `fa_lame_get_info` (.NET `Lame.Info`) says which version is in use and where it came from. Without LAME, creating an MP3 encoder returns `FA_ERROR_PROVIDER_MISSING`. LAME 3.98 and later work; 3.100 is the current release.
 
-## Not yet
+## Possible future updates
 
-- Opus and AAC encoding (planned in the design: Opus with the built-in Opus codec, AAC through the operating system's encoders), the Windows Media Foundation MP3 encoder as a fallback when LAME is missing, and broadcasting to Icecast/Shoutcast servers. See [engineering notes](../engineering-notes.md).
+These are not built and are not required for a release. Apps that need them can use their own encoder on PCM from `fa_stream_read`:
+
+- Opus and AAC encoding (Opus with the built-in Opus codec, AAC through the operating system's encoders).
+- The Windows Media Foundation MP3 encoder as a fallback when LAME is missing.
+- Broadcasting to Icecast/Shoutcast servers.

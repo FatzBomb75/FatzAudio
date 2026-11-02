@@ -455,7 +455,7 @@ The songs come from a fixed random sequence, so they are the same on every run. 
 - **Bars are found from chord changes and kicks only.** Without `FA_GRID_BARS`, `beats_per_bar` is 4 and `bar_offset` 0: beat 0, the first beat heard, is taken as a bar start, and it may not be one. The meter is one for the whole song (4 or 3; no 6/8, 5/4 or changes of meter). On a grid at half or double the music's tempo, a bar found is two bars of the music, or half of one.
 - **One key per song.** A song that modulates gets its main key.
 - Audio that is not music (speech, silence) has no grid or key, and the getters say so.
-- Quantized seeks and automatic key matching in an auto-mix are on the list of later work (section 19 of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md)).
+- Quantized seeks and automatic key matching in an auto-mix are possible future additions ([DJ mixer](dj-mixer.md#possible-future-additions)).
 
 ## Per-song results
 

@@ -1,6 +1,8 @@
 # bass.dll analysis (legacy folder)
 
-Target: `C:\development\nuget\fatzaudio\legacy\bass.dll` (not modified; analysed read-only with REA 6.5.0 + Ghidra 12.1.4).
+> **Historical.** The October 2026 analysis of the legacy BASS binaries that started the project. It is kept for the record and is not maintained: the current mapping from BASS to FatzAudio is [the migration guide](../migration/bass.md).
+
+Target: the legacy folder's `bass.dll` (not modified; analysed read-only with REA 6.5.0 + Ghidra 12.1.4).
 
 ## 1. Identity
 

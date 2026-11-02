@@ -21,7 +21,22 @@ Each stream has one event callback. The audio thread queues events without locki
 | `FA_EVENT_TRACKER_ROW` | the row's first frame | `order << 16 \| row` | ✅ tracker modules with `FA_TRACKER_ROW_EVENTS` on; raised as the audio is mixed, like markers ([trackers](trackers.md#row-events)) |
 | `FA_EVENT_TRACKER_INSTRUMENT` | the row's first frame | `channel << 16 \| instrument` (0-based) | ✅ tracker modules with `FA_TRACKER_CELL_EVENTS` bit 1 ([trackers](trackers.md#instrument-and-sync-events)) |
 | `FA_EVENT_TRACKER_SYNC` | the row's first frame | `channel << 16 \| Zxx parameter` | ✅ tracker modules with `FA_TRACKER_CELL_EVENTS` bit 2 |
+| `FA_EVENT_CDG_CHANGED` | CD+G packs now shown | what changed: `FA_CDG_CHANGE_X/Y/WIDTH/HEIGHT(value)` is the area (0 wide: only colours changed), `FA_CDG_CHANGE_PALETTE(value)` is 1 when colours or transparency changed | ✅ after `fa_stream_set_cdg_events(s, 1)` ([CD+G](cdg.md)); .NET `CdgChanged` |
 | `FA_EVENT_SEEK_FAILED` | the target of `fa_stream_seek_async` that was not reached | the `fa_result` | ✅ a worker could not seek there (a web server refusing the range); playback goes on where it was (.NET `SeekFailed`, `e.Error`; `DecodeError` carries `e.Error` too) ([seek cost](playback.md#what-a-seek-costs)) |
+
+## Mixer events
+
+The [DJ mixer](dj-mixer.md) has its own callback, `fa_mixer_set_event_callback`, which delivers `fa_mixer_event` structs. Its events are not stream events: they say which deck or microphone they are about.
+
+| Type | `index` | `mic` | `value` | .NET event | Raised when |
+|---|---|---|---|---|---|
+| `FA_EVENT_AUTOMIX_STARTED` | the incoming deck | `NULL` | the incoming deck | `AutoMix.Started` | an auto-mix transition starts and the incoming deck is heard |
+| `FA_EVENT_AUTOMIX_DONE` | the incoming deck | `NULL` | the incoming deck | `AutoMix.Done` | the crossfader is across |
+| `FA_EVENT_DECK_EMPTY` | the idle deck | `NULL` | 0 | `AutoMix.DeckEmpty` | a transition is over and the idle deck needs its next song |
+| `FA_EVENT_INPUT_LOST` | the mic's slot | the mic (valid only during the call) | 0 | `DjMixer.InputLost` | a mic's input device went away; it goes silent and the mix carries on |
+| `FA_EVENT_CUE_LOST` | 0 | `NULL` | 0 | `DjMixer.CueLost` | the headphone device (`FA_CUE_DEVICE`) went away; the master plays on |
+
+The same lifetime rules apply as for streams (callbacks run on the event thread, never the audio thread).
 
 ## C
 

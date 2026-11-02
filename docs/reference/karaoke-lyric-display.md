@@ -1,15 +1,15 @@
-<!-- Written 2026-10-20 from the code at commit 561a4ba; file:line references are to that commit. -->
+<!-- Written 2026-10-20 from the original app's code; file:line references are to the app's source at that time, not to this repository. -->
 
 # MIDI/.kar Karaoke Lyric Display: Design Specification
 
-Source of truth (all paths relative to /home/user/FatzBombMedia):
+Reference document for the lyric surface ([lyrics.md](../features/lyrics.md)). It records how the original app drew MIDI/.kar karaoke lyrics, so FatzAudio's surface could match it. The abbreviations used for source locations below (STR, SC, MLE, MME, KTS, MPC) name the original app's source files, which are not part of this repository:
 
-- STR = FatzBomb.MediaControl.Rendering.Direct3D11/Subtitle/SubtitleTextRenderer.cs
-- SC  = FatzBomb.MediaControl/Core/Subtitle/SubtitleCue.cs (KaraokeCueTiming, KaraokeLineTiming, KaraokeTextSegment, KaraokeCountdownState)
-- MLE = FatzBomb.MediaControl/Core/Audio/MidiLyricExtractor.cs
-- MME = FatzBomb.MediaControl/Core/Audio/MidiMetadataExtractor.cs
-- KTS = FatzBomb.MediaControl/Core/Configuration/KaraokeTextStyle.cs
-- MPC = FatzBomb.MediaControl/Controllers/MediaPresentationCoordinator.cs
+- STR = the Direct3D 11 subtitle text renderer
+- SC  = the karaoke cue timing types (`KaraokeCueTiming`, `KaraokeLineTiming`, `KaraokeTextSegment`, `KaraokeCountdownState`)
+- MLE = the MIDI lyric extractor
+- MME = the MIDI metadata extractor
+- KTS = the karaoke text style configuration
+- MPC = the media presentation coordinator
 
 Architecture: MLE (BASS MIDI markers) produces a list of cues. Each cue carries a pure-data `KaraokeCueTiming`. The renderer is a pure function `RenderKaraoke(timing, position, 1920, 1080)` that returns a premultiplied BGRA bitmap plus its offset. It keeps no state between frames. Any time-dependent value is derived from `position`, so seeking in either direction needs no special handling. A reimplementation only needs three things: the timing data model (sections 2 and 3), the per-frame draw rules (sections 4 to 6), and the style options (section 7).
 

@@ -456,7 +456,7 @@ of the master plus the exposed band, about 1 ms at 1080p and 3-5 ms at 2160p wit
 | Scroll or page-fade frame (all lines resampled) | 3 ms | 3 ms | 12 ms | 12 ms |
 | Intro or ending page (once) | 3 ms | 8 ms | 12 ms | 30 ms |
 
-The numbers measured with the finished lyric surface, with and without render-ahead, are in [docs/features/lyrics.md](../features/lyrics.md#cost).
+The numbers measured with the finished lyric surface, with and without render-ahead, are in [docs/features/lyrics.md](../../features/lyrics.md#cost).
 
 So: CD+G is cheap enough on the caller's thread except full repaints with effects at 2160p, which
 render-ahead or a split across workers takes care of. Lyrics at 2160p want render-ahead during the

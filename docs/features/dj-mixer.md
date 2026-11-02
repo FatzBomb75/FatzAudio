@@ -488,6 +488,16 @@ mixer.AutoMix.Skip();
 | `min_confidence` / `MinConfidence` | 0..1 | 0.5 |
 | `restore_time` / `RestoreTime` | 0..300 s (RESTORE_TEMPO's glide) | 20 s |
 
-## Planned
+## Possible future additions
 
-More than two decks is pinned in section 19 of the [DJ mixer plan](../requests/2026-10-23_FatzAudio_Plan_DjMixer.md).
+None of these is built, and none is needed for a release. The API keeps struct sizes, enum values and flags open for them.
+
+- **More than two decks.** `fa_mixer_create` returns `FA_ERROR_NOT_IMPLEMENTED` above 2 decks. Two decks cover the karaoke and DJ use this library is for.
+- **Quantized seeks**, and **automatic key matching in an auto-mix** (the singer's key is the app's choice, so the app shifts pitch itself with `FA_PARAM_PITCH`).
+- **More crossfader curves** (full-middle and cut). Today: constant power and linear.
+- **Echo synced to the beat** (the mic echo time is set in milliseconds).
+- **A per-deck filter knob** (the isolator EQ with kills covers most uses).
+- **CD+G scroll shift in the frame** (`scroll_dx` / `scroll_dy`), if profiling ever asks for it.
+- **Out of scope:** DVS, controller mapping, samplers and effect racks, scratching, streaming, ASIO, feedback suppression, stem separation, Ableton Link.
+
+Done since the plan was written, so no longer future: tempo maps for songs that change tempo, bar detection and bar sync, beat jump, the auto-mix bass swap and restore-tempo glide, manual cue trim (`FA_MIX_CUE_TRIM_MS`), and separate recording stems (music and vocals).

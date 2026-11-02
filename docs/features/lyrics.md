@@ -14,7 +14,7 @@ A lyric surface draws the lyrics of a MIDI or `.kar` song as a karaoke screen, s
 
 Text is drawn with FatzAudio's own font reader and rasterizer, not the system's text engine, so the picture is the same on every platform. Pixels are premultiplied BGRA against a transparent background: draw the surface over your video or background.
 
-The intro and ending pages follow the design reference ([sections 4.3 and 4.4](../requests/2026-10-20_MediaControl_KaraokeDesignReference.md)). A song without lyrics draws nothing.
+The intro and ending pages follow the design reference ([sections 4.3 and 4.4](../reference/karaoke-lyric-display.md)). A song without lyrics draws nothing.
 
 ## Quick start
 
@@ -241,7 +241,7 @@ var style = new LyricStyle
 using var lyrics = song.CreateLyricSurface(style);   // layout.BitmapX == layout.BitmapY == 0
 ```
 
-The pages match the [design reference](../requests/2026-10-20_MediaControl_KaraokeDesignReference.md) (sizes, colours and timings), with three differences: the info and copyright text use the font family's regular weight (or the lyric font when it is given by path or data), the italics are a synthetic slant, and the labels are configurable.
+The pages match the [design reference](../reference/karaoke-lyric-display.md) (sizes, colours and timings), with three differences: the info and copyright text use the font family's regular weight (or the lyric font when it is given by path or data), the italics are a synthetic slant, and the labels are configurable.
 
 ## How lines and pages are built
 

@@ -10,7 +10,7 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | Callback streams and capture streams (audio from your own function; an input device as a stream, for recording) | [callback-capture.md](callback-capture.md) | ✅ |
 | Sounds: a voice pool (a short sound loaded once, many overlapping copies with their own volume and pan, voice limit and steal rules) | [sounds.md](sounds.md) | ✅ |
 | Volume, pan and ramps (7 curves, scheduled starts, ramp-done) | [ramps.md](ramps.md) | ✅ volume and pan |
-| Events | [events.md](events.md) | ✅ ended, ramp done, marker, started, loudness final, metadata, stalled/resumed, decode error, MIDI text |
+| Events | [events.md](events.md) | ✅ every stream event, plus the mixer's auto-mix, deck and lost-device events |
 | Loudness normalization (R128 scans, tags, cache, limiter) | [normalization.md](normalization.md) | ✅ |
 | Track analysis (beat grid and BPM, musical key, waveform overview, silence detection; exact grids from MIDI and tracker files; cache) | [analysis.md](analysis.md) | ✅ |
 | Crossfades, markers, queues and gapless, scheduled starts | [crossfade.md](crossfade.md) | ✅ |
@@ -20,12 +20,12 @@ One page per feature, each with: what it does, C example, C# example, options, t
 | FFmpeg hand-off and A/V sync (packets, frames, presentation clock) | [ffmpeg.md](ffmpeg.md) | ✅ |
 | Web streams and HLS (HTTP/HTTPS, radio titles, reconnects, HLS) | [web-streams.md](web-streams.md) | ✅ |
 | CD+G karaoke graphics (MP3+G, ZIP, CD+G discs, surfaces for any renderer) | [cdg.md](cdg.md) | ✅ |
-| MIDI lyric surface (karaoke lyrics drawn for you: lines, pages, wipes, countdown, presets, effects) | [lyrics.md](lyrics.md) | ✅ (intro and ending pages 🗓️) |
-| Dolby Digital and Dolby Digital Plus (AC-3, E-AC-3, up to 7.1, dynamic range) | [dolby.md](dolby.md) | ✅ (passthrough 🗓️) |
+| MIDI lyric surface (karaoke lyrics drawn for you: lines, pages, wipes, countdown, presets, effects) | [lyrics.md](lyrics.md) | ✅ (intro and ending pages included) |
+| Dolby Digital and Dolby Digital Plus (AC-3, E-AC-3, up to 7.1, dynamic range) | [dolby.md](dolby.md) | ✅ (passthrough to a receiver: possible future update 🗓️) |
 | Disc playback (audio CDs, CD+G discs and `.cue` images) | [disc.md](disc.md) | ✅ |
-| MIDI and karaoke files (SoundFont 2, SF3 and DLS, stacks of several soundfonts, the OS's gm.dls by default, lyrics, transpose, channel mute) | [midi.md](midi.md) | ✅ (SFZ and MIDI input 🗓️) |
+| MIDI and karaoke files (SoundFont 2, SF3 and DLS, stacks of several soundfonts, the OS's gm.dls by default, lyrics, transpose, channel mute) | [midi.md](midi.md) | ✅ (SFZ and MIDI device input: possible future update 🗓️) |
 | Tracker modules (MOD, XM, S3M, IT, MPTM and more via libopenmpt; info and names, order/row seeking, order list, interpolation, stereo separation, channel mute and volume, live tempo and speed, amplification, row/instrument/sync events) | [trackers.md](trackers.md) | ✅ |
-| Recording and encoding (WAV, FLAC, MP3 via LAME; device, stream or file sources) | [recording-encoding.md](recording-encoding.md) | ✅ WAV/FLAC/MP3; Opus, AAC and casting 🗓️ |
+| Recording and encoding (WAV, FLAC, MP3 via LAME; device, stream or file sources) | [recording-encoding.md](recording-encoding.md) | ✅ WAV/FLAC/MP3; Opus and AAC encoders and casting: possible future update 🗓️ |
 | Equalizer, presets and user DSP (parametric/graphic EQ, 14 presets, `fa_stream_add_dsp`) | [equalizer.md](equalizer.md) | ✅ |
 | Levels, loudness meters and spectrum (VU meters, momentary and short-term LUFS, FFT for visualizers; per stream or the whole output) | [levels-spectrum.md](levels-spectrum.md) | ✅ |
 | Tags, cover art and file properties (ID3v1/v2, APEv2, Vorbis comments, MP4, ASF, RIFF, AIFF, Matroska; bitrate, sizes) | [tags.md](tags.md) | ✅ |

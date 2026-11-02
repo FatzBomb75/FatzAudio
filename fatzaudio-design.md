@@ -1,8 +1,8 @@
 # FatzAudio design (draft 2)
 
-Goal: one native library per platform (Windows, macOS, iOS, Android, Linux), one source tree, one C API, each capability implemented once. It must match or beat the legacy BASS stack (bass.dll 2.4.18 + 9 add-ons, see `bass-dll-analysis.md`) on measured behaviour.
+> **Historical.** This is the early design draft from October 2026, before the library was built. Several decisions here changed: FFmpeg is never used inside FatzAudio (apps hand over packets or frames, see [FFmpeg hand-off](docs/features/ffmpeg.md)), WMA decodes through Media Foundation on Windows only, and the open decisions below were settled. For what exists and how it behaves, read the [documentation](docs/README.md) and the [CHANGELOG](CHANGELOG.md); this page is only background on why the library is shaped as it is.
 
-Code location: `C:\development\nuget\fatzaudio` (not under git yet; it will be initialised when the project is scaffolded).
+Goal: one native library per platform (Windows, macOS, iOS, Android, Linux), one source tree, one C API, each capability implemented once. It must match or beat the legacy BASS stack (bass.dll 2.4.18 + 9 add-ons, see `docs/archive/bass-dll-analysis.md`) on measured behaviour.
 
 ## 1. Requirements (from Keith, 2026-10-17)
 

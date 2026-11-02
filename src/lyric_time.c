@@ -1,5 +1,5 @@
 /* The lyric surface's timeline (lyric_time.h). The rules are those of MediaControl's
- * design reference (docs/requests/2026-10-20_MediaControl_KaraokeDesignReference.md),
+ * design reference (docs/reference/karaoke-lyric-display.md),
  * with its fixed numbers as settings and its quirks handled as the plan says:
  * lines too wide are split at a word when they are built (Q4), the 42-character rule
  * also breaks before a syllable that starts with a space (Q8), and a line leaving the

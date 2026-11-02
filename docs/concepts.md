@@ -1,5 +1,19 @@
 # Concepts
 
+This page explains the ideas the rest of the documentation assumes: the objects you hold, how audio flows from a file to the speaker, how time and position work, which thread does what, who owns what, and a few words used throughout. Each topic links to its full guide.
+
+## The path of a sound
+
+```
+source ─▶ decoder ─▶ tempo/pitch ─▶ equalizer ─▶ gain ─▶ bus ─▶ device mix ─▶ limiter ─▶ device volume ─▶ speaker
+```
+
+- A **source** is whatever produces audio: a file, memory, your own reader, a URL, packets or frames you push, your own callback, a microphone, a disc track, a MIDI file or a tracker module. All of them open with one `fa_stream_open_*` call and give the same kind of `fa_stream`. The **format is detected from the content**, never from the file name, and there are no add-ons to load.
+- The per-stream controls (tempo, pitch and rate, the equalizer, volume, pan, mute, ramps, loudness normalization) sit before the **bus**. A bus groups streams (a DJ deck, a cue bus) with its own volume and pan.
+- The **device** mixes everything attached to it, runs the true-peak limiter, then applies its master volume.
+- A stream that is not attached to a device is **decode-only**: you pull samples with `fa_stream_read`. Analysis, scanning and encoding work on streams the same way.
+
+
 ## Objects
 
 | Object | What it is | Created by | Released by |
@@ -62,3 +76,48 @@ In .NET none of this shows: the binding sets the sizes.
 - All API functions are thread-safe unless their documentation says otherwise.
 
 Details, including the buffer length option and transport timing: [playback.md](features/playback.md). Event delivery: [events.md](features/events.md). Loudness scans: [normalization.md](features/normalization.md).
+
+## Stream states
+
+A stream is always in one state (`fa_stream_get_state`, .NET `State`):
+
+| State | Meaning |
+|---|---|
+| `STOPPED` | Opened or stopped; the position is at the start (or the cue-in marker) |
+| `PLAYING` | Attached to a started device and being heard |
+| `PAUSED` | Holding its position; `play` continues |
+| `BUFFERING` | A push, packet or web stream ran dry; it resumes by itself when data arrives |
+| `ENDED` | Reached its end (or cue-out); `play` starts it again |
+| `SCHEDULED` | Waiting for a start time or a queue (`play_at`, a crossfade, `set_next`) |
+
+## Ownership and lifetime
+
+- You close what you open: `fa_stream_close` for every stream, `fa_device_close` for every device, `fa_engine_destroy` for the engine, in that order. In .NET, `Dispose()` (or `using`) does the same, and disposal order never crashes: a stream keeps its engine alive until it is disposed.
+- Closing a device detaches the streams still on it; they are not closed. Closing a stream while it plays is fine.
+- Handles are valid until you close them. There is no handle recycling to guard against.
+- A callback may close the stream it was called for. When `fa_stream_close` (or replacing the callback) returns, the old callback is not running and will not run again, so its `user` data can be freed.
+- The library copies strings and buffers you pass in, unless a function says it keeps a reference (a soundfont, for example, is reference counted and streams hold it).
+
+## Time, rate and speed
+
+Positions, markers, the clock, CD+G and lyrics are always in **song time**: they do not change when you change tempo or rate. The speed you hear is `TEMPO x RATE`; `PITCH` changes the key without changing speed. See [tempo and pitch](features/tempo-pitch.md).
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| Frame | One sample on every channel at the same instant. 44,100 frames per second at 44.1 kHz, whatever the channel count |
+| Decode-ahead | The stream is decoded on worker threads into a buffer (500 ms by default) before it is heard |
+| Device clock | Frames a device has mixed since it opened; used to schedule exact starts and ramps |
+| Presentation clock | The time of the audio leaving the speaker, with latency; what a video should follow |
+| Marker | A named point on a stream: cue-in, cue-out, mix point, fades |
+| Ramp | A change of volume, pan, tempo, pitch or rate over time on one of seven curves |
+| Gapless / queue | The next stream starts on the exact frame the current one ends, or at its mix point |
+| Bus | A group of streams with its own volume and pan, between the streams and the device |
+| Normalization | Loudness matching to a target in LUFS (EBU R128), per track or per album |
+| Limiter | The device's last stage: stops peaks above the ceiling clipping, with look-ahead |
+| Push / packet stream | A stream you feed with PCM, frames or compressed packets (from FFmpeg) |
+| Surface | A picture the engine draws for you in sync with the audio: CD+G graphics or MIDI lyrics |
+| Soundfont | The bank of instrument samples a MIDI file plays with (SF2, SF3 or DLS) |
+| Deck | One of the DJ mixer's two players |
+| Struct size | The first field of structs that can grow; see [Versioned structs](#versioned-structs) |

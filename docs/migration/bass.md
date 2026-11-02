@@ -1,6 +1,6 @@
 # Migrating from BASS
 
-This guide maps every BASS 2.4.18 function, and every add-on in the legacy app (bass_aac, bass_ac3, bass_fx, bassalac, basscd, bassflac, bassmidi, bassopus, basswebm, basswma), plus BASSenc for recording and encoding, to FatzAudio. It's updated as each feature lands. Status symbols are explained in the [docs index](../README.md#status-legend).
+This guide maps the BASS 2.4.18 functions (all 110 exports of bass.dll, see [Appendix N](#appendix-n-functions-not-named-in-the-tables-above) for those not named in the tables), its constants ([appendices A to M](#6-appendices-constants-and-leftover-functions)), and every add-on in the legacy app (bass_aac, bass_ac3, bass_fx, bassalac, basscd, bassflac, bassmidi, bassopus, basswebm, basswma), plus BASSenc for recording and encoding, to FatzAudio. It's updated as each feature lands. Status symbols are explained in the [docs index](../README.md#status-legend).
 
 **Goal:** after migration the app ships one native library per platform (`fatzaudio.dll`/`.dylib`/`.so`) and none of the BASS DLLs.
 
@@ -44,7 +44,7 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 | BASS_IsStarted | `fa_device_is_started` | `device.IsStarted` | ✅ |
 | BASS_SetVolume / BASS_GetVolume | `fa_device_set_volume` / `fa_device_get_volume` | `device.Volume` | ✅ |
 | Mute by saving the volume, setting BASS_ATTRIB_VOL (or BASS_SetVolume) to 0 and restoring it | `fa_stream_set_mute` / `fa_device_set_mute` (read with `fa_stream_get_mute` / `fa_device_get_mute`): the volume is kept, fades keep running, 5 ms glide | `stream.Muted`, `device.Muted` | ✅ |
-| BASS_SetConfig / GetConfig (+Ptr) | `fa_engine_config` fields at creation; per-stream options | `AudioEngineOptions` | ✅ partially (rate, period, threads, cache dir) |
+| BASS_SetConfig / GetConfig (+Ptr) | `fa_engine_config` fields at creation; per-stream options | `AudioEngineOptions` | ✅ for the settings FatzAudio has; each BASS_CONFIG_* is listed in [Appendix D](#appendix-d-configuration-bass_setconfig) |
 | BASS_CONFIG_BUFFER | `fa_open_options.buffer_ms` per stream, default 500 ms ([playback](../features/playback.md#buffer-length)) | `StreamOptions.BufferLength` | ✅ |
 | BASS_CONFIG_NET_TIMEOUT / NET_READTIMEOUT | `fa_net_options.timeout_ms` per stream: connecting, and the longest the server may stay silent ([web streams](../features/web-streams.md#connection-settings)) | `NetworkOptions.Timeout` | ✅ |
 | BASS_CONFIG_NET_BUFFER | Not needed: each web stream keeps up to 4 MB (a smaller file: its size plus 64 KB), at most 2 MB ahead of playback | — | ➖ (by design) |
@@ -169,15 +169,15 @@ On Android and iOS BASS also comes as the core library plus one library per add-
 
 ### Effects
 
-| BASS | FatzAudio (C; .NET: `SetEqualizer`, `SetEqualizerGain`, `EqualizerEnabled`, `Equalizer.GetPreset`) | Status |
-|---|---|---|
-| BASS_ChannelSetFX(BASS_FX_DX8_PARAMEQ) per band, or bass_fx `BASS_FX_BFX_PEAKEQ` with `lBand` per band + BASS_FXSetParameters | `fa_stream_set_eq` with up to 16 peak or shelf bands; `fa_stream_set_eq_gain` for one slider. No FX handles: one equalizer per stream, before volume and normalization, gliding without clicks, free when flat ([equalizer](../features/equalizer.md)) | ✅ |
-| `BASS_BFX_PEAKEQ.fCenter` / `fBandwidth` (octaves) / `fQ` / `fGain` | `fa_eq_band.frequency_hz` / `q` (one octave = 1.41) / `gain_db` | ✅ |
-| BASS_FXSetParameters to switch a whole EQ preset | `fa_eq_get_preset` + `fa_stream_set_eq` (14 presets) | ✅ |
-| BASS_FXSetBypass on the EQ | `fa_stream_set_eq_enabled(s, 0)`: glides to flat, keeps the bands | ✅ |
-| BASS_FXReset (clear the EQ's filter memory after a seek) | Not needed: cleared by itself on a seek, a flush and a restart | ➖ |
-| Three BASS_FX_BFX_PEAKEQ (or BQF filters) per deck as a DJ EQ with kills | The DJ mixer's isolator: `FA_DECK_EQ_LOW_DB` / `_MID_DB` / `_HIGH_DB` down to `FA_DECK_EQ_KILL_DB`, flat when all at 0 ([DJ mixer](../features/dj-mixer.md)) | ✅ |
-| Other BASS_FX / bass_fx effects (compressor, reverb, echo, chorus, flanger, distortion, phaser, auto-wah, ...) | Not built in: a player rarely needs them, and `fa_stream_add_dsp` takes your own | ➖ (by design) |
+| BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| BASS_ChannelSetFX(BASS_FX_DX8_PARAMEQ) per band, or bass_fx `BASS_FX_BFX_PEAKEQ` with `lBand` per band + BASS_FXSetParameters | `fa_stream_set_eq` with up to 16 peak or shelf bands; `fa_stream_set_eq_gain` for one slider. No FX handles: one equalizer per stream, before volume and normalization, gliding without clicks, free when flat ([equalizer](../features/equalizer.md)) | `stream.SetEqualizer(...)`, `SetEqualizerGain`, `EqualizerEnabled` | ✅ |
+| `BASS_BFX_PEAKEQ.fCenter` / `fBandwidth` (octaves) / `fQ` / `fGain` | `fa_eq_band.frequency_hz` / `q` (one octave = 1.41) / `gain_db` | `SetEqualizer(...)` bands | ✅ |
+| BASS_FXSetParameters to switch a whole EQ preset | `fa_eq_get_preset` + `fa_stream_set_eq` (14 presets) | `Equalizer.GetPreset(...)` + `SetEqualizer` | ✅ |
+| BASS_FXSetBypass on the EQ | `fa_stream_set_eq_enabled(s, 0)`: glides to flat, keeps the bands | `stream.EqualizerEnabled = false` | ✅ |
+| BASS_FXReset (clear the EQ's filter memory after a seek) | Not needed: cleared by itself on a seek, a flush and a restart | — | ➖ |
+| Three BASS_FX_BFX_PEAKEQ (or BQF filters) per deck as a DJ EQ with kills | The DJ mixer's isolator: `FA_DECK_EQ_LOW_DB` / `_MID_DB` / `_HIGH_DB` down to `FA_DECK_EQ_KILL_DB`, flat when all at 0 ([DJ mixer](../features/dj-mixer.md)) | `deck.Eq` | ✅ |
+| Other BASS_FX / bass_fx effects (compressor, reverb, echo, chorus, flanger, distortion, phaser, auto-wah, ...) | Not built in: a player rarely needs them, and `fa_stream_add_dsp` takes your own | `stream.AddDsp(...)` | ➖ (by design) |
 
 ### Loudness and normalization
 
@@ -259,20 +259,20 @@ MOD, S3M, XM, IT, MPTM and many more play through the statically linked libopenm
 
 ### Recording
 
-| BASS | FatzAudio | Status |
-|---|---|---|
-| BASS_RecordGetDeviceInfo | `fa_device_count/get_info(FA_DEVICE_CAPTURE)` | ✅ (listing) |
-| BASS_RecordInit + BASS_RecordStart, the record channel played live through a mixer (a karaoke mic) | `fa_mixer_add_mic` on the [DJ mixer](../features/dj-mixer.md#microphones): one channel or all channels of a capture device, drift-corrected into the master, with low cut, gain, gate, EQ, mute and pan built in; `fa_mic_remove` frees it. In .NET: `mixer.AddMic(new MicOptions { Device = input, Channel = 0 })` | ✅ |
-| BASS_ChannelGetLevel(Ex) on a record channel (a mic meter) | `fa_mic_get_levels` (after gain, gate and EQ) | ✅ |
-| BASS_FX_BFX_FREEVERB / BASS_FX_BFX_ECHO4 on a record channel (karaoke mic effects) | One shared reverb and echo for the mics: `fa_mixer_set_mic_effects` (size, damping, echo time, feedback, tone) and the sends `FA_MIC_REVERB_SEND` / `FA_MIC_ECHO_SEND`. In .NET: `mixer.MicEffects`, `mic.ReverbSend`, `mic.EchoSend` | ✅ |
-| Ducking the music under a host mic by hand (`BASS_ChannelSlideAttribute` on the music's volume when the mic level rises) | `FA_MIC_DUCKS_MUSIC` on the host's mic; depth, attack, hold, release and threshold in `fa_mixer_set_ducking` (on by default). In .NET: `MicOptions.DucksMusic`, `mixer.Ducking` | ✅ |
-| BASS_Encode_Start on the mixer plus one on the record channel, started together (a karaoke night as stems) | `fa_encoder_attach_mixer(enc, mixer, FA_MIXER_TAP_MASTER / FA_MIXER_TAP_VOCALS)` + `fa_mixer_start_recording`: one start frame, the vocals lined up as the singer heard the music. In .NET: `encoder.Record(mixer, MixerTap.Vocals)`, `mixer.StartRecording([...])` | ✅ |
-| Measuring a karaoke system's mic-to-speaker latency by hand (play a click, record it, find it in the recording) and guessing a safe mic gain | `fa_mixer_measure_latency`: the [setup check](../features/dj-mixer.md#setup-check) plays test chirps and pink noise, measures each latency mode, gives the most feedback-safe mic gain and advises whether to monitor; the mixer then uses the measured latency. In .NET: `await mixer.MeasureLatencyAsync(mic, new LatencyCheckOptions { AllModes = true })` | ✅ |
-| BASS_CONFIG_REC_WASAPI / BASSWASAPI exclusive mode for low-latency mic monitoring | `FA_LATENCY_EXCLUSIVE` in `fa_mixer_config.latency`, or `fa_mixer_set_latency_mode` on a running mixer (opt-in; output and mics in WASAPI exclusive, 3 ms periods). Mics capture in WASAPI raw mode (no voice processing) where the driver offers it. In .NET: `DjMixerOptions.Latency`, `mixer.LatencyMode` | ✅ (Windows) |
-| BASS_RecordInit + BASS_RecordStart for other uses (record an input to a file, read its samples, meter it) | `fa_stream_open_capture` (`fa_capture_options`: device, rate, channels): the input as an ordinary stream; record it with `FA_OPEN_DECODE_ONLY` + `fa_encoder_encode_stream`, read it with `fa_stream_read`, or play it ([capture streams](../features/callback-capture.md#capture-streams)). In .NET: `engine.OpenCapture(new CaptureOptions { Device = input })` | ✅ |
-| BASS_RecordInit on a device with BASS_DEVICE_LOOPBACK, or BASSWASAPI's loopback devices (record what the PC plays) | `fa_stream_open_capture` with `FA_CAPTURE_LOOPBACK` in `fa_capture_options.flags`; `device_id` is an output's id (NULL = the default output). Gaps where nothing plays are recorded as silence ([loopback](../features/callback-capture.md#recording-what-the-pc-plays-loopback)). `FA_ERROR_NOT_IMPLEMENTED` off Windows. In .NET: `engine.OpenCapture(new CaptureOptions { Loopback = true, Device = output })` | ✅ (Windows) |
-| BASS_RecordFree / SetDevice / GetDevice / GetInfo | Not needed: each capture stream opens its input and closes it with `fa_stream_close`; `fa_device_get_info(FA_DEVICE_CAPTURE)` lists the inputs | ➖ (by design) |
-| BASS_RecordGetInput / SetInput / GetInputName | Not provided (old WinMM mixer lines) | ➖ |
+| BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| BASS_RecordGetDeviceInfo | `fa_device_count/get_info(FA_DEVICE_CAPTURE)` | — | ✅ (listing) |
+| BASS_RecordInit + BASS_RecordStart, the record channel played live through a mixer (a karaoke mic) | `fa_mixer_add_mic` on the [DJ mixer](../features/dj-mixer.md#microphones): one channel or all channels of a capture device, drift-corrected into the master, with low cut, gain, gate, EQ, mute and pan built in; `fa_mic_remove` frees it. | `mixer.AddMic(new MicOptions { Device = input, Channel = 0 })` | ✅ |
+| BASS_ChannelGetLevel(Ex) on a record channel (a mic meter) | `fa_mic_get_levels` (after gain, gate and EQ) | — | ✅ |
+| BASS_FX_BFX_FREEVERB / BASS_FX_BFX_ECHO4 on a record channel (karaoke mic effects) | One shared reverb and echo for the mics: `fa_mixer_set_mic_effects` (size, damping, echo time, feedback, tone) and the sends `FA_MIC_REVERB_SEND` / `FA_MIC_ECHO_SEND`. | `mixer.MicEffects`, `mic.ReverbSend`, `mic.EchoSend` | ✅ |
+| Ducking the music under a host mic by hand (`BASS_ChannelSlideAttribute` on the music's volume when the mic level rises) | `FA_MIC_DUCKS_MUSIC` on the host's mic; depth, attack, hold, release and threshold in `fa_mixer_set_ducking` (on by default). | `MicOptions.DucksMusic`, `mixer.Ducking` | ✅ |
+| BASS_Encode_Start on the mixer plus one on the record channel, started together (a karaoke night as stems) | `fa_encoder_attach_mixer(enc, mixer, FA_MIXER_TAP_MASTER / FA_MIXER_TAP_VOCALS)` + `fa_mixer_start_recording`: one start frame, the vocals lined up as the singer heard the music. | `encoder.Record(mixer, MixerTap.Vocals)`, `mixer.StartRecording([...])` | ✅ |
+| Measuring a karaoke system's mic-to-speaker latency by hand (play a click, record it, find it in the recording) and guessing a safe mic gain | `fa_mixer_measure_latency`: the [setup check](../features/dj-mixer.md#setup-check) plays test chirps and pink noise, measures each latency mode, gives the most feedback-safe mic gain and advises whether to monitor; the mixer then uses the measured latency. | `await mixer.MeasureLatencyAsync(mic, new LatencyCheckOptions { AllModes = true })` | ✅ |
+| BASS_CONFIG_REC_WASAPI / BASSWASAPI exclusive mode for low-latency mic monitoring | `FA_LATENCY_EXCLUSIVE` in `fa_mixer_config.latency`, or `fa_mixer_set_latency_mode` on a running mixer (opt-in; output and mics in WASAPI exclusive, 3 ms periods). Mics capture in WASAPI raw mode (no voice processing) where the driver offers it. | `DjMixerOptions.Latency`, `mixer.LatencyMode` | ✅ (Windows) |
+| BASS_RecordInit + BASS_RecordStart for other uses (record an input to a file, read its samples, meter it) | `fa_stream_open_capture` (`fa_capture_options`: device, rate, channels): the input as an ordinary stream; record it with `FA_OPEN_DECODE_ONLY` + `fa_encoder_encode_stream`, read it with `fa_stream_read`, or play it ([capture streams](../features/callback-capture.md#capture-streams)). | `engine.OpenCapture(new CaptureOptions { Device = input })` | ✅ |
+| BASS_RecordInit on a device with BASS_DEVICE_LOOPBACK, or BASSWASAPI's loopback devices (record what the PC plays) | `fa_stream_open_capture` with `FA_CAPTURE_LOOPBACK` in `fa_capture_options.flags`; `device_id` is an output's id (NULL = the default output). Gaps where nothing plays are recorded as silence ([loopback](../features/callback-capture.md#recording-what-the-pc-plays-loopback)). `FA_ERROR_NOT_IMPLEMENTED` off Windows. | `engine.OpenCapture(new CaptureOptions { Loopback = true, Device = output })` | ✅ (Windows) |
+| BASS_RecordFree / SetDevice / GetDevice / GetInfo | Not needed: each capture stream opens its input and closes it with `fa_stream_close`; `fa_device_get_info(FA_DEVICE_CAPTURE)` lists the inputs | — | ➖ (by design) |
+| BASS_RecordGetInput / SetInput / GetInputName | Not provided (old WinMM mixer lines) | — | ➖ |
 
 ### Encoding and recording (BASSenc, BASSenc_MP3, BASSenc_FLAC)
 
@@ -297,17 +297,17 @@ The legacy app ships no encoder DLLs; this is how BASSenc-style code maps. One e
 | BASS_ENCODE_QUEUE, BASS_ENCODE_LIMIT, BASS_CONFIG_ENCODE_PRIORITY | Always queued on the encoder's own thread (`queue_ms`); the audio thread never waits | `QueueLength` | ✅ |
 | BASS_Encode_SetNotify (encoder died) | `FA_ENCODER_FAILED` in the status, the error from `fa_encoder_close` | `Status.State`, `Close()` throws | ✅ |
 | Sample rate / channel conversion with a resampling mixer in front of the encoder | `sample_rate` and `channels` in the options | `SampleRate`, `Channels` | ✅ |
-| BASS_Encode_OPUS_* (bassenc_opus), BASS_Encode_OGG_* (bassenc_ogg), BASS_Encode_AAC (bassenc_aac) | Opus and AAC encoding | | 🗓️ |
-| BASS_Encode_CastInit / CastSetTitle / CastGetStats (Icecast/Shoutcast) | Broadcasting through `fa_encoder_create_output` to a server connection | | 🗓️ |
+| BASS_Encode_OPUS_* (bassenc_opus), BASS_Encode_OGG_* (bassenc_ogg), BASS_Encode_AAC (bassenc_aac) | Not built: possible future update, not required for release. Meanwhile read PCM with `fa_stream_read` and use your own encoder | | 🗓️ |
+| BASS_Encode_CastInit / CastSetTitle / CastGetStats (Icecast/Shoutcast) | Not built: possible future update, not required for release. `fa_encoder_create_output` already writes to your own connection | | 🗓️ |
 | BASS_Encode_ServerInit (built-in server) | Not provided | | ➖ |
-| BASS_Encode_StartCA / StartACM (OS codecs) | AAC through the OS encoders is planned; ACM is obsolete | | 🗓️ / ➖ |
+| BASS_Encode_StartCA / StartACM (OS codecs) | AAC through the OS encoders: possible future update, not required for release; ACM is obsolete | | 🗓️ / ➖ |
 | BASS_WMA_Encode* (basswma) | Not provided (Windows-only, WMA is obsolete) | | ➖ |
 
 ### 3D and EAX
 
 | BASS | FatzAudio | Status |
 |---|---|---|
-| BASS_Set3DFactors / Get3DFactors / Set3DPosition / Get3DPosition / Apply3D, BASS_ChannelSet3D* / Get3D* | Optional spatial module | 🗓️ (low priority) |
+| BASS_Set3DFactors / Get3DFactors / Set3DPosition / Get3DPosition / Apply3D, BASS_ChannelSet3D* / Get3D* | Not built: possible future update, not required for release. Pan and the channel matrix cover stereo placement | 🗓️ |
 | BASS_SetEAXParameters / GetEAXParameters | Not provided (hardware EAX no longer exists) | ➖ |
 
 ### Plugins
@@ -373,7 +373,7 @@ AC-3 and E-AC-3 are built-in formats: the ordinary open calls play them, in raw 
 | Dialogue level (dialnorm) for loudness | `fa_engine_set_dialnorm` lets a file's dialnorm stand in for a loudness scan (`FA_LOUDNESS_DIALNORM`) | `engine.SetDialnorm(true)` | ✅ |
 | E-AC-3 (Dolby Digital Plus), 7.1 | Built in with every coding tool (dependent substreams, spectral extension, enhanced coupling, the adaptive hybrid transform); Atmos streams play their bed | Built in | ✅ |
 | AC-3 packets from your own FFmpeg demuxer | `fa_stream_open_packets` with codec `ac3` / `eac3`, decoded natively | `engine.OpenPackets` | ✅ |
-| Passthrough to an AV receiver (S/PDIF, HDMI) | Not provided | — | 🗓️ |
+| Passthrough to an AV receiver (S/PDIF, HDMI) | Not built: possible future update, not required for release | — | 🗓️ |
 
 ### bassopus and OGG Vorbis
 
@@ -531,7 +531,7 @@ basscd is an add-on DLL; FatzAudio reads CDs and `.cue` images itself, with one 
 | BASS_CD_StreamCreateFile (`.cda`) | `fa_stream_open_path` (Windows) | `engine.OpenFile` | ✅ |
 | BASS_CD_StreamCreateEx / BASS_CD_SUBCHANNEL, BASS_CD_SUBCHANNEL_NOHW (subchannel callback) | Not needed for CD+G: `fa_stream_open_disc` reads, de-interleaves and decodes it; `FA_DISC_NO_CDG` skips the subcode. Raw subchannel access is not provided | `DiscOptions.ReadCdg` | ✅ CD+G, ➖ raw access |
 | BASS_CD_StreamGetTrack | Not needed: you opened the track, so you know its number | | ➖ |
-| BASS_CD_StreamSetTrack (switch track on the same stream) | Open the next track and `fa_stream_set_next` (gapless) or crossfade | `SetNext` | ✅ |
+| BASS_CD_StreamSetTrack (switch track on the same stream) | Open the next track and `fa_stream_set_next` (gapless) or crossfade | `QueueNext` | ✅ |
 | BASS_CD_Analog_* (drive's own DAC) | Not provided: modern drives have no analog output | | ➖ |
 | BASS_CONFIG_CD_RETRY | `fa_disc_options.retries` (default 5) | `DiscOptions.Retries` | ✅ |
 | BASS_CONFIG_CD_SKIPERROR | Always on: unreadable sectors play as silence and raise `FA_EVENT_DECODE_ERROR` | automatic | ✅ |
@@ -582,7 +582,7 @@ MIDI files are a built-in format: the ordinary open calls play them with a Sound
 | BASS_MIDI_StreamCreateEvents (an event list as a song) | `fa_stream_open_midi_events`: plays, seeks and loops like a file, length = last event + 1 s; `track` per event for track volume | `engine.OpenMidiEvents(events)` | ✅ |
 | BASS_MIDI_StreamGetEvents (a file's events) | `fa_stream_get_midi_events(s, track, type, out, capacity, &count)`: notes, controllers, programs, pressure, bends, SysEx in time order, with frame, time and track; `track` / `type` -1 for all ([sending events](../features/midi.md#sending-events-and-the-real-time-synthesizer)) | `stream.GetMidiEvents(track, type)` | ✅ |
 | BASS_MIDI_StreamGetEvent (a channel's current value) | `fa_stream_get_midi_value(s, channel, type, param, &value)`: a controller, the program, pitch bend or channel pressure, as the synth has rendered | `stream.GetMidiValue(channel, type, controller)` | ✅ (those four types) |
-| BASS_MIDI_InInit / BASS_MIDI_InStart (MIDI input devices) | Not provided | — | 🗓️ |
+| BASS_MIDI_InInit / BASS_MIDI_InStart (MIDI input devices) | Not built: possible future update, not required for release. Read the device yourself and pass the bytes to `fa_stream_send_midi` | — | 🗓️ |
 | BASS_ATTRIB_MIDI_VOICES | Fixed at 256 voices per stream | — | ✅ (fixed) |
 | BASS_ATTRIB_MIDI_PPQN, BASS_POS_MIDI_TICK | Not provided: positions are frames and time | — | ➖ |
 | BASS_ATTRIB_MIDI_TRACK_VOL | `fa_stream_set_midi_track_volume(s, track, volume)` / `_get_`: 0..4, the track's notes from their next note on ([sending events](../features/midi.md#sending-events-and-the-real-time-synthesizer)) | `SetMidiTrackVolume(track, volume)` / `GetMidiTrackVolume` | ✅ |
@@ -1054,3 +1054,283 @@ With `--rec`, the harness also plays both libraries through the output device an
 
 The comparison report opens with every measurement where BASS won; the ones to fix are in the [engineering notes](../engineering-notes.md) (area "bass-compare"). In short: the start and crossfade latency measured on Windows hardware (about 9 and 19 ms behind BASS) is fixed but not yet measured again; WMA has not been compared yet (basswma does not run under Wine), and 16 AC-3 5.1 streams at once take more memory each than in bass_ac3. The AC-3 decoder now runs faster than bass_ac3 (5.1 about 400× real time against 350×, stereo 900× against 820×) and opens a file in about 0.5 ms. MP3 now seeks exactly in about 0.3 ms (BASS lands off target unless it prescans), decodes as accurately as BASS, and its loudness scan runs faster than BASS decodes the file. `.aac` files and AAC radio start on the same frame as in bass_aac. Ogg Opus and Ogg Vorbis match bassopus and BASS's Vorbis decoder.
 
+## 6. Appendices: constants and leftover functions
+
+These tables map BASS's constants, which a ported app uses everywhere, to FatzAudio. They follow `bass.h` 2.4.18 and the add-on headers as documented by Un4seen. A constant that appears in a function row above is only listed here when porting needs more than that row says.
+
+### Appendix A: error codes
+
+FatzAudio returns the error directly from the call that failed, so there is no `BASS_ErrorGetCode()` to port: replace `if (!BASS_X(...)) code = BASS_ErrorGetCode();` with `r = fa_x(...); if (r != FA_OK) ...`. In .NET catch `FatzAudioException` and read `ErrorCode`. `fa_result_string(r)` gives a sentence for any code.
+
+| BASS_ERROR_* | FatzAudio (C) | FatzAudio (.NET `ErrorCode`) | Notes |
+|---|---|---|---|
+| `OK` (0) | `FA_OK` (0) | `Ok` | |
+| `MEM` (1) | `FA_ERROR_OUT_OF_MEMORY` | `OutOfMemory` | |
+| `FILEOPEN` (2) | `FA_ERROR_NOT_FOUND` (no such file or track), `FA_ERROR_IO` (could not be read) | `NotFound`, `Io` | |
+| `DRIVER` (3) | `FA_ERROR_DEVICE` | `Device` | The output or input device could not be opened |
+| `BUFLOST` (4) | none | none | DirectSound only; devices recover by themselves |
+| `HANDLE` (5) | `FA_ERROR_INVALID_ARG` for a `NULL` handle | `ArgumentNullException`, `ObjectDisposedException` | Handles are typed; a closed handle is a bug, as in any C API |
+| `FORMAT` (6) | `FA_ERROR_UNSUPPORTED_FORMAT` | `UnsupportedFormat` | |
+| `POSITION` (7) | `FA_ERROR_INVALID_ARG` (negative position), `FA_ERROR_NOT_SEEKABLE` (live or forward-only source) | `InvalidArgument`, `NotSeekable` | A seek a worker cannot reach later raises `FA_EVENT_SEEK_FAILED` |
+| `INIT` (8) | none | none | No init step: you hold the `fa_engine` and `fa_device` you pass |
+| `START` (9) | none | none | Playing on a stopped device waits for `fa_device_start` |
+| `ALREADY` (14) | none | none | Start, stop and attach are idempotent. Conflicting use is `FA_ERROR_BUSY` |
+| `NOTAUDIO` (17, basscd) | `FA_ERROR_UNSUPPORTED_FORMAT` | `UnsupportedFormat` | A data track |
+| `NOCHAN` (18) | `FA_ERROR_BUSY` | `Busy` | Every sound voice is busy and the steal rule is `NONE` |
+| `ILLTYPE` (19) | `FA_ERROR_INVALID_ARG` | `InvalidArgument` | |
+| `ILLPARAM` (20) | `FA_ERROR_INVALID_ARG`, `FA_ERROR_OUT_OF_RANGE` | `InvalidArgument`, `OutOfRange` | `OUT_OF_RANGE`: a value valid on its own that this deck, stream or tempo cannot do |
+| `NO3D` (21), `NOEAX` (22), `NOFX` (34) | `FA_ERROR_NOT_IMPLEMENTED` | `NotImplemented` | 3D, EAX and the generic FX API are not provided |
+| `DEVICE` (23) | `FA_ERROR_NOT_FOUND` (no such device id), `FA_ERROR_DEVICE` | `NotFound`, `Device` | |
+| `NOPLAY` (24) | none | none | Pause, stop and play on any stream are valid |
+| `FREQ` (25) | `FA_ERROR_INVALID_ARG` | `InvalidArgument` | A sample rate out of range |
+| `NOTFILE` (27) | `FA_ERROR_NOT_SEEKABLE` | `NotSeekable` | The call needs a seekable source |
+| `NOHW` (29) | none | none | There are no hardware voices |
+| `EMPTY` (31) | `FA_ERROR_UNSUPPORTED_FORMAT` | `UnsupportedFormat` | A file with no audio at all |
+| `NONET` (32), `TIMEOUT` (40) | `FA_ERROR_NETWORK` | `Network` | |
+| `CREATE` (33) | `FA_ERROR_IO` | `Io` | A file could not be created (encoder) |
+| `NOTAVAIL` (37) | `FA_ERROR_NOT_FOUND`, `FA_ERROR_NOT_SEEKABLE` | `NotFound`, `NotSeekable` | The thing asked for is not there (no tag, no header), or not known for a live stream |
+| `DECODE` (38) | `FA_ERROR_INVALID_ARG` | `InvalidArgument` | Attaching a decode-only stream |
+| `DX` (39) | none | none | |
+| `FILEFORM` (41), `CODEC` (44) | `FA_ERROR_UNSUPPORTED_FORMAT` | `UnsupportedFormat` | Includes DTS, TrueHD and WMA outside Windows |
+| `SPEAKER` (42) | `FA_ERROR_NOT_ENOUGH_CHANNELS` | `NotEnoughChannels` | The headphone cue channels the output does not have |
+| `VERSION` (43) | none | `InvalidOperationException` | The .NET binding refuses a native library of another major.minor version. In C compare `fa_version()` |
+| `ENDED` (45) | `FA_ERROR_END_OF_STREAM` | `EndOfStream` | `Read` returns 0 at the end instead of throwing |
+| `BUSY` (46) | `FA_ERROR_BUSY` | `Busy` | |
+| `UNSTREAMABLE` (47) | `FA_ERROR_NOT_SEEKABLE` | `NotSeekable` | A forward-only source that needs a seek |
+| `PROTOCOL` (48) | `FA_ERROR_UNSUPPORTED_FORMAT`, `FA_ERROR_NETWORK` | `UnsupportedFormat`, `Network` | |
+| `DENIED` (49) | `FA_ERROR_PERMISSION_DENIED` (microphone), `FA_ERROR_NETWORK` (a server's 401 or 403) | `PermissionDenied`, `Network` | |
+| `UNKNOWN` (-1) | `FA_ERROR_GENERIC` | `Generic` | |
+| `NOCD` (12, basscd) | `FA_ERROR_NO_DISC` | `NoDisc` | |
+| `CDTRACK` (13, basscd) | `FA_ERROR_NOT_FOUND` | `NotFound` | |
+| `WMA_LICENSE` (1000, basswma) | `FA_ERROR_PROTECTED_CONTENT` | `ProtectedContent` | Also encrypted MP4/MKV and SAMPLE-AES HLS |
+| `WMA` (1001, basswma) | `FA_ERROR_UNSUPPORTED_FORMAT` | `UnsupportedFormat` | WMA off Windows. No Windows Media Player install is needed on Windows |
+| No BASS code | `FA_ERROR_PROVIDER_MISSING`, `FA_ERROR_NO_SOUNDFONT`, `FA_ERROR_TOO_LARGE`, `FA_ERROR_SIZE_MISMATCH`, `FA_ERROR_CANCELLED`, `FA_ERROR_NOT_IMPLEMENTED` | `ProviderMissing`, `NoSoundFont`, `TooLarge`, `SizeMismatch`, `Cancelled`, `NotImplemented` | LAME not found; a MIDI file and no soundfont; a ZIP entry over the memory limit; a surface buffer of the wrong size; an open stopped by its cancel flag; a call a platform cannot do |
+
+### Appendix B: channel state (`BASS_ChannelIsActive`)
+
+| BASS_ACTIVE_* | `fa_stream_state` | .NET `StreamState` | Notes |
+|---|---|---|---|
+| `STOPPED` | `FA_STATE_STOPPED`, or `FA_STATE_ENDED` after the stream reached its end | `Stopped`, `Ended` | BASS reports both as stopped. Test for `ENDED` to tell "finished" from "never started" |
+| `PLAYING` | `FA_STATE_PLAYING` | `Playing` | |
+| `PAUSED` | `FA_STATE_PAUSED` | `Paused` | |
+| `STALLED` | `FA_STATE_BUFFERING` | `Buffering` | Push, packet and web streams that ran dry |
+| `PAUSED_DEVICE` | no state of its own | `OutputDevice.IsStarted` | A stopped device leaves its streams `PLAYING` (they keep their position); read `fa_device_is_started` |
+| (none) | `FA_STATE_SCHEDULED` | `Scheduled` | Waiting for `play_at`, a crossfade or a queue |
+
+### Appendix C: stream types (`BASS_CHANNELINFO.ctype`)
+
+`fa_stream_get_info` gives `codec` and `container` as short strings (`stream.Info.Codec`, `.Container`), not numbers: compare them as text. A numeric type does not exist because one stream can carry any codec in any container.
+
+| BASS_CTYPE_* | `codec` | `container` |
+|---|---|---|
+| `STREAM_WAV`, `_WAV_PCM`, `_WAV_FLOAT`, `_WAV` (ADPCM) | `pcm` (µ-law, A-law and ADPCM are decoded; the codec name says which) | `wav`, `aiff` |
+| `STREAM_AIFF` | `pcm` | `aiff` |
+| `STREAM_MP1`, `STREAM_MP2` | not supported (`FA_ERROR_UNSUPPORTED_FORMAT`): only Layer III plays | |
+| `STREAM_MP3` | `mp3` | `mp3` (also inside MP4, Matroska, ASF, CAF) |
+| `STREAM_OGG` | `vorbis` | `ogg` |
+| `STREAM_OPUS` | `opus` | `ogg`, `webm`, `matroska`, `mp4` |
+| `STREAM_FLAC`, `STREAM_FLAC_OGG` | `flac` | `flac`, `ogg`, `mp4`, `matroska` |
+| `STREAM_AAC`, `STREAM_MP4` | `aac` | `adts`, `mp4`, `mov`, `caf`, `matroska` |
+| `STREAM_ALAC` | `alac` | `mp4`, `mov`, `caf`, `matroska` |
+| `STREAM_AC3`, `STREAM_AC3`+E-AC-3 | `ac3`, `eac3` | `ac3`, `ec3`, `mp4`, `matroska` |
+| `STREAM_WMA`, `STREAM_WMA_MP3` | `wmav1`, `wmav2`, `wmapro`, `wmalossless`, `wmavoice`, `mp3` | `asf` |
+| `STREAM_WEBM`, `STREAM_MF` (Media Foundation) | the track's codec | `webm`, `matroska` |
+| `STREAM_CD` | `pcm` | `cd` (`Disc` tracks; `bits_per_sample` is 16) |
+| `MUSIC_MOD`, `_MTM`, `_S3M`, `_XM`, `_IT`, `_MO3` | the module type (`mod`, `s3m`, `xm`, `it`, ...) | `tracker` |
+| `MIDI` (`BASS_CTYPE_STREAM_MIDI`) | `midi` | `smf` or `rmid` |
+| `STREAM_HLS` | the segments' codec | `hls` |
+| `STREAM` (BASS_StreamCreate), `STREAM_RECORD` | `pcm` (push, callback, capture) | `raw` |
+| `BASS_CTYPE_SAMPLE` | `fa_sound` is not a stream: `fa_sound_get_info` | |
+| `BASS_CTYPE_MUSIC_*` flags (`BASS_MUSIC_*`) | see [Tracker music](#tracker-music) | |
+| `BASS_CTYPE_STREAM_ASF`, other plugin types | the container list at [streams](../features/streams.md#supported-formats), or `AudioEngine.SupportedFormats` | |
+
+### Appendix D: configuration (`BASS_SetConfig`)
+
+FatzAudio has no global option table. The few global settings are fields of `fa_engine_config` (set when the engine is created), and everything else is a per-stream or per-call option, which avoids one part of an app changing another's behaviour.
+
+| BASS_CONFIG_* | FatzAudio | .NET | Status |
+|---|---|---|---|
+| `BUFFER`, `UPDATEPERIOD`, `UPDATETHREADS`, `DEV_BUFFER`, `DEV_PERIOD`, `NET_*`, `SRC`, `SRC_SAMPLE` | see [Library and devices](#library-and-devices) | | ✅ |
+| `GVOL_SAMPLE` / `GVOL_STREAM` / `GVOL_MUSIC` (global volume per kind) | Put each kind on its own bus (`fa_bus_create`, `fa_stream_attach(s, device, bus)`) and set `fa_bus_set_param` | `bus.Volume` | ✅ |
+| `CURVE_VOL` / `CURVE_PAN` (squared volume, linear pan) | Not switchable: volume is linear gain and pan is equal-power. Convert your slider yourself, or ramp with a curve | `Curve.*` | ➖ (by design) |
+| `FLOATDSP` | Always on: the engine mixes in 32-bit float and DSP callbacks receive floats | | ✅ |
+| `3DALGORITHM` | 3D is not provided | | ➖ |
+| `PAUSE_NOPLAY` | Not needed: pause, stop and seek keep their own state | | ➖ |
+| `REC_BUFFER` | `fa_open_options.buffer_ms` on a capture stream | `StreamOptions.BufferLength` | ✅ |
+| `MUSIC_VIRTUAL` | Not needed: libopenmpt chooses its voices | | ➖ |
+| `VERIFY`, `VERIFY_NET` | `FA_OPEN_PRESCAN` for an MP3 whose length must be exact. Other formats are exact without it | `StreamOptions.Prescan` | ✅ |
+| `DEV_DEFAULT` | A `NULL` device id is the system default and follows it when it changes | `engine.OpenOutput()` | ✅ |
+| `DEV_NONSTOP` | Not needed: a device runs until `fa_device_stop` | | ➖ |
+| `HANDLES` | No limit; handles are pointers | | ➖ |
+| `ASYNCFILE_BUFFER` | Not needed: file reads are internal | | ➖ |
+| `OGG_PRESCAN` | Always exact | | ✅ |
+| `MF_VIDEO`, `MF_DISABLE` | Not needed: WMA and xHE-AAC use Media Foundation by themselves where it is available | | ➖ |
+| `LIBSSL`, `NET_AGENT`, `NET_PROXY` | No SSL library to load: HTTPS uses the system's stack. Agent and proxy: `fa_net_options.user_agent`, `.proxy` | `NetworkOptions` | ✅ |
+| `AIRPLAY`, `IOS_MIXAUDIO`, `IOS_SPEAKER`, `IOS_NOCATEGORY`, `IOS_NOTIFY` | Not provided: configure `AVAudioSession` in your app before opening a device | | ➖ |
+| `ANDROID_AAUDIO`, `ANDROID_SESSIONID` | Not provided: AAudio is used from Android 8.1, OpenSL ES before | | ➖ |
+| `ANDROID_JAVAVM` | `fa_android_set_java_vm` (only Java/Kotlin apps on Android 7 to 11 need it for HTTPS) | `AudioEngine.SetAndroidJavaVM` | ✅ |
+| `MP3_ERRORS`, `SPLIT_BUFFER`, `NORAMP`-style options | Not needed: bad MP3 frames are skipped (`FA_EVENT_DECODE_ERROR`), and starts and fades are explicit | | ➖ |
+
+### Appendix E: channel attributes (`BASS_ChannelSetAttribute`)
+
+| BASS_ATTRIB_* | FatzAudio | .NET | Status |
+|---|---|---|---|
+| `FREQ`, `VOL`, `PAN`, `BITRATE`, `TEMPO*`, `REVERSE_DIR`, `MUSIC_*`, `MIDI_*`, `OPUS_*` | see [Channel control](#channel-control), [bass_fx](#bass_fx-tempo-pitch-and-rate), [Tracker music](#tracker-music) and the add-on sections | | ✅ |
+| `EAXMIX` | EAX is not provided | | ➖ |
+| `NOBUFFER` | Not needed: the decode-ahead buffer is part of the design; shorten it with `buffer_ms` | `BufferLength` | ✅ |
+| `VBR` | `fa_stream_info.bitrate` is the average | `Info.Bitrate` | ✅ |
+| `CPU` | `fa_engine_get_stats` (the engine's load; there is no per-channel CPU figure) | `engine.GetStats()` | ✅ |
+| `NET_RESUME` | `fa_net_options.prebuffer_ms` | `NetworkOptions.Prebuffer` | ✅ |
+| `SCANINFO` | Not needed: no scan data to attach | | ➖ |
+| `NORAMP` | Not needed: starts are exact and the 5 ms glide on parameter changes cannot be switched off | | ➖ |
+| `BUFFER` (playback buffer length) | `fa_open_options.buffer_ms` | `StreamOptions.BufferLength` | ✅ |
+| `GRANULE` | Not needed | | ➖ |
+| `USER` | The `user` pointer of callbacks; in .NET, a field in your own class | | ➖ |
+| `TAIL` | Not provided: a stream ends at its end. MIDI lengths already include the decay of the last notes | | ➖ |
+| `PUSH_LIMIT` | `fa_stream_get_buffered`: hold back pushing while it is above your limit | `Buffered` | ✅ |
+| `DOWNLOADPROC` | `fa_net_options.download_proc`, `fa_stream_set_download_callback` | | ✅ |
+| `VOLDSP`, `VOLDSP_PRIORITY` | Normalization gain is separate from the stream volume and boosts up to +12 dB | | ✅ |
+
+### Appendix F: sync types (`BASS_ChannelSetSync`)
+
+Every sync is an event on the stream's one event callback. In .NET each is a normal C# event.
+
+| BASS_SYNC_* | `fa_event_type` | .NET event | Notes |
+|---|---|---|---|
+| `POS` | `FA_EVENT_POSITION` (`fa_stream_add_position_event`) | `PositionReached` | One-shot, frame exact |
+| `END` | `FA_EVENT_ENDED` | `Ended` | |
+| `SLIDE` | `FA_EVENT_RAMP_DONE` | `RampCompleted` | |
+| `STALL` | `FA_EVENT_STALLED`, `FA_EVENT_RESUMED` | `Stalled`, `Resumed` | |
+| `DOWNLOAD` | `fa_net_status.finished` | `NetworkStatus.Finished` | Polled, no event |
+| `FREE` | none | none | You close the stream; you know when |
+| `SETPOS` | none | none | A seek you call yourself; `RequestSeek` failing raises `FA_EVENT_SEEK_FAILED` |
+| `META` | `FA_EVENT_METADATA` | `MetadataChanged` | |
+| `OGG_CHANGE` | `FA_EVENT_METADATA` | `MetadataChanged` | The next link of a chained Ogg file |
+| `DEV_FAIL`, `DEV_FORMAT` | `FA_EVENT_DEVICE_CHANGED` | `DeviceChanged` | `value` 0: moved to the new default. 1: the device went away and the output was reopened |
+| `MUSICPOS`, `MUSICINST`, `MUSICFX` | `FA_EVENT_TRACKER_ROW`, `_INSTRUMENT`, `_SYNC` | `TrackerRowReached`, ... | See [Tracker music](#tracker-music) |
+| `MIDI_*` | `FA_EVENT_MIDI_TEXT` | `MidiTextReached` | Lyrics and text |
+| `MIXTIME` (flag) | not needed | | Callbacks never run on the audio thread. Sample-exact actions are scheduled instead |
+| `ONETIME` (flag) | position events are always one-shot | | |
+| `HLS_SEGMENT` | none | none | |
+| (new) | `FA_EVENT_LOOPED`, `_MARKER`, `_STARTED`, `_DECODE_ERROR`, `_LOUDNESS_FINAL`, `_SEEK_FAILED`, `_CDG_CHANGED` | | See [events](../features/events.md) |
+
+### Appendix G: positions (`BASS_POS_*`)
+
+Positions are frames (`fa_frames`), the same for every format, or nanoseconds (`fa_time`). There is no mode flag to choose.
+
+| BASS_POS_* | FatzAudio | Notes |
+|---|---|---|
+| `BYTE` | frames; multiply by the frame size if you need bytes | `fa_stream_get_position`, `fa_stream_seek` |
+| `MUSIC_ORDER` | `fa_stream_seek_tracker`, `fa_stream_get_tracker_position` | [Tracker music](#tracker-music) |
+| `OGG` | not needed | Ogg seeks are frame exact |
+| `RESET`, `RELATIVE`, `INEXACT`, `DECODE`, `DECODETO`, `SCAN` | not needed or by design | Seeks are exact by default; the position is always what was played; `fa_stream_read` decodes forward |
+| `END`, `LOOP` | `FA_MARKER_CUE_OUT`, `FA_MARKER_CUE_IN` | |
+| `MIDI_TICK` | not provided | MIDI positions are frames and time |
+| `FLUSH`, `FLUSHPOS` | `fa_stream_push_flush` | |
+
+### Appendix H: stream and sample flags (`BASS_STREAM_*`, `BASS_SAMPLE_*`, `BASS_MUSIC_*`)
+
+| Flag | FatzAudio | Notes |
+|---|---|---|
+| `BASS_SAMPLE_FLOAT` | always float internally | Pushed or decoded data can be any sample format |
+| `BASS_SAMPLE_8BITS`, `_MONO`, `_SOFTWARE`, `_VAM`, `_FX`, `_3D`, `_MUTEMAX` | not needed | Format and mixing are the engine's |
+| `BASS_SAMPLE_LOOP` | `FA_OPEN_LOOP`, `fa_stream_set_loop` | |
+| `BASS_SAMPLE_OVER_VOL`, `_OVER_POS`, `_OVER_DIST` | `fa_sound_options.steal` | [Samples](#samples-in-memory-sounds) |
+| `BASS_STREAM_DECODE` | `FA_OPEN_DECODE_ONLY` | |
+| `BASS_STREAM_PRESCAN` | `FA_OPEN_PRESCAN` | |
+| `BASS_STREAM_AUTOFREE` | not provided: close the stream in the `Ended` handler | |
+| `BASS_STREAM_RESTRATE` | not needed: downloads are paced by playback | |
+| `BASS_STREAM_BLOCK` | not needed: memory per web stream is bounded | |
+| `BASS_STREAM_STATUS` | `fa_stream_get_net_status` | |
+| `BASS_SPEAKER_*` | `fa_stream_set_matrix` | Channel routing |
+| `BASS_ASYNCFILE` | not needed | File reads are internal |
+| `BASS_UNICODE` | all paths are UTF-8 | In .NET pass a normal `string` |
+| `BASS_MUSIC_*` | see [Tracker music](#tracker-music) | |
+| `BASS_ORIGRES` | `fa_stream_info.bits_per_sample` reports it; samples are never truncated | |
+| `BASS_FX_FREESOURCE` | not needed: there is no wrapper stream | |
+
+### Appendix I: device flags (`BASS_Init`, `BASS_DEVICE_*`)
+
+| Flag | FatzAudio | Notes |
+|---|---|---|
+| `BASS_DEVICE_8BITS`, `_MONO`, `_STEREO`, `_3D`, `_LATENCY`, `_CPSPEAKERS`, `_SPEAKERS`, `_NOSPEAKER`, `_DMIX`, `_FREQ`, `_DSOUND`, `_SOFTWARE` | not needed | Output is float; the device's own rate and channels are used (`mix_sample_rate` overrides the rate) |
+| `BASS_DEVICE_REINIT` | automatic | A lost device is reopened on the default |
+| `BASS_DEVICE_LOOPBACK` | `FA_CAPTURE_LOOPBACK` | [Recording](#recording) |
+| `BASS_DEVICE_ENABLED`, `_DEFAULT`, `_INIT`, `_LOOPBACK`, `_TYPE_*` | `fa_device_info.is_default`, `.type` | `AudioDeviceInfo.IsDefault`, `.Kind` |
+| `BASS_DEVICE_AUDIOTRACK`, `_HIGHRES`, `_NOTHREAD` | not needed | |
+| `BASS_DEVICE_NOSPEAKER`, `BASS_DEVICE_DSOUND` | not needed | WASAPI, Core Audio, AAudio or ALSA/PulseAudio are chosen per platform |
+
+### Appendix J: tag types (`BASS_TAG_*`)
+
+| BASS_TAG_* | FatzAudio |
+|---|---|
+| `ID3`, `ID3V2`, `APE`, `MP4`, `RIFF_INFO`, `LYRICS3`, `OGG`, `VENDOR`, `COMMENT`, `FLAC_PICTURE`, `FLAC_CUE`, `MUSIC_*` | parsed for you into `fa_tags` (`FA_TAG_*` fields and every item with its format). See [Channel control](#channel-control), [bassflac](#bassflac) and [Tracker music](#tracker-music) |
+| `META`, `ICY`, `HTTP`, `HLS_*` | `fa_stream_get_metadata`, `fa_stream_get_http_header`, `fa_stream_get_net_status` |
+| `RIFF_BEXT`, `RIFF_CART`, `RIFF_DISP`, `RIFF_CUE`, `RIFF_SMPL` | `fa_tags_get_item` returns the RIFF INFO items; the broadcast-wave chunks are not parsed |
+| `WMA`, `WMA_META` | `fa_tags_*`: ASF content description and attributes are items with `FA_TAG_FORMAT_ASF` |
+| `MF` (Media Foundation) | same as `WMA` |
+| `WAVEFORMAT` | `fa_stream_get_info` (rate, channels, `bits_per_sample`, `codec`) |
+| `APE_BINARY`, `ID3V2` `APIC` | `fa_tags_get_cover`, `fa_tags_get_picture` |
+| `CA_CODEC` (Core Audio) | `Info.Codec` |
+
+### Appendix K: data and level flags (`BASS_ChannelGetData`, `GetLevelEx`)
+
+| Flag | FatzAudio |
+|---|---|
+| `BASS_DATA_AVAILABLE` | `fa_stream_get_buffered` (how much is queued or decoded ahead) |
+| `BASS_DATA_FLOAT` | `fa_stream_read` gives interleaved 32-bit float; convert it yourself for other sample formats |
+| `BASS_DATA_FIXED`, `BASS_DATA_NODELAY`, `BASS_DATA_END` | not needed |
+| `BASS_DATA_FFT256` ... `FFT32768`, `FFT_INDIVIDUAL`, `FFT_NOWINDOW`, `FFT_REMOVEDC`, `FFT_COMPLEX`, `FFT2048` ... | `fa_stream_get_spectrum`, [Levels and spectrum](#channel-control) |
+| `BASS_LEVEL_MONO`, `BASS_LEVEL_STEREO`, `BASS_LEVEL_RMS`, `BASS_LEVEL_VOLPAN` | `fa_stream_get_levels(stream, window, peak, rms, channels)`: peak and RMS together |
+
+### Appendix L: the generic effect API
+
+BASS can attach any of its DX8 effects or a bass_fx effect to a channel with `BASS_ChannelSetFX`. FatzAudio has no effect chain of handles. What an app of this kind uses is built in as a feature of its own, and anything else is a DSP callback.
+
+| BASS | FatzAudio (C) | FatzAudio (.NET) | Status |
+|---|---|---|---|
+| `BASS_ChannelSetFX`, `BASS_ChannelRemoveFX`, `BASS_FXFree` | No FX handles. The equalizer is `fa_stream_set_eq`; a DJ deck's isolator and the mic reverb and echo are part of the [DJ mixer](../features/dj-mixer.md); your own effect is `fa_stream_add_dsp` / `fa_stream_remove_dsp` | `SetEqualizer`, `AddDsp` | ✅ for those, ➖ for the rest |
+| `BASS_FXGetParameters`, `BASS_FXSetParameters` | The setter of the feature (`fa_stream_set_eq`, `fa_mixer_set_mic_effects`) and its getter | | ✅ |
+| `BASS_FXSetPriority` | `fa_stream_add_dsp(..., priority)`: higher runs first | `AddDsp(..., priority)` | ✅ |
+| `BASS_FXReset` | Not needed: state is cleared on seeks and restarts | | ➖ |
+| DX8 `CHORUS`, `COMPRESSOR`, `DISTORTION`, `ECHO`, `FLANGER`, `GARGLE`, `I3DL2REVERB`, `PARAMEQ`, `REVERB` | Only `PARAMEQ` has a counterpart (the equalizer). The rest are not built in: write them as a DSP callback | | ➖ (by design) |
+| bass_fx `BFX_*`: `ROTATE`, `ECHO`, `FLANGER`, `VOLUME`, `PEAKEQ`, `REVERB`, `LPF`, `MIX`, `DAMP`, `AUTOWAH`, `ECHO2`, `PHASER`, `ECHO3`, `CHORUS`, `APF`, `COMPRESSOR`, `DISTORTION`, `COMPRESSOR2`, `VOLUME_ENV`, `BQF` | `PEAKEQ`, `BQF` filters: the equalizer's bands (peak and shelf). `DAMP`, `COMPRESSOR2`: normalization and the limiter. `VOLUME`, `VOLUME_ENV`: volume and [ramps](../features/ramps.md). `MIX`: the channel matrix `fa_stream_set_matrix`. `PITCHSHIFT`: `FA_PARAM_PITCH`. `REVERB` and `ECHO*` on a mic: the mixer's mic effects. The others are not built in | | ✅ for those named, ➖ for the rest |
+| `BASS_ChannelSetDSPEx` | `fa_stream_add_dsp` (the callback gets the sample rate) | `AddDsp` | ✅ |
+| `BASS_ChannelRemoveDSP`, `BASS_ChannelRemoveLink` | `fa_stream_remove_dsp`; links are not needed (see `BASS_ChannelSetLink`) | dispose the handle `AddDsp` returned | ✅ / ➖ |
+
+### Appendix M: bass_fx, bassmidi, bass_aac, basscd and basswebm leftovers
+
+| BASS / add-on | FatzAudio | Status |
+|---|---|---|
+| bass_fx `BASS_FX_BPM_CallbackSet`, `BASS_FX_BPM_BeatCallbackSet`, `BASS_FX_BPM_BeatCallbackReset`, `BASS_FX_BPM_BeatGetPositions` (real-time beat callbacks) | No live beat detection. Analyse the file with `fa_analyze_path` / `fa_analyze_stream` for the beat grid, then use position events or `fa_stream_get_clock` against the grid. A live stream cannot be analysed twice | ➖ (by design) |
+| bass_fx `BASS_FX_BPM_*` flags: `BASS_FX_BPM_BKGRND`, `BASS_FX_BPM_MULT2`, `BASS_FX_FREESOURCE`, `BASS_FX_BPM_BEATFXD` | `FA_ANALYZE_BEATS` runs in a worker; the grid's `bpm` can be halved or doubled with `fa_stream_set_beat_grid`; there is no source to free | ✅ / ➖ |
+| bass_fx `BASS_FX_Version`, `BASS_FX_GetVersion` | `fa_version` | ✅ |
+| bass_fx `BASS_FX_TempoGetRateRatio`, `BASS_FX_TempoCreate` flags | see [bass_fx tempo, pitch and rate](#bass_fx-tempo-pitch-and-rate) | ✅ |
+| bassmidi `BASS_CONFIG_MIDI_COMPACT`, `_VOICES`, `_AUTOFONT`, `_IN_PORTS`, `_DEFFONT`, `_SINCINTER` | `COMPACT`, `AUTOFONT`, `SINCINTER`: not needed (the bank loads at open, the synthesizer interpolates itself). `VOICES`: fixed at 256. `DEFFONT`: `fa_engine_set_soundfont`. `IN_PORTS`: MIDI input is not provided | ➖ |
+| bassmidi `BASS_MIDI_FONT_MEM`, `_MMAP`, `_NOLIMIT`, `_PACK`, `_XGDRUMS`, `_NOFX`, `_LINATTMOD`, `_LINDECVOL`, `_NORAMPIN`, `_SBLIMIT` | `MEM`: `fa_soundfont_open_memory`. The rest are synthesizer quirks of BASSMIDI that are not switchable here | ✅ / ➖ |
+| bassmidi `BASS_MIDI_ASYNC`, `_DECAYEND`, `_DECAYSEEK`, `_FILTER`, `_NOCROP`, `_NOSYSRESET`, `_SINCINTER`, `_NOTEOFF1`, `_NONFIXED` | See [bassmidi](#bassmidi-midi-files-and-soundfonts): decay at the end is always on; the others are not switchable | ✅ / ➖ |
+| bassmidi `MIDI_EVENT_*` types | The `MIDI_EVENT_*` event types are covered one by one in [bassmidi](#bassmidi-midi-files-and-soundfonts) (controllers as `FA_MIDI_EVENT_CONTROL`, notes, programs, bend, pressure, SysEx) | ✅ |
+| bass_aac `BASS_AAC_*` flags (`BASS_AAC_FRAME960`, `BASS_AAC_STEREO`, `BASS_MP4_VIDEO`), `BASS_CTYPE_STREAM_AAC`, `BASS_CTYPE_STREAM_MP4` | Frame length and stereo down-mix: not needed (detected, and up to 7.1 plays). Video tracks are never read. Stream types: [Appendix C](#appendix-c-stream-types-bass_channelinfoctype) | ✅ |
+| bass_aac `BASS_AAC_*` tags, `BASS_TAG_MP4` | [Appendix J](#appendix-j-tag-types-bass_tag_) | ✅ |
+| basscd `BASS_CD_FLAG_*` (`READ_ERRORS`, `C2`, `SUBCHANNEL`), `BASS_CD_RIP`, `BASS_CD_SUBCHANNEL`, `BASS_CD_SUBCHANNEL_NOHW`, `BASS_CD_C2ERRORS` | `FA_DISC_NO_C2`, `FA_DISC_NO_CDG`; sector errors play as silence and raise `FA_EVENT_DECODE_ERROR`. Ripping is `FA_OPEN_DECODE_ONLY` with `fa_stream_read` | ✅ |
+| basscd `BASS_CD_DOOR_OPEN`, `_CLOSE`, `_LOCK`, `_UNLOCK` | `fa_disc_eject`, `fa_disc_load`, `fa_disc_set_locked` | ✅ |
+| basswebm `BASS_WEBM_StreamCreateFile`, `BASS_WEBM_StreamCreateURL`, `BASS_WEBM_StreamCreateFileUser`, `BASS_WEBM_StreamCreate` flags, `BASS_WEBM_Init` | The ordinary open calls; `audio_track` picks the track. Video tracks are never read | ✅ |
+| basswebm `BASS_ATTRIB_WEBM_*` | not provided | ➖ |
+
+### Appendix N: functions not named in the tables above
+
+Every other export of bass.dll 2.4.18, so none is missing from this guide:
+
+| BASS function | FatzAudio | Status |
+|---|---|---|
+| `BASS_GetConfig`, `BASS_GetConfigPtr`, `BASS_SetConfigPtr` | [Appendix D](#appendix-d-configuration-bass_setconfig) | ➖ (by design) |
+| `BASS_ChannelGetAttributeEx`, `BASS_ChannelSetAttributeEx` | Typed getters instead: `fa_stream_get_param`, `fa_stream_get_tracker_info`, ... | ➖ (by design) |
+| `BASS_ChannelGetDevice` | `stream.Device` (.NET); in C, you passed the device to `fa_stream_attach` | ✅ |
+| `BASS_ChannelRemoveDSP`, `BASS_ChannelSetDSPEx` | `fa_stream_remove_dsp`, `fa_stream_add_dsp` | ✅ |
+| `BASS_ChannelRemoveFX`, `BASS_FXFree`, `BASS_FXGetParameters`, `BASS_FXSetPriority` | [Appendix L](#appendix-l-the-generic-effect-api) | ➖ (by design) |
+| `BASS_ChannelRemoveLink` | Not needed: see `BASS_ChannelSetLink` | ➖ (by design) |
+| `BASS_Set3DFactors`, `BASS_Get3DFactors`, `BASS_Set3DPosition`, `BASS_Get3DPosition`, `BASS_Apply3D`, `BASS_ChannelSet3DAttributes`, `BASS_ChannelSet3DPosition` | 3D is not provided (a possible future update, not needed for release) | ➖ |
+| `BASS_GetEAXParameters` | Not provided: hardware EAX no longer exists | ➖ |
+| `BASS_PluginEnable`, `BASS_PluginFree` | Not needed: there are no plugins | ➖ (by design) |
+| `BASS_RecordGetInfo` | `fa_device_get_info(FA_DEVICE_CAPTURE)` (native rate and channels) | ✅ |
+| `BASS_RecordGetInputName`, `BASS_RecordSetInput`, `BASS_RecordSetDevice` | Not provided (old mixer lines); each capture stream opens its own input | ➖ |
