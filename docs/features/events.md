@@ -21,7 +21,7 @@ Each stream has one event callback. The audio thread queues events without locki
 | `FA_EVENT_TRACKER_ROW` | the row's first frame | `order << 16 \| row` | ✅ tracker modules with `FA_TRACKER_ROW_EVENTS` on; raised as the audio is mixed, like markers ([trackers](trackers.md#row-events)) |
 | `FA_EVENT_TRACKER_INSTRUMENT` | the row's first frame | `channel << 16 \| instrument` (0-based) | ✅ tracker modules with `FA_TRACKER_CELL_EVENTS` bit 1 ([trackers](trackers.md#instrument-and-sync-events)) |
 | `FA_EVENT_TRACKER_SYNC` | the row's first frame | `channel << 16 \| Zxx parameter` | ✅ tracker modules with `FA_TRACKER_CELL_EVENTS` bit 2 |
-| `FA_EVENT_SEEK_FAILED` | the target of `fa_stream_seek_async` that was not reached | the `fa_result` | ✅ a worker could not seek there (a web server refusing the range); playback goes on where it was ([seek cost](playback.md#what-a-seek-costs)) |
+| `FA_EVENT_SEEK_FAILED` | the target of `fa_stream_seek_async` that was not reached | the `fa_result` | ✅ a worker could not seek there (a web server refusing the range); playback goes on where it was (.NET `SeekFailed`, `e.Error`; `DecodeError` carries `e.Error` too) ([seek cost](playback.md#what-a-seek-costs)) |
 
 ## C
 

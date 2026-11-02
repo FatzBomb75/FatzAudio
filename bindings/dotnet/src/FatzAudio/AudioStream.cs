@@ -7,13 +7,20 @@ namespace FatzAudio;
 /// <summary>Event data for stream events that carry a position (position reached, marker, device change).</summary>
 public sealed class StreamEventArgs : EventArgs
 {
-    internal StreamEventArgs(TimeSpan position, long frame, long value, MarkerKind? marker = null)
+    internal StreamEventArgs(TimeSpan position, long frame, long value, MarkerKind? marker = null, ErrorCode? error = null)
     {
         Position = position;
         Frame = frame;
         Value = value;
         Marker = marker;
+        Error = error;
     }
+
+    /// <summary>
+    /// For <see cref="AudioStream.SeekFailed"/> and <see cref="AudioStream.DecodeError"/>: why (the same number as
+    /// <see cref="Value"/>, as an <see cref="ErrorCode"/>); otherwise null.
+    /// </summary>
+    public ErrorCode? Error { get; }
 
     /// <summary>For <see cref="AudioStream.MarkerReached"/>: which marker was passed; otherwise null.</summary>
     public MarkerKind? Marker { get; }
@@ -338,6 +345,8 @@ public unsafe partial class AudioStream : IDisposable
             // never throw across the native boundary
         }
     }
+
+    private static ErrorCode? ToError(long value) => value is < 0 and >= int.MinValue ? (ErrorCode)(int)value : null;
 
     internal TimeSpan FramesToTime(long frames) => TimeConvert.FromFrames(frames, _sampleRate);
     internal long TimeToFrames(TimeSpan time) => TimeConvert.ToFrames(time, _sampleRate);
@@ -1711,6 +1720,26 @@ public unsafe partial class AudioStream : IDisposable
     }
 
     /// <summary>
+    /// <see cref="CrossfadeTo"/> with a token: cancelling stops the wait (the task is cancelled) but not the fade,
+    /// which has already started and runs to its end.
+    /// </summary>
+    /// <param name="next">The stream to fade in.</param>
+    /// <param name="duration">Length of the crossfade.</param>
+    /// <param name="curve">Fade shape; defaults to <see cref="Curve.EqualPower"/>.</param>
+    /// <param name="cancellationToken">Stops waiting for the fade to finish.</param>
+    /// <returns>A task that completes when the crossfade is done.</returns>
+    /// <exception cref="OperationCanceledException">The token was cancelled (before the fade began, it does not begin).</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="next"/> is null.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="duration"/> is negative.</exception>
+    /// <exception cref="InvalidOperationException">This stream is not attached to a device.</exception>
+    /// <exception cref="FatzAudioException"><paramref name="next"/> plays on another device (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    public Task CrossfadeToAsync(AudioStream next, TimeSpan duration, Curve? curve = null, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return CrossfadeTo(next, duration, curve).WaitAsync(cancellationToken);
+    }
+
+    /// <summary>
     /// Queues <paramref name="next"/> to start automatically, to the exact frame, when this stream reaches its
     /// mix point: <see cref="StreamMarkers.MixPoint"/> if set; else <paramref name="crossfade"/> before its end;
     /// else right after its last frame (gapless). With a crossfade, this stream fades out over it (and ends) unless
@@ -2127,8 +2156,8 @@ public unsafe partial class AudioStream : IDisposable
     public event EventHandler? Stalled;
     /// <summary>Raised when playback resumes after a stall. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? Resumed;
-    /// <summary>Raised when a recoverable decode error occurred (data skipped, playback continues). Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
-    public event EventHandler? DecodeError;
+    /// <summary>Raised when a recoverable decode error occurred (data skipped, playback continues). <see cref="StreamEventArgs.Position"/> is where, <see cref="StreamEventArgs.Error"/> why. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
+    public event EventHandler<StreamEventArgs>? DecodeError;
     /// <summary>Raised when the stream's final loudness is known (from tags, the cache or a scan); <see cref="GetLoudness"/> then returns it. Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
     public event EventHandler? LoudnessFinal;
     /// <summary>Raised when a position requested with <see cref="AddPositionEvent"/> is reached (<see cref="StreamEventArgs.Frame"/> is that position, in frames). Raised on the engine's event thread (never the audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.</summary>
@@ -2194,7 +2223,7 @@ public unsafe partial class AudioStream : IDisposable
     /// <summary>
     /// Raised when a <see cref="RequestSeek(TimeSpan)"/> could not be carried out (for example a web server refusing
     /// the range); playback goes on where it was. <see cref="StreamEventArgs.Position"/> is the target and
-    /// <see cref="StreamEventArgs.Value"/> the <see cref="ErrorCode"/>. Raised on the engine's event thread (never the
+    /// <see cref="StreamEventArgs.Error"/> (also <see cref="StreamEventArgs.Value"/>) the <see cref="ErrorCode"/>. Raised on the engine's event thread (never the
     /// audio thread); handlers may call any FatzAudio method but should return quickly, since they delay later events.
     /// </summary>
     public event EventHandler<StreamEventArgs>? SeekFailed;
@@ -2272,10 +2301,10 @@ public unsafe partial class AudioStream : IDisposable
         {
             switch (type)
             {
-                case 0: Ended?.Invoke(this, EventArgs.Empty); break;
-                case 1: PositionReached?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
-                case 2: MarkerReached?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value, (MarkerKind)value)); break;
-                case 3:
+                case NativeConstants.EventEnded: Ended?.Invoke(this, EventArgs.Empty); break;
+                case NativeConstants.EventPosition: PositionReached?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
+                case NativeConstants.EventMarker: MarkerReached?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value, (MarkerKind)value)); break;
+                case NativeConstants.EventMetadata:
                     if (MetadataChanged is { } onMeta)
                     {
                         // A newer title was heard before this event was delivered (a fast
@@ -2284,34 +2313,34 @@ public unsafe partial class AudioStream : IDisposable
                         if (md.Sequence <= value) onMeta(this, new MetadataChangedEventArgs(md, FramesToTime(frame), frame));
                     }
                     break;
-                case 4: Stalled?.Invoke(this, EventArgs.Empty); break;
-                case 5: Resumed?.Invoke(this, EventArgs.Empty); break;
-                case 6: DecodeError?.Invoke(this, EventArgs.Empty); break;
-                case 7: DeviceChanged?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
-                case 8: LoudnessFinal?.Invoke(this, EventArgs.Empty); break;
-                case 9:
+                case NativeConstants.EventStalled: Stalled?.Invoke(this, EventArgs.Empty); break;
+                case NativeConstants.EventResumed: Resumed?.Invoke(this, EventArgs.Empty); break;
+                case NativeConstants.EventDecodeError: DecodeError?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value, error: ToError(value))); break;
+                case NativeConstants.EventDeviceChanged: DeviceChanged?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
+                case NativeConstants.EventLoudnessFinal: LoudnessFinal?.Invoke(this, EventArgs.Empty); break;
+                case NativeConstants.EventRampDone:
                     CompleteRamp(value);
                     RampCompleted?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value));
                     break;
-                case 10: Started?.Invoke(this, EventArgs.Empty); break;
-                case 11:
+                case NativeConstants.EventStarted: Started?.Invoke(this, EventArgs.Empty); break;
+                case NativeConstants.EventMidiText:
                     if (MidiTextReached is { } onText) onText(this, new MidiTextEventArgs(GetMidiText((int)value)));
                     break;
-                case 12: Looped?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
-                case 13:
+                case NativeConstants.EventLooped: Looped?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
+                case NativeConstants.EventCdgChanged:
                     _cdgChanged?.Invoke(this, new CdgChangedEventArgs(
                         new CdgRect((int)(value & 0xFFF), (int)((value >> 12) & 0xFFF), (int)((value >> 24) & 0xFFF), (int)((value >> 36) & 0xFFF)),
                         ((value >> 48) & 1) != 0, frame));
                     break;
-                case 14: SeekFailed?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value)); break;
-                case 15:
+                case NativeConstants.EventSeekFailed: SeekFailed?.Invoke(this, new StreamEventArgs(FramesToTime(frame), frame, value, error: ToError(value))); break;
+                case NativeConstants.EventTrackerRow:
                     TrackerRowReached?.Invoke(this, new TrackerRowEventArgs(
                         new TrackerPosition((int)((value >> 16) & 0xFFFF), (int)(value & 0xFFFF)), FramesToTime(frame), frame));
                     break;
-                case 21:
+                case NativeConstants.EventTrackerInstrument:
                     TrackerInstrumentPlayed?.Invoke(this, new TrackerCellEventArgs((int)((value >> 16) & 0xFFFF), (int)(value & 0xFFFF), FramesToTime(frame), frame));
                     break;
-                case 22:
+                case NativeConstants.EventTrackerSync:
                     TrackerSyncReached?.Invoke(this, new TrackerCellEventArgs((int)((value >> 16) & 0xFFFF), (int)(value & 0xFFFF), FramesToTime(frame), frame));
                     break;
             }

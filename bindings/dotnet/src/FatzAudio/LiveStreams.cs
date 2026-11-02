@@ -14,6 +14,13 @@ namespace FatzAudio;
 /// </returns>
 public delegate int AudioCallback(Span<float> buffer);
 
+/// <summary>
+/// Fills a callback stream made for any sample format (<see cref="AudioEngine.OpenCallback(AudioFormat, RawAudioCallback, StreamOptions?)"/>).
+/// </summary>
+/// <param name="buffer">Room for some frames, in the stream's format (<c>buffer.Length / frame size</c> of them). Write from the start.</param>
+/// <returns>The frames written; the same rules as <see cref="AudioCallback"/>.</returns>
+public delegate int RawAudioCallback(Span<byte> buffer);
+
 /// <summary>Settings of an input opened as a stream (<see cref="AudioEngine.OpenCapture"/>).</summary>
 public sealed class CaptureOptions
 {
@@ -88,13 +95,20 @@ public readonly record struct LoudnessMeter(double Momentary, double ShortTerm);
 /// <summary>Bridges a managed <see cref="AudioCallback"/> to the native fa_stream_proc.</summary>
 internal sealed unsafe class CallbackState
 {
-    private readonly AudioCallback _fill;
-    private readonly int _channels;
+    private readonly AudioCallback? _fill;
+    private readonly RawAudioCallback? _raw;
+    private readonly int _unit;   // floats per frame (channels), or bytes per frame for a raw callback
 
     public CallbackState(AudioCallback fill, int channels)
     {
         _fill = fill;
-        _channels = channels;
+        _unit = channels;
+    }
+
+    public CallbackState(RawAudioCallback raw, int frameBytes)
+    {
+        _raw = raw;
+        _unit = frameBytes;
     }
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
@@ -103,7 +117,9 @@ internal sealed unsafe class CallbackState
         try
         {
             if (GCHandle.FromIntPtr((nint)user).Target is not CallbackState s) return AudioEngine.EndOfStream;
-            int n = s._fill(new Span<float>(buffer, checked((int)(frames * s._channels))));
+            int n = s._fill is { } f
+                ? f(new Span<float>(buffer, checked((int)(frames * s._unit))))
+                : s._raw!(new Span<byte>(buffer, checked((int)(frames * s._unit))));
             return n < 0 ? AudioEngine.EndOfStream : Math.Min(n, frames);
         }
         catch

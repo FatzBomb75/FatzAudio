@@ -39,6 +39,12 @@ public readonly record struct MidiEvent(MidiEventType Type, int Channel, int Par
     /// <summary>The frame of an event to play at once: at the next frames the synth renders.</summary>
     public const long Now = -1;
 
+    /// <summary>The frame of a time, at <paramref name="sampleRate"/> (the rate set in <see cref="MidiStreamOptions.SampleRate"/>).</summary>
+    public static long FrameAt(TimeSpan time, int sampleRate) => TimeConvert.ToFrames(time, sampleRate);
+
+    /// <summary>The time of <see cref="Frame"/> at <paramref name="sampleRate"/>; <see cref="Now"/> is zero.</summary>
+    public TimeSpan TimeAt(int sampleRate) => Frame == Now ? TimeSpan.Zero : TimeConvert.FromFrames(Frame, sampleRate);
+
     /// <summary>Read from a file: the track (MTrk chunk), 0-based. For <see cref="AudioEngine.OpenMidiEvents"/>: the
     /// track whose volume applies (<see cref="AudioStream.SetMidiTrackVolume"/>). Ignored when sent.</summary>
     public int Track { get; init; }
@@ -179,6 +185,27 @@ public sealed partial class AudioEngine
         return AudioStream.Wrap(this, NativeMethods.fa_stream_open_midi(h, &mo, opts.Pointer, out nint s), s, null);
     }
 
+    /// <summary><see cref="OpenMidi"/> on a worker thread (loading a big soundfont can take a moment).</summary>
+    /// <param name="midi">The rate and effects; null for the defaults.</param>
+    /// <param name="options">Optional open options.</param>
+    /// <param name="cancellationToken">Cancels the open; no stream is made.</param>
+    public Task<AudioStream> OpenMidiAsync(MidiStreamOptions? midi = null, StreamOptions? options = null,
+        CancellationToken cancellationToken = default) =>
+        OpenAsync(o => OpenMidi(midi, o), options, cancellationToken);
+
+    /// <summary><see cref="OpenMidiEvents"/> on a worker thread.</summary>
+    /// <param name="events">The events.</param>
+    /// <param name="midi">The rate; null for the defaults.</param>
+    /// <param name="options">Optional open options.</param>
+    /// <param name="cancellationToken">Cancels the open; no stream is made.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="events"/> is null.</exception>
+    public Task<AudioStream> OpenMidiEventsAsync(IReadOnlyList<MidiEvent> events, MidiStreamOptions? midi = null,
+        StreamOptions? options = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(events);
+        return OpenAsync(o => OpenMidiEvents(events, midi, o), options, cancellationToken);
+    }
+
     /// <summary>
     /// Opens a MIDI stream that plays a list of events as a MIDI file would (BASS_MIDI_StreamCreateEvents): seekable,
     /// its length measured as a file's (until the last events' sound has died away). Frames count at <see cref="MidiStreamOptions.SampleRate"/> (set it to
@@ -234,6 +261,27 @@ public unsafe partial class AudioStream
         FatzAudioException.ThrowIfFailed(r);
         return true;
     }
+
+    /// <summary>
+    /// <see cref="SendMidi(ReadOnlySpan{MidiEvent})"/> that never throws for a refused send (a keyboard handler or an
+    /// audio-adjacent thread has no use for an exception): the result says what happened.
+    /// </summary>
+    /// <param name="events">The events.</param>
+    /// <param name="error">Null when sent; <see cref="ErrorCode.Busy"/> when the queue has no room (nothing was sent);
+    /// otherwise why not (not a MIDI stream, an event out of range, too many events).</param>
+    /// <returns>True if all were sent.</returns>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    public bool TrySendMidi(ReadOnlySpan<MidiEvent> events, out ErrorCode? error)
+    {
+        using var native = NativeMidiEvents.Create(events, withTracks: false);
+        int r = NativeMethods.fa_stream_send_midi_events(Handle, native.Pointer, (uint)events.Length);
+        error = r == 0 ? null : (ErrorCode)r;
+        return r == 0;
+    }
+
+    /// <summary><see cref="TrySendMidi(ReadOnlySpan{MidiEvent}, out ErrorCode?)"/> for one event.</summary>
+    public bool TrySendMidi(in MidiEvent midiEvent, out ErrorCode? error) =>
+        TrySendMidi(new ReadOnlySpan<MidiEvent>(in midiEvent), out error);
 
     /// <summary>
     /// MIDI streams: sends MIDI bytes as a device or a file's track gives them (BASS_MIDI_EVENTS_RAW): status bytes

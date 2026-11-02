@@ -182,6 +182,11 @@ public enum CueAlign
 /// <param name="Out">The frame it turns back at.</param>
 public readonly record struct DeckLoop(long In, long Out);
 
+/// <summary>A deck loop between two source times (<see cref="DjDeck.LoopTime"/>).</summary>
+/// <param name="In">Where the loop starts.</param>
+/// <param name="Out">Where it turns back.</param>
+public readonly record struct DeckLoopTime(TimeSpan In, TimeSpan Out);
+
 /// <summary>
 /// A DJ mixer: decks on one output device, each with a channel fader, a trim, an isolator EQ with kills and a meter,
 /// a crossfader between them, a master gain and a limiter that is always on, plus a headphone cue.
@@ -417,6 +422,9 @@ public sealed partial class DjMixer : IDisposable
     /// the measured time for that mic and mode (<see cref="Mic.MonitorLatency"/>, the vocals' recording alignment).
     /// Keep the mic until the task completes.
     /// </summary>
+    /// <param name="cancellationToken">Cancels a check that has not begun. Once the test sounds play it runs to its end
+    /// (the mixer must go back to its own mode), and so the token is then ignored.</param>
+    /// <exception cref="OperationCanceledException">The token was cancelled before the check began.</exception>
     /// <exception cref="ArgumentException"><paramref name="mic"/> is another mixer's.</exception>
     /// <exception cref="FatzAudioException"><see cref="ErrorCode.Busy"/> while another check runs;
     /// <see cref="ErrorCode.Device"/> when only the mixer's own mode is measured and its output isn't running, or when
@@ -432,12 +440,13 @@ public sealed partial class DjMixer : IDisposable
     /// }
     /// </code>
     /// </example>
-    public Task<LatencyCheck> MeasureLatencyAsync(Mic mic, LatencyCheckOptions? options = null)
+    public Task<LatencyCheck> MeasureLatencyAsync(Mic mic, LatencyCheckOptions? options = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(mic);
         if (mic.Mixer != this) throw new ArgumentException("The mic is another mixer's.", nameof(mic));
         options ??= new LatencyCheckOptions();
-        return Task.Run(() => MeasureLatency(mic, options));
+        // A check that has begun cannot be stopped half way (the mixer must go back to its own mode), so the token only counts before it begins.
+        return Task.Run(() => MeasureLatency(mic, options), cancellationToken);
     }
 
     private unsafe LatencyCheck MeasureLatency(Mic mic, LatencyCheckOptions options)
@@ -932,6 +941,20 @@ public sealed partial class DjDeck
         }
     }
 
+    /// <summary>
+    /// <see cref="CuePoint"/> as a time in the stream's own sample rate; null when the deck is empty. Setting null
+    /// restores the default.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Set on an empty deck.</exception>
+    public TimeSpan? CuePointTime
+    {
+        get => CuePoint is { } f && Stream is { } s ? s.FramesToTime(f) : null;
+        set => CuePoint = value is { } t ? RequireStream().TimeToFrames(t) : null;
+    }
+
+    private AudioStream RequireStream() =>
+        Stream ?? throw new InvalidOperationException("The deck is empty: load a stream first.");
+
     /// <summary>The CDJ cue button: pauses the deck and goes back to the <see cref="CuePoint"/>.</summary>
     /// <exception cref="FatzAudioException"><see cref="ErrorCode.NotFound"/> when the deck is empty.</exception>
     public void ReturnToCuePoint()
@@ -962,6 +985,20 @@ public sealed partial class DjDeck
             if (value is { } v && (v.In < 0 || v.Out <= v.In)) throw new ArgumentOutOfRangeException(nameof(value), "Out must be after In.");
             using var _ = _mixer.Lease();
             FatzAudioException.ThrowIfFailed(NativeMethods.fa_deck_set_loop(_deck, value?.In ?? 0, value?.Out ?? 0));
+        }
+    }
+
+    /// <summary><see cref="Loop"/> in time, in the stream's own sample rate; null when off.</summary>
+    /// <exception cref="InvalidOperationException">Set on an empty deck.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">Out is not after In.</exception>
+    public DeckLoopTime? LoopTime
+    {
+        get => Loop is { } l && Stream is { } s ? new DeckLoopTime(s.FramesToTime(l.In), s.FramesToTime(l.Out)) : null;
+        set
+        {
+            if (value is not { } v) { Loop = null; return; }
+            var s = RequireStream();
+            Loop = new DeckLoop(s.TimeToFrames(v.In), s.TimeToFrames(v.Out));
         }
     }
 
@@ -999,6 +1036,9 @@ public sealed partial class DjDeck
             return frame < 0 ? null : frame;   // FA_FRAMES_UNSET
         }
     }
+
+    /// <summary><see cref="SlipPosition"/> as a time in the stream's own sample rate.</summary>
+    public TimeSpan? SlipPositionTime => SlipPosition is { } f && Stream is { } s ? s.FramesToTime(f) : null;
 
     /// <summary>
     /// Ends a running <see cref="Slip"/> now: the reverse and the deck loop end too, and the deck joins to where it

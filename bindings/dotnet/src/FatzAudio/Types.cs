@@ -520,6 +520,24 @@ public sealed record AudioEngineOptions
 /// <param name="MimeTypes">MIME types of the format.</param>
 public sealed record AudioFormatInfo(string Name, string Description, IReadOnlyList<string> Extensions, IReadOnlyList<string> MimeTypes);
 
+internal static class SampleFormatSize
+{
+    /// <summary>Bytes of one frame; throws for planar formats (the interleaved entry points do not take them).</summary>
+    public static int FrameBytes(this AudioFormat f)
+    {
+        int sample = f.SampleFormat switch
+        {
+            SampleFormat.Float32 or SampleFormat.Int32 => 4,
+            SampleFormat.Int16 => 2,
+            SampleFormat.Int24 => 3,
+            SampleFormat.UInt8 => 1,
+            SampleFormat.Float64 => 8,
+            _ => throw new ArgumentException("Planar formats are not allowed here.", nameof(f)),
+        };
+        return sample * Math.Clamp(f.Channels, 1, 32);   // the native call rejects a bad count
+    }
+}
+
 internal static class TimeConvert
 {
     public static TimeSpan FromNanoseconds(long ns) => TimeSpan.FromTicks(ns / 100);

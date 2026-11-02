@@ -31,15 +31,15 @@ public sealed class Curve : IEquatable<Curve>
     }
 
     /// <summary>Straight line from start to target.</summary>
-    public static Curve Linear { get; } = new(0);
+    public static Curve Linear { get; } = new(NativeConstants.CurveLinear);
     /// <summary>Equal-power curve; keeps perceived loudness constant while crossfading.</summary>
-    public static Curve EqualPower { get; } = new(1);
+    public static Curve EqualPower { get; } = new(NativeConstants.CurveEqualPower);
     /// <summary>Logarithmic curve (fast start, slow finish).</summary>
-    public static Curve Logarithmic { get; } = new(2);
+    public static Curve Logarithmic { get; } = new(NativeConstants.CurveLog);
     /// <summary>Exponential curve (slow start, fast finish).</summary>
-    public static Curve Exponential { get; } = new(3);
+    public static Curve Exponential { get; } = new(NativeConstants.CurveExp);
     /// <summary>Smooth S-shaped curve.</summary>
-    public static Curve SCurve { get; } = new(4);
+    public static Curve SCurve { get; } = new(NativeConstants.CurveSCurve);
 
     /// <summary>A CSS <c>cubic-bezier(x1, y1, x2, y2)</c> style curve.</summary>
     /// <param name="x1">X of the first control point (0..1).</param>
@@ -52,7 +52,7 @@ public sealed class Curve : IEquatable<Curve>
     {
         if (x1 < 0 || x1 > 1) throw new ArgumentOutOfRangeException(nameof(x1), "x1 must be within 0..1.");
         if (x2 < 0 || x2 > 1) throw new ArgumentOutOfRangeException(nameof(x2), "x2 must be within 0..1.");
-        return new Curve(5, x1, y1, x2, y2);
+        return new Curve(NativeConstants.CurveBezier, x1, y1, x2, y2);
     }
 
     /// <summary>
@@ -79,7 +79,7 @@ public sealed class Curve : IEquatable<Curve>
             if (!float.IsFinite(values[i])) throw new ArgumentException("Curve values must be finite numbers.", nameof(values));
             copy[i] = values[i];
         }
-        return new Curve(6, points: copy);
+        return new Curve(NativeConstants.CurvePoints, points: copy);
     }
 
     /// <summary>The values of a <see cref="Points"/> curve; empty for the built-in shapes.</summary>
@@ -108,8 +108,9 @@ public sealed class Curve : IEquatable<Curve>
     /// <inheritdoc/>
     public override string ToString() => _kind switch
     {
-        0 => "Linear", 1 => "EqualPower", 2 => "Logarithmic", 3 => "Exponential", 4 => "SCurve",
-        5 => $"Bezier({_x1}, {_y1}, {_x2}, {_y2})",
+        NativeConstants.CurveLinear => "Linear", NativeConstants.CurveEqualPower => "EqualPower",
+        NativeConstants.CurveLog => "Logarithmic", NativeConstants.CurveExp => "Exponential", NativeConstants.CurveSCurve => "SCurve",
+        NativeConstants.CurveBezier => $"Bezier({_x1}, {_y1}, {_x2}, {_y2})",
         _ => $"Points({string.Join(", ", PointValues)})",
     };
 }

@@ -301,6 +301,19 @@ public sealed partial class AudioEngine : IDisposable
     }
 
     /// <summary>
+    /// <see cref="OpenMemory"/> on a worker thread (a big file, or a compressed ZIP song, takes a moment to open).
+    /// The data must stay unchanged until the task completes.
+    /// </summary>
+    /// <param name="data">Encoded audio file contents.</param>
+    /// <param name="options">Optional open options.</param>
+    /// <param name="cancellationToken">Stops the open; no stream is created.</param>
+    /// <exception cref="OperationCanceledException">The token was cancelled.</exception>
+    /// <exception cref="FatzAudioException">See <see cref="OpenMemory"/>.</exception>
+    public Task<AudioStream> OpenMemoryAsync(ReadOnlyMemory<byte> data, StreamOptions? options = null,
+        CancellationToken cancellationToken = default) =>
+        OpenAsync(o => OpenMemory(data, o), options, cancellationToken);
+
+    /// <summary>
     /// Opens one audio track of a CD (or disc image). The stream is 44.1 kHz stereo and seekable, and works
     /// like any other: crossfades, queues (gapless track to track), normalization and buses.
     /// </summary>
@@ -408,6 +421,33 @@ public sealed partial class AudioEngine : IDisposable
         var f = new FaAudioFormat { SampleFormat = 0, SampleRate = (uint)Math.Max(sampleRate, 0), Channels = (uint)channels };
         fixed (float* p = samples)
             return Sound.Wrap(this, NativeMethods.fa_sound_load_pcm(h, &f, p, samples.Length / channels, &o, out nint s), s);
+    }
+
+    /// <summary>
+    /// Makes a sound from your own samples in any interleaved <see cref="SampleFormat"/> (16-bit, 24-bit, 32-bit,
+    /// 8-bit unsigned, float or double). They are copied.
+    /// </summary>
+    /// <param name="data">The samples as bytes, in <paramref name="format"/>'s layout (little-endian), a whole number of frames.</param>
+    /// <param name="format">The format; planar formats are not allowed.</param>
+    /// <param name="options">Voice limit and steal rule (Open is ignored).</param>
+    /// <returns>The sound; dispose it when done.</returns>
+    /// <exception cref="ArgumentException">Empty data, a planar format, or not a whole number of frames.</exception>
+    /// <example>
+    /// <code>
+    /// using var sound = engine.CreateSound(pcm16Bytes, AudioFormat.Int16(44100, 2));
+    /// </code>
+    /// </example>
+    public unsafe Sound CreateSound(ReadOnlySpan<byte> data, AudioFormat format, SoundOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(format);
+        int frameBytes = format.FrameBytes();
+        if (data.IsEmpty || data.Length % frameBytes != 0)
+            throw new ArgumentException("The data must be a whole number of frames.", nameof(data));
+        var h = Handle;
+        var o = Sound.ToNative(options);
+        var f = format.ToNative();
+        fixed (byte* p = data)
+            return Sound.Wrap(this, NativeMethods.fa_sound_load_pcm(h, &f, p, data.Length / frameBytes, &o, out nint s), s);
     }
 
     /// <summary>Opens a managed <see cref="Stream"/> as audio source via custom I/O callbacks.</summary>
@@ -654,6 +694,32 @@ public sealed partial class AudioEngine : IDisposable
     }
 
     /// <summary>
+    /// <see cref="OpenCallback(int, int, AudioCallback, StreamOptions?)"/> for any interleaved sample format: the
+    /// callback fills bytes in <paramref name="format"/>'s layout (little-endian).
+    /// </summary>
+    /// <param name="format">The audio's format; planar formats are not allowed.</param>
+    /// <param name="fill">Writes bytes and returns the frames written (see <see cref="RawAudioCallback"/>).</param>
+    /// <param name="options">Optional open options (<see cref="StreamOptions.Loop"/> is not allowed).</param>
+    /// <returns>The stream; dispose it when done.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="format"/> or <paramref name="fill"/> is null.</exception>
+    /// <exception cref="ArgumentException">A planar format.</exception>
+    /// <exception cref="FatzAudioException">An invalid rate or channel count (<see cref="ErrorCode.InvalidArgument"/>).</exception>
+    public unsafe AudioStream OpenCallback(AudioFormat format, RawAudioCallback fill, StreamOptions? options = null)
+    {
+        ArgumentNullException.ThrowIfNull(format);
+        ArgumentNullException.ThrowIfNull(fill);
+        int frameBytes = format.FrameBytes();
+        var h = Handle;
+        using var opts = NativeOptions.Create(options);
+        if (format.SampleRate <= 0 || format.Channels <= 0) throw new FatzAudioException(ErrorCode.InvalidArgument);
+        var nf = format.ToNative();
+        var gc = GCHandle.Alloc(new CallbackState(fill, frameBytes));
+        int rc = NativeMethods.fa_stream_open_callback(h, &nf, &CallbackState.Fill, (void*)GCHandle.ToIntPtr(gc), opts.Pointer, out nint s);
+        if (rc < 0) gc.Free();
+        return AudioStream.Wrap(this, rc, s, gc);
+    }
+
+    /// <summary>
     /// Opens an input (a microphone, a line input) as an ordinary stream (BASS_RecordStart): record it to a file
     /// (<see cref="StreamOptions.DecodeOnly"/> and <see cref="AudioEncoder.Encode"/>), read its samples, meter
     /// it, or play it to check it. The stream begins with the audio of its first read (or of <see cref="AudioStream.PlayOn(OutputDevice)"/>), not with what came before.
@@ -687,7 +753,7 @@ public sealed partial class AudioEngine : IDisposable
         NativeMethods.fa_capture_options_init(&c);
         c.SampleRate = (uint)Math.Max(0, capture?.SampleRate ?? 0);
         c.Channels = (uint)Math.Max(0, capture?.Channels ?? 0);
-        c.Flags = (capture?.KeepOsProcessing == true ? 1u : 0u) | (loopback ? 2u : 0u);
+        c.Flags = (capture?.KeepOsProcessing == true ? NativeConstants.CaptureOsProcessing : 0u) | (loopback ? NativeConstants.CaptureLoopback : 0u);
         byte* id = capture?.Device?.Id is { } devId ? (byte*)Marshal.StringToCoTaskMemUTF8(devId) : null;
         try
         {

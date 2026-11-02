@@ -267,6 +267,12 @@ public sealed class Disc : IDisposable
         return sectors;
     }
 
+    /// <summary>
+    /// <see cref="GetPregap"/> as a time (75 sectors to the second). Throws as <see cref="GetPregap"/> does.
+    /// </summary>
+    /// <param name="track">The track number, as in <see cref="Toc"/>.</param>
+    public TimeSpan GetPregapTime(int track) => TimeSpan.FromTicks(GetPregap(track) * TimeSpan.TicksPerSecond / 75);
+
     /// <summary>Opens the tray (unlocking it first).</summary>
     /// <exception cref="FatzAudioException">The drive refused (<see cref="ErrorCode.Device"/>, or <see cref="ErrorCode.Busy"/> on macOS while Finder has the disc mounted).</exception>
     public void Eject() => FatzAudioException.ThrowIfFailed(NativeMethods.fa_disc_eject(Handle));

@@ -4,7 +4,7 @@ Two stream sources that are not files: your own function that makes audio on dem
 
 | Source | C | .NET | BASS |
 |---|---|---|---|
-| Your function, asked for audio when the stream wants more | `fa_stream_open_callback` | `engine.OpenCallback(rate, channels, fill)` | `BASS_StreamCreate` with a `STREAMPROC` |
+| Your function, asked for audio when the stream wants more | `fa_stream_open_callback` | `engine.OpenCallback(rate, channels, fill)`; any interleaved sample format: `engine.OpenCallback(format, rawFill)` (the callback fills bytes) | `BASS_StreamCreate` with a `STREAMPROC` |
 | An input device | `fa_stream_open_capture` | `engine.OpenCapture(capture)` | `BASS_RecordInit` + `BASS_RecordStart` |
 | What an output plays (Windows) | `fa_stream_open_capture` with `FA_CAPTURE_LOOPBACK` | `engine.OpenCapture(new CaptureOptions { Loopback = true })` | `BASS_RecordInit` on a `BASS_DEVICE_LOOPBACK` device, BASSWASAPI loopback |
 

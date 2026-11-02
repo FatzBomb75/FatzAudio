@@ -4,7 +4,7 @@ Everything here is timed on the **device clock** and is exact to the frame: a cr
 
 | You want | Use |
 |---|---|
-| Crossfade from the playing track to another one, now | `fa_crossfade` / `CrossfadeTo` |
+| Crossfade from the playing track to another one, now | `fa_crossfade` / `CrossfadeTo` (`CrossfadeToAsync` with a token: cancelling stops the wait, not the fade) |
 | The next track to start by itself (gapless or with a crossfade) | `fa_stream_set_next` / `QueueNext` |
 | Per-track start, end, fade and mix-in points | markers: `fa_stream_set_marker` / `stream.Markers` |
 | A start or a ramp at an exact time | `fa_stream_play_at` / `PlayAt`, the `device_time` of a ramp / `startAt` |

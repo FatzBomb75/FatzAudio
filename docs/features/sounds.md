@@ -5,7 +5,7 @@ Load a short sound once and play as many overlapping copies of it as you like, e
 | What | C | .NET | BASS |
 |---|---|---|---|
 | Load a file (any format a stream opens, ZIP included) | `fa_sound_load_path`, `fa_sound_load_memory` | `engine.LoadSound(path)`, `engine.LoadSound(bytes)` | `BASS_SampleLoad` |
-| Your own PCM | `fa_sound_load_pcm` | `engine.CreateSound(samples, rate, channels)` | `BASS_SampleCreate` + `BASS_SampleSetData` |
+| Your own PCM | `fa_sound_load_pcm` | `engine.CreateSound(samples, rate, channels)`; other sample formats: `engine.CreateSound(bytes, AudioFormat.Int16(rate, ch))` | `BASS_SampleCreate` + `BASS_SampleSetData` |
 | Play a copy | `fa_sound_play(sound, device, bus, volume, pan, &voice)` | `sound.Play(output, volume, pan)` | `BASS_SampleGetChannel` + `BASS_ChannelPlay` |
 | Stop every copy | `fa_sound_stop` | `sound.Stop()` | `BASS_SampleStop` |
 | The copies playing | `fa_sound_get_voices` | `sound.GetPlayingVoices()` | `BASS_SampleGetChannels` |

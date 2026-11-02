@@ -44,6 +44,15 @@ updates the package and the native library together and rebuilds.
 
 ### Added
 
+- .NET polish (final audit step 10), all additive except one event type (see below): `DjDeck.CuePointTime`, `LoopTime`
+  (`DeckLoopTime`) and `SlipPositionTime`; `Disc.GetPregapTime`; `MidiEvent.FrameAt` / `TimeAt`;
+  `AudioStream.CrossfadeToAsync` and `DjMixer.MeasureLatencyAsync` take a `CancellationToken`; `TrySendMidi` (never
+  throws for a refused send); `OpenMemoryAsync`, `OpenMidiAsync`, `OpenMidiEventsAsync`;
+  `CreateSound(bytes, AudioFormat)` and `OpenCallback(AudioFormat, RawAudioCallback)` for every interleaved sample
+  format (C already took any); `StreamEventArgs.Error` for `SeekFailed` and `DecodeError`. A new test checks the event,
+  curve and capture-flag numbers and the error codes against the C header. The `DecodeError` event is now an
+  `EventHandler<StreamEventArgs>` (was `EventHandler`): `+=` with a lambda or a `(object?, EventArgs)` method still
+  compiles; only code that stored the delegate in an `EventHandler` variable needs a change.
 - Silence detection (MediaControl request 9, karaoke timing step K9): where a song stays below a threshold (default
   -50 dBFS) for at least a minimum length (default 1 s), and its first and last audible frame, for the CUE_IN /
   CUE_OUT markers. Two modes (`fa_silence_options.mode`): RMS over 50 ms windows (`window_ms`), the default, where
