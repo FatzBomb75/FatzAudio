@@ -4,6 +4,8 @@
 |---|---|
 | [Getting started](getting-started.md) | Install, play a file in C and in .NET, choose a device, handle errors, run without sound hardware, a "no sound?" checklist |
 | [Concepts](concepts.md) | Engine, devices, streams, buses, the clock, threading, errors |
+| [Tutorials](tutorials/README.md) | Eight walk-throughs: console and WPF players, karaoke, DJ, radio recorder, library scanner, FFmpeg A/V sync, mobile setup |
+| [Cookbook](cookbook.md) | Short recipes: fades, crossfades, meters, tempo and key, recording |
 | [Common tasks](common-tasks.md) | Volume, seek, end of song, URLs, tags and karaoke in a few lines each |
 | [Platforms](platforms.md) | What each OS needs, where features differ, the .NET package layout, sizes |
 | [Formats and codecs](formats.md) | What plays, what is written, per platform |
@@ -11,6 +13,7 @@
 | [Feature guides](features/README.md) | One page per feature: what it does, how to use it, options, pitfalls; for example [MIDI and karaoke files](features/midi.md) |
 | [Migrating from BASS](migration/bass.md) | Every BASS function and add-on mapped to FatzAudio |
 | [Migrating from SoundTouch](migration/soundtouch.md) | SoundTouch calls mapped to the tempo, pitch and rate parameters |
+| [C API reference](reference/c-api.md) | Every function and type, generated from the header |
 | [Troubleshooting and error codes](troubleshooting.md) | Every `FA_ERROR_*` code and what to do; symptoms |
 | [Limits and performance](limits.md) | The documented limits in one table |
 | [FAQ](faq.md) | Short answers |
