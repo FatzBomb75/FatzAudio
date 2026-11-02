@@ -13,7 +13,7 @@ Versioned output structs start with a `struct_size` that you set to `sizeof` bef
 
 ## Licenses
 
-FatzAudio's own code is original. The license for it is chosen by the owner before the first release.
+FatzAudio's own code is original and proprietary: copyright (c) 2026 Keith (FatzBomb75), all rights reserved, no redistribution without written permission. See [LICENSE](../LICENSE). The third-party components below keep their own licenses.
 
 The third-party libraries that are built into the library (miniaudio, libopus, libvorbis, libogg, TinySoundFont, Signalsmith Stretch, libopenmpt) are all permissively licensed and linked statically, so nothing else has to ship for them. Their names, versions, licenses and the notices your app should carry are in [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
 

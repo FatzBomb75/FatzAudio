@@ -1,0 +1,26 @@
+FatzAudio Proprietary License
+
+Copyright (c) 2026 Keith (FatzBomb75). All rights reserved.
+
+FatzAudio, including its source code, compiled libraries, .NET binding,
+documentation and tools (the "Software"), is proprietary. No license or right
+to use, copy, modify, merge, publish, distribute, sublicense, sell or create
+derivative works of the Software is granted except by written permission from
+the copyright holder.
+
+You may not redistribute the Software, in source or binary form, with or
+without modification, without the copyright holder's prior written permission.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+Third-party components
+----------------------
+The Software includes third-party components that are NOT covered by the terms
+above. Each remains under its own license, which is stated in the component's
+folder under third_party/ and summarised in THIRD_PARTY_NOTICES.md. Those
+licenses continue to apply to those components, and their notices must be kept
+and shown as THIRD_PARTY_NOTICES.md describes.

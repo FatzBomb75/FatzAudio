@@ -48,4 +48,6 @@ See the [documentation](docs/README.md). [fatzaudio-design.md](fatzaudio-design.
 
 ## Licenses
 
+FatzAudio is proprietary software. Copyright (c) 2026 Keith (FatzBomb75). All rights reserved. See [LICENSE](LICENSE); use or redistribution needs written permission.
+
 Third-party code built into the library, and what is loaded at run time, is listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
