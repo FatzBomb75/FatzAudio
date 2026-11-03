@@ -25,6 +25,13 @@ fa_result fa_font_find(const char* family, int weight, int italic, fa_font** out
  * hangul or han for ja, ko and zh). */
 fa_result fa_font_find_for_language(const char* language, int weight, int italic, fa_font** out);
 
+/* Opens the font the system would draw `text` (UTF-8) with when the app's font
+ * lacks its characters: its fallback for the text's script (Core Text's on Apple,
+ * DirectWrite's on Windows, fontconfig's on Linux, the platform's on Android 12 and
+ * later), nearest to `weight` and `italic`. FA_ERROR_NOT_FOUND when the system
+ * cannot tell; the font may still lack some of the characters. */
+fa_result fa_font_find_for_text(const char* text, uint32_t len, int weight, int italic, fa_font** out);
+
 /* Tests: 1 = ignore the OS's own lists and scan the font folders. */
 void fa_font_find_set_scan_only(int scan_only);
 

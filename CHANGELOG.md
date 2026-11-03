@@ -23,6 +23,14 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
   gives its time base. Now and past times read the clock's history; a future time past the mixed audio runs on at the
   current rate while the stream plays (up to 250 ms past it) instead of freezing at the end of the device buffer.
   .NET: `AudioStream.GetClockAt(long)`, `AudioEngine.MonotonicTime` and `AudioEngine.MonotonicTimeFromStopwatch(long)`.
+- Lyric text shaping for every script (karaoke timing plan K8, MediaControl request 6). Lines that need shaping
+  (Arabic, Hebrew, Indic and other complex scripts, combining marks) are laid out by the system's own shaper, nothing
+  bundled: DirectWrite on Windows 10 1703+, Core Text on macOS and iOS, HarfBuzz and FriBidi loaded at run time on
+  Linux, `TextRunShaper` through the app's Java VM on Android 12+. Letters join, ligatures and marks are placed,
+  right-to-left lines read and wipe right to left, mixed lines follow Unicode bidi. A song in a script the font lacks
+  gets the system's fallback font for it (before, only Japanese, Korean and Chinese). New field at the end of
+  `fa_surface_layout`: `text_shaper` (.NET `SurfaceLayout.TextShaper`). Without a shaper, and for text that needs
+  none, lines are laid out as before ([lyrics](docs/features/lyrics.md#text-shaping-arabic-hebrew-indic-and-every-other-script)).
 
 ### Changed
 

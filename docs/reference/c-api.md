@@ -2704,6 +2704,11 @@ typedef struct fa_surface_layout {
                                           fa_cdg_presentation.padding */
     uint64_t layout_revision;          /* goes up whenever any of the above changes (then
                                           reallocate, and the next draw is a full one) */
+    char text_shaper[32];              /* lyrics: the system's text shaper for scripts that
+                                          need one (Arabic, Hebrew, Indic, marks): "DirectWrite",
+                                          "Core Text", "HarfBuzz" or "TextRunShaper"; "" when
+                                          the system has none (that text is then drawn
+                                          unjoined, left to right) and for CD+G */
 } fa_surface_layout;
 
 typedef struct fa_surface_frame {
@@ -3390,9 +3395,12 @@ typedef struct fa_lyric_style {
     /* The font: a file (font_path, UTF-8), a file in memory (font_data, copied), or an
      * installed family (font_family, as fa_font_find); with none of them, or when the
      * family is not installed, the system's UI font. A song whose text the font
-     * mostly cannot show is drawn with the system's font for its script (Japanese,
-     * Korean, Chinese) unless font_explicit is 1. fa_surface_layout.font_used names
-     * the family drawn with. */
+     * mostly cannot show is drawn with the system's font for its script (its own
+     * list for Japanese, Korean and Chinese, the system's font fallback for any
+     * other script) unless font_explicit is 1. fa_surface_layout.font_used names
+     * the family drawn with. Text in scripts that need shaping (Arabic, Hebrew,
+     * Indic, combining marks) is laid out by the system's shaper and wiped in its
+     * reading direction (fa_surface_layout.text_shaper). */
     const char* font_family;
     const char* font_path;
     const void* font_data;

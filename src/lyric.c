@@ -20,6 +20,7 @@
 #include "font.h"
 #include "font_find.h"
 #include "raster.h"
+#include "shape.h"
 #include "surface.h"
 #include "surface_fx.h"
 
@@ -220,7 +221,9 @@ typedef struct ly_layer {
     float cx, cy;                 /* the point placed at the line's centre */
     float text_x, text_y;         /* the text box's top-left */
     float* bnd;                   /* nseg + 1: crossfade column boundaries */
-    float* gx;                    /* 2 * nseg: each syllable's text from .. to (sweep) */
+    float* gx;                    /* 2 * nseg: each syllable's text from .. to (sweep), left to right */
+    uint8_t* srtl;                /* nseg: the syllable reads (and sweeps) right to left */
+    uint32_t* vis;                /* nseg: the syllables from left to right (bnd's cells) */
     int* span;                    /* 2 * h: each row's drawn columns from .. to (0, 0: none) */
     uint8_t* px;                  /* w x h premultiplied BGRA: the masks coloured */
     ly_wipe pw;                   /* the wipe px is coloured for */
@@ -322,6 +325,8 @@ static void layer_clear(ly_layer* L)
     free(L->m);
     free(L->bnd);
     free(L->gx);
+    free(L->srtl);
+    free(L->vis);
     free(L->span);
     free(L->px);
     memset(L, 0, sizeof(*L));
@@ -363,43 +368,16 @@ static uint32_t next_cp(const char* s, uint32_t len, uint32_t* i)
     return cp;
 }
 
-/* Pen positions of a line's text, in em (font size 1): x[b] for each byte b that
- * starts a character, and x[len] the end. Glyphs into `g` (one per character, at
- * its first byte; others 0). Returns the width. */
-static float shape_with(fa_font* font, float bold, const char* text, uint32_t len, float* x, uint32_t* g)
+/* A line's text laid out (shape.h), em: font size 1. */
+static float text_width(fa_font* font, float bold, const char* text, uint32_t len)
 {
-    const fa_font_info* in = fa_font_get_info(font);
-    float upem = (float)in->units_per_em, pen = 0.0f, extra = 2.0f * bold;
-    uint32_t i = 0, prev = 0;
-    int have = 0;
-    while (i < len) {
-        uint32_t at = i, cp = next_cp(text, len, &i), gid = fa_font_glyph(font, cp), b;
-        if (have) pen += (float)fa_font_kerning(font, prev, gid) / upem;
-        if (x) {
-            x[at] = pen;
-            for (b = at + 1; b < i; b++) x[b] = pen;
-        }
-        if (g) {
-            g[at] = gid;
-            for (b = at + 1; b < i; b++) g[b] = UINT32_MAX;
-        }
-        pen += (float)fa_font_advance(font, gid) / upem + extra;
-        prev = gid;
-        have = 1;
-    }
-    if (x) x[len] = pen;
-    return pen;
-}
-
-static float shape(const fa_lyric* l, const char* text, uint32_t len, float* x, uint32_t* g)
-{
-    return shape_with(l->font, l->bold, text, len, x, g);
+    return fa_text_width(font, text, len, 2.0f * bold);
 }
 
 static float measure_design(void* ctx, const char* text, uint32_t len)
 {
     const fa_lyric* l = (const fa_lyric*)ctx;
-    return shape(l, text, len, NULL, NULL) * l->st.font_size;
+    return text_width(l->font, l->bold, text, len) * l->st.font_size;
 }
 
 /* ---- the font ------------------------------------------------------------------- */
@@ -440,6 +418,50 @@ static void coverage(const fa_lyric* l, const fa_font* f, uint32_t* missing, uin
     }
 }
 
+/* Takes `alt` in place of *f when it can show more of the song. */
+static void try_font(const fa_lyric* l, fa_font** f, fa_font* alt, uint32_t* miss)
+{
+    uint32_t miss2, total2;
+    coverage(l, alt, &miss2, &total2);
+    if (miss2 < *miss) {
+        fa_font_close(*f);
+        *f = alt;
+        *miss = miss2;
+    } else {
+        fa_font_close(alt);
+    }
+}
+
+/* The song's characters font `f` has no glyph for (UTF-8, each once, spaces and
+ * ASCII left out), as many as fit `cap`: what the system is asked a font for.
+ * Returns the bytes written. */
+static uint32_t missing_sample(const fa_lyric* l, const fa_font* f, char* out, uint32_t cap)
+{
+    uint32_t i, n = 0;
+    for (i = 0; i < l->nsong; i++) {
+        const char* t = l->song[i].text;
+        uint32_t len = (uint32_t)strlen(t), j = 0;
+        while (j < len) {
+            uint32_t at = j, cp = next_cp(t, len, &j), k = j - at;
+            if (cp < 0x80 || cp == 0x3000 || cp == 0xFFFD || fa_font_glyph(f, cp)) continue;
+            if (n + k > cap) return n;
+            /* Each character once: a short sample covers more of the song. */
+            {
+                uint32_t q = 0, seen = 0;
+                while (q < n && !seen) {
+                    uint32_t from = q;
+                    next_cp(out, n, &q);
+                    seen = q - from == k && !memcmp(out + from, t + at, k);
+                }
+                if (seen) continue;
+            }
+            memcpy(out + n, t + at, k);
+            n += k;
+        }
+    }
+    return n;
+}
+
 /* `data`: the lyric's own copy of st->font_data, which the font then reads in place
  * (it outlives the font: style_take frees both together). */
 static fa_result font_open(fa_lyric* l, const fa_lyric_style* st, const void* data, fa_font** out, float* bold)
@@ -458,22 +480,21 @@ static fa_result font_open(fa_lyric* l, const fa_lyric_style* st, const void* da
     }
     if (r != FA_OK) return r;
     if (!st->font_explicit) {
-        /* A song the font mostly cannot show: the system's font for its script. */
+        /* A song the font mostly cannot show: the system's font for its script (its
+         * own list for Japanese, Korean and Chinese, else the system's fallback for
+         * the characters the font lacks). */
         uint32_t miss, total;
         coverage(l, f, &miss, &total);
         if (miss * 2 > total) {
             const char* lang = lang_of(l);
             fa_font* alt = NULL;
-            if (lang && fa_font_find_for_language(lang, want, 0, &alt) == FA_OK) {
-                uint32_t miss2, total2;
-                coverage(l, alt, &miss2, &total2);
-                if (miss2 < miss) {
-                    fa_font_close(f);
-                    f = alt;
-                } else {
-                    fa_font_close(alt);
-                }
-            }
+            if (lang && fa_font_find_for_language(lang, want, 0, &alt) == FA_OK) try_font(l, &f, alt, &miss);
+        }
+        if (miss * 2 > total) {
+            char sample[128];
+            uint32_t n = missing_sample(l, f, sample, sizeof(sample));
+            fa_font* alt = NULL;
+            if (n && fa_font_find_for_text(sample, n, want, 0, &alt) == FA_OK) try_font(l, &f, alt, &miss);
         }
     }
     {
@@ -837,19 +858,77 @@ static int spans_make(ly_layer* L)
     return 1;
 }
 
+/* A syllable's text on the line, em: from its leftmost to its rightmost character
+ * (a syllable split by a change of direction spans both parts), and whether it
+ * reads right to left (its first character's direction). */
+static void seg_span(const fa_shaped* sh, uint32_t len, uint32_t start, uint32_t n, float* x0, float* x1, int* rtl)
+{
+    uint32_t i;
+    if (start >= len) {
+        /* An empty syllable after the text: where the last character ends. */
+        int r = len ? sh->rtl[len - 1] : 0;
+        *x0 = *x1 = len ? (r ? sh->left[len - 1] : sh->right[len - 1]) : 0.0f;
+        *rtl = r;
+        return;
+    }
+    *rtl = sh->rtl[start];
+    if (!n) {
+        *x0 = *x1 = *rtl ? sh->right[start] : sh->left[start];
+        return;
+    }
+    *x0 = sh->left[start];
+    *x1 = sh->right[start];
+    for (i = start + 1; i < start + n && i < len; i++) {
+        if (sh->left[i] < *x0) *x0 = sh->left[i];
+        if (sh->right[i] > *x1) *x1 = sh->right[i];
+    }
+}
+
+/* The wipe's places: each syllable's span (L->gx, srtl), the syllables in order from
+ * the left (L->vis; for left-to-right text the syllables' own order) and the column
+ * boundaries between them (L->bnd, half way between neighbours). */
+static int wipe_cells(ly_layer* L, const ly_line* line, const fa_shaped* sh, float pad, float size)
+{
+    uint32_t j, k, n = line->nseg;
+    L->bnd = (float*)malloc(((size_t)n + 1) * sizeof(float));
+    L->gx = (float*)malloc(((size_t)n * 2 + 1) * sizeof(float));
+    L->srtl = (uint8_t*)malloc((size_t)n + 1);
+    L->vis = (uint32_t*)malloc(((size_t)n + 1) * sizeof(uint32_t));
+    if (!L->bnd || !L->gx || !L->srtl || !L->vis) return 0;
+    for (j = 0; j < n; j++) {
+        float x0, x1;
+        int r;
+        seg_span(sh, line->text_len, line->seg[j].start, line->seg[j].len, &x0, &x1, &r);
+        L->gx[2 * j] = pad + x0 * size;
+        L->gx[2 * j + 1] = pad + x1 * size;
+        L->srtl[j] = (uint8_t)r;
+        /* Sorted by centre (insertion: already in order unless the line has
+         * right-to-left text). */
+        for (k = j; k > 0; k--) {
+            uint32_t p = L->vis[k - 1];
+            if (L->gx[2 * p] + L->gx[2 * p + 1] <= L->gx[2 * j] + L->gx[2 * j + 1]) break;
+            L->vis[k] = p;
+        }
+        L->vis[k] = j;
+    }
+    L->bnd[0] = -1e9f;
+    for (k = 1; k < n; k++) L->bnd[k] = (L->gx[2 * L->vis[k - 1] + 1] + L->gx[2 * L->vis[k]]) / 2.0f;
+    L->bnd[n] = 1e9f;
+    return 1;
+}
+
 static int layer_draw(fa_lyric* l, uint32_t index, ly_layer* L)
 {
     const ly_line* line = &l->tl.line[index];
     const fa_font_info* fi = fa_font_get_info(l->font);
     float size = l->em * line->fit, gs = size / (float)fi->units_per_em, tw, lh = l->line_h * line->fit, base;
-    float* x = (float*)malloc(((size_t)line->text_len + 1) * sizeof(float));
-    uint32_t* g = (uint32_t*)malloc(((size_t)line->text_len + 1) * sizeof(uint32_t));
+    fa_shaped sh;
     uint8_t* cov;
-    uint32_t i, j;
+    uint32_t i;
     int nch = l->st.panel ? 5 : 4;
     layer_clear(L);
-    if (!x || !g) goto fail;
-    tw = shape(l, line->text, line->text_len, x, g) * size;
+    if (fa_text_shape(l->font, line->text, line->text_len, 2.0f * l->bold, &sh) != FA_OK) goto fail;
+    tw = sh.width * size;
     if (tw < 1.0f) tw = 1.0f;
     /* Never taller than the area, nor wider than 8 times it (a long line without a
      * place to break is shrunk to fit later): a damaged font's metrics must not make a
@@ -863,10 +942,10 @@ static int layer_draw(fa_lyric* l, uint32_t index, ly_layer* L)
     L->cy = (float)l->pad + lh / 2.0f;
     base = (float)l->pad + l->asc * line->fit;
     if (!raster_shape(l, L->w, L->h, &cov)) goto fail;
-    for (i = 0; i < line->text_len; i++) {
-        if (g[i] == UINT32_MAX || line->text[i] == ' ') continue;
-        if (fa_font_outline(l->font, g[i], &l->gpath) != FA_OK || !l->gpath.count) continue;
-        fa_raster_path(&l->ras, &l->gpath, gs, -gs, (float)l->pad + x[i] * size + l->bold * l->em, base);
+    for (i = 0; i < sh.count; i++) {
+        if (fa_font_outline(l->font, sh.glyph[i].glyph, &l->gpath) != FA_OK || !l->gpath.count) continue;
+        fa_raster_path(&l->ras, &l->gpath, gs, -gs, (float)l->pad + sh.glyph[i].x * size + l->bold * l->em,
+                       base - sh.glyph[i].y * size);
     }
     fa_raster_end(&l->ras, cov, (size_t)L->w);
     if (!make_masks(l, L, cov, nch)) goto fail;
@@ -874,24 +953,12 @@ static int layer_draw(fa_lyric* l, uint32_t index, ly_layer* L)
         float pp = l->st.panel_padding * l->em;
         panel_mask(L, L->text_x - pp, L->text_y - pp, L->text_x + tw + pp, L->text_y + lh + pp, l->st.panel_radius * l->em);
     }
-    if (!spans_make(L)) goto fail;
-    L->bnd = (float*)malloc(((size_t)line->nseg + 1) * sizeof(float));
-    L->gx = (float*)malloc(((size_t)line->nseg * 2 + 1) * sizeof(float));
-    if (!L->bnd || !L->gx) goto fail;
-    for (j = 0; j < line->nseg; j++) {
-        L->gx[2 * j] = (float)l->pad + x[line->seg[j].start] * size;
-        L->gx[2 * j + 1] = (float)l->pad + x[line->seg[j].start + line->seg[j].len] * size;
-    }
-    L->bnd[0] = -1e9f;
-    for (j = 1; j < line->nseg; j++) L->bnd[j] = (L->gx[2 * j - 1] + L->gx[2 * j]) / 2.0f;
-    L->bnd[line->nseg] = 1e9f;
-    free(x);
-    free(g);
+    if (!spans_make(L) || !wipe_cells(L, line, &sh, (float)l->pad, size)) goto fail;
+    fa_shaped_free(&sh);
     L->line = (int)index;
     return 1;
 fail:
-    free(x);
-    free(g);
+    fa_shaped_free(&sh);
     layer_clear(L);
     return 0;
 }
@@ -1023,16 +1090,25 @@ static void over(float acc[4], const float c[4], float w)
     acc[3] = c[3] * w + acc[3] * keep;
 }
 
+/* A sweep's edge in syllable j at mix: from its start (its right end when it reads
+ * right to left) to its end. */
+static float sweep_edge(const ly_layer* L, uint32_t j, float mix)
+{
+    float x0 = L->gx[2 * j], x1 = L->gx[2 * j + 1];
+    return L->srtl[j] ? x1 - (x1 - x0) * mix : x0 + (x1 - x0) * mix;
+}
+
 /* How sung column u (its centre, layer pixels) of a line's layer is. */
 static float sung_at(const fa_lyric* l, const ly_layer* L, const ly_line* line, const ly_wipe* w, float u)
 {
-    uint32_t j = 0;
+    uint32_t k = 0, j;
     if (w->full == 0 && w->current < 0) return 0.0f;
-    while (j + 1 < line->nseg + 1 && u >= L->bnd[j + 1]) j++;
+    while (k + 1 < line->nseg + 1 && u >= L->bnd[k + 1]) k++;
+    j = k < line->nseg ? L->vis[k] : k;
     if ((int)j < w->full) return 1.0f;
     if ((int)j != w->current) return 0.0f;
     if (l->st.wipe == FA_WIPE_SWEEP) {
-        float x0 = L->gx[2 * j], x1 = L->gx[2 * j + 1], edge = x0 + (x1 - x0) * w->mix, v = edge - u + 0.5f;
+        float edge = sweep_edge(L, j, w->mix), v = L->srtl[j] ? u - edge + 0.5f : edge - u + 0.5f;
         if (w->mix >= 1.0f) return 1.0f;
         return v <= 0.0f ? 0.0f : v >= 1.0f ? 1.0f : v;
     }
@@ -1105,20 +1181,22 @@ static int changed_columns(const fa_lyric* l, const ly_layer* L, const ly_line* 
 {
     if (l->st.wipe == FA_WIPE_SWEEP && a->current >= 0 && a->current == b->current && a->full == b->full &&
         a->mix < 1.0f && b->mix < 1.0f) {
-        float x0 = L->gx[2 * a->current], x1 = L->gx[2 * a->current + 1];
-        float e0 = x0 + (x1 - x0) * a->mix, e1 = x0 + (x1 - x0) * b->mix;
+        float e0 = sweep_edge(L, (uint32_t)a->current, a->mix), e1 = sweep_edge(L, (uint32_t)a->current, b->mix);
         if (same(a->mix, b->mix)) return 0;
         *c0 = (int)floorf(e0 < e1 ? e0 : e1) - 1;
         *c1 = (int)ceilf(e0 < e1 ? e1 : e0) + 1;
     } else {
         int first = -1, last = -1;
-        uint32_t j;
+        uint32_t j, k;
         float u0, u1;
-        for (j = 0; j < line->nseg; j++)
+        /* The changed syllables' cells, from the left. */
+        for (k = 0; k < line->nseg; k++) {
+            j = L->vis[k];
             if (seg_mix(a, j) != seg_mix(b, j) || (a->current == (int)j) != (b->current == (int)j)) {
-                if (first < 0) first = (int)j;
-                last = (int)j;
+                if (first < 0) first = (int)k;
+                last = (int)k;
             }
+        }
         if (first < 0) return 0;
         u0 = first ? L->bnd[first] : 0.0f;
         u1 = (uint32_t)last + 1 < line->nseg ? L->bnd[last + 1] : (float)L->w;
@@ -1414,7 +1492,7 @@ typedef struct ly_text {
 
 static float shape_px(const ly_text* t, uint32_t a, uint32_t n)
 {
-    return shape_with(t->font, t->bold, t->s + a, n, NULL, NULL) * t->size;
+    return text_width(t->font, t->bold, t->s + a, n) * t->size;
 }
 
 static void text_wrap(ly_text* t, float max_w)
@@ -1514,12 +1592,11 @@ static int cv_line(fa_lyric* l, ly_canvas* cv, const ly_text* t, uint32_t a, uin
 {
     const fa_font_info* fi = fa_font_get_info(t->font);
     float gs = t->size / (float)fi->units_per_em, grow = t->bold * t->size;
-    float* xs = (float*)malloc(((size_t)n + 1) * sizeof(float));
-    uint32_t* g = (uint32_t*)malloc(((size_t)n + 1) * sizeof(uint32_t));
-    int pass, ok = xs && g;
+    fa_shaped sh;
+    int pass, ok;
     /* Ink can reach past the line's box by the bold, the slant and a glyph's overhang. */
     int m = 2 + (int)ceilf(grow + 0.25f * t->size + (t->italic ? 0.2f * t->asc : 0.0f));
-    if (ok) shape_with(t->font, t->bold, t->s + a, n, xs, g);
+    ok = fa_text_shape(t->font, t->s + a, n, 2.0f * t->bold, &sh) == FA_OK;
     for (pass = 0; pass < 2 && ok; pass++) {
         float c[4], d = pass ? 0.0f : t->shadow;
         int x0 = (int)floorf(x + d) - m, x1 = (int)ceilf(x + d + w) + m;
@@ -1539,10 +1616,9 @@ static int cv_line(fa_lyric* l, ly_canvas* cv, const ly_text* t, uint32_t a, uin
             ok = 0;
             break;
         }
-        for (k = 0; k < n; k++) {
+        for (k = 0; k < sh.count; k++) {
             size_t q;
-            if (g[k] == UINT32_MAX || t->s[a + k] == ' ') continue;
-            if (fa_font_outline(t->font, g[k], &l->gpath) != FA_OK || !l->gpath.count) continue;
+            if (fa_font_outline(t->font, sh.glyph[k].glyph, &l->gpath) != FA_OK || !l->gpath.count) continue;
             if (t->italic)
                 for (q = 0; q < l->gpath.count; q++) {
                     fa_path_cmd* pc = &l->gpath.cmd[q];
@@ -1550,7 +1626,8 @@ static int cv_line(fa_lyric* l, ly_canvas* cv, const ly_text* t, uint32_t a, uin
                     pc->x1 += 0.2f * pc->y1;
                     pc->x2 += 0.2f * pc->y2;
                 }
-            fa_raster_path(&l->ras, &l->gpath, gs, -gs, x + xs[k] * t->size + grow + d - (float)x0, y + d - (float)y0);
+            fa_raster_path(&l->ras, &l->gpath, gs, -gs, x + sh.glyph[k].x * t->size + grow + d - (float)x0,
+                           y - sh.glyph[k].y * t->size + d - (float)y0);
         }
         fa_raster_end(&l->ras, cov, (size_t)bw);
         if (grow > 0.0f) {
@@ -1571,8 +1648,7 @@ static int cv_line(fa_lyric* l, ly_canvas* cv, const ly_text* t, uint32_t a, uin
             }
         free(cov);
     }
-    free(xs);
-    free(g);
+    fa_shaped_free(&sh);
     return ok;
 }
 
@@ -2332,6 +2408,13 @@ fa_result fa_lyric_get_layout(fa_lyric* l, uint32_t aw, uint32_t ah, fa_surface_
     o->content_height = (uint32_t)l->content[3];
     o->scale = (float)l->area_h / (float)LY_DESIGN_H;
     memcpy(o->font_used, l->font_used, sizeof(o->font_used));
+    {
+        const char* sh = fa_shaper_name();
+        size_t n = strlen(sh);
+        if (n >= sizeof(o->text_shaper)) n = sizeof(o->text_shaper) - 1;
+        memcpy(o->text_shaper, sh, n);
+        o->text_shaper[n] = 0;
+    }
     o->padding = (uint32_t)l->pad;
     o->layout_revision = l->layout_revision;
     return FA_OK;

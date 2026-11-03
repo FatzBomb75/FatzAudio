@@ -9,6 +9,7 @@
  * composite depth and subroutine nesting, so a damaged or hostile file can give a
  * wrong glyph but never read outside the file or loop for long. */
 #include "font.h"
+#include "shape.h"
 #include "fa_platform.h"
 #include "fa_util.h"
 #include <math.h>
@@ -84,6 +85,8 @@ struct fa_font {
     uint32_t kern_lookups[KERN_MAX_LOOKUPS];
     uint32_t kern_lookup_count;
     view gpos_lookups;                /* the LookupList */
+    uint32_t index;                   /* the face in the file */
+    void* shaper;                     /* the OS text shaper's state for this face (shape.c), or NULL */
 };
 
 static uint32_t tag(const char* t) { return (uint32_t)t[0] << 24 | (uint32_t)t[1] << 16 | (uint32_t)t[2] << 8 | (uint32_t)t[3]; }
@@ -1081,6 +1084,7 @@ fa_result fa_font_open(const uint8_t* data, size_t size, uint32_t index, int own
     if (!f) { if (owned) free((void*)data); return FA_ERROR_OUT_OF_MEMORY; }
     f->file = file;
     f->owned = owned;
+    f->index = index;
     tables = u16(face, 4);
     for (i = 0; i < tables; i++) {
         size_t rec = 12 + (size_t)i * 16;
@@ -1388,9 +1392,19 @@ fa_result fa_font_probe(FILE* fp, uint32_t* face_count, uint32_t index, fa_font_
 void fa_font_close(fa_font* f)
 {
     if (!f) return;
+    if (f->shaper) fa_text_release(f->shaper);
     if (f->owned) free((void*)f->file.p);
     if (f->shared) blob_release(f->shared);
     free(f);
 }
 
 const fa_font_info* fa_font_get_info(const fa_font* f) { return f ? &f->info : NULL; }
+
+void fa_font_source(const fa_font* font, const uint8_t** data, size_t* size, uint32_t* index)
+{
+    *data = font->file.p;
+    *size = font->file.n;
+    *index = font->index;
+}
+
+void** fa_font_shaper_slot(fa_font* font) { return &font->shaper; }

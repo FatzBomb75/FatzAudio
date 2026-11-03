@@ -107,6 +107,8 @@ public class LyricTests
             lyrics.PresentationSize = new PixelSize(1920, 1080);
             var layout = lyrics.GetLayout();
             Assert.Equal("FA Test", layout.FontUsed);
+            if (OperatingSystem.IsWindows()) Assert.Equal("DirectWrite", layout.TextShaper);
+            else if (OperatingSystem.IsMacOS()) Assert.Equal("Core Text", layout.TextShaper);
             Assert.Equal(1f, layout.Scale);
             Assert.InRange(layout.Width, (int)(0.85 * 1920), 1919);
             Assert.Equal(960, layout.BitmapX + layout.Width / 2, 1.0);

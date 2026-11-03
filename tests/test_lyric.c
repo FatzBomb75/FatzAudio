@@ -8,6 +8,7 @@
 #include "fa_internal.h"
 #include "cdg.h"
 #include "lyric_time.h"
+#include "shape.h"
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -689,6 +690,73 @@ static void test_wipe_exact(void)
         free(ta.px);
     }
     fa_stream_close(s);
+}
+
+/* Mean x of the opaque pixels near a colour (premultiplied BGRA), -1 when none. */
+static double mean_x(const target* t, int r, int g, int b)
+{
+    uint32_t x, y;
+    double sum = 0.0;
+    long n = 0;
+    for (y = 0; y < t->lay.height; y++)
+        for (x = 0; x < t->lay.width; x++) {
+            const uint8_t* p = t->px + (size_t)y * (size_t)t->stride + x * 4;
+            if (p[3] > 240 && abs(p[2] - r) < 16 && abs(p[1] - g) < 16 && abs(p[0] - b) < 16) {
+                sum += x;
+                n++;
+            }
+        }
+    return n ? sum / (double)n : -1.0;
+}
+
+/* An Arabic line (shape.ttf): with the system's shaper it reads and wipes right to
+ * left; without one it is drawn as before, left to right. */
+static void test_rtl_wipe(void)
+{
+    buf f = { 0 }, t = { 0 };
+    fa_open_options o;
+    fa_stream* s = NULL;
+    fa_lyric_style st;
+    fa_surface* sf = NULL;
+    fa_surface_frame fr;
+    target tg;
+    double sung, unsung;
+    int rtl = fa_shaper_name()[0] != '\0';
+    /* Two syllables of joined beh (U+0628) at 1 and 2 s, a note to 4 s. */
+    put(&f, "MThd", 4); put32be(&f, 6); put8(&f, 0); put8(&f, 0); put8(&f, 0); put8(&f, 1); put8(&f, 480 >> 8); put8(&f, 480 & 255);
+    ev3(&t, 0, 0x90, 69, 1);
+    lyric(&t, 960, "\xD8\xA8\xD8\xA8\xD8\xA8");
+    lyric(&t, 960, "\xD8\xA8\xD8\xA8\xD8\xA8");
+    ev3(&t, 1920, 0x80, 69, 0);
+    varlen(&t, 0); put8(&t, 0xFF); put8(&t, 0x2F); put8(&t, 0);
+    put(&f, "MTrk", 4); put32be(&f, (uint32_t)t.n); put(&f, t.d, t.n);
+    fa_open_options_init(&o);
+    o.flags = FA_OPEN_DECODE_ONLY;
+    CHECK_EQ(fa_stream_open_memory(g_engine, f.d, f.n, &o, &s), FA_OK);
+    fa_lyric_style_init(&st, FA_LYRIC_MODERN);
+    st.font_path = FA_TEST_DATA_DIR "/fonts/shape.ttf";
+    st.font_explicit = 1;
+    st.font_weight = 400;
+    st.wipe = FA_WIPE_SWEEP;
+    st.text_color = 0xFFFFFFFFu;
+    st.sung_color = 0xFFFFFF00u;
+    st.intro_page = st.ending_page = 0;
+    st.effects.outline.on = st.effects.shadow.on = st.effects.bevel.on = 0;
+    CHECK_EQ(fa_lyric_surface_create(s, &st, &sf), FA_OK);
+    CHECK(target_make(sf, &tg));
+    CHECK_EQ(strcmp(tg.lay.text_shaper, fa_shaper_name()), 0);
+    /* The first syllable sung, the second not yet. */
+    CHECK_EQ(draw_at(sf, &tg, 1500 * MS, &fr), FA_OK);
+    sung = mean_x(&tg, 255, 255, 0);
+    unsung = mean_x(&tg, 255, 255, 255);
+    printf("  %s: sung at x %.0f, unsung at x %.0f\n", rtl ? "right to left" : "left to right", sung, unsung);
+    CHECK(sung >= 0.0 && unsung >= 0.0);
+    CHECK(rtl ? sung > unsung : sung < unsung);
+    fa_surface_destroy(sf);
+    free(tg.px);
+    fa_stream_close(s);
+    free(f.d);
+    free(t.d);
 }
 
 /* Three buffers in rotation: each catches up from the frame it holds. */
@@ -1681,6 +1749,7 @@ int main(void)
     RUN(test_wipe_area);
     RUN(test_stateless);
     RUN(test_rotation);
+    RUN(test_rtl_wipe);
     RUN(test_wipe_exact);
     RUN(test_countdown_drawn);
     RUN(test_presets);

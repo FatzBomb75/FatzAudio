@@ -310,6 +310,7 @@ internal unsafe struct FaSurfaceLayout
     public fixed byte FontUsed[128];
     public uint Margin, Padding;
     public ulong LayoutRevision;
+    public fixed byte TextShaper[32];
 }
 
 [StructLayout(LayoutKind.Sequential)]

@@ -64,7 +64,13 @@ public enum SafetyZone
 /// <param name="LayoutRevision">Goes up whenever any of the above changes: then reallocate, and the next draw is a full one.</param>
 public sealed record SurfaceLayout(int Width, int Height, int BitmapX, int BitmapY, PixelRect Content, float Scale,
     PixelRect Crop, SafetyZone SafetyZone, bool SafetyZoneResolved, string FontUsed, int Margin, int Padding,
-    ulong LayoutRevision);
+    ulong LayoutRevision)
+{
+    /// <summary>Lyrics: the system's text shaper for scripts that need one (Arabic, Hebrew, Indic, combining marks):
+    /// "DirectWrite", "Core Text", "HarfBuzz" or "TextRunShaper". Empty when the system has none (that text is then
+    /// drawn unjoined, left to right) and for CD+G.</summary>
+    public string TextShaper { get; init; } = "";
+}
 
 /// <summary>
 /// What one <see cref="IKaraokeSurface.UpdateInto(nint, int, int, int, ulong, TimeSpan?)"/> call drew. Keep
@@ -370,7 +376,10 @@ internal static unsafe class SurfaceInterop
         return new SurfaceLayout((int)l->Width, (int)l->Height, l->BitmapX, l->BitmapY,
             new PixelRect((int)l->ContentX, (int)l->ContentY, (int)l->ContentWidth, (int)l->ContentHeight), l->Scale,
             new PixelRect((int)l->CropX, (int)l->CropY, (int)l->CropWidth, (int)l->CropHeight), (SafetyZone)l->SafetyZone,
-            l->SafetyZoneResolved != 0, font, (int)l->Margin, (int)l->Padding, l->LayoutRevision);
+            l->SafetyZoneResolved != 0, font, (int)l->Margin, (int)l->Padding, l->LayoutRevision)
+        {
+            TextShaper = NativeText.Read(l->TextShaper),
+        };
     }
 
     /// <summary>The native rule: the shape kept, inside 300x216 .. 3840x2160.</summary>

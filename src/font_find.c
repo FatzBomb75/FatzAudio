@@ -3,6 +3,7 @@
  * family wins. */
 #include "font_find.h"
 #include "fa_platform.h"
+#include "shape.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -413,6 +414,11 @@ static struct {
     int (*substitute)(void*, FcPattern*, int);
     void (*default_substitute)(FcPattern*);
     FcPattern* (*font_match)(void*, FcPattern*, int*);
+    /* For a font that has some characters (optional). */
+    void* (*charset_create)(void);
+    int (*charset_add)(void*, uint32_t);
+    void (*charset_destroy)(void*);
+    int (*add_charset)(FcPattern*, const char*, const void*);
 } g_fc;
 static fa_lazy_mutex g_fc_lock;
 
@@ -436,6 +442,12 @@ static int fc_load(void)
             g_fc.substitute = (int (*)(void*, FcPattern*, int))fa_lib_sym(lib, "FcConfigSubstitute");
             g_fc.default_substitute = (void (*)(FcPattern*))fa_lib_sym(lib, "FcDefaultSubstitute");
             g_fc.font_match = (FcPattern * (*)(void*, FcPattern*, int*)) fa_lib_sym(lib, "FcFontMatch");
+            g_fc.charset_create = (void* (*)(void))fa_lib_sym(lib, "FcCharSetCreate");
+            g_fc.charset_add = (int (*)(void*, uint32_t))fa_lib_sym(lib, "FcCharSetAddChar");
+            g_fc.charset_destroy = (void (*)(void*))fa_lib_sym(lib, "FcCharSetDestroy");
+            g_fc.add_charset = (int (*)(FcPattern*, const char*, const void*))fa_lib_sym(lib, "FcPatternAddCharSet");
+            if (!g_fc.charset_create || !g_fc.charset_add || !g_fc.charset_destroy || !g_fc.add_charset)
+                g_fc.charset_create = NULL;
             if (!g_fc.init || !g_fc.pattern_create || !g_fc.pattern_destroy || !g_fc.add_string || !g_fc.get_string ||
                 !g_fc.get_integer || !g_fc.object_set_build || !g_fc.object_set_destroy || !g_fc.font_list ||
                 !g_fc.font_set_destroy || !g_fc.substitute || !g_fc.default_substitute || !g_fc.font_match || !g_fc.init())
@@ -494,6 +506,34 @@ static int fc_pick(const char* generic, const char* lang, char* out, size_t cap)
         ok = 1;
     }
     if (m) g_fc.pattern_destroy(m);
+    g_fc.pattern_destroy(p);
+    return ok;
+}
+
+/* The family fontconfig picks for a sans-serif font with these characters. */
+static int fc_pick_chars(const uint32_t* cps, uint32_t n, char* out, size_t cap)
+{
+    FcPattern *p, *m = NULL;
+    void* cs;
+    unsigned char* fam = NULL;
+    int result = 0, ok = 0;
+    uint32_t i;
+    if (!g_fc.charset_create || !(p = g_fc.pattern_create())) return 0;
+    cs = g_fc.charset_create();
+    if (cs) {
+        for (i = 0; i < n; i++) g_fc.charset_add(cs, cps[i]);
+        g_fc.add_string(p, "family", (const unsigned char*)"sans-serif");
+        g_fc.add_charset(p, "charset", cs);   /* the pattern keeps its own copy */
+        g_fc.charset_destroy(cs);
+        g_fc.substitute(NULL, p, 0);
+        g_fc.default_substitute(p);
+        m = g_fc.font_match(NULL, p, &result);
+        if (m && g_fc.get_string(m, "family", 0, &fam) == 0 && fam && strlen((const char*)fam) < cap) {
+            memcpy(out, fam, strlen((const char*)fam) + 1);
+            ok = 1;
+        }
+        if (m) g_fc.pattern_destroy(m);
+    }
     g_fc.pattern_destroy(p);
     return ok;
 }
@@ -609,4 +649,69 @@ fa_result fa_font_find_for_language(const char* language, int weight, int italic
         }
     }
     return r;
+}
+
+/* At most this many different characters of the text are asked about. */
+#define FOR_TEXT_MAX 32
+
+fa_result fa_font_find_for_text(const char* text, uint32_t len, int weight, int italic, fa_font** out)
+{
+    best_face b;
+    char family[256];
+    uint32_t cps[FOR_TEXT_MAX], n = 0, i = 0, k;
+    if (!out || (!text && len)) return FA_ERROR_INVALID_ARG;
+    *out = NULL;
+    if (weight < 1) weight = 400;
+    if (weight > 1000) weight = 1000;
+    b.score = -1;
+    /* The text's different characters (spaces and ASCII left out). */
+    while (i < len && n < FOR_TEXT_MAX) {
+        uint32_t cp = fa_text_next_cp(text, len, &i);
+        if (cp < 0x80 || cp == 0xFFFD) continue;
+        for (k = 0; k < n && cps[k] != cp; k++) {}
+        if (k == n) cps[n++] = cp;
+    }
+    if (!n || g_scan_only) return FA_ERROR_NOT_FOUND;
+#if defined(__APPLE__)
+    {
+        /* The font Core Text would draw the text with in place of the UI font. */
+        CTFontRef ui = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, 0.0, NULL);
+        CFStringRef str = CFStringCreateWithBytes(NULL, (const UInt8*)text, (CFIndex)len, kCFStringEncodingUTF8, false);
+        CTFontRef f = ui && str ? CTFontCreateForString(ui, str, CFRangeMake(0, CFStringGetLength(str))) : NULL;
+        if (f) {
+            CFURLRef url = (CFURLRef)CTFontCopyAttribute(f, kCTFontURLAttribute);
+            CFStringRef fam = CTFontCopyFamilyName(f);
+            char path[FIND_MAX_PATH];
+            family[0] = '\0';
+            if (fam) CFStringGetCString(fam, family, sizeof(family), kCFStringEncodingUTF8);
+            if (url && CFURLGetFileSystemRepresentation(url, true, (UInt8*)path, sizeof(path)) && font_ext(path)) {
+                /* Hidden system families start with a dot (".SF Arabic"); the file's
+                 * names do not. */
+                probe_file(&b, path, family[0] == '.' ? family + 1 : family, weight, italic);
+                if (b.score < 0) probe_file(&b, path, NULL, weight, italic);
+            }
+            if (b.score < 0 && family[0] && family[0] != '.') os_family(&b, family, weight, italic);
+            if (url) CFRelease(url);
+            if (fam) CFRelease(fam);
+            CFRelease(f);
+        }
+        if (str) CFRelease(str);
+        if (ui) CFRelease(ui);
+    }
+#elif defined(_WIN32) || defined(__ANDROID__)
+    {
+        /* The OS shaper's own fallback: DirectWrite's (a family) or Android's (a file). */
+        char path[FIND_MAX_PATH];
+        uint32_t index = 0;
+        family[0] = path[0] = '\0';
+        (void)cps;
+        if (fa_text_os_fallback(text, len, weight, italic, family, sizeof(family), path, sizeof(path), &index)) {
+            if (path[0]) return fa_font_open_file(path, index, out);
+            if (family[0]) os_family(&b, family, weight, italic);
+        }
+    }
+#else
+    if (fc_load() && fc_pick_chars(cps, n, family, sizeof(family))) fc_family(&b, family, weight, italic);
+#endif
+    return open_best(&b, out);
 }

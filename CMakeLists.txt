@@ -140,6 +140,8 @@ set(FA_SOURCES
     src/font.c
     src/raster.c
     src/font_find.c
+    src/shape.c
+    src/shape.h
     src/zip.c
     src/tempo.c
     src/resample.c
@@ -171,10 +173,14 @@ if(WIN32)
     # codec_mf.c: Windows Media Audio, AAC and ALAC through Media Foundation
     # (mfplat.dll is loaded at run time, so the library still loads on Windows N).
     list(APPEND FA_SOURCES src/net_https_winhttp.c src/disc_win.c src/codec_mf.c)
+    # shape_dwrite.cpp: text shaping for lyrics through DirectWrite (dwrite.dll is
+    # loaded at run time).
+    list(APPEND FA_SOURCES src/shape_dwrite.cpp)
 elseif(APPLE)
     enable_language(OBJC)
     # codec_at.c: AAC through AudioToolbox.
-    list(APPEND FA_SOURCES src/net_https_apple.m src/disc_mac.c src/codec_at.c)
+    # shape_ct.c: text shaping for lyrics through Core Text.
+    list(APPEND FA_SOURCES src/net_https_apple.m src/disc_mac.c src/codec_at.c src/shape_ct.c)
     # Objective-C files (and miniaudio on iOS) export only fa_*, like the C ones.
     set(CMAKE_OBJC_VISIBILITY_PRESET hidden)
     if(IOS)
@@ -187,9 +193,13 @@ else()
         # net_https_android.c: HTTPS through the app's Java VM (HttpURLConnection,
         # found at run time). codec_mediacodec.c: AAC through MediaCodec
         # (libmediandk.so is loaded at run time).
-        list(APPEND FA_SOURCES src/net_https_android.c src/codec_mediacodec.c)
+        # shape_android.c: text shaping for lyrics through the platform's
+        # TextRunShaper (Android 12 and later), through the app's Java VM.
+        list(APPEND FA_SOURCES src/net_https_android.c src/codec_mediacodec.c src/shape_android.c)
     else()
-        list(APPEND FA_SOURCES src/net_https_curl.c)
+        # shape_hb.c: text shaping for lyrics through the system's HarfBuzz and
+        # FriBidi (loaded at run time).
+        list(APPEND FA_SOURCES src/net_https_curl.c src/shape_hb.c)
     endif()
 endif()
 

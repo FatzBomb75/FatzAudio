@@ -4,6 +4,7 @@
  * found at run time (JNI_GetCreatedJavaVMs, or fa_android_set_java_vm). */
 #if defined(__ANDROID__)
 #include "net.h"
+#include "android_jni.h"
 #include <dlfcn.h>
 #include <jni.h>
 #include <pthread.h>
@@ -62,8 +63,9 @@ static JavaVM* find_vm(void)
 static void detach_thread(void* vm) { (*(JavaVM*)vm)->DetachCurrentThread((JavaVM*)vm); }
 static void env_key_init(void) { pthread_key_create(&g_env_key, detach_thread); }
 
-/* The calling thread's JNIEnv, attaching the thread (a download thread) if needed. */
-static JNIEnv* get_env(void)
+/* The calling thread's JNIEnv, attaching the thread (a download thread, a lyric
+ * surface's worker) if needed (android_jni.h). */
+JNIEnv* fa_android_env(void)
 {
     JavaVM* vm = find_vm();
     JNIEnv* env = NULL;
@@ -75,7 +77,7 @@ static JNIEnv* get_env(void)
     {
         JavaVMAttachArgs args;
         args.version = JNI_VERSION_1_6;
-        args.name = "FatzAudio net";
+        args.name = "FatzAudio";
         args.group = NULL;
         if ((*vm)->AttachCurrentThread(vm, &env, &args) != JNI_OK) return NULL;
     }
@@ -172,7 +174,7 @@ static int load_classes_once(void* env) { return load_classes((JNIEnv*)env) ? 1 
 /* The JNIEnv of this thread once the classes are loaded, else NULL. */
 static JNIEnv* java_ready(void)
 {
-    JNIEnv* env = get_env();
+    JNIEnv* env = fa_android_env();
     if (!env) return NULL;
     return fa_once(&J.state, load_classes_once, env) ? env : NULL;
 }

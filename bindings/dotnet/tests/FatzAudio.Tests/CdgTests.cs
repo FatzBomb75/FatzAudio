@@ -369,6 +369,7 @@ public class CdgTests
         Assert.Equal(SafetyZone.Show, layout.SafetyZone);
         Assert.Equal(1f, layout.Scale);
         Assert.Equal("", layout.FontUsed);
+        Assert.Equal("", layout.TextShaper);
         Assert.Equal(1UL, layout.LayoutRevision);
 
         int stride = 300 * 4 + 8;

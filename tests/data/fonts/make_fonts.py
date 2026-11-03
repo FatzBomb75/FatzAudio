@@ -14,6 +14,10 @@ Every shape is ours and simple, so the tests can say exactly what each glyph cov
   pair.ttc    A collection of tt.ttf and cff.otf.
   bomb.ttf    Composites eight deep, each of 64 copies of the one below, over an empty
               glyph: 64^8 components if nothing stopped it.
+  shape.ttf   For text shaping (src/shape.c): "A", Arabic beh, lam and alef with
+              their joining forms (init, medi, fina) and a lam-alef ligature (rlig),
+              Hebrew alef and bet, and a combining acute placed on "A" (GPOS mark).
+              Every glyph has its own advance, so a test can tell them apart.
 
 Run from this folder; the outputs are committed, so the tests need no Python.
 """
@@ -252,6 +256,55 @@ def build_bomb():
     return fb.font
 
 
+SHAPE_ADV = {".notdef": 500, "space": 250, "A": 600, "acute": 0,
+             "beh": 500, "beh.init": 410, "beh.medi": 420, "beh.fina": 430,
+             "lam": 350, "lam.init": 310, "lam.medi": 320, "lam.fina": 330,
+             "alef": 300, "alef.fina": 290, "lam_alef": 640, "lam_alef.fina": 650,
+             "he_alef": 520, "he_bet": 540}
+SHAPE_CMAP = {0x20: "space", 0x41: "A", 0x301: "acute", 0x628: "beh", 0x644: "lam", 0x627: "alef",
+              0x5D0: "he_alef", 0x5D1: "he_bet"}
+
+
+def build_shape():
+    order = list(SHAPE_ADV)
+    fb = FontBuilder(1000, isTTF=True)
+    fb.setupGlyphOrder(order)
+    fb.setupCharacterMap(SHAPE_CMAP)
+    glyphs = {}
+    for g in order:
+        pen = TTGlyphPen(None)
+        w = SHAPE_ADV[g]
+        if g == "acute":
+            square(pen, -250, 750, -50, 850)               # above, drawn left of its origin
+        elif g != "space":
+            square(pen, 20, 0, w - 20, 400 + w // 2)       # each glyph its own height
+        glyphs[g] = pen.glyph()
+    fb.setupGlyf(glyphs)
+    fb.setupHorizontalMetrics({g: (SHAPE_ADV[g], 0) for g in order})
+    fb.setupHorizontalHeader(ascent=800, descent=-200)
+    fb.setupNameTable({"familyName": "FA Shape", "styleName": "Regular", "psName": "FAShape-Regular"})
+    fb.setupOS2(sTypoAscender=800, sTypoDescender=-200, usWinAscent=900, usWinDescent=200,
+                sxHeight=500, sCapHeight=700, usWeightClass=400, version=4)
+    fb.setupPost()
+    addOpenTypeFeaturesFromString(fb.font, """
+        languagesystem DFLT dflt;
+        languagesystem arab dflt;
+        languagesystem hebr dflt;
+        languagesystem latn dflt;
+        table GDEF {
+            GlyphClassDef [A beh beh.init beh.medi beh.fina lam lam.init lam.medi lam.fina alef alef.fina
+                           he_alef he_bet], [lam_alef lam_alef.fina], [acute], ;
+        } GDEF;
+        feature init { sub beh by beh.init; sub lam by lam.init; } init;
+        feature medi { sub beh by beh.medi; sub lam by lam.medi; } medi;
+        feature fina { sub beh by beh.fina; sub lam by lam.fina; sub alef by alef.fina; } fina;
+        feature rlig { sub lam.init alef.fina by lam_alef; sub lam.medi alef.fina by lam_alef.fina; } rlig;
+        markClass acute <anchor -150 700> @TOP;
+        feature mark { pos base A <anchor 300 700> mark @TOP; } mark;
+    """)
+    return fb.font
+
+
 def main():
     tt = build_tt(False)
     tt.save("tt.ttf")
@@ -263,6 +316,7 @@ def main():
     col.fonts = [TTFont("tt.ttf"), TTFont("cff.otf")]
     col.save("pair.ttc")
     build_bomb().save("bomb.ttf")
+    build_shape().save("shape.ttf")
 
 
 if __name__ == "__main__":

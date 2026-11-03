@@ -26,6 +26,7 @@ One source tree builds one library per platform. Nothing ships beside it: no add
 | Loopback capture (what the PC plays) | ✅ | ➖ | ➖ | ➖ | ➖ |
 | HTTPS | System TLS | System TLS | libcurl (`libcurl.so.4`), loaded at run time | `HttpURLConnection` | URLSession |
 | System GM soundfont for MIDI | `gm.dls` | System bank | An installed `.sf2` | You supply one | You supply one |
+| Lyric text shaping (Arabic, Hebrew, Indic, marks) | DirectWrite (Windows 10 1703+) | Core Text | HarfBuzz and FriBidi (`libharfbuzz.so.0`, `libfribidi.so.0`), loaded at run time | `TextRunShaper` (Android 12+, in an app) | Core Text |
 
 Details: [streams](features/streams.md) (formats), [MIDI](features/midi.md), [discs](features/disc.md), [web streams](features/web-streams.md), [capture](features/callback-capture.md). Playing a codec the platform lacks returns `FA_ERROR_UNSUPPORTED_FORMAT`; see [formats](formats.md).
 

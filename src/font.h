@@ -76,4 +76,11 @@ fa_result fa_font_outline(const fa_font* font, uint32_t glyph, fa_path* path);
 
 void fa_path_free(fa_path* path);
 
+/* The font file the face reads (the whole collection for a .ttc) and the face's
+ * index in it: for the OS text shaper (shape.c), which reads the same bytes. */
+void fa_font_source(const fa_font* font, const uint8_t** data, size_t* size, uint32_t* index);
+/* Where shape.c keeps its state for this face (NULL until it makes some); freed
+ * with fa_shape_release when the font closes. */
+void** fa_font_shaper_slot(fa_font* font);
+
 #endif

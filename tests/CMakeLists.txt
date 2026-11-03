@@ -263,6 +263,11 @@ if(UNIX)
 endif()
 add_test(NAME font COMMAND fa_test_font)
 
+add_executable(fa_test_shape test_shape.c)
+target_compile_definitions(fa_test_shape PRIVATE FA_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data")
+target_compile_options(fa_test_shape PRIVATE ${FA_WARNINGS})
+add_test(NAME shape COMMAND fa_test_shape)
+
 add_executable(fa_test_lyric test_lyric.c)
 target_include_directories(fa_test_lyric PRIVATE
     ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/third_party/miniaudio
@@ -477,7 +482,7 @@ add_subdirectory(fuzz)
 foreach(t fa_test_internal fa_test_loudness fa_test_crossfade fa_test_sound fa_test_handoff fa_test_demux
           fa_test_dolby fa_test_aac fa_test_net fa_test_cdg fa_test_disc fa_test_tempo fa_test_ogg
           fa_test_encode fa_test_midi fa_test_tracker fa_test_flac fa_test_asf fa_test_tags fa_test_font
-          fa_test_lyric fa_test_mixer fa_test_sync fa_test_mic fa_test_device fa_test_midi_fx
+          fa_test_lyric fa_test_shape fa_test_mixer fa_test_sync fa_test_mic fa_test_device fa_test_midi_fx
           fa_test_midi_efx fa_test_midi_live)
     target_link_libraries(${t} PRIVATE fa_whitebox)
     # The same static C runtime as those libraries: libopenmpt is C++, and MSVC
