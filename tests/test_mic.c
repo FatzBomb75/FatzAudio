@@ -1821,11 +1821,13 @@ static void test_cue_heard_position(void)
          * happened somewhere between the stamps around it, so the gap between the two
          * reads is known to within those stamps: only an error beyond that counts. A
          * clock holds at the end of what was rendered, so reads later than the undelayed
-         * mixer's latency after `now` (a busy machine) are left out. */
+         * mixer's latency after `now` (a busy machine) are left out. While the clock
+         * glides over a smoothing step (device.c, `cb_slew`) it runs at 0.5x to 1.5x
+         * real time for one callback, so the stamps allow 1.5 times their span. */
         if (t[6] - now < db) {
-            double dc = fabs((double)(cb - ca - (t[1] - t[0])) / 1e6 - delay_ms) - (double)(t[2] - t[0]) / 1e6;
-            double dg = fabs((double)(fb_.time - fa_.time - (t[3] - t[2])) / 1e6 - delay_ms) - (double)(t[4] - t[2]) / 1e6;
-            double dy = fabs((double)(yb - ya - (t[5] - t[4])) / 1e6 - delay_ms) - (double)(t[6] - t[4]) / 1e6;
+            double dc = fabs((double)(cb - ca - (t[1] - t[0])) / 1e6 - delay_ms) - 1.5 * (double)(t[2] - t[0]) / 1e6;
+            double dg = fabs((double)(fb_.time - fa_.time - (t[3] - t[2])) / 1e6 - delay_ms) - 1.5 * (double)(t[4] - t[2]) / 1e6;
+            double dy = fabs((double)(yb - ya - (t[5] - t[4])) / 1e6 - delay_ms) - 1.5 * (double)(t[6] - t[4]) / 1e6;
             if (dc > worst_clock) worst_clock = dc;
             if (dg > worst_cdg) worst_cdg = dg;
             if (dy > worst_lyric) worst_lyric = dy;
