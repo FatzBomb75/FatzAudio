@@ -87,7 +87,7 @@ static void serve_one(int c)
     char req[8192], path[1024] = "";
     size_t got = 0;
     int mode;
-    const uint8_t *body, *list;
+    uint8_t *body = NULL, *list = NULL;
     size_t body_n, list_n;
     while (got < sizeof(req) - 1) {
         ssize_t k = recv(c, req + got, sizeof(req) - 1 - got, 0);
@@ -97,9 +97,16 @@ static void serve_one(int c)
         if (strstr(req, "\r\n\r\n")) break;
     }
     sscanf(req, "GET %1023s", path);
+    /* Copies: the input's bytes are freed once its open ends, which may be while a
+     * late request from it is still being answered here. */
     fa_mutex_lock(&g_lock);
-    mode = g_mode; body = g_body; body_n = g_body_n; list = g_list; list_n = g_list_n;
+    mode = g_mode; body_n = g_body_n; list_n = g_list_n;
+    body = (uint8_t*)malloc(body_n ? body_n : 1);
+    list = (uint8_t*)malloc(list_n ? list_n : 1);
+    if (body && body_n) memcpy(body, g_body, body_n);
+    if (list && list_n) memcpy(list, g_list, list_n);
     fa_mutex_unlock(&g_lock);
+    if (!body || !list) mode = 0;
     if (mode == 1) {
         send_all(c, body, body_n);
     } else if (mode == 2) {
@@ -109,6 +116,8 @@ static void serve_one(int c)
         if (pl >= 5 && strcmp(path + pl - 5, ".m3u8") == 0) serve_ranged(c, req, list, list_n, "application/vnd.apple.mpegurl");
         else serve_ranged(c, req, body, body_n, "video/mp2t");
     }
+    free(body);
+    free(list);
 }
 
 /* One connection at a time: every reply ends with the connection closed. (A stream's side request for an index waits for
@@ -165,7 +174,7 @@ static void watchdog_main(void* arg)
     }
 }
 
-static void play_url(const uint8_t* data, size_t size, int mode, const uint8_t* list, size_t list_n)
+static void play_url_on(const uint8_t* data, size_t size, int mode, const uint8_t* list, size_t list_n)
 {
     char url[64];
     fa_open_options o;
@@ -215,6 +224,15 @@ static void play_url(const uint8_t* data, size_t size, int mode, const uint8_t* 
         fa_stream_read(s, buf, n, &got);
     }
     fa_stream_close(s);
+}
+
+/* The server serves the input only while its open runs: after that the bytes are freed. */
+static void play_url(const uint8_t* data, size_t size, int mode, const uint8_t* list, size_t list_n)
+{
+    play_url_on(data, size, mode, list, list_n);
+    fa_mutex_lock(&g_lock);
+    g_mode = 0; g_body = NULL; g_body_n = 0; g_list = NULL; g_list_n = 0;
+    fa_mutex_unlock(&g_lock);
 }
 #endif /* !_WIN32 */
 
