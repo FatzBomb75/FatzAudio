@@ -1227,7 +1227,7 @@ FA_API fa_result FA_CALL fa_tags_get_info(const fa_tags* tags, fa_stream_info* o
 
 ### Transport and position
 
-Functions: `fa_stream_attach`, `fa_stream_detach`, `fa_stream_play`, `fa_stream_play_at`, `fa_stream_pause`, `fa_stream_stop`, `fa_stream_get_state`, `fa_stream_seek`, `fa_stream_seek_async`, `fa_stream_get_position`, `fa_stream_set_loop`, `fa_stream_get_loop`, `fa_stream_set_reverse`, `fa_stream_get_reverse`, `fa_stream_set_mute`, `fa_stream_get_mute`, `fa_stream_get_clock`, `fa_stream_get_stats`, `fa_stream_read`
+Functions: `fa_stream_attach`, `fa_stream_detach`, `fa_stream_play`, `fa_stream_play_at`, `fa_stream_pause`, `fa_stream_stop`, `fa_stream_get_state`, `fa_stream_seek`, `fa_stream_seek_async`, `fa_stream_get_position`, `fa_stream_set_loop`, `fa_stream_get_loop`, `fa_stream_set_reverse`, `fa_stream_get_reverse`, `fa_stream_set_mute`, `fa_stream_get_mute`, `fa_stream_get_clock`, `fa_monotonic_time`, `fa_stream_get_clock_at`, `fa_stream_get_stats`, `fa_stream_read`
 
 ```c
 /* Routes a stream to a device, through `bus` (fa_bus_create) or straight into the
@@ -1339,6 +1339,47 @@ FA_API fa_result FA_CALL fa_stream_get_mute(fa_stream* stream, int32_t* out_mute
  * called every vsync (240 Hz and more) from any thread. Push and packet streams
  * that are not attached take the stream's lock briefly. */
 FA_API fa_result FA_CALL fa_stream_get_clock(fa_stream* stream, fa_time* out_pts);
+
+/* The engine's monotonic time in nanoseconds, the time base of
+ * fa_stream_get_clock_at. It never jumps with the wall clock. Per OS it is the
+ * clock your presentation timestamps already come from:
+ *
+ *   Windows        QueryPerformanceCounter: ns = ticks / freq * 1e9 + ticks % freq
+ *                  * 1e9 / freq (exact, in 64-bit integers). The same ticks as .NET
+ *                  Stopwatch.GetTimestamp(), DXGI_FRAME_STATISTICS.SyncQPCTime and
+ *                  QueryPerformanceFrequency's freq.
+ *   macOS, iOS     mach_absolute_time in ns (CLOCK_UPTIME_RAW; it stops while the
+ *                  machine sleeps). CADisplayLink.targetTimestamp and CVDisplayLink
+ *                  host times: seconds * 1e9, or mach ticks * numer / denom from
+ *                  mach_timebase_info.
+ *   Linux, Android CLOCK_MONOTONIC. Android Choreographer frameTimeNanos and
+ *                  System.nanoTime() as they are.
+ *
+ * Lock-free and cheap. */
+FA_API int64_t FA_CALL fa_monotonic_time(void);
+
+/* The presentation clock at a given monotonic time (fa_monotonic_time's base):
+ * the timestamp that is leaving the speaker at that moment. Pass the time your
+ * frame will be shown (the next vsync), not the time you happen to draw it, and
+ * the picture lines up with the sound however late in the frame you render.
+ *
+ * - Now: exactly fa_stream_get_clock. Past times: the timestamp heard then, from
+ *   the clock's history (a few seconds; older times read the oldest time kept),
+ *   placed with the device timing of now, so within a ms or so of what
+ *   fa_stream_get_clock read then (more after a latency change).
+ * - Future times: the device frame heard then is often past the audio mixed so far
+ *   (the device buffer runs out ahead of a vsync two frames away). While the
+ *   stream is playing, the clock runs on past the mixed audio at the current rate
+ *   (tempo and pitch included), for at most the part of the time that lies ahead
+ *   and never more than 250 ms; further out it holds. It is a prediction: a pause,
+ *   seek, stall or tempo change that is not mixed yet is not in it. A paused,
+ *   stalled or ended stream holds as fa_stream_get_clock does.
+ * - Streams that are not on a device (file streams, detached push streams) do not
+ *   move with time: the same answer as fa_stream_get_clock.
+ *
+ * Same cost and locking as fa_stream_get_clock: no lock for attached and file
+ * streams, safe every vsync from any thread. INT64_MIN is FA_ERROR_INVALID_ARG. */
+FA_API fa_result FA_CALL fa_stream_get_clock_at(fa_stream* stream, int64_t monotonic_ns, fa_time* out_pts);
 
 /* How well the decode workers keep up with a stream, for a diagnostics panel or to
  * back off (render-ahead, effects, extra streams) when audio runs short. Set

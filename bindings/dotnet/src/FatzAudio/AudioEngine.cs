@@ -124,6 +124,45 @@ public sealed partial class AudioEngine : IDisposable
     }
 
     /// <summary>
+    /// The engine's monotonic time in nanoseconds: the time base of <see cref="AudioStream.GetClockAt(long)"/>.
+    /// It never jumps with the wall clock.
+    /// </summary>
+    /// <remarks>
+    /// It runs on the same counter as <see cref="System.Diagnostics.Stopwatch"/> on every platform (QueryPerformanceCounter
+    /// on Windows, mach_absolute_time on macOS and iOS, CLOCK_MONOTONIC on Linux and Android), so a
+    /// <see cref="System.Diagnostics.Stopwatch.GetTimestamp"/> value, a DXGI <c>SyncQPCTime</c>, a CADisplayLink or
+    /// Choreographer frame time converts with <see cref="MonotonicTimeFromStopwatch(long)"/> or a plain unit change.
+    /// Cheap and lock-free.
+    /// </remarks>
+    public static long MonotonicTime
+    {
+        get
+        {
+            NativeLoader.EnsureInitialized();
+            return NativeMethods.fa_monotonic_time();
+        }
+    }
+
+    /// <summary>
+    /// Converts a <see cref="System.Diagnostics.Stopwatch.GetTimestamp"/> value (or a Windows QPC count, such as DXGI
+    /// present statistics' <c>SyncQPCTime</c>) to <see cref="MonotonicTime"/> nanoseconds, exactly, in integers.
+    /// </summary>
+    /// <param name="timestamp">Stopwatch ticks.</param>
+    /// <returns>The same moment in <see cref="MonotonicTime"/>'s base.</returns>
+    /// <example>
+    /// <code>
+    /// // the moment the next frame is shown, from your own frame pacing
+    /// long nextVsync = Stopwatch.GetTimestamp() + framePeriodTicks;
+    /// TimeSpan heard = song.GetClockAt(AudioEngine.MonotonicTimeFromStopwatch(nextVsync));
+    /// </code>
+    /// </example>
+    public static long MonotonicTimeFromStopwatch(long timestamp)
+    {
+        long f = System.Diagnostics.Stopwatch.Frequency;
+        return timestamp / f * 1_000_000_000L + timestamp % f * 1_000_000_000L / f;
+    }
+
+    /// <summary>
     /// Every format the native library can open. All formats are built in and detected from the
     /// content, so there is nothing to load or register (unlike BASS plugins).
     /// </summary>

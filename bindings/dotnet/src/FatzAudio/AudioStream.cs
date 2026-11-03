@@ -626,6 +626,38 @@ public unsafe partial class AudioStream : IDisposable
     }
 
     /// <summary>
+    /// The presentation clock at a given moment: the timestamp leaving the speaker at <paramref name="monotonicNs"/>
+    /// (<see cref="AudioEngine.MonotonicTime"/>'s base). Pass the time your frame will be shown, such as the next
+    /// vsync, and the picture lines up with the sound however late in the frame you draw it.
+    /// </summary>
+    /// <param name="monotonicNs">The moment, in <see cref="AudioEngine.MonotonicTime"/> nanoseconds
+    /// (<see cref="AudioEngine.MonotonicTimeFromStopwatch(long)"/> converts a Stopwatch timestamp).</param>
+    /// <returns>The stream time heard at that moment.</returns>
+    /// <remarks>
+    /// Now is exactly <see cref="Clock"/>; a past time reads the clock's history (a few seconds), within a ms or so of what
+    /// <see cref="Clock"/> read then. A future time past the
+    /// audio mixed so far runs on at the current rate while the stream plays, for at most the part of the time
+    /// that lies ahead and never more than 250 ms, then holds: a prediction that leaves out a pause, seek or tempo
+    /// change not mixed yet. Paused, stalled and ended streams hold, as <see cref="Clock"/> does; streams that are not
+    /// on a device give the same answer at any time. Same cost as <see cref="Clock"/>: lock-free for streams on a
+    /// device and file streams, safe every vsync.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="monotonicNs"/> is <see cref="long.MinValue"/>.</exception>
+    /// <exception cref="ObjectDisposedException">The stream was disposed.</exception>
+    /// <example>
+    /// <code>
+    /// long shownAt = AudioEngine.MonotonicTime + 16_666_667;   // the next 60 Hz frame
+    /// var frame = surface.UpdateInto(pixels, stride, width, height, revision, song.GetClockAt(shownAt));
+    /// </code>
+    /// </example>
+    public TimeSpan GetClockAt(long monotonicNs)
+    {
+        if (monotonicNs == long.MinValue) throw new ArgumentOutOfRangeException(nameof(monotonicNs));
+        FatzAudioException.ThrowIfFailed(NativeMethods.fa_stream_get_clock_at(Handle, monotonicNs, out long ns));
+        return TimeConvert.FromNanoseconds(ns);
+    }
+
+    /// <summary>
     /// How well the decode workers keep up with this stream: its dropouts so far and the decoded audio ready ahead.
     /// Use it in a diagnostics panel, or to back off (render-ahead, effects, extra streams) when
     /// <see cref="StreamStats.Underruns"/> goes up.

@@ -3167,17 +3167,36 @@ int64_t fa_stream_clock_at(struct fa_stream* s, int64_t now_ns)
     return clock_of_position(s);
 }
 
+/* fa_stream_get_clock_at for a time ahead of now: the device frame heard then, and
+ * past the audio mixed so far the clock runs on (while the stream is being mixed)
+ * for at most the part of the time that lies in the future, up to 250 ms. */
+#define FA_CLOCK_AHEAD_MAX_NS 250000000
+static int64_t clock_on_device_ahead(struct fa_stream* s, fa_device* dev, int64_t at_ns, int64_t now_ns)
+{
+    int64_t ahead_ns = at_ns - now_ns;
+    double frame = fa_device_speaker_frame(dev, at_ns);
+    /* Only a playing stream runs on: one just paused or stalled still has a record
+     * reaching the last callback's end until the next callback completes. */
+    if (ahead_ns <= 0 || frame < 0.0 || fa_load32(&s->state) != FA_STATE_PLAYING) return fa_clock_at(&s->clock, frame);
+    if (ahead_ns > FA_CLOCK_AHEAD_MAX_NS) ahead_ns = FA_CLOCK_AHEAD_MAX_NS;
+    return fa_clock_at_ahead(&s->clock, frame, fa_load64(&dev->clock), (double)ahead_ns * (double)dev->rate / 1e9);
+}
+
 /* No lock while attached or for file streams: a render loop calls this every vsync,
  * and must not wait behind a seek (which holds api_lock while it refills) or a
  * worker. Detached push streams read their carry, which the API lock guards. */
 /* wait 0: FA_ERROR_BUSY instead of waiting for a detached push stream's api_lock. */
-static fa_result get_clock(fa_stream* stream, fa_time* out_pts, int wait)
+/* at_ns: the monotonic time asked for; INT64_MIN = now (fa_stream_get_clock). */
+static fa_result get_clock(fa_stream* stream, int64_t at_ns, fa_time* out_pts, int wait)
 {
     fa_device* dev;
     if ((*out_pts = pending_clock(stream)) >= 0) return FA_OK;
     fa_fetch_add32(&stream->clock_readers, 1);
     dev = (fa_device*)fa_load_ptr(&stream->clock_device);
-    if (dev) *out_pts = clock_on_device(stream, dev, fa_monotonic_ns());
+    if (dev) {
+        int64_t now = fa_monotonic_ns();
+        *out_pts = at_ns == INT64_MIN ? clock_on_device(stream, dev, now) : clock_on_device_ahead(stream, dev, at_ns, now);
+    }
     fa_fetch_add32(&stream->clock_readers, -1);
     if (dev) return FA_OK;
     if (!stream->push) {
@@ -3198,12 +3217,23 @@ static fa_result get_clock(fa_stream* stream, fa_time* out_pts, int wait)
 FA_API fa_result FA_CALL fa_stream_get_clock(fa_stream* stream, fa_time* out_pts)
 {
     if (!stream || !out_pts) return FA_ERROR_INVALID_ARG;
-    return get_clock(stream, out_pts, 1);
+    return get_clock(stream, INT64_MIN, out_pts, 1);
+}
+
+FA_API fa_result FA_CALL fa_stream_get_clock_at(fa_stream* stream, int64_t monotonic_ns, fa_time* out_pts)
+{
+    if (!stream || !out_pts || monotonic_ns == INT64_MIN) return FA_ERROR_INVALID_ARG;
+    return get_clock(stream, monotonic_ns, out_pts, 1);
+}
+
+FA_API int64_t FA_CALL fa_monotonic_time(void)
+{
+    return fa_monotonic_ns();
 }
 
 fa_result fa_stream_get_clock_nowait(struct fa_stream* s, fa_time* out_pts)
 {
-    return get_clock(s, out_pts, 0);
+    return get_clock(s, INT64_MIN, out_pts, 0);
 }
 
 FA_API fa_result FA_CALL fa_stream_get_stats(fa_stream* stream, fa_stream_stats* out_stats)

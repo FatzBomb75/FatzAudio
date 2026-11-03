@@ -6,7 +6,9 @@
  * speaker is "callback start frame + elapsed time - latency"; looking it up in the
  * records gives its timestamp. Pauses, stalls and the end need no special cases:
  * between records the clock holds at the last timestamp that played, and before
- * the first record after a seek it holds at the seek target. */
+ * the first record after a seek it holds at the seek target. A time asked for
+ * ahead of the mixed audio (fa_stream_get_clock_at) can run on past the last record
+ * instead: fa_clock_at_ahead. */
 #include "fa_internal.h"
 #include <string.h>
 
@@ -75,7 +77,10 @@ static int read_rec(fa_clock* c, int64_t k, int64_t* dev, int64_t* n, int64_t* p
     return s1 == s2 && fa_load64(&r->idx) == k;
 }
 
-int64_t fa_clock_at(fa_clock* c, double frame)
+/* `ahead` > 0: past the end of the newest record, while that record reaches
+ * `live_from` (the stream was mixed through the last callback), the clock runs on
+ * at that record's rate for up to `ahead` frames instead of holding. */
+int64_t fa_clock_at_ahead(fa_clock* c, double frame, int64_t live_from, double ahead)
 {
     for (;;) {
         int32_t e1 = fa_load32(&c->epoch);
@@ -95,7 +100,14 @@ int64_t fa_clock_at(fa_clock* c, double frame)
                 break;
             }
             if ((double)dev <= frame) {
-                if (frame >= (double)(dev + n)) result = p1;    /* after it: holds at its end */
+                if (frame >= (double)(dev + n)) {
+                    result = p1;                                /* after it: holds at its end */
+                    if (ahead > 0.0 && k == cnt - 1 && dev + n >= live_from) {
+                        double past = frame - (double)(dev + n);
+                        if (past > ahead) past = ahead;
+                        result = p1 + (int64_t)((double)(p1 - p0) * past / (double)n);
+                    }
+                }
                 else result = p0 + (int64_t)((double)(p1 - p0) * (frame - (double)dev) / (double)n);
                 found = 1;
                 break;
@@ -110,6 +122,11 @@ int64_t fa_clock_at(fa_clock* c, double frame)
         if (!found && have_oldest && cnt > FA_CLOCK_HISTORY) result = oldest_pts;
         if (fa_load32(&c->epoch) == e1) return result;
     }
+}
+
+int64_t fa_clock_at(fa_clock* c, double frame)
+{
+    return fa_clock_at_ahead(c, frame, 0, 0.0);
 }
 
 int64_t fa_clock_mixed_end(fa_clock* c)

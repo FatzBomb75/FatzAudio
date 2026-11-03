@@ -1652,6 +1652,124 @@ static void test_clock_never_waits_for_api_lock(void)
     fa_stream_close(s);
 }
 
+/* fa_clock_at_ahead on hand-made records (48 kHz, 4800 frames = 100 ms). */
+static void test_clock_ahead_runs_on_while_live(void)
+{
+    static fa_clock c;
+    int i;
+    fa_clock_reset(&c, 0);
+    fa_clock_record(&c, 0, 4800, 0, 100000000);
+    /* Live (the record reaches the last callback's end): runs on at its rate. */
+    CHECK_EQ(fa_clock_at_ahead(&c, 7200.0, 4800, 4800.0), 150000000);
+    CHECK_EQ(fa_clock_at_ahead(&c, 2400.0, 4800, 4800.0), 50000000);      /* inside: as fa_clock_at */
+    /* Capped at `ahead` frames past the record, then holds. */
+    CHECK_EQ(fa_clock_at_ahead(&c, 9600.0, 4800, 1200.0), 125000000);
+    /* Not mixed in the last callback (paused, stalled, ended): holds. */
+    CHECK_EQ(fa_clock_at_ahead(&c, 7200.0, 9600, 4800.0), 100000000);
+    CHECK_EQ(fa_clock_at(&c, 7200.0), 100000000);
+    /* A tempo change: the newest record's rate (1.3x) carries on. */
+    fa_clock_record(&c, 4800, 4800, 100000000, 230000000);
+    CHECK_EQ(fa_clock_at_ahead(&c, 9600.0 + 2400.0, 9600, 4800.0), 295000000);
+    /* A gap between records holds at the older one's end, ahead or not. */
+    fa_clock_reset(&c, 0);
+    fa_clock_record(&c, 0, 4800, 0, 100000000);
+    fa_clock_record(&c, 9600, 4800, 100000000, 200000000);
+    CHECK_EQ(fa_clock_at_ahead(&c, 7200.0, 14400, 4800.0), 100000000);
+    /* Older than the history kept: the oldest start, as fa_clock_at. */
+    fa_clock_reset(&c, 0);
+    for (i = 0; i < FA_CLOCK_HISTORY + 5; i++)
+        fa_clock_record(&c, (int64_t)i * 9600, 4800, (int64_t)i * 100000000, (int64_t)i * 100000000 + 100000000);
+    CHECK_EQ(fa_clock_at_ahead(&c, 0.0, 0, 4800.0), 500000000);
+    CHECK_EQ(fa_clock_at(&c, 0.0), 500000000);
+}
+
+/* A late callback pulls the smoothed callback time later; the speaker frame read at
+ * one moment must not be smaller after that callback published than before. */
+static void test_speaker_frame_never_steps_back(void)
+{
+    fa_device* d = NULL;
+    float out[2 * 480];
+    int64_t t = 1000000000000LL, period = 10000000;
+    double before, after;
+    int i;
+    CHECK_EQ(fa_device_open(g_engine, NULL, &d), FA_OK);
+    if (!d) return;
+    for (i = 0; i < 5; i++) {   /* on time: 480 frames every 10 ms at 48 kHz */
+        fa_device_render_at(d, out, d->rate / 100, t);
+        t += period;
+    }
+    t += 8000000;               /* 8 ms late */
+    before = fa_device_speaker_frame(d, t);
+    fa_device_render_at(d, out, d->rate / 100, t);
+    after = fa_device_speaker_frame(d, t);
+    printf("  speaker frame before %.3f after %.3f\n", before, after);
+    CHECK(after >= before - 1e-6);
+    /* Monotonic through the glide, and the glide is over after one callback. */
+    for (i = 1; i <= 10; i++) {
+        double f = fa_device_speaker_frame(d, t + period * i / 10);
+        CHECK(f >= after);
+        after = f;
+    }
+    CHECK_NEAR(fa_device_speaker_frame(d, t + 2 * period) - fa_device_speaker_frame(d, t + period),
+               (double)d->rate / 100, 1e-6);
+    /* An early callback: a step forward, glided too, still monotonic. */
+    t += period - 6000000;
+    before = fa_device_speaker_frame(d, t);
+    fa_device_render_at(d, out, d->rate / 100, t);
+    printf("  early: before %.3f after %.3f\n", before, fa_device_speaker_frame(d, t));
+    CHECK(fa_device_speaker_frame(d, t) >= before - 1e-6);
+    fa_device_close(d);
+}
+
+/* fa_stream_get_clock_at: now matches fa_stream_get_clock, a time ahead runs on
+ * past the mixed audio while playing (capped at 250 ms past it). */
+static void test_clock_at_given_time(void)
+{
+    fa_stream* s = open_attached(g_dev->rate * 3, 0, 0);
+    fa_stream* file = NULL;
+    float out[2 * 480];
+    fa_time now_clock = 0, at_now = 0, ahead = 0, far = 0, plain = 0, latency = 0;
+    int64_t t0;
+    int i;
+    CHECK(s != NULL);
+    if (!s) return;
+    CHECK_EQ(fa_stream_get_clock_at(NULL, 0, &now_clock), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_get_clock_at(s, INT64_MIN, &now_clock), FA_ERROR_INVALID_ARG);
+    CHECK_EQ(fa_stream_play(s), FA_OK);
+    fa_device_get_latency(g_dev, &latency);
+    for (i = 0; i < 30; i++) {
+        int j;
+        for (j = 0; j < 2000 && fa_ring_readable(&s->ring) < 480 && !fa_load32(&s->eof); j++) fa_sleep_ms(1);
+        fa_fetch_add64(&g_dev->epoch, 1);
+        fa_device_render_at(g_dev, out, 480, fa_monotonic_ns());
+        fa_fetch_add64(&g_dev->epoch, 1);
+    }
+    t0 = fa_monotonic_ns();
+    CHECK_EQ(fa_stream_get_clock(s, &now_clock), FA_OK);
+    CHECK_EQ(fa_stream_get_clock_at(s, t0, &at_now), FA_OK);
+    CHECK_EQ(fa_stream_get_clock_at(s, t0 + 100000000, &ahead), FA_OK);
+    CHECK_EQ(fa_stream_get_clock_at(s, t0 + 5000000000LL, &far), FA_OK);
+    printf("  latency %.1f ms: now %.3f ms, at t0 %.3f, +100 ms %.3f, +5 s %.3f\n", latency / 1e6, now_clock / 1e6,
+           at_now / 1e6, ahead / 1e6, far / 1e6);
+    CHECK(llabs(at_now - now_clock) < 2000000);
+    CHECK(llabs(ahead - at_now - 100000000) < 2000000);   /* ran on, not frozen at the mixed end */
+    CHECK(far > ahead);
+    CHECK(far - at_now < 500000000);                       /* held 250 ms past the mixed audio */
+    /* A past time inside the history. */
+    CHECK_EQ(fa_stream_get_clock_at(s, t0 - 50000000, &plain), FA_OK);
+    CHECK(llabs(at_now - plain - 50000000) < 2000000);
+    fa_stream_close(s);
+    /* Not on a device: the same answer at any time. */
+    file = open_attached(g_dev->rate, 0, 0);
+    CHECK(file != NULL);
+    if (!file) return;
+    CHECK_EQ(fa_stream_detach(file), FA_OK);
+    CHECK_EQ(fa_stream_get_clock(file, &plain), FA_OK);
+    CHECK_EQ(fa_stream_get_clock_at(file, fa_monotonic_time() + 1000000000, &ahead), FA_OK);
+    CHECK_EQ(ahead, plain);
+    fa_stream_close(file);
+}
+
 /* Peak amplitude of the left channel over `n` frames. */
 static float peak_left(const float* out, uint32_t n)
 {
@@ -2280,6 +2398,9 @@ int main(void)
     RUN(test_device_mute);
     RUN(test_clock_never_waits_for_api_lock);
     RUN(test_clock_during_attach_detach);
+    RUN(test_clock_ahead_runs_on_while_live);
+    RUN(test_speaker_frame_never_steps_back);
+    RUN(test_clock_at_given_time);
     RUN(test_eq_peak_band_and_bypass);
     RUN(test_eq_change_is_smooth);
     RUN(test_eq_memory_cleared_on_seek);

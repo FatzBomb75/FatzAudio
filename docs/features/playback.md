@@ -97,6 +97,7 @@ The call also waits for the audio callback in progress to finish, at most one de
 
 - `fa_stream_get_position`: source frames handed to the device. Frames decoded ahead into the buffer don't count.
 - `fa_stream_get_clock`: the presentation clock, the time of the audio leaving the speaker now, device latency included. It moves smoothly between audio callbacks, holds while paused, buffering or ended, and jumps on a seek. Sync video, CD+G and lyrics to it. Push and packet streams report your own timestamps ([FFmpeg hand-off](ffmpeg.md#following-the-clock-with-the-video)). It is lock-free for streams on a device and for file streams: it never waits for a seek, a decode worker or the audio thread, so a render loop can call it every vsync, even at 240 Hz. Only a push or packet stream that isn't attached takes the stream's lock, briefly.
+- `fa_stream_get_clock_at(s, monotonic_ns, &pts)` (.NET `GetClockAt`): the same clock at a moment you choose, in the time base of `fa_monotonic_time()` (.NET `AudioEngine.MonotonicTime`). Pass the time your frame will be shown, such as the next vsync, so the picture matches what is heard then however late in the frame you draw. See [Clock at a given time](#clock-at-a-given-time).
 - `fa_device_get_time` (.NET `OutputDevice.Time`): the device clock, the audio the device has mixed since it opened. Scheduled starts and ramps use it ([crossfade](crossfade.md#the-device-clock)).
 
 ```c
@@ -109,6 +110,39 @@ fa_stream_get_clock(s, &clock);
 TimeSpan pos = song.Position;
 TimeSpan clock = song.Clock;  // for video/lyrics sync
 ```
+
+## Clock at a given time
+
+A renderer draws a frame now and shows it at the next vsync, one or two frames later. Ask the clock for the time the frame is shown, not for now:
+
+```c
+int64_t shown_at = fa_monotonic_time() + 16666667;   /* or the vsync time your display API reports */
+fa_time heard;
+fa_stream_get_clock_at(s, shown_at, &heard);
+fa_cdg_surface_update_at(surface, heard, &frame);
+```
+
+```csharp
+long shownAt = AudioEngine.MonotonicTime + 16_666_667;
+TimeSpan heard = song.GetClockAt(shownAt);
+```
+
+How it answers:
+
+- **Now or a past time**: now is exactly `fa_stream_get_clock`. A past time reads the clock's history (a few seconds; older times read the oldest time kept) placed with today's device timing, so it is within a ms or so of what `fa_stream_get_clock` read then (more after a latency change).
+- **A future time**: the audio heard then is often not mixed yet, since the device buffer ends a few ms ahead. While the stream plays, the clock runs on at the current rate (tempo and pitch included) past the mixed audio, for at most the part of the time that lies ahead and never more than 250 ms; further out it holds. It is a prediction: a pause, seek, stall or tempo change that is not mixed yet is not in it, and the next read corrects it.
+- **Paused, stalled or ended**: holds, as `fa_stream_get_clock` does. Streams not on a device (file streams, detached push streams) give the same answer at any time.
+- Same cost as `fa_stream_get_clock`: lock-free for streams on a device and file streams, fine every vsync.
+
+### The time base per OS
+
+`fa_monotonic_time()` is the counter your display timestamps already use, so they convert with a unit change:
+
+| OS | Base | Converting your times |
+|---|---|---|
+| Windows | QueryPerformanceCounter | ns = ticks / freq × 10⁹ + ticks % freq × 10⁹ / freq, in 64-bit integers (`freq` from QueryPerformanceFrequency). Works for `Stopwatch.GetTimestamp()` and DXGI `DXGI_FRAME_STATISTICS.SyncQPCTime`. .NET: `AudioEngine.MonotonicTimeFromStopwatch(ticks)`. |
+| macOS, iOS | `mach_absolute_time` (`CLOCK_UPTIME_RAW`, stops while asleep) | CADisplayLink `targetTimestamp` and `CACurrentMediaTime()`: seconds × 10⁹. CVDisplayLink `CVTimeStamp.hostTime`: ticks × numer / denom from `mach_timebase_info`. .NET `Stopwatch` uses the same counter. |
+| Linux, Android | `CLOCK_MONOTONIC` | Android `Choreographer` `frameTimeNanos` and `System.nanoTime()` as they are. .NET `Stopwatch` uses the same counter. |
 
 ## Loop and mute while playing
 

@@ -357,6 +357,7 @@ Pack *n* of a `.cdg` belongs at *n* / 300 seconds of the audio. `fa_cdg_surface_
 - **Tempo and pitch:** the clock is a position in the song, so slower or faster playback moves the graphics with it.
 - **Out-of-sync files:** `fa_stream_set_cdg_offset(song, 150000000)` (`fa_stream_get_cdg_offset`; .NET `CdgOffset`) shows the graphics 150 ms later (negative: earlier).
 - **Your own clock** (rendering a karaoke video, a scrub preview): `fa_cdg_surface_update_at(cdg, time, &frame)` draws the picture at any time you choose. The CD+G offset still applies.
+- **The time of the next vsync**: `fa_cdg_surface_update_at(cdg, t, &frame)` (or `fa_surface_update_into` with that time) with `t` from `fa_stream_get_clock_at(stream, vsync_ns, &t)` draws what will be heard when the frame is shown, not when it is drawn ([clock at a given time](playback.md#clock-at-a-given-time)).
 
 The exact rule, for apps that compare their own decoder frame for frame: at time *t* (in seconds, after subtracting the offset) the picture shows packs [0, ceil(*t* × 300)) applied. Pack *n* occupies [*n*/300, (*n*+1)/300) and counts as soon as its slot starts, so at *t* = 1 s exactly packs 0..299 are applied, and at 1 s + 1 ns packs 0..300. *t* ≤ 0 shows no pack.
 

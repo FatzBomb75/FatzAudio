@@ -14,6 +14,29 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Additions (new functions, new enum values at the end, new fields at the end of a struct that has a
   `struct_size`) are not breaking.
 
+## Unreleased
+
+### Added
+
+- The clock at a given time (karaoke timing step K4, MediaControl request 2): `fa_stream_get_clock_at(stream,
+  monotonic_ns, &pts)` gives the time heard at a moment you choose, such as the next vsync, and `fa_monotonic_time()`
+  gives its time base. Now and past times read the clock's history; a future time past the mixed audio runs on at the
+  current rate while the stream plays (up to 250 ms past it) instead of freezing at the end of the device buffer.
+  .NET: `AudioStream.GetClockAt(long)`, `AudioEngine.MonotonicTime` and `AudioEngine.MonotonicTimeFromStopwatch(long)`.
+
+### Changed
+
+- macOS and iOS: the engine's monotonic time is now `mach_absolute_time` (`CLOCK_UPTIME_RAW`, which stops while the
+  machine sleeps) instead of `CLOCK_MONOTONIC`, so CADisplayLink / CVDisplayLink times and .NET `Stopwatch` timestamps
+  can be passed in as they are. Windows converts QueryPerformanceCounter to ns exactly in integers (it went through
+  a double, which loses nanoseconds after about 100 days of uptime).
+
+### Fixed
+
+- The presentation clock (`fa_stream_get_clock`) could step back by up to about 1 ms when an audio callback arrived
+  late: the smoothed callback time moved later at once. The step is now spread over the next callback, so two reads in
+  a row never go backwards while playing. Seen once as a .NET CI failure in `CdgTests.Surface_FollowsTheAudioClock`.
+
 ## 1.0.0 (release candidate 1.0.0-rc.1)
 
 `FA_VERSION` is 1.0.0 on main. The first package built from it is the prerelease `1.0.0-rc.1`; the stable 1.0.0 follows

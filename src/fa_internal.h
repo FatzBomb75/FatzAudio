@@ -697,6 +697,9 @@ void fa_clock_set_hold(fa_clock* c, int64_t hold_pts);  /* before the first reco
 void fa_clock_record(fa_clock* c, int64_t dev, int64_t n, int64_t pts0, int64_t pts1);
 /* Presentation time at device frame `frame` (fractional). */
 int64_t fa_clock_at(fa_clock* c, double frame);
+/* The same, but past the newest record, if it ends at or after device frame
+ * `live_from`, runs on at its rate for up to `ahead` frames (then holds). */
+int64_t fa_clock_at_ahead(fa_clock* c, double frame, int64_t live_from, double ahead);
 /* The device frame right after the last one recorded, -1 = none since the reset. */
 int64_t fa_clock_mixed_end(fa_clock* c);
 
@@ -1189,6 +1192,7 @@ struct fa_device {
     /* When the last callback started: its first device frame and the (smoothed)
      * monotonic time, seqlocked by cb_seq. The presentation clock interpolates from it. */
     fa_atomic64 cb_seq, cb_frame, cb_time;
+    fa_atomic64 cb_slew, cb_slew_from, cb_slew_ns;   /* the step left to glide over (publish_callback_time) */
     int64_t cb_prev_time;        /* audio thread: smoothing state */
     uint32_t cb_prev_frames;
     fa_atomic64 epoch;           /* odd while the audio callback runs */

@@ -229,13 +229,16 @@ void fa_temp_folder_sweep(const char* folder)
     }
     free(wp);
 }
+/* QueryPerformanceCounter, in integers: whole seconds and the remainder apart, so
+ * the result is exact (a double loses nanoseconds after ~100 days of uptime) and
+ * matches Stopwatch.GetTimestamp() * 1e9 / Stopwatch.Frequency done the same way. */
 int64_t fa_monotonic_ns(void)
 {
     static LARGE_INTEGER freq;
     LARGE_INTEGER now;
     if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&now);
-    return (int64_t)((double)now.QuadPart * 1e9 / (double)freq.QuadPart);
+    return now.QuadPart / freq.QuadPart * 1000000000LL + now.QuadPart % freq.QuadPart * 1000000000LL / freq.QuadPart;
 }
 
 #else
@@ -471,11 +474,18 @@ uint32_t fa_cpu_count(void)
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     return n > 0 ? (uint32_t)n : 1;
 }
+/* Apple: mach_absolute_time in ns (CLOCK_UPTIME_RAW, stops while asleep), the base
+ * of CADisplayLink / CVDisplayLink timestamps and .NET's Stopwatch there. Elsewhere
+ * CLOCK_MONOTONIC, the base of Android Choreographer frame times. */
 int64_t fa_monotonic_ns(void)
 {
+#  if defined(__APPLE__)
+    return (int64_t)clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#  else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+#  endif
 }
 #endif
 

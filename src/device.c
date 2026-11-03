@@ -91,18 +91,52 @@ static int limiter_on(fa_engine* e)
 /* Publishes when this callback started, for the presentation clock. Callbacks
  * arrive with a few ms of scheduling jitter while the device consumes frames at an
  * exact rate, so the time is smoothed: predicted from the previous callback and
- * pulled 1/16 of the way toward the measured time (a jump over 20 ms resets it). */
-static void publish_callback_time(fa_device* dev, int64_t frame, int64_t now_ns)
+ * pulled 1/16 of the way toward the measured time (a jump over 20 ms resets it).
+ *
+ * A pull toward a later time would move the speaker frame back by up to ~1 ms at
+ * the moment of publishing (a clock read just before reads more than one just
+ * after). So the step is not taken at once: `cb_slew` (a double, in frames) is the
+ * difference between the previous line and the new one at the moment of
+ * publishing, and readers add it, shrinking to 0 over this callback's length. Steps bigger
+ * than half a callback (a reset) are taken as they are. */
+static int64_t slew_bits(double frames)
 {
-    int64_t t = now_ns;
+    int64_t b;
+    memcpy(&b, &frames, sizeof(b));
+    return b;
+}
+static double slew_at(int64_t bits, int64_t slew_from, int64_t slew_ns, int64_t now_ns)
+{
+    double slew, since = (double)(now_ns - slew_from);
+    memcpy(&slew, &bits, sizeof(slew));
+    if (slew == 0.0 || since >= (double)slew_ns) return 0.0;
+    if (since <= 0.0) return slew;
+    return slew * (1.0 - since / (double)slew_ns);
+}
+static void publish_callback_time(fa_device* dev, int64_t frame, uint32_t frames, int64_t now_ns)
+{
+    int64_t t = now_ns, slew = slew_bits(0.0), slew_ns = dev->rate ? (int64_t)((double)frames * 1e9 / (double)dev->rate) : 0;
     if (dev->cb_prev_time && dev->rate) {
         int64_t expected = dev->cb_prev_time + (int64_t)((double)dev->cb_prev_frames * 1e9 / (double)dev->rate);
         int64_t err = now_ns - expected;
-        if (err > -20000000 && err < 20000000) t = expected + err / 16;
+        if (err > -20000000 && err < 20000000) {
+            /* Only this thread writes these, so it reads them without the seqlock. */
+            int64_t pf = fa_load64(&dev->cb_frame), pt = fa_load64(&dev->cb_time);
+            double old_line, gap;
+            t = expected + err / 16;
+            /* Both lines at this moment (the time readers switch from one to the other). */
+            old_line = (double)pf + (double)(now_ns - pt) * (double)dev->rate / 1e9 +
+                       slew_at(fa_load64(&dev->cb_slew), fa_load64(&dev->cb_slew_from), fa_load64(&dev->cb_slew_ns), now_ns);
+            gap = old_line - ((double)frame + (double)(now_ns - t) * (double)dev->rate / 1e9);
+            if (gap < (double)frames / 2 && gap > -(double)frames / 2) slew = slew_bits(gap);
+        }
     }
     fa_fetch_add64(&dev->cb_seq, 1);
     fa_store64(&dev->cb_frame, frame);
     fa_store64(&dev->cb_time, t);
+    fa_store64(&dev->cb_slew, slew);
+    fa_store64(&dev->cb_slew_from, now_ns);
+    fa_store64(&dev->cb_slew_ns, slew_ns);
     fa_fetch_add64(&dev->cb_seq, 1);
     dev->cb_prev_time = t;
 }
@@ -117,7 +151,7 @@ static void render_block(fa_device* dev, float* out, uint32_t frames, int64_t no
     fa_voice_list* list;
     struct fa_mixer* mixer = (struct fa_mixer*)fa_load_ptr(&dev->mixer);
     uint32_t i;
-    publish_callback_time(dev, fa_load64(&dev->clock), now_ns);
+    publish_callback_time(dev, fa_load64(&dev->clock), frames, now_ns);
     dev->cb_prev_frames = frames;
     dev->xf_busy = !fa_mutex_trylock(&dev->xf_lock);   /* never waits */
     memset(out, 0, (size_t)frames * FA_DEVICE_CHANNELS * sizeof(float));
@@ -759,17 +793,21 @@ FA_API fa_result FA_CALL fa_device_get_time(fa_device* device, fa_time* out_time
 
 double fa_device_speaker_frame(fa_device* dev, int64_t now_ns)
 {
-    int64_t s1, s2, frame, t;
+    int64_t s1, s2, frame, t, slew, slew_from, slew_ns;
     fa_time latency = 0;
     double elapsed;
     do {
         s1 = fa_load64(&dev->cb_seq);
         frame = fa_load64(&dev->cb_frame);
         t = fa_load64(&dev->cb_time);
+        slew = fa_load64(&dev->cb_slew);
+        slew_from = fa_load64(&dev->cb_slew_from);
+        slew_ns = fa_load64(&dev->cb_slew_ns);
         s2 = fa_load64(&dev->cb_seq);
     } while ((s1 & 1) || s1 != s2);
     if (s1 == 0) return -1.0;             /* no callback yet: nothing heard */
     fa_device_get_latency(dev, &latency);
     elapsed = (double)(now_ns - t);   /* may be slightly negative: the smoothed time can run ahead */
-    return (double)frame + (elapsed - (double)latency) * (double)dev->rate / 1e9;
+    return (double)frame + (elapsed - (double)latency) * (double)dev->rate / 1e9 +
+           slew_at(slew, slew_from, slew_ns, now_ns);
 }

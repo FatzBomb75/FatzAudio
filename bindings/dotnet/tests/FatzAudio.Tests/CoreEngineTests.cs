@@ -317,6 +317,31 @@ public class PlaybackTests
     }
 
     [Fact]
+    public async Task GetClockAt_MatchesClockNow_AndRunsAheadWhilePlaying()
+    {
+        Assert.Equal(3_000_000_000L, AudioEngine.MonotonicTimeFromStopwatch(System.Diagnostics.Stopwatch.Frequency * 3));
+        using var engine = CreateHeadless();
+        using var output = engine.OpenOutput();
+        using var s = engine.OpenMemory(TestAudio.SineWav(seconds: 5));
+        Assert.Throws<ArgumentOutOfRangeException>(() => s.GetClockAt(long.MinValue));
+        s.PlayOn(output);
+        await Task.Delay(300);
+        long now = AudioEngine.MonotonicTime;
+        // Same counter as Stopwatch on every platform.
+        Assert.InRange(AudioEngine.MonotonicTimeFromStopwatch(System.Diagnostics.Stopwatch.GetTimestamp()) - now,
+            0L, 50_000_000L);
+        var atNow = s.GetClockAt(now);
+        var ahead = s.GetClockAt(now + 100_000_000);
+        Assert.True(atNow > TimeSpan.Zero);
+        // Runs on past the mixed audio instead of freezing at the end of the device buffer.
+        Assert.InRange((ahead - atNow).TotalMilliseconds, 90, 110);
+        s.Pause();
+        await Task.Delay(300);
+        long later = AudioEngine.MonotonicTime;
+        Assert.Equal(s.GetClockAt(later), s.GetClockAt(later + 100_000_000));   // paused: holds
+    }
+
+    [Fact]
     public async Task Dispose_CancelsPendingRamp()
     {
         using var engine = CreateHeadless();

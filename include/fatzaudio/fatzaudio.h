@@ -1301,6 +1301,47 @@ FA_API fa_result FA_CALL fa_stream_get_mute(fa_stream* stream, int32_t* out_mute
  * that are not attached take the stream's lock briefly. */
 FA_API fa_result FA_CALL fa_stream_get_clock(fa_stream* stream, fa_time* out_pts);
 
+/* The engine's monotonic time in nanoseconds, the time base of
+ * fa_stream_get_clock_at. It never jumps with the wall clock. Per OS it is the
+ * clock your presentation timestamps already come from:
+ *
+ *   Windows        QueryPerformanceCounter: ns = ticks / freq * 1e9 + ticks % freq
+ *                  * 1e9 / freq (exact, in 64-bit integers). The same ticks as .NET
+ *                  Stopwatch.GetTimestamp(), DXGI_FRAME_STATISTICS.SyncQPCTime and
+ *                  QueryPerformanceFrequency's freq.
+ *   macOS, iOS     mach_absolute_time in ns (CLOCK_UPTIME_RAW; it stops while the
+ *                  machine sleeps). CADisplayLink.targetTimestamp and CVDisplayLink
+ *                  host times: seconds * 1e9, or mach ticks * numer / denom from
+ *                  mach_timebase_info.
+ *   Linux, Android CLOCK_MONOTONIC. Android Choreographer frameTimeNanos and
+ *                  System.nanoTime() as they are.
+ *
+ * Lock-free and cheap. */
+FA_API int64_t FA_CALL fa_monotonic_time(void);
+
+/* The presentation clock at a given monotonic time (fa_monotonic_time's base):
+ * the timestamp that is leaving the speaker at that moment. Pass the time your
+ * frame will be shown (the next vsync), not the time you happen to draw it, and
+ * the picture lines up with the sound however late in the frame you render.
+ *
+ * - Now: exactly fa_stream_get_clock. Past times: the timestamp heard then, from
+ *   the clock's history (a few seconds; older times read the oldest time kept),
+ *   placed with the device timing of now, so within a ms or so of what
+ *   fa_stream_get_clock read then (more after a latency change).
+ * - Future times: the device frame heard then is often past the audio mixed so far
+ *   (the device buffer runs out ahead of a vsync two frames away). While the
+ *   stream is playing, the clock runs on past the mixed audio at the current rate
+ *   (tempo and pitch included), for at most the part of the time that lies ahead
+ *   and never more than 250 ms; further out it holds. It is a prediction: a pause,
+ *   seek, stall or tempo change that is not mixed yet is not in it. A paused,
+ *   stalled or ended stream holds as fa_stream_get_clock does.
+ * - Streams that are not on a device (file streams, detached push streams) do not
+ *   move with time: the same answer as fa_stream_get_clock.
+ *
+ * Same cost and locking as fa_stream_get_clock: no lock for attached and file
+ * streams, safe every vsync from any thread. INT64_MIN is FA_ERROR_INVALID_ARG. */
+FA_API fa_result FA_CALL fa_stream_get_clock_at(fa_stream* stream, int64_t monotonic_ns, fa_time* out_pts);
+
 /* How well the decode workers keep up with a stream, for a diagnostics panel or to
  * back off (render-ahead, effects, extra streams) when audio runs short. Set
  * struct_size (sizeof(fa_stream_stats)) first; filled up to it. */
@@ -4046,7 +4087,7 @@ FA_API fa_result FA_CALL fa_device_get_loudness_meter(fa_device* device, double*
 typedef enum fa_spectrum_flags {
     FA_SPECTRUM_LEFT      = 1 << 0,  /* the left channel only (default: both, mixed) */
     FA_SPECTRUM_RIGHT     = 1 << 1,  /* the right channel only */
-    FA_SPECTRUM_NO_WINDOW = 1 << 2   /* no Hann window (BASS_FFT_NOWINDOW) */
+    FA_SPECTRUM_NO_WINDOW = 1 << 2   /* no Hann window (BASS_DATA_FFT_NOWINDOW) */
 } fa_spectrum_flags;
 
 /* The magnitude spectrum of the last `size` frames being heard now, for a
