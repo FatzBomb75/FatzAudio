@@ -2194,6 +2194,206 @@ static void test_mp3_junk(void)
     free(data);
 }
 
+/* ---- AVI (demux_avi.c) --------------------------------------------------------------- */
+
+/* A lossy track of an AVI with a video stream: 2 s of the two sines at 44.1 kHz. */
+static void check_avi_lossy(const char* name, const char* codec, double len_tol)
+{
+    static const int64_t targets[] = { 0, 1, 1151, 1152, 30000, 60000, 3 };
+    fa_stream* s;
+    fa_stream_info info = { .struct_size = sizeof(info) };
+    float* full;
+    int64_t n;
+    double worst;
+    CHECK_EQ(open_file(name, -1, &s), FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.codec, codec) == 0);
+    CHECK(strcmp(info.container, "avi") == 0);
+    CHECK_EQ(info.format.sample_rate, 44100);
+    CHECK_EQ(info.format.channels, 2);
+    CHECK_EQ(info.seekable, 1);
+    full = read_all(s, 2, &n);
+    CHECK_EQ(n, info.length_frames);
+    CHECK_NEAR((double)n, 88200.0, len_tol);
+    CHECK_NEAR(freq(full, 8000, 80000, 2, 44100), 440.0, 2.0);
+    CHECK_NEAR(freq(full + 1, 8000, 80000, 2, 44100), 660.0, 3.0);
+    CHECK_NEAR(rms(full, 8000, 80000, 2), 0.5 * 0.7071, 0.03);
+    CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), strcmp(codec, "aac") == 0 ? AAC_SEEK_TOL : strcmp(codec, "ac3") == 0 ? 1e-3 : 0.0, &worst));   /* AC-3 has no earlier frame to overlap with at 0 */
+    free(full);
+    fa_stream_close(s);
+}
+
+static void test_avi_lossy(void)
+{
+    check_avi_lossy("avi/mp3cbr.avi", "mp3", 2300.0);
+    check_avi_lossy("avi/mp3vbr.avi", "mp3", 2300.0);
+    check_avi_lossy("avi/mp2.avi", "mp2", 2300.0);
+    check_avi_lossy("avi/ac3.avi", "ac3", 2300.0);
+    check_avi_lossy("avi/aac.avi", "aac", 2300.0);
+}
+
+static void test_avi_pcm(void)
+{
+    check_pcm_sine_stereo("avi/pcm16.avi", "avi", "pcm_s16le", 1e-4, 6000);
+    check_pcm_sine_stereo("avi/pcm_u8.avi", "avi", "pcm_u8", 0.012, 6000);
+    check_pcm_sine_stereo("avi/ulaw.avi", "avi", "pcm_mulaw", 0.012, 6000);
+}
+
+/* The same samples whichever way the packets are found: idx1 from the movi list, idx1 from the
+ * file start, no index (walk), wrong RIFF and list sizes, OpenDML with AVIX, AVIX without its index. */
+static void test_avi_index_variants(void)
+{
+    check_pcm_sine_stereo("avi/pcm16_absolute.avi", "avi", "pcm_s16le", 1e-4, 6000);
+    check_pcm_sine_stereo("avi/pcm16_noindex.avi", "avi", "pcm_s16le", 1e-4, 6000);
+    check_pcm_sine_stereo("avi/pcm16_zero_sizes.avi", "avi", "pcm_s16le", 1e-4, 6000);
+    check_pcm_sine_stereo("avi/pcm16_opendml.avi", "avi", "pcm_s16le", 1e-4, 6000);
+    check_pcm_sine_stereo("avi/pcm16_avix_noindex.avi", "avi", "pcm_s16le", 1e-4, 6000);
+}
+
+static void test_avi_tracks(void)
+{
+    fa_stream* s;
+    fa_stream_info info = { .struct_size = sizeof(info) };
+    CHECK_EQ(open_file("avi/two_audio.avi", -1, &s), FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.codec, "mp3") == 0);
+    CHECK_EQ(info.audio_track_count, 2);
+    fa_stream_close(s);
+    CHECK_EQ(open_file("avi/two_audio.avi", 1, &s), FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.codec, "pcm_s16le") == 0);
+    CHECK_EQ(info.format.sample_rate, 8000);
+    CHECK_EQ(info.length_frames, 6000);
+    fa_stream_close(s);
+    CHECK_EQ(open_file("avi/two_audio.avi", 2, &s), FA_ERROR_NOT_FOUND);
+}
+
+static void test_avi_forward_only(void)
+{
+    compare_forward_only("avi/pcm16.avi", -1, 2);
+    compare_forward_only("avi/pcm16_noindex.avi", -1, 2);
+    compare_forward_only("avi/pcm16_opendml.avi", -1, 2);
+    compare_forward_only("avi/two_audio.avi", 1, 2);
+}
+
+/* A LIST INFO at the top level is read like a WAV file's. */
+static void test_avi_tags(void)
+{
+    char path[512];
+    fa_tags* t = NULL;
+    data_path(path, sizeof(path), "avi/tagged.avi");
+    CHECK_EQ(fa_tags_read_path(path, 0, &t), FA_OK);
+    CHECK(t != NULL);
+    CHECK(strcmp(fa_tags_get(t, FA_TAG_TITLE), "AVI Title") == 0);
+    CHECK(strcmp(fa_tags_get(t, FA_TAG_ARTIST), "AVI Artist") == 0);
+    fa_tags_close(t);
+}
+
+/* Damaged files never crash, and cut ones play what is there. */
+static void test_avi_damaged(void)
+{
+    size_t size = 0, cut;
+    uint8_t* data = load_file("avi/mp3cbr.avi", &size);
+    CHECK(data != NULL);
+    for (cut = 0; cut < size; cut += size / 61 + 1) {
+        fa_open_options opt;
+        fa_stream* s = NULL;
+        fa_open_options_init(&opt);
+        opt.flags = FA_OPEN_DECODE_ONLY;
+        if (fa_stream_open_memory(g_engine, data, cut, &opt, &s) == FA_OK) {
+            int64_t n;
+            float* p = read_all(s, 2, &n);
+            free(p);
+            fa_stream_close(s);
+        }
+    }
+    free(data);
+}
+
+/* ---- Flash Video (demux_flv.c) -------------------------------------------------------- */
+
+static void check_flv_lossy(const char* name, const char* codec)
+{
+    static const int64_t targets[] = { 0, 1, 1151, 1152, 30000, 60000, 3 };
+    fa_stream* s;
+    fa_stream_info info = { .struct_size = sizeof(info) };
+    float* full;
+    int64_t n;
+    double worst;
+    CHECK_EQ(open_file(name, -1, &s), FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.codec, codec) == 0);
+    CHECK(strcmp(info.container, "flv") == 0);
+    CHECK_EQ(info.format.sample_rate, 44100);
+    CHECK_EQ(info.format.channels, 2);
+    CHECK_EQ(info.seekable, 1);
+    full = read_all(s, 2, &n);
+    CHECK_EQ(n, info.length_frames);
+    CHECK_NEAR((double)n, 88200.0, 2300.0);
+    CHECK_NEAR(freq(full, 8000, 80000, 2, 44100), 440.0, 2.0);
+    CHECK_NEAR(freq(full + 1, 8000, 80000, 2, 44100), 660.0, 3.0);
+    CHECK_NEAR(rms(full, 8000, 80000, 2), 0.5 * 0.7071, 0.03);
+    /* The container's millisecond times are snapped to the codec's frame grid, so seeks are exact. */
+    CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), strcmp(codec, "aac") == 0 ? AAC_SEEK_TOL : 0.0, &worst));
+    free(full);
+    fa_stream_close(s);
+}
+
+static void test_flv_files(void)
+{
+    static const int64_t targets[] = { 0, 1, 4095, 4096, 5000, 3000 };
+    fa_stream* s;
+    fa_stream_info info = { .struct_size = sizeof(info) };
+    float* full;
+    int64_t n;
+    double worst;
+    fa_result r;
+    check_flv_lossy("flv/mp3.flv", "mp3");
+    check_flv_lossy("flv/aac.flv", "aac");
+    check_flv_lossy("flv/aac_audio_only.flv", "aac");
+    CHECK_EQ(open_file("flv/pcm16.flv", -1, &s), FA_OK);
+    CHECK_EQ(fa_stream_get_info(s, &info), FA_OK);
+    CHECK(strcmp(info.codec, "pcm_s16le") == 0);
+    CHECK_EQ(info.format.sample_rate, 11025);
+    CHECK_EQ(info.format.channels, 2);
+    full = read_all(s, 2, &n);
+    CHECK_EQ(n, info.length_frames);
+    CHECK_NEAR((double)n, 8269.0, 12.0);     /* 0.75 s; times are in ms */
+    check_sine2(full, n, 2, 11025, 0.5, 0.3, 1e-4, 0);
+    CHECK(seek_matches(s, full, n, 2, targets, (int)(sizeof(targets) / sizeof(targets[0])), 0.0, &worst));
+    free(full);
+    fa_stream_close(s);
+    r = open_file("flv/nelly.flv", -1, &s);     /* Nellymoser */
+    CHECK_EQ(r, FA_ERROR_UNSUPPORTED_FORMAT);
+}
+
+static void test_flv_forward_only(void)
+{
+    compare_forward_only("flv/mp3.flv", -1, 2);
+    compare_forward_only("flv/aac.flv", -1, 2);
+    compare_forward_only("flv/pcm16.flv", -1, 2);
+}
+
+static void test_flv_damaged(void)
+{
+    size_t size = 0, cut;
+    uint8_t* data = load_file("flv/aac.flv", &size);
+    CHECK(data != NULL);
+    for (cut = 0; cut < size; cut += size / 61 + 1) {
+        fa_open_options opt;
+        fa_stream* s = NULL;
+        fa_open_options_init(&opt);
+        opt.flags = FA_OPEN_DECODE_ONLY;
+        if (fa_stream_open_memory(g_engine, data, cut, &opt, &s) == FA_OK) {
+            int64_t n;
+            float* p = read_all(s, 2, &n);
+            free(p);
+            fa_stream_close(s);
+        }
+    }
+    free(data);
+}
+
 int main(void)
 {
     fa_engine_config cfg;
@@ -2249,6 +2449,16 @@ int main(void)
     RUN(test_caf_g711_and_ima4);
     RUN(test_mov_ima4);
     RUN(test_ima4_known_values);
+    RUN(test_avi_lossy);
+    RUN(test_avi_pcm);
+    RUN(test_avi_index_variants);
+    RUN(test_avi_tracks);
+    RUN(test_avi_forward_only);
+    RUN(test_avi_tags);
+    RUN(test_avi_damaged);
+    RUN(test_flv_files);
+    RUN(test_flv_forward_only);
+    RUN(test_flv_damaged);
 
     fa_engine_destroy(g_engine);
     if (g_failures) { printf("%d failure(s)\n", g_failures); return 1; }

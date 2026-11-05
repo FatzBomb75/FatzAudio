@@ -1,7 +1,7 @@
 # Fuzzing the file readers
 
 Fuzz targets for the readers that take untrusted bytes: AAC and HE-AAC (ADTS, MP4, CAF, Matroska), MP3, FLAC (native,
-Ogg, Matroska, MP4), MP4/MOV, Matroska/WebM, CAF, ASF, Ogg (Vorbis, Opus, FLAC, chained), AC-3/E-AC-3, WAV/W64/RF64/AIFF,
+Ogg, Matroska, MP4), MP4/MOV, Matroska/WebM, CAF, AVI, FLV, ASF, Ogg (Vorbis, Opus, FLAC, chained), AC-3/E-AC-3, WAV/W64/RF64/AIFF,
 trackers (libopenmpt), MIDI (SMF, RMID, karaoke, GS/XG effect SysEx), tags (ID3, APE, Vorbis comments, MP4, RIFF, AIFF, Matroska),
 ZIP (central directory, ZIP64, DEFLATE), HLS playlists with the MPEG-TS extractor, `.pls` / `.m3u` radio lists, and the web client
 (HTTP replies, cookies, byte-range reads for MP4 and Matroska indexes) against a server inside the process; sounds (`fa_sound_*`);

@@ -126,6 +126,8 @@ set(FA_SOURCES
     src/codec_os.c
     src/demux_asf.c
     src/demux_caf.c
+    src/demux_avi.c
+    src/demux_flv.c
     src/pkt_index.c
     src/pkt_index.h
     src/stubs.c

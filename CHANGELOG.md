@@ -29,6 +29,10 @@ version number (`FA_VERSION_*` in `include/fatzaudio/fatzaudio.h`; `fa_version()
 - Sun/NeXT `.au`/`.snd` files (PCM 8 to 32 bit, float, µ-law, A-law); µ-law and A-law in CAF and MP4/MOV; IMA 4:1 ADPCM
   (`ima4`) in CAF and QuickTime `.mov`; `.3g2` is listed as an MP4 extension (request 15). New codec names `pcm_mulaw`,
   `pcm_alaw`, `ima4` for `fa_stream_open_packets`.
+- AVI (`.avi`, including OpenDML files over 1 GB) and Flash Video (`.flv`) open by path, memory and callbacks, audio
+  track only (MediaControl request 14): PCM, µ-law, A-law, MP3 (CBR and VBR), MP2, AC-3 and AAC in AVI; AAC, MP3 and PCM
+  in FLV. Exact lengths and seeks; containers `avi` and `flv`; `audio_track` picks a track; forward-only sources play
+  without seeking. DTS, ADPCM and Nellymoser return `FA_ERROR_UNSUPPORTED_FORMAT`.
 - Windows Media Audio on a Windows with no Media Foundation (N and KN editions without the Media Feature Pack) now
   returns `FA_ERROR_PROVIDER_MISSING` (.NET `ErrorCode.ProviderMissing`) instead of `FA_ERROR_UNSUPPORTED_FORMAT`, so an app
   can tell the user what to install. Off Windows, WMA still returns `FA_ERROR_UNSUPPORTED_FORMAT`.

@@ -359,6 +359,7 @@ AAC plays through the ordinary open calls, in MP4/M4A files, video files, CAF (`
 | BASS_AAC_StreamCreateURL (also MP4) | `fa_stream_open_url` (AAC radio with song titles, `.aac` and MP4 over HTTP, AAC in HLS). Fragmented MP4 with a `sidx` or `mfra` index reads its fragments as playback reaches them; seeks are exact ([MP4 and Matroska files](../features/web-streams.md#mp4-and-matroska-files)) | `engine.OpenUrl` | ✅ |
 | BASS_AAC_StreamCreateFileUser (also MP4) | `fa_stream_open_io` | `engine.OpenStream` | ✅ |
 | AAC in CAF (Core Audio Format) files | Built in: `.caf` files open with the same calls, exact length and start from the packet table ([streams](../features/streams.md#supported-formats)) | `engine.OpenFile` | ✅ |
+| Audio of AVI and FLV video files (BASS opens neither) | Built in: `.avi` (PCM, MP3, MP2, AC-3, AAC, OpenDML) and `.flv` (AAC, MP3, PCM) open with the same calls, exact length and seeks; pick a track with `audio_track` ([streams](../features/streams.md#avi-and-flv)) | `engine.OpenFile` | ✅ |
 | BASS_PluginLoad("bass_aac.dll") | Not needed: built in | — | ➖ (by design) |
 
 ### bass_ac3 (Dolby Digital and Dolby Digital Plus)
