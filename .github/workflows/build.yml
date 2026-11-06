@@ -121,12 +121,7 @@ jobs:
         if: runner.os != 'macOS'
         shell: bash
         run: |
-          py=python3; [ "$RUNNER_OS" = "Windows" ] && py=python
-          $py tools/test-https/serve.py tests/data "$RUNNER_TEMP/https" > "$RUNNER_TEMP/https.log" 2>&1 &
-          for i in $(seq 150); do
-            $py -c "import socket; socket.create_connection(('127.0.0.1', 8443), 1)" 2>/dev/null && break
-            sleep 0.2
-          done
+          tools/test-https/start.sh "$RUNNER_TEMP/https"
           if [ "$RUNNER_OS" = "Windows" ]; then
             certutil -addstore -f Root "$RUNNER_TEMP/https/ca.crt"
           else
@@ -392,10 +387,7 @@ jobs:
       - name: Build for every Android ABI
         run: |
           for abi in arm64-v8a x86_64 armeabi-v7a x86; do
-            cmake -S . -B build-android-$abi -G Ninja \
-              -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
-              -DANDROID_ABI=$abi -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release \
-              -DFA_BUILD_TESTS=OFF -DFA_BUILD_TOOLS=OFF
+            tools/android-configure.sh . build-android-$abi $abi -DFA_BUILD_TESTS=OFF
             cmake --build build-android-$abi --parallel "$(nproc)"
           done
       - name: Stage arm64-v8a and x86_64 for the NuGet package
@@ -455,10 +447,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y qemu-user-static
       - name: Build for Android ${{ matrix.abi }} with tests
         run: |
-          cmake -S . -B build-android -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=${{ matrix.abi }} -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release \
-            -DFA_BUILD_TOOLS=OFF
+          tools/android-configure.sh . build-android ${{ matrix.abi }}
           cmake --build build-android --parallel "$(nproc)"
       - name: Test in Android 14
         run: sudo tools/android-test/run.sh build-android

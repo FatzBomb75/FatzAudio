@@ -69,16 +69,10 @@ jobs:
           sudo mkdir -p /data/local/tmp/fa
           sudo chown "$USER" /data/local/tmp/fa
           rsync -a --exclude .git "$GITHUB_WORKSPACE/" /data/local/tmp/fa/src/
-          cmake -S /data/local/tmp/fa/src -B /data/local/tmp/fa/build -G Ninja \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_LATEST_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=x86_64 -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release \
-            -DFA_BUILD_TOOLS=OFF
+          tools/android-configure.sh /data/local/tmp/fa/src /data/local/tmp/fa/build x86_64
           cmake --build /data/local/tmp/fa/build --parallel "$(nproc)"
       - name: Enable KVM
-        run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
+        run: tools/ci/enable-kvm.sh
       # The emulator keeps its virtual sound card (no -no-audio): with no sound
       # server on the runner it plays into nothing, but AAudio runs for real.
       - name: Test on an Android 14 emulator
@@ -119,18 +113,10 @@ jobs:
           brew install --cask blackhole-2ch
           sudo killall coreaudiod || true
       - name: Boot a simulator
-        run: |
-          udid=$(xcrun simctl list devices available -j | python3 -c '
-          import json, sys
-          d = json.load(sys.stdin)["devices"]
-          print(next(x["udid"] for k in sorted(d, reverse=True) if ".iOS-" in k for x in d[k] if x["name"].startswith("iPhone")))')
-          xcrun simctl boot "$udid"
-          xcrun simctl bootstatus "$udid" -b
-          echo "FA_IOS_SIM=$udid" >> "$GITHUB_ENV"
+        run: echo "FA_IOS_SIM=$(tools/ios-sim/boot.sh)" >> "$GITHUB_ENV"
       - name: Start the HTTPS test server
         run: |
-          python3 tools/test-https/serve.py tests/data "$RUNNER_TEMP/https" > "$RUNNER_TEMP/https.log" 2>&1 &
-          for i in $(seq 100); do nc -z 127.0.0.1 8443 && break; sleep 0.2; done
+          tools/test-https/start.sh "$RUNNER_TEMP/https"
           xcrun simctl keychain "$FA_IOS_SIM" add-root-cert "$RUNNER_TEMP/https/ca.crt"
       - name: Test in the iOS simulator
         env:
